@@ -1,0 +1,26 @@
+[[task]]
+name = "demo"
+
+    [[task.session]]
+    cwd = "C:/Users/korinkite/temp"
+    command = "echo hello-ralphus > out2.txt"
+
+    [[task.session]]
+    cwd = "C:/Users/korinkite/temp"
+    agent = "claude-code"
+    model = "sonnet"
+    prompt = "Create hello_claude2.txt containing exactly: sonnet"
+
+    [[task.session]]
+    cwd = "C:/Users/korinkite/temp"
+    agent = "ollama"
+    model = "qwen3:8b"
+    prompt = "Create hello2.txt containing exactly: hi"
+
+  [[task.verify]]
+  id = "check-file-1"
+  command = "if exist out2.txt (exit 0) else (exit 1)"
+
+  [[task.verify]]
+  id = "check-file-2"
+  command = "if exist hello2.txt (exit 0) else (exit 1)"

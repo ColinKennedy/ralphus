@@ -1,0 +1,29 @@
+[package]
+name = "ralphus-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ralphus daemon: authoritative task store, scheduler, and HTTP/JSON API."
+
+[[bin]]
+name = "ralphus-daemon"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_daemon"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ralphus-core.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+rusqlite = { workspace = true }
+tiny_http = { workspace = true }
+
+[dev-dependencies]
+ureq = { workspace = true }

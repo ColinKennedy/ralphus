@@ -1,0 +1,23 @@
+[package]
+name = "ralphus-librarian"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ralphus librarian: web UI server that renders the daemon's state."
+
+[[bin]]
+name = "ralphus-librarian"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_librarian"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ralphus-core.workspace = true
+tiny_http = { workspace = true }
+ureq = { workspace = true }

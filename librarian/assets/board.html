@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ralphus</title>
+    <style>
+      :root {
+        --bg: #0d1117; --panel: #161b22; --panel-2: #1c2129; --border: #30363d;
+        --text: #e6edf3; --muted: #8b949e; --accent: #4aa3ff; --danger: #f85149;
+        --running: #4aa3ff; --done: #3fb950; --failed: #f85149; --pending: #8b949e;
+        --queued: #a371f7; --cancelled: #6e7681; --teal: #39c5cf;
+      }
+      [data-theme="light"] {
+        --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
+        --text: #1f2328; --muted: #656d76; --accent: #0969da;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text);
+        font: 14px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+      code, .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+      button { font: inherit; cursor: pointer; }
+
+      header { display: flex; align-items: center; justify-content: space-between;
+        padding: 9px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
+      .brand { display: flex; align-items: center; gap: 14px; font-weight: 600; }
+      .logo { color: var(--accent); letter-spacing: .5px; }
+      .tabs { display: flex; gap: 4px; }
+      .tab { background: none; border: none; color: var(--muted); font-weight: 500; padding: 6px 12px; border-radius: 6px; }
+      .tab:hover, .tab.active { color: var(--text); background: var(--panel-2); }
+      .status-right { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 13px; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+      .dot.on { background: var(--done); box-shadow: 0 0 6px var(--done); }
+      .dot.off { background: var(--failed); }
+      .running-btn { position: relative; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 4px 10px; border-radius: 6px; }
+      .running-menu { position: absolute; right: 0; top: 110%; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 220px; padding: 6px; z-index: 30; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+      .running-menu div { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+      .running-menu div:hover { background: var(--panel-2); }
+      .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
+
+      main#tasks-page { display: grid; grid-template-columns: 280px 1fr 340px; height: calc(100vh - 51px); }
+      main#reviews-page { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 51px); }
+      .col { overflow-y: auto; }
+      .sidebar { border-right: 1px solid var(--border); background: var(--panel); }
+      .detail-pane { border-left: 1px solid var(--border); background: var(--panel); }
+      .center { padding: 18px 20px; }
+
+      .side-head { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+      .side-head input[type=text] { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; }
+      .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      .chip { background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
+      .chip.active { color: var(--text); border-color: var(--accent); }
+      .newtask { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 6px 10px; font-weight: 600; }
+      .status-filters label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); margin-right: 6px; }
+
+      .run-item { padding: 9px 12px; border-left: 3px solid transparent; border-bottom: 1px solid var(--border); cursor: pointer; }
+      .run-item:hover { background: var(--panel-2); }
+      .run-item.selected { background: var(--panel-2); border-left-color: var(--accent); }
+      .run-item .rid { font-family: ui-monospace, monospace; font-size: 13px; }
+      .run-item .meta { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; align-items: center; gap: 6px; }
+      .run-item .runbtn { float: right; font-size: 11px; padding: 1px 6px; }
+
+      .selectable { cursor: pointer; border: 1px solid transparent; }
+      .selectable.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+      .run-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--border); margin-bottom: 16px; position: relative; z-index: 1; }
+      .run-banner .rid { font-family: ui-monospace, monospace; font-size: 17px; }
+      .task { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin-bottom: 16px; overflow: hidden; position: relative; z-index: 1; }
+      .task-head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); background: var(--panel-2); font-weight: 600; }
+      .task-body { padding: 12px 14px; display: flex; flex-wrap: wrap; gap: 12px; }
+      .session { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; min-width: 210px; background: var(--bg); }
+      .session .sid { font-family: ui-monospace, monospace; font-weight: 600; }
+      .session .kv { color: var(--muted); font-size: 12px; margin-top: 3px; }
+      .vchips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+      .vchip { border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 11px; display: flex; gap: 4px; align-items: center; }
+      .verify-chain { display: flex; gap: 6px; padding: 0 14px 12px; flex-wrap: wrap; align-items: center; }
+      .verify-chain .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: 4px; }
+
+      .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+      .p-running { color: var(--running); border-color: var(--running); animation: pulse 1.6s infinite; }
+      .p-done { color: var(--done); border-color: var(--done); }
+      .p-failed { color: var(--failed); border-color: var(--failed); }
+      .p-pending { color: var(--pending); } .p-queued { color: var(--queued); border-color: var(--queued); }
+      .p-cancelled { color: var(--cancelled); }
+      .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
+      .p-in_progress { color: var(--running); border-color: var(--running); }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+
+      .detail-pane { padding: 16px 18px; }
+      .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+      .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+      .dhead .k { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+      h3.section { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 18px 0 8px; }
+      .kv-row { display: flex; gap: 8px; margin: 4px 0; font-size: 13px; }
+      .kv-row .k { color: var(--muted); min-width: 96px; }
+      .kv-row .v { word-break: break-word; }
+      .prompt-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; max-height: 200px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+      .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
+      .edit-form label { display: block; font-size: 12px; color: var(--muted); margin-top: 8px; }
+      .edit-form input, .edit-form textarea, .edit-form select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; margin-top: 3px; }
+      .btn { border: 1px solid var(--border); background: var(--panel-2); color: var(--text); border-radius: 6px; padding: 5px 12px; }
+      .btn.primary { background: var(--accent); color: #fff; border: none; }
+      .btn.danger { color: var(--danger); border-color: var(--danger); }
+      .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+
+      .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+      .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; width: 560px; max-width: 92vw; padding: 18px; }
+      .modal h2 { margin: 0 0 12px; font-size: 16px; }
+      .modal textarea { width: 100%; height: 240px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 10px; font-family: ui-monospace, monospace; }
+      .modal .btn-row { justify-content: flex-end; }
+      .verr { color: var(--failed); font-size: 12px; margin: 4px 0; }
+      .hidden { display: none; }
+
+      .progress { height: 8px; background: var(--panel-2); border-radius: 999px; overflow: hidden; display: flex; margin: 6px 0 12px; }
+      .progress > span { display: block; height: 100%; }
+      .branch-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; margin: 4px 0; background: var(--bg); }
+      .branch-row[draggable=true] { cursor: grab; }
+      .branch-row.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+      .branch-row .grip { color: var(--muted); }
+      .badge { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
+      .badge.warn2 { color: var(--queued); border-color: var(--queued); }
+      .badge.bad { color: var(--failed); border-color: var(--failed); }
+      .ctx-menu { position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 5px; z-index: 60; min-width: 160px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+      .ctx-menu div { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+      .ctx-menu div:hover { background: var(--panel-2); }
+      .ctx-menu div.danger { color: var(--danger); }
+      .sel-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+      .sel-tab { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 5px; }
+      .sel-tab.active { border-color: var(--accent); color: var(--text); }
+      .sel-tab .x { color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="logo">ralphus</span><span id="conn" class="dot off"></span>
+        <nav class="tabs">
+          <button id="tab-tasks" class="tab active" onclick="showTab('tasks')">Tasks</button>
+          <button id="tab-reviews" class="tab" onclick="showTab('reviews')">Reviews</button>
+        </nav>
+      </div>
+      <div class="status-right">
+        <div style="position:relative">
+          <button class="running-btn" onclick="toggleRunning(event)"><span id="running">Running 0 / 0</span> ▾</button>
+          <div id="running-menu" class="running-menu hidden"></div>
+        </div>
+        <span id="updated">—</span>
+        <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" title="Toggle theme">☾</button>
+      </div>
+    </header>
+
+    <main id="tasks-page">
+      <div class="col sidebar">
+        <div class="side-head">
+          <button class="newtask" onclick="openNewTask()">＋ New Task</button>
+          <input type="text" id="filter" placeholder="filter by run id / label…" oninput="onFilter(this.value)" />
+          <div class="row">
+            <span class="chip" data-sort="date" onclick="setSort('date')">date</span>
+            <span class="chip" data-sort="name" onclick="setSort('name')">name</span>
+            <span class="chip" onclick="toggleDir()" id="dir-chip">↓</span>
+          </div>
+          <div class="status-filters row" id="status-filters"></div>
+        </div>
+        <div id="runs"></div>
+      </div>
+      <div class="col center" id="graph">
+        <div class="empty">Select a run.</div>
+      </div>
+      <div class="col detail-pane" id="details">
+        <div class="empty">Select a run, task, or session.</div>
+      </div>
+    </main>
+
+    <main id="reviews-page" style="display:none">
+      <div class="col sidebar"><div class="side-head row" style="justify-content:space-between"><b>Reviews</b><button class="newtask" onclick="openCreateReview()">＋ Create</button></div><div id="reviews"></div></div>
+      <div class="col center"><div id="review-detail"><div class="empty">Select a review.</div></div></div>
+    </main>
+
+    <div id="modal-root"></div>
+
+    <script>
+      const STATES = ["running","done","failed","pending","queued","cancelled"];
+      let tab = "tasks";
+      let runs = [], guardians = [];
+      let selectedRunId = null;
+      let sel = { kind: null, taskIdx: 0, sessionIdx: 0 };  // what's shown in the details pane
+      let editing = false;
+      let filters = { q: "", sort: "date", dir: -1, status: new Set(STATES) };
+      let selectedGuardian = null;
+      let multiSel = new Set();   // multi-selected run ids (multi mode when size > 1)
+      let anchorId = null;        // anchor for shift-range selection
+
+      // ---------- helpers ----------
+      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+      const cvar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n) || "var(--muted)";
+      const sdot = (s) => `<span class="dot" style="background:${cvar("--"+s)}"></span>`;
+      const pill = (s) => `<span class="pill p-${s}">${s}</span>`;
+      const findRun = (id) => runs.find((r) => r.id === id);
+      const post = (path, body) => fetch(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
+      const del = (path) => fetch(path, { method: "DELETE" });
+
+      // ---------- theme ----------
+      function applyTheme(t) {
+        document.documentElement.dataset.theme = t;
+        document.getElementById("theme-btn").textContent = t === "light" ? "☀" : "☾";
+      }
+      function toggleTheme() {
+        const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+        localStorage.setItem("ralphus-theme", t); applyTheme(t);
+      }
+      applyTheme(localStorage.getItem("ralphus-theme") || "dark");
+
+      // ---------- tabs ----------
+      function showTab(name) {
+        tab = name;
+        document.getElementById("tasks-page").style.display = name === "tasks" ? "grid" : "none";
+        document.getElementById("reviews-page").style.display = name === "reviews" ? "grid" : "none";
+        document.getElementById("tab-tasks").classList.toggle("active", name === "tasks");
+        document.getElementById("tab-reviews").classList.toggle("active", name === "reviews");
+        syncHash();
+        tick();
+      }
+
+      // ---------- hash routing (#/tasks/<run>?sel=kind:ti:si&q=&sort=&dir=&status=) ----------
+      let pendingHash = null;
+      function syncHash() {
+        if (tab !== "tasks") { history.replaceState(null, "", "#/reviews"); return; }
+        const p = new URLSearchParams();
+        if (sel.kind) p.set("sel", `${sel.kind}:${sel.taskIdx}:${sel.sessionIdx}`);
+        if (filters.q) p.set("q", filters.q);
+        if (filters.sort !== "date") p.set("sort", filters.sort);
+        if (filters.dir !== -1) p.set("dir", "asc");
+        if (filters.status.size !== STATES.length) p.set("status", [...filters.status].join(","));
+        const base = selectedRunId ? `#/tasks/${selectedRunId}` : "#/tasks";
+        const qs = p.toString();
+        history.replaceState(null, "", qs ? `${base}?${qs}` : base);
+      }
+      function parseHash() {
+        const raw = location.hash.replace(/^#\/?/, "");
+        if (!raw) return null;
+        if (raw.startsWith("reviews")) return { tab: "reviews" };
+        const [path, query] = raw.split("?");
+        const seg = path.split("/");
+        const p = new URLSearchParams(query || "");
+        if (p.get("q")) filters.q = p.get("q").toLowerCase();
+        if (p.get("sort")) filters.sort = p.get("sort");
+        if (p.get("dir") === "asc") filters.dir = 1;
+        if (p.get("status")) filters.status = new Set(p.get("status").split(",").filter(Boolean));
+        return { tab: "tasks", runId: seg[1] || null, sel: p.get("sel") };
+      }
+
+      // ---------- filters ----------
+      function renderStatusFilters() {
+        const el = document.getElementById("status-filters");
+        el.innerHTML = STATES.map((s) => `<label>${sdot(s)}<input type="checkbox" ${filters.status.has(s) ? "checked" : ""} onchange="toggleStatus('${s}',this.checked)">${s}</label>`).join("")
+          + `<span class="chip" onclick="allStatus(true)">all</span><span class="chip" onclick="allStatus(false)">none</span>`;
+      }
+      function toggleStatus(s, on) { on ? filters.status.add(s) : filters.status.delete(s); renderRuns(); syncHash(); }
+      function allStatus(on) { filters.status = on ? new Set(STATES) : new Set(); renderStatusFilters(); renderRuns(); syncHash(); }
+      function onFilter(v) { filters.q = v.toLowerCase(); renderRuns(); syncHash(); }
+      function setSort(k) { filters.sort = k; renderSortChips(); renderRuns(); syncHash(); }
+      function toggleDir() { filters.dir *= -1; renderSortChips(); renderRuns(); syncHash(); }
+      function renderSortChips() {
+        document.querySelectorAll("[data-sort]").forEach((c) => c.classList.toggle("active", c.dataset.sort === filters.sort));
+        document.getElementById("dir-chip").textContent = filters.dir < 0 ? "↓" : "↑";
+      }
+      function visibleRuns() {
+        let list = runs.filter((r) => filters.status.has(r.state)
+          && (r.id.toLowerCase().includes(filters.q) || (r.label || "").toLowerCase().includes(filters.q)));
+        list.sort((a, b) => filters.sort === "name"
+          ? filters.dir * (a.label || a.id).localeCompare(b.label || b.id)
+          : filters.dir * (a.created_at_ms - b.created_at_ms));
+        return list;
+      }
+
+      // ---------- sidebar ----------
+      function renderRuns() {
+        const el = document.getElementById("runs");
+        const list = visibleRuns();
+        if (!list.length) { el.innerHTML = `<div class="empty">No runs.</div>`; return; }
+        el.innerHTML = list.map((r) => `
+          <div class="run-item ${(r.id === selectedRunId || multiSel.has(r.id)) ? "selected" : ""}" onclick="onRunClick(event,'${r.id}')" oncontextmenu="openRunMenu(event,'${r.id}')">
+            <button class="btn runbtn" onclick="openRunMenu(event,'${r.id}')" title="actions">⋯</button>
+            ${r.state === "queued" ? `<button class="btn runbtn" onclick="activateRun(event,'${r.id}')">▶ Run</button>` : ""}
+            <div class="rid">${esc(r.label || r.id)}</div>
+            <div class="meta">${sdot(r.state)}<span>${r.state}</span> · ${esc(r.id)}</div>
+          </div>`).join("");
+      }
+      function selectRun(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; renderAll(); syncHash(); }
+      async function activateRun(e, id) { e.stopPropagation(); await post(`/api/runs/${id}/activate`); tick(); }
+
+      // ---------- multi-select + context menu ----------
+      function onRunClick(e, id) {
+        if (e.shiftKey && anchorId) {
+          const vis = visibleRuns().map((r) => r.id);
+          const a = vis.indexOf(anchorId), b = vis.indexOf(id);
+          if (a >= 0 && b >= 0) { const lo = Math.min(a, b), hi = Math.max(a, b); multiSel = new Set(vis.slice(lo, hi + 1)); }
+        } else if (e.ctrlKey || e.metaKey) {
+          if (multiSel.has(id)) multiSel.delete(id); else multiSel.add(id);
+          anchorId = id;
+        } else {
+          multiSel = new Set([id]); anchorId = id;
+        }
+        selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false;
+        renderAll(); syncHash();
+      }
+      function openRunMenu(e, id) {
+        e.preventDefault(); e.stopPropagation(); closeRunMenu();
+        const r = findRun(id); if (!r) return;
+        const items = [`<div onclick="renameRun('${id}')">✎ Rename</div>`];
+        if (r.state === "queued") items.push(`<div onclick="runMenuAct('${id}','activate')">▶ Run</div>`);
+        if (!["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="runMenuAct('${id}','cancel')">■ Cancel</div>`);
+        items.push(`<div class="danger" onclick="deleteRun('${id}')">🗑 Delete</div>`);
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "run-menu"; menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 170) + "px";
+      }
+      function closeRunMenu() { const m = document.getElementById("run-menu"); if (m) m.remove(); }
+      document.addEventListener("click", closeRunMenu);
+      async function runMenuAct(id, act) { closeRunMenu(); await post(`/api/runs/${id}/${act}`); tick(); }
+      function renameRun(id) {
+        closeRunMenu();
+        const r = findRun(id); if (!r) return;
+        const name = prompt("Rename run label:", r.label || "");
+        if (name === null) return;
+        post(`/api/runs/${id}/edit`, { kind: "run", label: name }).then(() => tick());
+      }
+      async function deleteRun(id) {
+        closeRunMenu();
+        if (!confirm("Delete this run? This cannot be undone.")) return;
+        await del(`/api/runs/${id}`);
+        if (selectedRunId === id) selectedRunId = null;
+        multiSel.delete(id); tick();
+      }
+      // selection tabs / bulk actions (multi mode)
+      function focusSel(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; renderAll(); syncHash(); }
+      function unpickSel(id) { multiSel.delete(id); if (selectedRunId === id) selectedRunId = [...multiSel][0] || null; renderAll(); }
+      async function bulkCancel() { for (const id of [...multiSel]) { try { await post(`/api/runs/${id}/cancel`); } catch (_) {} } tick(); }
+      async function bulkDelete() {
+        if (!confirm(`Delete ${multiSel.size} run(s)? This cannot be undone.`)) return;
+        for (const id of [...multiSel]) { try { await del(`/api/runs/${id}`); } catch (_) {} }
+        multiSel.clear(); selectedRunId = null; tick();
+      }
+      function selectionTabs() {
+        const chips = [...multiSel].map((id) => {
+          const r = findRun(id); if (!r) return "";
+          return `<span class="sel-tab ${id === selectedRunId ? "active" : ""}" onclick="focusSel('${id}')">${esc(r.label || id)}<span class="x" onclick="event.stopPropagation();unpickSel('${id}')">✕</span></span>`;
+        }).join("");
+        return `<div class="sel-tabs">${chips}</div>
+          <div class="btn-row" style="margin-top:0"><button class="btn" onclick="bulkCancel()">Cancel ${multiSel.size}</button><button class="btn danger" onclick="bulkDelete()">Delete ${multiSel.size}</button></div>`;
+      }
+
+      // ---------- center graph ----------
+      function renderGraph() {
+        const el = document.getElementById("graph");
+        const run = findRun(selectedRunId);
+        if (!run) { el.innerHTML = `<div class="empty">Select a run.</div>`; return; }
+        const selCls = (k, t, s) => (sel.kind === k && (k !== "task" || sel.taskIdx === t) && (k !== "session" || (sel.taskIdx === t && sel.sessionIdx === s))) ? "sel" : "";
+        const banner = `<div class="run-banner selectable ${sel.kind === "run" ? "sel" : ""}" onclick="pick('run')">
+            ${sdot(run.state)}<span class="rid">${esc(run.label || run.id)}</span> ${pill(run.state)}
+            <span style="flex:1"></span><button class="icon-btn" onclick="event.stopPropagation();openLogs()">📄 Logs</button></div>`;
+        const tasks = run.tasks.map((t, ti) => {
+          const sessions = t.sessions.map((s, si) => `
+            <div class="session selectable ${selCls("session", ti, si)}" id="n-${ti}-${si}" onclick="pick('session',${ti},${si})"
+                 title="${esc(s.id)} — ${esc(s.state)}${(s.depends_on||[]).length ? "\ndepends on: " + esc((s.depends_on||[]).join(", ")) : ""}">
+              <div class="sid">${esc(s.id)} ${pill(s.state)}</div>
+              <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
+              <div class="kv mono">${esc(s.cwd || "")}</div>
+              ${s.error ? `<div class="kv" style="color:var(--failed)">${esc(s.error)}</div>` : ""}
+            </div>`).join("");
+          const tverify = (t.verify || []).map((v, vi) => `<span class="vchip" id="v-${ti}-${vi}" title="${esc(v.kind)}${v.id ? " · " + esc(v.id) : ""}">${sdot(v.state)} ${esc(v.id || v.kind)}</span>`).join("");
+          const tdep = (t.depends_on || []).length ? `<span class="k" style="font-size:11px" title="task depends on ${esc((t.depends_on||[]).join(", "))}">⇠ ${esc((t.depends_on||[]).join(", "))}</span>` : "";
+          return `<div class="task" id="tk-${ti}">
+            <div class="task-head selectable ${selCls("task", ti)}" onclick="pick('task',${ti})">${sdot(t.state)} <span>${esc(t.name)}</span> ${pill(t.state)} ${tdep}</div>
+            <div class="task-body">${sessions || '<span class="kv">no sessions</span>'}</div>
+            ${tverify ? `<div class="verify-chain"><span class="label">verify</span>${tverify}</div>` : ""}
+          </div>`;
+        }).join("");
+        el.innerHTML = banner + tasks;
+        requestAnimationFrame(drawArrows);
+      }
+
+      // ---------- SVG dependency arrows ----------
+      const SVGNS = "http://www.w3.org/2000/svg";
+      function drawArrows() {
+        const graph = document.getElementById("graph");
+        const existing = document.getElementById("arrow-svg");
+        if (existing) existing.remove();
+        const run = findRun(selectedRunId);
+        if (!run) return;
+        // Map every dependency reference (session id and "taskName/sessionId") to a node id.
+        const byRef = {};
+        run.tasks.forEach((t, ti) => t.sessions.forEach((s, si) => {
+          byRef[s.id] = `n-${ti}-${si}`;
+          byRef[`${t.name}/${s.id}`] = `n-${ti}-${si}`;
+        }));
+        const taskByName = {};
+        run.tasks.forEach((t, ti) => { taskByName[t.name] = `tk-${ti}`; });
+        const edges = [];
+        // task -> task dependencies (routed card-to-card, in the gaps)
+        run.tasks.forEach((t, ti) => (t.depends_on || []).forEach((dep) => {
+          const from = taskByName[dep]; if (from) edges.push({ from, to: `tk-${ti}`, kind: "dep" });
+        }));
+        // session -> session dependencies
+        run.tasks.forEach((t, ti) => t.sessions.forEach((s, si) => {
+          (s.depends_on || []).forEach((dep) => {
+            const from = byRef[dep]; if (from) edges.push({ from, to: `n-${ti}-${si}`, kind: "dep" });
+          });
+        }));
+        // verify chain
+        run.tasks.forEach((t, ti) => {
+          const vs = t.verify || [];
+          for (let i = 1; i < vs.length; i++) edges.push({ from: `v-${ti}-${i - 1}`, to: `v-${ti}-${i}`, kind: "vchain" });
+        });
+        if (!edges.length) return;
+        const gr = graph.getBoundingClientRect();
+        const rectOf = (id) => { const e = document.getElementById(id); return e ? e.getBoundingClientRect() : null; };
+        const px = (r) => r.left - gr.left + graph.scrollLeft;
+        const py = (r) => r.top - gr.top + graph.scrollTop;
+        const svg = document.createElementNS(SVGNS, "svg");
+        svg.id = "arrow-svg";
+        svg.setAttribute("width", graph.scrollWidth);
+        svg.setAttribute("height", graph.scrollHeight);
+        // Above the cards (z-index 5 > card z-index 1) but click-through.
+        svg.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;z-index:5;overflow:visible";
+        svg.innerHTML = `<defs>
+          <marker id="ah-dep" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker>
+          <marker id="ah-v" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--teal)"/></marker>
+        </defs>`;
+        // Anchor on the facing edges so the line travels in the gap, not across faces.
+        const anchor = (a, b) => {
+          const acx = px(a) + a.width / 2, acy = py(a) + a.height / 2;
+          const bcx = px(b) + b.width / 2, bcy = py(b) + b.height / 2;
+          const dx = bcx - acx, dy = bcy - acy;
+          if (Math.abs(dx) > Math.abs(dy)) {
+            return { x1: dx > 0 ? px(a) + a.width : px(a), y1: acy, x2: dx > 0 ? px(b) : px(b) + b.width, y2: bcy, h: true };
+          }
+          return { x1: acx, y1: dy > 0 ? py(a) + a.height : py(a), x2: bcx, y2: dy > 0 ? py(b) : py(b) + b.height, h: false };
+        };
+        edges.forEach((e) => {
+          const a = rectOf(e.from), b = rectOf(e.to); if (!a || !b) return;
+          const { x1, y1, x2, y2, h } = anchor(a, b);
+          const d = h
+            ? `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}`
+            : `M${x1},${y1} C${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2}`;
+          const p = document.createElementNS(SVGNS, "path");
+          p.setAttribute("d", d);
+          p.setAttribute("fill", "none");
+          p.setAttribute("stroke", e.kind === "dep" ? "var(--muted)" : "var(--teal)");
+          p.setAttribute("stroke-width", "1.75");
+          p.setAttribute("opacity", "0.9");
+          p.setAttribute("marker-end", e.kind === "dep" ? "url(#ah-dep)" : "url(#ah-v)");
+          svg.appendChild(p);
+        });
+        graph.style.position = "relative";
+        graph.appendChild(svg);
+      }
+      window.addEventListener("resize", () => requestAnimationFrame(drawArrows));
+      function pick(kind, ti = 0, si = 0) { sel = { kind, taskIdx: ti, sessionIdx: si }; editing = false; renderGraph(); renderDetails(); syncHash(); }
+
+      // ---------- right details pane ----------
+      function renderDetails() {
+        const el = document.getElementById("details");
+        const run = findRun(selectedRunId);
+        if (!run || !sel.kind) { el.innerHTML = `<div class="empty">Select a run, task, or session.</div>`; return; }
+        const tabs = multiSel.size > 1 ? selectionTabs() : "";
+        if (editing) { el.innerHTML = tabs + editForm(run); return; }
+        if (sel.kind === "run") el.innerHTML = tabs + runView(run);
+        else if (sel.kind === "task") el.innerHTML = tabs + taskView(run, run.tasks[sel.taskIdx]);
+        else el.innerHTML = tabs + sessionView(run, run.tasks[sel.taskIdx], run.tasks[sel.taskIdx].sessions[sel.sessionIdx]);
+      }
+      const editBtn = () => `<div class="btn-row"><button class="btn primary" onclick="startEdit()">✎ Edit</button></div>`;
+      function runView(r) {
+        const reviews = (r.reviews || []).length
+          ? `<h3 class="section">reviews</h3>` + r.reviews.map((rv) =>
+              `<div class="kv-row"><span>${gdot(rv.status)}</span><span class="v"><a href="#" onclick="gotoReview('${rv.id}');return false" style="color:var(--accent)">${esc(rv.name)}</a></span><span class="k">${esc(rv.status)}</span></div>`).join("")
+          : "";
+        return `<div class="dhead"><span class="k">▶ run</span></div>
+          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(r.id)}</span></div>
+          <div class="kv-row"><span class="k">label</span><span class="v">${esc(r.label || "—")}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(r.state)}</span></div>
+          <div class="kv-row"><span class="k">tasks</span><span class="v">${r.tasks.length}</span></div>
+          ${reviews}
+          ${editBtn()}`;
+      }
+      function gotoReview(id) { selectedGuardian = id; showTab("reviews"); }
+      function gotoRun(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; showTab("tasks"); }
+      function taskView(r, t) {
+        const verify = (t.verify || []).map((v) => `${sdot(v.state)} ${esc(v.id || v.kind)}`).join("<br>") || "—";
+        return `<div class="dhead"><span class="k">⯀ task</span></div>
+          <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
+          <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project || "—")}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}</span></div>
+          <div class="kv-row"><span class="k">sessions</span><span class="v">${t.sessions.length}</span></div>
+          <h3 class="section">verify steps</h3><div class="kv-row"><span class="v">${verify}</span></div>
+          ${editBtn()}`;
+      }
+      function sessionView(r, t, s) {
+        return `<div class="dhead"><span class="k">◉ session</span></div>
+          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}</span></div>
+          <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}</span></div>
+          <div class="kv-row"><span class="k">agent</span><span class="v">${esc(s.agent)}</span></div>
+          <div class="kv-row"><span class="k">model</span><span class="v">${esc(s.model || "—")}</span></div>
+          <div class="kv-row"><span class="k">cwd</span><span class="v mono">${esc(s.cwd || "—")}</span></div>
+          <div class="kv-row"><span class="k">tokens</span><span class="v">${s.tokens_in}/${s.tokens_out} · $${(s.cost_usd||0).toFixed(4)}</span></div>
+          ${s.error ? `<div class="warn">${esc(s.error)}</div>` : ""}
+          <h3 class="section">${s.command ? "command" : "prompt"}</h3>
+          <div class="prompt-box">${esc(s.command || s.prompt || "—")}</div>
+          ${editBtn()}`;
+      }
+
+      function startEdit() { editing = true; renderDetails(); }
+      function cancelEdit() { editing = false; renderDetails(); }
+      function editForm(r) {
+        const running = r.state === "running";
+        const warn = running ? `<div class="warn">This run is Running. Saving will stop it and set it back to Pending.</div>` : "";
+        let fields = "";
+        if (sel.kind === "run") {
+          fields = `<label>label<input id="e-label" value="${esc(r.label || "")}"></label>`;
+        } else if (sel.kind === "task") {
+          const t = r.tasks[sel.taskIdx];
+          fields = `<label>name<input id="e-name" value="${esc(t.name)}"></label>
+            <label>project<input id="e-project" value="${esc(t.project || "")}"></label>`;
+        } else {
+          const s = r.tasks[sel.taskIdx].sessions[sel.sessionIdx];
+          const isCmd = !!s.command;
+          fields = `<label>cwd<input id="e-cwd" value="${esc(s.cwd || "")}"></label>
+            <label>agent<input id="e-agent" value="${esc(s.agent)}"></label>
+            <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
+            <label>${isCmd ? "command" : "prompt"}<textarea id="e-prompt" rows="5">${esc(s.command || s.prompt || "")}</textarea></label>`;
+        }
+        return `<div class="dhead"><span class="k">✎ editing ${sel.kind}</span></div>${warn}
+          <div class="edit-form">${fields}</div>
+          <div id="save-err" class="verr"></div>
+          <div class="btn-row"><button class="btn primary" onclick="saveEdit()">Save</button><button class="btn" onclick="cancelEdit()">Cancel</button></div>`;
+      }
+      async function saveEdit() {
+        const r = findRun(selectedRunId); if (!r) return;
+        const body = { kind: sel.kind, task_idx: sel.taskIdx, session_idx: sel.sessionIdx };
+        const val = (id) => (document.getElementById(id) || {}).value || "";
+        if (sel.kind === "run") body.label = val("e-label");
+        else if (sel.kind === "task") { body.name = val("e-name"); body.project = val("e-project"); }
+        else {
+          const s = r.tasks[sel.taskIdx].sessions[sel.sessionIdx];
+          body.cwd = val("e-cwd"); body.agent = val("e-agent"); body.model = val("e-model");
+          if (s.command) body.command = val("e-prompt"); else body.prompt = val("e-prompt");
+        }
+        try {
+          const resp = await fetch(`/api/runs/${r.id}/edit`, { method: "POST", body: JSON.stringify(body) });
+          if (!resp.ok) { document.getElementById("save-err").textContent = "save failed (" + resp.status + ")"; return; }
+          editing = false; await tick();
+        } catch (e) { document.getElementById("save-err").textContent = "save failed: " + e; }
+      }
+
+      // ---------- running dropdown ----------
+      function toggleRunning(e) {
+        e.stopPropagation();
+        const m = document.getElementById("running-menu");
+        if (!m.classList.contains("hidden")) { m.classList.add("hidden"); return; }
+        const active = runs.filter((r) => r.state === "running");
+        m.innerHTML = active.length ? active.map((r) => `<div onclick="showTab('tasks');selectRun('${r.id}');document.getElementById('running-menu').classList.add('hidden')">${esc(r.label || r.id)}</div>`).join("") : `<div class="empty" style="margin:6px">No running tasks</div>`;
+        m.classList.remove("hidden");
+      }
+      document.addEventListener("click", () => document.getElementById("running-menu").classList.add("hidden"));
+
+      // ---------- new task modal ----------
+      function openNewTask() {
+        document.getElementById("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
+            <h2>New Task</h2>
+            <textarea id="nt-toml" placeholder="Paste task TOML here…"></textarea>
+            <label style="font-size:12px;color:var(--muted)">label (optional) <input id="nt-label" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px"></label>
+            <div id="nt-err" class="verr"></div>
+            <div class="btn-row"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="submitTask()">Validate & Queue</button></div>
+          </div></div>`;
+      }
+      function closeModal() { document.getElementById("modal-root").innerHTML = ""; }
+
+      // ---------- logs modal ----------
+      let logRunId = null, logsTab = "sessions";
+      function openLogs() { const r = findRun(selectedRunId); if (!r) return; logRunId = r.id; renderLogs(); }
+      function renderLogs() {
+        const run = findRun(logRunId); if (!run) return;
+        const tabs = ["tasks", "sessions", "verifiers"];
+        document.getElementById("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw">
+            <h2>Logs — ${esc(run.label || run.id)}</h2>
+            <div class="row" style="margin-bottom:10px">
+              ${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" onclick="logsTab='${t}';renderLogs()">${t}</span>`).join("")}
+            </div>
+            <div style="max-height:60vh;overflow:auto">${logsBody(run)}</div>
+            <div class="btn-row"><button class="btn" onclick="closeModal()">Close</button></div>
+          </div></div>`;
+      }
+      function tblRow(cells) { return "<tr>" + cells.map((c) => `<td style="padding:5px 10px;border-bottom:1px solid var(--border)">${c}</td>`).join("") + "</tr>"; }
+      function logsBody(run) {
+        const T = (head, rows) => `<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr>${head.map((h) => `<th style="text-align:left;padding:5px 10px;color:var(--muted);font-weight:500">${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+        if (logsTab === "tasks") {
+          return T(["task", "state", "sessions"], run.tasks.map((t) => tblRow([esc(t.name), pill(t.state), t.sessions.length])));
+        }
+        if (logsTab === "verifiers") {
+          const rows = [];
+          run.tasks.forEach((t) => (t.verify || []).forEach((v) => rows.push(tblRow([esc(t.name), esc(v.id || "—"), esc(v.kind), pill(v.state)]))));
+          return rows.length ? T(["task", "id", "kind", "state"], rows) : `<div class="empty">No task-level verifiers.</div>`;
+        }
+        const rows = [];
+        run.tasks.forEach((t) => t.sessions.forEach((s) => rows.push(tblRow([esc(t.name), `<span class="mono">${esc(s.id)}</span>`, pill(s.state), `${s.tokens_in}/${s.tokens_out}`, `$${(s.cost_usd || 0).toFixed(4)}`, s.error ? `<span style="color:var(--failed)">${esc(s.error)}</span>` : ""]))));
+        return T(["task", "session", "state", "tokens", "cost", "error"], rows);
+      }
+      async function submitTask() {
+        const toml = document.getElementById("nt-toml").value;
+        const label = document.getElementById("nt-label").value;
+        const errEl = document.getElementById("nt-err");
+        const v = await (await fetch("/api/runs/validate", { method: "POST", body: JSON.stringify({ toml }) })).json();
+        if (!v.valid) { errEl.innerHTML = v.errors.map((e) => `line ${e.line ?? "?"}: ${esc(e.message)}`).join("<br>"); return; }
+        const resp = await fetch("/api/runs", { method: "POST", body: JSON.stringify({ toml, label: label || null }) });
+        if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
+        closeModal(); tick();
+      }
+
+      // ---------- reviews (list + detail, read-only for now) ----------
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", deployed:"--done", pending:"--pending", in_progress:"--running", done:"--done", conflict_resolved:"--queued", failed:"--failed" };
+      const gdot = (s) => `<span class="dot" style="background:${cvar(G_COLORS[s]||"--muted")}"></span>`;
+      function renderReviews() {
+        const el = document.getElementById("reviews");
+        if (!guardians.length) { el.innerHTML = `<div class="empty">No reviews.</div>`; return; }
+        el.innerHTML = guardians.map((g) => `<div class="run-item ${g.id===selectedGuardian?"selected":""}" onclick="selectedGuardian='${g.id}';renderReviews();renderReviewDetail()">
+          <div class="rid">${esc(g.name)}</div><div class="meta">${gdot(g.status)}<span>${g.status}</span> · ${g.branches.length} branches</div></div>`).join("");
+      }
+      function mergeProgress(g) {
+        const total = g.branches.length;
+        if (!total) return "";
+        const cnt = (f) => g.branches.filter(f).length;
+        const done = cnt((b) => b.merge_status === "done");
+        const resolved = cnt((b) => b.merge_status === "conflict_resolved");
+        const prog = cnt((b) => b.merge_status === "in_progress");
+        const failed = cnt((b) => b.merge_status === "failed");
+        const pct = (n) => (100 * n / total).toFixed(2) + "%";
+        return `<div class="kv-row"><span class="k">merged</span><span>${done + resolved}/${total}${failed ? ` · <span style="color:var(--failed)">${failed} failed</span>` : ""}</span></div>
+          <div class="progress" title="green=clean, purple=conflict-resolved, blue=in-progress, red=failed">
+            <span style="width:${pct(done)};background:var(--done)"></span>
+            <span style="width:${pct(resolved)};background:var(--queued)"></span>
+            <span style="width:${pct(prog)};background:var(--running)"></span>
+            <span style="width:${pct(failed)};background:var(--failed)"></span>
+          </div>`;
+      }
+      function branchBadge(b) {
+        if (b.merge_status === "failed") return `<span class="badge bad" title="${esc(b.detail || "conflict")}">⚠ conflict</span>`;
+        if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" title="${esc(b.detail || "resolved")}">✓ resolved</span>`;
+        return "";
+      }
+      function renderReviewDetail() {
+        const el = document.getElementById("review-detail");
+        const g = guardians.find((x) => x.id === selectedGuardian);
+        if (!g) { el.innerHTML = `<div class="empty">Select a review.</div>`; return; }
+        const canReorder = ["collecting", "merge_failed"].includes(g.status);
+        const drag = canReorder ? `draggable="true" ondragstart="brDragStart(event)" ondragover="brDragOver(event)" ondragleave="brDragLeave(event)" ondrop="brDrop(event,'${g.id}')" ondragend="brDragEnd(event)"` : "";
+        const branches = g.branches.map((b) => `
+          <div class="branch-row" data-branch="${esc(b.branch)}" ${drag}>
+            ${canReorder ? '<span class="grip" title="drag to reorder">⋮⋮</span>' : ""}
+            <span>${gdot(b.merge_status)}</span>
+            <span class="mono" style="flex:1">${esc(b.branch)}</span>
+            ${branchBadge(b)} ${pill(b.merge_status)}
+          </div>`).join("");
+        const checks = g.checks.length
+          ? `<div class="row">${g.checks.map((c) => `<span class="vchip" title="check gate — runs in the review worktree before it is ready">🔒 <span class="mono">${esc(c)}</span></span>`).join("")}</div>`
+          : "—";
+        el.innerHTML = `<div class="run-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)}</div>
+          ${mergeProgress(g)}
+          ${g.run_id ? `<div class="kv-row"><span class="k">from run</span><span class="v"><a href="#" onclick="gotoRun('${g.run_id}');return false" style="color:var(--accent)">${esc(g.run_id)}</a></span></div>` : ""}
+          ${g.status === "collecting" && g.run_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">starts automatically when its run finishes — or start it now below</span></div>` : ""}
+          <div class="kv-row"><span class="k">base</span><span class="mono">${esc(g.base_branch)}</span></div>
+          <div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>
+          <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
+          <h3 class="section">check gates</h3>${checks}
+          ${g.detail?`<div class="warn">${esc(g.detail)}</div>`:""}
+          <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder</span>' : ""}</h3>${branches||'<div class="empty">none</div>'}
+          <div class="row" style="margin-top:10px">
+            <input type="text" id="add-branch" placeholder="feature/branch" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px">
+            <button class="btn" onclick="addBranch('${g.id}')">Add branch</button>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" onclick="mergeReview('${g.id}')" ${["collecting","merge_failed","in_review"].includes(g.status)?"":"disabled"}>Merge / rebase</button>
+            <button class="btn" onclick="approveReview('${g.id}')" ${g.status==="in_review"?"":"disabled"}>Approve</button>
+          </div>`;
+      }
+      // branch drag-to-reorder
+      let dragBranch = null;
+      function brDragStart(e) { dragBranch = e.currentTarget.dataset.branch; e.dataTransfer.effectAllowed = "move"; }
+      function brDragOver(e) { e.preventDefault(); e.currentTarget.classList.add("dragover"); }
+      function brDragLeave(e) { e.currentTarget.classList.remove("dragover"); }
+      function brDragEnd() { document.querySelectorAll(".branch-row.dragover").forEach((x) => x.classList.remove("dragover")); }
+      async function brDrop(e, gid) {
+        e.preventDefault();
+        const target = e.currentTarget; target.classList.remove("dragover");
+        const tgt = target.dataset.branch;
+        if (!dragBranch || dragBranch === tgt) { dragBranch = null; return; }
+        const rows = [...target.parentElement.querySelectorAll(".branch-row")].map((x) => x.dataset.branch);
+        const order = rows.filter((b) => b !== dragBranch);
+        order.splice(order.indexOf(tgt), 0, dragBranch);
+        dragBranch = null;
+        await fetch(`/api/guardians/${gid}/branches/reorder`, { method: "POST", body: JSON.stringify({ order }) });
+        tick();
+      }
+      function openCreateReview() {
+        document.getElementById("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
+            <h2>Create Review</h2>
+            <div class="edit-form">
+              <label>name<input id="cr-name" value="my review"></label>
+              <label>base branch<input id="cr-base" value="main"></label>
+              <label>git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
+              <label>checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
+            </div>
+            <div id="cr-err" class="verr"></div>
+            <div class="btn-row"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="createReview()">Create</button></div>
+          </div></div>`;
+      }
+      async function createReview() {
+        const v = (id) => document.getElementById(id).value.trim();
+        const checks = v("cr-checks") ? v("cr-checks").split(",").map((s) => s.trim()).filter(Boolean) : [];
+        const body = { name: v("cr-name"), base_branch: v("cr-base"), git_root: v("cr-root"), checks };
+        if (!body.git_root) { document.getElementById("cr-err").textContent = "git root is required"; return; }
+        const resp = await fetch("/api/guardians", { method: "POST", body: JSON.stringify(body) });
+        if (!resp.ok) { document.getElementById("cr-err").textContent = "create failed"; return; }
+        const g = await resp.json(); selectedGuardian = g.id; closeModal(); tick();
+      }
+      async function addBranch(id) {
+        const b = document.getElementById("add-branch").value.trim(); if (!b) return;
+        await fetch(`/api/guardians/${id}/branches`, { method: "POST", body: JSON.stringify({ branch: b }) }); tick();
+      }
+      async function mergeReview(id) { await fetch(`/api/guardians/${id}/merge`, { method: "POST" }); tick(); }
+      async function approveReview(id) { await fetch(`/api/guardians/${id}/approve`, { method: "POST" }); tick(); }
+
+      // ---------- polling ----------
+      function renderAll() { renderRuns(); renderGraph(); renderDetails(); }
+      async function tick() { tab === "reviews" ? await pollReviews() : await pollTasks(); }
+      async function pollTasks() {
+        try {
+          const d = await (await fetch("/api/tasks")).json();
+          document.getElementById("conn").className = "dot on";
+          document.getElementById("running").textContent = `Running ${d.daemon.running ?? 0} / ${d.daemon.max_concurrent ?? 0}`;
+          document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          runs = d.runs || [];
+          if (pendingHash && pendingHash.runId && findRun(pendingHash.runId)) {
+            const want = pendingHash; pendingHash = null;
+            selectedRunId = want.runId;
+            if (want.sel) { const [k, ti, si] = want.sel.split(":"); sel = { kind: k, taskIdx: +ti || 0, sessionIdx: +si || 0 }; }
+            else sel = { kind: "run", taskIdx: 0, sessionIdx: 0 };
+            renderSortChips(); renderStatusFilters(); renderAll();
+          } else if (!selectedRunId && runs.length) { pendingHash = null; selectRun(runs[0].id); }
+          else if (!editing) renderAll();
+          else renderRuns();
+        } catch (e) { document.getElementById("conn").className = "dot off"; document.getElementById("updated").textContent = "daemon unreachable"; }
+      }
+      async function pollReviews() {
+        try {
+          guardians = await (await fetch("/api/guardians")).json();
+          document.getElementById("conn").className = "dot on";
+          if (!selectedGuardian && guardians.length) selectedGuardian = guardians[0].id;
+          renderReviews(); renderReviewDetail();
+        } catch (e) { document.getElementById("conn").className = "dot off"; }
+      }
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeModal();
+        else if ((e.key === "l" || e.key === "L") && tab === "tasks" && !/input|textarea/i.test((e.target.tagName || ""))) openLogs();
+      });
+      pendingHash = parseHash();
+      renderStatusFilters(); renderSortChips();
+      if (pendingHash && pendingHash.tab === "reviews") { pendingHash = null; showTab("reviews"); }
+      else { tick(); }
+      setInterval(tick, 2000);
+    </script>
+  </body>
+</html>

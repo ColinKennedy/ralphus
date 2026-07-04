@@ -1,0 +1,13 @@
+{
+  "name": "ralphus-web-lint",
+  "private": true,
+  "description": "Lint tooling for the librarian's inline board.html JavaScript. Not a runtime dependency — the librarian embeds board.html via include_str! and ships no Node code.",
+  "scripts": {
+    "lint": "eslint librarian/assets/board.html"
+  },
+  "devDependencies": {
+    "eslint": "^9.13.0",
+    "eslint-plugin-html": "^8.1.2",
+    "globals": "^15.11.0"
+  }
+}

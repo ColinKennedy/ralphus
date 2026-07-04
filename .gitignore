@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ralphus runtime state (daemon DB, pid files, logs)
+*.db
+*.db-wal
+*.db-shm
+*.pid
+/.ralphus/
+
+# Node (only for linting board.html's inline JS — see package.json)
+node_modules/
+
+# Editors / OS
+.DS_Store
+*.local.md.bak
