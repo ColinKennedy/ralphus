@@ -17,13 +17,18 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+secure-dist = ["ralphus-auth/secure-dist"]
+
 [dependencies]
+ralphus-auth = { path = "../auth" }
 ralphus-core.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 rusqlite = { workspace = true }
 tiny_http = { workspace = true }
+ureq = { workspace = true, features = ["tls"] }
 
 [dev-dependencies]
 ureq = { workspace = true }

@@ -19,13 +19,20 @@ def test_no_command_prints_help_and_succeeds(capsys: pytest.CaptureFixture[str])
     assert "usage: ralphus" in captured.out.lower()
 
 
-def test_doctor_runs(capsys: pytest.CaptureFixture[str]) -> None:
+def test_check_health_runs(capsys: pytest.CaptureFixture[str]) -> None:
     # Point at an unreachable daemon so the outcome is deterministic (daemon
-    # check fails). Real check behaviour is covered in test_doctor.py.
-    code = main(["--daemon-url", "http://127.0.0.1:9", "doctor"])
+    # check fails). Real check behaviour is covered in test_health.py.
+    code = main(["--daemon-url", "http://127.0.0.1:9", "check", "health"])
     captured = capsys.readouterr()
     assert code == 1
     assert "daemon" in captured.out.lower()
+
+
+def test_bare_check_prints_check_help(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["check"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "health" in captured.out
 
 
 def test_version_flag_exits_zero() -> None:

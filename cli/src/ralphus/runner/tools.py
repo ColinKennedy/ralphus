@@ -78,6 +78,10 @@ class Workspace:
                 cwd=self.root,
                 capture_output=True,
                 text=True,
+                # Force UTF-8 decoding; `text=True` alone uses the OS locale
+                # codepage (cp1252 on Windows) and mangles UTF-8 output.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_sec,
                 check=False,
             )

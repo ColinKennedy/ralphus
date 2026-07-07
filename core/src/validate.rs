@@ -162,36 +162,45 @@ const TASK_KEYS: &[&str] = &[
     "agent",
     "model",
     "args",
-    "budget_usd",
+    "budget_tokens",
     "max_retries",
-    "timeout_min",
+    "timeout_minutes",
     "depends_on",
     "session",
     "verify",
 ];
 const SESSION_KEYS: &[&str] = &[
     "id",
+    "name",
     "role",
     "cwd",
+    "subprojects",
     "prompt",
     "command",
     "depends_on",
     "agent",
     "model",
+    "system_prompt",
+    "system_prompt_position",
     "args",
-    "budget_usd",
+    "budget_tokens",
+    "timeout_minutes",
     "verify",
     "review",
+    "upstream",
 ];
-const REVIEW_KEYS: &[&str] = &["id", "name", "base"];
+const REVIEW_KEYS: &[&str] = &["id", "name", "base", "agent", "model"];
 const VERIFY_KEYS: &[&str] = &[
     "id",
     "command",
     "brain",
-    "agent",
+    "prompt",
     "model",
+    "system_prompt",
+    "system_prompt_position",
     "arguments",
-    "budget_usd",
+    "budget_tokens",
+    "timeout_minutes",
     "requires_approval",
     "restart_on",
 ];
@@ -203,7 +212,6 @@ enum Ty {
     Str,
     Bool,
     Int,
-    Num,
     StrArray,
 }
 
@@ -233,7 +241,6 @@ fn check_type(
         Ty::Str => v.is_str(),
         Ty::Bool => v.is_bool(),
         Ty::Int => v.is_integer(),
-        Ty::Num => v.is_integer() || v.is_float(),
         Ty::StrArray => v
             .as_array()
             .is_some_and(|a| a.iter().all(toml::Value::is_str)),
@@ -245,7 +252,6 @@ fn check_type(
         Ty::Str => "string",
         Ty::Bool => "boolean",
         Ty::Int => "integer",
-        Ty::Num => "number",
         Ty::StrArray => "array of strings",
     };
     let line = ctx.key_line(header, key);
@@ -387,19 +393,26 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "agent", Ty::Str, &path, header);
         check_type(ctx, table, "model", Ty::Str, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
-        check_type(ctx, table, "budget_usd", Ty::Num, &path, header);
+        check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
-        check_type(ctx, table, "timeout_min", Ty::Int, &path, header);
+        check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
 
-        validate_sessions(table.get("session"), t, &path, ctx);
+        let task_agent = table.get("agent").and_then(toml::Value::as_str);
+        validate_sessions(table.get("session"), t, &path, task_agent, ctx);
         validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
     }
 }
 
 // ── [[task.session]] ─────────────────────────────────────────────────────────
 
-fn validate_sessions(value: Option<&toml::Value>, task_idx: usize, task_path: &str, ctx: &mut Ctx) {
+fn validate_sessions(
+    value: Option<&toml::Value>,
+    task_idx: usize,
+    task_path: &str,
+    task_agent: Option<&str>,
+    ctx: &mut Ctx,
+) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
@@ -448,6 +461,9 @@ fn validate_sessions(value: Option<&toml::Value>, task_idx: usize, task_path: &s
             Some(_) => {}
         }
 
+        check_type(ctx, table, "subprojects", Ty::StrArray, &path, header);
+        check_subprojects(ctx, table, &path, header);
+
         let has_prompt = table.contains_key("prompt");
         let has_command = table.contains_key("command");
         match (has_prompt, has_command) {
@@ -490,8 +506,12 @@ fn validate_sessions(value: Option<&toml::Value>, task_idx: usize, task_path: &s
         check_type(ctx, table, "role", Ty::Str, &path, header);
         check_type(ctx, table, "agent", Ty::Str, &path, header);
         check_type(ctx, table, "model", Ty::Str, &path, header);
+        check_type(ctx, table, "system_prompt", Ty::Str, &path, header);
+        check_type(ctx, table, "system_prompt_position", Ty::Str, &path, header);
+        check_system_prompt(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
-        check_type(ctx, table, "budget_usd", Ty::Num, &path, header);
+        check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
+        check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
 
         if let Some(deps) = table.get("depends_on").and_then(toml::Value::as_array) {
@@ -500,11 +520,111 @@ fn validate_sessions(value: Option<&toml::Value>, task_idx: usize, task_path: &s
             }
         }
 
+        check_type(ctx, table, "upstream", Ty::Str, &path, header);
+        check_upstream(ctx, table, &path, header);
+
         validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
         validate_review_array(table.get("review"), &format!("{path}.review"), ctx);
     }
 
     check_session_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
+}
+
+/// Validate the `subprojects` array (RAL-23): each element must be a
+/// non-empty relative path with no `..` components so it cannot escape the
+/// repository root.
+fn check_subprojects(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(arr) = table.get("subprojects").and_then(toml::Value::as_array) else {
+        return;
+    };
+    for sp in arr.iter().filter_map(toml::Value::as_str) {
+        if sp.trim().is_empty() {
+            let line = ctx.key_line(header, "subprojects");
+            ctx.error(
+                &format!("{path}.subprojects"),
+                ErrorKind::InvalidValue,
+                "'subprojects' entries must not be empty strings",
+                line,
+            );
+        } else if sp.starts_with('/') || sp.starts_with('\\') {
+            let line = ctx.key_line(header, "subprojects");
+            ctx.error(
+                &format!("{path}.subprojects"),
+                ErrorKind::InvalidValue,
+                "'subprojects' entries must be relative paths (no leading '/' or '\\')",
+                line,
+            );
+        } else if sp.split(['/', '\\']).any(|seg| seg == "..") {
+            let line = ctx.key_line(header, "subprojects");
+            ctx.error(
+                &format!("{path}.subprojects"),
+                ErrorKind::InvalidValue,
+                "'subprojects' entries must not contain '..' path components",
+                line,
+            );
+        }
+    }
+}
+
+/// Enforce the appended-system-prompt rules (RAL-5). `system_prompt` and
+/// `system_prompt_position` are only accepted for the `claude-code` backend —
+/// the sole one that maps them to a real flag (`--append-system-prompt`) today —
+/// and the position, when set, must be the `"append"` sentinel. The effective
+/// agent is the session's own `agent`, falling back to the task-level `agent`,
+/// then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
+fn check_system_prompt(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    task_agent: Option<&str>,
+    path: &str,
+    header: Option<u32>,
+) {
+    let has_prompt = table.contains_key("system_prompt");
+    let has_position = table.contains_key("system_prompt_position");
+    if !has_prompt && !has_position {
+        return;
+    }
+
+    let agent = table
+        .get("agent")
+        .and_then(toml::Value::as_str)
+        .or(task_agent)
+        .unwrap_or(crate::schema::DEFAULT_AGENT);
+    if !crate::schema::agent_supports_system_prompt(agent) {
+        let key = if has_prompt {
+            "system_prompt"
+        } else {
+            "system_prompt_position"
+        };
+        let line = ctx.key_line(header, key);
+        ctx.error(
+            &format!("{path}.{key}"),
+            ErrorKind::InvalidValue,
+            format!(
+                "'system_prompt'/'system_prompt_position' are only supported for the \
+                 'claude-code' agent right now, not '{agent}'"
+            ),
+            line,
+        );
+    }
+
+    if let Some(pos) = table
+        .get("system_prompt_position")
+        .and_then(toml::Value::as_str)
+    {
+        if pos != crate::schema::SYSTEM_PROMPT_POSITION_APPEND {
+            let line = ctx.key_line(header, "system_prompt_position");
+            ctx.error(
+                &format!("{path}.system_prompt_position"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'system_prompt_position' must be \"{}\" (the only supported position), got \"{pos}\"",
+                    crate::schema::SYSTEM_PROMPT_POSITION_APPEND
+                ),
+                line,
+            );
+        }
+    }
 }
 
 /// Validate `[[task.session.review]]` entries. Only the TOML shape is checked
@@ -537,6 +657,27 @@ fn validate_review_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
         check_type(ctx, table, "id", Ty::Str, &rpath, None);
         check_type(ctx, table, "name", Ty::Str, &rpath, None);
         check_type(ctx, table, "base", Ty::Str, &rpath, None);
+        check_type(ctx, table, "agent", Ty::Str, &rpath, None);
+        check_type(ctx, table, "model", Ty::Str, &rpath, None);
+        // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
+        // `ralphus:new-review/<key>` with a non-empty slug key. Any session that
+        // repeats the same key links to one shared review.
+        if let Some(id) = table.get("id").and_then(toml::Value::as_str) {
+            if id.starts_with("ralphus:") {
+                let ok = crate::schema::review_link_key(id).is_some_and(|key| {
+                    key.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                });
+                if !ok {
+                    ctx.error(
+                        &format!("{rpath}.id"),
+                        ErrorKind::InvalidValue,
+                        "review link id must be 'ralphus:new-review/<key>' with a non-empty key of letters, digits, '-', '_' or '.'",
+                        None,
+                    );
+                }
+            }
+        }
         if let Some(base) = table.get("base").and_then(toml::Value::as_str) {
             if base.trim().is_empty() {
                 ctx.error(
@@ -546,6 +687,38 @@ fn validate_review_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
                     None,
                 );
             }
+        }
+    }
+}
+
+/// Validate the `upstream` field of a session. When it uses the
+/// `<<task:...>>` sentinel the inner reference must be non-empty.
+fn check_upstream(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(val) = table.get("upstream").and_then(toml::Value::as_str) else {
+        return;
+    };
+    if val.trim().is_empty() {
+        let line = ctx.key_line(header, "upstream");
+        ctx.error(
+            &format!("{path}.upstream"),
+            ErrorKind::InvalidValue,
+            "'upstream' must not be empty",
+            line,
+        );
+        return;
+    }
+    if let Some(inner) = val
+        .strip_prefix(crate::schema::UPSTREAM_TASK_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))
+    {
+        if inner.trim().is_empty() {
+            let line = ctx.key_line(header, "upstream");
+            ctx.error(
+                &format!("{path}.upstream"),
+                ErrorKind::InvalidValue,
+                "'upstream' <<task:...>> sentinel requires a non-empty task reference",
+                line,
+            );
         }
     }
 }
@@ -639,7 +812,7 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
         };
         unknown_keys(ctx, table, VERIFY_KEYS, &vpath, None);
 
-        let kinds = ["command", "brain", "agent"];
+        let kinds = ["command", "brain", "prompt"];
         let set: Vec<&str> = kinds
             .iter()
             .copied()
@@ -649,7 +822,7 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
             0 => ctx.error(
                 &vpath,
                 ErrorKind::MissingRequired,
-                "verify step requires exactly one of: command, brain, agent",
+                "verify step requires exactly one of: command, brain, prompt",
                 None,
             ),
             1 => {}
@@ -665,7 +838,8 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
         }
 
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
-        check_type(ctx, table, "budget_usd", Ty::Num, &vpath, None);
+        check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
+        check_type(ctx, table, "timeout_minutes", Ty::Int, &vpath, None);
         check_type(ctx, table, "arguments", Ty::StrArray, &vpath, None);
         check_type(ctx, table, "restart_on", Ty::StrArray, &vpath, None);
 
@@ -927,12 +1101,12 @@ command = "cargo build"
 
     #[test]
     fn wrong_type_for_budget() {
-        let src = "[[task]]\nname=\"t\"\nbudget_usd=\"lots\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nbudget_tokens=\"lots\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
                 .iter()
-                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("budget_usd"))
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("budget_tokens"))
         );
     }
 
@@ -1018,12 +1192,110 @@ command = "cargo build"
     }
 
     #[test]
+    fn system_prompt_valid_for_claude_code() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn system_prompt_inherits_task_agent() {
+        // agent set at the task level (claude-code); the session omits it.
+        let src = "[[task]]\nname=\"t\"\nagent=\"claude-code\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn system_prompt_rejected_for_default_agent() {
+        // No agent set anywhere → resolves to the default "claude", not claude-code.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("only supported for the")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn system_prompt_rejected_for_ollama() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\nsystem_prompt=\"be terse\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn system_prompt_position_rejects_unknown_value() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"x\"\nsystem_prompt_position=\"prepend\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("system_prompt_position")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn system_prompt_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=123\n";
+        let r = validate_toml(src);
+        assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
     fn review_block_is_valid() {
         let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"be\"\nbase=\"<<upstream>>\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
             validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn review_link_placeholder_id_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"ralphus:new-review/ral-batch\"\nbase=\"main\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn malformed_review_link_id_reported() {
+        // Right scheme, but empty key after the slash.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"ralphus:new-review/\"\nbase=\"main\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("review link id")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn wrong_scheme_review_link_id_reported() {
+        // `ralphus:` scheme but not the `new-review/` form.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"ralphus:review/xyz\"\nbase=\"main\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("review link id")),
+            "{:?}",
+            r.errors
         );
     }
 
@@ -1057,6 +1329,99 @@ command = "cargo build"
     }
 
     #[test]
+    fn subprojects_single_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn subprojects_multiple_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\",\"packages/bar\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn subprojects_nested_path_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"a/b/c\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn subprojects_empty_entry_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("subprojects")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn subprojects_absolute_path_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"/packages/foo\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("relative")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn subprojects_dotdot_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/../etc\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("..")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn subprojects_wrong_type_rejected() {
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=123\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn subprojects_string_not_array_rejected() {
+        // Passing a plain string instead of an array should be caught as WrongType
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=\"packages/foo\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn parse_error_has_line() {
         let src = "[[task]\nname = \"t\"\n";
         let r = validate_toml(src);
@@ -1069,5 +1434,71 @@ command = "cargo build"
         let r = validate_toml("");
         let json = serde_json::to_string(&r).expect("serialize");
         assert!(json.contains("missing_required"));
+    }
+
+    // ── upstream field (RAL-50) ───────────────────────────────────────────────
+
+    #[test]
+    fn upstream_task_sentinel_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:task-a>>\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn upstream_task_session_sentinel_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:task-a/session-1>>\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn upstream_empty_sentinel_ref_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:>>\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("<<task:")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_empty_string_is_rejected() {
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("upstream")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_wrong_type_rejected() {
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=123\n";
+        let r = validate_toml(src);
+        assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
+    fn upstream_unknown_key_would_have_been_caught() {
+        // Regression guard: "upstream" must be in SESSION_KEYS so it is NOT
+        // reported as an unknown key.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:dep>>\"\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownKey && e.message.contains("upstream")),
+            "upstream must not be reported as unknown: {:?}",
+            r.errors
+        );
     }
 }

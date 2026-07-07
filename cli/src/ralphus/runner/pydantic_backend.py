@@ -39,8 +39,21 @@ class PydanticAgentBackend:
     def __init__(self, agent: str) -> None:
         self._agent = agent
 
-    def run(self, prompt: str, workspace: Workspace, *, model: str | None) -> BackendOutcome:
-        """Drive the prompt to completion using the workspace tools."""
+    def run(
+        self,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        model: str | None,
+        append_system_prompt: str | None = None,
+    ) -> BackendOutcome:
+        """Drive the prompt to completion using the workspace tools.
+
+        ``append_system_prompt`` is applied as an *additional* system prompt
+        (never concatenated into ``prompt``). This is best-effort: TOML
+        validation currently blocks non-``claude-code`` agents from setting it,
+        so it is not exercised in production yet (RAL-5).
+        """
         llm = _build_model(self._agent, model)
 
         def read_file(path: str) -> str:
@@ -63,9 +76,12 @@ class PydanticAgentBackend:
             out = workspace.run_bash(command)
             return f"exit={out.exit_code}\nstdout:\n{out.stdout}\nstderr:\n{out.stderr}"
 
+        system_prompt: str | tuple[str, ...] = _SYSTEM_PROMPT
+        if append_system_prompt:
+            system_prompt = (_SYSTEM_PROMPT, append_system_prompt)
         agent = Agent(
             llm,
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             tools=[read_file, write_file, run_bash],
         )
         try:

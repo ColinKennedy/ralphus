@@ -73,7 +73,7 @@ ralphus-librarian serve            # open http://127.0.0.1:7474
 ralphus validate task.toml         # optional: check it first
 ralphus submit task.toml --label demo
 ralphus status                     # list runs; `ralphus status <run-id>` for detail
-ralphus doctor                     # check the local setup
+ralphus check health                # check the local setup
 ```
 
 A minimal `task.toml` (a deterministic command session — no model needed):

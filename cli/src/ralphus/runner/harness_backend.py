@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import subprocess
 
+from ralphus.config import load_config
 from ralphus.runner.backend import BackendError, BackendOutcome
 from ralphus.runner.tools import Workspace
 
 __all__ = ["HarnessBackend"]
-
-_TIMEOUT_SEC = 1800
 
 
 class HarnessBackend:
@@ -29,19 +28,36 @@ class HarnessBackend:
         self._program = program
         self._args = list(args or [])
 
-    def run(self, prompt: str, workspace: Workspace, *, model: str | None) -> BackendOutcome:
-        """Run the harness in the workspace, passing the prompt as the final arg."""
+    def run(
+        self,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        model: str | None,
+        append_system_prompt: str | None = None,
+    ) -> BackendOutcome:
+        """Run the harness in the workspace, passing the prompt as the final arg.
+
+        ``append_system_prompt`` is accepted for Protocol compatibility but not
+        yet wired for generic harnesses (there is no portable flag); TOML
+        validation blocks non-``claude-code`` agents from setting it (RAL-5).
+        """
         cmd = [self._program, *self._args]
         if model:
             cmd += ["--model", model]
         cmd.append(prompt)
+        config = load_config()
         try:
             proc = subprocess.run(
                 cmd,
                 cwd=workspace.root,
                 capture_output=True,
                 text=True,
-                timeout=_TIMEOUT_SEC,
+                # Force UTF-8 decoding; `text=True` alone uses the OS locale
+                # codepage (cp1252 on Windows) and mangles UTF-8 output.
+                encoding="utf-8",
+                errors="replace",
+                timeout=config.subprocess_timeout(),
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:

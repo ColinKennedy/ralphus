@@ -30,6 +30,10 @@ fn main() -> ExitCode {
             }
         }
         Command::Serve => {
+            if let Err(e) = ralphus_auth::check_license() {
+                eprintln!("Authorization error: {e}");
+                return ExitCode::FAILURE;
+            }
             let db = default_db_path();
             let addr = ("127.0.0.1", DEFAULT_PORT);
             eprintln!(

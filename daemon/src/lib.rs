@@ -5,9 +5,14 @@
 //! `docs/daemon-api.md`). Splitting the logic into a library (with a thin
 //! `main.rs` binary on top) keeps it unit-testable.
 
+pub mod cancel;
+pub mod chat_client;
+pub mod config;
 pub mod guardian;
 pub mod guardian_merge;
 pub mod plan;
+pub mod procreg;
+pub mod resources;
 pub mod reviews;
 pub mod runner;
 pub mod scheduler;
@@ -21,7 +26,7 @@ use std::path::PathBuf;
 pub const DEFAULT_PORT: u16 = 7890;
 
 /// Default maximum number of concurrently running runs.
-pub const DEFAULT_MAX_CONCURRENT: i64 = 4;
+pub const DEFAULT_MAX_CONCURRENT: i64 = 12;
 
 /// Resolve the daemon's state directory (`~/.ralphus`), creating it if needed.
 ///

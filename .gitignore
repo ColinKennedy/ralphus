@@ -20,9 +20,16 @@ build/
 *.db-shm
 *.pid
 /.ralphus/
+# Guardian review worktrees and task worktrees created at runtime
+/.ralphus_guardian/
+/.worktrees/
 
 # Node (only for linting board.html's inline JS — see package.json)
 node_modules/
+
+# Secure distribution — private key must never be committed
+ralphus-private.key
+ralphus.lic
 
 # Editors / OS
 .DS_Store

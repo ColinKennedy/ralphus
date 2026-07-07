@@ -58,6 +58,46 @@ def test_spec_requires_string_fields() -> None:
         )
 
 
+def test_spec_parses_system_prompt_fields() -> None:
+    spec = SessionSpec.from_json(
+        _spec_json(
+            prompt="do work",
+            command=None,
+            agent="claude-code",
+            system_prompt="Follow the house style.",
+            system_prompt_position="append",
+        )
+    )
+    assert spec.system_prompt == "Follow the house style."
+    assert spec.system_prompt_position == "append"
+
+
+def test_spec_system_prompt_fields_default_none() -> None:
+    spec = SessionSpec.from_json(_spec_json())
+    assert spec.system_prompt is None
+    assert spec.system_prompt_position is None
+
+
+def test_spec_rejects_non_string_system_prompt() -> None:
+    with pytest.raises(SpecError):
+        SessionSpec.from_json(_spec_json(prompt="p", command=None, system_prompt=123))
+
+
+def test_spec_verify_flag_defaults_false() -> None:
+    spec = SessionSpec.from_json(_spec_json())
+    assert spec.verify is False
+
+
+def test_spec_parses_verify_flag() -> None:
+    spec = SessionSpec.from_json(_spec_json(prompt="check it", command=None, verify=True))
+    assert spec.verify is True
+
+
+def test_spec_rejects_non_bool_verify() -> None:
+    with pytest.raises(SpecError):
+        SessionSpec.from_json(_spec_json(verify="yes"))
+
+
 # ── Workspace tools ──────────────────────────────────────────────────────────
 
 
@@ -118,13 +158,27 @@ def test_prompt_session_without_backend_fails(tmp_path: Path) -> None:
 class _WritingBackend:
     """A fake backend that proves tool use by writing a file, then reports usage."""
 
-    def run(self, prompt: str, workspace: Workspace, *, model: str | None) -> BackendOutcome:
+    def run(
+        self,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        model: str | None,
+        append_system_prompt: str | None = None,
+    ) -> BackendOutcome:
         workspace.write_file("agent_output.txt", f"prompt={prompt} model={model}")
         return BackendOutcome(summary="wrote a file", tokens_in=10, tokens_out=5, cost_usd=0.01)
 
 
 class _FailingBackend:
-    def run(self, prompt: str, workspace: Workspace, *, model: str | None) -> BackendOutcome:
+    def run(
+        self,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        model: str | None,
+        append_system_prompt: str | None = None,
+    ) -> BackendOutcome:
         raise BackendError("model unreachable")
 
 
@@ -150,6 +204,58 @@ def test_prompt_session_with_backend(tmp_path: Path) -> None:
     ) == "prompt=make a file model=qwen2.5-coder"
 
 
+def test_spec_parses_budget_tokens(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_spec_json(budget_tokens=5000, timeout_sec=120))
+    assert spec.budget_tokens == 5000
+    assert spec.timeout_sec == 120
+
+
+def test_prompt_session_over_budget_fails(tmp_path: Path) -> None:
+    # RAL-15: the mocked backend reports 15 tokens against a budget of 10, so the
+    # session must fail with a budget message instead of reporting success.
+    spec = SessionSpec.from_json(
+        json.dumps(
+            {
+                "run_id": "r",
+                "task": "t",
+                "session_id": "s",
+                "cwd": str(tmp_path),
+                "prompt": "spend a lot",
+                "budget_tokens": 10,
+            }
+        )
+    )
+    result = run_session(spec, backend=_WritingBackend())  # 10 in + 5 out = 15
+    assert not result.ok
+    assert "budget exceeded" in (result.error or "")
+
+
+def test_prompt_session_within_budget_succeeds(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(
+        json.dumps(
+            {
+                "run_id": "r",
+                "task": "t",
+                "session_id": "s",
+                "cwd": str(tmp_path),
+                "prompt": "modest",
+                "budget_tokens": 100,
+            }
+        )
+    )
+    result = run_session(spec, backend=_WritingBackend())  # 15 total <= 100
+    assert result.ok
+
+
+def test_agent_verify_over_budget_fails_closed(tmp_path: Path) -> None:
+    # A verify step that blows its budget reports verified=False (fail closed)
+    # even if the model's output contained a PASS marker.
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path, budget_tokens=2))
+    result = run_session(spec, backend=_ScriptedVerdictBackend("all good\nRALPHUS_VERIFY: PASS"))
+    assert result.verified is False
+    assert "budget exceeded" in result.summary
+
+
 def test_prompt_session_backend_error(tmp_path: Path) -> None:
     spec = SessionSpec.from_json(
         json.dumps(
@@ -161,6 +267,126 @@ def test_prompt_session_backend_error(tmp_path: Path) -> None:
     assert "model backend error" in (result.error or "")
 
 
+# ── agent-kind verify execution ──────────────────────────────────────────────
+
+
+def _verify_spec_json(tmp_path: Path, **overrides: object) -> str:
+    base: dict[str, object] = {
+        "run_id": "r",
+        "task": "t",
+        "session_id": "s",
+        "cwd": str(tmp_path),
+        "prompt": "check that the build works",
+        "verify": True,
+    }
+    base.update(overrides)
+    return json.dumps(base)
+
+
+class _ScriptedVerdictBackend:
+    """A fake backend that returns a canned summary, for verdict parsing."""
+
+    def __init__(self, summary: str) -> None:
+        self._summary = summary
+
+    def run(
+        self,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        model: str | None,
+        append_system_prompt: str | None = None,
+    ) -> BackendOutcome:
+        return BackendOutcome(summary=self._summary, tokens_in=1, tokens_out=2, cost_usd=0.1)
+
+
+def test_agent_verify_without_backend_fails(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=None)
+    assert not result.ok
+    assert result.verified is None
+    assert "backend" in (result.error or "")
+
+
+def test_agent_verify_pass_marker_sets_verified_true(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=_ScriptedVerdictBackend("looks good\nRALPHUS_VERIFY: PASS"))
+    assert result.ok
+    assert result.verified is True
+
+
+def test_agent_verify_fail_marker_sets_verified_false(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(
+        spec, backend=_ScriptedVerdictBackend("still broken\nRALPHUS_VERIFY: FAIL")
+    )
+    assert result.ok, "the verifier itself ran fine; it just found a failure"
+    assert result.verified is False
+
+
+def test_agent_verify_marker_embedded_mid_sentence_still_parses(tmp_path: Path) -> None:
+    # Regression: a real local model (qwen3.5) put the marker inline instead of
+    # alone on its own line as instructed — parsing must tolerate that instead
+    # of failing closed on a technicality.
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(
+        spec,
+        backend=_ScriptedVerdictBackend("The check succeeded, confirming RALPHUS_VERIFY: PASS."),
+    )
+    assert result.ok
+    assert result.verified is True
+
+
+def test_agent_verify_trusts_the_last_marker_when_several_appear(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(
+        spec,
+        backend=_ScriptedVerdictBackend(
+            "First I thought RALPHUS_VERIFY: FAIL, but on reflection RALPHUS_VERIFY: PASS"
+        ),
+    )
+    assert result.ok
+    assert result.verified is True
+
+
+def test_agent_verify_missing_marker_fails_closed(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=_ScriptedVerdictBackend("I think it's fine, probably"))
+    assert result.ok
+    assert result.verified is False
+    assert "no" in result.summary.lower() and "marker" in result.summary.lower()
+
+
+def test_agent_verify_backend_error_leaves_verified_none(tmp_path: Path) -> None:
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=_FailingBackend())
+    assert not result.ok
+    assert result.verified is None
+
+
+def test_agent_verify_wraps_the_prompt_with_verdict_instructions(tmp_path: Path) -> None:
+    seen_prompts: list[str] = []
+
+    class _RecordingBackend:
+        def run(
+            self,
+            prompt: str,
+            workspace: Workspace,
+            *,
+            model: str | None,
+            append_system_prompt: str | None = None,
+        ) -> BackendOutcome:
+            seen_prompts.append(prompt)
+            return BackendOutcome(summary="RALPHUS_VERIFY: PASS")
+
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path, prompt="check the widget"))
+    run_session(spec, backend=_RecordingBackend())
+    assert len(seen_prompts) == 1
+    assert "check the widget" in seen_prompts[0]
+    assert "RALPHUS_VERIFY: PASS" in seen_prompts[0]
+    assert "RALPHUS_VERIFY: FAIL" in seen_prompts[0]
+
+
 # ── SessionResult ────────────────────────────────────────────────────────────
 
 
@@ -170,6 +396,13 @@ def test_result_json_roundtrip() -> None:
     assert data["status"] == "done"
     assert data["tokens_in"] == 3
     assert data["error"] is None
+    assert data["verified"] is None
+
+
+def test_result_json_roundtrip_with_verified() -> None:
+    result = SessionResult.done(summary="ok", verified=True)
+    data = json.loads(result.to_json())
+    assert data["verified"] is True
 
 
 # ── __main__ ─────────────────────────────────────────────────────────────────

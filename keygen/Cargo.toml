@@ -1,0 +1,21 @@
+[package]
+name = "ralphus-keygen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Author-only tool: generate Ed25519 keypairs and sign ralphus license files."
+
+[[bin]]
+name = "ralphus-keygen"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }

@@ -34,15 +34,6 @@ def _opt_str(data: dict[str, Any], key: str) -> str | None:
     return value
 
 
-def _opt_float(data: dict[str, Any], key: str) -> float | None:
-    value = data.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise SpecError(f"field {key!r} must be a number or null")
-    return float(value)
-
-
 def _opt_int(data: dict[str, Any], key: str) -> int | None:
     value = data.get(key)
     if value is None:
@@ -59,6 +50,13 @@ def _str_list(data: dict[str, Any], key: str) -> list[str]:
     return list(value)
 
 
+def _opt_bool(data: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise SpecError(f"field {key!r} must be a boolean")
+    return value
+
+
 @dataclass
 class SessionSpec:
     """Everything the runner needs to execute one session."""
@@ -71,9 +69,12 @@ class SessionSpec:
     command: str | None = None
     agent: str = "claude"
     model: str | None = None
+    system_prompt: str | None = None
+    system_prompt_position: str | None = None
     args: list[str] = field(default_factory=list)
-    budget_usd: float | None = None
+    budget_tokens: int | None = None
     timeout_sec: int | None = None
+    verify: bool = False
 
     @staticmethod
     def from_json(text: str) -> SessionSpec:
@@ -93,9 +94,12 @@ class SessionSpec:
             command=_opt_str(data, "command"),
             agent=_opt_str(data, "agent") or "claude",
             model=_opt_str(data, "model"),
+            system_prompt=_opt_str(data, "system_prompt"),
+            system_prompt_position=_opt_str(data, "system_prompt_position"),
             args=_str_list(data, "args"),
-            budget_usd=_opt_float(data, "budget_usd"),
+            budget_tokens=_opt_int(data, "budget_tokens"),
             timeout_sec=_opt_int(data, "timeout_sec"),
+            verify=_opt_bool(data, "verify"),
         )
         if (spec.prompt is None) == (spec.command is None):
             raise SpecError("exactly one of 'prompt' or 'command' must be set")
@@ -112,18 +116,28 @@ class SessionResult:
     cost_usd: float = 0.0
     summary: str = ""
     error: str | None = None
+    verified: bool | None = None
+    claude_session_id: str | None = None
 
     @staticmethod
     def done(
-        summary: str = "", *, tokens_in: int = 0, tokens_out: int = 0, cost_usd: float = 0.0
+        summary: str = "",
+        *,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        cost_usd: float = 0.0,
+        verified: bool | None = None,
+        claude_session_id: str | None = None,
     ) -> SessionResult:
-        """Construct a successful result."""
+        """Construct a successful result. ``verified`` is set for verify runs only."""
         return SessionResult(
             status="done",
             summary=summary,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             cost_usd=cost_usd,
+            verified=verified,
+            claude_session_id=claude_session_id,
         )
 
     @staticmethod
@@ -146,5 +160,7 @@ class SessionResult:
                 "cost_usd": self.cost_usd,
                 "summary": self.summary,
                 "error": self.error,
+                "verified": self.verified,
+                "claude_session_id": self.claude_session_id,
             }
         )

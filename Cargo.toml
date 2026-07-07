@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "daemon", "librarian"]
+members = ["core", "daemon", "librarian", "auth", "keygen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,8 @@ thiserror = "2"
 tiny_http = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2", default-features = false }
+ed25519-dalek = "2"
+base64 = "0.22"
 
 # Keep the dev profile fast to compile (this project's whole reason for the
 # Python/HTML split is that the old Rust build took minutes). Release stays lean

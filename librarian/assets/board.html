@@ -37,10 +37,31 @@
       .running-menu div { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
       .running-menu div:hover { background: var(--panel-2); }
       .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
+      .copy-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 0 6px; font-size: 12px; line-height: 1.7; vertical-align: middle; }
+      .copy-btn:hover { color: var(--text); }
+      .copy-btn.copied { color: var(--done); border-color: var(--done); }
+      .copy-menu { position:fixed;z-index:999;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:4px 0;box-shadow:0 4px 16px #0005;min-width:110px; }
+      .copy-menu-item { padding:5px 14px;cursor:pointer;font-size:12px;color:var(--text);white-space:nowrap; }
+      .copy-menu-item:hover { background:var(--panel-2); }
+      .logs-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 1px 7px; font-size: 11px; line-height: 1.6; vertical-align: middle; margin-left: 6px; }
+      .logs-btn:hover { color: var(--text); }
+      .logs-btn.fail { color: var(--failed); border-color: var(--failed); }
 
-      main#tasks-page { display: grid; grid-template-columns: 280px 1fr 340px; height: calc(100vh - 51px); }
+      /* RAL-12: sidebar/details widths are draggable (var-driven) and persisted. */
+      main#tasks-page { display: grid; grid-template-columns: var(--sidebar-w, 280px) 6px 1fr 6px var(--details-w, 340px); height: calc(100vh - 51px); }
       main#reviews-page { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 51px); }
+      main#resources-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
+      .res-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .res-table th { text-align: right; padding: 6px 12px; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; user-select: none; }
+      .res-table th:first-child, .res-table td:first-child { text-align: left; }
+      .res-table th.sorted { color: var(--text); }
+      .res-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); text-align: right; }
+      .res-table tbody tr:hover { background: var(--panel-2); }
+      .res-jump { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; color: var(--accent); padding: 2px 8px; font-size: 12px; cursor: pointer; }
+      .res-jump:hover { border-color: var(--accent); }
       .col { overflow-y: auto; }
+      .splitter { cursor: col-resize; background: transparent; transition: background .12s; }
+      .splitter:hover, .splitter.dragging { background: var(--accent); }
       .sidebar { border-right: 1px solid var(--border); background: var(--panel); }
       .detail-pane { border-left: 1px solid var(--border); background: var(--panel); }
       .center { padding: 18px 20px; }
@@ -74,6 +95,11 @@
       .vchip { border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 11px; display: flex; gap: 4px; align-items: center; }
       .verify-chain { display: flex; gap: 6px; padding: 0 14px 12px; flex-wrap: wrap; align-items: center; }
       .verify-chain .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: 4px; }
+      /* per-session verify list, under a dashed separator inside the session card */
+      .sverify { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 7px; display: flex; flex-direction: column; gap: 4px; }
+      .sverify .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+      .sv-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+      .sv-row .sv-name { font-family: ui-monospace, monospace; }
 
       .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
       .p-running { color: var(--running); border-color: var(--running); animation: pulse 1.6s infinite; }
@@ -94,12 +120,17 @@
       .kv-row .k { color: var(--muted); min-width: 96px; }
       .kv-row .v { word-break: break-word; }
       .prompt-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; max-height: 200px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+      .cmd-list { max-height: 96px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+      .cmd-line { padding: 5px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; font-family: ui-monospace, monospace; border-bottom: 1px solid var(--border); cursor: pointer; }
+      .cmd-line:last-child { border-bottom: none; }
+      .cmd-line:hover { background: var(--panel-2); }
       .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
       .edit-form label { display: block; font-size: 12px; color: var(--muted); margin-top: 8px; }
       .edit-form input, .edit-form textarea, .edit-form select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; margin-top: 3px; }
       .btn { border: 1px solid var(--border); background: var(--panel-2); color: var(--text); border-radius: 6px; padding: 5px 12px; }
       .btn.primary { background: var(--accent); color: #fff; border: none; }
       .btn.danger { color: var(--danger); border-color: var(--danger); }
+      .btn[disabled] { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
       .btn-row { display: flex; gap: 8px; margin-top: 14px; }
 
       .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
@@ -113,12 +144,28 @@
       .progress { height: 8px; background: var(--panel-2); border-radius: 999px; overflow: hidden; display: flex; margin: 6px 0 12px; }
       .progress > span { display: block; height: 100%; }
       .branch-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; margin: 4px 0; background: var(--bg); }
+      .branch-conflict-bar { margin: 2px 8px 4px; }
+      .branch-conflict-label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+      .branch-conflict-label .conflict-icon { font-size: 12px; }
       .branch-row[draggable=true] { cursor: grab; }
       .branch-row.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
       .branch-row .grip { color: var(--muted); }
+      .br-toggle { color: var(--muted); cursor: pointer; width: 14px; display: inline-block; text-align: center; user-select: none; }
+      .br-toggle:hover { color: var(--text); }
+      .br-toggle.placeholder { visibility: hidden; }
+      .branch-detail { margin: 2px 0 6px 22px; }
       .badge { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
       .badge.warn2 { color: var(--queued); border-color: var(--queued); }
       .badge.bad { color: var(--failed); border-color: var(--failed); }
+      .chat-bubble-wrap { display: flex; margin: 5px 0; }
+      .chat-bubble-wrap.user { justify-content: flex-end; }
+      .chat-bubble-wrap.guardian { justify-content: flex-start; }
+      .chat-bubble-wrap > div { max-width: 80%; }
+      .chat-bubble { max-width: 100%; padding: 7px 10px; border-radius: 14px; font-size: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+      .chat-bubble-wrap.user .chat-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+      .chat-bubble-wrap.guardian .chat-bubble { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
+      .chat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 2px; }
+      .chat-bubble-wrap.user .chat-label { text-align: right; }
       .ctx-menu { position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 5px; z-index: 60; min-width: 160px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
       .ctx-menu div { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
       .ctx-menu div:hover { background: var(--panel-2); }
@@ -127,67 +174,135 @@
       .sel-tab { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 5px; }
       .sel-tab.active { border-color: var(--accent); color: var(--text); }
       .sel-tab .x { color: var(--muted); }
+      #ready-banner:empty { display: none; }
+      .ready-banner { display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: rgba(63,185,80,.12); border-bottom: 1px solid var(--done); color: var(--text); font-size: 13px; }
+      .ready-banner a { color: var(--accent); text-decoration: none; font-weight: 600; }
+      .ready-banner a:hover { text-decoration: underline; }
+
+      /* ---- Tooltip system (RAL-40) ---- */
+      /* Use data-tip="..." on any element. The JS engine below renders a styled
+         popover near the cursor — dark-themed, multi-line (use \n), max 300 px wide. */
+      #board-tip {
+        position: fixed; z-index: 200; pointer-events: none;
+        background: var(--panel); color: var(--text); border: 1px solid var(--border);
+        border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: normal;
+        max-width: 300px; line-height: 1.45; white-space: pre-line;
+        box-shadow: 0 4px 16px rgba(0,0,0,.5); opacity: 0; transition: opacity .1s;
+      }
+      #board-tip.show { opacity: 1; }
     </style>
   </head>
   <body>
     <header>
       <div class="brand">
-        <span class="logo">ralphus</span><span id="conn" class="dot off"></span>
+        <span class="logo" data-tip="ralphus — orchestrates autonomous AI agent tasks.\nSubmit a TOML task file; the scheduler runs sessions with any model (Claude, Ollama, etc.).">ralphus</span><span id="conn" class="dot off" data-tip="Daemon connection — green means the daemon is reachable and the board refreshes every 2 s.\nRed means the daemon is down or unreachable."></span>
         <nav class="tabs">
-          <button id="tab-tasks" class="tab active" onclick="showTab('tasks')">Tasks</button>
-          <button id="tab-reviews" class="tab" onclick="showTab('reviews')">Reviews</button>
+          <button id="tab-tasks" class="tab active" onclick="showTab('tasks', true)" data-tip="Tasks — view submitted runs, their sessions, the dependency graph, and verify steps.">Tasks</button>
+          <button id="tab-reviews" class="tab" onclick="showTab('reviews', true)" data-tip="Reviews — manage Guardian merge reviews: branch stacking, automated rebase, conflict resolution, and CI check gates.">Reviews</button>
+          <button id="tab-resources" class="tab" onclick="showTab('resources', true)" data-tip="Resources — live CPU, RAM, and GPU usage per running session. Useful for spotting runaway processes.">Resources</button>
         </nav>
       </div>
       <div class="status-right">
         <div style="position:relative">
-          <button class="running-btn" onclick="toggleRunning(event)"><span id="running">Running 0 / 0</span> ▾</button>
+          <button class="running-btn" onclick="toggleRunning(event)" data-tip="Active work vs. max concurrency.\nCounts running sessions, verify steps, and guardian review merges — all of which use a concurrency slot.\nClick to see each active item and jump to it in the board."><span id="running">Running 0 / 0</span> ▾</button>
           <div id="running-menu" class="running-menu hidden"></div>
         </div>
-        <span id="updated">—</span>
-        <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" title="Toggle theme">☾</button>
+        <span id="updated" data-tip="Last time the board polled the daemon.\nThe board refreshes automatically every 2 s.">—</span>
+        <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" data-tip="Toggle between dark and light theme.">☾</button>
       </div>
     </header>
+
+    <div id="ready-banner"></div>
 
     <main id="tasks-page">
       <div class="col sidebar">
         <div class="side-head">
-          <button class="newtask" onclick="openNewTask()">＋ New Task</button>
-          <input type="text" id="filter" placeholder="filter by run id / label…" oninput="onFilter(this.value)" />
+          <button class="newtask" onclick="openNewTask()" data-tip="Submit a new task — paste a TOML task definition, set an optional label, then Validate &amp; Queue sends it to the scheduler.">＋ New Task</button>
+          <input type="text" id="filter" placeholder="filter by run id / label…" oninput="onFilter(this.value)" data-tip="Filter runs by run ID or label. Only matching runs appear in the list." />
           <div class="row">
-            <span class="chip" data-sort="date" onclick="setSort('date')">date</span>
-            <span class="chip" data-sort="name" onclick="setSort('name')">name</span>
-            <span class="chip" onclick="toggleDir()" id="dir-chip">↓</span>
+            <span class="chip" data-sort="date" onclick="setSort('date')" data-tip="Sort runs by creation date.">date</span>
+            <span class="chip" data-sort="name" onclick="setSort('name')" data-tip="Sort runs alphabetically by label.">name</span>
+            <span class="chip" onclick="toggleDir()" id="dir-chip" data-tip="Toggle sort order between descending (↓) and ascending (↑).">↓</span>
           </div>
           <div class="status-filters row" id="status-filters"></div>
         </div>
         <div id="runs"></div>
       </div>
+      <div class="splitter" data-var="--sidebar-w" data-tip="Drag to resize the sidebar. Your preference is saved between sessions."></div>
       <div class="col center" id="graph">
         <div class="empty">Select a run.</div>
       </div>
+      <div class="splitter" data-var="--details-w" data-invert="1" data-tip="Drag to resize the details pane. Your preference is saved between sessions."></div>
       <div class="col detail-pane" id="details">
-        <div class="empty">Select a run, task, or session.</div>
+        <div class="empty">Select a run, task, session, or verify step.</div>
       </div>
     </main>
 
     <main id="reviews-page" style="display:none">
-      <div class="col sidebar"><div class="side-head row" style="justify-content:space-between"><b>Reviews</b><button class="newtask" onclick="openCreateReview()">＋ Create</button></div><div id="reviews"></div></div>
+      <div class="col sidebar"><div class="side-head row" style="justify-content:space-between"><b>Reviews</b><button class="newtask" onclick="openCreateReview()" data-tip="Create a new Guardian review — set up a branch stack to rebase, validate with check gates, and approve for deployment.">＋ Create</button></div><div id="reviews"></div></div>
       <div class="col center"><div id="review-detail"><div class="empty">Select a review.</div></div></div>
+    </main>
+
+    <main id="resources-page" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <b>Resource Usage</b>
+        <span style="color:var(--muted)" id="res-summary">—</span>
+      </div>
+      <div id="resources"><div class="empty">No running tasks.</div></div>
     </main>
 
     <div id="modal-root"></div>
 
     <script>
+      // ---- Tooltip engine (RAL-40) ----
+      // Attach data-tip="..." to any element for a styled dark-theme tooltip.
+      // Multi-line content: use \n in the attribute value.
+      (function () {
+        const tip = document.createElement("div");
+        tip.id = "board-tip"; document.body.appendChild(tip);
+        let mx = 0, my = 0, cur = null;
+        function reposition() {
+          if (!cur) return;
+          const w = tip.offsetWidth, h = tip.offsetHeight, pad = 14;
+          let tx = mx + pad, ty = my - h - pad;
+          if (tx + w > window.innerWidth - 8) tx = mx - w - pad;
+          if (ty < 8) ty = my + pad;
+          tip.style.left = tx + "px"; tip.style.top = ty + "px";
+        }
+        document.addEventListener("mousemove", (e) => { mx = e.clientX; my = e.clientY; reposition(); });
+        document.addEventListener("mouseover", (e) => {
+          const el = e.target.closest("[data-tip]");
+          if (!el) { if (cur) { cur = null; tip.classList.remove("show"); } return; }
+          if (el === cur) return;
+          cur = el; tip.textContent = el.dataset.tip;
+          tip.classList.add("show"); reposition();
+        });
+        document.addEventListener("mouseout", (e) => {
+          const el = e.target.closest("[data-tip]");
+          if (!el) return;
+          if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest("[data-tip]") === el) return;
+          cur = null; tip.classList.remove("show");
+        });
+      })();
+
       const STATES = ["running","done","failed","pending","queued","cancelled"];
       let tab = "tasks";
       let runs = [], guardians = [];
+      let resources = [];
+      let resSort = { key: "cpu", dir: -1 };   // resource-table sort: column key + direction
       let selectedRunId = null;
-      let sel = { kind: null, taskIdx: 0, sessionIdx: 0 };  // what's shown in the details pane
+      let sel = { kind: null, taskIdx: 0, sessionIdx: 0, verifyIdx: -1 };  // what's shown in the details pane
       let editing = false;
       let filters = { q: "", sort: "date", dir: -1, status: new Set(STATES) };
       let selectedGuardian = null;
+      let _inPopstate = false;
+      let selectedProjectTabs = {};       // gid -> project root shown in the tab view
+      let expandedBranches = new Set();   // "<gid>:<pos>" for branches whose detail block is open
+      let manualMenuOpen = {};            // gid -> bool, whether the manual-checks dropdown is open
+      let dismissedReady = new Set(JSON.parse(localStorage.getItem("ralphus-dismissed-ready") || "[]"));
       let multiSel = new Set();   // multi-selected run ids (multi mode when size > 1)
       let anchorId = null;        // anchor for shift-range selection
+      let runPaths = {};          // runId -> { "ti:si": {worktree, project} }, lazily loaded (CCTL-148)
 
       // ---------- helpers ----------
       const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -197,6 +312,22 @@
       const findRun = (id) => runs.find((r) => r.id === id);
       const post = (path, body) => fetch(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
       const del = (path) => fetch(path, { method: "DELETE" });
+      // copy-to-clipboard: a small button carrying its payload in data-copy.
+      const copyBtn = (text) => `<button class="copy-btn" data-tip="Copy to clipboard." data-copy="${esc(text)}" onclick="copyText(event)">⧉</button>`;
+      // Run-level Logs button (opens the logs modal) — sits next to a run's state.
+      const runLogsBtn = (id) => `<button class="logs-btn" data-tip="View run logs — events, task states, session timings, and verifier output." onclick="openRunLogs(event,'${id}')">📄 Logs</button>`;
+      // Per-session failure-log button (opens the traceback popup) — next to a failed badge.
+      const failLogBtn = (err) => `<button class="logs-btn fail" data-tip="View the failure log — the full error traceback for this session." data-full="${esc(err)}" onclick="event.stopPropagation();openErrPopup(event)">📄 Failure log</button>`;
+      async function copyText(e) {
+        e.stopPropagation();
+        const btn = e.currentTarget, text = btn.dataset.copy || "";
+        try {
+          if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+          else { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+          btn.textContent = "✓"; btn.classList.add("copied");
+          setTimeout(() => { btn.textContent = "⧉"; btn.classList.remove("copied"); }, 1200);
+        } catch (_) { btn.textContent = "✗"; setTimeout(() => { btn.textContent = "⧉"; }, 1200); }
+      }
 
       // ---------- theme ----------
       function applyTheme(t) {
@@ -209,35 +340,103 @@
       }
       applyTheme(localStorage.getItem("ralphus-theme") || "dark");
 
+      // ---------- resizable panes (RAL-12) ----------
+      // The tasks-page sidebar and details columns are var-driven grid tracks; a
+      // thin splitter beside each drags its width. Widths persist in localStorage.
+      const SPLIT_CFG = {
+        "--sidebar-w": { key: "ralphus-sidebar-w", def: 280, min: 180, max: 520 },
+        "--details-w": { key: "ralphus-details-w", def: 340, min: 240, max: 680 },
+      };
+      let splitDrag = null;
+      function applyPaneWidths() {
+        for (const [v, c] of Object.entries(SPLIT_CFG)) {
+          const saved = parseFloat(localStorage.getItem(c.key));
+          if (!Number.isNaN(saved)) {
+            document.documentElement.style.setProperty(v, Math.max(c.min, Math.min(c.max, saved)) + "px");
+          }
+        }
+      }
+      function onSplitMove(e) {
+        if (!splitDrag) return;
+        const { varName, invert, startX, startW, min, max } = splitDrag;
+        const delta = (e.clientX - startX) * (invert ? -1 : 1);
+        const w = Math.max(min, Math.min(max, startW + delta));
+        document.documentElement.style.setProperty(varName, w + "px");
+      }
+      function onSplitUp() {
+        if (!splitDrag) return;
+        const c = SPLIT_CFG[splitDrag.varName];
+        const w = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(splitDrag.varName)) || c.def;
+        localStorage.setItem(c.key, Math.round(w));
+        splitDrag.el.classList.remove("dragging");
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        window.removeEventListener("mousemove", onSplitMove);
+        window.removeEventListener("mouseup", onSplitUp);
+        splitDrag = null;
+      }
+      function initSplitters() {
+        applyPaneWidths();
+        document.querySelectorAll("#tasks-page .splitter").forEach(sp => {
+          sp.addEventListener("mousedown", e => {
+            e.preventDefault();
+            const varName = sp.dataset.var;
+            const c = SPLIT_CFG[varName];
+            const startW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(varName)) || c.def;
+            splitDrag = { el: sp, varName, invert: sp.dataset.invert === "1", startX: e.clientX, startW, min: c.min, max: c.max };
+            sp.classList.add("dragging");
+            document.body.style.userSelect = "none";
+            document.body.style.cursor = "col-resize";
+            window.addEventListener("mousemove", onSplitMove);
+            window.addEventListener("mouseup", onSplitUp);
+          });
+        });
+      }
+      initSplitters();
+
       // ---------- tabs ----------
-      function showTab(name) {
+      const TABS = ["tasks", "reviews", "resources"];
+      function showTab(name, push = false) {
         tab = name;
-        document.getElementById("tasks-page").style.display = name === "tasks" ? "grid" : "none";
-        document.getElementById("reviews-page").style.display = name === "reviews" ? "grid" : "none";
-        document.getElementById("tab-tasks").classList.toggle("active", name === "tasks");
-        document.getElementById("tab-reviews").classList.toggle("active", name === "reviews");
-        syncHash();
+        for (const t of TABS) {
+          const page = document.getElementById(t + "-page");
+          page.style.display = name === t ? (t === "resources" ? "block" : "grid") : "none";
+          document.getElementById("tab-" + t).classList.toggle("active", name === t);
+        }
+        syncHash(push);
         tick();
       }
 
-      // ---------- hash routing (#/tasks/<run>?sel=kind:ti:si&q=&sort=&dir=&status=) ----------
+      // ---------- hash routing (#/tasks/<run>?sel=kind:ti:si&q=&sort=&dir=&status=, #/reviews/<id>) ----------
       let pendingHash = null;
-      function syncHash() {
-        if (tab !== "tasks") { history.replaceState(null, "", "#/reviews"); return; }
-        const p = new URLSearchParams();
-        if (sel.kind) p.set("sel", `${sel.kind}:${sel.taskIdx}:${sel.sessionIdx}`);
-        if (filters.q) p.set("q", filters.q);
-        if (filters.sort !== "date") p.set("sort", filters.sort);
-        if (filters.dir !== -1) p.set("dir", "asc");
-        if (filters.status.size !== STATES.length) p.set("status", [...filters.status].join(","));
-        const base = selectedRunId ? `#/tasks/${selectedRunId}` : "#/tasks";
-        const qs = p.toString();
-        history.replaceState(null, "", qs ? `${base}?${qs}` : base);
+      function syncHash(push = false) {
+        let url;
+        if (tab === "resources") {
+          url = "#/resources";
+        } else if (tab !== "tasks") {
+          url = selectedGuardian ? `#/reviews/${selectedGuardian}` : "#/reviews";
+        } else {
+          const p = new URLSearchParams();
+          if (sel.kind) { const vi = sel.kind === "verify" ? `:${sel.verifyIdx ?? -1}` : ""; p.set("sel", `${sel.kind}:${sel.taskIdx}:${sel.sessionIdx}${vi}`); }
+          if (filters.q) p.set("q", filters.q);
+          if (filters.sort !== "date") p.set("sort", filters.sort);
+          if (filters.dir !== -1) p.set("dir", "asc");
+          if (filters.status.size !== STATES.length) p.set("status", [...filters.status].join(","));
+          const base = selectedRunId ? `#/tasks/${selectedRunId}` : "#/tasks";
+          const qs = p.toString();
+          url = qs ? `${base}?${qs}` : base;
+        }
+        if (!_inPopstate && push) history.pushState(null, "", url);
+        else history.replaceState(null, "", url);
       }
       function parseHash() {
         const raw = location.hash.replace(/^#\/?/, "");
         if (!raw) return null;
-        if (raw.startsWith("reviews")) return { tab: "reviews" };
+        if (raw.startsWith("reviews")) {
+          const guardianId = raw.split("?")[0].split("/")[1] || null;
+          return { tab: "reviews", guardianId };
+        }
+        if (raw.startsWith("resources")) return { tab: "resources" };
         const [path, query] = raw.split("?");
         const seg = path.split("/");
         const p = new URLSearchParams(query || "");
@@ -245,14 +444,14 @@
         if (p.get("sort")) filters.sort = p.get("sort");
         if (p.get("dir") === "asc") filters.dir = 1;
         if (p.get("status")) filters.status = new Set(p.get("status").split(",").filter(Boolean));
-        return { tab: "tasks", runId: seg[1] || null, sel: p.get("sel") };
+        return { tab: "tasks", runId: seg[1] || null, sel: p.get("sel") };  // sel is decoded in pollTasks
       }
 
       // ---------- filters ----------
       function renderStatusFilters() {
         const el = document.getElementById("status-filters");
-        el.innerHTML = STATES.map((s) => `<label>${sdot(s)}<input type="checkbox" ${filters.status.has(s) ? "checked" : ""} onchange="toggleStatus('${s}',this.checked)">${s}</label>`).join("")
-          + `<span class="chip" onclick="allStatus(true)">all</span><span class="chip" onclick="allStatus(false)">none</span>`;
+        el.innerHTML = STATES.map((s) => `<label data-tip="Show or hide ${s} runs.">${sdot(s)}<input type="checkbox" ${filters.status.has(s) ? "checked" : ""} onchange="toggleStatus('${s}',this.checked)">${s}</label>`).join("")
+          + `<span class="chip" onclick="allStatus(true)" data-tip="Show runs of every status.">all</span><span class="chip" onclick="allStatus(false)" data-tip="Hide all runs — clear the status filter entirely.">none</span>`;
       }
       function toggleStatus(s, on) { on ? filters.status.add(s) : filters.status.delete(s); renderRuns(); syncHash(); }
       function allStatus(on) { filters.status = on ? new Set(STATES) : new Set(); renderStatusFilters(); renderRuns(); syncHash(); }
@@ -279,10 +478,10 @@
         if (!list.length) { el.innerHTML = `<div class="empty">No runs.</div>`; return; }
         el.innerHTML = list.map((r) => `
           <div class="run-item ${(r.id === selectedRunId || multiSel.has(r.id)) ? "selected" : ""}" onclick="onRunClick(event,'${r.id}')" oncontextmenu="openRunMenu(event,'${r.id}')">
-            <button class="btn runbtn" onclick="openRunMenu(event,'${r.id}')" title="actions">⋯</button>
-            ${r.state === "queued" ? `<button class="btn runbtn" onclick="activateRun(event,'${r.id}')">▶ Run</button>` : ""}
+            <button class="btn runbtn" onclick="openRunMenu(event,'${r.id}')" data-tip="Run actions — rename, retry, restart, cancel, or delete this run.">⋯</button>
+            ${r.state === "queued" ? `<button class="btn runbtn" onclick="activateRun(event,'${r.id}')" data-tip="Activate this queued run — it was staged with hold=true and is waiting to be scheduled.">▶ Run</button>` : ""}
             <div class="rid">${esc(r.label || r.id)}</div>
-            <div class="meta">${sdot(r.state)}<span>${r.state}</span> · ${esc(r.id)}</div>
+            <div class="meta">${sdot(r.state)}<span>${r.state}</span>${["pending","queued"].includes(r.state) ? "" : runLogsBtn(r.id)}</div>
           </div>`).join("");
       }
       function selectRun(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; renderAll(); syncHash(); }
@@ -301,15 +500,17 @@
           multiSel = new Set([id]); anchorId = id;
         }
         selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false;
-        renderAll(); syncHash();
+        renderAll(); syncHash(true);
       }
       function openRunMenu(e, id) {
         e.preventDefault(); e.stopPropagation(); closeRunMenu();
         const r = findRun(id); if (!r) return;
-        const items = [`<div onclick="renameRun('${id}')">✎ Rename</div>`];
-        if (r.state === "queued") items.push(`<div onclick="runMenuAct('${id}','activate')">▶ Run</div>`);
-        if (!["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="runMenuAct('${id}','cancel')">■ Cancel</div>`);
-        items.push(`<div class="danger" onclick="deleteRun('${id}')">🗑 Delete</div>`);
+        const items = [`<div onclick="renameRun('${id}')" data-tip="Rename this run — changes the display label only.">✎ Rename</div>`];
+        if (r.state === "queued") items.push(`<div onclick="runMenuAct('${id}','activate')" data-tip="Start this queued run immediately — it was held with hold=true and is waiting to be scheduled.">▶ Run</div>`);
+        if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="retryRun('${id}')" data-tip="Re-run with the same parameters.\nA succeeded run will prompt for extra confirmation since it may duplicate side effects.">↻ Retry</div>`);
+        if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="restartRun('${id}')" data-tip="Re-run this run and mark all downstream runs as dirty so they re-run too.\nThis cannot be undone.">⟳ Restart + downstream</div>`);
+        if (!["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="runMenuAct('${id}','cancel')" data-tip="Cancel this run — stops all running sessions and marks the run as cancelled.">■ Cancel</div>`);
+        items.push(`<div class="danger" onclick="deleteRun('${id}')" data-tip="Delete this run and all its data permanently.\nThis cannot be undone.">🗑 Delete</div>`);
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "run-menu"; menu.innerHTML = items.join("");
         document.body.appendChild(menu);
@@ -325,6 +526,74 @@
         const name = prompt("Rename run label:", r.label || "");
         if (name === null) return;
         post(`/api/runs/${id}/edit`, { kind: "run", label: name }).then(() => tick());
+      }
+      // CCTL-101: retry re-runs with the same params. A succeeded run gets a
+      // higher-friction confirmation (type-to-confirm) to guard against
+      // accidental re-runs of successful work; a failed/cancelled one just confirms.
+      async function retryRun(id) {
+        closeRunMenu();
+        const r = findRun(id); if (!r) return;
+        if (r.state === "done") {
+          const ans = prompt(`This run SUCCEEDED. Re-running it may duplicate side effects.\nType "retry" to confirm re-running "${r.label || id}".`);
+          if ((ans || "").trim().toLowerCase() !== "retry") return;
+        } else if (!confirm(`Retry "${r.label || id}"? It will re-run with the same parameters.`)) {
+          return;
+        }
+        await post(`/api/runs/${id}/retry`);
+        tick();
+      }
+      // RAL-19: restart re-runs the run and dirties every run that depends on
+      // it, so the whole downstream chain re-runs once this one finishes again.
+      async function restartRun(id) {
+        closeRunMenu();
+        const r = findRun(id); if (!r) return;
+        if (!confirm(`Restart "${r.label || id}" and re-run everything downstream of it?`)) return;
+        await post(`/api/runs/${id}/restart`);
+        tick();
+      }
+      // Restart a single session and everything downstream of it within the run
+      // (upstream sessions stay done and are skipped on re-run). Dependent runs
+      // are dirtied too.
+      async function restartSession(id, ti, si) {
+        const r = findRun(id); if (!r) return;
+        if (!confirm("Restart this session and everything downstream of it?")) return;
+        await post(`/api/runs/${id}/sessions/${ti}/${si}/restart`);
+        tick();
+      }
+      // Open a resumed claude-code session in a new terminal window. mode is
+      // "readonly" (no writes allowed) or "open" (full access).
+      async function openTerminal(runId, ti, si, mode) {
+        try {
+          const resp = await fetch(`/api/runs/${runId}/sessions/${ti}/${si}/open-terminal?mode=${mode}`, {method:'POST'});
+          if (!resp.ok) {
+            const e = await resp.json().catch(() => ({}));
+            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+          }
+        } catch (_) {
+          alert('Failed to open terminal: network error');
+        }
+      }
+      function closeGraphMenu() { const m = document.getElementById("graph-node-menu"); if (m) m.remove(); }
+      document.addEventListener("click", closeGraphMenu);
+      function openTaskNodeMenu(e, runId, ti) {
+        e.preventDefault(); e.stopPropagation(); closeGraphMenu();
+        const r = findRun(runId); if (!r) return;
+        const items = [`<div title="Re-run all sessions of this task from the first, and dirty every downstream run so it re-executes too. This cannot be undone." onclick="closeGraphMenu();restartRun('${runId}')">⟳ Restart task</div>`];
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 80) + "px";
+      }
+      function openSessionNodeMenu(e, runId, ti, si) {
+        e.preventDefault(); e.stopPropagation(); closeGraphMenu();
+        const r = findRun(runId); if (!r) return;
+        const items = [`<div title="Re-run this session and everything downstream of it. Sessions upstream of this one remain done and are skipped. Dependent runs are dirtied too. This cannot be undone." onclick="closeGraphMenu();restartSession('${runId}',${ti},${si})">⟳ Restart session</div>`];
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 80) + "px";
       }
       async function deleteRun(id) {
         closeRunMenu();
@@ -348,7 +617,20 @@
           return `<span class="sel-tab ${id === selectedRunId ? "active" : ""}" onclick="focusSel('${id}')">${esc(r.label || id)}<span class="x" onclick="event.stopPropagation();unpickSel('${id}')">✕</span></span>`;
         }).join("");
         return `<div class="sel-tabs">${chips}</div>
-          <div class="btn-row" style="margin-top:0"><button class="btn" onclick="bulkCancel()">Cancel ${multiSel.size}</button><button class="btn danger" onclick="bulkDelete()">Delete ${multiSel.size}</button></div>`;
+          <div class="btn-row" style="margin-top:0"><button class="btn" onclick="bulkCancel()" data-tip="Cancel all selected runs — stops running sessions and marks them as cancelled.">Cancel ${multiSel.size}</button><button class="btn danger" onclick="bulkDelete()" data-tip="Delete all selected runs and their data permanently. This cannot be undone.">Delete ${multiSel.size}</button></div>`;
+      }
+
+      // A session's own verify steps (`[[task.session.verify]]`), listed under a
+      // dashed separator inside the session card with a status dot each, so you
+      // can see which verifier is running/passed/failed. Clicking one selects it
+      // in the details pane. Empty = nothing to show.
+      function sessionVerify(s, ti, si, selCls) {
+        const vs = s.verify || [];
+        if (!vs.length) return "";
+        const rows = vs.map((v, vi) =>
+          `<div class="sv-row selectable ${selCls("verify", ti, si, vi)}" data-tip="Session verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after this session completes to validate its output.\nCurrent state: ${esc(v.state)}." onclick="event.stopPropagation();pick('verify',${ti},${si},${vi})">
+             ${sdot(v.state)}<span class="sv-name">${esc(v.id || v.kind)}</span> ${pill(v.state)}${v.output ? `<button class="logs-btn" data-tip="View verifier output — the raw response from the AI verifier." data-full="${esc(v.output)}" onclick="event.stopPropagation();openCmdPopup(event)">📄</button>` : ""}</div>`).join("");
+        return `<div class="sverify"><span class="label">verify</span>${rows}</div>`;
       }
 
       // ---------- center graph ----------
@@ -356,23 +638,29 @@
         const el = document.getElementById("graph");
         const run = findRun(selectedRunId);
         if (!run) { el.innerHTML = `<div class="empty">Select a run.</div>`; return; }
-        const selCls = (k, t, s) => (sel.kind === k && (k !== "task" || sel.taskIdx === t) && (k !== "session" || (sel.taskIdx === t && sel.sessionIdx === s))) ? "sel" : "";
+        const selCls = (k, t, s, v = -1) => {
+          if (sel.kind !== k) return "";
+          if (k === "run") return "sel";
+          if (k === "task") return sel.taskIdx === t ? "sel" : "";
+          if (k === "session") return (sel.taskIdx === t && sel.sessionIdx === s) ? "sel" : "";
+          if (k === "verify") return (sel.taskIdx === t && sel.sessionIdx === s && (sel.verifyIdx ?? -1) === v) ? "sel" : "";
+          return "";
+        };
         const banner = `<div class="run-banner selectable ${sel.kind === "run" ? "sel" : ""}" onclick="pick('run')">
-            ${sdot(run.state)}<span class="rid">${esc(run.label || run.id)}</span> ${pill(run.state)}
-            <span style="flex:1"></span><button class="icon-btn" onclick="event.stopPropagation();openLogs()">📄 Logs</button></div>`;
+            ${sdot(run.state)}<span class="rid">${esc(run.label || run.id)}</span>${copyBtn(run.label || run.id)} ${pill(run.state)}${runLogsBtn(run.id)}
+            <span style="flex:1"></span></div>`;
         const tasks = run.tasks.map((t, ti) => {
           const sessions = t.sessions.map((s, si) => `
-            <div class="session selectable ${selCls("session", ti, si)}" id="n-${ti}-${si}" onclick="pick('session',${ti},${si})"
-                 title="${esc(s.id)} — ${esc(s.state)}${(s.depends_on||[]).length ? "\ndepends on: " + esc((s.depends_on||[]).join(", ")) : ""}">
-              <div class="sid">${esc(s.id)} ${pill(s.state)}</div>
+            <div class="session selectable ${selCls("session", ti, si)}" id="n-${ti}-${si}" onclick="pick('session',${ti},${si})" oncontextmenu="openSessionNodeMenu(event,'${run.id}',${ti},${si})"
+                 data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details in the right pane. Right-click to restart.">
+              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${s.error ? failLogBtn(s.error) : ""}</div>
               <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
-              <div class="kv mono">${esc(s.cwd || "")}</div>
-              ${s.error ? `<div class="kv" style="color:var(--failed)">${esc(s.error)}</div>` : ""}
+              ${sessionVerify(s, ti, si, selCls)}
             </div>`).join("");
-          const tverify = (t.verify || []).map((v, vi) => `<span class="vchip" id="v-${ti}-${vi}" title="${esc(v.kind)}${v.id ? " · " + esc(v.id) : ""}">${sdot(v.state)} ${esc(v.id || v.kind)}</span>`).join("");
-          const tdep = (t.depends_on || []).length ? `<span class="k" style="font-size:11px" title="task depends on ${esc((t.depends_on||[]).join(", "))}">⇠ ${esc((t.depends_on||[]).join(", "))}</span>` : "";
+          const tverify = (t.verify || []).map((v, vi) => `<span class="vchip selectable ${selCls("verify", ti, -1, vi)}" id="v-${ti}-${vi}" data-tip="Task verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after all sessions finish to validate the task result.\nState: ${esc(v.state)}." onclick="event.stopPropagation();pick('verify',${ti},-1,${vi})">${sdot(v.state)} ${esc(v.id || v.kind)}</span>`).join("");
+          const tdep = (t.depends_on || []).length ? `<span class="k" style="font-size:11px" data-tip="This task depends on ${esc((t.depends_on||[]).join(", "))}.\nIt will not start until the upstream task(s) finish successfully.">⇠ ${esc((t.depends_on||[]).join(", "))}</span>` : "";
           return `<div class="task" id="tk-${ti}">
-            <div class="task-head selectable ${selCls("task", ti)}" onclick="pick('task',${ti})">${sdot(t.state)} <span>${esc(t.name)}</span> ${pill(t.state)} ${tdep}</div>
+            <div class="task-head selectable ${selCls("task", ti)}" onclick="pick('task',${ti})" oncontextmenu="openTaskNodeMenu(event,'${run.id}',${ti})">${sdot(t.state)} <span>${esc(t.name)}</span> ${pill(t.state)} ${tdep}</div>
             <div class="task-body">${sessions || '<span class="kv">no sessions</span>'}</div>
             ${tverify ? `<div class="verify-chain"><span class="label">verify</span>${tverify}</div>` : ""}
           </div>`;
@@ -457,62 +745,205 @@
         graph.appendChild(svg);
       }
       window.addEventListener("resize", () => requestAnimationFrame(drawArrows));
-      function pick(kind, ti = 0, si = 0) { sel = { kind, taskIdx: ti, sessionIdx: si }; editing = false; renderGraph(); renderDetails(); syncHash(); }
+      function pick(kind, ti = 0, si = 0, vi = -1) { sel = { kind, taskIdx: ti, sessionIdx: si, verifyIdx: vi }; editing = false; renderGraph(); renderDetails(); syncHash(true); }
 
       // ---------- right details pane ----------
       function renderDetails() {
         const el = document.getElementById("details");
         const run = findRun(selectedRunId);
-        if (!run || !sel.kind) { el.innerHTML = `<div class="empty">Select a run, task, or session.</div>`; return; }
+        if (!run || !sel.kind) { el.innerHTML = `<div class="empty">Select a run, task, session, or verify step.</div>`; return; }
         const tabs = multiSel.size > 1 ? selectionTabs() : "";
         if (editing) { el.innerHTML = tabs + editForm(run); return; }
         if (sel.kind === "run") el.innerHTML = tabs + runView(run);
         else if (sel.kind === "task") el.innerHTML = tabs + taskView(run, run.tasks[sel.taskIdx]);
+        else if (sel.kind === "verify") el.innerHTML = tabs + verifyView(run);
         else el.innerHTML = tabs + sessionView(run, run.tasks[sel.taskIdx], run.tasks[sel.taskIdx].sessions[sel.sessionIdx]);
       }
-      const editBtn = () => `<div class="btn-row"><button class="btn primary" onclick="startEdit()">✎ Edit</button></div>`;
+      const editBtn = () => `<div class="btn-row"><button class="btn primary" onclick="startEdit()" data-tip="Edit this item — change its label, prompt, agent, model, or command.\nIf the run is currently running it will be stopped and reset to Pending.">✎ Edit</button></div>`;
       function runView(r) {
         const reviews = (r.reviews || []).length
           ? `<h3 class="section">reviews</h3>` + r.reviews.map((rv) =>
-              `<div class="kv-row"><span>${gdot(rv.status)}</span><span class="v"><a href="#" onclick="gotoReview('${rv.id}');return false" style="color:var(--accent)">${esc(rv.name)}</a></span><span class="k">${esc(rv.status)}</span></div>`).join("")
+              `<div class="kv-row"><span>${gdot(rv.status)}</span><span class="v"><a href="#" onclick="gotoReview('${rv.id}');return false" style="color:var(--accent)" data-tip="Open this review on the Reviews tab.">${esc(rv.name)}</a></span><span class="k">${esc(rv.status)}</span></div>`).join("")
           : "";
+        const tasks = (r.tasks || []).length
+          ? `<h3 class="section">tasks</h3>` + r.tasks.map((t, ti) =>
+              `<div class="kv-row"><span>${sdot(t.state)}</span>` +
+              `<span class="v" style="flex:1">${esc(t.name)}</span>` +
+              `<span class="k">${esc(t.state)}</span>` +
+              `<button class="btn" onclick="pick('task',${ti})" data-tip="Jump to this task's detail pane — view its sessions and verify steps.">Go</button></div>`).join("")
+          : `<h3 class="section">tasks</h3><div class="kv-row"><span class="v">None</span></div>`;
         return `<div class="dhead"><span class="k">▶ run</span></div>
-          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(r.id)}</span></div>
+          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(r.id)}${copyBtn(r.id)}</span></div>
           <div class="kv-row"><span class="k">label</span><span class="v">${esc(r.label || "—")}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(r.state)}</span></div>
-          <div class="kv-row"><span class="k">tasks</span><span class="v">${r.tasks.length}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(r.state)}${["pending","queued"].includes(r.state) ? "" : runLogsBtn(r.id)}</span></div>
+          ${tasks}
           ${reviews}
           ${editBtn()}`;
       }
-      function gotoReview(id) { selectedGuardian = id; showTab("reviews"); }
-      function gotoRun(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; showTab("tasks"); }
+      function gotoReview(id) { selectedGuardian = id; showTab("reviews", true); }
+      function gotoRun(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; showTab("tasks", true); }
+      function gotoRunItem(runId, kind, ti, si, vi) { selectedRunId = runId; sel = { kind, taskIdx: ti, sessionIdx: si, verifyIdx: vi }; editing = false; showTab("tasks", true); }
       function taskView(r, t) {
-        const verify = (t.verify || []).map((v) => `${sdot(v.state)} ${esc(v.id || v.kind)}`).join("<br>") || "—";
+        const ti = sel.taskIdx;
+        const sessions = (t.sessions || []).length
+          ? `<h3 class="section">sessions</h3>` + t.sessions.map((s, si) =>
+              `<div class="kv-row"><span>${sdot(s.state)}</span>` +
+              `<span class="v mono" style="flex:1">${esc(s.name ?? s.id)}</span>` +
+              `<span class="k">${esc(s.state)}</span>` +
+              `<button class="btn" onclick="pick('session',${ti},${si})" data-tip="Jump to this session's detail pane — view its prompt, command, and run details.">Go</button></div>`).join("")
+          : `<h3 class="section">sessions</h3><div class="kv-row"><span class="v">None</span></div>`;
+        const verify = (t.verify || []).length
+          ? `<h3 class="section">verify steps</h3>` + t.verify.map((v, vi) =>
+              `<div class="kv-row"><span>${sdot(v.state)}</span>` +
+              `<span class="v" style="flex:1">${esc(v.id || v.kind)}</span>` +
+              `<span class="k">${esc(v.state)}</span>` +
+              `<button class="btn" onclick="pick('verify',${ti},-1,${vi})" data-tip="Jump to this verify step's detail pane — view its kind, state, and output.">Go</button></div>`).join("")
+          : `<h3 class="section">verify steps</h3><div class="kv-row"><span class="v">None</span></div>`;
         return `<div class="dhead"><span class="k">⯀ task</span></div>
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project || "—")}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}</span></div>
-          <div class="kv-row"><span class="k">sessions</span><span class="v">${t.sessions.length}</span></div>
-          <h3 class="section">verify steps</h3><div class="kv-row"><span class="v">${verify}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${["pending","queued"].includes(t.state) ? "" : runLogsBtn(r.id)}</span></div>
+          ${sessions}
+          ${verify}
           ${editBtn()}`;
       }
-      function sessionView(r, t, s) {
-        return `<div class="dhead"><span class="k">◉ session</span></div>
-          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}</span></div>
+      function verifyView(r) {
+        const ti = sel.taskIdx, si = sel.sessionIdx, vi = sel.verifyIdx ?? -1;
+        const t = r.tasks[ti];
+        if (!t) return `<div class="empty">Task not found.</div>`;
+        let v, scopeLabel;
+        if (si === -1) {
+          v = (t.verify || [])[vi];
+          scopeLabel = "task";
+        } else {
+          const s = (t.sessions || [])[si];
+          v = s && (s.verify || [])[vi];
+          scopeLabel = s ? `session · ${esc(s.name ?? s.id)}` : "session";
+        }
+        if (!v) return `<div class="empty">Verify step not found.</div>`;
+        const logBtn = v.output
+          ? `<button class="logs-btn" title="verifier output" data-full="${esc(v.output)}" onclick="openCmdPopup(event)">📄 Output log</button>`
+          : "—";
+        const specSection = v.kind === "command"
+          ? `<h3 class="section">command</h3>${cmdBox(v.spec || "")}`
+          : (v.spec ? `<h3 class="section">prompt</h3><div class="prompt-box">${esc(v.spec)}</div>` : "");
+        return `<div class="dhead"><span class="k">✓ verify step</span></div>
+          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(v.id || "—")}</span></div>
+          <div class="kv-row"><span class="k">kind</span><span class="v">${esc(v.kind)}</span></div>
+          <div class="kv-row"><span class="k">scope</span><span class="v">${scopeLabel}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}</span></div>
+          ${v.model ? `<div class="kv-row"><span class="k">model</span><span class="v">${esc(v.model)}</span></div>` : ""}
+          <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
+          ${specSection}`;
+      }
+
+      // CCTL-148: worktree (the session's own cwd) and project (its shared git
+      // root) are distinct — fetch the derived project root lazily and cache it.
+      async function loadRunPaths(id) {
+        if (!id || runPaths[id]) return;
+        runPaths[id] = {}; // mark loading so we don't refetch on the 2s poll
+        try {
+          const arr = await (await fetch(`/api/runs/${id}/worktrees`)).json();
+          const map = {}; arr.forEach((p) => { map[`${p.task_idx}:${p.session_idx}`] = p; });
+          runPaths[id] = map;
+          if (selectedRunId === id && sel.kind === "session") renderDetails();
+        } catch (_) { delete runPaths[id]; }
+      }
+      function sessionView(r, t, s) {
+        if (!runPaths[r.id]) loadRunPaths(r.id);
+        const paths = (runPaths[r.id] || {})[`${sel.taskIdx}:${sel.sessionIdx}`];
+        const project = paths ? (paths.project || "— (not a git worktree)") : "…";
+        // RAL-17: reviews this session participates in, sorted by name, each with
+        // its status and a button that jumps to that review's page.
+        const inReviews = (s.reviews || []).length
+          ? `<h3 class="section">in reviews</h3>` + [...s.reviews]
+              .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+              .map((rv) => `<div class="kv-row"><span>${gdot(rv.status)}</span>` +
+                `<span class="v" style="flex:1">${esc(rv.name)}</span>` +
+                `<span class="k">${esc(rv.status)}</span>` +
+                `<button class="btn" onclick="gotoReview('${rv.id}')" data-tip="Jump to this review on the Reviews tab to see its full status and branch stack.">Go to review</button></div>`).join("")
+          : "";
+        const verifySteps = (s.verify || []).length
+          ? `<h3 class="section">verify steps</h3>` + (s.verify || []).map((v, vi) =>
+              `<div class="kv-row"><span>${sdot(v.state)}</span>` +
+              `<span class="v" style="flex:1">${esc(v.id || v.kind)}</span>` +
+              `<span class="k">${esc(v.state)}</span>` +
+              `<button class="btn" onclick="pick('verify',${sel.taskIdx},${sel.sessionIdx},${vi})" data-tip="Jump to this verify step's detail pane — view its kind, state, and output.">Go</button></div>`).join("")
+          : "";
+        return `<div class="dhead"><span class="k">◉ session</span> <span>${esc(s.name ?? s.id)}</span></div>
+          ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
+          <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
+          <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${["pending","queued"].includes(s.state) ? "" : runLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           <div class="kv-row"><span class="k">agent</span><span class="v">${esc(s.agent)}</span></div>
           <div class="kv-row"><span class="k">model</span><span class="v">${esc(s.model || "—")}</span></div>
-          <div class="kv-row"><span class="k">cwd</span><span class="v mono">${esc(s.cwd || "—")}</span></div>
+          <div class="kv-row"><span class="k">project</span><span class="v mono">${esc(project)}${paths && paths.project ? copyBtn(paths.project) : ""}</span></div>
+          <div class="kv-row"><span class="k">worktree</span><span class="v mono">${esc(s.cwd || "—")}${s.cwd ? copyBtn(s.cwd) : ""}</span></div>
           <div class="kv-row"><span class="k">tokens</span><span class="v">${s.tokens_in}/${s.tokens_out} · $${(s.cost_usd||0).toFixed(4)}</span></div>
-          ${s.error ? `<div class="warn">${esc(s.error)}</div>` : ""}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
-          <div class="prompt-box">${esc(s.command || s.prompt || "—")}</div>
-          ${editBtn()}`;
+          ${s.command ? cmdBox(s.command) : `<div id="prompt-box-${sel.taskIdx}-${sel.sessionIdx}" class="prompt-box">${esc(s.prompt || "—")}</div>`}
+          ${inReviews}
+          ${verifySteps}
+          <div class="btn-row">
+            <button class="btn primary" onclick="startEdit()" data-tip="Edit this session — change its prompt, agent, model, command, or working directory.\nIf the run is currently running it will be stopped and reset to Pending.">✎ Edit</button>
+            <button class="btn" onclick="restartSession('${r.id}',${sel.taskIdx},${sel.sessionIdx})" data-tip="Re-run this session and all downstream sessions within this run.\nDependent runs in other tasks are also re-queued.\nThis cannot be undone.">⟳ Restart session</button>
+          </div>
+          ${(() => {
+            const canTerminal = s.agent === "claude-code";
+            const hasId = !!s.claude_session_id;
+            const enabled = canTerminal && hasId;
+            const disabledTip = !canTerminal
+              ? "Only available for claude-code sessions — this session uses a different agent."
+              : "Session ID not yet captured. The session must complete at least once before it can be resumed.";
+            const roBtn = enabled
+              ? `<button class="btn primary" onclick="openTerminal('${r.id}',${sel.taskIdx},${sel.sessionIdx},'readonly')" data-tip="Resume this claude-code session in a new terminal in read-only mode.\nYou can browse files and conversation history.\nThe agent cannot write, edit, delete, commit, or push anything.">Read-Only Terminal</button>`
+              : `<span data-tip="${disabledTip}"><button class="btn primary" disabled style="pointer-events:none">Read-Only Terminal</button></span>`;
+            const openBtn = enabled
+              ? `<button class="btn" onclick="openTerminal('${r.id}',${sel.taskIdx},${sel.sessionIdx},'open')" data-tip="Resume this claude-code session in a new terminal with full write access.\nThe agent can edit files, run commands, commit, and push.\nUse with caution — full write access is granted.">Open Terminal</button>`
+              : `<span data-tip="${disabledTip}"><button class="btn" disabled style="pointer-events:none">Open Terminal</button></span>`;
+            return `<div class="btn-row">${roBtn}${openBtn}</div>`;
+          })()}`;
+      }
+      // CCTL-115: render each command line elided in a fixed-height box; a
+      // double-click opens a floating popup with the full, scrollable text.
+      function cmdBox(text) {
+        const lines = String(text).split("\n").filter((l, i, a) => l !== "" || a.length === 1);
+        return `<div class="cmd-list" data-tip="Session command — double-click a line to view the full text.">`
+          + lines.map((l) => `<div class="cmd-line" data-full="${esc(l)}" ondblclick="openCmdPopup(event)">${esc(l) || "&nbsp;"}</div>`).join("")
+          + `</div>`;
+      }
+      function openCmdPopup(e) {
+        const text = e.currentTarget.dataset.full || "";
+        document.getElementById("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
+            <h2>Command</h2>
+            <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px">${esc(text)}</pre>
+            <div class="btn-row"><button class="btn" onclick="closeModal()">Close</button></div>
+          </div></div>`;
+      }
+      // A failed session/finalize shows only a badge + this button; the full
+      // error (often a long traceback) opens here instead of flooding the graph.
+      function openErrPopup(e) {
+        const text = e.currentTarget.dataset.full || "";
+        document.getElementById("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
+            <h2 style="color:var(--failed)">Failure log</h2>
+            <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--failed);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px;color:var(--failed)">${esc(text)}</pre>
+            <div class="btn-row"><button class="btn" onclick="closeModal()">Close</button></div>
+          </div></div>`;
       }
 
       function startEdit() { editing = true; renderDetails(); }
       function cancelEdit() { editing = false; renderDetails(); }
+      // Session edit form: purely cosmetic show/hide of the active mode's fields.
+      // It writes nothing and clears nothing — values stay in the DOM so an
+      // accidental toggle back loses no input. saveEdit() reads the dropdown.
+      function onModeChange() {
+        const agent = document.getElementById("e-mode").value === "agent";
+        document.getElementById("agent-fields").classList.toggle("hidden", !agent);
+        document.getElementById("command-fields").classList.toggle("hidden", agent);
+      }
       function editForm(r) {
         const running = r.state === "running";
         const warn = running ? `<div class="warn">This run is Running. Saving will stop it and set it back to Pending.</div>` : "";
@@ -526,10 +957,24 @@
         } else {
           const s = r.tasks[sel.taskIdx].sessions[sel.sessionIdx];
           const isCmd = !!s.command;
-          fields = `<label>cwd<input id="e-cwd" value="${esc(s.cwd || "")}"></label>
-            <label>agent<input id="e-agent" value="${esc(s.agent)}"></label>
-            <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
-            <label>${isCmd ? "command" : "prompt"}<textarea id="e-prompt" rows="5">${esc(s.command || s.prompt || "")}</textarea></label>`;
+          // Known agents in this codebase (core/src/schema.rs default is "claude";
+          // the runner dispatches "claude"/"anthropic", "claude-code"/"claude-cli",
+          // and "ollama"). Backed by a datalist so the input stays free-text.
+          const agents = ["claude", "claude-code", "ollama"];
+          fields = `<label>mode<select id="e-mode" onchange="onModeChange()">
+              <option value="agent"${isCmd ? "" : " selected"}>Agent</option>
+              <option value="command"${isCmd ? " selected" : ""}>Command</option>
+            </select></label>
+            <label>cwd<input id="e-cwd" value="${esc(s.cwd || "")}"></label>
+            <div id="agent-fields"${isCmd ? ' class="hidden"' : ""}>
+              <label>agent<input id="e-agent" list="e-agent-list" value="${esc(s.agent || "")}">
+                <datalist id="e-agent-list">${agents.map((a) => `<option value="${a}">`).join("")}</datalist></label>
+              <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
+              <label>prompt<textarea id="e-prompt" rows="5">${esc(s.prompt || "")}</textarea></label>
+            </div>
+            <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
+              <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
+            </div>`;
         }
         return `<div class="dhead"><span class="k">✎ editing ${sel.kind}</span></div>${warn}
           <div class="edit-form">${fields}</div>
@@ -543,9 +988,14 @@
         if (sel.kind === "run") body.label = val("e-label");
         else if (sel.kind === "task") { body.name = val("e-name"); body.project = val("e-project"); }
         else {
-          const s = r.tasks[sel.taskIdx].sessions[sel.sessionIdx];
-          body.cwd = val("e-cwd"); body.agent = val("e-agent"); body.model = val("e-model");
-          if (s.command) body.command = val("e-prompt"); else body.prompt = val("e-prompt");
+          body.cwd = val("e-cwd");
+          // Submit only the active mode's fields, driven by the dropdown — not by
+          // the session's pre-existing kind.
+          if (val("e-mode") === "command") {
+            body.command = val("e-command");
+          } else {
+            body.agent = val("e-agent"); body.model = val("e-model"); body.prompt = val("e-prompt");
+          }
         }
         try {
           const resp = await fetch(`/api/runs/${r.id}/edit`, { method: "POST", body: JSON.stringify(body) });
@@ -559,8 +1009,38 @@
         e.stopPropagation();
         const m = document.getElementById("running-menu");
         if (!m.classList.contains("hidden")) { m.classList.add("hidden"); return; }
-        const active = runs.filter((r) => r.state === "running");
-        m.innerHTML = active.length ? active.map((r) => `<div onclick="showTab('tasks');selectRun('${r.id}');document.getElementById('running-menu').classList.add('hidden')">${esc(r.label || r.id)}</div>`).join("") : `<div class="empty" style="margin:6px">No running tasks</div>`;
+        const rows = [];
+        // Running sessions
+        for (const r of runs) {
+          for (let ti = 0; ti < r.tasks.length; ti++) {
+            const t = r.tasks[ti];
+            for (let si = 0; si < t.sessions.length; si++) {
+              const s = t.sessions[si];
+              if (s.state !== "running") continue;
+              const runLabel = esc(r.label || r.id);
+              rows.push(`<div onclick="gotoRunItem('${r.id}','session',${ti},${si},-1);document.getElementById('running-menu').classList.add('hidden')" data-tip="Running session in run ${runLabel}, task ${esc(t.name)}.\nClick to navigate directly to this session."><span class="pill p-running" style="font-size:10px;margin-right:4px">Session</span>${runLabel} / ${esc(t.name)}</div>`);
+              // Session-level verifies
+              for (let vi = 0; vi < (s.verify || []).length; vi++) {
+                const v = s.verify[vi];
+                if (v.state !== "running") continue;
+                rows.push(`<div onclick="gotoRunItem('${r.id}','verify',${ti},${si},${vi});document.getElementById('running-menu').classList.add('hidden')" data-tip="Running verify step in run ${runLabel}, task ${esc(t.name)}, session ${si}.\nClick to navigate directly to this verify step."><span class="pill p-running" style="font-size:10px;margin-right:4px">Verify</span>${runLabel} / ${esc(t.name)} / s${si} verify</div>`);
+              }
+            }
+            // Task-level verifies
+            for (let vi = 0; vi < (t.verify || []).length; vi++) {
+              const v = t.verify[vi];
+              if (v.state !== "running") continue;
+              const runLabel = esc(r.label || r.id);
+              rows.push(`<div onclick="gotoRunItem('${r.id}','verify',${ti},-1,${vi});document.getElementById('running-menu').classList.add('hidden')" data-tip="Running task-level verify in run ${runLabel}, task ${esc(t.name)}.\nClick to navigate directly to this verify step."><span class="pill p-running" style="font-size:10px;margin-right:4px">Verify</span>${runLabel} / ${esc(t.name)} / task verify</div>`);
+            }
+          }
+        }
+        // Guardian review merges (from daemon status)
+        const reviewList = (window._daemonStatus && window._daemonStatus.running_reviews) || [];
+        for (const rv of reviewList) {
+          rows.push(`<div onclick="gotoReview('${rv.id}');document.getElementById('running-menu').classList.add('hidden')" data-tip="Guardian review '${esc(rv.name)}' is building its stacked rebase.\nClick to navigate to this review."><span class="pill p-running" style="font-size:10px;margin-right:4px">Review</span>${esc(rv.name)}</div>`);
+        }
+        m.innerHTML = rows.length ? rows.join("") : `<div class="empty" style="margin:6px">No running work</div>`;
         m.classList.remove("hidden");
       }
       document.addEventListener("click", () => document.getElementById("running-menu").classList.add("hidden"));
@@ -570,40 +1050,70 @@
         document.getElementById("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
             <h2>New Task</h2>
-            <textarea id="nt-toml" placeholder="Paste task TOML here…"></textarea>
-            <label style="font-size:12px;color:var(--muted)">label (optional) <input id="nt-label" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px"></label>
+            <textarea id="nt-toml" placeholder="Paste task TOML here…" data-tip="Paste a TOML task definition here.\nSee docs/daemon-api.md for the full schema — at minimum you need [[task]] with a name and at least one [[task.session]]."></textarea>
+            <label style="font-size:12px;color:var(--muted)" data-tip="Optional display label for this run — shown in the sidebar and board view. Defaults to the run ID if left blank.">label (optional) <input id="nt-label" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px"></label>
             <div id="nt-err" class="verr"></div>
-            <div class="btn-row"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="submitTask()">Validate & Queue</button></div>
+            <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close without submitting.">Cancel</button><button class="btn primary" onclick="submitTask()" data-tip="Validate the TOML and queue the run.\nThe daemon will start it as soon as a scheduler slot is available.">Validate &amp; Queue</button></div>
           </div></div>`;
       }
       function closeModal() { document.getElementById("modal-root").innerHTML = ""; }
 
       // ---------- logs modal ----------
       let logRunId = null, logsTab = "sessions";
-      function openLogs() { const r = findRun(selectedRunId); if (!r) return; logRunId = r.id; renderLogs(); }
+      let logEvents = {};   // runId -> events array (CCTL-99), lazily fetched
+      function openLogs(id) { const r = findRun(id || selectedRunId); if (!r) return; logRunId = r.id; renderLogs(); }
+      function openRunLogs(e, id) { e.stopPropagation(); openLogs(id); }
       function renderLogs() {
         const run = findRun(logRunId); if (!run) return;
-        const tabs = ["tasks", "sessions", "verifiers"];
+        const tabs = ["events", "tasks", "sessions", "verifiers"];
+        if (logsTab === "events" && logEvents[logRunId] === undefined) loadLogEvents(logRunId);
         document.getElementById("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw">
             <h2>Logs — ${esc(run.label || run.id)}</h2>
             <div class="row" style="margin-bottom:10px">
-              ${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" onclick="logsTab='${t}';renderLogs()">${t}</span>`).join("")}
+              ${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" onclick="logsTab='${t}';renderLogs()" data-tip="${{events:"Audit trail — every state change and scheduler event for this run.",tasks:"Task-level summary with session count.",sessions:"Per-session state, token usage, and cost breakdown.",verifiers:"Verifier step status and raw output."}[t]||t}">${t}</span>`).join("")}
             </div>
             <div style="max-height:60vh;overflow:auto">${logsBody(run)}</div>
             <div class="btn-row"><button class="btn" onclick="closeModal()">Close</button></div>
           </div></div>`;
       }
+      async function loadLogEvents(id) {
+        logEvents[id] = null; // loading
+        try {
+          logEvents[id] = await (await fetch(`/api/runs/${id}/logs`)).json();
+          if (logRunId === id && logsTab === "events") renderLogs();
+        } catch (_) { logEvents[id] = []; }
+      }
+      // Render an audit-log event list (shared by run + review log viewers).
+      function eventsTable(events) {
+        if (events === null || events === undefined) return `<div class="empty">Loading…</div>`;
+        if (!events.length) return `<div class="empty">No events yet.</div>`;
+        const T = (rows) => `<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr>${["time","scope","ref","message"].map((h) => `<th style="text-align:left;padding:5px 10px;color:var(--muted);font-weight:500">${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+        return T(events.map((e) => tblRow([
+          new Date(e.at_ms).toLocaleTimeString(),
+          `<span class="pill p-pending">${esc(e.scope)}</span>`,
+          `<span class="mono">${esc(e.ref || "—")}</span>`,
+          esc(e.message),
+        ])));
+      }
       function tblRow(cells) { return "<tr>" + cells.map((c) => `<td style="padding:5px 10px;border-bottom:1px solid var(--border)">${c}</td>`).join("") + "</tr>"; }
       function logsBody(run) {
         const T = (head, rows) => `<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr>${head.map((h) => `<th style="text-align:left;padding:5px 10px;color:var(--muted);font-weight:500">${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+        if (logsTab === "events") {
+          return eventsTable(logEvents[run.id]);
+        }
         if (logsTab === "tasks") {
           return T(["task", "state", "sessions"], run.tasks.map((t) => tblRow([esc(t.name), pill(t.state), t.sessions.length])));
         }
         if (logsTab === "verifiers") {
           const rows = [];
-          run.tasks.forEach((t) => (t.verify || []).forEach((v) => rows.push(tblRow([esc(t.name), esc(v.id || "—"), esc(v.kind), pill(v.state)]))));
-          return rows.length ? T(["task", "id", "kind", "state"], rows) : `<div class="empty">No task-level verifiers.</div>`;
+          const outBtn = (v) => v.output ? `<button class="btn" style="padding:1px 6px;font-size:11px" data-full="${esc(v.output)}" ondblclick="openCmdPopup(event)" onclick="openCmdPopup(event)">▶ output</button>` : "—";
+          run.tasks.forEach((t) => {
+            (t.verify || []).forEach((v) => rows.push(tblRow([esc(t.name), "task", esc(v.id || "—"), esc(v.kind), pill(v.state), outBtn(v)])));
+            (t.sessions || []).forEach((s) => (s.verify || []).forEach((v) =>
+              rows.push(tblRow([esc(t.name), `session ${esc(s.id)}`, esc(v.id || "—"), esc(v.kind), pill(v.state), outBtn(v)]))));
+          });
+          return rows.length ? T(["task", "scope", "id", "kind", "state", "output"], rows) : `<div class="empty">No verifiers.</div>`;
         }
         const rows = [];
         run.tasks.forEach((t) => t.sessions.forEach((s) => rows.push(tblRow([esc(t.name), `<span class="mono">${esc(s.id)}</span>`, pill(s.state), `${s.tokens_in}/${s.tokens_out}`, `$${(s.cost_usd || 0).toFixed(4)}`, s.error ? `<span style="color:var(--failed)">${esc(s.error)}</span>` : ""]))));
@@ -621,13 +1131,62 @@
       }
 
       // ---------- reviews (list + detail, read-only for now) ----------
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", deployed:"--done", pending:"--pending", in_progress:"--running", done:"--done", conflict_resolved:"--queued", failed:"--failed" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", in_progress:"--running", done:"--done", conflict_resolved:"--queued", failed:"--failed" };
       const gdot = (s) => `<span class="dot" style="background:${cvar(G_COLORS[s]||"--muted")}"></span>`;
+      function selectGuardian(id) { selectedGuardian = id; syncHash(true); renderReviews(); renderReviewDetail(); }
       function renderReviews() {
         const el = document.getElementById("reviews");
         if (!guardians.length) { el.innerHTML = `<div class="empty">No reviews.</div>`; return; }
-        el.innerHTML = guardians.map((g) => `<div class="run-item ${g.id===selectedGuardian?"selected":""}" onclick="selectedGuardian='${g.id}';renderReviews();renderReviewDetail()">
+        el.innerHTML = guardians.map((g) => `<div class="run-item ${g.id===selectedGuardian?"selected":""}" onclick="selectGuardian('${g.id}')" oncontextmenu="openReviewMenu(event,'${g.id}')">
+          <button class="btn runbtn" onclick="openReviewMenu(event,'${g.id}')" data-tip="Review actions — rename or delete this review.">⋯</button>
           <div class="rid">${esc(g.name)}</div><div class="meta">${gdot(g.status)}<span>${g.status}</span> · ${g.branches.length} branches</div></div>`).join("");
+      }
+      // CCTL-100: right-click a review for Rename / Delete (mirrors the run menu).
+      function openReviewMenu(e, id) {
+        e.preventDefault(); e.stopPropagation(); closeRunMenu();
+        const g = guardians.find((x) => x.id === id); if (!g) return;
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "run-menu";
+        const canCancel = ["collecting","merging","approved"].includes(g.status);
+        menu.innerHTML = `<div onclick="renameReview('${id}')" data-tip="Rename this review — changes the display name only.">✎ Rename</div>${canCancel ? `<div class="danger" onclick="cancelReview('${id}')" data-tip="Cancel this review — stops the current run and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>` : ""}<div class="danger" onclick="deleteReview('${id}')" data-tip="Delete this review and remove all review worktrees permanently.\nThis cannot be undone.">🗑 Delete</div>`;
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
+      }
+      function renameReview(id) {
+        closeRunMenu();
+        const g = guardians.find((x) => x.id === id); if (!g) return;
+        const name = prompt("Rename review:", g.name);
+        if (name === null || !name.trim()) return;
+        post(`/api/guardians/${id}/rename`, { name: name.trim() }).then(() => tick());
+      }
+      async function deleteReview(id) {
+        closeRunMenu();
+        const g = guardians.find((x) => x.id === id);
+        if (!confirm(`Delete review "${g ? g.name : id}"? This removes its review worktrees and cannot be undone.`)) return;
+        await del(`/api/guardians/${id}`);
+        if (selectedGuardian === id) selectedGuardian = null;
+        tick();
+      }
+      function openReviewTitleMenu(e, id) {
+        e.preventDefault(); e.stopPropagation(); closeRunMenu();
+        const g = guardians.find((x) => x.id === id); if (!g) return;
+        const canCancel = ["collecting","merging","approved"].includes(g.status);
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "run-menu";
+        menu.innerHTML = canCancel
+          ? `<div class="danger" onclick="cancelReview('${id}')" data-tip="Cancel this review — stops the current run and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>`
+          : `<div style="color:var(--muted);padding:6px 10px;font-size:12px" data-tip="No actions are available because this review's status is '${g.status}'.\nActions like Cancel are only available while the review is collecting, merging, or approved.">No actions available</div>`;
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
+      }
+      async function cancelReview(id) {
+        closeRunMenu();
+        const g = guardians.find((x) => x.id === id);
+        if (!confirm(`Cancel review "${g ? g.name : id}"? The current run will be discarded. This cannot be undone.`)) return;
+        await fetch(`/api/guardians/${id}/cancel`, { method: "POST" });
+        tick();
       }
       function mergeProgress(g) {
         const total = g.branches.length;
@@ -639,118 +1198,638 @@
         const failed = cnt((b) => b.merge_status === "failed");
         const pct = (n) => (100 * n / total).toFixed(2) + "%";
         return `<div class="kv-row"><span class="k">merged</span><span>${done + resolved}/${total}${failed ? ` · <span style="color:var(--failed)">${failed} failed</span>` : ""}</span></div>
-          <div class="progress" title="green=clean, purple=conflict-resolved, blue=in-progress, red=failed">
+          <div class="progress" data-tip="Merge progress bar — green: clean merge, purple: conflict resolved by agent, blue: in progress, red: failed.">
             <span style="width:${pct(done)};background:var(--done)"></span>
             <span style="width:${pct(resolved)};background:var(--queued)"></span>
             <span style="width:${pct(prog)};background:var(--running)"></span>
             <span style="width:${pct(failed)};background:var(--failed)"></span>
           </div>`;
       }
+      // CCTL-147: live merge-conflict resolution progress (resolved / total).
+      function conflictProgress(g) {
+        const total = g.conflicts_total;
+        if (total === null || total === undefined || total <= 0) return "";
+        const remaining = g.conflicts_remaining ?? total;
+        const resolved = Math.max(0, total - remaining);
+        const pct = (100 * resolved / total).toFixed(0);
+        const active = g.status === "merging";
+        return `<div class="kv-row"><span class="k">conflicts</span><span>${resolved}/${total} markers resolved${active && remaining > 0 ? " · resolving…" : ""}</span></div>
+          <div class="progress" data-tip="Conflict resolution progress — the agent is working through merge conflicts in this review's stack.">
+            <span style="width:${pct}%;background:var(--queued)"></span>
+          </div>`;
+      }
       function branchBadge(b) {
-        if (b.merge_status === "failed") return `<span class="badge bad" title="${esc(b.detail || "conflict")}">⚠ conflict</span>`;
-        if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" title="${esc(b.detail || "resolved")}">✓ resolved</span>`;
+        if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
+        if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" data-tip="Conflict was resolved by the guardian agent — ${esc(b.detail || "resolved")}">✓ resolved</span>`;
+        return "";
+      }
+      // Per-branch inline conflict progress bar (RAL-37).
+      function branchConflictBar(b) {
+        const total = b.conflicts_total;
+        if (total === null || total === undefined || total <= 0) return "";
+        const remaining = b.conflicts_remaining ?? total;
+        const resolved = Math.max(0, total - remaining);
+        const pct = (100 * resolved / total).toFixed(0);
+        const isResolved = remaining === 0;
+        const color = isResolved ? "var(--done)" : "var(--failed)";
+        const icon = isResolved ? "✓" : "⚠";
+        const label = `${resolved}/${total} markers resolved`;
+        const tooltip = isResolved
+          ? `All ${total} conflict marker${total === 1 ? "" : "s"} resolved by agent`
+          : `${remaining} of ${total} conflict marker${total === 1 ? "" : "s"} still remaining`;
+        return `<div class="branch-conflict-bar" title="${tooltip}">
+          <div class="branch-conflict-label">
+            <span class="conflict-icon" aria-label="${isResolved ? "resolved" : "unresolved"}">${icon}</span>
+            <span>${label}${!isResolved ? " · resolving…" : ""}</span>
+          </div>
+          <div class="progress" style="margin:0">
+            <span style="width:${pct}%;background:${color}"></span>
+          </div>
+        </div>`;
+      }
+      function renderChangeSummary(g) {
+        if (g.change_summary) {
+          return `<h3 class="section" data-tip="generated by the resolver agent from commit subject lines after each merge\nrecomputed whenever the review is rebuilt or feedback is applied">change summary</h3>
+            <div style="font-size:13px;line-height:1.55;white-space:pre-wrap;border:1px solid var(--border);border-radius:6px;padding:10px 12px;background:var(--bg);color:var(--text)">${esc(g.change_summary)}</div>`;
+        }
+        if (g.status === "merging") {
+          return `<h3 class="section" data-tip="summary is generated from commit subject lines after the merge completes">change summary</h3><div class="empty">generating summary…</div>`;
+        }
         return "";
       }
       function renderReviewDetail() {
         const el = document.getElementById("review-detail");
         const g = guardians.find((x) => x.id === selectedGuardian);
         if (!g) { el.innerHTML = `<div class="empty">Select a review.</div>`; return; }
-        const canReorder = ["collecting", "merge_failed"].includes(g.status);
+        // RAL-14: reorder is allowed while the review is still open — not once it
+        // is approved/deployed (those branches are considered merged/shipped).
+        const canReorder = !["approved", "cancelled", "deployed"].includes(g.status);
         const drag = canReorder ? `draggable="true" ondragstart="brDragStart(event)" ondragover="brDragOver(event)" ondragleave="brDragLeave(event)" ondrop="brDrop(event,'${g.id}')" ondragend="brDragEnd(event)"` : "";
-        const branches = g.branches.map((b) => `
-          <div class="branch-row" data-branch="${esc(b.branch)}" ${drag}>
-            ${canReorder ? '<span class="grip" title="drag to reorder">⋮⋮</span>' : ""}
-            <span>${gdot(b.merge_status)}</span>
-            <span class="mono" style="flex:1">${esc(b.branch)}</span>
-            ${branchBadge(b)} ${pill(b.merge_status)}
-          </div>`).join("");
-        const checks = g.checks.length
-          ? `<div class="row">${g.checks.map((c) => `<span class="vchip" title="check gate — runs in the review worktree before it is ready">🔒 <span class="mono">${esc(c)}</span></span>`).join("")}</div>`
-          : "—";
-        el.innerHTML = `<div class="run-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)}</div>
-          ${mergeProgress(g)}
-          ${g.run_id ? `<div class="kv-row"><span class="k">from run</span><span class="v"><a href="#" onclick="gotoRun('${g.run_id}');return false" style="color:var(--accent)">${esc(g.run_id)}</a></span></div>` : ""}
-          ${g.status === "collecting" && g.run_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">starts automatically when its run finishes — or start it now below</span></div>` : ""}
-          <div class="kv-row"><span class="k">base</span><span class="mono">${esc(g.base_branch)}</span></div>
-          <div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>
-          <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
-          <h3 class="section">check gates</h3>${checks}
-          ${g.detail?`<div class="warn">${esc(g.detail)}</div>`:""}
-          <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder</span>' : ""}</h3>${branches||'<div class="empty">none</div>'}
-          <div class="row" style="margin-top:10px">
-            <input type="text" id="add-branch" placeholder="feature/branch" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px">
-            <button class="btn" onclick="addBranch('${g.id}')">Add branch</button>
-          </div>
-          <div class="btn-row">
-            <button class="btn primary" onclick="mergeReview('${g.id}')" ${["collecting","merge_failed","in_review"].includes(g.status)?"":"disabled"}>Merge / rebase</button>
-            <button class="btn" onclick="approveReview('${g.id}')" ${g.status==="in_review"?"":"disabled"}>Approve</button>
+        // Staged reorder + enable state (RAL-6, RAL-43): pendingReorder holds both
+        // the branch order and per-branch enabled flags, committed only on Save.
+        // All pre-save changes are local UI state — nothing hits the server until
+        // Save, which persists both order and enabled states, then kicks off the
+        // rebase. Discard reverts to the last server-side state.
+        const serverOrder = g.branches.map((b) => b.branch);
+        const serverEnabled = Object.fromEntries(g.branches.map((b) => [b.branch, b.enabled !== false]));
+        const hasPending = !!(pendingReorder && pendingReorder.gid === g.id);
+        const stagedOrder = hasPending ? pendingReorder.order : serverOrder;
+        const stagedEnabled = (hasPending && pendingReorder.enabled) ? pendingReorder.enabled : serverEnabled;
+        const byBranch = Object.fromEntries(g.branches.map((b) => [b.branch, b]));
+        const orderedBranches = stagedOrder.map((n) => byBranch[n]).filter(Boolean);
+        // RAL-29: multi-project tab view — filter branches to the active project tab.
+        const isMultiProject = g.projects && g.projects.length > 1;
+        const activeTab = isMultiProject
+          ? (selectedProjectTabs[g.id] && g.projects.includes(selectedProjectTabs[g.id])
+              ? selectedProjectTabs[g.id] : g.projects[0])
+          : null;
+        const visibleBranches = isMultiProject
+          ? orderedBranches.filter((b) => (b.project || g.git_root) === activeTab)
+          : orderedBranches;
+        // RAL-43: warn when all branches are staged as disabled.
+        const enabledCount = visibleBranches.filter((b) => stagedEnabled[b.branch] !== false).length;
+        const allDisabled = visibleBranches.length > 0 && enabledCount === 0;
+        const branches = visibleBranches.map((b, i) => {
+          const isEnabled = stagedEnabled[b.branch] !== false;
+          const hasDetail = !!(b.worktree || b.detail);
+          const open = expandedBranches.has(`${g.id}:${b.position}`);
+          const toggle = hasDetail
+            ? `<span class="br-toggle" data-tip="Expand or collapse merge detail for this branch." onclick="toggleBranch(event,'${g.id}',${b.position})">${open ? "▾" : "▸"}</span>`
+            : `<span class="br-toggle placeholder">▸</span>`;
+          const detail = hasDetail ? `<div class="branch-detail ${open ? "" : "hidden"}">
+              ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${esc(b.detail)}</span></div>` : ""}
+              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span></div>
+                <div class="row" style="margin:4px 0 0">
+                  <input type="text" id="fb-${b.position}" placeholder="reviewer feedback for this branch…" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
+                  <button class="btn" onclick="sendFeedback('${g.id}',${b.position})" data-tip="Send reviewer feedback for this specific branch.\nThe guardian agent routes it to the session that owns this branch.">Send feedback</button>
+                </div>` : ""}
+            </div>` : "";
+          // RAL-43: enable/disable toggle — staged like drag-reorder, takes effect on Save.
+          const enableToggle = canReorder
+            ? `<button class="icon-btn" onclick="toggleBranchEnabled('${g.id}','${esc(b.branch)}')" title="${isEnabled ? 'Drop this branch from the rebase stack — it stays visible and can be re-enabled. Staged: takes effect on Save.' : 'Re-enable this branch — it will be included in the rebase stack again. Staged: takes effect on Save.'}" style="font-size:11px;padding:1px 5px;border-color:${isEnabled ? 'var(--border)' : 'var(--queued)'};color:${isEnabled ? 'var(--muted)' : 'var(--queued)'}">${isEnabled ? '⊙' : '⊘'}</button>`
+            : "";
+          return `
+          <div class="branch-item"${isEnabled ? "" : ' style="opacity:0.45"'}>
+            <div class="branch-row" data-branch="${esc(b.branch)}" ${drag}>
+              ${canReorder ? '<span class="grip" data-tip="Drag to reorder branches — the merge order determines the rebase stack.">⋮⋮</span>' : ""}
+              ${toggle}
+              <span>${gdot(b.merge_status)}</span>
+              <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}">${esc(b.branch)}</span>
+              ${isEnabled ? `${branchBadge(b)} ${pill(b.merge_status)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
+              ${enableToggle}
+            </div>
+            ${branchConflictBar(b)}
+            ${detail}
           </div>`;
+        }).join("");
+        const checks = g.checks.length
+          ? `<div class="row"${g.skip_checks ? ' style="opacity:.45"' : ""}>${g.checks.map((c) => `<span class="vchip" data-tip="Check gate — runs after each merge commit and on the combined review worktree.\nAll gates must pass before the review can be approved.">🔒 <span class="mono">${esc(c)}</span></span>`).join("")}</div>`
+          : "—";
+        const skipChecks = `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip running the configured check gates (e.g. cargo test).\nUseful while iterating — gates are still listed but not executed.">
+            <input type="checkbox" ${g.skip_checks ? "checked" : ""} onchange="setSkipChecks('${g.id}',this.checked)">skip build/check verification${g.skip_checks && g.checks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees.\nFaster for large repos but gives less isolation between branches.">
+            <input type="checkbox" ${g.skip_worktrees ? "checked" : ""} onchange="setSkipWorktrees('${g.id}',this.checked)">skip per-branch worktrees (build the stack in one shared worktree)</label>`;
+        // Conflict-resolver backend/model for this review. Unset shows the
+        // effective fallback (ollama / qwen3:8b) muted as "(default)".
+        const rAgent = g.resolver_agent || "ollama";
+        const rModel = g.resolver_model || (rAgent === "ollama" ? "qwen3:8b" : "backend default");
+        const rIsDefault = !g.resolver_agent && !g.resolver_model;
+        const resolverRow = `<div class="kv-row"><span class="k">resolver</span><span class="v">${esc(rAgent)} · <span class="mono">${esc(rModel)}</span>${rIsDefault ? ' <span style="opacity:.55">(default)</span>' : ""}</span></div>`;
+        // RAL-22: a global feedback chat — a persisted triage thread for the whole
+        // review, distinct from the per-branch feedback inputs above. The guardian
+        // agent replies in-thread, routing instructions to individual branches.
+        if (reviewMessages[g.id] === undefined) loadReviewMessages(g.id);
+        const msgs = reviewMessages[g.id] || [];
+        // RAL-35: strip any residual <route …>…</route> blocks (server strips
+        // them before storing, but guard here in case of old messages).
+        const stripRoute = (t) => t.replace(/<route\s[^>]*>[\s\S]*?<\/route>/g, '').trim();
+        const thread = msgs.length
+          ? msgs.map((m) => {
+              const isUser = m.role === "reviewer";
+              const side = isUser ? "user" : "guardian";
+              const label = isUser ? "you" : "guardian";
+              return `<div class="chat-msg chat-bubble-wrap ${side}"><div><div class="chat-label">${label}</div><div class="chat-bubble">${esc(stripRoute(m.text))}</div></div></div>`;
+            }).join("")
+          : `<div class="empty" style="margin-top:8px">No feedback yet — ask the guardian to route a change across the review.</div>`;
+        const chatSection = `<h3 class="section" style="display:flex;align-items:center;gap:6px">feedback chat <button class="copy-btn" data-tip="Copy this conversation to clipboard.\nChoose Markdown for readable text or JSON for raw data." onclick="showChatCopyMenu(event,'${g.id}')">⧉</button></h3>
+          <div id="chat-thread" style="height:${chatPanelHeight}px;min-height:80px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;background:var(--bg);position:relative"><div id="chat-resize-handle" style="position:absolute;top:0;left:0;right:0;height:6px;cursor:ns-resize;background:#444;border-radius:3px 3px 0 0" data-tip="Drag to resize the feedback panel.\nDrag up to expand, drag down to shrink."></div>${thread}</div>
+          <div class="row" style="margin-top:6px;align-items:flex-start">
+            <textarea id="chat-input" placeholder="feedback for the whole review…" rows="3" onkeydown="if(event.key==='Enter'&&event.shiftKey){event.preventDefault();sendChat('${g.id}');}" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;resize:vertical;font-family:inherit;font-size:inherit" data-tip="Send a message to the guardian agent for the whole review.\nEnter inserts a newline — use Shift+Enter to send.\nThe agent can route instructions to individual branches or coordinate across the stack."></textarea>
+            <button class="btn primary" onclick="sendChat('${g.id}')" data-tip="Send this message to the guardian agent.\nPress Shift+Enter in the input field as a shortcut.">Send</button>
+          </div>`;
+        el.innerHTML = `<div class="run-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)}
+            <span style="flex:1"></span><button class="icon-btn" onclick="openReviewLogs('${g.id}')" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn runbtn" onclick="openReviewTitleMenu(event,'${g.id}')" data-tip="Review actions — cancel this review.">⋯</button></div>
+          ${mergeProgress(g)}
+          ${conflictProgress(g)}
+          ${g.run_id ? `<div class="kv-row"><span class="k">from run</span><span class="v"><a href="#" onclick="gotoRun('${g.run_id}');return false" style="color:var(--accent)" data-tip="Switch to the Tasks tab and open this run.">${esc(g.run_id)}</a></span></div>` : ""}
+          ${g.status === "collecting" && g.run_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">starts automatically when its run finishes — or start it now below</span></div>` : ""}
+          <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
+          <div class="kv-row"><span class="k">base</span>${["approved","deployed"].includes(g.status) ? `<span class="mono">${esc(g.base_branch)}</span>` : `<div style="display:flex;flex-direction:column;gap:4px"><div style="display:flex;align-items:center;gap:4px"><input type="text" id="base-input" class="mono" list="base-datalist" value="${esc(g.base_branch)}" onfocus="loadBaseBranches('${g.id}')" oninput="onBaseBranchInput('${g.id}',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="The branch every submitted branch is rebased onto.\nUsually 'main' or 'master'.\nType or use ▾ to pick from remote."><datalist id="base-datalist">${(baseBranchCache[g.id]||[]).map(b=>`<option value="${esc(b)}"></option>`).join('')}</datalist><button class="btn" style="padding:2px 6px;font-size:13px;line-height:1" onclick="loadBaseBranches('${g.id}').then(()=>{const i=document.getElementById('base-input');if(i&&i.showPicker)i.showPicker();})" data-tip="Load all branches from the remote and show them as a pick list.\nClick a branch name to fill in the base field.">▾</button></div><div id="base-error" style="display:none;color:var(--failed);font-size:11px;margin-top:2px"></div><div id="base-pending" class="row" style="display:none;gap:4px;margin-top:2px"><button class="btn primary" style="padding:2px 8px;font-size:11px" onclick="saveBase('${g.id}',document.getElementById('base-input').value)" data-tip="Save the new base branch and trigger a full rebase of the review stack.\nReruns even if the branch name is unchanged — useful when the base has new commits.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelBase('${g.id}')" data-tip="Cancel — revert the base branch input to its last saved value.">Cancel</button></div></div>`}</div>
+          ${resolverRow}
+          ${isMultiProject
+            ? `<div class="kv-row"><span class="k">projects</span><span class="v" style="display:flex;flex-direction:column;gap:2px">${(g.projects||[]).map((p) => `<span class="mono" style="font-size:11px">${esc(p)}</span>`).join("")}</span></div>`
+            : `<div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>`}
+          <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
+          ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono" style="font-size:11px">${esc(g.combined_worktree)}</span></div>` : ""}
+          ${renderChangeSummary(g)}
+          <h3 class="section">check gates</h3>${checks}${skipChecks}
+          ${g.detail?`<div class="warn">${esc(g.detail)}</div>`:""}
+          <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
+          ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
+          ${isMultiProject ? `<div class="row" style="margin-bottom:8px;gap:4px">${(g.projects||[]).map((p) => {
+              const label = p.split(/[\\/]/).filter(Boolean).pop() || p;
+              const count = g.branches.filter((b) => (b.project || g.git_root) === p).length;
+              const anyFailed = g.branches.filter((b) => (b.project || g.git_root) === p).some((b) => b.merge_status === "failed");
+              return `<span class="chip ${p === activeTab ? "active" : ""}" style="${anyFailed ? "border-color:var(--failed);" : ""}" onclick="selectProjectTab('${g.id}','${esc(p)}')" data-tip="${esc(p)}">${esc(label)} <span style="color:var(--muted);font-size:11px">(${count})</span></span>`;
+            }).join("")}</div>` : ""}
+          <div id="branch-list">${branches||'<div class="empty">none</div>'}</div>
+          ${hasPending ? `<div class="row" style="margin-top:8px;align-items:center">
+            <button class="btn primary" onclick="saveReorder('${g.id}')" data-tip="Persist the new branch order and enabled states, then re-run the rebase.\nDisabled branches are skipped in the rebase stack.">Save</button>
+            <button class="btn" onclick="discardReorder('${g.id}')" data-tip="Discard the unsaved branch reorder and enable/disable changes, reverting to the last saved state.">Discard</button>
+            <span class="k" style="text-transform:none;letter-spacing:0;color:var(--muted)">Save persists the order and enabled states, then rebases</span>
+          </div>` : ""}
+          <div class="btn-row">
+            <button class="btn primary" onclick="mergeReview('${g.id}','${g.status}')" ${["collecting","merge_failed","in_review"].includes(g.status)?"":"disabled"} data-tip="Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, or merge_failed.">Merge / rebase</button>
+            <button class="btn" onclick="approveReview('${g.id}')" ${g.status==="in_review"?"":"disabled"} data-tip="Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nOnly available when the review is in_review.">Approve</button>
+          </div>
+          ${(() => {
+            const cmds = g.manual_commands || [];
+            if (cmds.length === 0 && g.status !== "merging") return "";
+            const menuOpen = !!manualMenuOpen[g.id];
+            const menuItems = cmds.map((cmd, i) =>
+              `<div onclick="runSingleManualCheck('${g.id}',${i})" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmd)}\nLaunches in the repository root." onmouseover="this.style.background='var(--hover)'" onmouseout="this.style.background=''">${esc(cmd)}</div>`
+            ).join("");
+            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nRegenerated every time the review branch is rebuilt.">manual checks</h3>
+              ${cmds.length === 0 ? `<div class="empty">generating commands…</div>` : `<div class="btn-row" style="position:relative;gap:0">
+                <button class="btn primary" onclick="runAllManualChecks('${g.id}')" style="${cmds.length > 1 ? 'border-radius:6px 0 0 6px' : ''}" data-tip="Run all ${cmds.length} suggested manual check command(s) in a new terminal window.\nEach launches in the repository root.">▶ Run all</button>
+                ${cmds.length > 1 ? `<button class="btn" onclick="toggleManualMenu('${g.id}')" style="border-left:none;border-radius:0 6px 6px 0;padding:4px 8px" data-tip="Show individual commands — run one at a time.">▾</button>
+                ${menuOpen ? `<div style="position:absolute;top:100%;left:0;background:var(--card);border:1px solid var(--border);border-radius:6px;min-width:200px;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.4);padding:4px 0;margin-top:2px">${menuItems}</div>` : ""}` : ""}
+              </div>`}`;
+          })()}
+          ${chatSection}`;
+        const handle = document.getElementById("chat-resize-handle");
+        if (handle) {
+          handle.addEventListener("pointerdown", e => {
+            e.preventDefault();
+            handle.setPointerCapture(e.pointerId);
+            const startY = e.clientY;
+            const startH = chatPanelHeight;
+            const onMove = ev => {
+              const delta = startY - ev.clientY;
+              const min = 80, max = Math.floor(window.innerHeight * 0.8);
+              chatPanelHeight = Math.min(max, Math.max(min, startH + delta));
+              const ct = document.getElementById("chat-thread");
+              if (ct) ct.style.height = chatPanelHeight + "px";
+            };
+            const onUp = () => {
+              handle.removeEventListener("pointermove", onMove);
+              handle.removeEventListener("pointerup", onUp);
+            };
+            handle.addEventListener("pointermove", onMove);
+            handle.addEventListener("pointerup", onUp);
+          });
+        }
       }
-      // branch drag-to-reorder
+      // CCTL-135: per-branch merge detail is collapsed by default; toggle open.
+      function toggleBranch(e, gid, pos) {
+        e.stopPropagation();
+        const key = `${gid}:${pos}`;
+        if (expandedBranches.has(key)) expandedBranches.delete(key); else expandedBranches.add(key);
+        renderReviewDetail();
+      }
+      // RAL-29: switch the active project tab in a multi-project review.
+      function selectProjectTab(gid, proj) { selectedProjectTabs[gid] = proj; renderReviewDetail(); }
+      // branch drag-to-reorder + enable/disable (RAL-14/RAL-6/RAL-43).
+      // pendingReorder holds both the staged order and per-branch enabled flags.
+      // Nothing hits the server until Save, which persists both and kicks off the
+      // rebase. Discard reverts to the last server-saved state.
       let dragBranch = null;
+      let pendingReorder = null; // { gid, order: [branchName, ...], enabled: {name: bool, ...} }
       function brDragStart(e) { dragBranch = e.currentTarget.dataset.branch; e.dataTransfer.effectAllowed = "move"; }
       function brDragOver(e) { e.preventDefault(); e.currentTarget.classList.add("dragover"); }
       function brDragLeave(e) { e.currentTarget.classList.remove("dragover"); }
       function brDragEnd() { document.querySelectorAll(".branch-row.dragover").forEach((x) => x.classList.remove("dragover")); }
-      async function brDrop(e, gid) {
+      function brDrop(e, gid) {
         e.preventDefault();
         const target = e.currentTarget; target.classList.remove("dragover");
         const tgt = target.dataset.branch;
         if (!dragBranch || dragBranch === tgt) { dragBranch = null; return; }
-        const rows = [...target.parentElement.querySelectorAll(".branch-row")].map((x) => x.dataset.branch);
-        const order = rows.filter((b) => b !== dragBranch);
-        order.splice(order.indexOf(tgt), 0, dragBranch);
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) { dragBranch = null; return; }
+        const cur = (pendingReorder && pendingReorder.gid === gid) ? pendingReorder : null;
+        // Base the move on the current staged order (or the server order if none).
+        const base = cur ? cur.order.slice() : g.branches.map((b) => b.branch);
+        // Preserve any staged enabled state so a drag does not reset toggle changes.
+        const curEnabled = (cur && cur.enabled) ? cur.enabled : Object.fromEntries(g.branches.map((b) => [b.branch, b.enabled !== false]));
+        // Move-to-index: pull the dragged branch out, reinsert at the target's
+        // slot — after it when moving down, before it when moving up. So in
+        // [1,2,3], dragging 1 onto 3 yields [2,3,1] (not a no-op).
+        const from = base.indexOf(dragBranch), to = base.indexOf(tgt);
+        const order = base.filter((b) => b !== dragBranch);
+        let insertAt = order.indexOf(tgt);
+        if (from < to) insertAt += 1;
+        order.splice(insertAt, 0, dragBranch);
         dragBranch = null;
-        await fetch(`/api/guardians/${gid}/branches/reorder`, { method: "POST", body: JSON.stringify({ order }) });
+        // RAL-6: any drop stages a pending reorder. No exact-order comparison —
+        // dragging back to the original arrangement is undone via Discard, not by
+        // silently clearing the pending state here.
+        pendingReorder = { gid, order, enabled: curEnabled };
+        renderReviewDetail();
+      }
+      // RAL-43: toggle a branch's staged enabled/disabled state. Staged like a
+      // drag-reorder — nothing hits the server until Save. Preserves any pending order.
+      function toggleBranchEnabled(gid, branchName) {
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        const cur = (pendingReorder && pendingReorder.gid === gid) ? pendingReorder : null;
+        const curOrder = cur ? cur.order : g.branches.map((b) => b.branch);
+        const curEnabled = (cur && cur.enabled)
+          ? { ...cur.enabled }
+          : Object.fromEntries(g.branches.map((b) => [b.branch, b.enabled !== false]));
+        curEnabled[branchName] = !curEnabled[branchName];
+        pendingReorder = { gid, order: curOrder, enabled: curEnabled };
+        renderReviewDetail();
+      }
+      // Save (RAL-6/RAL-43): persist the staged order and enabled states, then kick
+      // off the rebase so branches are re-stacked (disabled ones skipped).
+      async function saveReorder(gid) {
+        if (!pendingReorder || pendingReorder.gid !== gid) return;
+        const order = pendingReorder.order;
+        const enabled = pendingReorder.enabled || {};
+        pendingReorder = null;
+        await fetch(`/api/guardians/${gid}/branches/reorder`, { method: "POST", body: JSON.stringify({ order, enabled }) });
+        await fetch(`/api/guardians/${gid}/merge`, { method: "POST" });
         tick();
+      }
+      // Discard (RAL-6/RAL-43): drop all unsaved local changes; the next render
+      // falls back to the last server-saved order and enabled states.
+      function discardReorder(gid) { if (pendingReorder && pendingReorder.gid !== gid) return; pendingReorder = null; renderReviewDetail(); }
+      async function sendFeedback(gid, position) {
+        const input = document.getElementById("fb-" + position);
+        const feedback = (input && input.value || "").trim();
+        if (!feedback) return;
+        if (input) input.value = "";
+        await fetch(`/api/guardians/${gid}/branches/${position}/feedback`, { method: "POST", body: JSON.stringify({ feedback }) });
+        tick();
+      }
+      // RAL-24: candidate base-branch lists, keyed by guardian id. Fetched once on
+      // focus and cleared when the user commits a base change so the next open
+      // re-fetches with the new remote scope.
+      let baseBranchCache = {};
+      // Persists the user-dragged height of the chat thread across re-renders.
+      let chatPanelHeight = 260;
+      // RAL-22: global feedback chat — a persisted triage thread per review.
+      let reviewMessages = {};
+      async function loadReviewMessages(gid, opts) {
+        try {
+          const data = await (await fetch(`/api/guardians/${gid}/messages`)).json();
+          reviewMessages[gid] = data.messages || [];
+        } catch (_) { reviewMessages[gid] = reviewMessages[gid] || []; }
+        // `silent` callers (the poll loop) re-render themselves afterwards.
+        if (!(opts && opts.silent) && selectedGuardian === gid) {
+          renderReviewDetail();
+          const ct = document.getElementById("chat-thread");
+          if (ct) ct.scrollTop = ct.scrollHeight;
+        }
+      }
+      async function sendChat(gid) {
+        const input = document.getElementById("chat-input");
+        const text = (input && input.value || "").trim();
+        if (!text) return;
+        input.value = "";
+        // Optimistically show the reviewer's message; the guardian's reply
+        // arrives via the poll loop once the triage agent finishes.
+        (reviewMessages[gid] = reviewMessages[gid] || []).push({ role: "reviewer", text, at_ms: 0 });
+        renderReviewDetail();
+        const sendCt = document.getElementById("chat-thread");
+        if (sendCt) sendCt.scrollTop = sendCt.scrollHeight;
+        await post(`/api/guardians/${gid}/chat`, { text });
+        // RAL-33: poll every 500 ms until the guardian's reply arrives (direct LLM
+        // call cuts per-message latency from ~6s to ~1-3s, so a short interval here
+        // surfaces the reply promptly without hammering the daemon).
+        const sentLen = (reviewMessages[gid] || []).length;
+        var chatPolls = 0;
+        var pollForReply = function() {
+          loadReviewMessages(gid).then(function() {
+            var replied = (reviewMessages[gid] || []).length > sentLen;
+            if (!replied && chatPolls++ < 20) setTimeout(pollForReply, 500);
+          });
+        };
+        setTimeout(pollForReply, 500);
+      }
+      function showChatCopyMenu(e, gid) {
+        e.stopPropagation();
+        const existing = document.getElementById("chat-copy-menu");
+        if (existing) { existing.remove(); return; }
+        const rect = e.currentTarget.getBoundingClientRect();
+        const menu = document.createElement("div");
+        menu.id = "chat-copy-menu";
+        menu.className = "copy-menu";
+        menu.style.top = (rect.bottom + 4) + "px";
+        menu.style.left = rect.left + "px";
+        menu.innerHTML = `<div class="copy-menu-item" onclick="copyChatAs('${gid}','markdown')">Markdown</div><div class="copy-menu-item" onclick="copyChatAs('${gid}','json')">JSON</div>`;
+        document.body.appendChild(menu);
+        setTimeout(() => document.addEventListener("click", () => { const m = document.getElementById("chat-copy-menu"); if (m) m.remove(); }, { once: true }), 0);
+      }
+      async function copyChatAs(gid, format) {
+        const menu = document.getElementById("chat-copy-menu");
+        if (menu) menu.remove();
+        const msgs = reviewMessages[gid] || [];
+        const text = format === "markdown"
+          ? msgs.map((m) => `**${m.role === "reviewer" ? "You" : "Guardian"}:** ${m.text}`).join("\n\n")
+          : JSON.stringify(msgs.map((m) => ({ role: m.role, text: m.text })), null, 2);
+        await navigator.clipboard.writeText(text);
+      }
+      // RAL-24: base-branch change dropdown — fetch branches on demand and post the change.
+      async function loadBaseBranches(gid) {
+        if (baseBranchCache[gid]) return;
+        try {
+          const data = await (await fetch(`/api/guardians/${gid}/base-branches`)).json();
+          baseBranchCache[gid] = Array.isArray(data) ? data : [];
+        } catch (_) { baseBranchCache[gid] = []; }
+        const dl = document.getElementById("base-datalist");
+        if (dl) dl.innerHTML = baseBranchCache[gid].map(b => `<option value="${esc(b)}"></option>`).join('');
+      }
+      function onBaseBranchInput(gid, val) {
+        val = val.trim();
+        const cache = baseBranchCache[gid];
+        const isInvalid = cache && cache.length > 0 && val && !cache.includes(val);
+        const inp = document.getElementById("base-input");
+        if (inp) { inp.style.borderColor = isInvalid ? "var(--failed)" : ""; inp.style.color = isInvalid ? "var(--failed)" : ""; }
+        const errEl = document.getElementById("base-error");
+        if (errEl) { errEl.textContent = isInvalid ? "Branch not found in remote — check the name." : ""; errEl.style.display = isInvalid ? "" : "none"; }
+        const pendingDiv = document.getElementById("base-pending");
+        if (pendingDiv) pendingDiv.style.display = val ? "flex" : "none";
+      }
+      async function saveBase(gid, val) {
+        val = val.trim();
+        if (!val) return;
+        const cache = baseBranchCache[gid];
+        if (cache && cache.length > 0 && !cache.includes(val)) {
+          const errEl = document.getElementById("base-error");
+          if (errEl) { errEl.textContent = "Branch not found in remote — cannot save."; errEl.style.display = ""; }
+          return;
+        }
+        delete baseBranchCache[gid];
+        await fetch(`/api/guardians/${gid}/base`, { method: "POST", body: JSON.stringify({ branch: val }) });
+        tick();
+      }
+      function cancelBase(gid) {
+        const g = guardians.find(x => x.id === gid);
+        const inp = document.getElementById("base-input");
+        if (inp && g) { inp.value = g.base_branch; inp.style.borderColor = ""; inp.style.color = ""; }
+        const errEl = document.getElementById("base-error");
+        if (errEl) { errEl.textContent = ""; errEl.style.display = "none"; }
+        const pendingDiv = document.getElementById("base-pending");
+        if (pendingDiv) pendingDiv.style.display = "none";
+      }
+      // CCTL-99: the full audit log of a review cycle (state changes + notes).
+      async function openReviewLogs(gid) {
+        const g = guardians.find((x) => x.id === gid);
+        const root = document.getElementById("modal-root");
+        root.innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw"><h2>Review log — ${esc(g ? g.name : gid)}</h2><div class="empty">Loading…</div></div></div>`;
+        let events = [];
+        try { events = await (await fetch(`/api/guardians/${gid}/logs`)).json(); } catch (_) {}
+        root.innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw">
+            <h2>Review log — ${esc(g ? g.name : gid)}</h2>
+            <div style="max-height:60vh;overflow:auto">${eventsTable(events)}</div>
+            <div class="btn-row"><button class="btn" onclick="closeModal()">Close</button></div>
+          </div></div>`;
       }
       function openCreateReview() {
         document.getElementById("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
             <h2>Create Review</h2>
             <div class="edit-form">
-              <label>name<input id="cr-name" value="my review"></label>
-              <label>base branch<input id="cr-base" value="main"></label>
-              <label>git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
-              <label>checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
+              <label data-tip="Display name for this review — shown in the sidebar list.">name<input id="cr-name" value="my review"></label>
+              <label data-tip="Review type. 'git' stacks branches via rebase with AI conflict resolution. Other types are placeholders.">type<select id="cr-type" onchange="onReviewTypeChange()"><option value="git">git</option><option value="document">document (placeholder)</option></select></label>
+              <div id="cr-git-fields">
+                <label data-tip="The branch that every submitted branch is ultimately rebased onto. Usually 'main' or 'master'.">base branch<input id="cr-base" value="main"></label>
+                <label data-tip="Absolute path to the git repository root on this machine. The daemon checks out worktrees here.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
+                <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip running check gates during this review. Gates are still stored — you can re-enable them later."><input type="checkbox" id="cr-skip-checks" style="width:auto;margin:0">skip build/check verification</label>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Use one shared worktree for the entire stack instead of per-branch worktrees. Faster for large repos."><input type="checkbox" id="cr-skip-worktrees" style="width:auto;margin:0">skip per-branch worktrees (large repos)</label>
+              </div>
+              <div id="cr-other-fields" class="hidden"><div class="empty" style="margin:12px 0">No extra fields for this review type yet.</div></div>
             </div>
             <div id="cr-err" class="verr"></div>
             <div class="btn-row"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="createReview()">Create</button></div>
           </div></div>`;
       }
+      // CCTL-112: reviews are schema-based; the type dropdown toggles which
+      // fields are shown (git-specific fields for `git`, a generic state else).
+      function onReviewTypeChange() {
+        const isGit = document.getElementById("cr-type").value === "git";
+        document.getElementById("cr-git-fields").classList.toggle("hidden", !isGit);
+        document.getElementById("cr-other-fields").classList.toggle("hidden", isGit);
+      }
       async function createReview() {
         const v = (id) => document.getElementById(id).value.trim();
+        const review_type = document.getElementById("cr-type").value;
+        if (review_type !== "git") {
+          document.getElementById("cr-err").textContent = "only git reviews can be created here for now";
+          return;
+        }
         const checks = v("cr-checks") ? v("cr-checks").split(",").map((s) => s.trim()).filter(Boolean) : [];
-        const body = { name: v("cr-name"), base_branch: v("cr-base"), git_root: v("cr-root"), checks };
+        const skip_checks = document.getElementById("cr-skip-checks").checked;
+        const skip_worktrees = document.getElementById("cr-skip-worktrees").checked;
+        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), git_root: v("cr-root"), checks, skip_checks, skip_worktrees };
         if (!body.git_root) { document.getElementById("cr-err").textContent = "git root is required"; return; }
         const resp = await fetch("/api/guardians", { method: "POST", body: JSON.stringify(body) });
         if (!resp.ok) { document.getElementById("cr-err").textContent = "create failed"; return; }
         const g = await resp.json(); selectedGuardian = g.id; closeModal(); tick();
       }
-      async function addBranch(id) {
-        const b = document.getElementById("add-branch").value.trim(); if (!b) return;
-        await fetch(`/api/guardians/${id}/branches`, { method: "POST", body: JSON.stringify({ branch: b }) }); tick();
+      async function setSkipChecks(id, skip) {
+        await fetch(`/api/guardians/${id}/settings`, { method: "POST", body: JSON.stringify({ skip_checks: skip }) });
+        tick();
       }
-      async function mergeReview(id) { await fetch(`/api/guardians/${id}/merge`, { method: "POST" }); tick(); }
+      async function setSkipWorktrees(id, skip) {
+        await fetch(`/api/guardians/${id}/settings`, { method: "POST", body: JSON.stringify({ skip_worktrees: skip }) });
+        tick();
+      }
+      async function mergeReview(id, status) {
+        if (status === "in_review" || status === "merging") {
+          if (!confirm("There is a rebase currently in progress. Do you want to cancel it and start another?")) return;
+          await fetch(`/api/guardians/${id}/cancel_and_merge`, { method: "POST" });
+        } else {
+          await fetch(`/api/guardians/${id}/merge`, { method: "POST" });
+        }
+        tick();
+      }
       async function approveReview(id) { await fetch(`/api/guardians/${id}/approve`, { method: "POST" }); tick(); }
 
+      // ---------- manual review commands (RAL-27) ----------
+      function toggleManualMenu(id) {
+        manualMenuOpen[id] = !manualMenuOpen[id];
+        renderReviewDetail();
+      }
+      async function runAllManualChecks(id) {
+        await fetch(`/api/guardians/${id}/run-manual-commands`, { method: "POST", body: "{}" });
+      }
+      async function runSingleManualCheck(id, index) {
+        manualMenuOpen[id] = false;
+        renderReviewDetail();
+        await fetch(`/api/guardians/${id}/run-manual-commands`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ index }),
+        });
+      }
+
+      // ---------- review-ready banner (CCTL-145) ----------
+      // A guardian in `in_review` has its stack built and all check gates passed —
+      // the "ready to act on" signal. Show a dismissible banner that jumps to it.
+      function renderReadyBanner() {
+        const el = document.getElementById("ready-banner");
+        if (!el) return;
+        const ready = (guardians || []).filter((g) => g.status === "in_review" && !dismissedReady.has(g.id));
+        el.innerHTML = ready.map((g) => `<div class="ready-banner">
+            <span>✅ Review <b>${esc(g.name)}</b> is ready.</span>
+            <a href="#" onclick="gotoReview('${g.id}');return false" data-tip="Open this review on the Reviews tab to approve or inspect it.">Open review →</a>
+            <span style="flex:1"></span>
+            <button class="icon-btn" onclick="dismissReady('${g.id}')" data-tip="Dismiss this banner. You can still open the review from the Reviews tab.">✕</button>
+          </div>`).join("");
+      }
+      function dismissReady(id) {
+        dismissedReady.add(id);
+        localStorage.setItem("ralphus-dismissed-ready", JSON.stringify([...dismissedReady]));
+        renderReadyBanner();
+      }
+      async function refreshBanner() {
+        // On the reviews tab `guardians` is already fresh; elsewhere fetch it.
+        if (tab !== "reviews") { try { guardians = await (await fetch("/api/guardians")).json(); } catch (_) {} }
+        if (!userIsSelecting()) renderReadyBanner();
+      }
+
       // ---------- polling ----------
-      function renderAll() { renderRuns(); renderGraph(); renderDetails(); }
-      async function tick() { tab === "reviews" ? await pollReviews() : await pollTasks(); }
+      // Wraps a renderFn call with smart scroll for #chat-thread: if the user
+      // was at the bottom before render and a new message arrived, scrolls to
+      // the top of that new message. Otherwise leaves scroll position alone.
+      function applyChatSmartScroll(renderFn) {
+        const ct = document.getElementById("chat-thread");
+        const oldCount = ct ? ct.querySelectorAll(".chat-msg").length : 0;
+        let atBottom = false;
+        if (ct) {
+          const lastEl = ct.lastElementChild;
+          const threshold = (lastEl && lastEl.offsetHeight) || 30;
+          atBottom = ct.scrollTop + ct.clientHeight >= ct.scrollHeight - threshold;
+        }
+        renderFn();
+        const newCt = document.getElementById("chat-thread");
+        if (!newCt || !atBottom) return;
+        const newMsgs = newCt.querySelectorAll(".chat-msg");
+        if (newMsgs.length > oldCount) {
+          newCt.scrollTop = newMsgs[oldCount].offsetTop;
+        } else {
+          newCt.scrollTop = newCt.scrollHeight;
+        }
+      }
+      // RAL-7: the 2s poll re-renders panes via `el.innerHTML = …`, which resets
+      // scroll position and wipes in-progress text in a pane's inputs. Captures
+      // the user's scroll position and focused field beforehand and restores them
+      // after render — live updates keep flowing without clobbering typing.
+      function preserveUserState(el, render) {
+        if (!el) { render(); return; }
+        const active = document.activeElement;
+        const focused = active && el.contains(active) && active.id ? active : null;
+        const fId = focused ? focused.id : null;
+        const fVal = focused && "value" in focused ? focused.value : null;
+        const fStart = focused && "selectionStart" in focused ? focused.selectionStart : null;
+        const fEnd = focused && "selectionEnd" in focused ? focused.selectionEnd : null;
+        // `el` survives the innerHTML swap (only its children are replaced), so
+        // keep the ref; descendant scrollers are recreated, so re-find by id.
+        const scrolls = [];
+        if (el.scrollTop) scrolls.push([el, el.scrollTop]);
+        el.querySelectorAll("[id]").forEach((n) => { if (n.scrollTop) scrolls.push([n.id, n.scrollTop]); });
+        render();
+        for (const [ref, top] of scrolls) {
+          const n = typeof ref === "string" ? document.getElementById(ref) : ref;
+          if (n) n.scrollTop = top;
+        }
+        if (fId) {
+          const n = document.getElementById(fId);
+          if (n) {
+            if (fVal != null && "value" in n) n.value = fVal;
+            n.focus({ preventScroll: true });
+            if (fStart != null && n.setSelectionRange) { try { n.setSelectionRange(fStart, fEnd); } catch (_) {} }
+          }
+        }
+      }
+      // RAL-7 (follow-up): an innerHTML swap also destroys an active text
+      // selection — highlighting a read-only worktree path or prompt text gets
+      // wiped every tick. While the user has a live selection (a DOM range, or a
+      // non-collapsed range inside a focused input/textarea) anywhere on the
+      // page, skip the periodic re-renders entirely so the selection survives;
+      // the next tick after they release it refreshes normally.
+      function userIsSelecting() {
+        const a = document.activeElement;
+        if (a && "selectionStart" in a && a.selectionStart != null && a.selectionStart !== a.selectionEnd) return true;
+        const s = window.getSelection && window.getSelection();
+        return !!(s && !s.isCollapsed && String(s).length);
+      }
+      function renderAll() { renderRuns(); renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); }
+      async function tick() {
+        if (tab === "reviews") await pollReviews();
+        else if (tab === "resources") await pollResources();
+        else await pollTasks();
+        await refreshBanner();
+      }
       async function pollTasks() {
         try {
           const d = await (await fetch("/api/tasks")).json();
           document.getElementById("conn").className = "dot on";
+          window._daemonStatus = d.daemon;
           document.getElementById("running").textContent = `Running ${d.daemon.running ?? 0} / ${d.daemon.max_concurrent ?? 0}`;
           document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
           runs = d.runs || [];
           if (pendingHash && pendingHash.runId && findRun(pendingHash.runId)) {
             const want = pendingHash; pendingHash = null;
             selectedRunId = want.runId;
-            if (want.sel) { const [k, ti, si] = want.sel.split(":"); sel = { kind: k, taskIdx: +ti || 0, sessionIdx: +si || 0 }; }
+            if (want.sel) { const [k, ti, si, vi] = want.sel.split(":"); sel = { kind: k, taskIdx: +ti || 0, sessionIdx: +si || 0, verifyIdx: vi !== undefined ? +vi : -1 }; }
             else sel = { kind: "run", taskIdx: 0, sessionIdx: 0 };
             renderSortChips(); renderStatusFilters(); renderAll();
           } else if (!selectedRunId && runs.length) { pendingHash = null; selectRun(runs[0].id); }
+          else if (userIsSelecting()) { /* keep the user's text selection intact */ }
           else if (!editing) renderAll();
           else renderRuns();
         } catch (e) { document.getElementById("conn").className = "dot off"; document.getElementById("updated").textContent = "daemon unreachable"; }
@@ -759,18 +1838,123 @@
         try {
           guardians = await (await fetch("/api/guardians")).json();
           document.getElementById("conn").className = "dot on";
+          if (pendingHash && pendingHash.tab === "reviews") {
+            if (pendingHash.guardianId) selectedGuardian = pendingHash.guardianId;
+            pendingHash = null;
+          }
           if (!selectedGuardian && guardians.length) selectedGuardian = guardians[0].id;
-          renderReviews(); renderReviewDetail();
+          syncHash();  // keep URL in sync with selectedGuardian (replaceState)
+          // Keep the selected review's feedback thread fresh (RAL-22) so the
+          // guardian's async replies appear without a manual refresh.
+          if (selectedGuardian) await loadReviewMessages(selectedGuardian, { silent: true });
+          if (!userIsSelecting()) { renderReviews(); applyChatSmartScroll(() => preserveUserState(document.getElementById("review-detail"), renderReviewDetail)); }
         } catch (e) { document.getElementById("conn").className = "dot off"; }
+      }
+
+      // ---------- resource usage (RAL-11) ----------
+      async function pollResources() {
+        try {
+          const d = await (await fetch("/api/resources")).json();
+          document.getElementById("conn").className = "dot on";
+          document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          resources = d.resources || [];
+          if (!userIsSelecting()) renderResources();
+        } catch (e) { document.getElementById("conn").className = "dot off"; document.getElementById("updated").textContent = "daemon unreachable"; }
+      }
+      const RES_COLS = [
+        { key: "task", label: "Task", tip: "Task name and session ID. Click to sort alphabetically.", get: (r) => (r.task_name || "") + " / " + (r.session_id || "") },
+        { key: "cpu", label: "CPU", tip: "CPU usage of the runner process and its children. Click to sort — highest first.", get: (r) => r.cpu_percent },
+        { key: "ram", label: "RAM", tip: "RAM usage of the runner process and its children. Click to sort — highest first.", get: (r) => r.mem_bytes },
+        { key: "gpu", label: "GPU", tip: "GPU memory usage. Only available if the process uses CUDA/ROCm. Click to sort — highest first.", get: (r) => r.gpu_mem_bytes },
+      ];
+      const fmtPct = (v) => v == null ? "N/A" : v.toFixed(1) + "%";
+      const fmtBytes = (v) => {
+        if (v == null) return "N/A";
+        const u = ["B", "KB", "MB", "GB", "TB"];
+        let i = 0, n = v;
+        while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+        return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
+      };
+      function setResSort(key) {
+        if (resSort.key === key) resSort.dir *= -1;
+        else resSort = { key, dir: key === "task" ? 1 : -1 };
+        renderResources();
+      }
+      function sortedResources() {
+        const col = RES_COLS.find((c) => c.key === resSort.key) || RES_COLS[1];
+        return [...resources].sort((a, b) => {
+          const va = col.get(a), vb = col.get(b);
+          // Missing metrics (N/A) always sort to the bottom regardless of direction.
+          if (va == null && vb == null) return 0;
+          if (va == null) return 1;
+          if (vb == null) return -1;
+          const cmp = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+          return resSort.dir * cmp;
+        });
+      }
+      function renderResources() {
+        const el = document.getElementById("resources");
+        document.getElementById("res-summary").textContent =
+          `${resources.length} running ${resources.length === 1 ? "task" : "tasks"}`;
+        if (!resources.length) { el.innerHTML = `<div class="empty">No running tasks.</div>`; return; }
+        const arrow = (key) => resSort.key === key ? (resSort.dir < 0 ? " ↓" : " ↑") : "";
+        const head = RES_COLS.map((c) =>
+          `<th class="${resSort.key === c.key ? "sorted" : ""}" onclick="setResSort('${c.key}')" data-tip="${esc(c.tip)}">${c.label}${arrow(c.key)}</th>`
+        ).join("") + `<th data-tip="Jump to the session in the Tasks tab."></th>`;
+        const rows = sortedResources().map((r) => `<tr>
+            <td>${esc(r.task_name)} <span style="color:var(--muted)">/ ${esc(r.session_id)}</span><div style="color:var(--muted);font-size:11px">${esc(r.run_label || r.run_id)} · pid ${r.pid}</div></td>
+            <td>${fmtPct(r.cpu_percent)}</td>
+            <td>${fmtBytes(r.mem_bytes)}</td>
+            <td>${fmtBytes(r.gpu_mem_bytes)}</td>
+            <td><button class="res-jump" onclick="jumpToTask('${esc(r.run_id)}',${r.task_idx},${r.session_idx})" data-tip="Switch to the Tasks tab and scroll to this exact running session.">Go to task →</button></td>
+          </tr>`).join("");
+        el.innerHTML = `<table class="res-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+      }
+      // Jump straight to the exact running session in the Tasks tab and scroll to it.
+      function jumpToTask(runId, ti, si) {
+        if (findRun(runId)) {
+          selectedRunId = runId;
+          sel = { kind: "session", taskIdx: +ti, sessionIdx: +si, verifyIdx: -1 };
+          editing = false;
+        } else {
+          pendingHash = { runId, sel: `session:${ti}:${si}` };
+        }
+        showTab("tasks", true);
+        setTimeout(() => document.getElementById(`n-${ti}-${si}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
       }
 
       document.addEventListener("keydown", (e) => {
         if (e.key === "Escape") closeModal();
         else if ((e.key === "l" || e.key === "L") && tab === "tasks" && !/input|textarea/i.test((e.target.tagName || ""))) openLogs();
       });
+      window.addEventListener("popstate", () => {
+        _inPopstate = true;
+        try {
+          const h = parseHash();
+          if (!h || h.tab === "tasks") {
+            if (h && h.runId) {
+              if (findRun(h.runId)) {
+                selectedRunId = h.runId;
+                if (h.sel) { const [k, ti, si, vi] = h.sel.split(":"); sel = { kind: k, taskIdx: +ti || 0, sessionIdx: +si || 0, verifyIdx: vi !== undefined ? +vi : -1 }; }
+                else sel = { kind: "run", taskIdx: 0, sessionIdx: 0 };
+              } else { pendingHash = h; }
+            }
+            renderSortChips(); renderStatusFilters();
+            showTab("tasks");
+          } else if (h.tab === "reviews") {
+            if (h.guardianId) selectedGuardian = h.guardianId;
+            showTab("reviews");
+          } else if (h.tab === "resources") {
+            showTab("resources");
+          }
+        } finally {
+          _inPopstate = false;
+        }
+      });
       pendingHash = parseHash();
       renderStatusFilters(); renderSortChips();
-      if (pendingHash && pendingHash.tab === "reviews") { pendingHash = null; showTab("reviews"); }
+      if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId
+      else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }
       else { tick(); }
       setInterval(tick, 2000);
     </script>

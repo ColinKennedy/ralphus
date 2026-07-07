@@ -16,6 +16,10 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Serve { port } => {
+            if let Err(e) = ralphus_auth::check_license() {
+                eprintln!("Authorization error: {e}");
+                return ExitCode::FAILURE;
+            }
             let daemon_url = std::env::var("RALPHUS_DAEMON_URL")
                 .unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string());
             eprintln!(

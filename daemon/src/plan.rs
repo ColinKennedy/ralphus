@@ -121,11 +121,17 @@ mod tests {
             task_name: format!("task{task_idx}"),
             session_id: id.to_string(),
             cwd: Some(".".to_string()),
+            subprojects: vec![],
             prompt: None,
             command: Some("do".to_string()),
             agent: "claude".to_string(),
             model: None,
+            system_prompt: None,
+            system_prompt_position: None,
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
+            timeout_sec: None,
+            budget_tokens: None,
+            upstream: None,
         }
     }
 

@@ -110,6 +110,21 @@ class DaemonClient:
         result: dict[str, Any] = self._post(f"/api/runs/{run_id}/cancel")
         return result
 
+    def clear(
+        self, *, states: list[str] | None = None, keep_temporary: bool = False
+    ) -> dict[str, Any]:
+        """Bulk-clear tasks and reviews.
+
+        With no ``states`` filter this wipes everything and resets id sequences;
+        a non-empty ``states`` list deletes only runs in those states. Returns
+        ``{runs_deleted, guardians_deleted, worktrees_purged}``.
+        """
+        payload: dict[str, Any] = {"keep_temporary": keep_temporary}
+        if states:
+            payload["states"] = states
+        result: dict[str, Any] = self._post("/api/clear", payload)
+        return result
+
 
 def _extract_error_message(body: Any) -> str | None:
     if isinstance(body, dict):
