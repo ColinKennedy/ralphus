@@ -136,7 +136,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     };
 
     for key in table.keys() {
-        if key != "default" && key != "task" {
+        if key != "default" && key != "task" && key != "review" {
             let line = ctx.idx.find_toplevel_key(ctx.raw, key);
             ctx.error(
                 key,
@@ -149,6 +149,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
 
     validate_defaults(table.get("default"), &mut ctx);
     validate_tasks(table.get("task"), &mut ctx);
+    validate_review_blocks(table.get("review"), &mut ctx);
 
     report
 }
@@ -189,7 +190,8 @@ const SESSION_KEYS: &[&str] = &[
     "review",
     "upstream",
 ];
-const REVIEW_KEYS: &[&str] = &["id", "name", "base", "agent", "model"];
+const REVIEW_KEYS: &[&str] = &["id", "name", "agent", "model", "action"];
+const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command"];
 const VERIFY_KEYS: &[&str] = &[
     "id",
     "command",
@@ -523,8 +525,9 @@ fn validate_sessions(
         check_type(ctx, table, "upstream", Ty::Str, &path, header);
         check_upstream(ctx, table, &path, header);
 
+        check_type(ctx, table, "review", Ty::Str, &path, header);
+
         validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
-        validate_review_array(table.get("review"), &format!("{path}.review"), ctx);
     }
 
     check_session_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
@@ -627,41 +630,40 @@ fn check_system_prompt(
     }
 }
 
-/// Validate `[[task.session.review]]` entries. Only the TOML shape is checked
-/// here (keys, types, non-empty `base`); whether a `<<upstream>>` base actually
-/// resolves against the worktree is a git-aware daemon preflight, not a pure
-/// check — see `REVIEWS.local.md`.
-fn validate_review_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+/// Validate top-level `[[review]]` blocks. Only the TOML shape is checked here;
+/// whether a session's `review` id actually matches a declared review is a
+/// daemon-level preflight.
+fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
-            path,
+            "review",
             ErrorKind::WrongType,
-            "review must be an array of tables",
+            "[[review]] must be an array of tables",
             None,
         );
         return;
     };
     for (r, item) in arr.iter().enumerate() {
-        let rpath = format!("{path}[{r}]");
+        let rpath = format!("review[{r}]");
         let Some(table) = item.as_table() else {
             ctx.error(
                 &rpath,
                 ErrorKind::WrongType,
-                "each review must be a table",
+                "each [[review]] must be a table",
                 None,
             );
             continue;
         };
-        unknown_keys(ctx, table, REVIEW_KEYS, &rpath, None);
-        check_type(ctx, table, "id", Ty::Str, &rpath, None);
-        check_type(ctx, table, "name", Ty::Str, &rpath, None);
-        check_type(ctx, table, "base", Ty::Str, &rpath, None);
-        check_type(ctx, table, "agent", Ty::Str, &rpath, None);
-        check_type(ctx, table, "model", Ty::Str, &rpath, None);
+        let header = ctx.idx.review_line(r);
+        unknown_keys(ctx, table, REVIEW_KEYS, &rpath, header);
+        check_type(ctx, table, "id", Ty::Str, &rpath, header);
+        check_type(ctx, table, "name", Ty::Str, &rpath, header);
+        check_type(ctx, table, "agent", Ty::Str, &rpath, header);
+        check_type(ctx, table, "model", Ty::Str, &rpath, header);
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
-        // `ralphus:new-review/<key>` with a non-empty slug key. Any session that
-        // repeats the same key links to one shared review.
+        // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
+        // that repeats the same key attaches to one shared guardian.
         if let Some(id) = table.get("id").and_then(toml::Value::as_str) {
             if id.starts_with("ralphus:") {
                 let ok = crate::schema::review_link_key(id).is_some_and(|key| {
@@ -678,14 +680,73 @@ fn validate_review_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
                 }
             }
         }
-        if let Some(base) = table.get("base").and_then(toml::Value::as_str) {
-            if base.trim().is_empty() {
-                ctx.error(
-                    &format!("{rpath}.base"),
-                    ErrorKind::InvalidValue,
-                    "review 'base' must not be empty (a branch name or the '<<upstream>>' sentinel)",
-                    None,
-                );
+        validate_review_action_array(table.get("action"), &format!("{rpath}.action"), ctx);
+    }
+}
+
+/// Validate `[[review.action]]` entries. Each entry must have `label` plus exactly
+/// one of `prompt` or `command`.
+fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(arr) = value.as_array() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "[[review.action]] must be an array of tables",
+            None,
+        );
+        return;
+    };
+    for (a, item) in arr.iter().enumerate() {
+        let apath = format!("{path}[{a}]");
+        let Some(table) = item.as_table() else {
+            ctx.error(
+                &apath,
+                ErrorKind::WrongType,
+                "each [[review.action]] must be a table",
+                None,
+            );
+            continue;
+        };
+        unknown_keys(ctx, table, REVIEW_ACTION_KEYS, &apath, None);
+
+        // `label` is required.
+        match table.get("label") {
+            None => ctx.error(
+                &apath,
+                ErrorKind::MissingRequired,
+                "review action requires a 'label'",
+                None,
+            ),
+            Some(v) if !v.is_str() => check_type(ctx, table, "label", Ty::Str, &apath, None),
+            Some(toml::Value::String(s)) if s.trim().is_empty() => ctx.error(
+                &format!("{apath}.label"),
+                ErrorKind::InvalidValue,
+                "review action 'label' must not be empty",
+                None,
+            ),
+            Some(_) => {}
+        }
+
+        // Exactly one of `prompt` or `command` is required.
+        let has_prompt = table.contains_key("prompt");
+        let has_command = table.contains_key("command");
+        match (has_prompt, has_command) {
+            (true, true) => ctx.error(
+                &apath,
+                ErrorKind::ConflictingKeys,
+                "review action cannot set both 'prompt' and 'command'; use exactly one",
+                None,
+            ),
+            (false, false) => ctx.error(
+                &apath,
+                ErrorKind::MissingRequired,
+                "review action requires either 'prompt' or 'command'",
+                None,
+            ),
+            _ => {
+                check_type(ctx, table, "prompt", Ty::Str, &apath, None);
+                check_type(ctx, table, "command", Ty::Str, &apath, None);
             }
         }
     }
@@ -894,6 +955,7 @@ fn check_restart_grammar(spec: &str) -> Result<(), String> {
 struct HeaderIndex {
     default_lines: Vec<u32>,
     task_lines: Vec<u32>,
+    review_lines: Vec<u32>,
     /// (task_idx, session_idx) -> line
     session_lines: HashMap<(usize, usize), u32>,
 }
@@ -902,6 +964,7 @@ impl HeaderIndex {
     fn scan(raw: &str) -> Self {
         let mut default_lines = Vec::new();
         let mut task_lines = Vec::new();
+        let mut review_lines = Vec::new();
         let mut session_lines = HashMap::new();
         let mut cur_task: isize = -1;
         let mut cur_session: isize = -1;
@@ -923,12 +986,14 @@ impl HeaderIndex {
                         session_lines.insert((t, s), ln);
                     }
                 }
+                Some("[[review]]") => review_lines.push(ln),
                 _ => {}
             }
         }
         Self {
             default_lines,
             task_lines,
+            review_lines,
             session_lines,
         }
     }
@@ -939,6 +1004,10 @@ impl HeaderIndex {
 
     fn task_line(&self, t: usize) -> Option<u32> {
         self.task_lines.get(t).copied()
+    }
+
+    fn review_line(&self, r: usize) -> Option<u32> {
+        self.review_lines.get(r).copied()
     }
 
     fn session_line(&self, t: usize, s: usize) -> Option<u32> {
@@ -1252,8 +1321,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn review_block_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"be\"\nbase=\"<<upstream>>\"\n";
+    fn toplevel_review_block_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"be\"\n[[review]]\nid=\"be\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1262,8 +1331,80 @@ command = "cargo build"
     }
 
     #[test]
+    fn review_with_action_command_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run tests\"\ncommand=\"cargo test\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn review_with_action_prompt_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check UI\"\nprompt=\"Open localhost:3000 and verify the wizard\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn review_action_both_prompt_and_command_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\nprompt=\"do x\"\ncommand=\"do y\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::ConflictingKeys),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_missing_both_prompt_and_command_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("prompt")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_missing_label_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\ncommand=\"cargo test\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("label")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_unknown_key_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nfoo=\"bar\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownKey && e.message.contains("foo")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn review_link_placeholder_id_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"ralphus:new-review/ral-batch\"\nbase=\"main\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"ralphus:new-review/ral-batch\"\n[[review]]\nid=\"ralphus:new-review/ral-batch\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1274,7 +1415,7 @@ command = "cargo build"
     #[test]
     fn malformed_review_link_id_reported() {
         // Right scheme, but empty key after the slash.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"ralphus:new-review/\"\nbase=\"main\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=\"ralphus:new-review/\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1288,7 +1429,7 @@ command = "cargo build"
     #[test]
     fn wrong_scheme_review_link_id_reported() {
         // `ralphus:` scheme but not the `new-review/` form.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"ralphus:review/xyz\"\nbase=\"main\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=\"ralphus:review/xyz\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1301,7 +1442,7 @@ command = "cargo build"
 
     #[test]
     fn review_unknown_key_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nbranch=\"x\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nbranch=\"x\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1311,21 +1452,34 @@ command = "cargo build"
     }
 
     #[test]
-    fn review_empty_base_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nbase=\"\"\n";
+    fn review_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=123\n";
         let r = validate_toml(src);
+        assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
+    fn session_review_must_be_string_not_table() {
+        // Old format [[task.session.review]] must fail: review on session is now a string.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"x\"\n";
+        let r = validate_toml(src);
+        // The session's review field is now a string; an array-of-tables value is WrongType.
         assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
+            "old [[task.session.review]] format must be rejected: {:?}",
             r.errors
-                .iter()
-                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("base"))
         );
     }
 
     #[test]
-    fn review_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=123\n";
-        let r = validate_toml(src);
-        assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    fn review_without_action_block_works_identically() {
+        // A [[review]] with no [[review.action]] sub-blocks must still validate.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nagent=\"claude\"\nmodel=\"claude-opus-4-8\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
     }
 
     #[test]

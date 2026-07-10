@@ -109,6 +109,8 @@
       .p-cancelled { color: var(--cancelled); }
       .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
       .p-in_progress { color: var(--running); border-color: var(--running); }
+      .p-ready { color: var(--teal); border-color: var(--teal); }
+      .badge.ready { color: var(--teal); border-color: var(--teal); }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
 
       .detail-pane { padding: 16px 18px; }
@@ -286,6 +288,9 @@
       })();
 
       const STATES = ["running","done","failed","pending","queued","cancelled"];
+      const RUN_STATES = ["queued","pending","running","done","failed","cancelled"];
+      const NODE_STATES = ["pending","running","done","failed","cancelled"];
+      const IRREVERSIBLE_STATES = new Set(["done","failed","cancelled"]);
       let tab = "tasks";
       let runs = [], guardians = [];
       let resources = [];
@@ -301,8 +306,11 @@
       let manualMenuOpen = {};            // gid -> bool, whether the manual-checks dropdown is open
       let dismissedReady = new Set(JSON.parse(localStorage.getItem("ralphus-dismissed-ready") || "[]"));
       let multiSel = new Set();   // multi-selected run ids (multi mode when size > 1)
+      let _statusPickerItems = null; // [{runId,kind,taskIdx,sessionIdx,verifyIdx,verifyScope,label}]
       let anchorId = null;        // anchor for shift-range selection
       let runPaths = {};          // runId -> { "ti:si": {worktree, project} }, lazily loaded (CCTL-148)
+      let worktreeMenuOpen = {};  // "gid:pos" -> bool, worktree sessions dropdown open (RAL-71)
+      let selectedBranch = {};   // gid -> branch name, the currently selected branch in the review pane
 
       // ---------- helpers ----------
       const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -510,6 +518,7 @@
         if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="retryRun('${id}')" data-tip="Re-run with the same parameters.\nA succeeded run will prompt for extra confirmation since it may duplicate side effects.">↻ Retry</div>`);
         if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="restartRun('${id}')" data-tip="Re-run this run and mark all downstream runs as dirty so they re-run too.\nThis cannot be undone.">⟳ Restart + downstream</div>`);
         if (!["done", "failed", "cancelled"].includes(r.state)) items.push(`<div onclick="runMenuAct('${id}','cancel')" data-tip="Cancel this run — stops all running sessions and marks the run as cancelled.">■ Cancel</div>`);
+        items.push(`<div onclick="event.stopPropagation();closeRunMenu();openStatusPickerForRun(event,'${id}')" data-tip="Manually override this run's status — any valid state can be set regardless of current state.\nA confirmation dialog will appear before applying.\nThis cannot be undone for terminal states (done/failed/cancelled).">⚙ Set Status</div>`);
         items.push(`<div class="danger" onclick="deleteRun('${id}')" data-tip="Delete this run and all its data permanently.\nThis cannot be undone.">🗑 Delete</div>`);
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "run-menu"; menu.innerHTML = items.join("");
@@ -573,12 +582,120 @@
           alert('Failed to open terminal: network error');
         }
       }
+      async function openVerifyTerminal(runId, taskIdx, scope, sessionIdx, verifyIdx, mode) {
+        try {
+          const resp = await fetch(`/api/runs/${runId}/verifies/${taskIdx}/${scope}/${sessionIdx}/${verifyIdx}/open-terminal?mode=${mode}`, {method:'POST'});
+          if (!resp.ok) {
+            const e = await resp.json().catch(() => ({}));
+            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+          }
+        } catch (_) {
+          alert('Failed to open terminal: network error');
+        }
+      }
+      async function openGuardianBranchTerminal(guardianId, pos, mode) {
+        try {
+          const resp = await fetch(`/api/guardians/${guardianId}/branches/${pos}/open-terminal?mode=${mode}`, {method:'POST'});
+          if (!resp.ok) {
+            const e = await resp.json().catch(() => ({}));
+            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+          }
+        } catch (_) {
+          alert('Failed to open terminal: network error');
+        }
+      }
       function closeGraphMenu() { const m = document.getElementById("graph-node-menu"); if (m) m.remove(); }
       document.addEventListener("click", closeGraphMenu);
+
+      // ---- Set Status picker (RAL-74) ----
+      // Floating ctx-menu showing valid states. stopPropagation on the trigger click
+      // prevents the document listener from immediately closing the just-opened picker.
+      function closeStatusPicker() { const m = document.getElementById("status-picker"); if (m) m.remove(); }
+      document.addEventListener("click", closeStatusPicker);
+
+      function openStatusPicker(e, items) {
+        closeStatusPicker();
+        _statusPickerItems = items;
+        const allRuns = items.every(i => i.kind === "run");
+        const states = allRuns ? RUN_STATES : NODE_STATES;
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "status-picker";
+        menu.innerHTML = `<div style="color:var(--muted);font-size:11px;padding:3px 10px 6px;text-transform:uppercase;letter-spacing:.5px">Set status to…</div>`
+          + states.map(s =>
+            `<div onclick="doPickStatus('${s}')" data-tip="Set status to ${s}.${IRREVERSIBLE_STATES.has(s) ? "\nThis cannot be undone." : ""}">${sdot(s)} ${s}</div>`
+          ).join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 220) + "px";
+      }
+      async function doPickStatus(state) {
+        closeStatusPicker();
+        const items = _statusPickerItems; if (!items || !items.length) return;
+        const isDestructive = IRREVERSIBLE_STATES.has(state);
+        let msg = items.length > 1
+          ? `Set ${items.length} items to "${state}"?\n\n${items.map(i => "• " + i.label).join("\n")}`
+          : `Set "${items[0].label}" to "${state}"?`;
+        if (isDestructive) msg += "\n\nThis cannot be undone.";
+        if (!confirm(msg)) return;
+        for (const item of items) {
+          try {
+            await post(`/api/runs/${item.runId}/set-status`, {
+              kind: item.kind, task_idx: item.taskIdx, session_idx: item.sessionIdx,
+              verify_idx: item.verifyIdx, verify_scope: item.verifyScope, state
+            });
+          } catch (_) {}
+        }
+        tick();
+      }
+      function openStatusPickerForRun(e, id) {
+        const r = findRun(id); if (!r) return;
+        openStatusPicker(e, [{runId: id, kind: "run", taskIdx: 0, sessionIdx: -1, verifyIdx: -1, verifyScope: "", label: r.label || id}]);
+      }
+      function openStatusPickerForTask(e, runId, ti) {
+        const r = findRun(runId); if (!r) return;
+        const t = r.tasks[ti]; if (!t) return;
+        openStatusPicker(e, [{runId, kind: "task", taskIdx: ti, sessionIdx: -1, verifyIdx: -1, verifyScope: "", label: t.name}]);
+      }
+      function openStatusPickerForSession(e, runId, ti, si) {
+        const r = findRun(runId); if (!r) return;
+        const s = r.tasks[ti]?.sessions[si]; if (!s) return;
+        openStatusPicker(e, [{runId, kind: "session", taskIdx: ti, sessionIdx: si, verifyIdx: -1, verifyScope: "", label: s.name ?? s.id}]);
+      }
+      function openStatusPickerForVerify(e, runId, ti, si, vi) {
+        const r = findRun(runId); if (!r) return;
+        const isTask = si < 0;
+        const v = isTask ? r.tasks[ti]?.verify[vi] : r.tasks[ti]?.sessions[si]?.verify[vi];
+        if (!v) return;
+        openStatusPicker(e, [{runId, kind: "verify", taskIdx: ti, sessionIdx: si, verifyIdx: vi, verifyScope: isTask ? "task" : "session", label: v.id || v.kind}]);
+      }
+      async function bulkSetStatus(e) {
+        e.stopPropagation();
+        const items = [...multiSel].map(id => ({runId: id, kind: "run", taskIdx: 0, sessionIdx: -1, verifyIdx: -1, verifyScope: "", label: findRun(id)?.label || id}));
+        if (!items.length) return;
+        openStatusPicker(e, items);
+      }
+      function openVerifyMenu(e, runId, ti, si, vi) {
+        e.preventDefault(); e.stopPropagation(); closeGraphMenu();
+        const restartTip = si === -1
+          ? "Re-run this task-level verify step and all verify steps after it.\nEarlier verify steps in this task are left as-is.\nDependent runs are dirtied too. This cannot be undone."
+          : "Re-run this session-level verify step and all verify steps after it in this session.\nEarlier verify steps in this session are left as-is.\nDependent runs are dirtied too. This cannot be undone.";
+        const items = [
+          `<div data-tip="${restartTip}" onclick="closeGraphMenu();restartVerify('${runId}',${ti},${si},${vi})">⟳ Restart verify</div>`,
+          `<div onclick="event.stopPropagation();closeGraphMenu();openStatusPickerForVerify(event,'${runId}',${ti},${si},${vi})" data-tip="Manually override this verify step's status — any valid state can be set. A confirmation dialog will appear before applying.">⚙ Set Status</div>`
+        ];
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 80) + "px";
+      }
       function openTaskNodeMenu(e, runId, ti) {
         e.preventDefault(); e.stopPropagation(); closeGraphMenu();
         const r = findRun(runId); if (!r) return;
-        const items = [`<div title="Re-run all sessions of this task from the first, and dirty every downstream run so it re-executes too. This cannot be undone." onclick="closeGraphMenu();restartRun('${runId}')">⟳ Restart task</div>`];
+        const items = [
+          `<div title="Re-run all sessions of this task from the first, and dirty every downstream run so it re-executes too. This cannot be undone." onclick="closeGraphMenu();restartRun('${runId}')">⟳ Restart task</div>`,
+          `<div onclick="event.stopPropagation();closeGraphMenu();openStatusPickerForTask(event,'${runId}',${ti})" data-tip="Manually override this task's status — any valid state can be set. A confirmation dialog will appear before applying.\nThis cannot be undone for terminal states.">⚙ Set Status</div>`
+        ];
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
         document.body.appendChild(menu);
@@ -588,12 +705,37 @@
       function openSessionNodeMenu(e, runId, ti, si) {
         e.preventDefault(); e.stopPropagation(); closeGraphMenu();
         const r = findRun(runId); if (!r) return;
-        const items = [`<div title="Re-run this session and everything downstream of it. Sessions upstream of this one remain done and are skipped. Dependent runs are dirtied too. This cannot be undone." onclick="closeGraphMenu();restartSession('${runId}',${ti},${si})">⟳ Restart session</div>`];
+        const items = [
+          `<div title="Re-run this session and everything downstream of it. Sessions upstream of this one remain done and are skipped. Dependent runs are dirtied too. This cannot be undone." onclick="closeGraphMenu();restartSession('${runId}',${ti},${si})">⟳ Restart session</div>`,
+          `<div onclick="event.stopPropagation();closeGraphMenu();openStatusPickerForSession(event,'${runId}',${ti},${si})" data-tip="Manually override this session's status — any valid state can be set. A confirmation dialog will appear before applying.\nThis cannot be undone for terminal states.">⚙ Set Status</div>`
+        ];
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 80) + "px";
+      }
+      // si === -1 means task-level verify; si >= 0 means session-level verify.
+      function openVerifyNodeMenu(e, runId, ti, si, vi) {
+        e.preventDefault(); e.stopPropagation(); closeGraphMenu();
+        const r = findRun(runId); if (!r) return;
+        const tip = si === -1
+          ? "Re-run this task-level verify step.\nResets all sessions in the task and re-runs them together with their verifies.\nDependent runs are dirtied too. This cannot be undone."
+          : "Re-run this session-level verify step.\nResets the owning session and re-runs it together with its verify steps.\nDependent runs are dirtied too. This cannot be undone.";
+        const items = [`<div data-tip="${tip}" onclick="closeGraphMenu();restartVerify('${runId}',${ti},${si},${vi})">⟳ Restart verify</div>`];
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 80) + "px";
+      }
+      async function restartVerify(id, ti, si, vi) {
+        if (!confirm("Restart this verify step? This cannot be undone.")) return;
+        const url = si === -1
+          ? `/api/runs/${id}/tasks/${ti}/verify/${vi}/restart`
+          : `/api/runs/${id}/sessions/${ti}/${si}/verify/${vi}/restart`;
+        await post(url);
+        tick();
       }
       async function deleteRun(id) {
         closeRunMenu();
@@ -617,18 +759,18 @@
           return `<span class="sel-tab ${id === selectedRunId ? "active" : ""}" onclick="focusSel('${id}')">${esc(r.label || id)}<span class="x" onclick="event.stopPropagation();unpickSel('${id}')">✕</span></span>`;
         }).join("");
         return `<div class="sel-tabs">${chips}</div>
-          <div class="btn-row" style="margin-top:0"><button class="btn" onclick="bulkCancel()" data-tip="Cancel all selected runs — stops running sessions and marks them as cancelled.">Cancel ${multiSel.size}</button><button class="btn danger" onclick="bulkDelete()" data-tip="Delete all selected runs and their data permanently. This cannot be undone.">Delete ${multiSel.size}</button></div>`;
+          <div class="btn-row" style="margin-top:0"><button class="btn" onclick="bulkSetStatus(event)" data-tip="Override the status of all ${multiSel.size} selected runs to any valid state.\nA confirmation dialog will list all affected runs before applying.\nTerminal states (done/failed/cancelled) cannot be undone.">Set Status ${multiSel.size}</button><button class="btn" onclick="bulkCancel()" data-tip="Cancel all selected runs — stops running sessions and marks them as cancelled.">Cancel ${multiSel.size}</button><button class="btn danger" onclick="bulkDelete()" data-tip="Delete all selected runs and their data permanently. This cannot be undone.">Delete ${multiSel.size}</button></div>`;
       }
 
       // A session's own verify steps (`[[task.session.verify]]`), listed under a
       // dashed separator inside the session card with a status dot each, so you
       // can see which verifier is running/passed/failed. Clicking one selects it
       // in the details pane. Empty = nothing to show.
-      function sessionVerify(s, ti, si, selCls) {
+      function sessionVerify(s, ti, si, selCls, runId) {
         const vs = s.verify || [];
         if (!vs.length) return "";
         const rows = vs.map((v, vi) =>
-          `<div class="sv-row selectable ${selCls("verify", ti, si, vi)}" data-tip="Session verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after this session completes to validate its output.\nCurrent state: ${esc(v.state)}." onclick="event.stopPropagation();pick('verify',${ti},${si},${vi})">
+          `<div class="sv-row selectable ${selCls("verify", ti, si, vi)}" data-tip="Session verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after this session completes to validate its output.\nCurrent state: ${esc(v.state)}.\nRight-click to restart or set status." onclick="event.stopPropagation();pick('verify',${ti},${si},${vi})" oncontextmenu="event.preventDefault();event.stopPropagation();openVerifyMenu(event,'${runId}',${ti},${si},${vi})">
              ${sdot(v.state)}<span class="sv-name">${esc(v.id || v.kind)}</span> ${pill(v.state)}${v.output ? `<button class="logs-btn" data-tip="View verifier output — the raw response from the AI verifier." data-full="${esc(v.output)}" onclick="event.stopPropagation();openCmdPopup(event)">📄</button>` : ""}</div>`).join("");
         return `<div class="sverify"><span class="label">verify</span>${rows}</div>`;
       }
@@ -655,9 +797,9 @@
                  data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details in the right pane. Right-click to restart.">
               <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${s.error ? failLogBtn(s.error) : ""}</div>
               <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
-              ${sessionVerify(s, ti, si, selCls)}
+              ${sessionVerify(s, ti, si, selCls, run.id)}
             </div>`).join("");
-          const tverify = (t.verify || []).map((v, vi) => `<span class="vchip selectable ${selCls("verify", ti, -1, vi)}" id="v-${ti}-${vi}" data-tip="Task verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after all sessions finish to validate the task result.\nState: ${esc(v.state)}." onclick="event.stopPropagation();pick('verify',${ti},-1,${vi})">${sdot(v.state)} ${esc(v.id || v.kind)}</span>`).join("");
+          const tverify = (t.verify || []).map((v, vi) => `<span class="vchip selectable ${selCls("verify", ti, -1, vi)}" id="v-${ti}-${vi}" data-tip="Task verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after all sessions finish to validate the task result.\nState: ${esc(v.state)}.\nRight-click to restart or set status." onclick="event.stopPropagation();pick('verify',${ti},-1,${vi})" oncontextmenu="event.preventDefault();event.stopPropagation();openVerifyMenu(event,'${run.id}',${ti},-1,${vi})">${sdot(v.state)} ${esc(v.id || v.kind)}</span>`).join("");
           const tdep = (t.depends_on || []).length ? `<span class="k" style="font-size:11px" data-tip="This task depends on ${esc((t.depends_on||[]).join(", "))}.\nIt will not start until the upstream task(s) finish successfully.">⇠ ${esc((t.depends_on||[]).join(", "))}</span>` : "";
           return `<div class="task" id="tk-${ti}">
             <div class="task-head selectable ${selCls("task", ti)}" onclick="pick('task',${ti})" oncontextmenu="openTaskNodeMenu(event,'${run.id}',${ti})">${sdot(t.state)} <span>${esc(t.name)}</span> ${pill(t.state)} ${tdep}</div>
@@ -781,6 +923,22 @@
           ${editBtn()}`;
       }
       function gotoReview(id) { selectedGuardian = id; showTab("reviews", true); }
+      function gotoReviewBranch(gid, branch) {
+        selectedGuardian = gid;
+        selectedBranch[gid] = branch;
+        // Auto-expand the branch so its detail is visible.
+        const g = guardians.find((x) => x.id === gid);
+        if (g) {
+          const b = g.branches.find((br) => br.branch === branch);
+          if (b != null) expandedBranches.add(`${gid}:${b.position}`);
+        }
+        showTab("reviews", true);
+      }
+      function selectBranchRow(e, gid, branch) {
+        // Toggle: clicking a selected branch deselects it; clicking another selects it.
+        selectedBranch[gid] = selectedBranch[gid] === branch ? null : branch;
+        renderReviewDetail();
+      }
       function gotoRun(id) { selectedRunId = id; sel = { kind: "run", taskIdx: 0, sessionIdx: 0 }; editing = false; showTab("tasks", true); }
       function gotoRunItem(runId, kind, ti, si, vi) { selectedRunId = runId; sel = { kind, taskIdx: ti, sessionIdx: si, verifyIdx: vi }; editing = false; showTab("tasks", true); }
       function taskView(r, t) {
@@ -822,11 +980,31 @@
         }
         if (!v) return `<div class="empty">Verify step not found.</div>`;
         const logBtn = v.output
-          ? `<button class="logs-btn" title="verifier output" data-full="${esc(v.output)}" onclick="openCmdPopup(event)">📄 Output log</button>`
+          ? `<button class="logs-btn" data-tip="View the raw output from this verify step — the agent's response or command stdout/stderr." data-full="${esc(v.output)}" onclick="openCmdPopup(event)">📄 Output log</button>`
           : "—";
         const specSection = v.kind === "command"
           ? `<h3 class="section">command</h3>${cmdBox(v.spec || "")}`
           : (v.spec ? `<h3 class="section">prompt</h3><div class="prompt-box">${esc(v.spec)}</div>` : "");
+        const terminalBtns = (() => {
+          const scope = si === -1 ? "task" : "session";
+          if (v.kind !== "prompt") {
+            const tip = "Terminal access is not available — this verify step runs a shell command rather than an AI agent.\nOnly claude-code prompt verify steps can be resumed in a terminal.";
+            return `<div class="btn-row"><span data-tip="${tip}"><button class="btn primary" disabled style="pointer-events:none">Read-Only Terminal</button></span><span data-tip="${tip}"><button class="btn" disabled style="pointer-events:none">Open Terminal</button></span></div>`;
+          }
+          const canTerminal = v.agent === "claude-code";
+          const hasId = !!v.claude_session_id;
+          const enabled = canTerminal && hasId;
+          const disabledTip = !canTerminal
+            ? "Only available when the verify step runs via claude-code — this step uses a different agent."
+            : "Session ID not yet captured. The verify step must complete at least once before it can be resumed.";
+          const roBtn = enabled
+            ? `<button class="btn primary" onclick="openVerifyTerminal('${r.id}',${ti},'${scope}',${si},${vi},'readonly')" data-tip="Resume this claude-code verify session in read-only mode.\nYou can browse files and conversation history.\nThe agent cannot write, edit, delete, commit, or push anything.">Read-Only Terminal</button>`
+            : `<span data-tip="${disabledTip}"><button class="btn primary" disabled style="pointer-events:none">Read-Only Terminal</button></span>`;
+          const openBtn = enabled
+            ? `<button class="btn" onclick="openVerifyTerminal('${r.id}',${ti},'${scope}',${si},${vi},'open')" data-tip="Resume this claude-code verify session with full write access.\nThe agent can edit files, run commands, commit, and push.\nUse with caution — full write access is granted.">Open Terminal</button>`
+            : `<span data-tip="${disabledTip}"><button class="btn" disabled style="pointer-events:none">Open Terminal</button></span>`;
+          return `<div class="btn-row">${roBtn}${openBtn}</div>`;
+        })();
         return `<div class="dhead"><span class="k">✓ verify step</span></div>
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(v.id || "—")}</span></div>
           <div class="kv-row"><span class="k">kind</span><span class="v">${esc(v.kind)}</span></div>
@@ -835,7 +1013,7 @@
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}</span></div>
           ${v.model ? `<div class="kv-row"><span class="k">model</span><span class="v">${esc(v.model)}</span></div>` : ""}
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
-          ${specSection}`;
+          ${specSection}${terminalBtns}`;
       }
 
       // CCTL-148: worktree (the session's own cwd) and project (its shared git
@@ -860,9 +1038,13 @@
           ? `<h3 class="section">in reviews</h3>` + [...s.reviews]
               .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
               .map((rv) => `<div class="kv-row"><span>${gdot(rv.status)}</span>` +
-                `<span class="v" style="flex:1">${esc(rv.name)}</span>` +
+                `<span class="v" style="flex:1"><div>${esc(rv.name)}</div>${rv.branch ? `<div class="mono" style="font-size:11px;color:var(--muted)">${esc(rv.branch)}</div>` : ""}</span>` +
                 `<span class="k">${esc(rv.status)}</span>` +
-                `<button class="btn" onclick="gotoReview('${rv.id}')" data-tip="Jump to this review on the Reviews tab to see its full status and branch stack.">Go to review</button></div>`).join("")
+                (rv.branch
+                  ? `<button class="btn" onclick="gotoReviewBranch('${rv.id}','${esc(rv.branch)}')" data-tip="Jump to the Reviews tab and select the branch ${esc(rv.branch)} in review '${esc(rv.name)}'.">Go to branch</button>`
+                  : `<button class="btn" onclick="gotoReview('${rv.id}')" data-tip="Jump to this review on the Reviews tab to see its full status and branch stack.">Go to review</button>`
+                ) +
+                `</div>`).join("")
           : "";
         const verifySteps = (s.verify || []).length
           ? `<h3 class="section">verify steps</h3>` + (s.verify || []).map((v, vi) =>
@@ -959,8 +1141,8 @@
           const isCmd = !!s.command;
           // Known agents in this codebase (core/src/schema.rs default is "claude";
           // the runner dispatches "claude"/"anthropic", "claude-code"/"claude-cli",
-          // and "ollama"). Backed by a datalist so the input stays free-text.
-          const agents = ["claude", "claude-code", "ollama"];
+          // "codex"/"codex-cli", and "ollama"). Backed by a datalist so the input stays free-text.
+          const agents = ["claude", "claude-code", "codex-cli", "ollama"];
           fields = `<label>mode<select id="e-mode" onchange="onModeChange()">
               <option value="agent"${isCmd ? "" : " selected"}>Agent</option>
               <option value="command"${isCmd ? " selected" : ""}>Command</option>
@@ -1038,7 +1220,18 @@
         // Guardian review merges (from daemon status)
         const reviewList = (window._daemonStatus && window._daemonStatus.running_reviews) || [];
         for (const rv of reviewList) {
-          rows.push(`<div onclick="gotoReview('${rv.id}');document.getElementById('running-menu').classList.add('hidden')" data-tip="Guardian review '${esc(rv.name)}' is building its stacked rebase.\nClick to navigate to this review."><span class="pill p-running" style="font-size:10px;margin-right:4px">Review</span>${esc(rv.name)}</div>`);
+          const g = guardians.find((x) => x.id === rv.id);
+          const inProg = g && g.branches.find((b) => b.merge_status === "in_progress");
+          const onclick = inProg
+            ? `gotoReviewBranch('${rv.id}','${esc(inProg.branch)}');document.getElementById('running-menu').classList.add('hidden')`
+            : `gotoReview('${rv.id}');document.getElementById('running-menu').classList.add('hidden')`;
+          const tip = inProg
+            ? `Guardian review '${esc(rv.name)}' is rebasing branch ${esc(inProg.branch)}.\nClick to jump to this worktree row and expand it.`
+            : `Guardian review '${esc(rv.name)}' is building its stacked rebase.\nClick to navigate to this review.`;
+          const label = inProg
+            ? `${esc(rv.name)} <span style="color:var(--muted);font-size:10px">/ ${esc(inProg.branch)}</span>`
+            : esc(rv.name);
+          rows.push(`<div onclick="${onclick}" data-tip="${tip}"><span class="pill p-running" style="font-size:10px;margin-right:4px">Review</span>${label}</div>`);
         }
         m.innerHTML = rows.length ? rows.join("") : `<div class="empty" style="margin:6px">No running work</div>`;
         m.classList.remove("hidden");
@@ -1130,15 +1323,145 @@
         closeModal(); tick();
       }
 
+      // ---------- worktree → session linking (RAL-71) ----------
+      // Normalise a path for comparison: forward slashes, lowercase, no trailing slash.
+      function normPath(p) {
+        if (!p) return "";
+        return p.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
+      }
+      // A session cwd and a review worktree path are "linked" when one is a path-boundary
+      // prefix of the other (i.e. one directory is at or inside the other).
+      function pathLinked(sessionCwd, worktreePath) {
+        const a = normPath(sessionCwd), b = normPath(worktreePath);
+        if (!a || !b) return false;
+        const longer = a.length >= b.length ? a : b;
+        const shorter = a.length < b.length ? a : b;
+        if (!longer.startsWith(shorter)) return false;
+        const next = longer[shorter.length];
+        return next === "/" || next === undefined;
+      }
+      // Collect all sessions (across all loaded runs) whose cwd is linked to the given worktree.
+      function findLinkedSessions(worktreePath) {
+        const results = [];
+        for (const run of runs) {
+          run.tasks.forEach((t, ti) => {
+            t.sessions.forEach((s, si) => {
+              if (s.cwd && pathLinked(s.cwd, worktreePath)) {
+                results.push({ runId: run.id, taskIdx: ti, sessionIdx: si,
+                  name: s.name ?? s.id, taskName: t.name, state: s.state });
+              }
+            });
+          });
+        }
+        return results;
+      }
+      // Session state priority for the summary dot (worst-first).
+      const SESSION_STATE_RANK = ["running", "failed", "pending", "queued", "cancelled", "done"];
+      function toggleWorktreeMenu(key) {
+        worktreeMenuOpen[key] = !worktreeMenuOpen[key];
+        renderReviewDetail();
+      }
+      // Render resolver terminal buttons for a review branch.
+      // Four states:
+      //   session ID + live             → Watch Live (Read-Only) / Open Live Terminal
+      //   session ID + done             → Read-Only Terminal / Open Terminal
+      //   no ID + CLI agent + worktree  → disabled Read-Only + enabled Open Worktree
+      //   no ID + other                 → both disabled
+      function resolverTerminalBtns(g, b) {
+        const agent = g.resolver_agent || "ollama";
+        const sessionId = b.resolver_claude_session_id;
+        const isLive = g.status === "merging" && b.merge_status === "in_progress";
+        if (sessionId) {
+          const roLabel = isLive ? "Watch Live (Read-Only)" : "Read-Only Terminal";
+          const openLabel = isLive ? "Open Live Terminal" : "Open Terminal";
+          const roTip = isLive
+            ? "Watch the claude-code conflict resolver in real time — opens the live session in read-only mode.\nYou can observe what the agent is doing but cannot write, edit, or commit anything."
+            : "Resume the claude-code conflict resolver in read-only mode.\nYou can browse the resolved files and conversation history.\nThe agent cannot write, edit, delete, commit, or push anything.";
+          const openTip = isLive
+            ? "Open the live claude-code conflict resolver with full write access.\nYou can observe or intervene while the agent is working.\nUse with caution — full write access is granted."
+            : "Resume the claude-code conflict resolver with full write access.\nThe agent can edit files, run commands, commit, and push.\nUse with caution — full write access is granted.";
+          return `<button class="btn primary" onclick="openGuardianBranchTerminal('${g.id}',${b.position},'readonly')" data-tip="${roTip}">${roLabel}</button>`
+            + `<button class="btn" onclick="openGuardianBranchTerminal('${g.id}',${b.position},'open')" data-tip="${openTip}">${openLabel}</button>`;
+        }
+        // No session ID yet but the worktree exists and a CLI agent is the resolver.
+        // Offer "Open Worktree" to inspect files. For claude-code the session ID
+        // becomes available after the first pass; for codex-cli session resumption
+        // is never available, so Open Worktree is the permanent interface.
+        const isCliAgent = agent === "claude-code" || agent === "codex" || agent === "codex-cli";
+        if (isCliAgent && b.worktree) {
+          const roTip = agent === "claude-code"
+            ? (isLive
+                ? "The resolver is running — Read-Only Terminal becomes available once the first pass finishes.\nUse Open Worktree to observe files in real time."
+                : "No resolver session yet — Read-Only Terminal becomes available after the first conflict is resolved.\nUse Open Worktree to inspect the branch manually.")
+            : "codex-cli does not support session resumption — terminal resume is not available.\nUse Open Worktree to inspect files in the branch.";
+          const wtTip = isLive
+            ? `Open a shell in the review worktree while ${agent} is resolving conflicts.\nRun 'git diff' or 'git status' to watch files change in real time.`
+            : "Open a shell in the review worktree to manually inspect or fix merge conflicts.";
+          return `<span data-tip="${roTip}"><button class="btn primary" disabled style="pointer-events:none">Read-Only Terminal</button></span>`
+            + `<button class="btn" onclick="openGuardianBranchTerminal('${g.id}',${b.position},'worktree')" data-tip="${wtTip}">Open Worktree</button>`;
+        }
+        const tip = isCliAgent
+          ? "No worktree or session yet — buttons become available once the branch is being processed."
+          : `The ${agent} conflict resolver doesn't support terminal access.`;
+        return `<span data-tip="${tip}"><button class="btn primary" disabled style="pointer-events:none">Read-Only Terminal</button></span>`
+          + `<span data-tip="${tip}"><button class="btn" disabled style="pointer-events:none">Open Terminal</button></span>`;
+      }
+
+      // Render the inline session-link button for a review branch row.
+      // Prefers direct run/task/session indices from the API; falls back to cwd path matching.
+      function worktreeSessionBtn(branch, menuKey) {
+        if (branch.source_run_id != null && branch.source_task_idx != null && branch.source_session_idx != null) {
+          const ti = branch.source_task_idx, si = branch.source_session_idx;
+          const run = runs.find(r => r.id === branch.source_run_id);
+          const t = run && run.tasks[ti];
+          const s = t && t.sessions[si];
+          const state = s ? s.state : (branch.source_session_state || "pending");
+          const name = s ? (s.name ?? s.id) : branch.branch;
+          const taskName = t ? t.name : "";
+          const readyDot = state === "done" ? ` <span class="dot" style="background:var(--done)"></span>` : "";
+          const tip = `Open the task session that worked on this review branch.\nSession: ${esc(name)} · Task: ${esc(taskName)} · State: ${esc(state)}\nSwitches to the Tasks tab and opens this session in the detail pane.`;
+          return `<button class="btn" onclick="gotoRunItem('${branch.source_run_id}','session',${ti},${si},-1)" data-tip="${tip}">${sdot(state)} ${esc(name)}${readyDot}</button>`;
+        }
+        // Fallback: path-based linking (manually added branches with no submitted session).
+        const sessions = branch.worktree ? findLinkedSessions(branch.worktree) : [];
+        if (!sessions.length) {
+          return `<button class="btn" disabled style="opacity:0.5;cursor:not-allowed" data-tip="No task sessions are linked to this review branch.\nThe run may not have started yet, or the session may not have a review_branch set.">◉ No sessions</button>`;
+        }
+        const allDone = sessions.every(s => s.state === "done");
+        const readyDot = allDone ? ` <span class="dot" style="background:var(--done)"></span>` : "";
+        if (sessions.length === 1) {
+          const s = sessions[0];
+          const tip = `Open the task session that worked on this review branch.\nSession: ${esc(s.name)} · Task: ${esc(s.taskName)} · State: ${esc(s.state)}\nSwitches to the Tasks tab and opens this session in the detail pane.`;
+          return `<button class="btn" onclick="gotoRunItem('${s.runId}','session',${s.taskIdx},${s.sessionIdx},-1)" data-tip="${tip}">${sdot(s.state)} ${esc(s.name)}${readyDot}</button>`;
+        }
+        const worst = SESSION_STATE_RANK.find(r => sessions.some(s => s.state === r)) || sessions[0].state;
+        const isOpen = !!worktreeMenuOpen[menuKey];
+        const tip = `${sessions.length} task sessions are linked to this review branch — click to pick one.\nEach entry shows the session name and its current state.`;
+        const items = sessions.map(s =>
+          `<div onclick="worktreeMenuOpen={};gotoRunItem('${s.runId}','session',${s.taskIdx},${s.sessionIdx},-1)" data-tip="${esc(s.name)} · ${esc(s.taskName)} · state: ${esc(s.state)}" style="padding:5px 10px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px" onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">
+            ${sdot(s.state)}<span style="flex:1">${esc(s.name)}</span><span style="color:var(--muted)">${esc(s.state)}</span>
+          </div>`
+        ).join("");
+        return `<div style="position:relative;display:inline-block">
+          <button class="btn" onclick="toggleWorktreeMenu('${menuKey}')" data-tip="${tip}">${sdot(worst)} ${sessions.length} sessions ▾${readyDot}</button>
+          ${isOpen ? `<div style="position:absolute;left:0;top:100%;background:var(--panel);border:1px solid var(--border);border-radius:6px;min-width:220px;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.4);padding:4px 0;margin-top:2px">${items}</div>` : ""}
+        </div>`;
+      }
+
       // ---------- reviews (list + detail, read-only for now) ----------
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", in_progress:"--running", done:"--done", conflict_resolved:"--queued", failed:"--failed" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", done:"--done", conflict_resolved:"--queued", failed:"--failed" };
+      // States in which a review may be cancelled — mirrors the backend's
+      // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
+      // list menu and the detail pane's upper-right ⋯ menu use this one set so
+      // "Cancel review" appears in the same states everywhere.
+      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "in_review", "approved"];
       const gdot = (s) => `<span class="dot" style="background:${cvar(G_COLORS[s]||"--muted")}"></span>`;
       function selectGuardian(id) { selectedGuardian = id; syncHash(true); renderReviews(); renderReviewDetail(); }
       function renderReviews() {
         const el = document.getElementById("reviews");
         if (!guardians.length) { el.innerHTML = `<div class="empty">No reviews.</div>`; return; }
         el.innerHTML = guardians.map((g) => `<div class="run-item ${g.id===selectedGuardian?"selected":""}" onclick="selectGuardian('${g.id}')" oncontextmenu="openReviewMenu(event,'${g.id}')">
-          <button class="btn runbtn" onclick="openReviewMenu(event,'${g.id}')" data-tip="Review actions — rename or delete this review.">⋯</button>
+          <button class="btn runbtn" onclick="openReviewMenu(event,'${g.id}')" data-tip="Review actions — rename, cancel, or delete this review.">⋯</button>
           <div class="rid">${esc(g.name)}</div><div class="meta">${gdot(g.status)}<span>${g.status}</span> · ${g.branches.length} branches</div></div>`).join("");
       }
       // CCTL-100: right-click a review for Rename / Delete (mirrors the run menu).
@@ -1147,7 +1470,7 @@
         const g = guardians.find((x) => x.id === id); if (!g) return;
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "run-menu";
-        const canCancel = ["collecting","merging","approved"].includes(g.status);
+        const canCancel = G_CANCELLABLE.includes(g.status);
         menu.innerHTML = `<div onclick="renameReview('${id}')" data-tip="Rename this review — changes the display name only.">✎ Rename</div>${canCancel ? `<div class="danger" onclick="cancelReview('${id}')" data-tip="Cancel this review — stops the current run and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>` : ""}<div class="danger" onclick="deleteReview('${id}')" data-tip="Delete this review and remove all review worktrees permanently.\nThis cannot be undone.">🗑 Delete</div>`;
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
@@ -1171,12 +1494,12 @@
       function openReviewTitleMenu(e, id) {
         e.preventDefault(); e.stopPropagation(); closeRunMenu();
         const g = guardians.find((x) => x.id === id); if (!g) return;
-        const canCancel = ["collecting","merging","approved"].includes(g.status);
+        const canCancel = G_CANCELLABLE.includes(g.status);
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "run-menu";
         menu.innerHTML = canCancel
           ? `<div class="danger" onclick="cancelReview('${id}')" data-tip="Cancel this review — stops the current run and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>`
-          : `<div style="color:var(--muted);padding:6px 10px;font-size:12px" data-tip="No actions are available because this review's status is '${g.status}'.\nActions like Cancel are only available while the review is collecting, merging, or approved.">No actions available</div>`;
+          : `<div style="color:var(--muted);padding:6px 10px;font-size:12px" data-tip="No actions are available because this review's status is '${g.status}'.\nActions like Cancel are only available while the review is collecting, merging, merge_failed, in_review, or approved.">No actions available</div>`;
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
@@ -1205,45 +1528,33 @@
             <span style="width:${pct(failed)};background:var(--failed)"></span>
           </div>`;
       }
-      // CCTL-147: live merge-conflict resolution progress (resolved / total).
+      // RAL-72: live conflict-resolution progress — three distinct metrics.
       function conflictProgress(g) {
-        const total = g.conflicts_total;
-        if (total === null || total === undefined || total <= 0) return "";
-        const remaining = g.conflicts_remaining ?? total;
-        const resolved = Math.max(0, total - remaining);
-        const pct = (100 * resolved / total).toFixed(0);
+        const found = g.conflicts_found;
+        if (found === null || found === undefined || found <= 0) return "";
+        const fixed = g.conflicts_fixed ?? 0;
+        const committed = g.conflicts_committed ?? 0;
         const active = g.status === "merging";
-        return `<div class="kv-row"><span class="k">conflicts</span><span>${resolved}/${total} markers resolved${active && remaining > 0 ? " · resolving…" : ""}</span></div>
-          <div class="progress" data-tip="Conflict resolution progress — the agent is working through merge conflicts in this review's stack.">
-            <span style="width:${pct}%;background:var(--queued)"></span>
-          </div>`;
+        const resolving = active ? " · resolving…" : "";
+        const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
+        return `<div class="kv-row" data-tip="${tip}"><span class="k">conflicts</span><span>${found} found · ${fixed} fixed · ${committed} committed${resolving}</span></div>`;
       }
       function branchBadge(b) {
+        if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
         if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
         if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" data-tip="Conflict was resolved by the guardian agent — ${esc(b.detail || "resolved")}">✓ resolved</span>`;
         return "";
       }
-      // Per-branch inline conflict progress bar (RAL-37).
+      // RAL-72: per-branch inline conflict progress (found / fixed / committed).
       function branchConflictBar(b) {
-        const total = b.conflicts_total;
-        if (total === null || total === undefined || total <= 0) return "";
-        const remaining = b.conflicts_remaining ?? total;
-        const resolved = Math.max(0, total - remaining);
-        const pct = (100 * resolved / total).toFixed(0);
-        const isResolved = remaining === 0;
-        const color = isResolved ? "var(--done)" : "var(--failed)";
-        const icon = isResolved ? "✓" : "⚠";
-        const label = `${resolved}/${total} markers resolved`;
-        const tooltip = isResolved
-          ? `All ${total} conflict marker${total === 1 ? "" : "s"} resolved by agent`
-          : `${remaining} of ${total} conflict marker${total === 1 ? "" : "s"} still remaining`;
-        return `<div class="branch-conflict-bar" title="${tooltip}">
+        const found = b.conflicts_found;
+        if (found === null || found === undefined || found <= 0) return "";
+        const fixed = b.conflicts_fixed ?? 0;
+        const committed = b.conflicts_committed ?? 0;
+        const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
+        return `<div class="branch-conflict-bar" data-tip="${tip}">
           <div class="branch-conflict-label">
-            <span class="conflict-icon" aria-label="${isResolved ? "resolved" : "unresolved"}">${icon}</span>
-            <span>${label}${!isResolved ? " · resolving…" : ""}</span>
-          </div>
-          <div class="progress" style="margin:0">
-            <span style="width:${pct}%;background:${color}"></span>
+            <span>${found} found · ${fixed} fixed · ${committed} committed</span>
           </div>
         </div>`;
       }
@@ -1291,32 +1602,43 @@
         const allDisabled = visibleBranches.length > 0 && enabledCount === 0;
         const branches = visibleBranches.map((b, i) => {
           const isEnabled = stagedEnabled[b.branch] !== false;
-          const hasDetail = !!(b.worktree || b.detail);
+          const hasDetail = !!(b.worktree || b.detail || b.source_run_id != null || b.resolver_claude_session_id);
           const open = expandedBranches.has(`${g.id}:${b.position}`);
           const toggle = hasDetail
-            ? `<span class="br-toggle" data-tip="Expand or collapse merge detail for this branch." onclick="toggleBranch(event,'${g.id}',${b.position})">${open ? "▾" : "▸"}</span>`
+            ? `<span class="br-toggle" data-tip="Expand or collapse merge detail for this branch." onclick="event.stopPropagation();toggleBranch(event,'${g.id}',${b.position})">${open ? "▾" : "▸"}</span>`
             : `<span class="br-toggle placeholder">▸</span>`;
           const detail = hasDetail ? `<div class="branch-detail ${open ? "" : "hidden"}">
               ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${esc(b.detail)}</span></div>` : ""}
-              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span></div>
-                <div class="row" style="margin:4px 0 0">
+              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span></div>` : ""}
+              ${(b.worktree || b.source_run_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeSessionBtn(b, `${g.id}:${b.position}`)}</div>` : ""}
+              <div class="btn-row" style="margin-top:4px">${resolverTerminalBtns(g, b)}</div>
+              ${b.worktree ? `<div class="row" style="margin:4px 0 0">
                   <input type="text" id="fb-${b.position}" placeholder="reviewer feedback for this branch…" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
                   <button class="btn" onclick="sendFeedback('${g.id}',${b.position})" data-tip="Send reviewer feedback for this specific branch.\nThe guardian agent routes it to the session that owns this branch.">Send feedback</button>
                 </div>` : ""}
             </div>` : "";
           // RAL-43: enable/disable toggle — staged like drag-reorder, takes effect on Save.
           const enableToggle = canReorder
-            ? `<button class="icon-btn" onclick="toggleBranchEnabled('${g.id}','${esc(b.branch)}')" title="${isEnabled ? 'Drop this branch from the rebase stack — it stays visible and can be re-enabled. Staged: takes effect on Save.' : 'Re-enable this branch — it will be included in the rebase stack again. Staged: takes effect on Save.'}" style="font-size:11px;padding:1px 5px;border-color:${isEnabled ? 'var(--border)' : 'var(--queued)'};color:${isEnabled ? 'var(--muted)' : 'var(--queued)'}">${isEnabled ? '⊙' : '⊘'}</button>`
+            ? `<button class="icon-btn" onclick="event.stopPropagation();toggleBranchEnabled('${g.id}','${esc(b.branch)}')" title="${isEnabled ? 'Drop this branch from the rebase stack — it stays visible and can be re-enabled. Staged: takes effect on Save.' : 'Re-enable this branch — it will be included in the rebase stack again. Staged: takes effect on Save.'}" style="font-size:11px;padding:1px 5px;border-color:${isEnabled ? 'var(--border)' : 'var(--queued)'};color:${isEnabled ? 'var(--muted)' : 'var(--queued)'}">${isEnabled ? '⊙' : '⊘'}</button>`
             : "";
+          // RAL-69: inform the reviewer when a force-disabled branch is now safe to re-enable.
+          // Shown only when the server signals can_reenable (not yet dismissed, all sources done).
+          const reEnableIcon = (!hasPending && b.can_reenable)
+            ? `<span style="display:inline-flex;align-items:center;gap:2px">
+                 <span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:11px" data-tip="This branch was disabled because it wasn't ready when the review was force-started, but it can be safely enabled now.\nUse the ⊘ toggle and Save to re-enable it.\nDismissing this notice does not auto-enable the branch.">ℹ can enable now</span>
+                 <button class="icon-btn" onclick="event.stopPropagation();dismissReenable('${g.id}',${b.position})" style="font-size:10px;padding:1px 4px;color:var(--muted);border-color:var(--border)" data-tip="Permanently dismiss this notice for this branch.\nThe branch stays disabled — use the ⊘ toggle and Save to re-enable it when ready.">✕</button>
+               </span>`
+            : "";
+          const isBranchSel = selectedBranch[g.id] === b.branch;
           return `
           <div class="branch-item"${isEnabled ? "" : ' style="opacity:0.45"'}>
-            <div class="branch-row" data-branch="${esc(b.branch)}" ${drag}>
+            <div class="branch-row selectable${isBranchSel ? " sel" : ""}" data-branch="${esc(b.branch)}" ${drag} onclick="selectBranchRow(event,'${g.id}','${esc(b.branch)}')" data-tip="Click to select this branch. Drag to reorder.">
               ${canReorder ? '<span class="grip" data-tip="Drag to reorder branches — the merge order determines the rebase stack.">⋮⋮</span>' : ""}
               ${toggle}
               <span>${gdot(b.merge_status)}</span>
               <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}">${esc(b.branch)}</span>
               ${isEnabled ? `${branchBadge(b)} ${pill(b.merge_status)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
-              ${enableToggle}
+              ${enableToggle}${reEnableIcon}
             </div>
             ${branchConflictBar(b)}
             ${detail}
@@ -1329,12 +1651,13 @@
             <input type="checkbox" ${g.skip_checks ? "checked" : ""} onchange="setSkipChecks('${g.id}',this.checked)">skip build/check verification${g.skip_checks && g.checks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees.\nFaster for large repos but gives less isolation between branches.">
             <input type="checkbox" ${g.skip_worktrees ? "checked" : ""} onchange="setSkipWorktrees('${g.id}',this.checked)">skip per-branch worktrees (build the stack in one shared worktree)</label>`;
-        // Conflict-resolver backend/model for this review. Unset shows the
-        // effective fallback (ollama / qwen3:8b) muted as "(default)".
-        const rAgent = g.resolver_agent || "ollama";
-        const rModel = g.resolver_model || (rAgent === "ollama" ? "qwen3:8b" : "backend default");
-        const rIsDefault = !g.resolver_agent && !g.resolver_model;
-        const resolverRow = `<div class="kv-row"><span class="k">resolver</span><span class="v">${esc(rAgent)} · <span class="mono">${esc(rModel)}</span>${rIsDefault ? ' <span style="opacity:.55">(default)</span>' : ""}</span></div>`;
+        // Conflict-resolver backend for this review.
+        const resolverFrozen = ["approved", "deployed"].includes(g.status);
+        const rPending = pendingResolver && pendingResolver.gid === g.id;
+        const rSelVal = rPending ? pendingResolver.agent : (g.resolver_agent || "");
+        const resolverRow = resolverFrozen
+          ? `<div class="kv-row"><span class="k">resolver</span><span class="v mono">${esc(g.resolver_agent || "ollama")}</span></div>`
+          : `<div class="kv-row"><span class="k">resolver</span><div style="display:flex;flex-direction:column;gap:4px"><select id="resolver-select" onchange="onResolverChange('${g.id}',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts.\nBackends: ollama (local, default), claude (Anthropic API), claude-code (interactive harness), codex-cli (OpenAI Codex CLI, non-interactive).\nPress Save to apply — if the review is active it will trigger a fresh rebase with the new backend."><option value="" ${rSelVal===""?"selected":""}>ollama (default)</option><option value="claude" ${rSelVal==="claude"?"selected":""}>claude</option><option value="claude-code" ${rSelVal==="claude-code"?"selected":""}>claude-code</option><option value="codex-cli" ${rSelVal==="codex-cli"?"selected":""}>codex-cli</option></select><div id="resolver-pending" style="display:${rPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" onclick="saveResolver('${g.id}','${g.status}')" data-tip="Save the resolver backend.\nIf the review is active, a rebase will be triggered immediately with the new backend.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelResolver('${g.id}')" data-tip="Discard — revert the dropdown to the last saved value.">Cancel</button></div></div></div>`;
         // RAL-22: a global feedback chat — a persisted triage thread for the whole
         // review, distinct from the per-branch feedback inputs above. The guardian
         // agent replies in-thread, routing instructions to individual branches.
@@ -1346,23 +1669,34 @@
         const thread = msgs.length
           ? msgs.map((m) => {
               const isUser = m.role === "reviewer";
-              const side = isUser ? "user" : "guardian";
-              const label = isUser ? "you" : "guardian";
-              return `<div class="chat-msg chat-bubble-wrap ${side}"><div><div class="chat-label">${label}</div><div class="chat-bubble">${esc(stripRoute(m.text))}</div></div></div>`;
+              if (isUser) {
+                const isEditing = m.seq > 0 && chatEditState === m.seq;
+                if (isEditing) {
+                  return `<div class="chat-msg chat-bubble-wrap user"><div style="max-width:80%"><div class="chat-label" style="text-align:right">you</div><div class="chat-bubble" style="padding:6px;background:var(--bg);border:1px solid var(--accent)"><textarea id="chat-edit-input" rows="3" style="width:100%;box-sizing:border-box;background:var(--bg);border:none;color:var(--text);font-family:inherit;font-size:inherit;resize:vertical;outline:none" oninput="chatEditContent=this.value" onkeydown="if(event.key==='Escape'){cancelChatEdit();event.preventDefault();}else if(event.key==='Enter'&&event.shiftKey){saveChatEdit('${g.id}',${m.seq});event.preventDefault();}" data-tip="Edit your message.\nShift+Enter saves · Esc cancels.">${esc(chatEditContent)}</textarea><div style="display:flex;gap:4px;justify-content:flex-end;margin-top:4px"><button class="btn" onclick="cancelChatEdit()" data-tip="Cancel editing — restore the original message.">Cancel</button><button class="btn primary" onclick="saveChatEdit('${g.id}',${m.seq})" data-tip="Save this edit — clears all messages after this one and re-sends to the guardian.\nThis cannot be undone.">Save</button></div></div></div></div>`;
+                }
+                const editBtn = m.seq > 0 ? `<button class="icon-btn" style="font-size:10px;padding:0 3px;opacity:.55;min-width:0;line-height:1" onclick="startChatEdit(${m.seq},'${g.id}')" data-tip="Edit this message — clears all messages after it and re-sends to the guardian.\nThis cannot be undone.">✏</button>` : "";
+                return `<div class="chat-msg chat-bubble-wrap user"><div><div class="chat-label" style="text-align:right;display:flex;align-items:center;gap:3px;justify-content:flex-end">${editBtn}<span>you</span></div><div class="chat-bubble" ondblclick="${m.seq > 0 ? `startChatEdit(${m.seq},'${g.id}')` : ''}" data-tip="${m.seq > 0 ? 'Double-click to edit this message.' : ''}">${esc(stripRoute(m.text))}</div></div></div>`;
+              }
+              return `<div class="chat-msg chat-bubble-wrap guardian"><div><div class="chat-label">guardian</div><div class="chat-bubble">${esc(stripRoute(m.text))}</div></div></div>`;
             }).join("")
           : `<div class="empty" style="margin-top:8px">No feedback yet — ask the guardian to route a change across the review.</div>`;
+        const imagePreviewHtml = chatPendingImage
+          ? `<div style="display:flex;align-items:center;gap:6px;margin-top:4px;padding:4px 8px;background:var(--panel-2);border-radius:6px;border:1px solid var(--border)"><img src="${chatPendingImage}" style="max-height:50px;border-radius:3px" data-tip="Image attached to the next message."><button class="btn" style="padding:2px 6px;font-size:11px" onclick="clearChatImage()" data-tip="Remove the attached image.">✕ Remove</button></div>`
+          : "";
         const chatSection = `<h3 class="section" style="display:flex;align-items:center;gap:6px">feedback chat <button class="copy-btn" data-tip="Copy this conversation to clipboard.\nChoose Markdown for readable text or JSON for raw data." onclick="showChatCopyMenu(event,'${g.id}')">⧉</button></h3>
           <div id="chat-thread" style="height:${chatPanelHeight}px;min-height:80px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;background:var(--bg);position:relative"><div id="chat-resize-handle" style="position:absolute;top:0;left:0;right:0;height:6px;cursor:ns-resize;background:#444;border-radius:3px 3px 0 0" data-tip="Drag to resize the feedback panel.\nDrag up to expand, drag down to shrink."></div>${thread}</div>
+          ${imagePreviewHtml}
           <div class="row" style="margin-top:6px;align-items:flex-start">
-            <textarea id="chat-input" placeholder="feedback for the whole review…" rows="3" onkeydown="if(event.key==='Enter'&&event.shiftKey){event.preventDefault();sendChat('${g.id}');}" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;resize:vertical;font-family:inherit;font-size:inherit" data-tip="Send a message to the guardian agent for the whole review.\nEnter inserts a newline — use Shift+Enter to send.\nThe agent can route instructions to individual branches or coordinate across the stack."></textarea>
+            <textarea id="chat-input" placeholder="feedback for the whole review…" rows="3" onkeydown="chatInputKeydown(event,'${g.id}')" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;resize:vertical;font-family:inherit;font-size:inherit" data-tip="Send a message to the guardian agent for the whole review.\nShift+Enter sends · ESC×2 clears draft · ↑ navigates history · paste an image to attach it.\nThe agent can route instructions to individual branches or coordinate across the stack."></textarea>
             <button class="btn primary" onclick="sendChat('${g.id}')" data-tip="Send this message to the guardian agent.\nPress Shift+Enter in the input field as a shortcut.">Send</button>
           </div>`;
         el.innerHTML = `<div class="run-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)}
             <span style="flex:1"></span><button class="icon-btn" onclick="openReviewLogs('${g.id}')" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn runbtn" onclick="openReviewTitleMenu(event,'${g.id}')" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
+          <div class="kv-row"><span class="k">review id</span><span class="mono" style="cursor:pointer" data-tip="The unique identifier for this Guardian review.\nUse this ID in API calls, daemon logs, or to find the review worktree on disk.\nClick to copy the full ID." data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
           ${g.run_id ? `<div class="kv-row"><span class="k">from run</span><span class="v"><a href="#" onclick="gotoRun('${g.run_id}');return false" style="color:var(--accent)" data-tip="Switch to the Tasks tab and open this run.">${esc(g.run_id)}</a></span></div>` : ""}
-          ${g.status === "collecting" && g.run_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">starts automatically when its run finishes — or start it now below</span></div>` : ""}
+          ${g.status === "collecting" && g.run_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its run finishes — or start it now below"}</span></div>` : ""}
           <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
           <div class="kv-row"><span class="k">base</span>${["approved","deployed"].includes(g.status) ? `<span class="mono">${esc(g.base_branch)}</span>` : `<div style="display:flex;flex-direction:column;gap:4px"><div style="display:flex;align-items:center;gap:4px"><input type="text" id="base-input" class="mono" list="base-datalist" value="${esc(g.base_branch)}" onfocus="loadBaseBranches('${g.id}')" oninput="onBaseBranchInput('${g.id}',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="The branch every submitted branch is rebased onto.\nUsually 'main' or 'master'.\nType or use ▾ to pick from remote."><datalist id="base-datalist">${(baseBranchCache[g.id]||[]).map(b=>`<option value="${esc(b)}"></option>`).join('')}</datalist><button class="btn" style="padding:2px 6px;font-size:13px;line-height:1" onclick="loadBaseBranches('${g.id}').then(()=>{const i=document.getElementById('base-input');if(i&&i.showPicker)i.showPicker();})" data-tip="Load all branches from the remote and show them as a pick list.\nClick a branch name to fill in the base field.">▾</button></div><div id="base-error" style="display:none;color:var(--failed);font-size:11px;margin-top:2px"></div><div id="base-pending" class="row" style="display:none;gap:4px;margin-top:2px"><button class="btn primary" style="padding:2px 8px;font-size:11px" onclick="saveBase('${g.id}',document.getElementById('base-input').value)" data-tip="Save the new base branch and trigger a full rebase of the review stack.\nReruns even if the branch name is unchanged — useful when the base has new commits.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelBase('${g.id}')" data-tip="Cancel — revert the base branch input to its last saved value.">Cancel</button></div></div>`}</div>
           ${resolverRow}
@@ -1388,10 +1722,40 @@
             <button class="btn" onclick="discardReorder('${g.id}')" data-tip="Discard the unsaved branch reorder and enable/disable changes, reverting to the last saved state.">Discard</button>
             <span class="k" style="text-transform:none;letter-spacing:0;color:var(--muted)">Save persists the order and enabled states, then rebases</span>
           </div>` : ""}
+          ${(() => {
+            // RAL-69: show Force-Start when collecting and some enabled branches are not yet done.
+            const hasNotReady = g.status === "collecting" && (g.branches || []).some(
+              (b) => b.enabled !== false && b.source_session_state !== "done"
+            );
+            return hasNotReady
+              ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). <b>Force-Start</b> will disable the unready branches and start immediately.</div>`
+              : "";
+          })()}
           <div class="btn-row">
-            <button class="btn primary" onclick="mergeReview('${g.id}','${g.status}')" ${["collecting","merge_failed","in_review"].includes(g.status)?"":"disabled"} data-tip="Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, or merge_failed.">Merge / rebase</button>
+            <button class="btn primary" onclick="mergeReview('${g.id}','${g.status}')" ${["collecting","merge_failed","in_review"].includes(g.status)?"":"disabled"} data-tip="${g.status==='merging'?'A rebase is already in progress — wait for it to finish.\nTo restart from scratch, cancel the running merge first.':'Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, or merge_failed.'}">Merge / rebase</button>
+            ${(() => {
+              const hasNotReady = g.status === "collecting" && (g.branches || []).some(
+                (b) => b.enabled !== false && b.source_session_state !== "done"
+              );
+              return hasNotReady
+                ? `<button class="btn" onclick="forceStartReview('${g.id}')" data-tip="Start the review now using only branches whose source sessions are already done.\nBranches that are still running or were never submitted will be disabled — you can re-enable them later once their source tasks finish.\nThis cannot be undone.">Force-Start</button>`
+                : "";
+            })()}
             <button class="btn" onclick="approveReview('${g.id}')" ${g.status==="in_review"?"":"disabled"} data-tip="Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nOnly available when the review is in_review.">Approve</button>
           </div>
+          ${(() => {
+            // RAL-77: user-declared test actions from [[review.action]] in TOML.
+            const hints = g.action_hints || [];
+            if (hints.length === 0) return "";
+            const btns = hints.map((h, i) => {
+              if (h.command) {
+                return `<button class="btn" onclick="runActionHint('${g.id}',${i})" data-tip="Run: ${esc(h.command)}\nUser-declared test action. Launches in the repository root.">${esc(h.label)}</button>`;
+              }
+              return `<button class="btn" disabled style="opacity:0.6" data-tip="Prompt: ${esc(h.prompt||'')}\nThis action expands via the resolver LLM before running.">${esc(h.label)}</button>`;
+            }).join("");
+            return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions</h3>
+              <div class="btn-row">${btns}</div>`;
+          })()}
           ${(() => {
             const cmds = g.manual_commands || [];
             if (cmds.length === 0 && g.status !== "merging") return "";
@@ -1429,6 +1793,17 @@
             handle.addEventListener("pointerup", onUp);
           });
         }
+        // RAL-59: attach paste handler to capture clipboard images.
+        const chatInputEl = document.getElementById("chat-input");
+        if (chatInputEl) chatInputEl.addEventListener("paste", handleChatPaste);
+        // Focus the inline edit textarea and seed its value when editing mode is active.
+        if (chatEditState !== null) {
+          const editTa = document.getElementById("chat-edit-input");
+          if (editTa && document.activeElement !== editTa) {
+            editTa.focus({ preventScroll: true });
+            editTa.setSelectionRange(editTa.value.length, editTa.value.length);
+          }
+        }
       }
       // CCTL-135: per-branch merge detail is collapsed by default; toggle open.
       function toggleBranch(e, gid, pos) {
@@ -1445,6 +1820,7 @@
       // rebase. Discard reverts to the last server-saved state.
       let dragBranch = null;
       let pendingReorder = null; // { gid, order: [branchName, ...], enabled: {name: bool, ...} }
+      let pendingResolver = null; // { gid, agent: string }
       function brDragStart(e) { dragBranch = e.currentTarget.dataset.branch; e.dataTransfer.effectAllowed = "move"; }
       function brDragOver(e) { e.preventDefault(); e.currentTarget.classList.add("dragover"); }
       function brDragLeave(e) { e.currentTarget.classList.remove("dragover"); }
@@ -1520,6 +1896,14 @@
       let chatPanelHeight = 260;
       // RAL-22: global feedback chat — a persisted triage thread per review.
       let reviewMessages = {};
+      // RAL-59: conversation branching state.
+      let chatEditState = null;   // seq of the bubble currently being edited inline
+      let chatEditContent = "";   // text the user has typed in the edit textarea
+      let chatHistoryPos = -1;    // index into user-msg history; -1 = not navigating
+      let chatHistorySeq = null;  // seq of the forked message when navigating history
+      let chatHistoryDraft = "";  // original draft to restore when exiting history nav
+      let lastEsc = 0;            // timestamp of the last ESC keypress
+      let chatPendingImage = null; // data-URI of the pasted image waiting to be sent
       async function loadReviewMessages(gid, opts) {
         try {
           const data = await (await fetch(`/api/guardians/${gid}/messages`)).json();
@@ -1536,14 +1920,25 @@
         const input = document.getElementById("chat-input");
         const text = (input && input.value || "").trim();
         if (!text) return;
+        const image = chatPendingImage || null;
+        chatPendingImage = null;
         input.value = "";
+        // RAL-59: if the user navigated to a history message, fork from it.
+        if (chatHistorySeq !== null) {
+          const seq = chatHistorySeq;
+          chatHistorySeq = null;
+          chatHistoryPos = -1;
+          await forkChat(gid, seq, text, image);
+          return;
+        }
         // Optimistically show the reviewer's message; the guardian's reply
         // arrives via the poll loop once the triage agent finishes.
-        (reviewMessages[gid] = reviewMessages[gid] || []).push({ role: "reviewer", text, at_ms: 0 });
+        (reviewMessages[gid] = reviewMessages[gid] || []).push({ seq: 0, role: "reviewer", text, at_ms: 0 });
         renderReviewDetail();
         const sendCt = document.getElementById("chat-thread");
         if (sendCt) sendCt.scrollTop = sendCt.scrollHeight;
-        await post(`/api/guardians/${gid}/chat`, { text });
+        const chatBody = image ? { text, image } : { text };
+        await post(`/api/guardians/${gid}/chat`, chatBody);
         // RAL-33: poll every 500 ms until the guardian's reply arrives (direct LLM
         // call cuts per-message latency from ~6s to ~1-3s, so a short interval here
         // surfaces the reply promptly without hammering the daemon).
@@ -1557,6 +1952,134 @@
         };
         setTimeout(pollForReply, 500);
       }
+      // RAL-59: inline bubble editing ─────────────────────────────────────────
+      function startChatEdit(seq, gid) {
+        const msgs = reviewMessages[gid] || [];
+        const msg = msgs.find((m) => m.seq === seq);
+        chatEditContent = msg ? msg.text : "";
+        chatEditState = seq;
+        renderReviewDetail();
+      }
+      function cancelChatEdit() {
+        chatEditState = null;
+        chatEditContent = "";
+        renderReviewDetail();
+      }
+      async function saveChatEdit(gid, seq) {
+        const text = chatEditContent.trim();
+        if (!text) return;
+        const msgs = reviewMessages[gid] || [];
+        const original = msgs.find((m) => m.seq === seq);
+        if (original && original.text === text) { cancelChatEdit(); return; }
+        chatEditState = null;
+        chatEditContent = "";
+        await forkChat(gid, seq, text, null);
+      }
+      // RAL-59: fork — replace everything from seq onwards with a new message ─
+      async function forkChat(gid, seq, text, image) {
+        const msgs = reviewMessages[gid] || [];
+        const pruned = msgs.filter((m) => m.seq > 0 && m.seq < seq);
+        pruned.push({ seq: 0, role: "reviewer", text, at_ms: 0 });
+        reviewMessages[gid] = pruned;
+        renderReviewDetail();
+        const ct = document.getElementById("chat-thread");
+        if (ct) ct.scrollTop = ct.scrollHeight;
+        const forkBody = image ? { seq, text, image } : { seq, text };
+        await post(`/api/guardians/${gid}/chat/fork`, forkBody);
+        const sentLen = pruned.length;
+        var polls = 0;
+        var poll = function() {
+          loadReviewMessages(gid).then(function() {
+            if ((reviewMessages[gid] || []).length <= sentLen && polls++ < 20) setTimeout(poll, 500);
+          });
+        };
+        setTimeout(poll, 500);
+      }
+      // RAL-59: image paste ────────────────────────────────────────────────────
+      function handleChatPaste(e) {
+        if (!e.clipboardData) return;
+        const items = e.clipboardData.items;
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.startsWith("image/")) {
+            e.preventDefault();
+            const file = items[i].getAsFile();
+            if (!file) continue;
+            const reader = new FileReader();
+            reader.onload = function(evt) {
+              chatPendingImage = evt.target.result;
+              renderReviewDetail();
+            };
+            reader.readAsDataURL(file);
+            return;
+          }
+        }
+      }
+      function clearChatImage() { chatPendingImage = null; renderReviewDetail(); }
+      // RAL-59: keyboard handler for the main chat input ──────────────────────
+      function chatInputKeydown(event, gid) {
+        if (event.key === "Escape") {
+          const now = Date.now();
+          if (now - lastEsc < 400) {
+            const inp = document.getElementById("chat-input");
+            if (inp) inp.value = "";
+            chatPendingImage = null;
+            chatHistoryPos = -1;
+            chatHistorySeq = null;
+            renderReviewDetail();
+          }
+          lastEsc = now;
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          const inp = document.getElementById("chat-input");
+          if (!inp) return;
+          const onFirstLine = inp.value.substring(0, inp.selectionStart).indexOf("\n") === -1;
+          if (!onFirstLine && chatHistoryPos < 0) return;
+          const userMsgs = (reviewMessages[gid] || []).filter((m) => m.role === "reviewer" && m.seq > 0);
+          if (chatHistoryPos < 0) {
+            if (inp.value.trim() !== "") return;
+            if (userMsgs.length === 0) return;
+            chatHistoryDraft = inp.value;
+            chatHistoryPos = userMsgs.length - 1;
+          } else if (chatHistoryPos > 0) {
+            chatHistoryPos--;
+          } else {
+            return;
+          }
+          inp.value = userMsgs[chatHistoryPos].text;
+          chatHistorySeq = userMsgs[chatHistoryPos].seq;
+          event.preventDefault();
+          return;
+        }
+        if (event.key === "ArrowDown") {
+          if (chatHistoryPos < 0) return;
+          const inp = document.getElementById("chat-input");
+          if (!inp) return;
+          const userMsgs = (reviewMessages[gid] || []).filter((m) => m.role === "reviewer" && m.seq > 0);
+          chatHistoryPos++;
+          if (chatHistoryPos >= userMsgs.length) {
+            chatHistoryPos = -1;
+            chatHistorySeq = null;
+            inp.value = chatHistoryDraft;
+          } else {
+            inp.value = userMsgs[chatHistoryPos].text;
+            chatHistorySeq = userMsgs[chatHistoryPos].seq;
+          }
+          event.preventDefault();
+          return;
+        }
+        if (event.key === "Enter" && event.shiftKey) {
+          event.preventDefault();
+          sendChat(gid);
+          return;
+        }
+        // Exit history navigation on any character-modifying key.
+        if (chatHistoryPos >= 0 && (event.key.length === 1 || event.key === "Backspace" || event.key === "Delete")) {
+          chatHistoryPos = -1;
+          chatHistorySeq = null;
+        }
+      }
+      // ────────────────────────────────────────────────────────────────────────
       function showChatCopyMenu(e, gid) {
         e.stopPropagation();
         const existing = document.getElementById("chat-copy-menu");
@@ -1623,6 +2146,31 @@
         const pendingDiv = document.getElementById("base-pending");
         if (pendingDiv) pendingDiv.style.display = "none";
       }
+      function onResolverChange(gid, agent) {
+        pendingResolver = { gid, agent };
+        renderReviewDetail();
+      }
+      async function saveResolver(gid, status) {
+        const agent = pendingResolver ? pendingResolver.agent : "";
+        pendingResolver = null;
+        await fetch(`/api/guardians/${gid}/settings`, {
+          method: "POST",
+          body: JSON.stringify({ resolver_agent: agent, resolver_model: "" }),
+        });
+        const done = ["approved", "cancelled", "deployed"];
+        if (!done.includes(status)) {
+          if (status === "merging") {
+            await fetch(`/api/guardians/${gid}/cancel_and_merge`, { method: "POST" });
+          } else {
+            await fetch(`/api/guardians/${gid}/merge`, { method: "POST" });
+          }
+        }
+        tick();
+      }
+      function cancelResolver(gid) {
+        pendingResolver = null;
+        renderReviewDetail();
+      }
       // CCTL-99: the full audit log of a review cycle (state changes + notes).
       async function openReviewLogs(gid) {
         const g = guardians.find((x) => x.id === gid);
@@ -1688,7 +2236,7 @@
         tick();
       }
       async function mergeReview(id, status) {
-        if (status === "in_review" || status === "merging") {
+        if (status === "merging") {
           if (!confirm("There is a rebase currently in progress. Do you want to cancel it and start another?")) return;
           await fetch(`/api/guardians/${id}/cancel_and_merge`, { method: "POST" });
         } else {
@@ -1697,6 +2245,45 @@
         tick();
       }
       async function approveReview(id) { await fetch(`/api/guardians/${id}/approve`, { method: "POST" }); tick(); }
+
+      // ---------- force-start review (RAL-69) ----------
+      // Shows a confirmation modal listing not-ready branches, then calls
+      // POST /api/guardians/{id}/force_start which disables them and kicks off the merge.
+      function forceStartReview(id) {
+        const g = (guardians || []).find((x) => x.id === id);
+        if (!g) return;
+        const notReady = (g.branches || []).filter(
+          (b) => b.enabled !== false && b.source_session_state !== "done"
+        );
+        const rows = notReady.map((b) => {
+          const st = b.source_session_state || "not submitted";
+          return `<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span class="mono" style="flex:1;font-size:12px">${esc(b.branch)}</span>
+            <span class="badge" style="color:var(--queued);border-color:var(--queued);font-size:11px">${esc(st)}</span>
+          </div>`;
+        }).join("");
+        document.getElementById("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
+            <h2>Force-Start Review?</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">The following ${notReady.length === 1 ? "branch is" : "branches are"} not yet ready and will be <b>disabled</b> in the review stack. You can re-enable them later once their source sessions finish.</p>
+            <div style="border-top:1px solid var(--border);margin-bottom:10px">${rows}</div>
+            <p style="font-size:12px;color:var(--failed);margin:0 0 2px">This cannot be undone.</p>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Cancel — leave the review in its current collecting state.">Cancel</button>
+              <button class="btn primary" onclick="doForceStart('${id}')" data-tip="Disable the listed branches and start the review immediately with whatever branches remain enabled.">Continue anyway</button>
+            </div>
+          </div></div>`;
+      }
+      async function doForceStart(id) {
+        closeModal();
+        await fetch(`/api/guardians/${id}/force_start`, { method: "POST" });
+        tick();
+      }
+      // Permanently dismiss the "can enable now" notice for a disabled branch (RAL-69).
+      async function dismissReenable(id, pos) {
+        await fetch(`/api/guardians/${id}/branches/${pos}/dismiss_reenable`, { method: "POST" });
+        tick();
+      }
 
       // ---------- manual review commands (RAL-27) ----------
       function toggleManualMenu(id) {
@@ -1710,6 +2297,14 @@
         manualMenuOpen[id] = false;
         renderReviewDetail();
         await fetch(`/api/guardians/${id}/run-manual-commands`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ index }),
+        });
+      }
+      // RAL-77: run a user-declared action hint by index.
+      async function runActionHint(id, index) {
+        await fetch(`/api/guardians/${id}/run-action-hint`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ index }),
@@ -1808,9 +2403,21 @@
         return !!(s && !s.isCollapsed && String(s).length);
       }
       function renderAll() { renderRuns(); renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); }
+      // Fetch /api/tasks for the daemon status block only — updates the "Running X / Y"
+      // counter and the `runs` cache (used by the running dropdown) without triggering
+      // task-view rendering. Called by tick() on non-task tabs so the counter stays
+      // accurate regardless of which tab is active.
+      async function updateCounter() {
+        try {
+          const d = await (await fetch("/api/tasks")).json();
+          window._daemonStatus = d.daemon;
+          runs = d.runs || [];
+          document.getElementById("running").textContent = `Running ${d.daemon.running ?? 0} / ${d.daemon.max_concurrent ?? 0}`;
+        } catch (_) {}
+      }
       async function tick() {
-        if (tab === "reviews") await pollReviews();
-        else if (tab === "resources") await pollResources();
+        if (tab === "reviews") { await updateCounter(); await pollReviews(); }
+        else if (tab === "resources") { await updateCounter(); await pollResources(); }
         else await pollTasks();
         await refreshBanner();
       }

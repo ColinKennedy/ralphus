@@ -27,6 +27,21 @@ def _find_daemon_bin() -> str | None:
     override = os.environ.get("RALPHUS_DAEMON_BIN")
     if override and (os.path.exists(override) or shutil.which(override)):
         return override
+    # Prefer the Cargo workspace's debug build so tests always use the current
+    # source rather than a potentially stale dist/ binary.
+    here = Path(__file__).resolve()
+    cargo_target = os.environ.get("CARGO_TARGET_DIR")
+    for ancestor in [here, *here.parents]:
+        if (ancestor / "Cargo.toml").exists():
+            target_dirs = [ancestor / "target"]
+            if cargo_target:
+                target_dirs.insert(0, Path(cargo_target))
+            for target_dir in target_dirs:
+                for name in ("ralphus-daemon.exe", "ralphus-daemon"):
+                    candidate = target_dir / "debug" / name
+                    if candidate.exists():
+                        return str(candidate)
+            break
     search_dirs = [Path(sys.executable).resolve().parent, Path(sys.argv[0]).resolve().parent]
     for directory in search_dirs:
         for name in ("ralphus-daemon.exe", "ralphus-daemon"):

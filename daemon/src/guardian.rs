@@ -7,13 +7,27 @@
 //! `guardian_git.rs` and the orchestration in the server/merge path.
 
 use rusqlite::{OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::store::{Result, Store, StoreError, VerifyView};
 
 /// Return type of [`Store::verify_steps_for_review_branch`]:
 /// `(session_verifies, task_verifies, session_system_prompt)`.
 pub type BranchVerifyInfo = (Vec<VerifyView>, Vec<VerifyView>, Option<String>);
+
+/// One user-declared test/action hint from `[[review.action]]` (RAL-77).
+/// Either `command` (verbatim shell) or `prompt` (forwarded to LLM) is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionHint {
+    /// Button label shown in the UI.
+    pub label: String,
+    /// Verbatim shell command to run (mutually exclusive with `prompt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Prompt forwarded to the LLM to expand into a command (mutually exclusive with `command`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
 
 /// Lifecycle state of a guardian/review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -68,8 +82,10 @@ impl GuardianStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStatus {
-    /// Not yet merged.
+    /// Waiting for linked task sessions to complete.
     Pending,
+    /// All linked task sessions are done; branch is waiting for the rebase to start.
+    Ready,
     /// Being rebased onto the stack.
     InProgress,
     /// Rebased cleanly.
@@ -86,6 +102,7 @@ impl MergeStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Ready => "ready",
             Self::InProgress => "in_progress",
             Self::Done => "done",
             Self::ConflictResolved => "conflict_resolved",
@@ -109,27 +126,53 @@ pub struct BranchView {
     pub review_branch: Option<String>,
     /// The review worktree this branch is assembled in (read/write for feedback).
     pub worktree: Option<String>,
-    /// Total conflict markers seen when this branch was being resolved, if any.
-    pub conflicts_total: Option<i64>,
-    /// Conflict markers still remaining (0 once fully resolved).
-    pub conflicts_remaining: Option<i64>,
+    /// Total conflict marker blocks detected when this branch was being resolved, if any.
+    pub conflicts_found: Option<i64>,
+    /// Files where markers are resolved in the working tree, not yet staged.
+    pub conflicts_fixed: Option<i64>,
+    /// Files whose conflict resolutions are staged and committed to the branch.
+    pub conflicts_committed: Option<i64>,
     /// Whether this branch is included in the rebase stack (RAL-43). Disabled
     /// branches are skipped during merge but remain visible in the branch list.
     pub enabled: bool,
     /// Which git project root this branch lives in (RAL-29). `None` means the
     /// guardian's primary `git_root` (backward compatible with single-project).
     pub project: Option<String>,
+    /// State of the session whose work lives in this branch's worktree (RAL-69).
+    /// `None` when no session has `review_branch = branch` (branch was never
+    /// submitted or was added manually). Used to determine force-start readiness.
+    pub source_session_state: Option<String>,
+    /// `true` when this branch is disabled, all its source sessions are `done`,
+    /// and the "can re-enable" notification has not been dismissed (RAL-69).
+    /// TODO(RAL-73): wire to the dedicated `ready` signal when that lands.
+    pub can_reenable: bool,
+    /// Run ID of the most recent session submitted for this branch (for board navigation).
+    pub source_run_id: Option<String>,
+    /// Task index within the run for the source session.
+    pub source_task_idx: Option<i64>,
+    /// Session index within the task for the source session.
+    pub source_session_idx: Option<i64>,
+    /// claude_session_id from the conflict-resolver run on this branch.
+    /// Only populated when resolver_agent is "claude-code". Enables terminal resume.
+    pub resolver_claude_session_id: Option<String>,
 }
 
 /// One message in a guardian's global feedback thread (RAL-22).
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
+    /// Auto-increment primary key — used by the client to reference a specific
+    /// message for conversation branching (RAL-59).
+    pub seq: i64,
     /// `"reviewer"` (human) or `"guardian"` (triage agent).
     pub role: String,
     /// Message body.
     pub text: String,
     /// When it was posted (Unix epoch milliseconds).
     pub at_ms: i64,
+    /// Base64 data-URI of an image attached to this message (RAL-59). `None`
+    /// for text-only messages; omitted from JSON when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// A guardian/review, for display.
@@ -156,11 +199,12 @@ pub struct GuardianView {
     pub run_id: Option<String>,
     /// The stable, read-only combined review worktree (head of the last branch).
     pub combined_worktree: Option<String>,
-    /// Total conflict markers seen for the branch currently being resolved, if a
-    /// merge is (or was last) resolving conflicts.
-    pub conflicts_total: Option<i64>,
-    /// Conflict markers still remaining to resolve (0 once resolved).
-    pub conflicts_remaining: Option<i64>,
+    /// Total conflict marker blocks detected across all files when last resolving.
+    pub conflicts_found: Option<i64>,
+    /// Files where markers are resolved in the working tree, not yet staged.
+    pub conflicts_fixed: Option<i64>,
+    /// Files whose conflict resolutions are staged and committed to the branch.
+    pub conflicts_committed: Option<i64>,
     /// When true, the check gates (build verification) are skipped at finalize.
     pub skip_checks: bool,
     /// The review source type. `git` (the default and only fully-implemented
@@ -196,6 +240,9 @@ pub struct GuardianView {
     /// LLM-generated shell commands for manual review verification (RAL-27).
     /// Regenerated each time the review branch is rebuilt.
     pub manual_commands: Vec<String>,
+    /// User-declared test/action hints from `[[review.action]]` (RAL-77).
+    /// Persisted at submit time; not regenerated by the merge engine.
+    pub action_hints: Vec<ActionHint>,
 }
 
 /// The ordered `(position, branch)` list a merge run consumes.
@@ -261,16 +308,45 @@ impl Store {
         Ok(id)
     }
 
-    /// Atomically transition a guardian from `collecting` to `merging`.
-    /// Returns `true` when this call won the transition (the caller should
-    /// proceed with the merge), `false` when the guardian was already past
-    /// `collecting` (another caller claimed it first).
+    /// Atomically transition a guardian from `collecting` or `merge_failed` to
+    /// `merging`. Returns `true` when this call won the transition (the caller
+    /// should proceed with the merge), `false` when the guardian was already in
+    /// `merging`, `in_review`, or any other state that does not allow a new merge
+    /// (another caller claimed it first, or an explicit cancel is required).
     pub fn claim_guardian_merge(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE guardians SET status='merging', updated_at_ms=? WHERE id=? AND status='collecting'",
+            "UPDATE guardians SET status='merging', updated_at_ms=? \
+             WHERE id=? AND status IN ('collecting','merge_failed')",
             params![crate::store::now_ms(), id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Crash recovery: guardians left `merging` after an unclean shutdown have
+    /// no background thread to complete them. Reset each to `merge_failed` so
+    /// the user can see the interruption and re-trigger. Run at daemon startup
+    /// before the scheduler begins; returns the recovered guardian ids.
+    pub fn recover_orphaned_merges(&self) -> Result<Vec<String>> {
+        let ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM guardians WHERE status='merging'")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            self.conn.execute(
+                "UPDATE guardians SET status='merge_failed', \
+                 detail='merge interrupted by daemon restart', \
+                 updated_at_ms=? WHERE id=?",
+                params![crate::store::now_ms(), id],
+            )?;
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] guardian {id} merging → merge_failed (daemon restart)"
+            );
+        }
+        Ok(ids)
     }
 
     /// Ids of the guardians derived from a run, oldest first.
@@ -323,6 +399,18 @@ impl Store {
                    AND s.state != 'done'
              )
              ORDER BY created_at_ms, id",
+        )?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Ids of guardians whose merge was interrupted by a daemon restart (status =
+    /// `merging` with no live background thread). Called at startup to resume them.
+    pub fn interrupted_merges(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM guardians WHERE status='merging' ORDER BY created_at_ms, id",
         )?;
         let ids = stmt
             .query_map([], |r| r.get::<_, String>(0))?
@@ -407,11 +495,32 @@ impl Store {
     }
 
     /// Append a message to a guardian's global feedback thread (RAL-22). `role`
-    /// is `"reviewer"` (the human) or `"guardian"` (the triage agent).
-    pub fn add_guardian_message(&self, guardian_id: &str, role: &str, text: &str) -> Result<()> {
+    /// is `"reviewer"` (the human) or `"guardian"` (the triage agent). `image`
+    /// is an optional base64 data-URI attached to the message (RAL-59).
+    pub fn add_guardian_message(
+        &self,
+        guardian_id: &str,
+        role: &str,
+        text: &str,
+        image: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms) VALUES(?,?,?,?)",
-            params![guardian_id, role, text, crate::store::now_ms()],
+            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image) VALUES(?,?,?,?,?)",
+            params![guardian_id, role, text, crate::store::now_ms(), image],
+        )?;
+        Ok(())
+    }
+
+    /// Delete all messages with `seq >= from_seq` for the given guardian.
+    /// Used by the conversation-branching fork operation (RAL-59).
+    pub fn delete_guardian_messages_from_seq(
+        &self,
+        guardian_id: &str,
+        from_seq: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM guardian_messages WHERE guardian_id=? AND seq>=?",
+            params![guardian_id, from_seq],
         )?;
         Ok(())
     }
@@ -419,14 +528,16 @@ impl Store {
     /// A guardian's global feedback thread, oldest first (RAL-22).
     pub fn guardian_messages(&self, guardian_id: &str) -> Result<Vec<MessageView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, text, at_ms FROM guardian_messages WHERE guardian_id=? ORDER BY seq",
+            "SELECT seq, role, text, at_ms, image FROM guardian_messages WHERE guardian_id=? ORDER BY seq",
         )?;
         let rows = stmt
             .query_map(params![guardian_id], |r| {
                 Ok(MessageView {
-                    role: r.get(0)?,
-                    text: r.get(1)?,
-                    at_ms: r.get(2)?,
+                    seq: r.get(0)?,
+                    role: r.get(1)?,
+                    text: r.get(2)?,
+                    at_ms: r.get(3)?,
+                    image: r.get(4)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -440,6 +551,17 @@ impl Store {
         status: GuardianStatus,
         detail: Option<&str>,
     ) -> Result<()> {
+        let old = self
+            .conn
+            .query_row(
+                "SELECT status FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
         let n = self.conn.execute(
             "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=?",
             params![status.as_str(), detail, crate::store::now_ms(), id],
@@ -447,6 +569,11 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            crate::rlog!(
+                INFO,
+                "ralphus [state] guardian {id} {old} → {}",
+                status.as_str()
+            );
             let msg = match detail {
                 Some(d) => format!("review → {} ({d})", status.as_str()),
                 None => format!("review → {}", status.as_str()),
@@ -646,42 +773,90 @@ impl Store {
         Ok(())
     }
 
-    /// Record live conflict-resolution progress for a guardian (total markers and
-    /// how many remain). Pass `None, None` to clear it at the start of a merge.
+    /// Record live conflict-resolution progress for a guardian (RAL-72).
+    /// Pass `None` for all three to clear at the start of a merge.
     pub fn set_guardian_conflicts(
         &self,
         id: &str,
-        total: Option<i64>,
-        remaining: Option<i64>,
+        found: Option<i64>,
+        fixed: Option<i64>,
+        committed: Option<i64>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardians SET conflicts_total=?, conflicts_remaining=?, updated_at_ms=? WHERE id=?",
-            params![total, remaining, crate::store::now_ms(), id],
+            "UPDATE guardians SET conflicts_found=?, conflicts_fixed=?, conflicts_committed=?, updated_at_ms=? WHERE id=?",
+            params![found, fixed, committed, crate::store::now_ms(), id],
         )?;
         Ok(())
     }
 
-    /// Record per-branch conflict-resolution progress. Called alongside
+    /// Record per-branch conflict-resolution progress (RAL-72). Called alongside
     /// [`set_guardian_conflicts`] so the board can show a per-row progress bar.
     pub fn set_branch_conflicts(
         &self,
         guardian_id: &str,
         position: i64,
-        total: Option<i64>,
-        remaining: Option<i64>,
+        found: Option<i64>,
+        fixed: Option<i64>,
+        committed: Option<i64>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_branches SET conflicts_total=?, conflicts_remaining=? WHERE guardian_id=? AND position=?",
-            params![total, remaining, guardian_id, position],
+            "UPDATE guardian_branches SET conflicts_found=?, conflicts_fixed=?, conflicts_committed=? WHERE guardian_id=? AND position=?",
+            params![found, fixed, committed, guardian_id, position],
         )?;
         Ok(())
+    }
+
+    /// Store the claude_session_id from the most recent conflict-resolver run on
+    /// a branch. Only populated when the resolver backend is claude-code.
+    pub fn set_branch_resolver_session_id(
+        &self,
+        guardian_id: &str,
+        position: i64,
+        session_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET resolver_claude_session_id=? WHERE guardian_id=? AND position=?",
+            params![session_id, guardian_id, position],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the stored conflict-resolver claude_session_id for a branch.
+    pub fn get_branch_resolver_session_id(
+        &self,
+        guardian_id: &str,
+        position: i64,
+    ) -> Result<Option<String>> {
+        let r: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT resolver_claude_session_id FROM guardian_branches WHERE guardian_id=? AND position=?",
+                params![guardian_id, position],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(r.flatten())
+    }
+
+    /// Retrieve the review worktree path for a branch (for opening a plain terminal
+    /// when no session ID is available yet).
+    pub fn get_branch_worktree(&self, guardian_id: &str, position: i64) -> Result<Option<String>> {
+        let r: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT worktree FROM guardian_branches WHERE guardian_id=? AND position=?",
+                params![guardian_id, position],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(r.flatten())
     }
 
     /// Clear all per-branch conflict counts for a guardian — called at the start
     /// of a fresh merge so stale data from a previous run is not displayed.
     pub fn clear_all_branch_conflicts(&self, guardian_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_branches SET conflicts_total=NULL, conflicts_remaining=NULL WHERE guardian_id=?",
+            "UPDATE guardian_branches SET conflicts_found=NULL, conflicts_fixed=NULL, conflicts_committed=NULL WHERE guardian_id=?",
             params![guardian_id],
         )?;
         Ok(())
@@ -711,6 +886,17 @@ impl Store {
         let json = crate::store::to_json(commands);
         self.conn.execute(
             "UPDATE guardians SET manual_commands=?, updated_at_ms=? WHERE id=?",
+            params![json, crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist user-declared action hints from `[[review.action]]` (RAL-77).
+    /// Stored as a JSON array; set once at submit time and not touched by the merge engine.
+    pub fn set_guardian_action_hints(&self, id: &str, hints: &[ActionHint]) -> Result<()> {
+        let json = serde_json::to_string(hints).unwrap_or_else(|_| "[]".to_string());
+        self.conn.execute(
+            "UPDATE guardians SET action_hints=?, updated_at_ms=? WHERE id=?",
             params![json, crate::store::now_ms(), id],
         )?;
         Ok(())
@@ -822,6 +1008,48 @@ impl Store {
         Ok(rows)
     }
 
+    /// Disable all enabled branches whose source session is not yet `done`
+    /// (or have no linked session at all). Returns the list of disabled branch
+    /// names with their source session state (None = never submitted). Called by
+    /// the force-start endpoint (RAL-69).
+    pub fn force_start_disable_branches(
+        &self,
+        guardian_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gb.branch,
+                    (SELECT s.state FROM sessions s
+                     WHERE s.review_branch = gb.branch
+                     ORDER BY s.rowid DESC LIMIT 1) AS source_session_state
+             FROM guardian_branches gb
+             WHERE gb.guardian_id=? AND gb.enabled=1
+             ORDER BY gb.position",
+        )?;
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map(params![guardian_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let not_ready: Vec<(String, Option<String>)> = rows
+            .into_iter()
+            .filter(|(_, state)| state.as_deref() != Some("done"))
+            .collect();
+        for (branch, _) in &not_ready {
+            self.set_branch_enabled_by_name(guardian_id, branch, false)?;
+        }
+        Ok(not_ready)
+    }
+
+    /// Permanently dismiss the "can re-enable" notification for a branch (RAL-69).
+    /// Idempotent — unknown positions are silently ignored.
+    pub fn dismiss_branch_reenable(&self, guardian_id: &str, position: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET dismissed_reenable=1 WHERE guardian_id=? AND position=?",
+            params![guardian_id, position],
+        )?;
+        Ok(())
+    }
+
     /// Set a branch's enabled/disabled state by branch name (RAL-43). Unknown
     /// branch names are silently ignored (0 rows updated is not an error).
     pub fn set_branch_enabled_by_name(
@@ -841,21 +1069,39 @@ impl Store {
     /// Used when a disabled branch is skipped during a merge rebuild (RAL-43).
     pub fn reset_branch_to_pending(&self, guardian_id: &str, position: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_branches SET merge_status='pending', detail=NULL, review_branch=NULL, worktree=NULL
+            "UPDATE guardian_branches SET merge_status='pending', detail=NULL, review_branch=NULL,
+             worktree=NULL, resolver_claude_session_id=NULL
              WHERE guardian_id=? AND position=?",
             params![guardian_id, position],
         )?;
         Ok(())
     }
 
-    /// Reset all enabled branches of a guardian to Pending, clearing their
-    /// review-branch/worktree columns. Called at the start of a fresh merge so
-    /// downstream branches never show stale terminal statuses (Done, Failed)
-    /// from a prior build while the new merge is in progress (RAL-54).
+    /// Reset all enabled branches of a guardian before a fresh merge, clearing
+    /// their review-branch/worktree columns. Branches already in a
+    /// pre-merge state (`pending` or `ready`) keep their status so the
+    /// dependency-satisfaction signal survives the reset; only in-flight or
+    /// terminal merge states (`in_progress`, `done`, `conflict_resolved`,
+    /// `failed`) are rolled back to `pending` (RAL-54, RAL-73).
     pub fn reset_all_enabled_branches_to_pending(&self, guardian_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_branches SET merge_status='pending', detail=NULL, review_branch=NULL, worktree=NULL
+            "UPDATE guardian_branches
+             SET merge_status = CASE WHEN merge_status IN ('pending','ready') THEN merge_status ELSE 'pending' END,
+                 detail=NULL, review_branch=NULL, worktree=NULL, resolver_claude_session_id=NULL
              WHERE guardian_id=? AND enabled=1",
+            params![guardian_id],
+        )?;
+        Ok(())
+    }
+
+    /// Transition all enabled `pending` branches of a guardian to `ready`,
+    /// signalling that every linked task session is done and the branch is
+    /// waiting for the rebase to start (RAL-73). Branches already past
+    /// `pending` (e.g. `in_progress`, `done`, `failed`) are left unchanged.
+    pub fn mark_guardian_branches_ready(&self, guardian_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET merge_status='ready'
+             WHERE guardian_id=? AND enabled=1 AND merge_status='pending'",
             params![guardian_id],
         )?;
         Ok(())
@@ -866,7 +1112,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_total, conflicts_remaining, skip_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -879,7 +1125,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_total, conflicts_remaining, skip_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -900,28 +1146,51 @@ impl Store {
             checks: r.get(7)?,
             run_id: r.get(8)?,
             combined_worktree: r.get(9)?,
-            conflicts_total: r.get(10)?,
-            conflicts_remaining: r.get(11)?,
-            skip_checks: r.get(12)?,
-            review_type: r.get(13)?,
-            skip_worktrees: r.get(14)?,
-            created_at_ms: r.get(15)?,
-            resolver_agent: r.get(16)?,
-            resolver_model: r.get(17)?,
-            base_commit: r.get(18)?,
-            change_summary: r.get(19)?,
-            base_commits: r.get(20)?,
-            manual_commands: r.get(21)?,
+            conflicts_found: r.get(10)?,
+            conflicts_fixed: r.get(11)?,
+            conflicts_committed: r.get(12)?,
+            skip_checks: r.get(13)?,
+            review_type: r.get(14)?,
+            skip_worktrees: r.get(15)?,
+            created_at_ms: r.get(16)?,
+            resolver_agent: r.get(17)?,
+            resolver_model: r.get(18)?,
+            base_commit: r.get(19)?,
+            change_summary: r.get(20)?,
+            base_commits: r.get(21)?,
+            manual_commands: r.get(22)?,
+            action_hints: r.get(23)?,
         })
     }
 
     fn hydrate_guardian(&self, row: GuardianRow) -> Result<GuardianView> {
         let mut stmt = self.conn.prepare(
-            "SELECT position, branch, merge_status, detail, review_branch, worktree, conflicts_total, conflicts_remaining, enabled, project FROM guardian_branches
-             WHERE guardian_id=? ORDER BY position",
+            "SELECT gb.position, gb.branch, gb.merge_status, gb.detail, gb.review_branch,
+                    gb.worktree, gb.conflicts_found, gb.conflicts_fixed, gb.conflicts_committed,
+                    gb.enabled, gb.project, gb.dismissed_reenable,
+                    (SELECT s.state FROM sessions s
+                     WHERE s.review_branch = gb.branch
+                     ORDER BY s.rowid DESC LIMIT 1) AS source_session_state,
+                    (SELECT s.run_id FROM sessions s
+                     WHERE s.review_branch = gb.branch
+                     ORDER BY s.rowid DESC LIMIT 1) AS source_run_id,
+                    (SELECT s.task_idx FROM sessions s
+                     WHERE s.review_branch = gb.branch
+                     ORDER BY s.rowid DESC LIMIT 1) AS source_task_idx,
+                    (SELECT s.idx FROM sessions s
+                     WHERE s.review_branch = gb.branch
+                     ORDER BY s.rowid DESC LIMIT 1) AS source_session_idx,
+                    gb.resolver_claude_session_id
+             FROM guardian_branches gb
+             WHERE gb.guardian_id=? ORDER BY gb.position",
         )?;
         let branches = stmt
             .query_map(params![row.id], |r| {
+                let enabled = r.get::<_, i64>(9).map(|v| v != 0).unwrap_or(true);
+                let dismissed = r.get::<_, i64>(11).map(|v| v != 0).unwrap_or(false);
+                let source_session_state: Option<String> = r.get(12)?;
+                let can_reenable =
+                    !enabled && source_session_state.as_deref() == Some("done") && !dismissed;
                 Ok(BranchView {
                     position: r.get(0)?,
                     branch: r.get(1)?,
@@ -929,10 +1198,17 @@ impl Store {
                     detail: r.get(3)?,
                     review_branch: r.get(4)?,
                     worktree: r.get(5)?,
-                    conflicts_total: r.get(6)?,
-                    conflicts_remaining: r.get(7)?,
-                    enabled: r.get::<_, i64>(8).map(|v| v != 0).unwrap_or(true),
-                    project: r.get(9)?,
+                    conflicts_found: r.get(6)?,
+                    conflicts_fixed: r.get(7)?,
+                    conflicts_committed: r.get(8)?,
+                    enabled,
+                    project: r.get(10)?,
+                    source_session_state,
+                    can_reenable,
+                    source_run_id: r.get(13)?,
+                    source_task_idx: r.get(14)?,
+                    source_session_idx: r.get(15)?,
+                    resolver_claude_session_id: r.get(16)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -966,8 +1242,9 @@ impl Store {
             detail: row.detail,
             run_id: row.run_id,
             combined_worktree: row.combined_worktree,
-            conflicts_total: row.conflicts_total,
-            conflicts_remaining: row.conflicts_remaining,
+            conflicts_found: row.conflicts_found,
+            conflicts_fixed: row.conflicts_fixed,
+            conflicts_committed: row.conflicts_committed,
             skip_checks: row.skip_checks,
             review_type: row.review_type,
             skip_worktrees: row.skip_worktrees,
@@ -982,6 +1259,8 @@ impl Store {
             manual_commands: crate::store::from_json(
                 row.manual_commands.as_deref().unwrap_or("[]"),
             ),
+            action_hints: serde_json::from_str(row.action_hints.as_deref().unwrap_or("[]"))
+                .unwrap_or_default(),
         })
     }
 
@@ -1066,13 +1345,17 @@ impl Store {
         }
     }
 
-    /// Cancel a guardian that is in a cancellable state (collecting, merging, or approved).
+    /// Cancel a guardian that is in a cancellable state (collecting, merging, in_review, merge_failed, or approved).
     /// Background threads that are still running should check the status on completion
     /// and discard their result if the guardian is already cancelled.
     pub fn cancel_guardian(&self, id: &str) -> Result<GuardianStatus> {
         match GuardianStatus::parse(&self.guardian_status_str(id)?) {
             Some(
-                GuardianStatus::Collecting | GuardianStatus::Merging | GuardianStatus::Approved,
+                GuardianStatus::Collecting
+                | GuardianStatus::Merging
+                | GuardianStatus::MergeFailed
+                | GuardianStatus::InReview
+                | GuardianStatus::Approved,
             ) => {
                 self.set_guardian_status(id, GuardianStatus::Cancelled, None)?;
                 Ok(GuardianStatus::Cancelled)
@@ -1137,8 +1420,9 @@ struct GuardianRow {
     checks: String,
     run_id: Option<String>,
     combined_worktree: Option<String>,
-    conflicts_total: Option<i64>,
-    conflicts_remaining: Option<i64>,
+    conflicts_found: Option<i64>,
+    conflicts_fixed: Option<i64>,
+    conflicts_committed: Option<i64>,
     skip_checks: bool,
     review_type: String,
     skip_worktrees: bool,
@@ -1147,6 +1431,7 @@ struct GuardianRow {
     created_at_ms: i64,
     change_summary: Option<String>,
     manual_commands: Option<String>,
+    action_hints: Option<String>,
 }
 
 #[cfg(test)]
@@ -1249,10 +1534,10 @@ mod tests {
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         assert!(store.guardian_messages(&id).unwrap().is_empty());
         store
-            .add_guardian_message(&id, "reviewer", "please fix the naming")
+            .add_guardian_message(&id, "reviewer", "please fix the naming", None)
             .unwrap();
         store
-            .add_guardian_message(&id, "guardian", "that lands on branch feature/a")
+            .add_guardian_message(&id, "guardian", "that lands on branch feature/a", None)
             .unwrap();
         let thread = store.guardian_messages(&id).unwrap();
         assert_eq!(thread.len(), 2);
@@ -1265,9 +1550,107 @@ mod tests {
     fn deleting_a_guardian_clears_its_messages() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store.add_guardian_message(&id, "reviewer", "hi").unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "hi", None)
+            .unwrap();
         store.delete_guardian(&id).unwrap();
         assert!(store.guardian_messages(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_guardian_messages_from_seq_truncates_thread() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "msg1", None)
+            .unwrap();
+        store
+            .add_guardian_message(&id, "guardian", "msg2", None)
+            .unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "msg3", None)
+            .unwrap();
+        let thread = store.guardian_messages(&id).unwrap();
+        assert_eq!(thread.len(), 3);
+        let fork_seq = thread[1].seq;
+        store
+            .delete_guardian_messages_from_seq(&id, fork_seq)
+            .unwrap();
+        let after = store.guardian_messages(&id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "msg1");
+    }
+
+    #[test]
+    fn delete_guardian_messages_from_seq_prunes_from_that_point() {
+        // RAL-59: conversation branching prunes everything from the fork seq onwards.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "a", None)
+            .unwrap();
+        store
+            .add_guardian_message(&id, "guardian", "b", None)
+            .unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "c", None)
+            .unwrap();
+        let msgs = store.guardian_messages(&id).unwrap();
+        assert_eq!(msgs.len(), 3);
+        let seq_b = msgs[1].seq;
+        store.delete_guardian_messages_from_seq(&id, seq_b).unwrap();
+        let after = store.guardian_messages(&id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "a");
+        assert_eq!(after[0].role, "reviewer");
+    }
+
+    #[test]
+    fn claim_guardian_merge_is_atomic_and_covers_both_claimable_states() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert!(store.claim_guardian_merge(&id).unwrap());
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merging");
+
+        assert!(!store.claim_guardian_merge(&id).unwrap());
+
+        store
+            .set_guardian_status(&id, GuardianStatus::MergeFailed, Some("conflict"))
+            .unwrap();
+        assert!(store.claim_guardian_merge(&id).unwrap());
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merging");
+
+        store
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        assert!(!store.claim_guardian_merge(&id).unwrap());
+    }
+
+    #[test]
+    fn recover_orphaned_merges_resets_merging_guardians_to_merge_failed() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert!(store.recover_orphaned_merges().unwrap().is_empty());
+
+        store.claim_guardian_merge(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merging");
+
+        let recovered = store.recover_orphaned_merges().unwrap();
+        assert_eq!(recovered, vec![id.clone()]);
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.status, "merge_failed");
+        assert!(
+            g.detail.as_deref().unwrap_or("").contains("restart"),
+            "detail should mention restart: {:?}",
+            g.detail
+        );
+
+        assert!(store.claim_guardian_merge(&id).unwrap());
     }
 
     #[test]
@@ -1380,7 +1763,8 @@ mod tests {
 
     #[test]
     fn reset_branch_to_pending_clears_review_fields() {
-        // RAL-43: reset_branch_to_pending clears review_branch and worktree.
+        // RAL-43: reset_branch_to_pending clears review_branch, worktree, and
+        // resolver_claude_session_id so Watch Live never points at a stale session.
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
@@ -1390,12 +1774,42 @@ mod tests {
         store
             .set_branch_status(&id, 0, MergeStatus::Done, None)
             .unwrap();
+        store
+            .set_branch_resolver_session_id(&id, 0, "old-session-123")
+            .unwrap();
 
         store.reset_branch_to_pending(&id, 0).unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.branches[0].merge_status, "pending");
         assert!(g.branches[0].review_branch.is_none());
         assert!(g.branches[0].worktree.is_none());
+        assert!(
+            g.branches[0].resolver_claude_session_id.is_none(),
+            "session ID must be cleared so Watch Live doesn't point at a stale session"
+        );
+    }
+
+    #[test]
+    fn reset_all_branches_clears_resolver_session_id() {
+        // Regression: bulk reset must clear resolver_claude_session_id so that
+        // pressing Merge/Rebase (or a base-branch auto-rebuild) doesn't leave
+        // Watch Live pointing at the previous conflict-resolution session.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "a").unwrap();
+        store
+            .set_branch_resolver_session_id(&id, 0, "session-from-last-run")
+            .unwrap();
+        store
+            .set_branch_status(&id, 0, MergeStatus::Done, None)
+            .unwrap();
+
+        store.reset_all_enabled_branches_to_pending(&id).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert!(
+            g.branches[0].resolver_claude_session_id.is_none(),
+            "session ID must be cleared on bulk reset"
+        );
     }
 
     #[test]
@@ -1446,5 +1860,66 @@ mod tests {
         // Disabled branch (b) is untouched.
         assert_eq!(g.branches[1].merge_status, "done");
         assert!(g.branches[1].review_branch.is_some());
+    }
+
+    #[test]
+    fn mark_branches_ready_transitions_pending_to_ready() {
+        // RAL-73: mark_guardian_branches_ready flips pending → ready; other
+        // states (in_progress, done, failed) are not touched.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "a").unwrap();
+        store.add_guardian_branch(&id, "b").unwrap();
+        store.add_guardian_branch(&id, "c").unwrap();
+
+        // Advance branch b to done to simulate a branch already processed.
+        store
+            .set_branch_status(&id, 1, MergeStatus::Done, None)
+            .unwrap();
+
+        store.mark_guardian_branches_ready(&id).unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        // pending → ready.
+        assert_eq!(g.branches[0].merge_status, "ready");
+        // done stays done (only pending is flipped).
+        assert_eq!(g.branches[1].merge_status, "done");
+        // pending → ready.
+        assert_eq!(g.branches[2].merge_status, "ready");
+    }
+
+    #[test]
+    fn reset_preserves_ready_but_clears_merge_states() {
+        // RAL-73: reset_all_enabled_branches_to_pending keeps `ready` branches
+        // in place (they are pre-merge, dependency-satisfied) while rolling back
+        // in-flight or terminal merge states to `pending`.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "a").unwrap(); // will be ready
+        store.add_guardian_branch(&id, "b").unwrap(); // will be done (stale)
+        store.add_guardian_branch(&id, "c").unwrap(); // will be pending
+
+        store
+            .set_branch_status(&id, 0, MergeStatus::Ready, None)
+            .unwrap();
+        store
+            .set_branch_review(&id, 1, "review/b001", "/wt")
+            .unwrap();
+        store
+            .set_branch_status(&id, 1, MergeStatus::Done, Some("clean"))
+            .unwrap();
+        // branch c stays pending (default).
+
+        store.reset_all_enabled_branches_to_pending(&id).unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        // ready is preserved (RAL-73 dependency signal must survive the reset).
+        assert_eq!(g.branches[0].merge_status, "ready");
+        // done → pending (stale merge result cleared).
+        assert_eq!(g.branches[1].merge_status, "pending");
+        assert!(g.branches[1].review_branch.is_none());
+        assert!(g.branches[1].worktree.is_none());
+        // pending stays pending.
+        assert_eq!(g.branches[2].merge_status, "pending");
     }
 }

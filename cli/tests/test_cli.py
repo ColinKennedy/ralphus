@@ -48,8 +48,8 @@ def test_task_show_tutor_prints_reference(capsys: pytest.CaptureFixture[str]) ->
     assert code == 0
     out = captured.out
     # Reflects ralphus-specific syntax, not the predecessor's.
-    assert "[[task.session.review]]" in out
-    assert "<<upstream>>" in out
+    assert "[[review]]" in out
+    assert "[[review.action]]" in out
     assert "{handoff:" in out
     assert "[[task]]" in out
 

@@ -53,6 +53,60 @@ impl Runner for NoopRunner {
     }
 }
 
+/// A fake conflict resolver that strips conflict-marker lines, stages everything
+/// with `git add -A`, and emits `RALPHUS_STAGE: DONE` — exercising the fast path
+/// where the orchestrator advances the rebase without re-scanning for markers.
+struct StageDoneRunner;
+impl Runner for StageDoneRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let cwd = PathBuf::from(&spec.cwd);
+        if let Ok(entries) = std::fs::read_dir(&cwd) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if content.contains("<<<<<<<") {
+                        let cleaned: String = content
+                            .lines()
+                            .filter(|l| {
+                                !l.starts_with("<<<<<<<")
+                                    && !l.starts_with("=======")
+                                    && !l.starts_with(">>>>>>>")
+                            })
+                            .map(|l| format!("{l}\n"))
+                            .collect();
+                        let _ = std::fs::write(&path, cleaned);
+                    }
+                }
+            }
+        }
+        // Stage the resolved files so `git rebase --continue` can proceed.
+        let ok = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&cwd)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            ok,
+            "StageDoneRunner: git add -A failed in {}",
+            cwd.display()
+        );
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            summary: "resolved\nRALPHUS_STAGE: DONE".into(),
+            error: None,
+            verified: None,
+            claude_session_id: None,
+        }
+    }
+}
+
 /// A fake conflict resolver: strips conflict-marker lines from every top-level
 /// file in the worktree, leaving a marker-free (both-sides) result.
 struct MarkerStrippingRunner;
@@ -525,6 +579,191 @@ fn base_branch_shift_triggers_rebuild() {
     assert!(
         !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem),
         "no rebuild when base is unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// Lever 2 (carry-forward) regression: once a review branch's conflict is resolved,
+// a LATER base shift must NOT re-run the resolver for the same conflict — even with
+// git rerere OFF. The prior resolved commit is replayed onto the new base. This
+// simulates the exact reported scenario: a task branch that goes out of date with
+// its upstream, is resolved once, then the upstream moves again and the resolution
+// must survive without any agent call. Pure git; the agent is only used for build 1.
+#[test]
+fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
+    let root = temp_repo();
+    init_repo(&root);
+    // Prove the point WITHOUT rerere: force it off so a passing test can only be
+    // explained by carry-forward, not by a resolution the machine's git replayed.
+    git(&root, &["config", "rerere.enabled", "false"]);
+
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // The task/feature branch is cut from main and changes the middle line to X.
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+    git(&root, &["checkout", "main"]);
+
+    // The upstream (base) moves and touches the SAME line → out of date, conflicts.
+    write(&root, "conflict.txt", "line1\nMAIN2\nline3\n");
+    git(&root, &["commit", "-am", "main advances"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("carry", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        id
+    };
+
+    // Build 1: rebasing feature/x onto the advanced base conflicts; the agent
+    // resolves it (StageDoneRunner strips markers, keeping both sides).
+    run_merge(&store, &StageDoneRunner, &id);
+    let v1 = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(v1.status, "in_review", "detail: {:?}", v1.detail);
+    let x1 = v1
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/x")
+        .unwrap();
+    assert_eq!(x1.merge_status, "conflict_resolved");
+    let review1 = v1.review_branch.clone().expect("review branch");
+    let show1 = git(&root, &["show", &format!("{review1}:conflict.txt")]);
+    assert!(
+        !show1.contains("<<<<<<<"),
+        "markers remain after build 1: {show1}"
+    );
+    assert!(
+        show1.contains('X') && show1.contains("MAIN2"),
+        "both sides kept: {show1}"
+    );
+
+    // The base shifts AGAIN, in an unrelated file — no new conflict on conflict.txt.
+    git(&root, &["checkout", "main"]);
+    write(&root, "unrelated.txt", "later\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "unrelated base move"]);
+
+    // Build 2 via the auto-rebuild path, with a runner that MUST NOT be called.
+    // Carry-forward replays the already-resolved commit onto the new base, so the
+    // resolver agent is never invoked. If it regressed and re-derived from the
+    // feature tip, the old conflict would resurface, NoopRunner would be called,
+    // and the guardian would end merge_failed — caught by the assertion below.
+    let sem = Semaphore::new(4);
+    assert!(
+        rebuild_on_base_shift(&store, &NoopRunner, &id, &sem),
+        "the second base shift should trigger a rebuild"
+    );
+
+    let v2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        v2.status, "in_review",
+        "carry-forward should reach review without the agent; detail: {:?}",
+        v2.detail
+    );
+    let review2 = v2.review_branch.clone().expect("review branch");
+    let show2 = git(&root, &["show", &format!("{review2}:conflict.txt")]);
+    assert!(
+        !show2.contains("<<<<<<<"),
+        "conflict reappeared on rebuild: {show2}"
+    );
+    assert!(
+        show2.contains('X') && show2.contains("MAIN2"),
+        "resolved content did not survive the rebuild: {show2}"
+    );
+    let combined = v2.combined_worktree.as_deref().expect("combined");
+    assert!(
+        Path::new(combined).join("unrelated.txt").exists(),
+        "new base commit picked up"
+    );
+
+    // The protection refs pinned during the rebuild are cleaned up afterwards.
+    let carry = git(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/ralphus/carry/{id}"),
+        ],
+    );
+    assert!(
+        carry.trim().is_empty(),
+        "carry-forward refs leaked: {carry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// The carry-forward protection refs must be cleaned up even when the rebuild
+// fails partway through — the `CarryRefs` guard runs on the early-return path.
+#[test]
+fn carry_forward_refs_are_cleaned_up_when_a_rebuild_fails() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("carry-fail", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+
+    // Build 1 succeeds and records a review branch (no conflict).
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "in_review"
+    );
+
+    // Arm a check gate that always fails, then shift the base so a rebuild runs.
+    // During that rebuild carry-forward pins build 1's review commit, then the
+    // check gate fails and the merge returns early — the guard must still fire.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_checks(&id, &["test -f nonexistent.txt".to_string()])
+        .unwrap();
+    git(&root, &["checkout", "main"]);
+    write(&root, "c.txt", "on base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base moves"]);
+
+    let sem = Semaphore::new(4);
+    assert!(rebuild_on_base_shift(&store, &NoopRunner, &id, &sem));
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "merge_failed"
+    );
+
+    let carry = git(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/ralphus/carry/{id}"),
+        ],
+    );
+    assert!(
+        carry.trim().is_empty(),
+        "carry-forward refs leaked after a failed rebuild: {carry}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1037,7 +1276,7 @@ fn chat_no_commit_leaves_working_tree_dirty() {
         target_branch: "feature/a".to_string(),
         dispatch_file: "dispatch_note.txt",
     });
-    run_chat(&store, runner, &id, "apply the change, don't commit");
+    run_chat(&store, runner, &id, "apply the change, don't commit", None);
 
     // The review-branch HEAD must not have moved.
     let head_after = git(&root, &["rev-parse", &rev]);
@@ -1128,6 +1367,309 @@ fn rerun_resets_downstream_branches_to_pending_before_processing() {
             "branch 1 must be reset to pending, not linger as done"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebase_succeeds_when_worktree_has_untracked_file_introduced_by_new_base() {
+    // Regression: if the worktree has an untracked file that also exists in the
+    // new base commit, `git rebase --onto` fails with
+    // "untracked working tree files would be overwritten by checkout".
+    // The engine must clean the worktree before rebasing so this never blocks a
+    // rebuild.
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "in_review"
+    );
+
+    // Advance the base branch with a NEW file (leftover.txt).
+    git(&root, &["checkout", "main"]);
+    write(&root, "leftover.txt", "new base file\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "main adds leftover.txt"]);
+
+    // Simulate the scenario: an agent session created leftover.txt in the
+    // worktree but never staged or committed it (an untracked leftover).
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let wt_path = view
+        .branches
+        .first()
+        .and_then(|b| b.worktree.as_deref())
+        .map(PathBuf::from)
+        .expect("worktree path");
+    std::fs::write(wt_path.join("leftover.txt"), "stale agent output\n")
+        .expect("write untracked file");
+
+    // The rebuild must succeed — not fail with "untracked files would be
+    // overwritten".
+    let sem = Semaphore::new(4);
+    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem);
+    assert!(rebuilt, "base shift should trigger rebuild");
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        after.status, "in_review",
+        "rebuild must reach in_review; detail: {:?}",
+        after.detail
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stage_done_signal_triggers_fast_path_rebase_continue() {
+    // When the conflict-resolver agent emits RALPHUS_STAGE: DONE after calling
+    // git add -A, the orchestrator must advance the rebase immediately via the
+    // fast path instead of waiting for a marker re-scan.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("stage-done", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    run_merge(&store, &StageDoneRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(y.merge_status, "conflict_resolved");
+
+    // The review branch file must be marker-free.
+    let review = view.review_branch.expect("review branch");
+    let show = git(&root, &["show", &format!("{review}:conflict.txt")]);
+    assert!(
+        !show.contains("<<<<<<<"),
+        "markers remain in review branch: {show}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stage_done_marker_present_in_resolver_system_prompt() {
+    // The system prompt sent to the conflict-resolver agent must contain the
+    // RALPHUS_STAGE: DONE protocol instruction so the agent knows to emit it
+    // after git add -A.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    struct CapturingRunner {
+        specs: Arc<Mutex<Vec<RunnerSpec>>>,
+    }
+    impl Runner for CapturingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.specs.lock().unwrap().push(spec.clone());
+            // Strip conflict markers so the rebase completes via the fallback path.
+            let cwd = PathBuf::from(&spec.cwd);
+            if let Ok(entries) = std::fs::read_dir(&cwd) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if content.contains("<<<<<<<") {
+                                let cleaned: String = content
+                                    .lines()
+                                    .filter(|l| {
+                                        !l.starts_with("<<<<<<<")
+                                            && !l.starts_with("=======")
+                                            && !l.starts_with(">>>>>>>")
+                                    })
+                                    .map(|l| format!("{l}\n"))
+                                    .collect();
+                                let _ = std::fs::write(&path, cleaned);
+                            }
+                        }
+                    }
+                }
+            }
+            RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: "resolved".into(),
+                error: None,
+                verified: None,
+                claude_session_id: None,
+            }
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<RunnerSpec>>> = Arc::new(Mutex::new(Vec::new()));
+    let runner = CapturingRunner {
+        specs: captured.clone(),
+    };
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("sys-prompt-check", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    run_merge(&store, &runner, &id);
+
+    let specs = captured.lock().unwrap();
+    let resolve = specs
+        .iter()
+        .find(|s| s.task == "resolve")
+        .expect("resolve spec not found — conflict resolver was never invoked");
+    let sys = resolve.system_prompt.as_deref().unwrap_or("");
+    assert!(
+        sys.contains("RALPHUS_STAGE: DONE"),
+        "resolver system prompt must contain the RALPHUS_STAGE: DONE instruction:\n{sys}"
+    );
+    assert!(
+        sys.contains("git add -A"),
+        "resolver system prompt must instruct the agent to run git add -A:\n{sys}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rerere_autoupdate_resolves_conflict_without_agent() {
+    // Regression test for the rerere.autoupdate=true interaction. When that
+    // config is set, git automatically stages previously-resolved conflicts,
+    // leaving `git diff --name-only --diff-filter=U` empty even though the
+    // rebase is still paused. drive_rebase must detect this (no unmerged files
+    // but rebase_in_progress) and continue rather than aborting.
+    let root = temp_repo();
+    init_repo(&root);
+    git(&root, &["config", "rerere.enabled", "true"]);
+    git(&root, &["config", "rerere.autoupdate", "true"]);
+
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // feature/x: BASE → X
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+    git(&root, &["checkout", "main"]);
+
+    // feature/y: BASE → Y (will conflict with feature/x when stacked)
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    // Train rerere: cherry-pick feature/y onto feature/x to produce the same
+    // conflict the guardian rebase will see, then resolve it so rerere records
+    // the postimage. The cherry-pick is expected to fail (conflict).
+    git(&root, &["checkout", "-b", "rerere-train", "feature/x"]);
+    let _ = Command::new("git")
+        .args(["cherry-pick", "feature/y"])
+        .current_dir(&root)
+        .env("GIT_AUTHOR_NAME", "ralphus")
+        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+        .env("GIT_COMMITTER_NAME", "ralphus")
+        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
+        .env("GIT_EDITOR", "true")
+        .output()
+        .expect("git cherry-pick");
+    // Resolve the conflict — rerere will replay this resolution later.
+    write(&root, "conflict.txt", "line1\nX and Y\nline3\n");
+    git(&root, &["add", "conflict.txt"]); // rerere records postimage
+    let _ = Command::new("git")
+        .args(["cherry-pick", "--continue", "--no-edit"])
+        .current_dir(&root)
+        .env("GIT_AUTHOR_NAME", "ralphus")
+        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+        .env("GIT_COMMITTER_NAME", "ralphus")
+        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
+        .env("GIT_EDITOR", "true")
+        .output()
+        .expect("git cherry-pick --continue");
+    git(&root, &["checkout", "main"]);
+    let _ = Command::new("git")
+        .args(["branch", "-D", "rerere-train"])
+        .current_dir(&root)
+        .output();
+
+    // Run the guardian merge. NoopRunner must not be invoked for conflict
+    // resolution — rerere handles it transparently via rerere.autoupdate.
+    // If the agent were called and failed, the guardian would end up
+    // merge_failed and the status assertion below would catch it.
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let gid = g
+            .create_guardian("rerere", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&gid, "feature/x").unwrap();
+        g.add_guardian_branch(&gid, "feature/y").unwrap();
+        gid
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(
+        y.merge_status, "conflict_resolved",
+        "feature/y should be conflict_resolved (rerere handled it)"
+    );
+
+    let review = view.review_branch.expect("review branch");
+    let show = git(&root, &["show", &format!("{review}:conflict.txt")]);
+    assert!(!show.contains("<<<<<<<"), "conflict markers remain: {show}");
+    assert!(
+        show.contains("X and Y"),
+        "rerere resolution not applied: {show}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

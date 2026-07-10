@@ -85,15 +85,33 @@ pub fn run_loop(
     sem: Arc<Semaphore>,
 ) {
     let mut last_maintenance = std::time::Instant::now();
+    // Recovery: restart merges that were interrupted by a daemon shutdown.
+    // Guardians stuck in `merging` have no live background thread; reset them to
+    // `collecting` so `claim_guardian_merge` can claim them again.
+    {
+        let ids = {
+            let guard = store.lock().expect("store mutex poisoned");
+            let ids = guard.interrupted_merges().unwrap_or_default();
+            for gid in &ids {
+                let _ = guard.reset_guardian_to_collecting(gid);
+                let _ = guard.mark_guardian_branches_ready(gid);
+            }
+            ids
+        };
+        start_reviews(&store, ids, &sem);
+    }
     // Recovery: start collecting guardians whose contributing sessions are all
     // Done. This handles the case where the daemon was restarted after the run
     // completed but before the guardian auto-started.
     {
-        let ids = store
-            .lock()
-            .expect("store mutex poisoned")
-            .collecting_guardians_ready()
-            .unwrap_or_default();
+        let ids = {
+            let guard = store.lock().expect("store mutex poisoned");
+            let ids = guard.collecting_guardians_ready().unwrap_or_default();
+            for gid in &ids {
+                let _ = guard.mark_guardian_branches_ready(gid);
+            }
+            ids
+        };
         start_reviews(&store, ids, &sem);
     }
     loop {
@@ -142,6 +160,7 @@ fn claim_ready(store: &Arc<Mutex<Store>>) -> Vec<String> {
     let mut claimed = Vec::new();
     for run_id in ready {
         if guard.set_run_state(&run_id, RunState::Running).is_ok() {
+            crate::rlog!(INFO, "ralphus [scheduler] run {run_id} claimed → running");
             claimed.push(run_id);
         }
     }
@@ -213,7 +232,7 @@ fn execute_run_inner(
     cancel: &CancelToken,
     sem: &Arc<Semaphore>,
 ) {
-    let (sessions, tasks, already_done) = {
+    let (sessions, tasks, already_done, already_failed_tasks, verify_only_set) = {
         let guard = store.lock().expect("store mutex poisoned");
         // Mark Running up front so the finalization guard (which leaves an
         // edit-reset run Pending) has a Running baseline to compare against.
@@ -224,8 +243,26 @@ fn execute_run_inner(
             // Sessions already Done are skipped, so a restarted run only re-runs
             // its dirty (reset-to-pending) subset instead of redoing them (RAL-19).
             guard.done_sessions(run_id).unwrap_or_default(),
+            // Skipped sessions whose session-level verify previously failed still
+            // condemn their task — without this seed, `already_failed` in the
+            // task finalizer is false and the task is incorrectly marked Done.
+            guard
+                .done_sessions_with_failed_verify(run_id)
+                .unwrap_or_default(),
+            // Sessions that are Done but have pending verifies (e.g. after
+            // restart_session_verify). These skip the session body and re-run
+            // only their verify steps via run_verify_only_worker.
+            guard
+                .sessions_needing_verify_only(run_id)
+                .unwrap_or_default(),
         )
     };
+    crate::rlog!(
+        INFO,
+        "ralphus [scheduler] run {run_id} executing ({} sessions, {} tasks)",
+        sessions.len(),
+        tasks.len()
+    );
 
     let plan = match crate::plan::plan(&sessions, &tasks) {
         Ok(p) => p,
@@ -237,20 +274,32 @@ fn execute_run_inner(
 
     let n = sessions.len();
     // An already-Done session (restarted run's untouched upstream) starts
-    // satisfied so its downstream can proceed (RAL-19); the rest start Pending.
+    // satisfied so its downstream can proceed (RAL-19).
+    // A verify-only session (Done but with pending verifies) starts Running so
+    // the dispatcher doesn't re-dispatch the session body; a dedicated
+    // verify-only worker is spawned immediately before the dispatcher loop.
     let progress = Mutex::new(Progress {
         status: (0..n)
             .map(|i| {
-                if already_done.contains(&(sessions[i].task_idx, sessions[i].idx)) {
+                let key = (sessions[i].task_idx, sessions[i].idx);
+                if already_done.contains(&key) {
                     SessState::Done
+                } else if verify_only_set.contains(&key) {
+                    SessState::Running
                 } else {
                     SessState::Pending
                 }
             })
             .collect(),
         summaries: vec![None; n],
-        failed: HashSet::new(),
+        failed: already_failed_tasks,
     });
+
+    // Indices of sessions that need verify-only dispatch (precomputed so the
+    // borrows inside std::thread::scope are satisfied).
+    let verify_only_indices: Vec<usize> = (0..n)
+        .filter(|&i| verify_only_set.contains(&(sessions[i].task_idx, sessions[i].idx)))
+        .collect();
 
     // Each task's session indices, so the dispatcher can tell when a task's own
     // sessions have all finished and finalize *that* task on its own — rather
@@ -271,6 +320,31 @@ fn execute_run_inner(
     // per-task finalizer the moment a task's sessions are all terminal — until
     // no session is left Pending or Running.
     std::thread::scope(|scope| {
+        // Hoist borrows outside the loop so verify-only workers (spawned below)
+        // and normal workers (spawned inside the loop) share the same references.
+        let sessions_ref = &sessions;
+        let progress_ref = &progress;
+        let plan_ref = &plan;
+
+        // Spawn verify-only workers immediately for sessions that are Done but
+        // have pending verifies (restart_session_verify or crash recovery). They
+        // start as Running in progress so the dispatcher won't re-dispatch the
+        // session body; after verifies finish they transition to Done/Failed.
+        for &i in &verify_only_indices {
+            scope.spawn(move || {
+                run_verify_only_worker(
+                    store,
+                    runner,
+                    run_id,
+                    cancel,
+                    sem,
+                    sessions_ref,
+                    progress_ref,
+                    i,
+                );
+            });
+        }
+
         loop {
             // Stop launching the moment the run is cancelled; in-flight workers
             // observe the same token and unwind.
@@ -344,11 +418,6 @@ fn execute_run_inner(
                 let _ = guard.record_session_result(run_id, row.task_idx, row.idx, &outcome);
             }
 
-            // Launch the ready sessions concurrently. Borrow the owned locals by
-            // reference so each worker shares (not moves) them.
-            let progress_ref = &progress;
-            let plan_ref = &plan;
-            let sessions_ref = &sessions;
             for i in to_dispatch {
                 scope.spawn(move || {
                     run_session_worker(
@@ -459,7 +528,8 @@ fn try_upstream_rebase(
     let a_cwd = std::path::Path::new(dep.cwd.as_deref()?);
 
     if !crate::reviews::same_git_repo(a_cwd, b_cwd) {
-        eprintln!(
+        crate::rlog!(
+            WARNING,
             "ralphus: upstream rebase skipped — '{}' and '{}' are in different repositories; \
              task '{}' will start from its own branch base",
             a_cwd.display(),
@@ -480,13 +550,22 @@ fn try_upstream_rebase(
     };
 
     if let Err(e) = crate::reviews::rebase_onto(b_cwd, &a_branch) {
-        return Some(format!(
-            "failed to rebase session '{}' onto upstream branch '{a_branch}': {e}",
+        // A rebase conflict is transient: `rebase_onto` already aborted and left
+        // the worktree clean.  Failing the session permanently means the developer
+        // can never run it until they manually fix the branch — even though the
+        // session's own code is unaffected.  Log the conflict and let the session
+        // run on its current branch instead.
+        crate::rlog!(
+            WARNING,
+            "ralphus: upstream rebase of session '{}' onto '{a_branch}' has a conflict; \
+             running session on its current branch: {e}",
             row.session_id
-        ));
+        );
+        return None;
     }
 
-    eprintln!(
+    crate::rlog!(
+        DEBUG,
         "ralphus: rebased session '{}' onto upstream branch '{a_branch}'",
         row.session_id
     );
@@ -514,6 +593,13 @@ fn run_session_worker(
     if cancel.is_cancelled() {
         return;
     }
+    crate::rlog!(
+        INFO,
+        "ralphus [scheduler] session {run_id}/{} start agent={} model={}",
+        row.session_id,
+        row.agent,
+        row.model.as_deref().unwrap_or("default"),
+    );
     // Acquire a global slot; released when `_permit` drops at function end.
     let _permit = sem.acquire();
     if cancel.is_cancelled() {
@@ -563,6 +649,14 @@ fn run_session_worker(
     if cancel.is_cancelled() {
         return;
     }
+    crate::rlog!(
+        INFO,
+        "ralphus [scheduler] session {run_id}/{} completed status={} tokens_in={} tokens_out={}",
+        row.session_id,
+        result.status,
+        result.tokens_in,
+        result.tokens_out,
+    );
     let outcome = SessionOutcome {
         state: result.node_state(),
         tokens_in: result.tokens_in,
@@ -608,6 +702,59 @@ fn run_session_worker(
     // while a failing session-verify is still in flight.
     let mut prog = progress.lock().expect("progress mutex poisoned");
     prog.summaries[i] = Some(result.summary.clone());
+    prog.status[i] = SessState::Done;
+    if !verified {
+        prog.failed.insert(row.task_idx);
+    }
+}
+
+/// Run only the verify steps for a session whose body is already Done (e.g.
+/// after `restart_session_verify`). Skips the runner entirely; transitions the
+/// session from Running to Done/Failed in `progress` after verifies complete.
+#[allow(clippy::too_many_arguments)]
+fn run_verify_only_worker(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    run_id: &str,
+    cancel: &CancelToken,
+    sem: &Arc<Semaphore>,
+    sessions: &[crate::store::SessionRow],
+    progress: &Mutex<Progress>,
+    i: usize,
+) {
+    let row = &sessions[i];
+    if cancel.is_cancelled() {
+        let mut prog = progress.lock().expect("progress mutex poisoned");
+        prog.status[i] = SessState::Done;
+        return;
+    }
+    let _permit = sem.acquire();
+    if cancel.is_cancelled() {
+        let mut prog = progress.lock().expect("progress mutex poisoned");
+        prog.status[i] = SessState::Done;
+        return;
+    }
+    // Mark the owning task Running while verifies execute so the board doesn't
+    // show a task as Done while its session-level verifies are still in flight.
+    {
+        let guard = store.lock().expect("store mutex poisoned");
+        let _ = guard.set_task_state(run_id, row.task_idx, NodeState::Running);
+    }
+    let cwd = row.cwd.clone().unwrap_or_default();
+    let verified = run_verifies(
+        store,
+        runner,
+        run_id,
+        row.task_idx,
+        &row.task_name,
+        "session",
+        row.idx,
+        &cwd,
+        &row.agent,
+        row.model.as_deref(),
+        cancel,
+    );
+    let mut prog = progress.lock().expect("progress mutex poisoned");
     prog.status[i] = SessState::Done;
     if !verified {
         prog.failed.insert(row.task_idx);
@@ -737,6 +884,7 @@ fn run_task_finalizer(
 /// as sessions and task-level verifies.
 fn start_reviews(store: &Arc<Mutex<Store>>, guardian_ids: Vec<String>, sem: &Arc<Semaphore>) {
     for gid in guardian_ids {
+        crate::rlog!(INFO, "ralphus [scheduler] review {gid} starting merge");
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         std::thread::spawn(move || {
@@ -835,6 +983,14 @@ fn try_start_ready_reviews_for_task(
             ready.push(gid.clone());
         }
     }
+    // Mark pending branches as ready so the UI reflects the dependency-satisfied
+    // state before the merge thread acquires a concurrency slot (RAL-73).
+    {
+        let guard = store.lock().expect("store mutex poisoned");
+        for gid in &ready {
+            let _ = guard.mark_guardian_branches_ready(gid);
+        }
+    }
     start_reviews(store, ready, sem);
 }
 
@@ -918,14 +1074,24 @@ fn run_verifies(
         if cancel.is_cancelled() {
             return all_ok;
         }
-        let (passed, output) = match kind.as_str() {
+        let (passed, output, verify_claude_id) = match kind.as_str() {
             "command" => {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [scheduler] verify {run_id}/t{task_idx}/{scope}/#{idx} kind=command starting"
+                );
                 set_verify_running(store, run_id, task_idx, scope, session_idx, idx);
-                verify::run_command_verify_capture(cwd, &spec)
+                let (passed, output) = verify::run_command_verify_capture(cwd, &spec);
+                (passed, output, None)
             }
             "prompt" => {
-                set_verify_running(store, run_id, task_idx, scope, session_idx, idx);
                 let model = verify_model.as_deref().or(session_model);
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [scheduler] verify {run_id}/t{task_idx}/{scope}/#{idx} kind=prompt agent={session_agent} model={} starting",
+                    model.unwrap_or("default"),
+                );
+                set_verify_running(store, run_id, task_idx, scope, session_idx, idx);
                 let runner_spec = RunnerSpec::for_verify(
                     run_id,
                     task_name,
@@ -944,7 +1110,7 @@ fn run_verifies(
                     Some(err) => format!("{}\n{err}", result.summary),
                     None => result.summary.clone(),
                 };
-                (passed, output)
+                (passed, output, result.claude_session_id)
             }
             _ => continue, // brain / approval / unknown stay pending (deferred)
         };
@@ -955,8 +1121,16 @@ fn run_verifies(
         };
         {
             let guard = store.lock().expect("store mutex poisoned");
-            let _ =
-                guard.set_verify_result(run_id, task_idx, scope, session_idx, idx, state, &output);
+            let _ = guard.set_verify_result(
+                run_id,
+                task_idx,
+                scope,
+                session_idx,
+                idx,
+                state,
+                &output,
+                verify_claude_id.as_deref(),
+            );
         }
         if !passed {
             all_ok = false;
@@ -1527,6 +1701,54 @@ mod tests {
         assert_eq!(run.tasks[1].state, "done");
     }
 
+    // Two independent tasks; task "a" has a session-level verify that fails.
+    const TWO_TASKS_A_HAS_FAILING_SESSION_VERIFY: &str = "\
+        [[task]]\nname=\"a\"\n[[task.session]]\ncwd=\".\"\ncommand=\"cmd-a\"\n\
+        [[task.session.verify]]\ncommand=\"exit 1\"\n\
+        [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\".\"\ncommand=\"cmd-b\"\n";
+
+    #[test]
+    fn skipped_session_with_failed_verify_still_fails_task_on_partial_rerun() {
+        // Regression for the bug where `progress.failed` started empty on a
+        // partial restart, so a session whose session-level verify had
+        // previously failed but was not restarted (still in `done_sessions`)
+        // would let its task be marked Done by the finalizer.
+        let (store, id) = store_with(TWO_TASKS_A_HAS_FAILING_SESSION_VERIFY);
+
+        // First run: session "a" succeeds but its session-level verify fails.
+        // Task "a" → Failed, task "b" → Done, run → Failed.
+        execute_run(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(g.run_state(&id).unwrap(), RunState::Failed);
+            let run = g.get_run(&id).unwrap();
+            assert_eq!(run.tasks[0].state, "failed", "task 'a' should be failed");
+            assert_eq!(run.tasks[1].state, "done", "task 'b' should be done");
+        }
+
+        // Restart only task "b"'s session (task_idx=1, session_idx=0).
+        // Task "a"'s session stays Done and its failing verify stays Failed.
+        store.lock().unwrap().restart_session(&id, 1, 0).unwrap();
+
+        // Re-run: task "a"'s session is in `already_done` (skipped), but its
+        // prior verify failure must seed `progress.failed` so the task finalizer
+        // marks it Failed rather than Done.
+        execute_run(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
+
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            guard.run_state(&id).unwrap(),
+            RunState::Failed,
+            "run must be Failed because task 'a' verify still failed"
+        );
+        let run = guard.get_run(&id).unwrap();
+        assert_eq!(
+            run.tasks[0].state, "failed",
+            "task 'a' must remain Failed — its session-level verify was not re-run"
+        );
+        assert_eq!(run.tasks[1].state, "done", "task 'b' re-ran and succeeded");
+    }
+
     // ── per-task review readiness ─────────────────────────────────────────
 
     // `guardian_blocking_tasks` calls `project_root_of` which runs git, so it
@@ -1615,5 +1837,267 @@ mod tests {
         // check returns None early — treated as skip (None return).
         let result = try_upstream_rebase(&row, &[dep]);
         assert!(result.is_none(), "no cwd on B → silent skip");
+    }
+
+    /// Regression test for the production failure:
+    ///   "failed to rebase session 'work' onto upstream branch
+    ///   'RAL-54-reset_downstream_branch_statuses': git rebase ... failed:
+    ///   Rebasing (1/1) error: could not apply ... Could not apply ..."
+    ///
+    /// Root cause: when the upstream rebase has a conflict `try_upstream_rebase`
+    /// returned `Some(error)`, permanently failing the session before the runner
+    /// ever executed.  A rebase conflict is ephemeral — `rebase_onto` already
+    /// aborted and left the worktree clean — so it must not be treated as a
+    /// fatal error.  The fix: log a warning and return `None` so the session
+    /// runs on its current branch.
+    #[test]
+    fn try_upstream_rebase_warns_and_continues_on_rebase_conflict() {
+        use std::process::Command as Cmd;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ralphus-up-conflict-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir temp root");
+
+        let git = |args: &[&str]| {
+            let out = Cmd::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t.com")
+                .env("GIT_EDITOR", "true")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        // Two branches that both modify the same file — guaranteed conflict
+        // when "work" is rebased onto "dep".
+        git(&["init", "-b", "main"]);
+        std::fs::write(root.join("shared.txt"), "base\n").expect("write");
+        git(&["add", "shared.txt"]);
+        git(&["commit", "-m", "base"]);
+        git(&["checkout", "-b", "dep"]);
+        std::fs::write(root.join("shared.txt"), "from dep\n").expect("write dep");
+        git(&["commit", "-am", "dep changes"]);
+        git(&["checkout", "main"]);
+        git(&["checkout", "-b", "work"]);
+        std::fs::write(root.join("shared.txt"), "from work\n").expect("write work");
+        git(&["commit", "-am", "work changes"]);
+        git(&["checkout", "main"]);
+
+        // One worktree per branch, mirroring what the scheduler sets up.
+        let dep_wt = root.join("wt-dep");
+        let work_wt = root.join("wt-work");
+        git(&["worktree", "add", dep_wt.to_str().unwrap(), "dep"]);
+        git(&["worktree", "add", work_wt.to_str().unwrap(), "work"]);
+
+        let dep_row = crate::store::SessionRow {
+            task_idx: 0,
+            idx: 0,
+            task_name: "dep-task".into(),
+            session_id: "work".into(),
+            cwd: Some(dep_wt.to_str().unwrap().into()),
+            subprojects: vec![],
+            prompt: None,
+            command: Some("x".into()),
+            agent: "ollama".into(),
+            model: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            upstream: None,
+        };
+        let work_row = crate::store::SessionRow {
+            task_idx: 1,
+            idx: 0,
+            task_name: "work-task".into(),
+            session_id: "work".into(),
+            cwd: Some(work_wt.to_str().unwrap().into()),
+            upstream: Some("<<task:dep-task>>".into()),
+            ..dep_row.clone()
+        };
+        let sessions = [dep_row, work_row];
+
+        // Before the fix this returned Some(error) and permanently failed the
+        // session.  After the fix it must return None so the session can run.
+        let result = try_upstream_rebase(&sessions[1], &sessions);
+        assert!(
+            result.is_none(),
+            "rebase conflict must not permanently fail the session; got: {result:?}"
+        );
+
+        // The work worktree must be left in a clean state by the failed-rebase
+        // abort, ready for the session runner to use.
+        let status_out = Cmd::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&work_wt)
+            .output()
+            .expect("git status");
+        assert!(
+            status_out.stdout.is_empty(),
+            "work worktree must be clean after rebase conflict abort"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── verify-only restart (restart_session_verify / restart_task_verify) ──────
+
+    // A session with a PROMPT verify (not command), so the runner is invoked
+    // for both the session body and the verify — allowing CommandRecorder to
+    // distinguish them by checking spec.command vs spec.prompt.
+    const SESSION_WITH_PROMPT_VERIFY: &str = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do-work\"\n\
+         agent=\"ollama\"\nmodel=\"test-model\"\n\
+         [[task.session.verify]]\nprompt=\"check-output\"\n";
+
+    /// Records every command/prompt string the runner sees. Because command
+    /// verifies bypass the runner (they use run_command_verify_capture), this
+    /// only captures session bodies and prompt verifies.
+    struct CommandRecorder {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Runner for CommandRecorder {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            let label = spec
+                .command
+                .clone()
+                .or_else(|| spec.prompt.clone())
+                .unwrap_or_default();
+            self.calls.lock().unwrap().push(label);
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: "ok".to_string(),
+                error: None,
+                verified: spec.verify.then_some(true),
+                claude_session_id: None,
+            }
+        }
+    }
+
+    #[test]
+    fn restart_session_verify_does_not_re_run_session_body() {
+        let (store, id) = store_with(SESSION_WITH_PROMPT_VERIFY);
+
+        // First run: session body ("do-work") and prompt verify ("check-output") both succeed.
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        execute_run(
+            &store,
+            Arc::new(CommandRecorder {
+                calls: Arc::clone(&calls),
+            })
+            .as_ref(),
+            &id,
+        );
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done
+        );
+        assert!(
+            calls.lock().unwrap().contains(&"do-work".to_string()),
+            "session body must run on first pass"
+        );
+        assert!(
+            calls.lock().unwrap().contains(&"check-output".to_string()),
+            "prompt verify must run on first pass"
+        );
+
+        // Restart only the session-level verify.
+        store
+            .lock()
+            .unwrap()
+            .restart_session_verify(&id, 0, 0, 0)
+            .unwrap();
+
+        // Re-run: session body must NOT be called again; only the prompt verify re-runs.
+        calls.lock().unwrap().clear();
+        execute_run(
+            &store,
+            Arc::new(CommandRecorder {
+                calls: Arc::clone(&calls),
+            })
+            .as_ref(),
+            &id,
+        );
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            !recorded.contains(&"do-work".to_string()),
+            "session body must NOT re-run after restart_session_verify; got: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"check-output".to_string()),
+            "prompt verify must re-run; got: {recorded:?}"
+        );
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done
+        );
+    }
+
+    #[test]
+    fn restart_task_verify_does_not_re_run_session_body() {
+        // TASK_PROMPT_VERIFY has session command "do" + task prompt verify "check it".
+        // First run: session succeeds, task verify also succeeds (FakeRunner passes all).
+        // We'll use a custom TOML where the session body can be tracked.
+        const TASK_PROMPT_VERIFY_WITH_CMD_SESSION: &str = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do-work\"\n\
+             agent=\"ollama\"\nmodel=\"test-model\"\n\
+             [[task.verify]]\nprompt=\"task-check\"\n";
+
+        let (store, id) = store_with(TASK_PROMPT_VERIFY_WITH_CMD_SESSION);
+
+        // First run: all succeed.
+        execute_run(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done
+        );
+
+        // Restart only the task-level verify.
+        store
+            .lock()
+            .unwrap()
+            .restart_task_verify(&id, 0, 0)
+            .unwrap();
+
+        // Re-run: session body "do-work" must NOT be called; only "task-check" runs.
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        execute_run(
+            &store,
+            Arc::new(CommandRecorder {
+                calls: Arc::clone(&calls),
+            })
+            .as_ref(),
+            &id,
+        );
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            !recorded.contains(&"do-work".to_string()),
+            "session body must NOT re-run after restart_task_verify; got: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"task-check".to_string()),
+            "task prompt verify must re-run; got: {recorded:?}"
+        );
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done
+        );
     }
 }

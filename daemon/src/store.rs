@@ -125,6 +125,19 @@ impl NodeState {
             Self::Cancelled => "cancelled",
         }
     }
+
+    /// Parse the stable lowercase state string, or `None` if unrecognized.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
 }
 
 // ── Read views (serialized straight to the API) ──────────────────────────────
@@ -155,6 +168,12 @@ pub struct VerifyView {
     pub spec: String,
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<String>,
+    /// Resolved agent program (inherited from the owning session or task defaults).
+    pub agent: String,
+    /// Claude Code session UUID captured when the step ran via the claude-code
+    /// backend. `None` for non-claude-code steps or steps that have not yet run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 /// A session as shown in the board.
@@ -225,6 +244,10 @@ pub struct RunReviewRef {
     pub name: String,
     /// Guardian status string.
     pub status: String,
+    /// The specific branch in the review stack this session contributes to.
+    /// `None` for run-level review refs (not tied to a branch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// One entry in the execution/transition log (CCTL-99).
@@ -373,8 +396,10 @@ impl Store {
                 kind        TEXT NOT NULL,
                 spec        TEXT NOT NULL,
                 model       TEXT,
+                agent       TEXT NOT NULL DEFAULT 'claude',
                 state       TEXT NOT NULL,
                 output      TEXT,
+                claude_session_id TEXT,
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
                 PRIMARY KEY (run_id, task_idx, scope, session_idx, idx)
@@ -393,6 +418,9 @@ impl Store {
                 combined_worktree TEXT,
                 conflicts_total     INTEGER,
                 conflicts_remaining INTEGER,
+                conflicts_found     INTEGER,
+                conflicts_fixed     INTEGER,
+                conflicts_committed INTEGER,
                 skip_checks       INTEGER NOT NULL DEFAULT 0,
                 review_type       TEXT NOT NULL DEFAULT 'git',
                 skip_worktrees    INTEGER NOT NULL DEFAULT 0,
@@ -412,6 +440,9 @@ impl Store {
                 worktree            TEXT,
                 conflicts_total     INTEGER,
                 conflicts_remaining INTEGER,
+                conflicts_found     INTEGER,
+                conflicts_fixed     INTEGER,
+                conflicts_committed INTEGER,
                 PRIMARY KEY (guardian_id, position)
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -464,12 +495,21 @@ impl Store {
             "ALTER TABLE guardian_branches ADD COLUMN worktree TEXT",
             "ALTER TABLE guardian_branches ADD COLUMN conflicts_total INTEGER",
             "ALTER TABLE guardian_branches ADD COLUMN conflicts_remaining INTEGER",
+            // RAL-72: three-metric conflict progress replacing the old two-column pair.
+            "ALTER TABLE guardians ADD COLUMN conflicts_found INTEGER",
+            "ALTER TABLE guardians ADD COLUMN conflicts_fixed INTEGER",
+            "ALTER TABLE guardians ADD COLUMN conflicts_committed INTEGER",
+            "ALTER TABLE guardian_branches ADD COLUMN conflicts_found INTEGER",
+            "ALTER TABLE guardian_branches ADD COLUMN conflicts_fixed INTEGER",
+            "ALTER TABLE guardian_branches ADD COLUMN conflicts_committed INTEGER",
             // RAL-43: branch can be disabled (dropped from the stack) without deletion.
             "ALTER TABLE guardian_branches ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
             // Which git project (repository root) this branch lives in (RAL-29).
             // NULL means the guardian's own git_root (backward compatible).
             "ALTER TABLE guardian_branches ADD COLUMN project TEXT",
             "ALTER TABLE verifies ADD COLUMN model TEXT",
+            "ALTER TABLE verifies ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
+            "ALTER TABLE verifies ADD COLUMN claude_session_id TEXT",
             "ALTER TABLE sessions ADD COLUMN review_branch TEXT",
             "ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER",
             "ALTER TABLE sessions ADD COLUMN budget_tokens INTEGER",
@@ -482,6 +522,17 @@ impl Store {
             "ALTER TABLE verifies ADD COLUMN budget_tokens INTEGER",
             // RAL-50: branch-chaining upstream sentinel.
             "ALTER TABLE sessions ADD COLUMN upstream TEXT",
+            // RAL-69: tracks whether the user dismissed the "can re-enable" icon
+            // on a force-started disabled branch. Once dismissed it never reappears.
+            "ALTER TABLE guardian_branches ADD COLUMN dismissed_reenable INTEGER NOT NULL DEFAULT 0",
+            // RAL-77: user-declared action hints from [[review.action]] in TOML.
+            // JSON array of {label, command?, prompt?} objects, set at submit time.
+            "ALTER TABLE guardians ADD COLUMN action_hints TEXT NOT NULL DEFAULT '[]'",
+            // RAL-59: optional base64 image attached to a chat message.
+            "ALTER TABLE guardian_messages ADD COLUMN image TEXT",
+            // claude_session_id from the conflict-resolver run on this branch.
+            // Only set when the resolver backend is claude-code; enables terminal resume.
+            "ALTER TABLE guardian_branches ADD COLUMN resolver_claude_session_id TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -595,16 +646,42 @@ impl Store {
                         v_idx,
                         v,
                         task,
+                        &resolved.program,
                     )?;
                 }
             }
 
+            // Task-level verifies inherit the first session's resolved agent to
+            // match the scheduler's runtime behaviour (scheduler takes
+            // `task_session.map(|s| s.agent)`). Fall back to the task-level
+            // agent field when there are no sessions.
+            let task_verify_agent = task
+                .session
+                .first()
+                .map(|s| ResolvedAgent::resolve(task, s).program)
+                .unwrap_or_else(|| ResolvedAgent::from_task(task).program);
             for (v_idx, v) in task.verify.iter().enumerate() {
-                insert_verify(&tx, &run_id, t_idx_i, "task", -1, v_idx, v, task)?;
+                insert_verify(
+                    &tx,
+                    &run_id,
+                    t_idx_i,
+                    "task",
+                    -1,
+                    v_idx,
+                    v,
+                    task,
+                    &task_verify_agent,
+                )?;
             }
         }
 
         tx.commit()?;
+        crate::rlog!(
+            INFO,
+            "ralphus [submit] run {run_id} inserted state={} tasks={}",
+            state.as_str(),
+            file.task.len()
+        );
         Ok(run_id)
     }
 
@@ -673,6 +750,7 @@ impl Store {
 
     /// Set a run's state.
     pub fn set_run_state(&self, id: &str, state: RunState) -> Result<()> {
+        let old = self.run_state(id).map(|s| s.as_str()).unwrap_or("unknown");
         let n = self.conn.execute(
             "UPDATE runs SET state=?, updated_at_ms=? WHERE id=?",
             params![state.as_str(), now_ms(), id],
@@ -680,6 +758,7 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            crate::rlog!(INFO, "ralphus [state] run {id} {old} → {}", state.as_str());
             let _ = self.log_event(
                 Some(id),
                 None,
@@ -842,10 +921,26 @@ impl Store {
         idx: i64,
         state: NodeState,
     ) -> Result<()> {
+        let old = self
+            .conn
+            .query_row(
+                "SELECT state FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
         self.conn.execute(
             "UPDATE sessions SET state=? WHERE run_id=? AND task_idx=? AND idx=?",
             params![state.as_str(), run_id, task_idx, idx],
         )?;
+        crate::rlog!(
+            DEBUG,
+            "ralphus [state] session {run_id}/t{task_idx}/s{idx} {old} → {}",
+            state.as_str()
+        );
         let _ = self.log_event(
             Some(run_id),
             None,
@@ -858,10 +953,26 @@ impl Store {
 
     /// Set a task node's state.
     pub fn set_task_state(&self, run_id: &str, task_idx: i64, state: NodeState) -> Result<()> {
+        let old = self
+            .conn
+            .query_row(
+                "SELECT state FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
         self.conn.execute(
             "UPDATE tasks SET state=? WHERE run_id=? AND idx=?",
             params![state.as_str(), run_id, task_idx],
         )?;
+        crate::rlog!(
+            INFO,
+            "ralphus [state] task {run_id}/t{task_idx} {old} → {}",
+            state.as_str()
+        );
         let _ = self.log_event(
             Some(run_id),
             None,
@@ -975,6 +1086,7 @@ impl Store {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     status: r.get(2)?,
+                    branch: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1035,7 +1147,14 @@ impl Store {
         let mut map: HashMap<String, Vec<RunReviewRef>> = HashMap::new();
         for guardian in self.reviews_for_run(run_id)? {
             for ob in self.guardian_branches(&guardian.id)? {
-                map.entry(ob.branch).or_default().push(guardian.clone());
+                map.entry(ob.branch.clone())
+                    .or_default()
+                    .push(RunReviewRef {
+                        id: guardian.id.clone(),
+                        name: guardian.name.clone(),
+                        status: guardian.status.clone(),
+                        branch: Some(ob.branch),
+                    });
             }
         }
         Ok(map)
@@ -1049,7 +1168,7 @@ impl Store {
         session_idx: i64,
     ) -> Result<Vec<VerifyView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, model FROM verifies
+            "SELECT vid, kind, state, output, spec, model, agent, claude_session_id FROM verifies
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -1061,6 +1180,8 @@ impl Store {
                     output: r.get::<_, Option<String>>(3)?,
                     spec: r.get::<_, String>(4)?,
                     model: r.get::<_, Option<String>>(5)?,
+                    agent: r.get::<_, String>(6)?,
+                    claude_session_id: r.get::<_, Option<String>>(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1090,6 +1211,7 @@ fn insert_verify(
     v_idx: usize,
     v: &ralphus_core::schema::VerifyStep,
     task: &ralphus_core::schema::TaskDef,
+    agent: &str,
 ) -> Result<()> {
     let (kind, spec) = if let Some(c) = &v.command {
         ("command", c.clone())
@@ -1105,8 +1227,8 @@ fn insert_verify(
     let timeout_sec = resolve_timeout_sec(v.timeout_minutes, task.timeout_minutes);
     let budget_tokens = resolve_budget(v.budget_tokens, task.budget_tokens);
     tx.execute(
-        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, model, state, timeout_sec, budget_tokens)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, model, agent, state, timeout_sec, budget_tokens)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             run_id,
             task_idx,
@@ -1117,6 +1239,7 @@ fn insert_verify(
             kind,
             spec,
             v.model,
+            agent,
             NodeState::Pending.as_str(),
             timeout_sec,
             budget_tokens,
@@ -1328,11 +1451,27 @@ impl Store {
         idx: i64,
         state: NodeState,
     ) -> Result<()> {
+        let old = self
+            .conn
+            .query_row(
+                "SELECT state FROM verifies WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+                params![run_id, task_idx, scope, session_idx, idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
         self.conn.execute(
             "UPDATE verifies SET state=?
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
             params![state.as_str(), run_id, task_idx, scope, session_idx, idx],
         )?;
+        crate::rlog!(
+            DEBUG,
+            "ralphus [state] verify {run_id}/t{task_idx}/{scope}/#{idx} {old} → {}",
+            state.as_str()
+        );
         Ok(())
     }
 
@@ -1347,13 +1486,28 @@ impl Store {
         idx: i64,
         state: NodeState,
         output: &str,
+        claude_session_id: Option<&str>,
     ) -> Result<()> {
+        // Query old state and vid together before the UPDATE so we have both for
+        // logging (vid doesn't change, but reading it before avoids a second round trip).
+        let (old, vid): (String, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT state, vid FROM verifies WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+                params![run_id, task_idx, scope, session_idx, idx],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE verifies SET state=?, output=?
+            "UPDATE verifies SET state=?, output=?, claude_session_id=?
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
             params![
                 state.as_str(),
                 output,
+                claude_session_id,
                 run_id,
                 task_idx,
                 scope,
@@ -1361,21 +1515,16 @@ impl Store {
                 idx
             ],
         )?;
-        // Prefer the verifier's own id (e.g. `fmt`) over the bare index in the
-        // event log, so the Logs view names which verifier moved.
-        let vid: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT vid FROM verifies WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-                params![run_id, task_idx, scope, session_idx, idx],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten();
-        let reference = match vid {
+        let reference = match &vid {
             Some(v) => format!("{scope} t{task_idx}/{v}"),
             None => format!("{scope} t{task_idx} #{idx}"),
         };
+        crate::rlog!(
+            INFO,
+            "ralphus [state] verify {run_id}/t{task_idx}/{scope}/#{idx} {old} → {} output_len={}",
+            state.as_str(),
+            output.len()
+        );
         let _ = self.log_event(
             Some(run_id),
             None,
@@ -1489,6 +1638,10 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         for id in &ids {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] run {id}: running → pending (orphaned on startup)"
+            );
             self.conn.execute(
                 "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND state='running'",
                 params![id],
@@ -1507,6 +1660,35 @@ impl Store {
             )?;
         }
         Ok(ids)
+    }
+
+    /// Task indices that have at least one session in [`done_sessions`] whose
+    /// session-level verify previously **failed**. Used by the scheduler to seed
+    /// `progress.failed` on a partial restart: those sessions are skipped (they
+    /// are already Done), but their prior failure must still condemn the task so
+    /// that the task finalizer does not incorrectly set the task to Done.
+    pub fn done_sessions_with_failed_verify(&self, run_id: &str) -> Result<HashSet<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.task_idx
+             FROM sessions s
+             WHERE s.run_id=? AND s.state='done'
+             AND NOT EXISTS (
+                 SELECT 1 FROM verifies v
+                 WHERE v.run_id=s.run_id AND v.task_idx=s.task_idx
+                 AND v.scope='session' AND v.session_idx=s.idx
+                 AND v.state NOT IN ('done','failed','cancelled')
+             )
+             AND EXISTS (
+                 SELECT 1 FROM verifies v2
+                 WHERE v2.run_id=s.run_id AND v2.task_idx=s.task_idx
+                 AND v2.scope='session' AND v2.session_idx=s.idx
+                 AND v2.state='failed'
+             )",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(rows)
     }
 
     /// The `(task_idx, idx)` of every session in a run that is already `Done`
@@ -1808,6 +1990,153 @@ impl Store {
             .query_row(
                 "SELECT claude_session_id FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
                 params![run_id, task_idx, session_idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Restart a single session's verify steps from `verify_from` onwards:
+    /// reset only the session-level verifies at index >= `verify_from` to
+    /// Pending while leaving the session itself Done. The owning task and run
+    /// are put back to Pending so the scheduler re-enters them. The scheduler
+    /// detects that the session is Done with pending verifies via
+    /// [`Store::sessions_needing_verify_only`] and skips re-running the
+    /// session body, executing only the verify steps. Returns dirtied
+    /// dependent run ids.
+    pub fn restart_session_verify(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+        verify_from: i64,
+    ) -> Result<Vec<String>> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT idx FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, session_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        // Reset only verifies at idx >= verify_from — the session body stays
+        // Done so the scheduler's verify-only path re-runs verifies without
+        // re-running the session.
+        self.conn.execute(
+            "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=? AND idx>=?",
+            params![run_id, task_idx, session_idx, verify_from],
+        )?;
+        self.conn.execute(
+            "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
+            params![run_id, task_idx],
+        )?;
+        self.conn.execute(
+            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
+            params![now_ms(), run_id],
+        )?;
+        let _ = self.log_event(
+            Some(run_id),
+            None,
+            "verify",
+            Some(&format!("session t{task_idx}/s{session_idx}")),
+            "restarted",
+        );
+        self.dirty_dependents(run_id)
+    }
+
+    /// Restart a task's task-level verify steps from `verify_from` onwards:
+    /// reset only the task-scope verifies at index >= `verify_from` to Pending
+    /// while leaving all sessions and their session-level verifies intact. The
+    /// task and run are put back to Pending so the scheduler's task finalizer
+    /// fires and re-runs the task-level verifies. Returns dirtied dependent
+    /// run ids.
+    pub fn restart_task_verify(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        verify_from: i64,
+    ) -> Result<Vec<String>> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT idx FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        // Reset only task-scope verifies at idx >= verify_from. Session states
+        // and session-level verifies are intentionally left untouched: all
+        // sessions remain Done so the scheduler's task finalizer fires
+        // immediately and re-runs only the affected task-level verifies,
+        // without re-running any session body.
+        self.conn.execute(
+            "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='task' AND idx>=?",
+            params![run_id, task_idx, verify_from],
+        )?;
+        self.conn.execute(
+            "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
+            params![run_id, task_idx],
+        )?;
+        self.conn.execute(
+            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
+            params![now_ms(), run_id],
+        )?;
+        let _ = self.log_event(
+            Some(run_id),
+            None,
+            "verify",
+            Some(&format!("task t{task_idx}")),
+            "restarted",
+        );
+        self.dirty_dependents(run_id)
+    }
+
+    /// Sessions that are `done` in the DB but have at least one session-level
+    /// verify in a non-terminal state. The scheduler uses this to identify
+    /// "verify-only restart" cases: these sessions skip the runner and execute
+    /// only their verify steps.
+    pub fn sessions_needing_verify_only(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.task_idx, s.idx FROM sessions s
+             WHERE s.run_id=? AND s.state='done'
+             AND EXISTS (
+                 SELECT 1 FROM verifies v
+                 WHERE v.run_id=s.run_id AND v.task_idx=s.task_idx
+                 AND v.scope='session' AND v.session_idx=s.idx
+                 AND v.state NOT IN ('done','failed','cancelled')
+             )",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch the `claude_session_id` for a verify step's open-terminal endpoint.
+    ///
+    /// Returns `Err(StoreError::NotFound)` when the verify row does not exist,
+    /// and `Ok(None)` when it exists but has no UUID yet.
+    pub fn get_verify_claude_id(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        scope: &str,
+        session_idx: i64,
+        verify_idx: i64,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT claude_session_id FROM verifies
+                 WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+                params![run_id, task_idx, scope, session_idx, verify_idx],
                 |r| r.get::<_, Option<String>>(0),
             )
             .optional()?
@@ -2209,5 +2538,221 @@ command = "y"
         // Deleting the run removes its events.
         store.delete_run(&id).unwrap();
         assert!(store.events_for_run(&id, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restart_session_verify_keeps_session_done_but_resets_its_verifies() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        // Simulate a completed session + verify.
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store
+            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
+            .unwrap();
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        store.restart_session_verify(&id, 0, 0, 0).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        assert_eq!(run.state, "pending", "run must be pending after restart");
+        assert_eq!(run.tasks[0].state, "pending", "task must be pending");
+        // Session body stays Done — only the verify is reset.
+        assert_eq!(
+            run.tasks[0].sessions[0].state, "done",
+            "session must remain done (only its verifies are reset)"
+        );
+        assert_eq!(
+            run.tasks[0].sessions[0].verify[0].state, "pending",
+            "session verify must be pending"
+        );
+    }
+
+    #[test]
+    fn restart_session_verify_on_missing_session_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        assert!(matches!(
+            store.restart_session_verify(&id, 0, 99, 0),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn restart_task_verify_resets_only_task_verifies_sessions_remain_done() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        // Simulate a task where sessions passed but the task-level verify failed.
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store
+            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
+            .unwrap();
+        store
+            .set_verify_state(&id, 0, "task", -1, 0, NodeState::Failed)
+            .unwrap();
+        store.set_task_state(&id, 0, NodeState::Failed).unwrap();
+        store.set_run_state(&id, RunState::Failed).unwrap();
+
+        store.restart_task_verify(&id, 0, 0).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        assert_eq!(run.state, "pending");
+        assert_eq!(run.tasks[0].state, "pending");
+        // Sessions and session-level verifies are NOT reset — only task-level verifies are.
+        assert_eq!(
+            run.tasks[0].sessions[0].state, "done",
+            "session must remain done"
+        );
+        assert_eq!(
+            run.tasks[0].sessions[0].verify[0].state, "done",
+            "session-level verify must remain done"
+        );
+        assert_eq!(run.tasks[0].verify[0].state, "pending");
+    }
+
+    #[test]
+    fn restart_task_verify_on_missing_task_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        assert!(matches!(
+            store.restart_task_verify(&id, 99, 0),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    // Three session-level verify steps: restart from vi=1 leaves vi=0 Done,
+    // resets vi=1 and vi=2 to Pending.
+    const THREE_SESSION_VERIFIES: &str = r#"
+[[task]]
+name = "t"
+[[task.session]]
+cwd = "."
+command = "build"
+[[task.session.verify]]
+command = "check-a"
+[[task.session.verify]]
+command = "check-b"
+[[task.session.verify]]
+command = "check-c"
+"#;
+
+    // Three task-level verify steps (no session-level verifies).
+    const THREE_TASK_VERIFIES: &str = r#"
+[[task]]
+name = "t"
+[[task.session]]
+cwd = "."
+command = "build"
+[[task.verify]]
+command = "check-a"
+[[task.verify]]
+command = "check-b"
+[[task.verify]]
+command = "check-c"
+"#;
+
+    #[test]
+    fn restart_session_verify_from_middle_leaves_earlier_step_intact() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_run(&parse(THREE_SESSION_VERIFIES), None, false)
+            .unwrap();
+        // Simulate: session done, all three verifies done.
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        for vi in 0..3i64 {
+            store
+                .set_verify_state(&id, 0, "session", 0, vi, NodeState::Done)
+                .unwrap();
+        }
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        // Restart from vi=1 — only steps 1 and 2 should reset.
+        store.restart_session_verify(&id, 0, 0, 1).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        let vs = &run.tasks[0].sessions[0].verify;
+        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
+        assert_eq!(vs[1].state, "pending", "vi=1 must be reset to pending");
+        assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
+        assert_eq!(run.tasks[0].state, "pending");
+        assert_eq!(run.state, "pending");
+    }
+
+    #[test]
+    fn restart_session_verify_from_last_only_resets_that_step() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_run(&parse(THREE_SESSION_VERIFIES), None, false)
+            .unwrap();
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        for vi in 0..3i64 {
+            store
+                .set_verify_state(&id, 0, "session", 0, vi, NodeState::Done)
+                .unwrap();
+        }
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        // Restart from vi=2 — only the last step resets.
+        store.restart_session_verify(&id, 0, 0, 2).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        let vs = &run.tasks[0].sessions[0].verify;
+        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
+        assert_eq!(vs[1].state, "done", "vi=1 must stay done");
+        assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
+    }
+
+    #[test]
+    fn restart_task_verify_from_middle_leaves_earlier_step_intact() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_run(&parse(THREE_TASK_VERIFIES), None, false)
+            .unwrap();
+        // Simulate: session done, all three task-level verifies done.
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        for vi in 0..3i64 {
+            store
+                .set_verify_state(&id, 0, "task", -1, vi, NodeState::Done)
+                .unwrap();
+        }
+        store.set_task_state(&id, 0, NodeState::Done).unwrap();
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        // Restart from vi=1 — only steps 1 and 2 should reset.
+        store.restart_task_verify(&id, 0, 1).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        let vs = &run.tasks[0].verify;
+        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
+        assert_eq!(vs[1].state, "pending", "vi=1 must be reset to pending");
+        assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
+        assert_eq!(run.tasks[0].state, "pending");
+        assert_eq!(run.state, "pending");
+        // Session must be untouched.
+        assert_eq!(run.tasks[0].sessions[0].state, "done");
+    }
+
+    #[test]
+    fn restart_task_verify_from_last_only_resets_that_step() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_run(&parse(THREE_TASK_VERIFIES), None, false)
+            .unwrap();
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        for vi in 0..3i64 {
+            store
+                .set_verify_state(&id, 0, "task", -1, vi, NodeState::Done)
+                .unwrap();
+        }
+        store.set_task_state(&id, 0, NodeState::Done).unwrap();
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        // Restart from vi=2 — only the last step resets.
+        store.restart_task_verify(&id, 0, 2).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        let vs = &run.tasks[0].verify;
+        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
+        assert_eq!(vs[1].state, "done", "vi=1 must stay done");
+        assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
     }
 }

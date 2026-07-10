@@ -10,7 +10,9 @@ session (or verify step) becomes real work.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import sys
 
 from ralphus.runner.backend import BackendError, ModelBackend
 from ralphus.runner.spec import SessionResult, SessionSpec
@@ -21,10 +23,9 @@ __all__ = ["run_session"]
 _VERIFY_PASS = "RALPHUS_VERIFY: PASS"
 _VERIFY_FAIL = "RALPHUS_VERIFY: FAIL"
 
-_VERIFY_PROMPT_TEMPLATE = (
-    "{prompt}\n\n"
+_VERIFY_SYSTEM_PROMPT = (
     "This is a VERIFICATION step, not a normal task. Investigate whether the "
-    "above holds, attempting to fix any problems you find so the check passes "
+    "task holds, attempting to fix any problems you find so the check passes "
     "if you can reasonably do so. When you are done, your FINAL line of output "
     f"must be exactly one of:\n{_VERIFY_PASS}\n{_VERIFY_FAIL}\nwith nothing else "
     "on that line."
@@ -78,15 +79,39 @@ def _run_prompt(
             "no model backend available for this prompt session "
             "(the native pydantic-ai backend is configured by the caller)"
         )
+    prompt_text = spec.prompt or ""
+    prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()[:8]
+    print(
+        f"ralphus [llm] start run={spec.run_id} session={spec.session_id}"
+        f" agent={spec.agent!r} model={spec.model!r}"
+        f" prompt_len={len(prompt_text)} prompt_hash={prompt_hash}",
+        file=sys.stderr,
+    )
+    if spec.system_prompt:
+        print(
+            f"ralphus [llm] system-prompt applied len={len(spec.system_prompt)}"
+            f" position={spec.system_prompt_position!r} source=session-config",
+            file=sys.stderr,
+        )
     try:
         outcome = backend.run(
-            spec.prompt or "",
+            prompt_text,
             workspace,
             model=spec.model,
             append_system_prompt=spec.system_prompt,
         )
     except BackendError as exc:
+        print(
+            f"ralphus [llm] error run={spec.run_id} session={spec.session_id}: {exc}",
+            file=sys.stderr,
+        )
         return SessionResult.failed(f"model backend error: {exc}")
+    print(
+        f"ralphus [llm] done run={spec.run_id} session={spec.session_id}"
+        f" tokens_in={outcome.tokens_in} tokens_out={outcome.tokens_out}"
+        f" cost_usd={outcome.cost_usd:.4f}",
+        file=sys.stderr,
+    )
     over = _budget_exceeded(spec, outcome.tokens_in, outcome.tokens_out)
     if over is not None:
         return SessionResult.failed(over, summary=outcome.summary)
@@ -107,16 +132,44 @@ def _run_verify(
             "no model backend available for this agent verify step "
             "(the native pydantic-ai backend is configured by the caller)"
         )
-    wrapped_prompt = _VERIFY_PROMPT_TEMPLATE.format(prompt=spec.prompt or "")
+    prompt_text = spec.prompt or ""
+    verify_system = (
+        f"{spec.system_prompt}\n\n{_VERIFY_SYSTEM_PROMPT}"
+        if spec.system_prompt
+        else _VERIFY_SYSTEM_PROMPT
+    )
+    prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()[:8]
+    print(
+        f"ralphus [llm] verify start run={spec.run_id} session={spec.session_id}"
+        f" agent={spec.agent!r} model={spec.model!r}"
+        f" prompt_len={len(prompt_text)} prompt_hash={prompt_hash}",
+        file=sys.stderr,
+    )
+    source = "verify+session-config" if spec.system_prompt else "verify-instruction"
+    print(
+        f"ralphus [llm] system-prompt applied len={len(verify_system)}"
+        f" position=append source={source}",
+        file=sys.stderr,
+    )
     try:
         outcome = backend.run(
-            wrapped_prompt,
+            prompt_text,
             workspace,
             model=spec.model,
-            append_system_prompt=spec.system_prompt,
+            append_system_prompt=verify_system,
         )
     except BackendError as exc:
+        print(
+            f"ralphus [llm] verify error run={spec.run_id} session={spec.session_id}: {exc}",
+            file=sys.stderr,
+        )
         return SessionResult.failed(f"model backend error: {exc}")
+    print(
+        f"ralphus [llm] verify done run={spec.run_id} session={spec.session_id}"
+        f" tokens_in={outcome.tokens_in} tokens_out={outcome.tokens_out}"
+        f" cost_usd={outcome.cost_usd:.4f}",
+        file=sys.stderr,
+    )
 
     over = _budget_exceeded(spec, outcome.tokens_in, outcome.tokens_out)
     if over is not None:
@@ -142,6 +195,7 @@ def _run_verify(
         tokens_out=outcome.tokens_out,
         cost_usd=outcome.cost_usd,
         verified=passed,
+        claude_session_id=outcome.claude_session_id,
     )
 
 

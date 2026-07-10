@@ -127,11 +127,36 @@ fn repo_with_worktree(base: &Path, branch: &str) -> String {
         &repo,
         &["worktree", "add", "-b", branch, wt.to_str().unwrap()],
     );
+    git(&wt, &["branch", "--set-upstream-to=main"]);
     wt.to_string_lossy().replace('\\', "/")
 }
 
-fn session_toml(cwd: &str, review: &str) -> String {
-    format!("[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n{review}\n")
+/// Like `repo_with_worktree` but does NOT set an upstream tracking branch.
+/// Used for tests that verify the "no upstream" error path.
+fn repo_with_worktree_no_upstream(base: &Path, branch: &str) -> String {
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "base"]);
+    let wt = base.join(format!("wt-{}", branch.replace('/', "_")));
+    git(
+        &repo,
+        &["worktree", "add", "-b", branch, wt.to_str().unwrap()],
+    );
+    wt.to_string_lossy().replace('\\', "/")
+}
+
+/// Build a minimal task TOML with one session that opts into a review.
+/// `review_id` is the id for both the session's `review` field and the
+/// top-level `[[review]]` block. `review_attrs` is any extra `key = "value"`
+/// lines to append inside the `[[review]]` block (may be empty).
+fn session_toml(cwd: &str, review_id: &str, review_attrs: &str) -> String {
+    format!(
+        "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+         [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
+    )
 }
 
 #[test]
@@ -140,7 +165,8 @@ fn single_project_makes_one_review() {
     let cwd = repo_with_worktree(&base, "feature/a");
     let toml = session_toml(
         &cwd,
-        "[[task.session.review]]\nid=\"backend\"\nbase=\"main\"\nagent=\"claude\"\nmodel=\"claude-opus-4-8\"",
+        "backend",
+        "agent=\"claude\"\nmodel=\"claude-opus-4-8\"",
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -171,8 +197,10 @@ fn two_projects_make_two_disambiguated_reviews() {
     let cwd_b = repo_with_worktree(&base_b, "feature/b");
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"one\"\nbase=\"main\"\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"two\"\nbase=\"main\"\n"
+         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"one\"\n\
+         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"two\"\n\
+         [[review]]\nid=\"one\"\n\
+         [[review]]\nid=\"two\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -212,6 +240,8 @@ fn repo_with_two_worktrees(base: &Path, branch_a: &str, branch_b: &str) -> (Stri
         &repo,
         &["worktree", "add", "-b", branch_b, wtb.to_str().unwrap()],
     );
+    git(&wta, &["branch", "--set-upstream-to=main"]);
+    git(&wtb, &["branch", "--set-upstream-to=main"]);
     (
         wta.to_string_lossy().replace('\\', "/"),
         wtb.to_string_lossy().replace('\\', "/"),
@@ -222,12 +252,15 @@ fn repo_with_two_worktrees(base: &Path, branch_a: &str, branch_b: &str) -> (Stri
 fn separate_submissions_link_into_one_review_via_key() {
     let base = temp_base("link");
     let (cwd_a, cwd_b) = repo_with_two_worktrees(&base, "feature/a", "feature/b");
-    let review = "[[task.session.review]]\nid=\"ralphus:new-review/batch\"\nname=\"My Batch\"\nbase=\"main\"";
-
     let mut store = Store::open_in_memory().unwrap();
 
     // Submission 1 (branch a) creates the shared guardian, tagged with run 1.
-    let file1: TaskFile = toml::from_str(&session_toml(&cwd_a, review)).unwrap();
+    let file1: TaskFile = toml::from_str(&session_toml(
+        &cwd_a,
+        "ralphus:new-review/batch",
+        "name=\"My Batch\"",
+    ))
+    .unwrap();
     let run1 = store.insert_run(&file1, None, false).unwrap();
     let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
     assert_eq!(ids1.len(), 1, "first submission creates the guardian");
@@ -235,7 +268,12 @@ fn separate_submissions_link_into_one_review_via_key() {
     assert_eq!(store.get_guardian(&gid).unwrap().name, "My Batch");
 
     // Submission 2 (branch b) links to the SAME guardian by key — no new guardian.
-    let file2: TaskFile = toml::from_str(&session_toml(&cwd_b, review)).unwrap();
+    let file2: TaskFile = toml::from_str(&session_toml(
+        &cwd_b,
+        "ralphus:new-review/batch",
+        "name=\"My Batch\"",
+    ))
+    .unwrap();
     let run2 = store.insert_run(&file2, None, false).unwrap();
     let ids2 = derive_reviews(&store, &run2, &file2).expect("derive 2");
     assert!(ids2.is_empty(), "second submission creates no new guardian");
@@ -262,8 +300,8 @@ fn separate_submissions_link_into_one_review_via_key() {
 #[test]
 fn upstream_base_without_upstream_is_rejected() {
     let base = temp_base("noup");
-    let cwd = repo_with_worktree(&base, "feature/a");
-    let toml = session_toml(&cwd, "[[task.session.review]]\nbase=\"<<upstream>>\"");
+    let cwd = repo_with_worktree_no_upstream(&base, "feature/a");
+    let toml = session_toml(&cwd, "r", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let mut store = Store::open_in_memory().unwrap();
@@ -279,7 +317,8 @@ fn reviews_auto_start_when_the_run_succeeds() {
     let base = temp_base("autostart");
     let cwd = repo_with_worktree(&base, "feature/a");
     let toml = format!(
-        "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\n[[task.session.review]]\nid=\"r\"\nbase=\"main\"\n"
+        "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"r\"\n\
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -327,11 +366,10 @@ fn start_merge_resolves_conflicts_with_agent() {
     let (cwd_a, cwd_b) = two_conflicting_worktrees(&base);
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\n\
-         [[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\n\
-         [[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n"
+         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
@@ -416,6 +454,8 @@ fn force_push_then_merge_resolves_cleanly() {
         &repo,
         &["worktree", "add", "-b", "feature/b", wt_b.to_str().unwrap()],
     );
+    git(&wt_a, &["branch", "--set-upstream-to=main"]);
+    git(&wt_b, &["branch", "--set-upstream-to=main"]);
     std::fs::write(wt_a.join("shared.txt"), "changed by A\n").unwrap();
     git(&wt_a, &["commit", "-am", "A edits shared.txt"]);
     std::fs::write(wt_b.join("b_only.txt"), "changed by B\n").unwrap();
@@ -425,11 +465,10 @@ fn force_push_then_merge_resolves_cleanly() {
     let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\n\
-         [[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\n\
-         [[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n"
+         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
@@ -575,10 +614,9 @@ fn non_overlapping_task_does_not_block_readiness() {
     // Task A: fast, in project-X, declares a review.
     // Task B: slow/blocking, in project-Y, no review declaration.
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\n\
-        [[task.session.review]]\nbase=\"main\"\n\
-        \n\
-        [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n"
+        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -647,10 +685,9 @@ fn undeclared_overlapping_task_blocks_readiness() {
 
     // Task A: fast, declares a review. Task B: blocking, no review declaration.
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\n\
-        [[task.session.review]]\nbase=\"main\"\n\
-        \n\
-        [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n"
+        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -749,6 +786,24 @@ fn find_runner() -> Option<String> {
     None
 }
 
+fn pydantic_ai_available(runner_cmd: &str) -> bool {
+    let runner_path = Path::new(runner_cmd);
+    let Some(dir) = runner_path.parent() else {
+        return false;
+    };
+    for python in ["python.exe", "python3.exe", "python", "python3"] {
+        let p = dir.join(python);
+        if p.exists() {
+            return Command::new(p)
+                .args(["-c", "import pydantic_ai"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        }
+    }
+    false
+}
+
 /// One repo with two worktrees whose branches edit the SAME line differently, so
 /// stacking the second onto the first conflicts. Returns their (cwd_a, cwd_b),
 /// forward-slashed for TOML.
@@ -772,8 +827,10 @@ fn two_conflicting_worktrees(base: &Path) -> (String, String) {
     );
     std::fs::write(wt_a.join("shared.txt"), "line changed by A\n").unwrap();
     git(&wt_a, &["commit", "-am", "a change"]);
+    git(&wt_a, &["branch", "--set-upstream-to=main"]);
     std::fs::write(wt_b.join("shared.txt"), "line changed by B\n").unwrap();
     git(&wt_b, &["commit", "-am", "b change"]);
+    git(&wt_b, &["branch", "--set-upstream-to=main"]);
 
     (
         wt_a.to_string_lossy().replace('\\', "/"),
@@ -791,6 +848,12 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
         eprintln!("SKIP full_flow: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");
         return;
     };
+    if !pydantic_ai_available(&runner_cmd) {
+        eprintln!(
+            "SKIP full_flow: pydantic-ai not installed in runner environment (run `uv sync --extra runner` in cli/)"
+        );
+        return;
+    }
     if !ollama_up() {
         eprintln!("SKIP full_flow: ollama not reachable on 127.0.0.1:11434");
         return;
@@ -807,9 +870,10 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     // 1) The "ticket": a Task TOML. Validate it with the offline validator.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\n[[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\n[[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n"
+         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[review]]\nid=\"rev\"\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -901,18 +965,27 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
     let cwd_a = repo_with_worktree(&base_a, "feature/a");
     let cwd_b = repo_with_worktree(&base_b, "feature/b");
 
-    let review = "[[task.session.review]]\nid=\"ralphus:new-review/cross\"\nname=\"Cross Review\"\nbase=\"main\"";
     let mut store = Store::open_in_memory().unwrap();
 
     // Submission 1: repo A.
-    let file1: TaskFile = toml::from_str(&session_toml(&cwd_a, review)).unwrap();
+    let file1: TaskFile = toml::from_str(&session_toml(
+        &cwd_a,
+        "ralphus:new-review/cross",
+        "name=\"Cross Review\"",
+    ))
+    .unwrap();
     let run1 = store.insert_run(&file1, None, false).unwrap();
     let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
     assert_eq!(ids1.len(), 1, "first submission creates the guardian");
     let gid = ids1[0].clone();
 
     // Submission 2: repo B — links to the SAME guardian, no new guardian created.
-    let file2: TaskFile = toml::from_str(&session_toml(&cwd_b, review)).unwrap();
+    let file2: TaskFile = toml::from_str(&session_toml(
+        &cwd_b,
+        "ralphus:new-review/cross",
+        "name=\"Cross Review\"",
+    ))
+    .unwrap();
     let run2 = store.insert_run(&file2, None, false).unwrap();
     let ids2 = derive_reviews(&store, &run2, &file2).expect("derive 2");
     assert!(ids2.is_empty(), "second submission creates no new guardian");
@@ -953,14 +1026,23 @@ fn link_key_same_repo_branches_have_no_project_tag() {
     let base = temp_base("mp-link-same");
     let (cwd_a, cwd_b) = repo_with_two_worktrees(&base, "feature/a", "feature/b");
 
-    let review = "[[task.session.review]]\nid=\"ralphus:new-review/same\"\nname=\"Same Repo\"\nbase=\"main\"";
     let mut store = Store::open_in_memory().unwrap();
 
-    let file1: TaskFile = toml::from_str(&session_toml(&cwd_a, review)).unwrap();
+    let file1: TaskFile = toml::from_str(&session_toml(
+        &cwd_a,
+        "ralphus:new-review/same",
+        "name=\"Same Repo\"",
+    ))
+    .unwrap();
     let run1 = store.insert_run(&file1, None, false).unwrap();
     let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
 
-    let file2: TaskFile = toml::from_str(&session_toml(&cwd_b, review)).unwrap();
+    let file2: TaskFile = toml::from_str(&session_toml(
+        &cwd_b,
+        "ralphus:new-review/same",
+        "name=\"Same Repo\"",
+    ))
+    .unwrap();
     let run2 = store.insert_run(&file2, None, false).unwrap();
     derive_reviews(&store, &run2, &file2).expect("derive 2");
 
@@ -989,8 +1071,10 @@ fn proj_group_branches_carry_no_project_tag() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"rA\"\nbase=\"main\"\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"rB\"\nbase=\"main\"\n"
+         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"rA\"\n\
+         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"rB\"\n\
+         [[review]]\nid=\"rA\"\n\
+         [[review]]\nid=\"rB\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let mut store = Store::open_in_memory().unwrap();
@@ -1037,12 +1121,20 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
     git(wt_b, &["add", "."]);
     git(wt_b, &["commit", "-m", "b change"]);
 
-    let review =
-        "[[task.session.review]]\nid=\"ralphus:new-review/mp\"\nname=\"MP Review\"\nbase=\"main\"";
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
 
-    let file1: TaskFile = toml::from_str(&session_toml(&cwd_a, review)).unwrap();
-    let file2: TaskFile = toml::from_str(&session_toml(&cwd_b, review)).unwrap();
+    let file1: TaskFile = toml::from_str(&session_toml(
+        &cwd_a,
+        "ralphus:new-review/mp",
+        "name=\"MP Review\"",
+    ))
+    .unwrap();
+    let file2: TaskFile = toml::from_str(&session_toml(
+        &cwd_b,
+        "ralphus:new-review/mp",
+        "name=\"MP Review\"",
+    ))
+    .unwrap();
     let (gid, run1) = {
         let mut g = store.lock().unwrap();
         let r1 = g.insert_run(&file1, None, false).unwrap();

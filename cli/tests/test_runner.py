@@ -364,8 +364,9 @@ def test_agent_verify_backend_error_leaves_verified_none(tmp_path: Path) -> None
     assert result.verified is None
 
 
-def test_agent_verify_wraps_the_prompt_with_verdict_instructions(tmp_path: Path) -> None:
+def test_agent_verify_sends_verdict_instructions_as_system_prompt(tmp_path: Path) -> None:
     seen_prompts: list[str] = []
+    seen_system: list[str | None] = []
 
     class _RecordingBackend:
         def run(
@@ -377,14 +378,16 @@ def test_agent_verify_wraps_the_prompt_with_verdict_instructions(tmp_path: Path)
             append_system_prompt: str | None = None,
         ) -> BackendOutcome:
             seen_prompts.append(prompt)
+            seen_system.append(append_system_prompt)
             return BackendOutcome(summary="RALPHUS_VERIFY: PASS")
 
     spec = SessionSpec.from_json(_verify_spec_json(tmp_path, prompt="check the widget"))
     run_session(spec, backend=_RecordingBackend())
     assert len(seen_prompts) == 1
-    assert "check the widget" in seen_prompts[0]
-    assert "RALPHUS_VERIFY: PASS" in seen_prompts[0]
-    assert "RALPHUS_VERIFY: FAIL" in seen_prompts[0]
+    assert seen_prompts[0] == "check the widget"
+    assert seen_system[0] is not None
+    assert "RALPHUS_VERIFY: PASS" in seen_system[0]
+    assert "RALPHUS_VERIFY: FAIL" in seen_system[0]
 
 
 # ── SessionResult ────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import subprocess
@@ -21,7 +22,9 @@ from ralphus.author import (
     author_and_submit,
     parse_verify_answer,
 )
+from ralphus.author.agent import load_generator
 from ralphus.client import DEFAULT_DAEMON_URL, DaemonClient, DaemonError
+from ralphus.config import load_config, validate_config_files
 from ralphus.health import CORE, DEVELOPER, pydantic_ai_available, run_checks
 from ralphus.tutor import TASK_TUTOR
 
@@ -151,6 +154,22 @@ def build_parser() -> argparse.ArgumentParser:
     # `ralphus check` with no subcommand prints the check help.
     p_check.set_defaults(func=_help_printer(p_check))
 
+    p_configuration = subparsers.add_parser("configuration", help="Configuration inspection.")
+    configuration_sub = p_configuration.add_subparsers(
+        dest="configuration_command", metavar="SUBCOMMAND"
+    )
+    p_config_show = configuration_sub.add_parser(
+        "show",
+        help="Show sourced .ralphus.toml files and resolved values.",
+    )
+    p_config_show.add_argument(
+        "--no-local",
+        action="store_true",
+        help="Exclude the local .ralphus.toml (discovered via git root) from resolution.",
+    )
+    p_config_show.set_defaults(func=_cmd_configuration_show)
+    p_configuration.set_defaults(func=_help_printer(p_configuration))
+
     p_task = subparsers.add_parser("task", help="Task-authoring helpers.")
     task_sub = p_task.add_subparsers(dest="task_command", metavar="SUBCOMMAND")
     p_tutor = task_sub.add_parser(
@@ -160,6 +179,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_tutor.set_defaults(func=_cmd_show_tutor)
     # `ralphus task` with no subcommand prints the task help.
     p_task.set_defaults(func=_help_printer(p_task))
+
+    p_initialize = subparsers.add_parser(
+        "initialize", help="One-time local setup helpers for a repository."
+    )
+    initialize_sub = p_initialize.add_subparsers(dest="initialize_command", metavar="SUBCOMMAND")
+    p_init_git = initialize_sub.add_parser(
+        "git",
+        help="Enable git rerere in a repo so review rebases replay conflict resolutions.",
+    )
+    p_init_git.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        help="Repository directory to configure (default: the current directory).",
+    )
+    p_init_git.set_defaults(func=_cmd_initialize_git)
+    # `ralphus initialize` with no subcommand prints the group help.
+    p_initialize.set_defaults(func=_help_printer(p_initialize))
 
     return parser
 
@@ -260,18 +297,8 @@ def _cmd_submit(args: argparse.Namespace) -> int:
 
 
 def _load_generator(agent: str, model: str | None) -> Generator | None:
-    """Load the pydantic-ai authoring generator, or None if the extra is absent.
-
-    Checked with :func:`pydantic_ai_available` up front rather than relying on
-    an ``ImportError`` from importing ``ralphus.author.agent`` itself: that
-    module only imports pydantic-ai lazily inside its ``generate()`` method,
-    so the import here used to succeed even without the extra installed, and
-    the real ``ModuleNotFoundError`` surfaced later as an unhandled crash.
-    """
     if not pydantic_ai_available():
         return None
-    from ralphus.author.agent import load_generator
-
     return load_generator(agent, model)
 
 
@@ -486,6 +513,40 @@ def _print_run(run: dict[str, object]) -> None:
                 print(f"  task {task.get('name')}: {task.get('state')}")
 
 
+def _cmd_configuration_show(args: argparse.Namespace) -> int:
+    config = load_config(include_local=not args.no_local)
+
+    print("Sources (in resolution order, later wins):")
+    if not config.sources:
+        print("  (none)")
+    else:
+        for i, src in enumerate(config.sources, 1):
+            label = config.source_labels.get(src, "unknown")
+            print(f"  {i}. {src}  ({label})")
+
+    cwd_toml = Path.cwd() / ".ralphus.toml"
+    if cwd_toml.exists() and cwd_toml not in config.sources:
+        if args.no_local:
+            print(f"\nNote: {cwd_toml} exists but was excluded by --no-local.")
+        else:
+            print(f"\nNote: {cwd_toml} exists but is not in the resolution chain.")
+            print("      Add it to RALPHUS_CONFIGURATION_PATH to include it.")
+
+    def _prov(key: str) -> str:
+        src = config.provenance.get(key)
+        return f"from {src}" if src else "default"
+
+    mt = config.task.maximum_timeout_seconds
+    lp = config.daemon.log_path or "not set"
+    ll = config.daemon.log_level or "not set"
+
+    print("\nResolved values:")
+    print(f"  task.maximum_timeout_seconds  = {mt}  ({_prov('task.maximum_timeout_seconds')})")
+    print(f"  daemon.log_path               = {lp}  ({_prov('daemon.log_path')})")
+    print(f"  daemon.log_level              = {ll}  ({_prov('daemon.log_level')})")
+    return 0
+
+
 def _cmd_check_health(args: argparse.Namespace) -> int:
     symbols = {"pass": "OK  ", "warn": "WARN", "fail": "FAIL"}
     results = run_checks(args.daemon_url, enable_developer_checks=args.enable_developer_checks)
@@ -496,15 +557,86 @@ def _cmd_check_health(args: argparse.Namespace) -> int:
         print(f"{title}:")
         for r in section_results:
             print(f"  [{symbols.get(r.status, '?')}] {r.name}: {r.detail}")
-    failed = [r for r in results if r.is_fail]
-    if failed:
-        print(f"\n{len(failed)} check(s) failed.")
+
+    file_issues = validate_config_files()
+    if file_issues:
+        print("\nConfiguration file issues:")
+        for fi in file_issues:
+            print(f"  {fi.path}  ({fi.label})")
+            if fi.syntax_error:
+                print(f"    - TOML syntax error: {fi.syntax_error}")
+            for issue in fi.issues:
+                print(f"    - {issue}")
+
+    failed_checks = [r for r in results if r.is_fail]
+    total_failed = len(failed_checks) + len(file_issues)
+    if total_failed:
+        print(f"\n{total_failed} check(s) failed.")
         return 1
     return 0
 
 
 def _cmd_show_tutor(_args: argparse.Namespace) -> int:
     print(TASK_TUTOR)
+    return 0
+
+
+def _cmd_initialize_git(args: argparse.Namespace) -> int:
+    """Enable git rerere (+autoupdate) in the target repository.
+
+    ``rerere`` (reuse recorded resolution) makes git record how a merge conflict
+    was resolved and replay that resolution automatically the next time the same
+    conflict appears. This matters for Guardian reviews: when a base branch moves,
+    the review stack is rebased again, and without rerere the same conflict has to
+    be re-resolved from scratch every time. Enabling it is per-repository and git
+    keeps it off by default, so this configures whichever repo owns the current
+    directory (or ``--path``).
+    """
+    # Accept relative or absolute paths on either OS. `expanduser` resolves a
+    # leading `~`; `resolve` makes a relative path absolute (relative to the
+    # current directory) and normalises separators so a mix of `/` and `\` on
+    # Windows still lands on the right directory. `strict=False` keeps a missing
+    # path from raising here — the git working-tree probe below reports it cleanly.
+    raw = args.path if args.path is not None else Path.cwd()
+    target = raw.expanduser()
+    with contextlib.suppress(OSError):
+        target = target.resolve(strict=False)
+    if shutil.which("git") is None:
+        print("error: git is not on PATH", file=sys.stderr)
+        return 2
+    # Confirm the target is inside a git working tree before writing config.
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"error: could not run git: {exc}", file=sys.stderr)
+        return 2
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        print(
+            f"error: {target} is not inside a git working tree "
+            "(run this from a repository, or pass --path)",
+            file=sys.stderr,
+        )
+        return 2
+    for key, value in (("rerere.enabled", "true"), ("rerere.autoupdate", "true")):
+        result = subprocess.run(
+            ["git", "-C", str(target), "config", key, value],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"error: git config {key} failed: {result.stderr.strip()}", file=sys.stderr)
+            return 1
+        print(f"set {key} = {value}")
+    print(
+        "git rerere enabled: conflict resolutions during review rebases will now be "
+        "recorded and replayed automatically."
+    )
     return 0
 
 
@@ -516,6 +648,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if func is None:
         parser.print_help()
         return 0
+    subcommand = getattr(args, "command", func.__name__)
+    print(f"ralphus [cli] {subcommand} {vars(args)}", file=sys.stderr)
     exit_code: int = func(args)
     return exit_code
 

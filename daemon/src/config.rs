@@ -51,6 +51,18 @@ impl ReviewConfig {
     }
 }
 
+/// Daemon-level configuration (`[daemon]` table).
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct DaemonConfig {
+    /// Path to the log file; when absent all output goes to stderr.
+    #[serde(default)]
+    pub log_path: Option<String>,
+    /// Minimum log level: `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
+    /// Defaults to `"debug"` when unset.
+    #[serde(default)]
+    pub log_level: Option<String>,
+}
+
 /// The on-disk file shape: either a `[review]` or a `[defaults]` table.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
@@ -58,6 +70,8 @@ struct ConfigFile {
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
+    #[serde(default)]
+    daemon: Option<DaemonConfig>,
 }
 
 /// Parse a config from TOML text, preferring `[review]` over `[defaults]`.
@@ -106,6 +120,36 @@ pub fn find_project_config(start: &Path) -> Option<PathBuf> {
         dir = d.parent();
     }
     None
+}
+
+/// Parse a `DaemonConfig` from the given TOML text.
+#[must_use]
+pub fn daemon_from_toml_str(s: &str) -> DaemonConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .daemon
+        .unwrap_or_default()
+}
+
+/// Load the effective daemon config by layering the global config file under
+/// the nearest per-project `.ralphus.toml` (per-project scalars win).
+#[must_use]
+pub fn load_daemon_config() -> DaemonConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| daemon_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| daemon_from_toml_str(&s))
+        .unwrap_or_default();
+    DaemonConfig {
+        log_path: local.log_path.or(global.log_path),
+        log_level: local.log_level.or(global.log_level),
+    }
 }
 
 /// Resolve the effective review config for a review rooted at `cwd`: the global

@@ -17,12 +17,16 @@ pub fn run_command_verify(cwd: &str, command: &str) -> bool {
 /// (truncated) so it can be shown in the log viewer (CCTL-99).
 #[must_use]
 pub fn run_command_verify_capture(cwd: &str, command: &str) -> (bool, String) {
+    crate::rlog!(
+        DEBUG,
+        "ralphus [verify] command starting cwd={cwd:?} command={command:?}"
+    );
     let (shell, flag) = if cfg!(windows) {
         ("cmd", "/C")
     } else {
         ("sh", "-c")
     };
-    match Command::new(shell)
+    let result = match Command::new(shell)
         .arg(flag)
         .arg(command)
         .current_dir(cwd)
@@ -39,7 +43,13 @@ pub fn run_command_verify_capture(cwd: &str, command: &str) -> (bool, String) {
             (out.status.success(), truncate_output(&buf))
         }
         Err(e) => (false, format!("could not run command: {e}")),
-    }
+    };
+    crate::rlog!(
+        DEBUG,
+        "ralphus [verify] command completed passed={} cwd={cwd:?}",
+        result.0
+    );
+    result
 }
 
 /// Cap captured output so a runaway verifier can't bloat the DB / UI.

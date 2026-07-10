@@ -13,15 +13,9 @@ rem Loop: edit board.html -> re-run this script -> refresh the browser.
 rem Ctrl-C stops both processes. For a distributable standalone build (slow),
 rem use build-release.cmd instead.
 
-rem Resolve the main repo root via git's --git-common-dir so this works correctly
-rem when invoked from a linked worktree (scripts\ exists in every worktree, so a
-rem relative invocation like "scripts\build-debug.cmd" from a worktree causes
-rem %~dp0 to point into the worktree rather than the main checkout).
+rem Root is whichever checkout this script lives in (main or a worktree).
 set "root=%~dp0.."
 for %%I in ("%root%") do set "root=%%~fI"
-for /f "delims=" %%I in ('git -C "%~dp0." rev-parse --path-format^=absolute --git-common-dir 2^>nul') do set "_gc=%%I"
-if defined _gc for %%I in ("%_gc%\..") do set "root=%%~fI"
-set "_gc="
 
 rem 1. Runner: use the venv script (fast; no bundling). Sync the runner extra so
 rem    native model agents work; this is a near-no-op once the venv is warm.

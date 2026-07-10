@@ -81,9 +81,37 @@ impl RunnerSpec {
             ))
         };
         let system_prompt = match (row.system_prompt.clone(), subproject_addendum) {
-            (Some(existing), Some(addendum)) => Some(format!("{existing}\n\n{addendum}")),
-            (existing, None) => existing,
-            (None, Some(addendum)) => Some(addendum),
+            (Some(existing), Some(addendum)) => {
+                let combined = format!("{existing}\n\n{addendum}");
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [spec] session {} system-prompt: user-supplied ({} chars) + subproject addendum → combined ({} chars)",
+                    row.session_id,
+                    existing.len(),
+                    combined.len()
+                );
+                Some(combined)
+            }
+            (Some(existing), None) => {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [spec] session {} system-prompt: borrowed from session config ({} chars)",
+                    row.session_id,
+                    existing.len()
+                );
+                Some(existing)
+            }
+            (None, Some(addendum)) => {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [spec] session {} system-prompt: synthesised from subprojects ({} chars, {:?})",
+                    row.session_id,
+                    addendum.len(),
+                    row.subprojects
+                );
+                Some(addendum)
+            }
+            (None, None) => None,
         };
         // Carry the stored position through; when the subproject injection
         // creates a system prompt where none existed before, record "append" so
@@ -318,6 +346,17 @@ impl Runner for SubprocessRunner {
                 ));
             }
         };
+        crate::rlog!(
+            DEBUG,
+            "ralphus [runner] spawning {} pid={} run={} session={} agent={} model={} timeout={:?}s",
+            self.program,
+            child.id(),
+            spec.run_id,
+            spec.session_id,
+            spec.agent,
+            spec.model.as_deref().unwrap_or("default"),
+            spec.timeout_sec,
+        );
 
         // Track this session's PID for the resource view until the child exits
         // (the guard unregisters on every return path below).
@@ -356,6 +395,12 @@ impl Runner for SubprocessRunner {
                 let _ = child.wait();
                 join_reader(out_reader);
                 join_reader(err_reader);
+                crate::rlog!(
+                    INFO,
+                    "ralphus [runner] cancelled run={} session={}",
+                    spec.run_id,
+                    spec.session_id
+                );
                 return RunnerResult::failure("cancelled");
             }
             if timed_out(started.elapsed(), deadline) {
@@ -363,10 +408,14 @@ impl Runner for SubprocessRunner {
                 let _ = child.wait();
                 join_reader(out_reader);
                 join_reader(err_reader);
-                return RunnerResult::failure(format!(
-                    "timed out after {}s",
-                    deadline.map(|d| d.as_secs()).unwrap_or(0)
-                ));
+                let secs = deadline.map(|d| d.as_secs()).unwrap_or(0);
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [runner] timed out after {secs}s run={} session={}",
+                    spec.run_id,
+                    spec.session_id
+                );
+                return RunnerResult::failure(format!("timed out after {secs}s"));
             }
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -381,13 +430,24 @@ impl Runner for SubprocessRunner {
         let stdout_bytes = join_reader(out_reader);
         let stderr_bytes = join_reader(err_reader);
         let stdout = String::from_utf8_lossy(&stdout_bytes);
-        parse_result(&stdout).unwrap_or_else(|| {
+        let result = parse_result(&stdout).unwrap_or_else(|| {
             let stderr = String::from_utf8_lossy(&stderr_bytes);
             RunnerResult::failure(format!(
                 "runner produced no valid result (stderr: {})",
                 stderr.trim()
             ))
-        })
+        });
+        crate::rlog!(
+            INFO,
+            "ralphus [runner] done run={} session={} status={} tokens_in={} tokens_out={} cost_usd={:.4}",
+            spec.run_id,
+            spec.session_id,
+            result.status,
+            result.tokens_in,
+            result.tokens_out,
+            result.cost_usd,
+        );
+        result
     }
 }
 

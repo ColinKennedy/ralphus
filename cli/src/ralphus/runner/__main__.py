@@ -49,6 +49,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(result.to_json())
             return 1
 
+    print(
+        f"ralphus [runner] invoked run={spec.run_id} session={spec.session_id}"
+        f" agent={spec.agent!r} model={spec.model!r} verify={spec.verify}",
+        file=sys.stderr,
+    )
     result = run_session(spec, backend)
     print(result.to_json())
     return 0 if result.ok else 1
@@ -58,20 +63,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 # (uses your Claude Code / Max subscription login, no API key).
 _NATIVE_AGENTS = {"claude", "anthropic", "ollama"}
 _CLAUDE_CODE_AGENTS = {"claude-code", "claude-cli"}
+_CODEX_AGENTS = {"codex", "codex-cli"}
 
 
 def _load_backend(agent: str, args: list[str]) -> ModelBackend | None:
     """Resolve a backend for ``agent``.
 
     ``claude-code``/``claude-cli`` drive the Claude Code CLI (subscription, no
-    API key). Native model agents use the pydantic-ai backend (None if it is not
-    installed). Any other agent is treated as an external harness program.
+    API key). ``codex``/``codex-cli`` drive the OpenAI Codex CLI. Native model
+    agents use the pydantic-ai backend (None if it is not installed). Any other
+    agent is treated as an external harness program.
     """
     name = agent.lower()
     if name in _CLAUDE_CODE_AGENTS:
         from ralphus.runner.claude_code_backend import ClaudeCodeBackend
 
         return ClaudeCodeBackend()
+    if name in _CODEX_AGENTS:
+        from ralphus.runner.codex_backend import CodexBackend
+
+        return CodexBackend()
     if name in _NATIVE_AGENTS:
         try:
             from ralphus.runner.pydantic_backend import load_backend

@@ -117,9 +117,9 @@ def test_parse_verify_answer_explain_uses_note() -> None:
 def test_build_system_prompt_review_toggles() -> None:
     with_review = build_system_prompt(VerifyIntent(), wants_review=True, tutor="TUTOR")
     without = build_system_prompt(VerifyIntent(), wants_review=False, tutor="TUTOR")
-    assert "[[task.session.review]]" in with_review
+    assert "[[review]]" in with_review
     assert "MUST be reviewed" in with_review
-    assert "Do NOT add any [[task.session.review]]" in without
+    assert "Do NOT add any [[review]]" in without
     assert "TUTOR" in with_review  # schema reference is embedded
 
 

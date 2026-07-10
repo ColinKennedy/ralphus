@@ -23,8 +23,8 @@ ralphus runner. Every file must contain at least one [[task]].
 
 Section headers use TOML array-of-tables syntax ([[...]]). Each
 [[task]] starts a new task; each [[task.session]] appends to the
-most recent [[task]]; each [[task.session.verify]] / [[task.session.review]]
-appends to the most recent [[task.session]]; and so on.
+most recent [[task]]; each [[task.session.verify]] appends to the
+most recent [[task.session]]; each [[review]] is top-level; and so on.
 
 Tip: validate before submitting -- `ralphus validate file.toml`
 (runs offline, no daemon needed).
@@ -127,40 +127,53 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                         (pick a tool-capable model).
 
 ---------------------------------------------------------------
- [[task.session.review]]   (zero or more per session)
+ [[review]]   (zero or more per file, top-level)
 ---------------------------------------------------------------
- Marks this session's worktree branch for inclusion in a review
- (a Guardian). Branch order follows the task/session dependency order.
+ Declares a Guardian code review. Sessions opt in by setting
+ `review = "<id>"` in their [[task.session]] block. Branch order
+ follows the task/session dependency order.
+
+ The review's base branch is always resolved from the worktree's
+ upstream tracking branch at submit time (a hard error if the
+ branch has no upstream). Set the upstream with:
+   git branch --set-upstream-to=main <your-branch>
 
  Two ways branches fold into a review:
-   * By PROJECT (default): sessions with a plain `id` are grouped by the
-     shared git dir of their worktree -- all worktrees of one repo fold
-     into one review; sessions spanning N projects make N reviews, with
-     names disambiguated automatically. This grouping is per submission.
+   * By PROJECT (default): sessions with a plain `id` are grouped
+     by the shared git dir of their worktree -- all worktrees of
+     one repo fold into one review; sessions spanning N projects
+     make N reviews with names disambiguated automatically.
    * By LINK KEY (recommended for a planned batch): set
-     id = "ralphus:new-review/<key>". Every session that repeats the same
-     <key> -- across tasks AND across separate `ralphus submit` calls or
-     separate .toml files -- attaches to ONE shared review. Use this when
-     several tickets/branches belong in a single review together.
+     id = "ralphus:new-review/<key>". Every session naming the
+     same <key> -- across tasks AND across separate `ralphus
+     submit` calls -- attaches to ONE shared review.
 
  Key    Type    Notes
- base   string  Branch the review rebases onto. Usually "<<upstream>>",
-                meaning "use this worktree branch's upstream" -- a submit-time
-                error if the worktree has no upstream. May be a literal branch.
- id     string  Human-readable review id (also the default label), OR a link
-                placeholder "ralphus:new-review/<key>" (see above) whose <key>
-                is letters/digits/-/_/. -- the daemon resolves it to a real
-                review and reuses it for every session naming the same <key>.
- name   string  GUI label; falls back to `id` when unset. For a link id, set
-                `name` so the review has a readable label (not the raw URI).
- agent  string  Backend that RESOLVES this review's merge conflicts (and applies
-                reviewer feedback), e.g. "claude" or "ollama". This is the
-                conflict-fixer, NOT the session that produced the branch. Unset
-                falls back to the RALPHUS_RESOLVER_AGENT env override, then
-                "ollama". Shown on the review page in the GUI.
- model  string  Model the resolver `agent` runs, e.g. "qwen3:8b". Unset falls
-                back to RALPHUS_RESOLVER_MODEL, then "qwen3:8b" for the ollama
-                backend (other backends take their own default).
+ id     string  Human-readable review id (also the default label),
+                OR a link placeholder "ralphus:new-review/<key>"
+                whose <key> is letters/digits/-/_/. Sessions
+                reference this review by setting `review = "<id>"`.
+ name   string  GUI label; falls back to `id` when unset. For a
+                link id, set `name` so the review has a readable
+                label (not the raw URI).
+ agent  string  Backend that RESOLVES this review's merge conflicts
+                (and applies reviewer feedback), e.g. "claude" or
+                "ollama". This is the conflict-fixer, NOT the
+                session that produced the branch. Unset falls back
+                to RALPHUS_RESOLVER_AGENT env, then "ollama".
+ model  string  Model the resolver `agent` runs, e.g. "qwen3:8b".
+                Unset falls back to RALPHUS_RESOLVER_MODEL, then
+                "qwen3:8b" for the ollama backend.
+
+ [[review.action]]  (zero or more per [[review]])
+ User-declared labelled buttons shown in the review pane.
+ Exactly ONE of `prompt` or `command` is required per entry.
+
+ Key     Type    Notes
+ label   string  REQUIRED. Text shown on the UI button.
+ command string  ONE-OF Verbatim shell command run in a terminal.
+ prompt  string  ONE-OF Hint text forwarded to the resolver LLM
+                 to expand into a runnable command before running.
 
 ---------------------------------------------------------------
  [[task.verify]]  and  [[task.session.verify]]   (zero or more)
@@ -287,13 +300,15 @@ Guardian exists to surface, and is almost never what you want.
       depends_on             = ["prior-task-name/finalize"]
       ...
 
- 5. ONE review for the whole batch (the DEFAULT): give every branch's
-    [[task.session.review]] the SAME id = "ralphus:new-review/<key>"
-    so they ALL fold into a single Guardian -- even across separate
-    .toml files / submissions. This is the norm for a list of tickets,
-    not a special case. Reach for a second review only when the batch
-    splits into two genuinely independent streams; otherwise keep it to
-    one. Never emit one review per task -- that is the anti-pattern this
+ 5. ONE review for the whole batch (the DEFAULT): add a top-level
+    [[review]] block with id = "ralphus:new-review/<key>", then set
+    review = "ralphus:new-review/<key>" on every [[task.session]] whose
+    cwd is a git worktree. Every session naming the same <key> -- across
+    tasks AND across separate `ralphus submit` calls -- attaches to ONE
+    shared Guardian. This is the norm for a list of tickets, not a
+    special case. Reach for a second review only when the batch splits
+    into two genuinely independent streams; otherwise keep it to one.
+    Never emit one review per task -- that is the anti-pattern this
     layout exists to avoid.
 
  Ordering: branches that touch the SAME files should be sequenced
@@ -333,11 +348,7 @@ name = "setup"
   id     = "init"
   cwd    = "C:/Users/me/repo/.wt/feature-a"
   prompt = "Create data.json with {\"version\": 1}."
-
-    # this worktree's branch joins its project's review
-    [[task.session.review]]
-    id   = "backend"
-    base = "<<upstream>>"
+  review = "backend"              # opt this worktree branch into the review
 
     [[task.session.verify]]
     command = "test -f data.json"
@@ -350,15 +361,32 @@ depends_on = ["setup"]            # waits for all of setup's sessions + verifier
   cwd      = "C:/Users/me/repo/.wt/feature-b"
   upstream = "<<task:setup>>"     # rebase feature-b onto setup's branch tip first
   prompt   = "Using {handoff:setup}, write a summary to report.md."
-
-    [[task.session.review]]
-    id   = "backend"
-    base = "<<upstream>>"
+  review   = "backend"
 
     [[task.session.verify]]
     command = "test -f report.md"
 
+# Top-level review declaration (base is always the worktree's upstream tracking branch).
+[[review]]
+id = "backend"
+
 -- 4. Recommended per-branch shape (agent verify + finalize) --
+
+# One shared review for the whole batch; agent = "claude" resolves conflicts.
+# The base branch is always resolved from each worktree's upstream tracking branch.
+[[review]]
+id    = "ralphus:new-review/ral-batch"
+name  = "RAL batch"
+agent = "claude"
+
+# Optional: user-declared test buttons shown in the review pane.
+[[review.action]]
+label   = "Run tests"
+command = "cargo test --all-targets"
+
+[[review.action]]
+label  = "Frontend smoke test"
+prompt = "Open localhost:3000 and click through the main workflows"
 
 [[task]]
 name = "ral-2"
@@ -370,18 +398,10 @@ name = "ral-2"
   id                     = "work"
   agent                  = "claude-code"
   cwd                    = "C:/Users/me/repo_worktrees/RAL-2"
+  review                 = "ralphus:new-review/ral-batch"
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
   prompt                 = "<< the RAL-2 ticket text, pasted verbatim >>"
-
-    # one shared review for the whole batch (same key on every branch).
-    # agent/model pick who resolves conflicts in THIS review (here: Claude,
-    # instead of the default local ollama resolver).
-    [[task.session.review]]
-    id    = "ralphus:new-review/ral-batch"
-    name  = "RAL batch"
-    base  = "<<upstream>>"
-    agent = "claude"
 
     # agent verifiers fix-and-retry, without committing
     [[task.session.verify]]
@@ -413,15 +433,10 @@ depends_on = ["ral-2"]
   agent                  = "claude-code"
   cwd                    = "C:/Users/me/repo_worktrees/RAL-3"
   upstream               = "<<task:ral-2>>"
+  review                 = "ralphus:new-review/ral-batch"  # same key folds into same review
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
   prompt                 = "<< the RAL-3 ticket text, pasted verbatim >>"
-
-    [[task.session.review]]
-    id    = "ralphus:new-review/ral-batch"   # same key folds into the same review
-    name  = "RAL batch"
-    base  = "<<upstream>>"
-    agent = "claude"
 
 Submit it:  ralphus submit tasks.toml
 (Adds it as Pending -- schedulable now. Use --hold to stage as Queued.)

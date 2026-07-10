@@ -30,6 +30,10 @@ pub struct TaskFile {
     /// The tasks in this submission.
     #[serde(default)]
     pub task: Vec<TaskDef>,
+    /// Top-level review (guardian) declarations. Sessions opt in by setting
+    /// `review = "<id>"` to match a review's `id` field.
+    #[serde(default)]
+    pub review: Vec<ReviewDef>,
 }
 
 /// One task: a unit of work made of one or more agent sessions plus verify steps.
@@ -135,11 +139,10 @@ pub struct SessionDef {
     /// Session-level verify steps.
     #[serde(default)]
     pub verify: Vec<VerifyStep>,
-    /// Review (guardian) memberships for this session's worktree branch. Declared
-    /// as `[[task.session.review]]`. Sessions whose worktrees resolve to the same
-    /// project fold into one review; see `REVIEWS.local.md`.
+    /// Review (guardian) opt-in. Set to the `id` of a top-level `[[review]]`
+    /// block to include this session's worktree branch in that review.
     #[serde(default)]
-    pub review: Vec<ReviewDef>,
+    pub review: Option<String>,
     /// Upstream branch source for this session's branch. When set to
     /// `"<<task:task-name>>"` (or `"<<task:task-name/session-id>>"`), the daemon
     /// rebases this session's branch onto the named dependency's current branch
@@ -154,10 +157,6 @@ pub struct SessionDef {
 /// named dependency's current branch tip before the session starts. The daemon
 /// resolves this at run time, immediately before launching the runner.
 pub const UPSTREAM_TASK_REF_PREFIX: &str = "<<task:";
-
-/// The `base` sentinel meaning "use this worktree's upstream branch, resolved at
-/// submit time; fail if the worktree has no upstream".
-pub const REVIEW_BASE_UPSTREAM: &str = "<<upstream>>";
 
 /// The scheme prefix for a review-link placeholder id. A review whose `id` is
 /// `ralphus:new-review/<key>` declares a *stable link key*: every session — in
@@ -176,28 +175,22 @@ pub fn review_link_key(id: &str) -> Option<&str> {
         .filter(|k| !k.is_empty())
 }
 
-/// A review (guardian) membership declared on a session via
-/// `[[task.session.review]]`.
+/// A top-level review (guardian) declaration via `[[review]]`.
 ///
-/// The session's worktree branch is included in the review for its project. When
-/// several sessions across a run resolve to the same project they collapse into a
-/// single review; when they span N projects the daemon materializes N reviews and
-/// disambiguates their names. The `id`/`name`/`base` here are the *suggested*
-/// starting point — the daemon may rename a review (e.g. `review-001`) when it has
-/// to split one declaration across projects.
+/// Sessions opt in by declaring `review = "<id>"`. When several sessions resolve
+/// to the same project they collapse into one guardian; across N projects the
+/// daemon materialises N guardians and disambiguates their names. The base branch
+/// is always resolved from each worktree's tracking upstream at submit time.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewDef {
-    /// Human-readable review id (also the default label). Optional.
+    /// Human-readable review id (also the default label). May be a
+    /// `ralphus:new-review/<key>` link to attach multiple submissions to one
+    /// shared guardian.
     #[serde(default)]
     pub id: Option<String>,
     /// GUI label; falls back to `id` when unset.
     #[serde(default)]
     pub name: Option<String>,
-    /// Base branch the review rebases onto. The sentinel [`REVIEW_BASE_UPSTREAM`]
-    /// (`<<upstream>>`) means "use the worktree's upstream" — resolved by the
-    /// daemon at submit, and a hard error there if the worktree has none.
-    #[serde(default)]
-    pub base: Option<String>,
     /// Backend that resolves merge conflicts (and applies reviewer feedback) for
     /// this review, e.g. `"claude"` or `"ollama"`. Unset falls back to the
     /// `RALPHUS_RESOLVER_AGENT` env override, then `ollama`.
@@ -208,6 +201,28 @@ pub struct ReviewDef {
     /// backend (other backends take their own default).
     #[serde(default)]
     pub model: Option<String>,
+    /// User-declared test actions shown as labelled buttons in the board UI.
+    #[serde(default)]
+    pub action: Vec<ReviewActionDef>,
+}
+
+/// A user-declared manual-test action shown as a labelled button in the review UI.
+///
+/// Exactly one of `prompt` or `command` must be set. `command` is run directly
+/// in a terminal; `prompt` is forwarded to the LLM to expand into a runnable
+/// command before it is offered to the reviewer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewActionDef {
+    /// Button label shown in the UI.
+    pub label: String,
+    /// Human-readable test description forwarded to the LLM for command expansion.
+    /// Mutually exclusive with `command`.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Verbatim shell command run directly without LLM involvement.
+    /// Mutually exclusive with `prompt`.
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 /// One verify step. Exactly one of `command` / `brain` / `prompt` must be set.
@@ -353,7 +368,7 @@ mod tests {
             budget_tokens: None,
             timeout_minutes: None,
             verify: vec![],
-            review: vec![],
+            review: None,
             upstream: None,
         }
     }
@@ -386,28 +401,44 @@ mod tests {
     }
 
     #[test]
-    fn session_review_deserializes() {
+    fn toplevel_review_deserializes() {
         let toml = r#"
             [[task]]
             name = "t"
             [[task.session]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
-            [[task.session.review]]
+            review = "backend"
+
+            [[review]]
             id = "backend"
             name = "Backend review"
-            base = "<<upstream>>"
             agent = "claude"
             model = "claude-opus-4-8"
+
+            [[review.action]]
+            label = "Smoke test"
+            command = "cargo test"
+
+            [[review.action]]
+            label = "Frontend check"
+            prompt = "Open localhost:3000 and click through the new wizard"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        let review = &parsed.task[0].session[0].review;
+        assert_eq!(parsed.task[0].session[0].review.as_deref(), Some("backend"));
+        let review = &parsed.review;
         assert_eq!(review.len(), 1);
         assert_eq!(review[0].id.as_deref(), Some("backend"));
         assert_eq!(review[0].name.as_deref(), Some("Backend review"));
-        assert_eq!(review[0].base.as_deref(), Some(REVIEW_BASE_UPSTREAM));
         assert_eq!(review[0].agent.as_deref(), Some("claude"));
         assert_eq!(review[0].model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(review[0].action.len(), 2);
+        assert_eq!(review[0].action[0].label, "Smoke test");
+        assert_eq!(review[0].action[0].command.as_deref(), Some("cargo test"));
+        assert!(review[0].action[0].prompt.is_none());
+        assert_eq!(review[0].action[1].label, "Frontend check");
+        assert!(review[0].action[1].command.is_none());
+        assert!(review[0].action[1].prompt.is_some());
     }
 
     #[test]

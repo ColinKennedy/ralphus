@@ -15,8 +15,9 @@
 //!    cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --nocapture
 //!    ```
 //!
-//!    Skip conditions: no runner found (`RALPHUS_RUNNER_CMD` or dev venv), ollama
-//!    not up on `127.0.0.1:11434`, or resolver model (`RALPHUS_RESOLVER_MODEL`,
+//!    Skip conditions: no runner found (`RALPHUS_RUNNER_CMD` or dev venv),
+//!    pydantic-ai not installed in the runner's Python environment, ollama not
+//!    up on `127.0.0.1:11434`, or resolver model (`RALPHUS_RESOLVER_MODEL`,
 //!    default `qwen3:8b`) not pulled.
 
 use std::path::{Path, PathBuf};
@@ -102,6 +103,9 @@ fn monorepo_with_conflicting_worktrees(base: &Path) -> (String, String, String) 
     git(&wt_a, &["commit", "-am", "a changes alpha"]);
     std::fs::write(wt_b.join("packages/alpha/lib.rs"), "// changed by B\n").unwrap();
     git(&wt_b, &["commit", "-am", "b changes alpha"]);
+    // Set upstream so worktree_upstream() resolves to "main" during derive_reviews.
+    git(&wt_a, &["branch", "--set-upstream-to=main", "feature/a"]);
+    git(&wt_b, &["branch", "--set-upstream-to=main", "feature/b"]);
 
     (
         repo.to_string_lossy().replace('\\', "/"),
@@ -323,6 +327,24 @@ fn find_runner() -> Option<String> {
     None
 }
 
+fn pydantic_ai_available(runner_cmd: &str) -> bool {
+    let runner_path = Path::new(runner_cmd);
+    let Some(dir) = runner_path.parent() else {
+        return false;
+    };
+    for python in ["python.exe", "python3.exe", "python", "python3"] {
+        let p = dir.join(python);
+        if p.exists() {
+            return Command::new(p)
+                .args(["-c", "import pydantic_ai"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        }
+    }
+    false
+}
+
 /// Full monorepo flow: two subproject-scoped sessions in one monorepo repo
 /// → a review with a merge conflict between their branches → live ollama
 /// agent resolves the conflict. Skips unless ollama + a model + ralphus-runner
@@ -336,6 +358,12 @@ fn full_monorepo_flow_with_subproject_sessions() {
         eprintln!("SKIP full_monorepo_flow: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");
         return;
     };
+    if !pydantic_ai_available(&runner_cmd) {
+        eprintln!(
+            "SKIP full_monorepo_flow: pydantic-ai not installed in runner environment (run `uv sync --extra runner` in cli/)"
+        );
+        return;
+    }
     if !ollama_up() {
         eprintln!("SKIP full_monorepo_flow: ollama not reachable on 127.0.0.1:11434");
         return;
@@ -353,11 +381,10 @@ fn full_monorepo_flow_with_subproject_sessions() {
     //    of the same monorepo, both scoped to `packages/alpha`.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\n\
-         [[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\n\
-         [[task.session.review]]\nid=\"rev\"\nbase=\"main\"\n"
+         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
+         [[review]]\nid=\"rev\"\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),

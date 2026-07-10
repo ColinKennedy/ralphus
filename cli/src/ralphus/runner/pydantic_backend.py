@@ -12,7 +12,10 @@ it. mypy treats the import as untyped via the override in ``pyproject.toml``.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import sys
+import time
 from typing import Any
 
 from pydantic_ai import Agent
@@ -84,16 +87,36 @@ class PydanticAgentBackend:
             system_prompt=system_prompt,
             tools=[read_file, write_file, run_bash],
         )
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:8]
+        print(
+            f"ralphus [llm-invoke] start agent={self._agent!r} model={model!r}"
+            f" prompt_len={len(prompt)} prompt_hash={prompt_hash}",
+            file=sys.stderr,
+        )
+        t0 = time.monotonic()
         try:
             result = agent.run_sync(prompt)
         except Exception as exc:
+            elapsed = time.monotonic() - t0
+            print(
+                f"ralphus [llm-invoke] error agent={self._agent!r} elapsed={elapsed:.2f}s: {exc}",
+                file=sys.stderr,
+            )
             raise BackendError(str(exc)) from exc
+        elapsed = time.monotonic() - t0
 
         usage = result.usage
+        tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
+        tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
+        print(
+            f"ralphus [llm-invoke] done agent={self._agent!r} elapsed={elapsed:.2f}s"
+            f" tokens_in={tokens_in} tokens_out={tokens_out}",
+            file=sys.stderr,
+        )
         return BackendOutcome(
             summary=str(result.output)[:2000],
-            tokens_in=int(getattr(usage, "input_tokens", 0) or 0),
-            tokens_out=int(getattr(usage, "output_tokens", 0) or 0),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             cost_usd=0.0,
         )
 

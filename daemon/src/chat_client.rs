@@ -19,6 +19,8 @@ pub struct ChatMessage {
     pub role: &'static str,
     /// Message body.
     pub content: String,
+    /// Optional base64 data-URI image attached to this message (RAL-59).
+    pub image: Option<String>,
 }
 
 /// Dispatch a chat call to the appropriate provider without spawning a
@@ -34,7 +36,12 @@ pub fn call_direct(
     system: &str,
     messages: &[ChatMessage],
 ) -> Result<String, String> {
-    match agent.to_lowercase().as_str() {
+    let msg_count = messages.len();
+    crate::rlog!(
+        DEBUG,
+        "ralphus [guardian] chat-api start backend={agent:?} model={model:?} messages={msg_count}"
+    );
+    let result = match agent.to_lowercase().as_str() {
         "claude" | "anthropic" => {
             call_claude(model.unwrap_or("claude-haiku-4-5"), system, messages)
         }
@@ -46,7 +53,29 @@ pub fn call_direct(
         other => Err(format!(
             "agent '{other}' is not supported for direct chat; use the subprocess runner"
         )),
+    };
+    match &result {
+        Ok(_) => crate::rlog!(DEBUG, "ralphus [guardian] chat-api done backend={agent:?}"),
+        Err(e) => crate::rlog!(
+            ERROR,
+            "ralphus [guardian] chat-api error backend={agent:?}: {e}"
+        ),
     }
+    result
+}
+
+/// Parse a `data:image/...;base64,...` URI into `(media_type, base64_data)`.
+/// Falls back to `("image/jpeg", uri)` for unrecognised formats.
+fn parse_data_uri(uri: &str) -> (&str, &str) {
+    if let Some(rest) = uri.strip_prefix("data:") {
+        if let Some(comma) = rest.find(',') {
+            let meta = &rest[..comma];
+            let data = &rest[comma + 1..];
+            let media_type = meta.split(';').next().unwrap_or("image/jpeg");
+            return (media_type, data);
+        }
+    }
+    ("image/jpeg", uri)
 }
 
 /// POST to the Anthropic Claude Messages API and return the first text block.
@@ -56,7 +85,27 @@ fn call_claude(model: &str, system: &str, messages: &[ChatMessage]) -> Result<St
 
     let msgs_json: Vec<serde_json::Value> = messages
         .iter()
-        .map(|m| json!({"role": m.role, "content": m.content}))
+        .map(|m| {
+            if let Some(img) = &m.image {
+                let (media_type, data) = parse_data_uri(img);
+                json!({
+                    "role": m.role,
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data
+                            }
+                        },
+                        {"type": "text", "text": m.content}
+                    ]
+                })
+            } else {
+                json!({"role": m.role, "content": m.content})
+            }
+        })
         .collect();
 
     let payload = json!({
@@ -104,11 +153,19 @@ fn call_ollama(
 ) -> Result<String, String> {
     let mut all_msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
     all_msgs.push(json!({"role": "system", "content": system}));
-    all_msgs.extend(
-        messages
-            .iter()
-            .map(|m| json!({"role": m.role, "content": m.content})),
-    );
+    all_msgs.extend(messages.iter().map(|m| {
+        if let Some(img) = &m.image {
+            json!({
+                "role": m.role,
+                "content": [
+                    {"type": "text", "text": m.content},
+                    {"type": "image_url", "image_url": {"url": img}}
+                ]
+            })
+        } else {
+            json!({"role": m.role, "content": m.content})
+        }
+    }));
 
     let payload = json!({
         "model": model,
@@ -152,6 +209,7 @@ mod tests {
         let msgs = [ChatMessage {
             role: "user",
             content: "hi".to_string(),
+            image: None,
         }];
         let err = call_direct("claude-code", None, "system", &msgs).unwrap_err();
         assert!(err.contains("not supported"), "got: {err}");
@@ -166,6 +224,7 @@ mod tests {
         let msgs = [ChatMessage {
             role: "user",
             content: "hi".to_string(),
+            image: None,
         }];
         let err = call_direct("claude", None, "system", &msgs).unwrap_err();
         assert!(
@@ -183,6 +242,7 @@ mod tests {
         let msgs = [ChatMessage {
             role: "user",
             content: "hi".to_string(),
+            image: None,
         }];
         let err = call_direct("anthropic", None, "system", &msgs).unwrap_err();
         assert!(!err.contains("not supported"), "got: {err}");

@@ -275,11 +275,11 @@ def build_system_prompt(
 def _review_directive(wants_review: bool) -> str:
     if wants_review:
         return (
-            "- This is a worktree feature that MUST be reviewed: put at least one "
-            '[[task.session.review]] with base = "<<upstream>>" on a session whose '
-            "`cwd` is a git worktree with an upstream branch."
+            "- This is a worktree feature that MUST be reviewed: add a top-level "
+            '[[review]] block with id = "r", then set review = "r" on any '
+            "[[task.session]] whose `cwd` is a git worktree with an upstream branch."
         )
-    return "- Do NOT add any [[task.session.review]] blocks."
+    return "- Do NOT add any [[review]] blocks or review = ... fields."
 
 
 def _verify_directive(intent: VerifyIntent) -> str:

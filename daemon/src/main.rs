@@ -34,16 +34,27 @@ fn main() -> ExitCode {
                 eprintln!("Authorization error: {e}");
                 return ExitCode::FAILURE;
             }
+            let daemon_cfg = ralphus_daemon::config::load_daemon_config();
+            ralphus_daemon::logging::init(
+                daemon_cfg.log_path.as_deref(),
+                daemon_cfg.log_level.as_deref(),
+            );
             let db = default_db_path();
             let addr = ("127.0.0.1", DEFAULT_PORT);
-            eprintln!(
-                "ralphus-daemon serving on http://127.0.0.1:{DEFAULT_PORT} (db: {})",
-                db.display()
+            ralphus_daemon::logging::write_line(
+                ralphus_daemon::logging::LogLevel::INFO,
+                &format!(
+                    "ralphus-daemon serving on http://127.0.0.1:{DEFAULT_PORT} (db: {})",
+                    db.display()
+                ),
             );
             match server::serve(addr, &db, DEFAULT_MAX_CONCURRENT) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("daemon failed: {e}");
+                    ralphus_daemon::logging::write_line(
+                        ralphus_daemon::logging::LogLevel::ERROR,
+                        &format!("ralphus-daemon failed: {e}"),
+                    );
                     ExitCode::FAILURE
                 }
             }

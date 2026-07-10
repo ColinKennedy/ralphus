@@ -10,6 +10,7 @@ pub mod chat_client;
 pub mod config;
 pub mod guardian;
 pub mod guardian_merge;
+pub mod logging;
 pub mod plan;
 pub mod procreg;
 pub mod resources;

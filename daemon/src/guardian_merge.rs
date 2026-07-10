@@ -14,9 +14,18 @@
 //! is asked to edit the conflicted files marker-free, after which the rebase
 //! continues; a branch that still cannot be resolved marks the guardian
 //! `MergeFailed`.
+//!
+//! On a *rebuild* (the base branch shifted), the previous build's resolved review
+//! commits are carried forward: rather than re-deriving each branch from its
+//! feature tip, the prior resolved commit is replayed onto the new base
+//! (`git rebase --onto <new_prev> <old_upstream> <old_resolved>`). The replay
+//! conflicts only on genuine new base deltas, so a conflict resolved on an earlier
+//! build is not resolved again — no `git rerere` required. The feature branches
+//! stay untouched throughout.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::guardian::{GuardianStatus, MergeStatus};
@@ -118,6 +127,10 @@ fn head_hash(wt: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Marker the conflict-resolver agent outputs after `git add -A` to signal the
+/// orchestrator that the index is ready for `git rebase --continue`.
+const STAGE_DONE_MARKER: &str = "RALPHUS_STAGE: DONE";
+
 /// Run `git` with `args` in `root`, returning stdout on success or a message.
 /// `GIT_EDITOR=true` keeps operations like `rebase --continue` from opening an
 /// interactive editor.
@@ -145,7 +158,10 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
 /// because it is another process's CWD on Windows). Recreates
 /// `.git/worktrees/<name>/` and updates `<wt>/.git` so that `git -C wt`
 /// commands work again.
-fn relink_worktree(root: &Path, wt: &Path) -> std::io::Result<()> {
+///
+/// `branch` is used to write a placeholder `HEAD` when the entry is being
+/// created from scratch (missing `HEAD` → git refuses to open the gitdir).
+fn relink_worktree(root: &Path, wt: &Path, branch: &str) -> std::io::Result<()> {
     let name = wt
         .file_name()
         .expect("worktree path has no filename component")
@@ -155,16 +171,198 @@ fn relink_worktree(root: &Path, wt: &Path) -> std::io::Result<()> {
     let wt_git_str = wt.join(".git").to_string_lossy().replace('\\', "/");
     std::fs::write(entry_dir.join("gitdir"), format!("{wt_git_str}\n"))?;
     std::fs::write(entry_dir.join("commondir"), b"../..\n")?;
+    // Without HEAD, git refuses to open the gitdir ("not a git repository").
+    // Only write the placeholder when HEAD is absent — if the admin entry
+    // already has one (partial-remove scenario), keep it untouched.
+    if !entry_dir.join("HEAD").exists() {
+        std::fs::write(
+            entry_dir.join("HEAD"),
+            format!("ref: refs/heads/{branch}\n"),
+        )?;
+    }
     let entry_str = entry_dir.to_string_lossy().replace('\\', "/");
     std::fs::write(wt.join(".git"), format!("gitdir: {entry_str}\n"))?;
+    // Ensure a HEAD file exists so git commands work before checkout resets it.
+    // Only written when absent — avoids clobbering a valid HEAD from a prior setup.
+    let head_path = entry_dir.join("HEAD");
+    if !head_path.exists() {
+        std::fs::write(&head_path, b"ref: refs/heads/placeholder\n")?;
+    }
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Worktree fail-state detection helpers
+// ---------------------------------------------------------------------------
+
+/// Whether `wt` looks like a valid *linked* git worktree: the directory must
+/// contain a `.git` *file* (not a directory — directories mean a main repo)
+/// whose content begins with `gitdir:`.
+fn is_valid_linked_worktree(wt: &Path) -> bool {
+    let git_path = wt.join(".git");
+    if !git_path.is_file() {
+        return false;
+    }
+    std::fs::read_to_string(&git_path)
+        .map(|s| s.trim_start().starts_with("gitdir:"))
+        .unwrap_or(false)
+}
+
+/// Whether `rev` resolves to a commit in `root`. Accepts branch names, tag
+/// names, raw SHAs, and any other form understood by `git rev-parse --verify`.
+fn branch_exists(root: &Path, rev: &str) -> bool {
+    git(root, &["rev-parse", "--verify", rev]).is_ok()
+}
+
+/// Whether `ancestor` is an ancestor of (or equal to) `descendant` in `root`.
+/// `git merge-base --is-ancestor` exits 0 when true, so `git()` returns `Ok`
+/// only in that case. Used to validate a carry-forward chain before replaying a
+/// prior resolved review branch onto a shifted base.
+fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+}
+
+/// Delete every carry-forward protection ref (`refs/ralphus/carry/<id>/*`) in
+/// `root`. Clears leftovers from a merge that was killed before its [`CarryRefs`]
+/// guard ran, and runs when a guardian is deleted. Matching is path-component
+/// exact, so `<id>` never captures another guardian whose id shares this prefix.
+fn purge_carry_refs(root: &Path, id: &str) {
+    let listed = git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/ralphus/carry/{id}"),
+        ],
+    )
+    .unwrap_or_default();
+    for name in listed.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = git(root, &["update-ref", "-d", name]);
+    }
+}
+
+/// RAII holder for carry-forward protection refs. Each pinned ref
+/// (`refs/ralphus/carry/<id>/…`) keeps a commit the rebuild intends to replay
+/// reachable — created BEFORE cleanup deletes the `guardian/<id>/*` branches, so
+/// the commit is never dangling (and so never at risk from a concurrent `git gc`)
+/// in the window between cleanup and re-checkout. Dropping the guard deletes every
+/// ref it created, covering normal completion, early return, and panic-unwind, so
+/// a build never leaks protection refs.
+struct CarryRefs {
+    pins: Vec<(PathBuf, String)>,
+}
+
+impl CarryRefs {
+    fn new() -> Self {
+        Self { pins: Vec::new() }
+    }
+
+    /// Pin `sha` under `refs/ralphus/carry/<id>/<slug>` in `root`. Best-effort:
+    /// on failure the commit simply falls back to bare-SHA reachability (still
+    /// valid until gc), so pinning never blocks a merge.
+    fn pin(&mut self, root: &Path, id: &str, slug: &str, sha: &str) {
+        let name = format!("refs/ralphus/carry/{id}/{slug}");
+        if git(root, &["update-ref", &name, sha]).is_ok() {
+            self.pins.push((root.to_path_buf(), name));
+        }
+    }
+}
+
+impl Drop for CarryRefs {
+    fn drop(&mut self) {
+        for (root, name) in &self.pins {
+            let _ = git(root, &["update-ref", "-d", name]);
+        }
+    }
+}
+
+/// Whether the working tree in `wt` has any modification (staged, unstaged, or
+/// untracked files). Returns `false` when `git status` fails.
+fn worktree_has_changes(wt: &Path) -> bool {
+    git(wt, &["status", "--porcelain"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Find the worktree in `root`'s repo that is currently checked out on `branch`.
+/// Parses `git worktree list --porcelain` and returns the first matching path,
+/// or `None` when no worktree has that branch.
+fn find_worktree_for_branch(root: &Path, branch: &str) -> Option<PathBuf> {
+    let list = git(root, &["worktree", "list", "--porcelain"]).ok()?;
+    let mut cur_path: Option<PathBuf> = None;
+    for line in list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            cur_path = Some(PathBuf::from(path.trim()));
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            if b.trim() == branch {
+                return cur_path;
+            }
+        }
+    }
+    None
+}
+
+/// Regenerate a review worktree when the feature branch `branch` is absent from
+/// git. Locates an existing worktree checked out on `branch` (via
+/// `git worktree list`), creates branch `rev` at its HEAD, and adds a worktree
+/// at `wt`. Logs a warning that any prior review-branch commits are lost.
+fn regen_from_feature_worktree(
+    root: &Path,
+    rev: &str,
+    wt: &Path,
+    branch: &str,
+) -> std::result::Result<(), String> {
+    let wt_str = wt.to_string_lossy().to_string();
+    match find_worktree_for_branch(root, branch) {
+        Some(feature_wt) => {
+            let sha = git(&feature_wt, &["rev-parse", "HEAD"])
+                .map(|s| s.trim().to_string())
+                .map_err(|e| {
+                    format!(
+                        "cannot resolve HEAD of feature worktree at {}: {e}",
+                        feature_wt.display()
+                    )
+                })?;
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] worktree recovery: feature branch '{branch}' is absent; \
+                 creating '{rev}' from feature-worktree HEAD {sha} — prior review commits lost"
+            );
+            let _ = git(root, &["branch", "-D", rev]);
+            git(root, &["branch", rev, &sha])
+                .map_err(|e| format!("cannot create branch '{rev}' at {sha}: {e}"))?;
+            git(root, &["worktree", "add", "--force", &wt_str, rev])
+                .map(|_| ())
+                .map_err(|e| format!("cannot add worktree at {wt_str}: {e}"))
+        }
+        None => Err(format!(
+            "feature branch '{branch}' is absent from git and no worktree is checked \
+             out on it; cannot recover review worktree at {wt_str}"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worktree setup with exhaustive fail-state recovery
+// ---------------------------------------------------------------------------
+
 /// Set up `wt` as a worktree for `branch` under the review-branch name `rev`.
-/// Equivalent to `git worktree add -B <rev> <wt> <branch>`, but when the
-/// directory already exists and cannot be deleted (e.g., it is a process's CWD
-/// on Windows), re-registers the existing directory and resets it in-place
-/// instead of failing — preserving the directory for any process using it.
+/// Equivalent to `git worktree add -B <rev> <wt> <branch>` on a clean slate,
+/// but detects and recovers from all known fail-states before the add:
+///
+/// 1. **Directory missing entirely** — creates a fresh worktree.
+/// 2. **Directory not a git worktree** — `.git` file absent/malformed or a
+///    directory (main-repo); relinks if the review branch survives, wipes and
+///    regenerates otherwise.
+/// 3. **Review branch missing** — `checkout -B` recreates it from `branch`.
+/// 4. **Stale git tracking entry** — `git worktree prune` removes it so
+///    `worktree add` does not reject the path as already registered.
+/// 5. **Branch mismatch** — `checkout -f -B rev branch` corrects it.
+/// 6. **Detached HEAD** — `checkout` reattaches to a named branch.
+/// 7. **Worktree locked** — unlocked before removal.
+///
+/// When the feature branch `branch` is also gone, recovers from a worktree
+/// still checked out on `branch` (found via `git worktree list`).
 fn worktree_add_or_reset(
     root: &Path,
     rev: &str,
@@ -172,17 +370,107 @@ fn worktree_add_or_reset(
     branch: &str,
 ) -> std::result::Result<(), String> {
     let wt_str = wt.to_string_lossy().to_string();
-    let _ = git(root, &["worktree", "remove", "--force", &wt_str]);
+
     if !wt.exists() {
-        return git(root, &["worktree", "add", "-B", rev, &wt_str, branch]).map(|_| ());
+        // [State 1] Directory missing — fast path.
+        // Remove any stale tracking entry for this path (quick no-op when not
+        // registered). This handles [State 4] when git's remove succeeds on a
+        // ghost entry; if it does not, the lazy prune below is the fallback.
+        let _ = git(root, &["worktree", "remove", "-f", &wt_str]);
+
+        if branch_exists(root, branch) {
+            // [State 4] If a stale tracking entry blocks the add, prune and retry.
+            return git(root, &["worktree", "add", "-B", rev, &wt_str, branch])
+                .or_else(|_| {
+                    let _ = git(root, &["worktree", "prune"]);
+                    git(root, &["worktree", "add", "-B", rev, &wt_str, branch])
+                })
+                .map(|_| ());
+        }
+        // Feature branch is also absent — find its worktree and regenerate.
+        let _ = git(root, &["worktree", "prune"]);
+        return regen_from_feature_worktree(root, rev, wt, branch);
     }
-    // Directory survived (CWD lock or similar). Re-register it so git can
-    // work inside it, abort any in-progress rebase, then reset to the
-    // requested starting point.
-    relink_worktree(root, wt)
+
+    // Directory survived (Windows CWD lock or external process).
+
+    // [State 7] Unlock if locked. No-op when not locked.
+    let _ = git(root, &["worktree", "unlock", &wt_str]);
+
+    // Remove any existing tracking entry for this path.
+    // One `-f` handles dirty/untracked files; a second `-f` handles locked
+    // worktrees (belt-and-suspenders after the explicit unlock above).
+    let _ = git(root, &["worktree", "remove", "-f", &wt_str]);
+    let _ = git(root, &["worktree", "remove", "-f", "-f", &wt_str]);
+
+    // [State 4] Prune stale entries where a tracking path no longer exists on
+    // disk, so that `git worktree add` does not reject the path as registered.
+    let _ = git(root, &["worktree", "prune"]);
+
+    if !wt.exists() {
+        // Removal succeeded; add fresh.
+        if branch_exists(root, branch) {
+            return git(root, &["worktree", "add", "-B", rev, &wt_str, branch]).map(|_| ());
+        }
+        return regen_from_feature_worktree(root, rev, wt, branch);
+    }
+
+    // [State 2] Inspect the `.git` entry to decide how to repair.
+    // `is_valid_linked_worktree` is true only when `.git` is a file starting
+    // with `gitdir:`. If it's a directory the path contains a main git repo
+    // rather than a linked worktree — wipe and recreate. Otherwise the `.git`
+    // file is absent, malformed, or stale; `relink_worktree` will fix it.
+    if !is_valid_linked_worktree(wt) && wt.join(".git").is_dir() {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] worktree recovery: directory at {wt_str} is a main git \
+             repository; its contents will be discarded"
+        );
+        let _ = std::fs::remove_dir_all(wt);
+        return if branch_exists(root, branch) {
+            git(root, &["worktree", "add", "-B", rev, &wt_str, branch]).map(|_| ())
+        } else {
+            regen_from_feature_worktree(root, rev, wt, branch)
+        };
+    }
+
+    // (Re)register the worktree tracking entry so git commands work inside
+    // `wt`. Idempotent for already-valid worktrees — rewrites the same
+    // gitdir/commondir pointers and fills in a missing HEAD placeholder.
+    relink_worktree(root, wt, branch)
         .map_err(|e| format!("cannot relink worktree at {wt_str}: {e}"))?;
+
+    // Abort any rebase that was left in flight.
     let _ = git(wt, &["rebase", "--abort"]);
-    git(wt, &["checkout", "-f", "-B", rev, branch]).map(|_| ())
+
+    // Warn before discarding local changes.
+    if worktree_has_changes(wt) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] worktree recovery: discarding uncommitted changes in {wt_str} \
+             before resetting to '{branch}'"
+        );
+    }
+
+    // [State 3] Review branch missing: `-B` creates it.
+    // [State 5] Branch mismatch: `-B` resets to the correct starting point.
+    // [State 6] Detached HEAD: `checkout` reattaches to a named branch.
+    // `-f` discards local modifications.
+    match git(wt, &["checkout", "-f", "-B", rev, branch]) {
+        Ok(_) => Ok(()),
+        Err(checkout_err) => {
+            // Feature branch may be absent; wipe and regenerate.
+            let _ = std::fs::remove_dir_all(wt);
+            if branch_exists(root, branch) {
+                git(root, &["worktree", "add", "-B", rev, &wt_str, branch])
+                    .map(|_| ())
+                    .map_err(|e| format!("{checkout_err}; worktree add: {e}"))
+            } else {
+                regen_from_feature_worktree(root, rev, wt, branch)
+                    .map_err(|e| format!("{checkout_err}; regen: {e}"))
+            }
+        }
+    }
 }
 
 /// Whether a rebase is currently in progress in `wt` (its state directory
@@ -227,7 +515,7 @@ fn count_markers(wt: &Path, files: &[String]) -> usize {
 }
 
 /// The agent backend used to resolve conflicts: the review's own `stored` agent
-/// (from `[[task.session.review]]`), else the `RALPHUS_RESOLVER_AGENT` env
+/// (from `[[review]]`), else the `RALPHUS_RESOLVER_AGENT` env
 /// override, else `ollama`.
 fn resolver_agent(stored: Option<&str>) -> String {
     stored
@@ -239,15 +527,18 @@ fn resolver_agent(stored: Option<&str>) -> String {
 }
 
 /// The model the resolver runs: the review's own `stored` model, else the
-/// `RALPHUS_RESOLVER_MODEL` env override, else `qwen3:8b` for the ollama backend
-/// (other backends take their own default when unset).
+/// `RALPHUS_RESOLVER_MODEL` env override, else `qwen3:8b` for the ollama backend.
+/// claude, claude-code, and codex each pick their own default when unset → `None`.
 fn resolver_model(stored: Option<&str>, agent: &str) -> Option<String> {
     stored
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .or_else(|| std::env::var("RALPHUS_RESOLVER_MODEL").ok())
-        .or_else(|| (agent == "ollama").then(|| "qwen3:8b".to_string()))
+        .or_else(|| match agent {
+            "ollama" => Some("qwen3:8b".to_string()),
+            _ => None, // codex, claude, claude-code: each picks its own default
+        })
 }
 
 /// Derives a concise quality-bar instruction for the conflict-resolver agent.
@@ -440,7 +731,7 @@ fn resolve_conflicts_with_agent(
     runner: &dyn Runner,
     wt: &Path,
     branch: &str,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Option<String>, String> {
     // The review's configured resolver backend/model (falls back to env/default).
     let (agent, model) = {
         let guard = store.lock().expect("poisoned");
@@ -456,15 +747,35 @@ fn resolve_conflicts_with_agent(
     // once per branch rebase attempt; result is reused across loop iterations).
     let quality_note = synthesize_verify_instructions(store, id, branch, runner, &agent, &model);
 
-    // Seed the live progress (total markers for this branch) so the review page
-    // can show "resolved / total" while the agent works.
-    let total = i64::try_from(count_markers(wt, &conflicted_files(wt))).unwrap_or(i64::MAX);
-    let set_progress = |remaining: i64| {
+    // Seed the live progress (RAL-72): found = initial marker block count,
+    // fixed = files resolved in working tree (not staged), committed = cumulative.
+    let found = i64::try_from(count_markers(wt, &conflicted_files(wt))).unwrap_or(i64::MAX);
+    let mut committed = 0i64;
+    let mut last_session_id: Option<String> = None;
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} conflicts starting branch={branch:?} found={found} \
+         agent={agent:?} model={model:?}"
+    );
+    {
         let guard = store.lock().expect("poisoned");
-        let _ = guard.set_guardian_conflicts(id, Some(total), Some(remaining));
-        let _ = guard.set_branch_conflicts(id, position, Some(total), Some(remaining));
-    };
-    set_progress(total);
+        let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(0));
+        let _ = guard.set_branch_conflicts(id, position, Some(found), Some(0), Some(0));
+    }
+
+    // Side-channel file where the Python backend writes the claude session ID as
+    // soon as the stream-json init event arrives — before the session completes.
+    // Located in the system temp dir (never inside the worktree) so git can never
+    // track it.  The watcher thread below polls this file and writes the session ID
+    // to the DB immediately, enabling Watch Live access during a long resolve pass.
+    let wt_basename = wt
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    let sid_path = std::env::temp_dir()
+        .join("ralphus")
+        .join(format!("{wt_basename}.live_session"));
+
     for _ in 0..32 {
         let files = conflicted_files(wt);
         if files.is_empty() {
@@ -477,9 +788,43 @@ fn resolve_conflicts_with_agent(
                 }
                 continue;
             }
-            set_progress(0);
-            return Ok(());
+            {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
+                let _ =
+                    guard.set_branch_conflicts(id, position, Some(found), Some(0), Some(committed));
+            }
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} conflicts resolved branch={branch:?} committed={committed}"
+            );
+            return Ok(last_session_id);
         }
+        // Fast path: rerere (or a prior agent pass) may have already resolved
+        // the file content even though the index still shows UU entries.
+        // count_markers reads the actual files; if zero, stage and continue
+        // without invoking the agent at all.
+        let markers_before = i64::try_from(count_markers(wt, &files)).unwrap_or(i64::MAX);
+        if markers_before == 0 {
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} rerere fast-path branch={branch:?} \
+                 (content resolved, staging without agent)"
+            );
+            committed += i64::try_from(files.len()).unwrap_or(0);
+            {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
+                let _ =
+                    guard.set_branch_conflicts(id, position, Some(found), Some(0), Some(committed));
+            }
+            git(wt, &["add", "-A"])?;
+            if git(wt, &["rebase", "--continue"]).is_err() {
+                let _ = git(wt, &["rebase", "--skip"]);
+            }
+            continue;
+        }
+
         let prompt = format!(
             "Resolve all merge conflict markers in these files from branch '{branch}': {}. \
              Read each file, intelligently merge both sides of every conflict block \
@@ -503,10 +848,12 @@ fn resolve_conflicts_with_agent(
                 look for CLAUDE.md or AGENTS.md in the repository root.\n\
              5. Once all files are marker-free and quality requirements are met, call \
                 run_bash with exactly: git add -A\n\
+             6. After git add -A succeeds, output the following line and stop:\n\
+                RALPHUS_STAGE: DONE\n\
              \n\
              Do NOT call `git rebase --continue`, `git commit`, `git push`, or any other \
-             git command besides `git add -A`. The orchestrator advances the rebase after \
-             you finish.";
+             git command besides `git add -A`. The orchestrator advances the rebase as soon \
+             as it sees RALPHUS_STAGE: DONE in your output.";
         let spec = RunnerSpec {
             run_id: "guardian".to_string(),
             task: "resolve".to_string(),
@@ -522,17 +869,86 @@ fn resolve_conflicts_with_agent(
             budget_tokens: None,
             verify: false,
         };
+
+        // Clean up any stale file from a previous pass so the watcher does not
+        // read an old session ID.
+        let _ = std::fs::remove_file(&sid_path);
+
+        // Spawn a thread that polls the side-channel file and writes the session
+        // ID to the DB as soon as the Python backend creates it (on the init
+        // event, before the session finishes).  This is what makes Watch Live
+        // available immediately rather than only after the full pass completes.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let store_clone = Arc::clone(store);
+        let id_str = id.to_string();
+        let sid_path_clone = sid_path.clone();
+        let watcher = std::thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                if let Ok(raw) = std::fs::read_to_string(&sid_path_clone) {
+                    let sid = raw.trim();
+                    if !sid.is_empty() {
+                        let guard = store_clone.lock().expect("poisoned");
+                        let _ = guard.set_branch_resolver_session_id(&id_str, position, sid);
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+
         let result = runner.run(&spec);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = watcher.join();
+
+        if let Some(sid) = result.claude_session_id.clone() {
+            last_session_id = Some(sid);
+        }
         if !result.is_done() {
             let err = result
                 .error
                 .as_deref()
                 .unwrap_or("resolver subprocess produced no output");
+            crate::rlog!(
+                ERROR,
+                "ralphus [guardian] review {id} conflicts failed branch={branch:?}: {err}"
+            );
             return Err(format!("conflict resolver failed: {err}"));
         }
 
-        let remaining = count_markers(wt, &files);
-        set_progress(i64::try_from(remaining).unwrap_or(i64::MAX));
+        // Fast path: agent signalled it staged everything.  Trust it and advance
+        // the rebase immediately without re-scanning for markers.
+        let stage_done = result.summary.contains(STAGE_DONE_MARKER);
+        if stage_done {
+            committed += markers_before;
+            {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
+                let _ =
+                    guard.set_branch_conflicts(id, position, Some(found), Some(0), Some(committed));
+            }
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} stage-done signal received branch={branch:?}"
+            );
+            if git(wt, &["rebase", "--continue"]).is_err() {
+                let _ = git(wt, &["rebase", "--skip"]);
+            }
+            continue;
+        }
+
+        // Fallback: agent did not emit the signal (older model, partial run, etc.).
+        // Count remaining markers and advance when they are gone.
+        let remaining = i64::try_from(count_markers(wt, &files)).unwrap_or(i64::MAX);
+        // Fixed = hunks the agent cleared in the working tree, not yet staged.
+        let fixed = markers_before.saturating_sub(remaining);
+        {
+            let guard = store.lock().expect("poisoned");
+            let _ = guard.set_guardian_conflicts(id, Some(found), Some(fixed), Some(committed));
+            let _ =
+                guard.set_branch_conflicts(id, position, Some(found), Some(fixed), Some(committed));
+        }
         if remaining > 0 {
             // Markers still present — let the loop retry up to the cap rather than
             // failing immediately. The agent may need more than one pass to fully
@@ -540,6 +956,13 @@ fn resolve_conflicts_with_agent(
             continue;
         }
         git(wt, &["add", "-A"])?;
+        // All hunks in this batch are now staged; accumulate them as committed.
+        committed += markers_before;
+        {
+            let guard = store.lock().expect("poisoned");
+            let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
+            let _ = guard.set_branch_conflicts(id, position, Some(found), Some(0), Some(committed));
+        }
         // Advance the rebase. `--continue` may fail if the resolved commit is now
         // empty (its change already applied) — drop it with `--skip`. Either way
         // the loop re-checks and resolves any further conflicting commits.
@@ -633,6 +1056,10 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             fail_branch(store, id, ob.position, &ob.branch, &e, set_status);
             return;
         }
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_branch_review(id, ob.position, &rev, &wt_j_str);
         if stack_pick(
             store,
             runner,
@@ -652,10 +1079,6 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             fail_branch(store, id, ob.position, &ob.branch, &e, set_status);
             return;
         }
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_branch_review(id, ob.position, &rev, &wt_j_str);
         prev_ref = rev;
     }
     match finalize_review(store, root, wt_base, id, &prev_ref) {
@@ -700,6 +1123,11 @@ fn dispatch_routes(
     if routes.is_empty() {
         return;
     }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} routing feedback to {} branch(es) no_commit={no_commit}",
+        routes.len()
+    );
     let git_root = PathBuf::from(&guardian.git_root);
     let wt_base = worktree_dir(&guardian.git_root, id);
     let r_agent = resolver_agent(guardian.resolver_agent.as_deref());
@@ -869,6 +1297,9 @@ pub fn purge_worktrees(git_root: &str, id: &str) {
     let num = id.replace("guardian-", "");
     let wt_base = worktree_dir(git_root, id);
     cleanup_review_worktrees(Path::new(git_root), &wt_base, id, &num, &[]);
+    // Also drop any carry-forward protection refs so a deleted guardian leaves
+    // nothing pinning otherwise-unreachable commits.
+    purge_carry_refs(Path::new(git_root), id);
 }
 
 /// Validate the guardian and kick off a background merge. Returns immediately.
@@ -891,7 +1322,29 @@ pub fn start_merge(
             return reply(404, &error_body("not_found", &e.to_string()));
         }
     };
-    if matches!(guardian.status.as_str(), "merging" | "in_review") {
+    if guardian.branches.is_empty() {
+        return reply(
+            400,
+            &error_body("no_branches", "guardian has no branches to merge"),
+        );
+    }
+
+    // Atomically transition collecting or merge_failed → merging. Two concurrent
+    // requests can both pass the guardian-exists check above, but only one can
+    // win this SQL UPDATE; the other gets false and a 409.
+    let claimed = match store
+        .lock()
+        .expect("store mutex poisoned")
+        .claim_guardian_merge(id)
+    {
+        Ok(c) => c,
+        Err(e) => return reply(500, &error_body("store_error", &e.to_string())),
+    };
+    if !claimed {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] review {id} merge claim rejected (already merging/in_review)"
+        );
         return reply(
             409,
             &error_body(
@@ -900,13 +1353,11 @@ pub fn start_merge(
             ),
         );
     }
-    if guardian.branches.is_empty() {
-        return reply(
-            400,
-            &error_body("no_branches", "guardian has no branches to merge"),
-        );
-    }
-
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} merge starting branches={}",
+        guardian.branches.len()
+    );
     let sid = id.to_string();
     std::thread::spawn(move || {
         let _permit = sem.acquire();
@@ -958,7 +1409,13 @@ pub fn start_feedback(
 /// was the dominant per-message latency cost. Other backends fall back to the
 /// subprocess runner unchanged. The conversation history is passed as a proper
 /// messages array rather than a flat concatenated prompt.
-pub fn run_chat(store: &Arc<Mutex<Store>>, runner: Arc<dyn Runner>, id: &str, message: &str) {
+pub fn run_chat(
+    store: &Arc<Mutex<Store>>,
+    runner: Arc<dyn Runner>,
+    id: &str,
+    message: &str,
+    image: Option<&str>,
+) {
     let guardian = match store.lock().expect("poisoned").get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
@@ -1011,6 +1468,14 @@ pub fn run_chat(store: &Arc<Mutex<Store>>, runner: Arc<dyn Runner>, id: &str, me
         .guardian_messages(id)
         .unwrap_or_default();
 
+    crate::rlog!(
+        DEBUG,
+        "ralphus [guardian] review {id} chat triage start backend={r_agent:?} \
+         model={r_model:?} messages={} has_image={}",
+        history.len(),
+        image.is_some()
+    );
+
     // Map DB roles to API roles for the direct call.
     let chat_messages: Vec<crate::chat_client::ChatMessage> = history
         .iter()
@@ -1021,11 +1486,12 @@ pub fn run_chat(store: &Arc<Mutex<Store>>, runner: Arc<dyn Runner>, id: &str, me
                 "assistant"
             },
             content: m.text.clone(),
+            image: m.image.clone(),
         })
         .collect();
 
     // Try a direct HTTP call first (no subprocess). Falls back to the subprocess
-    // runner for unsupported agent types (e.g. claude-code, harness backends).
+    // runner for unsupported agent types (e.g. claude-code, codex-cli, harness backends).
     let raw_reply = match crate::chat_client::call_direct(
         &r_agent,
         r_model.as_deref(),
@@ -1033,7 +1499,11 @@ pub fn run_chat(store: &Arc<Mutex<Store>>, runner: Arc<dyn Runner>, id: &str, me
         &chat_messages,
     ) {
         Ok(text) => text,
-        Err(_) => {
+        Err(direct_err) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} chat-api fallback to subprocess: {direct_err}"
+            );
             // Subprocess fallback: build the old flat-text prompt and spawn the runner.
             // `message` is re-appended here because the subprocess backend does not
             // receive the structured messages array.
@@ -1083,14 +1553,22 @@ pub fn run_chat(store: &Arc<Mutex<Store>>, runner: Arc<dyn Runner>, id: &str, me
         strip_route_blocks(&raw_reply)
     };
 
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .add_guardian_message(id, "guardian", &visible_text);
+    let _ =
+        store
+            .lock()
+            .expect("poisoned")
+            .add_guardian_message(id, "guardian", &visible_text, None);
 
     // Dispatch each route block to a fresh agent in the target review worktree,
     // wait for all agents to finish, then restack downstream branches.
     if !routes.is_empty() {
+        let route_branches: Vec<&str> = routes.iter().map(|(b, _)| b.as_str()).collect();
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {id} chat routes={} branches=[{}]",
+            routes.len(),
+            route_branches.join(", ")
+        );
         let no_commit = is_no_commit_intent(message);
         dispatch_routes(store, runner, id, &routes, &guardian, no_commit);
     }
@@ -1098,25 +1576,30 @@ pub fn run_chat(store: &Arc<Mutex<Store>>, runner: Arc<dyn Runner>, id: &str, me
 
 /// Append the reviewer's message to the thread and kick off the triage agent's
 /// reply in the background. Returns immediately (RAL-22).
+///
+/// `image` is an optional base64 data-URI attached to this message (RAL-59).
 pub fn start_chat(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
     id: &str,
     message: String,
+    image: Option<String>,
 ) -> Reply {
     if let Err(e) = store.lock().expect("poisoned").get_guardian(id) {
         return reply(404, &error_body("not_found", &e.to_string()));
     }
     // Persist the reviewer's message synchronously so the UI shows it at once.
-    if let Err(e) = store
-        .lock()
-        .expect("poisoned")
-        .add_guardian_message(id, "reviewer", &message)
-    {
+    if let Err(e) = store.lock().expect("poisoned").add_guardian_message(
+        id,
+        "reviewer",
+        &message,
+        image.as_deref(),
+    ) {
         return reply(500, &error_body("internal", &e.to_string()));
     }
     let sid = id.to_string();
-    std::thread::spawn(move || run_chat(&store, runner, &sid, &message));
+    let img = image.clone();
+    std::thread::spawn(move || run_chat(&store, runner, &sid, &message, img.as_deref()));
     reply(202, "{\"status\":\"triaging\"}")
 }
 
@@ -1136,6 +1619,11 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
     };
     let num = id.replace("guardian-", "");
     let base = guardian.base_branch.clone();
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} merge executing base={base:?} branches={}",
+        guardian.branches.iter().filter(|b| b.enabled).count()
+    );
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         let _ = store
@@ -1148,7 +1636,7 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
         let guard = store.lock().expect("poisoned");
         let _ = guard.clear_guardian_summary(id);
         let _ = guard.clear_guardian_manual_commands(id);
-        let _ = guard.set_guardian_conflicts(id, None, None);
+        let _ = guard.set_guardian_conflicts(id, None, None, None);
         let _ = guard.clear_all_branch_conflicts(id);
     }
 
@@ -1212,6 +1700,47 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
         );
         return;
     }
+    // Carry-forward snapshot: record each enabled branch's prior resolved
+    // review-branch commit and the prior per-project base BEFORE cleanup deletes
+    // those refs. On a rebuild (e.g. the base branch moved) the already-resolved
+    // commits are replayed onto the new base instead of re-deriving from the
+    // feature tips — so a conflict resolved on an earlier build is not resolved
+    // again, even without git rerere. Empty on the first build (no prior refs),
+    // which makes this path identical to a from-scratch merge.
+    let mut old_base_by_proj: std::collections::HashMap<String, String> =
+        guardian.base_commits.clone();
+    if let Some(bc) = &guardian.base_commit {
+        old_base_by_proj
+            .entry(guardian.git_root.clone())
+            .or_insert_with(|| bc.clone());
+    }
+    let mut old_review: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+
+    // Pin every commit we may carry forward under `refs/ralphus/carry/<id>/…`
+    // BEFORE cleanup deletes the `guardian/<id>/*` branches, so a carried commit
+    // is never even briefly dangling — and thus never prunable by a concurrent
+    // `git gc` — in the window between cleanup and its re-checkout below. `carry`
+    // deletes every ref it creates when this function returns (success, early
+    // return, or panic); any leftovers from a merge killed before its guard ran
+    // are purged first.
+    let mut carry = CarryRefs::new();
+    for (proj, proj_branches) in &project_branches {
+        let proot = PathBuf::from(proj);
+        purge_carry_refs(&proot, id);
+        if let Some(sha) = old_base_by_proj.get(proj) {
+            carry.pin(&proot, id, "base", sha);
+        }
+        for ob in proj_branches {
+            let rev = format!("guardian/{id}/wt-{}", ob.branch);
+            if let Ok(sha) = git(&proot, &["rev-parse", "--verify", &rev]) {
+                let sha = sha.trim().to_string();
+                carry.pin(&proot, id, &ob.position.to_string(), &sha);
+                old_review.insert((proj.clone(), ob.branch.clone()), sha);
+            }
+        }
+    }
+
     // Clean up prior worktrees for ALL projects before starting fresh.
     for (proj, _) in &project_branches {
         let root = PathBuf::from(proj);
@@ -1285,7 +1814,11 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
         }
 
         // Per-branch worktree path: stack each branch on top of the previous.
+        // `prev_ref` is the NEW stack tip each branch rebases onto; `prev_old` is
+        // the matching tip from the PREVIOUS build (the old base for the first
+        // branch), used to carry a prior resolution forward.
         let mut prev_ref = base_sha.clone();
+        let mut prev_old: Option<String> = old_base_by_proj.get(proj).cloned();
         for ob in proj_branches {
             let _ = store.lock().expect("poisoned").set_branch_status(
                 id,
@@ -1300,13 +1833,36 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
                 fail_branch(store, id, ob.position, &ob.branch, &e, &set_status);
                 return;
             }
+            // Carry-forward: when this branch has a prior resolved review commit
+            // whose old upstream is still an ancestor of it, point the review
+            // branch at that commit and rebase ITS own (already conflict-resolved)
+            // changes onto the new stack tip — passing the old upstream as the
+            // rebase boundary. The replay then conflicts only on genuine new base
+            // deltas, so a previously-resolved conflict is not resolved again.
+            // Any mismatch (no prior commit, broken chain, checkout failure) falls
+            // back to `base_sha` — the from-feature-tip behaviour.
+            let this_old = old_review.get(&(proj.clone(), ob.branch.clone())).cloned();
+            let upstream = match (&this_old, &prev_old) {
+                (Some(src), Some(up))
+                    if is_ancestor(&root, up, src)
+                        && git(&wt, &["checkout", "-B", &rev, src]).is_ok() =>
+                {
+                    up.clone()
+                }
+                _ => base_sha.clone(),
+            };
+            let _ =
+                store
+                    .lock()
+                    .expect("poisoned")
+                    .set_branch_review(id, ob.position, &rev, &wt_str);
             if stack_pick(
                 store,
                 runner,
                 id,
                 ob.position,
                 &ob.branch,
-                &base_sha,
+                &upstream,
                 &prev_ref,
                 &rev,
                 &wt,
@@ -1319,11 +1875,9 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
                 fail_branch(store, id, ob.position, &ob.branch, &e, &set_status);
                 return;
             }
-            let _ =
-                store
-                    .lock()
-                    .expect("poisoned")
-                    .set_branch_review(id, ob.position, &rev, &wt_str);
+            // The next branch extracts its own OLD commits relative to THIS
+            // branch's old resolved tip, independent of the carry decision above.
+            prev_old = this_old;
             prev_ref = rev;
         }
 
@@ -1406,6 +1960,14 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             MergeStatus::InProgress,
             None,
         );
+        // Every branch shares the one combined worktree/branch; record it now so
+        // the UI can show the expand row and feedback widget even if this branch fails.
+        let _ = store.lock().expect("poisoned").set_branch_review(
+            id,
+            ob.position,
+            &combined_branch,
+            &wt_str,
+        );
         // Detach at the feature tip and rebase its own commits onto the current
         // combined head; then advance the combined branch to the result.
         if let Err(e) = git(&wt, &["checkout", "--detach", &ob.branch]) {
@@ -1424,7 +1986,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             base_sha,
             "HEAD",
         ) {
-            Ok(outcome) => {
+            Ok((outcome, session_id)) => {
                 let nothing = contributed_nothing(&wt, &combined_branch, "HEAD");
                 if let Err(e) = git(&wt, &["checkout", "-B", &combined_branch, "HEAD"]) {
                     fail_branch(store, id, ob.position, &ob.branch, &e, set_status);
@@ -1439,12 +2001,11 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                         nothing.then_some("no new commits over base (already merged?)"),
                     ),
                 };
-                let _ = store.lock().expect("poisoned").set_branch_status(
-                    id,
-                    ob.position,
-                    status,
-                    detail,
-                );
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.set_branch_status(id, ob.position, status, detail);
+                if let Some(ref sid) = session_id {
+                    let _ = guard.set_branch_resolver_session_id(id, ob.position, sid);
+                }
             }
             Err(e) => {
                 // drive_rebase already aborted; restore the combined branch.
@@ -1457,13 +2018,6 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             fail_branch(store, id, ob.position, &ob.branch, &e, set_status);
             return;
         }
-        // Every branch shares the one combined worktree/branch.
-        let _ = store.lock().expect("poisoned").set_branch_review(
-            id,
-            ob.position,
-            &combined_branch,
-            &wt_str,
-        );
         completed.push((ob.position, ob.branch.clone()));
         // RAL-39: update interim summary after each branch is stacked.
         generate_summary(
@@ -1527,6 +2081,10 @@ pub fn run_feedback(
         Err(_) => return,
     };
     let base = guardian.base_branch.clone();
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} feedback applying position={position}"
+    );
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         let _ = store
@@ -1611,6 +2169,10 @@ pub fn run_feedback(
         .lock()
         .expect("poisoned")
         .set_branch_detail(id, position, "feedback applied");
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} feedback done position={position} no_commit={no_commit}"
+    );
     if no_commit {
         set_status(GuardianStatus::InReview, None);
         return;
@@ -1668,6 +2230,10 @@ pub fn run_feedback(
             fail_branch(store, id, ob.position, &ob.branch, &e, &set_status);
             return;
         }
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_branch_review(id, ob.position, &rev, &wt_j_str);
         if stack_pick(
             store,
             runner,
@@ -1687,10 +2253,6 @@ pub fn run_feedback(
             fail_branch(store, id, ob.position, &ob.branch, &e, &set_status);
             return;
         }
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_branch_review(id, ob.position, &rev, &wt_j_str);
         prev_ref = rev;
     }
 
@@ -1861,7 +2423,7 @@ fn stack_pick(
         base_sha,
         rev,
     ) {
-        Ok(outcome) => {
+        Ok((outcome, session_id)) => {
             let (status, detail) = match outcome {
                 RebaseOutcome::Resolved => {
                     (MergeStatus::ConflictResolved, Some("resolved by agent"))
@@ -1874,10 +2436,11 @@ fn stack_pick(
                         .then_some("no new commits over base (already merged?)"),
                 ),
             };
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .set_branch_status(id, position, status, detail);
+            let guard = store.lock().expect("poisoned");
+            let _ = guard.set_branch_status(id, position, status, detail);
+            if let Some(ref sid) = session_id {
+                let _ = guard.set_branch_resolver_session_id(id, position, sid);
+            }
             Ok(())
         }
         Err(e) => {
@@ -1966,7 +2529,10 @@ fn cleanup_review_worktrees(
         if let Some(path) = line.strip_prefix("worktree ") {
             let path = path.trim();
             if path.contains(id) {
-                let _ = git(root, &["worktree", "remove", "--force", path]);
+                // Unlock first so that a locked worktree does not block removal.
+                let _ = git(root, &["worktree", "unlock", path]);
+                // Two --force flags handle dirty/untracked (first) and locked (second).
+                let _ = git(root, &["worktree", "remove", "-f", "-f", path]);
             }
         }
     }
@@ -2081,7 +2647,15 @@ fn drive_rebase(
     newbase: &str,
     base_sha: &str,
     branch_arg: &str,
-) -> std::result::Result<RebaseOutcome, String> {
+) -> std::result::Result<(RebaseOutcome, Option<String>), String> {
+    // Remove untracked files before rebasing. `git rebase --onto <newbase>` fails
+    // with "untracked working tree files would be overwritten by checkout" when the
+    // worktree contains a file that is tracked in `newbase` but untracked here —
+    // a common leftover from a prior agent session that didn't stage everything.
+    // This is especially likely on Windows where a CWD lock prevents
+    // `ensure_worktree` from deleting and recreating the directory cleanly.
+    let _ = git(wt, &["clean", "-fd"]);
+
     // `--empty=drop` discards commits already present on `newbase` (patch-equal),
     // which is exactly why rebase — not a range cherry-pick — is used here: a
     // shared or already-merged commit is dropped instead of halting the stack.
@@ -2095,15 +2669,26 @@ fn drive_rebase(
         branch_arg,
     ];
     match git(wt, &args) {
-        Ok(_) => Ok(RebaseOutcome::Clean),
+        Ok(_) => Ok((RebaseOutcome::Clean, None)),
         Err(e) => {
-            if conflicted_files(wt).is_empty() {
-                // Failed with no conflict to resolve (e.g. a bad ref): abort clean.
+            let conflicts = conflicted_files(wt);
+            if conflicts.is_empty() && !rebase_in_progress(wt) {
+                // Genuine failure with no conflict to resolve (e.g. a bad ref): abort clean.
                 let _ = git(wt, &["rebase", "--abort"]);
                 Err(e)
             } else {
+                if conflicts.is_empty() {
+                    // rerere.autoupdate staged every conflicted file automatically —
+                    // the rebase is still paused but the index is already clean.
+                    // The resolver loop drives it forward without invoking an agent.
+                    crate::rlog!(
+                        INFO,
+                        "ralphus [guardian] review {id} rerere-autoupdate fast-path \
+                         branch={feature:?} (staged by rerere, no agent needed)"
+                    );
+                }
                 match resolve_conflicts_with_agent(store, id, position, runner, wt, feature) {
-                    Ok(()) => Ok(RebaseOutcome::Resolved),
+                    Ok(session_id) => Ok((RebaseOutcome::Resolved, session_id)),
                     Err(re) => {
                         let _ = git(wt, &["rebase", "--abort"]);
                         Err(re)
@@ -2391,6 +2976,372 @@ fn error_body(code: &str, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // -----------------------------------------------------------------------
+    // Helpers shared by worktree-recovery tests
+    // -----------------------------------------------------------------------
+
+    static TEST_N: AtomicU32 = AtomicU32::new(0);
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let n = TEST_N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("wt-rec-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir tmp_dir");
+        dir
+    }
+
+    fn g(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_EDITOR", "true")
+            .status()
+            .expect("git");
+        assert!(
+            status.success(),
+            "git {args:?} in {} failed",
+            root.display()
+        );
+    }
+
+    /// Returns `(base_dir, repo_root, feature_worktree_path)`.
+    ///
+    /// Sets up: `main` branch with one commit, and a linked worktree on
+    /// `feature/a` with one additional commit.
+    fn make_repo(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = tmp_dir(tag);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "base"]);
+        let fwt = base.join("fwt");
+        g(
+            &repo,
+            &["worktree", "add", "-b", "feature/a", fwt.to_str().unwrap()],
+        );
+        std::fs::write(fwt.join("feat.txt"), "feat\n").unwrap();
+        g(&fwt, &["add", "."]);
+        g(&fwt, &["commit", "-m", "feature"]);
+        (base, repo, fwt)
+    }
+
+    fn current_branch(wt: &Path) -> String {
+        git(wt, &["symbolic-ref", "--short", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    fn assert_on_branch(wt: &Path, expected: &str) {
+        assert_eq!(
+            current_branch(wt),
+            expected,
+            "expected worktree at {} to be on '{expected}'",
+            wt.display()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 1 — directory missing entirely
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state1_directory_missing() {
+        let (base, repo, _fwt) = make_repo("s1");
+        let rwt = base.join("rwt");
+        assert!(!rwt.exists(), "precondition: rwt must not exist");
+
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 1 recovery");
+
+        assert!(rwt.exists());
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        assert!(branch_exists(&repo, "guardian/g/wt-feature-a"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 2 — directory exists but is not a git worktree
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state2_directory_not_a_worktree() {
+        let (base, repo, _fwt) = make_repo("s2");
+        let rwt = base.join("rwt");
+        // Create a plain directory with some files but no git tracking.
+        std::fs::create_dir_all(&rwt).unwrap();
+        std::fs::write(rwt.join("stray.txt"), "stray\n").unwrap();
+        assert!(!rwt.join(".git").exists(), "precondition: no .git");
+
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 2 recovery");
+
+        assert!(rwt.exists());
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 3 — worktree directory survives but review branch is deleted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state3_review_branch_deleted() {
+        let (base, repo, _fwt) = make_repo("s3");
+        let rwt = base.join("rwt");
+
+        // Initial setup.
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("initial setup");
+
+        // Simulate an external tool deleting the review branch:
+        // 1. Remove the git tracking entry so `git branch -D` won't complain
+        //    about the branch being checked out.
+        // 2. Delete the branch.
+        // 3. Directory `rwt` survives (CWD lock / external process).
+        let tracking = repo.join(".git").join("worktrees").join("rwt");
+        std::fs::remove_dir_all(&tracking).ok();
+        g(&repo, &["branch", "-D", "guardian/g/wt-feature-a"]);
+        // rwt directory still exists with its .git file.
+
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 3 recovery");
+
+        assert!(rwt.exists());
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        assert!(branch_exists(&repo, "guardian/g/wt-feature-a"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 4 — branch exists, directory absent (stale tracking entry)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state4_stale_tracking_entry() {
+        let (base, repo, _fwt) = make_repo("s4");
+        let rwt = base.join("rwt");
+
+        // Initial setup.
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("initial setup");
+
+        // Simulate an OS crash or manual deletion of the directory without
+        // going through `git worktree remove` — leaves a stale tracking entry.
+        std::fs::remove_dir_all(&rwt).expect("delete rwt dir");
+        assert!(!rwt.exists(), "precondition: rwt gone");
+        // git worktree list should report rwt as prunable now.
+
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 4 recovery");
+
+        assert!(rwt.exists());
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 5 — branch mismatch (directory survives, wrong branch)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state5_branch_mismatch() {
+        let (base, repo, _fwt) = make_repo("s5");
+        let rwt = base.join("rwt");
+
+        // Initial setup.
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("initial setup");
+
+        // Simulate the directory surviving with the wrong branch checked out.
+        // Order matters: change the branch FIRST (while the tracking entry
+        // exists so git commands work inside rwt), THEN remove the tracking
+        // entry to simulate a CWD-lock scenario where the directory outlived
+        // the git worktree removal.
+        g(&rwt, &["checkout", "-b", "wrong-branch"]);
+        let tracking = repo.join(".git").join("worktrees").join("rwt");
+        std::fs::remove_dir_all(&tracking).ok();
+        // Verify precondition: rwt still has files but git can't work in it
+        // (tracking is gone), and its HEAD points to wrong-branch.
+        assert!(rwt.exists(), "rwt directory must survive");
+        // Read the HEAD content from the (now deleted) tracking entry... we
+        // can't run git in rwt, so just confirm the directory exists with files.
+        assert!(
+            rwt.join(".git").is_file(),
+            "rwt/.git pointer file must remain"
+        );
+
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 5 recovery");
+
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 6 — detached HEAD in worktree
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state6_detached_head() {
+        let (base, repo, _fwt) = make_repo("s6");
+        let rwt = base.join("rwt");
+
+        // Initial setup.
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("initial setup");
+
+        // Simulate the directory surviving in detached-HEAD state.
+        // Order matters: detach HEAD FIRST (while the tracking entry is valid),
+        // THEN remove the entry to simulate the CWD-lock survival scenario.
+        let sha = git(&rwt, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        g(&rwt, &["checkout", "--detach", &sha]);
+        let tracking = repo.join(".git").join("worktrees").join("rwt");
+        std::fs::remove_dir_all(&tracking).ok();
+        assert!(rwt.exists(), "rwt directory must survive");
+
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 6 recovery");
+
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-state 7 — worktree locked externally
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_recovery_state7_locked_worktree() {
+        let (base, repo, _fwt) = make_repo("s7");
+        let rwt = base.join("rwt");
+
+        // Initial setup.
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("initial setup");
+
+        // Lock the worktree (simulates external tooling holding a lock).
+        g(&repo, &["worktree", "lock", rwt.to_str().unwrap()]);
+
+        // Recovery must unlock and succeed.
+        worktree_add_or_reset(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("state 7 recovery");
+
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        // Verify the worktree is no longer locked.
+        let list = git(&repo, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+        assert!(
+            !list.contains("locked"),
+            "worktree should not be locked after recovery; list:\n{list}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature branch absent — regenerate from live feature worktree
+    // -----------------------------------------------------------------------
+
+    /// When the feature branch ref is absent but a registered worktree is
+    /// checked out on it, `regen_from_feature_worktree` must create the review
+    /// branch at the feature worktree's HEAD and add the review worktree.
+    ///
+    /// We test the function directly because triggering it through
+    /// `worktree_add_or_reset` would require the feature branch ref to be
+    /// absent while `git rev-parse HEAD` still works — a state that requires
+    /// packing refs and deleting them at the filesystem level, which is too
+    /// fragile for a portable test.
+    #[test]
+    fn regen_from_feature_worktree_creates_review_worktree_at_feature_head() {
+        let (base, repo, _fwt) = make_repo("fbregen");
+        let rwt = base.join("rwt");
+
+        // fwt is already registered and `feature/a` is live. Call the regen
+        // function directly — it uses `find_worktree_for_branch` to locate fwt
+        // by searching git worktree list for anything on `feature/a`.
+        regen_from_feature_worktree(&repo, "guardian/g/wt-feature-a", &rwt, "feature/a")
+            .expect("regen from feature worktree");
+
+        assert!(rwt.exists());
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
+        // Content from fwt (the feature worktree) must be present.
+        assert!(
+            rwt.join("feat.txt").exists(),
+            "feat.txt from feature worktree should be present after regen"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper function unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_valid_linked_worktree_false_for_absent_dir() {
+        let dir = tmp_dir("vld-absent");
+        assert!(!is_valid_linked_worktree(&dir.join("nonexistent")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_valid_linked_worktree_false_for_plain_dir() {
+        let dir = tmp_dir("vld-plain");
+        std::fs::create_dir_all(dir.join("wt")).unwrap();
+        assert!(!is_valid_linked_worktree(&dir.join("wt")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_valid_linked_worktree_false_for_git_dir() {
+        let dir = tmp_dir("vld-gitdir");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(wt.join(".git")).unwrap(); // directory, not file
+        assert!(!is_valid_linked_worktree(&wt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_valid_linked_worktree_true_for_gitdir_file() {
+        let dir = tmp_dir("vld-file");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /some/path\n").unwrap();
+        assert!(is_valid_linked_worktree(&wt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_worktree_for_branch_finds_correct_worktree() {
+        let (base, repo, fwt) = make_repo("find-wt");
+        let found = find_worktree_for_branch(&repo, "feature/a");
+        // On Windows, git may report paths with long names while the PathBuf
+        // from temp_dir() uses short (8.3) names. Canonicalize both before
+        // comparing so they resolve to the same physical path.
+        let found_canon = found.and_then(|p| p.canonicalize().ok());
+        let fwt_canon = fwt.canonicalize().ok();
+        assert_eq!(
+            found_canon,
+            fwt_canon,
+            "should find fwt at {}",
+            fwt.display()
+        );
+        assert!(find_worktree_for_branch(&repo, "no-such-branch").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // XML route-block parsing (pre-existing tests)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn parse_route_blocks_extracts_branch_and_instructions() {
@@ -2460,5 +3411,180 @@ Let me know if you need anything else."#;
     #[test]
     fn extract_xml_attr_returns_none_when_missing() {
         assert_eq!(extract_xml_attr("<route>", "branch"), None);
+    }
+
+    /// Regression test for the production failure:
+    ///   "git checkout -f -B <rev> <branch> failed: fatal: not a git
+    ///   repository: .git/worktrees/<name>"
+    ///
+    /// Root cause: `git worktree remove --force` on Windows can delete the
+    /// admin entry (`.git/worktrees/<name>/`) while leaving the checkout
+    /// directory locked by another process's CWD.  When `worktree_add_or_reset`
+    /// then calls `relink_worktree` to recreate the entry, it wrote `gitdir`
+    /// and `commondir` but omitted `HEAD`.  Without `HEAD`, git refuses to
+    /// open the gitdir and the subsequent `checkout -f -B` fails.
+    #[test]
+    fn worktree_add_or_reset_recovers_when_admin_entry_missing() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ralphus-relink-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir temp root");
+
+        // Set up a repo with a feature branch.
+        git(&root, &["init", "-b", "main"]).expect("git init");
+        git(&root, &["config", "user.email", "t@t.com"]).expect("git config email");
+        git(&root, &["config", "user.name", "t"]).expect("git config name");
+        git(&root, &["commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
+        git(&root, &["checkout", "-b", "feat-test"]).expect("create branch");
+        std::fs::write(root.join("f.txt"), "hello\n").expect("write f.txt");
+        git(&root, &["add", "f.txt"]).expect("git add");
+        git(&root, &["commit", "-m", "add f"]).expect("git commit");
+        git(&root, &["checkout", "main"]).expect("checkout main");
+
+        // Create a worktree the normal way — this produces a valid admin entry.
+        let wt = root.join("wt-feat-test");
+        let rev = "guardian/g-001/wt-feat-test";
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-B",
+                rev,
+                wt.to_str().unwrap(),
+                "feat-test",
+            ],
+        )
+        .expect("git worktree add");
+
+        // Sanity: HEAD exists after a normal `git worktree add`.
+        let admin = root.join(".git").join("worktrees").join("wt-feat-test");
+        assert!(
+            admin.join("HEAD").exists(),
+            "HEAD must be present after git worktree add"
+        );
+
+        // Simulate the failure state: the admin entry is removed (as happens
+        // when `git worktree remove --force` deletes the entry but cannot
+        // delete the checkout directory due to a Windows CWD lock) while the
+        // checkout directory itself survives.
+        std::fs::remove_dir_all(&admin).expect("delete admin entry");
+        assert!(!admin.exists(), "admin entry must be gone");
+        assert!(wt.exists(), "checkout directory must survive");
+
+        // Before the fix, this call produced:
+        //   "git checkout -f -B … failed: fatal: not a git repository: …/wt-feat-test"
+        let result = worktree_add_or_reset(&root, rev, &wt, "feat-test");
+        assert!(result.is_ok(), "recovery must succeed; got: {:?}", result);
+
+        // After recovery the worktree must be on the review branch.
+        let head = git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("rev-parse HEAD");
+        assert_eq!(head.trim(), rev, "worktree HEAD after recovery");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Regression: when the guardian worktree has an untracked file that is now
+    // tracked in the new base commit (e.g. because main added the file after a
+    // previous agent session left it behind), `git rebase --onto <new_base>` fails
+    // with "untracked working tree files would be overwritten by checkout".
+    //
+    // This test calls `drive_rebase` directly (bypassing `ensure_worktree`) so it
+    // exercises exactly the code path that broke in production — where Windows
+    // CWD-lock prevents `ensure_worktree` from deleting the worktree directory.
+    #[test]
+    fn drive_rebase_cleans_untracked_file_that_blocks_rebase_onto() {
+        use crate::runner::RunnerResult;
+
+        let base = tmp_dir("drive-rebase-blocker");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-b", "main"]);
+
+        // Initial base commit — no blocker.txt yet.
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "initial"]);
+        let old_base_str = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let old_base = old_base_str.trim();
+
+        // Feature branch adds feat.txt (NOT blocker.txt).
+        g(&repo, &["checkout", "-b", "feature/a"]);
+        std::fs::write(repo.join("feat.txt"), "feat\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "add feature"]);
+        g(&repo, &["checkout", "main"]);
+
+        // Main moves forward and introduces blocker.txt.
+        std::fs::write(repo.join("blocker.txt"), "on main\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "main adds blocker.txt"]);
+        let new_base_str = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let new_base = new_base_str.trim();
+
+        // Set up a review worktree on feature/a.
+        let rev = "guardian/test/wt-feature-a";
+        let wt = base.join("review-wt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                rev,
+                wt.to_str().unwrap(),
+                "feature/a",
+            ],
+        );
+
+        // Simulate a stale agent leftover: an untracked copy of blocker.txt in the
+        // worktree. Without the fix, `git rebase --onto new_base` fails here because
+        // new_base has blocker.txt tracked and git refuses to overwrite the untracked
+        // file.
+        std::fs::write(wt.join("blocker.txt"), "stale agent output\n").unwrap();
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let guardian_id = store
+            .lock()
+            .unwrap()
+            .create_guardian("test", "main", repo.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&guardian_id, "feature/a")
+            .unwrap();
+
+        struct NopRunner;
+        impl Runner for NopRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                RunnerResult::failure("should not be called")
+            }
+        }
+
+        let result = drive_rebase(
+            &store,
+            &guardian_id,
+            0,
+            &NopRunner,
+            "feature/a",
+            &wt,
+            new_base,
+            old_base,
+            rev,
+        );
+        assert!(
+            result.is_ok(),
+            "drive_rebase must succeed despite untracked blocker.txt; got Err({:?})",
+            result.err()
+        );
+        assert!(
+            matches!(result.unwrap().0, RebaseOutcome::Clean),
+            "expected Clean rebase outcome"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

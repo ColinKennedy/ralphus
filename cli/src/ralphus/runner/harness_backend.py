@@ -13,6 +13,8 @@ Per-harness argument shapes are supplied via the session's ``args``.
 from __future__ import annotations
 
 import subprocess
+import sys
+import time
 
 from ralphus.config import load_config
 from ralphus.runner.backend import BackendError, BackendOutcome
@@ -47,6 +49,12 @@ class HarnessBackend:
             cmd += ["--model", model]
         cmd.append(prompt)
         config = load_config()
+        print(
+            f"ralphus [llm-invoke] harness {self._program!r} start"
+            f" prompt_len={len(prompt)} model={model!r}",
+            file=sys.stderr,
+        )
+        t0 = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd,
@@ -61,8 +69,23 @@ class HarnessBackend:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            print(
+                f"ralphus [llm-invoke] harness {self._program!r} error: {exc}",
+                file=sys.stderr,
+            )
             raise BackendError(f"could not run harness {self._program!r}: {exc}") from exc
+        elapsed = time.monotonic() - t0
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()[-500:]
+            print(
+                f"ralphus [llm-invoke] harness {self._program!r} error: exited {proc.returncode}",
+                file=sys.stderr,
+            )
             raise BackendError(f"harness {self._program!r} exited {proc.returncode}: {detail}")
+        output_len = len(proc.stdout.strip())
+        print(
+            f"ralphus [llm-invoke] harness {self._program!r} done"
+            f" elapsed={elapsed:.2f}s output_len={output_len}",
+            file=sys.stderr,
+        )
         return BackendOutcome(summary=proc.stdout.strip()[-2000:])

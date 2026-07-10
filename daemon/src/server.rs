@@ -16,7 +16,7 @@ use crate::cancel::Cancellations;
 use crate::procreg::ProcRegistry;
 use crate::runner::{Runner, SubprocessRunner};
 use crate::scheduler::Semaphore;
-use crate::store::{RunState, Store, StoreError};
+use crate::store::{NodeState, RunState, Store, StoreError};
 
 /// The running daemon: its store handle plus configuration.
 pub struct Daemon {
@@ -137,6 +137,8 @@ struct DaemonHealth<'a> {
     version: &'a str,
     status: &'a str,
     db: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -214,15 +216,47 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("GET", ["api", "runs", id, "logs"]) => run_logs(daemon, id),
         ("POST", ["api", "runs", id, "activate"]) => activate(daemon, id),
         ("POST", ["api", "runs", id, "cancel"]) => cancel(daemon, id),
+        ("POST", ["api", "runs", id, "set-status"]) => set_status(daemon, id, body),
         ("POST", ["api", "runs", id, "edit"]) => edit_run(daemon, id, body),
         ("POST", ["api", "runs", id, "retry"]) => retry_run(daemon, id),
         ("POST", ["api", "runs", id, "restart"]) => restart_run(daemon, id),
         ("POST", ["api", "runs", id, "sessions", ti, si, "restart"]) => {
             restart_session(daemon, id, ti, si)
         }
+        (
+            "POST",
+            [
+                "api",
+                "runs",
+                id,
+                "sessions",
+                ti,
+                si,
+                "verify",
+                vi,
+                "restart",
+            ],
+        ) => restart_session_verify(daemon, id, ti, si, vi),
+        ("POST", ["api", "runs", id, "tasks", ti, "verify", vi, "restart"]) => {
+            restart_task_verify(daemon, id, ti, vi)
+        }
         ("POST", ["api", "runs", id, "sessions", ti, si, "open-terminal"]) => {
             open_terminal(daemon, id, ti, si, query)
         }
+        (
+            "POST",
+            [
+                "api",
+                "runs",
+                id,
+                "verifies",
+                task_idx,
+                scope,
+                session_idx,
+                verify_idx,
+                "open-terminal",
+            ],
+        ) => open_verify_terminal(daemon, id, task_idx, scope, session_idx, verify_idx, query),
         ("DELETE", ["api", "runs", id]) => delete_run(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
         ("POST", ["api", "guardians"]) => guardian_create(daemon, body),
@@ -240,8 +274,16 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         }
         ("GET", ["api", "guardians", id, "messages"]) => guardian_messages(daemon, id),
         ("POST", ["api", "guardians", id, "chat"]) => guardian_chat(daemon, id, body),
+        ("POST", ["api", "guardians", id, "chat", "fork"]) => guardian_chat_fork(daemon, id, body),
         ("GET", ["api", "guardians", id, "base-branches"]) => guardian_base_branches(daemon, id),
         ("POST", ["api", "guardians", id, "base"]) => guardian_change_base(daemon, id, body),
+        ("POST", ["api", "guardians", id, "force_start"]) => guardian_force_start(daemon, id),
+        ("POST", ["api", "guardians", id, "branches", pos, "dismiss_reenable"]) => {
+            guardian_dismiss_reenable(daemon, id, pos)
+        }
+        ("POST", ["api", "guardians", id, "branches", pos, "open-terminal"]) => {
+            open_guardian_branch_terminal(daemon, id, pos, query)
+        }
         ("POST", ["api", "guardians", id, "merge"]) => guardian_merge(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
@@ -250,6 +292,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "guardians", id, "cancel"]) => guardian_cancel(daemon, id),
         ("POST", ["api", "guardians", id, "run-manual-commands"]) => {
             guardian_run_manual_commands(daemon, id, body)
+        }
+        ("POST", ["api", "guardians", id, "run-action-hint"]) => {
+            guardian_run_action_hint(daemon, id, body)
         }
         _ => error(
             404,
@@ -266,6 +311,10 @@ fn health(daemon: &Daemon) -> Reply {
     } else {
         "error"
     };
+    let mut warnings = Vec::new();
+    if !crate::logging::logging_to_file() {
+        warnings.push("no log_path configured — daemon logs go to stderr only");
+    }
     json(
         200,
         &DaemonHealth {
@@ -273,6 +322,7 @@ fn health(daemon: &Daemon) -> Reply {
             version: ralphus_core::version(),
             status: "ok",
             db,
+            warnings,
         },
     )
 }
@@ -613,6 +663,59 @@ fn restart_session(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     }
 }
 
+/// Restart a single session's verify steps from `vi` onwards: resets
+/// session-level verifies at index >= vi to Pending while leaving the session
+/// body Done so the scheduler re-runs only the affected verify steps.
+fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &str) -> Reply {
+    let (Ok(task_idx), Ok(session_idx), Ok(verify_from)) =
+        (ti.parse::<i64>(), si.parse::<i64>(), vi.parse::<i64>())
+    else {
+        return error(
+            400,
+            "bad_request",
+            "task/session/verify index must be integers",
+            vec![],
+        );
+    };
+    match daemon
+        .lock()
+        .restart_session_verify(id, task_idx, session_idx, verify_from)
+    {
+        Ok(dirtied) => json(
+            200,
+            &RestartResponse {
+                state: "pending",
+                dirtied,
+            },
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Restart a task's verify steps from `vi` onwards: resets task-scope verifies
+/// at index >= vi to Pending while leaving all sessions Done so the scheduler
+/// re-runs only the affected task-level verifies.
+fn restart_task_verify(daemon: &Daemon, id: &str, ti: &str, vi: &str) -> Reply {
+    let (Ok(task_idx), Ok(verify_from)) = (ti.parse::<i64>(), vi.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/verify index must be integers",
+            vec![],
+        );
+    };
+    match daemon.lock().restart_task_verify(id, task_idx, verify_from) {
+        Ok(dirtied) => json(
+            200,
+            &RestartResponse {
+                state: "pending",
+                dirtied,
+            },
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Parse a single named parameter from a URL query string (e.g. `"mode=readonly"`).
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|kv| {
@@ -658,6 +761,159 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
             409,
             "no_session_id",
             "claude_session_id is not available — the session may not have completed yet",
+            vec![],
+        );
+    };
+    let claude_cmd = std::env::var("RALPHUS_CLAUDE_CMD").unwrap_or_else(|_| "claude".to_string());
+    let claude_args: Vec<String> = if mode == "readonly" {
+        vec![
+            "--resume".to_string(),
+            session_uuid,
+            "--dangerously-skip-permissions".to_string(),
+            "--append-system-prompt".to_string(),
+            "You are in read-only mode. You may only read files. Do NOT write, edit, delete, commit, or push anything.".to_string(),
+        ]
+    } else {
+        vec!["--resume".to_string(), session_uuid]
+    };
+    match spawn_in_terminal(&claude_cmd, &claude_args) {
+        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+        Err(msg) => error(500, "terminal_error", &msg, vec![]),
+    }
+}
+
+/// Open a resumed `claude --resume <session-uuid>` session for a verify step
+/// in a new terminal window. Same mode semantics as [`open_terminal`].
+#[allow(clippy::too_many_arguments)]
+fn open_verify_terminal(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    session_idx: &str,
+    verify_idx: &str,
+    query: &str,
+) -> Reply {
+    let mode = query_param(query, "mode").unwrap_or("open");
+    if mode != "readonly" && mode != "open" {
+        return error(
+            400,
+            "bad_request",
+            "mode must be 'readonly' or 'open'",
+            vec![],
+        );
+    }
+    let (Ok(task_idx), Ok(session_idx), Ok(verify_idx)) = (
+        task_idx.parse::<i64>(),
+        session_idx.parse::<i64>(),
+        verify_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session/verify index must be integers",
+            vec![],
+        );
+    };
+    let claude_id =
+        match daemon
+            .lock()
+            .get_verify_claude_id(id, task_idx, scope, session_idx, verify_idx)
+        {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+    let Some(session_uuid) = claude_id else {
+        return error(
+            409,
+            "no_session_id",
+            "claude_session_id is not available — the verify step may not have completed yet",
+            vec![],
+        );
+    };
+    let claude_cmd = std::env::var("RALPHUS_CLAUDE_CMD").unwrap_or_else(|_| "claude".to_string());
+    let claude_args: Vec<String> = if mode == "readonly" {
+        vec![
+            "--resume".to_string(),
+            session_uuid,
+            "--dangerously-skip-permissions".to_string(),
+            "--append-system-prompt".to_string(),
+            "You are in read-only mode. You may only read files. Do NOT write, edit, delete, commit, or push anything.".to_string(),
+        ]
+    } else {
+        vec!["--resume".to_string(), session_uuid]
+    };
+    match spawn_in_terminal(&claude_cmd, &claude_args) {
+        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+        Err(msg) => error(500, "terminal_error", &msg, vec![]),
+    }
+}
+
+/// Open a terminal for a review branch's conflict-resolver.
+///
+/// `mode` (query param):
+/// - `"readonly"` — `claude --resume <id>` in read-only mode (requires session ID)
+/// - `"open"` — `claude --resume <id>` with full write access (requires session ID)
+/// - `"worktree"` — open a plain shell in the branch's review worktree directory;
+///   available as soon as the worktree exists, even before the first resolver pass
+fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, pos: &str, query: &str) -> Reply {
+    let mode = query_param(query, "mode").unwrap_or("open");
+    if mode != "readonly" && mode != "open" && mode != "worktree" {
+        return error(
+            400,
+            "bad_request",
+            "mode must be 'readonly', 'open', or 'worktree'",
+            vec![],
+        );
+    }
+    let Ok(position) = pos.parse::<i64>() else {
+        return error(
+            400,
+            "bad_request",
+            "branch position must be an integer",
+            vec![],
+        );
+    };
+
+    // Worktree mode: open a plain shell in the branch's review worktree directory.
+    // This is available as soon as the worktree exists, before any session ID.
+    if mode == "worktree" {
+        let worktree = match daemon.lock().get_branch_worktree(id, position) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        let Some(wt_path) = worktree else {
+            return error(
+                409,
+                "no_worktree",
+                "no worktree available for this branch yet",
+                vec![],
+            );
+        };
+        let safe_path = wt_path.replace('\'', "''");
+        let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
+        let shell_args = vec![
+            "-NoExit".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            format!("Set-Location -LiteralPath '{safe_path}'"),
+        ];
+        return match spawn_in_terminal(&shell_cmd, &shell_args) {
+            Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+            Err(msg) => error(500, "terminal_error", &msg, vec![]),
+        };
+    }
+
+    // readonly / open: require a stored claude_session_id from a completed resolver run.
+    let session_uuid = match daemon.lock().get_branch_resolver_session_id(id, position) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let Some(session_uuid) = session_uuid else {
+        return error(
+            409,
+            "no_session_id",
+            "no resolver claude_session_id — the branch may not have had a conflict resolved by claude-code yet",
             vec![],
         );
     };
@@ -756,6 +1012,100 @@ fn cancel(daemon: &Daemon, id: &str) -> Reply {
                 },
             )
         }
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetStatusBody {
+    kind: String,
+    #[serde(default)]
+    task_idx: i64,
+    #[serde(default)]
+    session_idx: i64,
+    #[serde(default)]
+    verify_idx: i64,
+    #[serde(default)]
+    verify_scope: String,
+    state: String,
+}
+
+/// Manually override the state of a run, task, session, or verify step (RAL-74).
+///
+/// Routes through the same store setters used by natural transitions so that
+/// audit log entries are written and the scheduler can observe the new state on
+/// its next tick (e.g. a run moved to Pending will be claimed and re-executed).
+fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetStatusBody>(body) else {
+        return error(400, "bad_request", "invalid set-status body", vec![]);
+    };
+    let store = daemon.lock();
+    let result = match req.kind.as_str() {
+        "run" => {
+            let Some(state) = RunState::parse(&req.state) else {
+                return error(
+                    400,
+                    "bad_request",
+                    &format!("unknown run state '{}'", req.state),
+                    vec![],
+                );
+            };
+            store.set_run_state(id, state)
+        }
+        "task" => {
+            let Some(state) = NodeState::parse(&req.state) else {
+                return error(
+                    400,
+                    "bad_request",
+                    &format!("unknown node state '{}'", req.state),
+                    vec![],
+                );
+            };
+            store.set_task_state(id, req.task_idx, state)
+        }
+        "session" => {
+            let Some(state) = NodeState::parse(&req.state) else {
+                return error(
+                    400,
+                    "bad_request",
+                    &format!("unknown node state '{}'", req.state),
+                    vec![],
+                );
+            };
+            store.set_session_state(id, req.task_idx, req.session_idx, state)
+        }
+        "verify" => {
+            let Some(state) = NodeState::parse(&req.state) else {
+                return error(
+                    400,
+                    "bad_request",
+                    &format!("unknown node state '{}'", req.state),
+                    vec![],
+                );
+            };
+            store.set_verify_state(
+                id,
+                req.task_idx,
+                &req.verify_scope,
+                req.session_idx,
+                req.verify_idx,
+                state,
+            )
+        }
+        other => {
+            return error(
+                400,
+                "bad_request",
+                &format!("unknown kind '{other}'"),
+                vec![],
+            );
+        }
+    };
+    if let Err(e) = result {
+        return store_error(&e);
+    }
+    match store.get_run(id) {
+        Ok(run) => json(200, &run),
         Err(e) => store_error(&e),
     }
 }
@@ -1129,6 +1479,54 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     }
 }
 
+/// Run a user-declared action hint from `[[review.action]]` (RAL-77).
+/// Body `{ "index": N }` runs the hint at position N (required).
+/// `command`-kind hints are opened in a terminal; `prompt`-kind hints are not
+/// yet executed (reserved for a future LLM-expansion step) and return 501.
+fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    #[derive(Deserialize)]
+    struct Body {
+        index: usize,
+    }
+    let Ok(req) = serde_json::from_str::<Body>(body) else {
+        return error(400, "bad_request", "body must be {\"index\": N}", vec![]);
+    };
+
+    let g = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+
+    let hint = match g.action_hints.get(req.index) {
+        Some(h) => h.clone(),
+        None => {
+            return error(
+                400,
+                "out_of_range",
+                "action hint index out of range",
+                vec![],
+            );
+        }
+    };
+
+    if let Some(cmd) = &hint.command {
+        let git_root = g.git_root.clone();
+        let full_cmd = format!("cd /d \"{git_root}\" && {cmd}");
+        match spawn_in_terminal("cmd", &["/K".to_string(), full_cmd]) {
+            Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+            Err(e) => error(500, "terminal_error", &e, vec![]),
+        }
+    } else {
+        // prompt-kind hints are stored for display only; LLM expansion is not yet implemented.
+        error(
+            501,
+            "not_implemented",
+            "prompt-kind action hints cannot be run directly yet",
+            vec![],
+        )
+    }
+}
+
 /// List candidate base branches for the given guardian, scoped to the same
 /// remote as its current base branch (e.g. `origin/*`).
 fn guardian_base_branches(daemon: &Daemon, id: &str) -> Reply {
@@ -1182,6 +1580,50 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     let runner: Arc<dyn Runner> = Arc::new(SubprocessRunner::from_env());
     crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+}
+
+/// Force-start a collecting review (RAL-69): disable all enabled branches whose
+/// source session is not yet done (or was never submitted), then kick off the
+/// merge immediately with whatever branches remain enabled.
+fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    let guardian = match store.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    if guardian.status != "collecting" {
+        return error(
+            409,
+            "invalid_transition",
+            "force_start is only valid when the review is in collecting state",
+            vec![],
+        );
+    }
+    if let Err(e) = store.force_start_disable_branches(id) {
+        return store_error(&e);
+    }
+    drop(store);
+    let runner: Arc<dyn Runner> = Arc::new(SubprocessRunner::from_env());
+    crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+}
+
+/// Permanently dismiss the "can re-enable" notification for a branch (RAL-69).
+fn guardian_dismiss_reenable(daemon: &Daemon, id: &str, pos: &str) -> Reply {
+    let Ok(position) = pos.parse::<i64>() else {
+        return error(
+            400,
+            "bad_request",
+            "branch position must be an integer",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon.lock().dismiss_branch_reenable(id, position) {
+        return store_error(&e);
+    }
+    match daemon.lock().get_guardian(id) {
+        Ok(g) => json(200, &g),
+        Err(e) => store_error(&e),
+    }
 }
 
 fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
@@ -1242,6 +1684,8 @@ fn guardian_messages(daemon: &Daemon, id: &str) -> Reply {
 struct ChatBody {
     #[serde(default)]
     text: String,
+    /// Optional base64 data-URI image attached to this message (RAL-59).
+    image: Option<String>,
 }
 
 /// Post a reviewer message to the global feedback thread; the triage agent
@@ -1254,7 +1698,40 @@ fn guardian_chat(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "message text must not be empty", vec![]);
     }
     let runner: Arc<dyn Runner> = Arc::new(SubprocessRunner::from_env());
-    crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text)
+    crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text, req.image)
+}
+
+#[derive(Deserialize)]
+struct ForkBody {
+    /// The `seq` of the message to fork from: all messages with seq ≥ this
+    /// value are deleted and the new text is posted in their place (RAL-59).
+    seq: i64,
+    #[serde(default)]
+    text: String,
+    /// Optional base64 data-URI image (RAL-59).
+    image: Option<String>,
+}
+
+/// Fork the conversation at `seq`: delete everything from that message
+/// onwards, post the new reviewer message, and re-trigger the triage agent
+/// (RAL-59).
+fn guardian_chat_fork(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<ForkBody>(body) else {
+        return error(400, "bad_request", "body must be {seq, text}", vec![]);
+    };
+    if req.text.trim().is_empty() {
+        return error(400, "bad_request", "message text must not be empty", vec![]);
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} chat fork from seq={}",
+        req.seq
+    );
+    if let Err(e) = daemon.lock().delete_guardian_messages_from_seq(id, req.seq) {
+        return store_error(&e);
+    }
+    let runner: Arc<dyn Runner> = Arc::new(SubprocessRunner::from_env());
+    crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text, req.image)
 }
 
 // ── blocking server ──────────────────────────────────────────────────────────
@@ -1276,14 +1753,29 @@ pub fn serve<A: ToSocketAddrs>(
     // only the unfinished tail re-runs (RAL-19).
     match store.recover_orphaned_runs() {
         Ok(ids) if !ids.is_empty() => {
-            eprintln!(
-                "recovered {} orphaned run(s): {}",
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] {} orphaned run(s) reset to pending: {}",
                 ids.len(),
                 ids.join(", ")
             );
         }
         Ok(_) => {}
-        Err(e) => eprintln!("crash recovery failed: {e}"),
+        Err(e) => crate::rlog!(ERROR, "ralphus [recovery] run recovery failed: {e}"),
+    }
+    // RAL-48: guardians stuck in `merging` after an unclean shutdown have no
+    // background thread; reset them to `merge_failed` so the user can retry.
+    match store.recover_orphaned_merges() {
+        Ok(ids) if !ids.is_empty() => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] {} orphaned merge(s) reset to merge_failed: {}",
+                ids.len(),
+                ids.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err(e) => crate::rlog!(ERROR, "ralphus [recovery] merge recovery failed: {e}"),
     }
     let server = tiny_http::Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
     let daemon = Daemon::new(store, max_concurrent);
@@ -1323,6 +1815,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
         let _ = request.as_reader().read_to_string(&mut body);
 
         let reply = route(daemon, &method, &path, &body);
+        crate::rlog!(DEBUG, "ralphus [http] {method} {path} → {}", reply.status);
         let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
             .expect("valid header");
         let response = tiny_http::Response::from_string(reply.body)
@@ -1575,6 +2068,59 @@ mod tests {
     }
 
     #[test]
+    fn set_status_run() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"kind": "run", "state": "done"}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"state\":\"done\""));
+    }
+
+    #[test]
+    fn set_status_task() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"kind": "task", "task_idx": 0, "state": "done"}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["state"].as_str(), Some("done"));
+    }
+
+    #[test]
+    fn set_status_session() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "session", "task_idx": 0, "session_idx": 0, "state": "done"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["sessions"][0]["state"].as_str(), Some("done"));
+    }
+
+    #[test]
+    fn set_status_bad_state_is_400() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"kind": "run", "state": "nope"}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_status_bad_kind_is_400() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"kind": "wat", "state": "done"}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
     fn guardian_reorder_route() {
         let d = daemon();
         let body =
@@ -1738,6 +2284,33 @@ mod tests {
     }
 
     #[test]
+    fn guardian_chat_fork_empty_text_is_400() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let r = route(
+            &d,
+            "POST",
+            "/api/guardians/guardian-000000000001/chat/fork",
+            "{\"seq\":1,\"text\":\"  \"}",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn guardian_chat_fork_missing_guardian_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/guardians/guardian-000000000099/chat/fork",
+            "{\"seq\":1,\"text\":\"retry\"}",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
     fn guardian_chat_empty_text_is_400() {
         let d = daemon();
         let body =
@@ -1851,5 +2424,52 @@ mod tests {
     fn unknown_route_is_404() {
         let d = daemon();
         assert_eq!(route(&d, "GET", "/nope", "").status, 404);
+    }
+
+    #[test]
+    fn restart_session_verify_route_returns_pending() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/0/verify/0/restart",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"state\":\"pending\""));
+    }
+
+    #[test]
+    fn restart_session_verify_bad_index_is_400() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-1/sessions/x/y/verify/z/restart",
+            "",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn restart_task_verify_route_returns_pending() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/verify/0/restart",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"state\":\"pending\""));
+    }
+
+    #[test]
+    fn restart_task_verify_bad_index_is_400() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/runs/run-1/tasks/x/verify/y/restart", "");
+        assert_eq!(r.status, 400);
     }
 }

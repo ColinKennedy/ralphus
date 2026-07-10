@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
@@ -175,3 +176,33 @@ def test_clear_confirmation_accept(monkeypatch: pytest.MonkeyPatch) -> None:
     code = cli.main(["clear", "--all"])
     assert code == 0
     assert _FakeClient.last_clear == {"states": [], "keep_temporary": False}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
+def test_initialize_git_enables_rerere(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _git(tmp_path, "init")
+    code = cli.main(["initialize", "git", "--path", str(tmp_path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "rerere.enabled = true" in out
+    assert _git(tmp_path, "config", "rerere.enabled") == "true"
+    assert _git(tmp_path, "config", "rerere.autoupdate") == "true"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
+def test_initialize_git_rejects_non_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = cli.main(["initialize", "git", "--path", str(tmp_path)])
+    assert code == 2
+    assert "not inside a git working tree" in capsys.readouterr().err

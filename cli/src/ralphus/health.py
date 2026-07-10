@@ -64,14 +64,17 @@ def pydantic_ai_available() -> bool:
     return importlib.util.find_spec("pydantic_ai") is not None
 
 
-def _check_daemon(daemon_url: str) -> CheckResult:
+def _check_daemon(daemon_url: str) -> list[CheckResult]:
     try:
         with DaemonClient(daemon_url) as client:
             health = client.health()
     except DaemonError as exc:
-        return CheckResult("daemon", _FAIL, f"unreachable at {daemon_url}: {exc}")
+        return [CheckResult("daemon", _FAIL, f"unreachable at {daemon_url}: {exc}")]
     version = health.get("version", "?")
-    return CheckResult("daemon", _PASS, f"reachable ({health.get('name', '?')} {version})")
+    results = [CheckResult("daemon", _PASS, f"reachable ({health.get('name', '?')} {version})")]
+    for warning in health.get("warnings", []):
+        results.append(CheckResult("daemon", _WARN, str(warning)))
+    return results
 
 
 def _check_git() -> CheckResult:
@@ -170,7 +173,7 @@ def run_checks(daemon_url: str, *, enable_developer_checks: bool = False) -> lis
     ``enable_developer_checks`` is set (``check health --enable-developer-checks``).
     """
     results = [
-        _check_daemon(daemon_url),
+        *_check_daemon(daemon_url),
         _check_git(),
         _check_runner(),
         _check_ollama(),
