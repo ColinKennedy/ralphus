@@ -13,3 +13,5 @@ workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+ralphus-bench-macros = { workspace = true }
+ralphus-bench-types = { workspace = true }

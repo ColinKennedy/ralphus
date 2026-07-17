@@ -5,6 +5,7 @@
 //! own (a future flag will make that opt-in). Keeping the logic in a library
 //! makes the argument parsing and daemon-URL resolution unit-testable.
 
+pub mod otel;
 pub mod server;
 
 /// Default port the librarian listens on.

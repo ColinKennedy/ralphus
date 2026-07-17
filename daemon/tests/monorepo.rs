@@ -142,6 +142,7 @@ impl Runner for CapturingRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }

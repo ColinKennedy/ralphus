@@ -41,7 +41,14 @@ pub struct TaskFile {
 pub struct TaskDef {
     /// Task name / identifier (unique within a submission).
     pub name: String,
-    /// Namespace label. Defaults to the git repo name of the first session's cwd.
+    /// Namespace label for a plain-path task; purely cosmetic and left unset if
+    /// the caller doesn't care to name it (the UI shows "--"). When any of this
+    /// task's sessions uses a `<project>:worktree/<branch>` placeholder `cwd`
+    /// (RAL-100), this field's meaning changes: it becomes required and must
+    /// name a project registered via `ralphus project git` -- checked
+    /// structurally here (`project` set whenever a placeholder is present, see
+    /// [`crate::validate`]) and against the registry at submit time (the
+    /// registry lives in the daemon's store, which `core` cannot see).
     #[serde(default)]
     pub project: Option<String>,
     /// Agent binary for all sessions (e.g. `"claude"`). Sessions inherit unless overridden.
@@ -60,6 +67,11 @@ pub struct TaskDef {
     /// Retry count.
     #[serde(default)]
     pub max_retries: Option<u32>,
+    /// Initial queue-priority hint (lower value = higher priority = runs sooner).
+    /// Seeds the live queue rank at submit time; the Queue view/CLI own ordering
+    /// thereafter, so this is only a starting position, not an authoritative cap.
+    #[serde(default)]
+    pub priority: Option<u32>,
     /// Default wall-clock timeout in minutes for the task's sessions and verify
     /// steps; each may override with its own `timeout_minutes`.
     #[serde(default)]
@@ -136,6 +148,11 @@ pub struct SessionDef {
     /// `timeout_minutes` when unset.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// Initial queue-priority hint for this session (lower value = higher
+    /// priority = runs sooner). Seeds the live queue rank at submit time; the
+    /// Queue view/CLI own ordering thereafter.
+    #[serde(default)]
+    pub priority: Option<u32>,
     /// Session-level verify steps.
     #[serde(default)]
     pub verify: Vec<VerifyStep>,
@@ -158,14 +175,55 @@ pub struct SessionDef {
 /// resolves this at run time, immediately before launching the runner.
 pub const UPSTREAM_TASK_REF_PREFIX: &str = "<<task:";
 
-/// The scheme prefix for a review-link placeholder id. A review whose `id` is
-/// `ralphus:new-review/<key>` declares a *stable link key*: every session — in
-/// any task or any separate submission — that names the same `<key>` attaches to
-/// one shared review, instead of grouping by project. The `<key>` is a
-/// placeholder the daemon resolves to a real guardian at submit time.
+/// Parse the task/session ref from an `upstream = "<<task:...>>"` sentinel.
+/// Returns the inner ref string (e.g. `"task-a"` or `"task-a/session-1"`)
+/// when the sentinel matches, `None` otherwise (a plain branch-name string,
+/// or any other non-matching value).
+#[must_use]
+pub fn parse_upstream_task_ref(upstream: &str) -> Option<&str> {
+    upstream
+        .strip_prefix(UPSTREAM_TASK_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))
+}
+
+/// Scheme prefix for a placeholder session `cwd` that names a branch to
+/// materialize a fresh (or reused) worktree for, e.g.
+/// `"ralphus:new-worktree/RAL-100-feature"` (RAL-100). Rather than a real
+/// filesystem path, this names a branch; the owning task's `project` field
+/// (REQUIRED whenever any of its sessions uses this placeholder) names which
+/// project registered via `ralphus project git` to materialize it under. The
+/// daemon resolves that project, materializes (or reuses) a git worktree for
+/// the branch under `.git/.ralphus_worktrees/<branch>`, and rewrites the
+/// session's `cwd` to that real path before the session runs.
+pub const WORKTREE_PLACEHOLDER_PREFIX: &str = "ralphus:new-worktree/";
+
+/// Parse a session `cwd` as a `ralphus:new-worktree/<branch>` placeholder
+/// (RAL-100). Returns the branch name when non-empty; `None` for a plain
+/// filesystem path or a malformed placeholder-shaped string (empty branch). A
+/// real absolute path never starts with the literal `ralphus:new-worktree/`
+/// prefix, so this is unambiguous. The project to materialize the branch
+/// under is NOT embedded here -- it comes from the owning task's `project`
+/// field (see [`crate::validate`]).
+#[must_use]
+pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
+    let branch = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
+    if branch.is_empty() {
+        return None;
+    }
+    Some(branch)
+}
+
+/// The scheme prefix for a new-review placeholder id. A review whose `id` is
+/// `ralphus:new-review/<key>` is a *submission-local placeholder* for a review id
+/// that does not exist yet: within a single submission, every session that names
+/// the same `<key>` collapses into one freshly-minted guardian, and distinct
+/// `<key>`s mint distinct guardians. The placeholder ALWAYS creates a new review —
+/// a later submission that happens to reuse the same `<key>` string gets its own
+/// brand-new guardian and never attaches to a previous submission's review. The
+/// `<key>` is only a grouping alias, not a stable cross-submission link.
 pub const REVIEW_LINK_PREFIX: &str = "ralphus:new-review/";
 
-/// If `id` is a review-link placeholder (`ralphus:new-review/<key>`), return its
+/// If `id` is a new-review placeholder (`ralphus:new-review/<key>`), return its
 /// `<key>` trimmed of surrounding whitespace. Returns `None` for a plain id or a
 /// non-matching scheme, or when the key is empty.
 #[must_use]
@@ -184,8 +242,8 @@ pub fn review_link_key(id: &str) -> Option<&str> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewDef {
     /// Human-readable review id (also the default label). May be a
-    /// `ralphus:new-review/<key>` link to attach multiple submissions to one
-    /// shared guardian.
+    /// `ralphus:new-review/<key>` placeholder that mints a fresh guardian for this
+    /// submission (see [`REVIEW_LINK_PREFIX`]).
     #[serde(default)]
     pub id: Option<String>,
     /// GUI label; falls back to `id` when unset.
@@ -343,6 +401,7 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
             max_retries: None,
+            priority: None,
             timeout_minutes: None,
             depends_on: vec![],
             session: vec![],
@@ -367,6 +426,7 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
             timeout_minutes: None,
+            priority: None,
             verify: vec![],
             review: None,
             upstream: None,
@@ -478,6 +538,53 @@ mod tests {
         let sess = &parsed.task[0].session[0];
         assert!(sess.system_prompt.is_none());
         assert!(sess.system_prompt_position.is_none());
+    }
+
+    #[test]
+    fn upstream_task_ref_matches_simple_task() {
+        assert_eq!(parse_upstream_task_ref("<<task:my-task>>"), Some("my-task"));
+    }
+
+    #[test]
+    fn upstream_task_ref_matches_task_session() {
+        assert_eq!(
+            parse_upstream_task_ref("<<task:my-task/session-1>>"),
+            Some("my-task/session-1")
+        );
+    }
+
+    #[test]
+    fn upstream_task_ref_none_for_plain_branch() {
+        assert_eq!(parse_upstream_task_ref("main"), None);
+        assert_eq!(parse_upstream_task_ref("<<upstream>>"), None);
+        assert_eq!(parse_upstream_task_ref(""), None);
+    }
+
+    #[test]
+    fn worktree_placeholder_parses() {
+        assert_eq!(
+            parse_worktree_placeholder("ralphus:new-worktree/RAL-100-feature"),
+            Some("RAL-100-feature")
+        );
+    }
+
+    #[test]
+    fn worktree_placeholder_rejects_plain_paths() {
+        assert_eq!(parse_worktree_placeholder("/home/me/repo"), None);
+        assert_eq!(parse_worktree_placeholder("C:/Users/me/repo"), None);
+        assert_eq!(
+            parse_worktree_placeholder("C:/repo/new-worktree/branch"),
+            None
+        );
+        // The old (RAL-100) `<project>:worktree/<branch>` scheme no longer
+        // parses -- it never starts with the new `ralphus:new-worktree/` prefix.
+        assert_eq!(parse_worktree_placeholder("my-project:worktree/feat"), None);
+    }
+
+    #[test]
+    fn worktree_placeholder_rejects_empty_branch() {
+        assert_eq!(parse_worktree_placeholder("ralphus:new-worktree/"), None);
+        assert_eq!(parse_worktree_placeholder("ralphus:new-worktree"), None);
     }
 
     #[test]

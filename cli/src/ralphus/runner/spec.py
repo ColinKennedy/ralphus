@@ -75,6 +75,12 @@ class SessionSpec:
     budget_tokens: int | None = None
     timeout_sec: int | None = None
     verify: bool = False
+    # W3C `traceparent` of the OpenTelemetry span this session/verify run is a
+    # child of (RAL-96), so the runner's own spans continue the same trace
+    # instead of starting a disconnected one. `None` when the daemon has no
+    # tracing configured (see `daemon/src/otel.rs`) — not a required field, so
+    # existing callers/tests that don't supply it are unaffected.
+    trace_context: str | None = None
 
     @staticmethod
     def from_json(text: str) -> SessionSpec:
@@ -100,6 +106,7 @@ class SessionSpec:
             budget_tokens=_opt_int(data, "budget_tokens"),
             timeout_sec=_opt_int(data, "timeout_sec"),
             verify=_opt_bool(data, "verify"),
+            trace_context=_opt_str(data, "trace_context"),
         )
         if (spec.prompt is None) == (spec.command is None):
             raise SpecError("exactly one of 'prompt' or 'command' must be set")
@@ -118,6 +125,11 @@ class SessionResult:
     error: str | None = None
     verified: bool | None = None
     claude_session_id: str | None = None
+    # RAL-136: the agent's self-summarized handoff note ("ghost"), extracted
+    # from a RALPHUS_GHOST: marker in a normal (non-verify) prompt session's
+    # final response. None for command sessions, verify steps, or when the
+    # agent had nothing to hand off.
+    ghost: str | None = None
 
     @staticmethod
     def done(
@@ -128,6 +140,7 @@ class SessionResult:
         cost_usd: float = 0.0,
         verified: bool | None = None,
         claude_session_id: str | None = None,
+        ghost: str | None = None,
     ) -> SessionResult:
         """Construct a successful result. ``verified`` is set for verify runs only."""
         return SessionResult(
@@ -138,6 +151,7 @@ class SessionResult:
             cost_usd=cost_usd,
             verified=verified,
             claude_session_id=claude_session_id,
+            ghost=ghost,
         )
 
     @staticmethod
@@ -162,5 +176,6 @@ class SessionResult:
                 "error": self.error,
                 "verified": self.verified,
                 "claude_session_id": self.claude_session_id,
+                "ghost": self.ghost,
             }
         )

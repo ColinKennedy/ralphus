@@ -25,7 +25,7 @@ jobs:
         run: cargo test --all-targets
 
   web:
-    name: Web (eslint on board.html)
+    name: Web (eslint + tsc --checkJs on board.html)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +34,10 @@ jobs:
           node-version: "20"
       - name: Install lint deps
         run: npm install --no-audit --no-fund
-      - name: ESLint (inline board.html JS)
+      - name: ESLint (inline board.html JS, incl. JSDoc coverage)
         run: npx eslint librarian/assets/board.html
+      - name: Type-check board.html's JSDoc-annotated JS (tsc --checkJs)
+        run: npm run typecheck
 
   python:
     name: Python (ruff, mypy --strict, privata, pytest)
@@ -61,3 +63,33 @@ jobs:
         run: uvx privata src
       - name: pytest
         run: uv run pytest
+
+  bench-patience:
+    name: Bench patience comment lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check bench patience comments
+        run: python scripts/check_bench_patience_comments.py
+
+  docs:
+    name: Docs (screenshot coverage lint)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --dev
+      - name: Every board.html tab has a screenshot
+        run: uv run ralphus-docs-lint
+      - name: cli-reference.md help-map is up to date (RAL-110)
+        run: uv run ralphus-docs-helpmap --check

@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 use crate::store::{SessionRow, TaskRow};
 
 /// A concrete execution plan for a run's sessions.
@@ -90,6 +92,74 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
     Ok(ExecutionPlan { order, deps })
 }
 
+/// A node in a rendered dependency graph (CLI_PARITY_PLAN.local.md Phase 6):
+/// one session, identified as `t<task_idx>s<session_idx>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    /// `t<task_idx>s<session_idx>` -- stable, unique within the run.
+    pub id: String,
+    /// Task index within the run.
+    pub task_idx: i64,
+    /// Session index within the task.
+    pub session_idx: i64,
+    /// Owning task's name.
+    pub task_name: String,
+    /// The session's own id (`[[task.session]] id`, or a generated `session-N`).
+    pub session_id: String,
+}
+
+/// A directed edge: `from` must complete before `to` may start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphEdge {
+    /// The prerequisite node/run id.
+    pub from: String,
+    /// The dependent node/run id.
+    pub to: String,
+}
+
+/// A run's internal session dependency graph, for `ralphus graph <run_id>`
+/// (CLI_PARITY_PLAN.local.md Phase 6). Nodes are sessions (the schedulable
+/// unit); edges come from the same session-level/task-level `depends_on`
+/// references [`plan`] resolves (including the ones `{handoff:...}` prompt
+/// substitution rides on -- there is no separate "handoff edge" kind).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunGraph {
+    /// One entry per session.
+    pub nodes: Vec<GraphNode>,
+    /// `from` must complete before `to`.
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Build the rendered dependency graph for a run's sessions.
+///
+/// # Errors
+/// Returns `Err` with a human-readable message when a dependency cycle exists
+/// (same condition [`plan`] rejects).
+pub fn graph(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<RunGraph, String> {
+    let ExecutionPlan { deps, .. } = plan(sessions, tasks)?;
+    let node_id = |s: &SessionRow| format!("t{}s{}", s.task_idx, s.idx);
+    let nodes = sessions
+        .iter()
+        .map(|s| GraphNode {
+            id: node_id(s),
+            task_idx: s.task_idx,
+            session_idx: s.idx,
+            task_name: s.task_name.clone(),
+            session_id: s.session_id.clone(),
+        })
+        .collect();
+    let mut edges = Vec::new();
+    for (i, prereqs) in deps.iter().enumerate() {
+        for &j in prereqs {
+            edges.push(GraphEdge {
+                from: node_id(&sessions[j]),
+                to: node_id(&sessions[i]),
+            });
+        }
+    }
+    Ok(RunGraph { nodes, edges })
+}
+
 /// Deterministic topological sort (lowest index first). `deps[i]` lists the
 /// prerequisites of `i`. Returns an error if no valid order exists (a cycle).
 fn topo_order(deps: &[Vec<usize>]) -> Result<Vec<usize>, String> {
@@ -139,6 +209,7 @@ mod tests {
         TaskRow {
             idx,
             name: format!("task{idx}"),
+            project: None,
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
         }
     }
@@ -195,5 +266,59 @@ mod tests {
         let p = plan(&sessions, &tasks).unwrap();
         assert_eq!(p.order, vec![0]);
         assert!(p.deps[0].is_empty());
+    }
+
+    // ── CLI_PARITY_PLAN.local.md Phase 6: `graph()` ─────────────────────────────
+
+    #[test]
+    fn graph_has_one_node_per_session_with_stable_ids() {
+        let sessions = vec![session(0, 0, "a", &[]), session(1, 0, "w", &[])];
+        let tasks = vec![task(0, &[]), task(1, &[])];
+        let g = graph(&sessions, &tasks).unwrap();
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.nodes[0].id, "t0s0");
+        assert_eq!(g.nodes[1].id, "t1s0");
+        assert_eq!(g.nodes[0].task_name, "task0");
+        assert_eq!(g.nodes[0].session_id, "a");
+    }
+
+    #[test]
+    fn graph_edge_points_from_prerequisite_to_dependent() {
+        // b depends on a: edge must be a -> b, not b -> a.
+        let sessions = vec![session(0, 0, "b", &["a"]), session(0, 1, "a", &[])];
+        let tasks = vec![task(0, &[])];
+        let g = graph(&sessions, &tasks).unwrap();
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].from, "t0s1"); // "a"
+        assert_eq!(g.edges[0].to, "t0s0"); // "b"
+    }
+
+    #[test]
+    fn graph_cross_task_dependency_produces_an_edge() {
+        let sessions = vec![session(0, 0, "x", &[]), session(1, 0, "w", &["task0/x"])];
+        let tasks = vec![task(0, &[]), task(1, &[])];
+        let g = graph(&sessions, &tasks).unwrap();
+        assert_eq!(
+            g.edges,
+            vec![GraphEdge {
+                from: "t0s0".to_string(),
+                to: "t1s0".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn graph_independent_sessions_have_no_edges() {
+        let sessions = vec![session(0, 0, "a", &[]), session(0, 1, "b", &[])];
+        let tasks = vec![task(0, &[])];
+        let g = graph(&sessions, &tasks).unwrap();
+        assert!(g.edges.is_empty());
+    }
+
+    #[test]
+    fn graph_propagates_the_cycle_error() {
+        let sessions = vec![session(0, 0, "a", &["b"]), session(0, 1, "b", &["a"])];
+        let tasks = vec![task(0, &[])];
+        assert!(graph(&sessions, &tasks).is_err());
     }
 }

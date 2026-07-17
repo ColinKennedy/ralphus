@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
 
 import ralphus.__main__ as cli
-from ralphus.client import ValidationOutcome
+from ralphus.client import DaemonError, ValidationOutcome
 
 
 class _FakeClient:
@@ -18,6 +19,12 @@ class _FakeClient:
 
     last_submit: ClassVar[dict[str, Any]] = {}
     last_clear: ClassVar[dict[str, Any] | None] = None
+    submissions: ClassVar[list[dict[str, Any]]] = []
+    activated: ClassVar[list[str]] = []
+    run_states: ClassVar[dict[str, str]] = {}
+    next_run_seq: ClassVar[list[int]] = [1]
+    last_register_project: ClassVar[dict[str, Any] | None] = None
+    projects: ClassVar[list[dict[str, Any]]] = []
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
@@ -32,11 +39,24 @@ class _FakeClient:
         return ValidationOutcome(valid=True, errors=[], warnings=[])
 
     def submit(self, text: str, *, hold: bool = False, label: str | None = None) -> dict[str, Any]:
-        _FakeClient.last_submit = {"text": text, "hold": hold, "label": label}
-        return {"run_id": "run-000000000001", "state": "queued" if hold else "pending"}
+        seq = _FakeClient.next_run_seq[0]
+        _FakeClient.next_run_seq[0] += 1
+        run_id = f"run-{seq:012d}"
+        state = "queued" if hold else "pending"
+        entry = {"text": text, "hold": hold, "label": label, "run_id": run_id}
+        _FakeClient.last_submit = entry
+        _FakeClient.submissions.append(entry)
+        _FakeClient.run_states[run_id] = state
+        return {"run_id": run_id, "state": state}
+
+    def activate_run(self, run_id: str) -> dict[str, Any]:
+        _FakeClient.activated.append(run_id)
+        _FakeClient.run_states[run_id] = "pending"
+        return {"run_id": run_id, "state": "pending"}
 
     def run(self, run_id: str) -> dict[str, Any]:
-        return {"id": run_id, "state": "done", "tasks": [{"name": "build", "state": "done"}]}
+        state = _FakeClient.run_states.get(run_id, "done")
+        return {"id": run_id, "state": state, "tasks": [{"name": "build", "state": "done"}]}
 
     def tasks(self) -> dict[str, Any]:
         return {"runs": [{"id": "run-000000000001", "state": "done", "label": "x"}]}
@@ -47,12 +67,54 @@ class _FakeClient:
         _FakeClient.last_clear = {"states": states, "keep_temporary": keep_temporary}
         return {"runs_deleted": 3, "guardians_deleted": 1, "worktrees_purged": 1}
 
+    def guardian_get(self, guardian_id: str) -> dict[str, Any]:
+        return {
+            "id": guardian_id,
+            "name": "my-review",
+            "status": "in_review",
+            "branches": [
+                {
+                    "id": "branch-000000000001",
+                    "position": 0,
+                    "branch": "feature/a",
+                    "merge_status": "done",
+                }
+            ],
+        }
+
+    def guardian_list(self) -> list[dict[str, Any]]:
+        return [{"id": "guardian-000000000001", "name": "my-review"}]
+
+    def register_project(
+        self, name: str, path: str, *, description: str = "", vcs: str = "git"
+    ) -> dict[str, Any]:
+        _FakeClient.last_register_project = {
+            "name": name,
+            "path": path,
+            "description": description,
+            "vcs": vcs,
+        }
+        return {"name": name}
+
+    def list_projects(self) -> dict[str, Any]:
+        return {"projects": _FakeClient.projects}
+
+    def get_project(self, name: str) -> dict[str, Any]:
+        for p in _FakeClient.projects:
+            if p["name"] == name:
+                return p
+        raise DaemonError(f'project "{name}" is not registered')
+
 
 @pytest.fixture(autouse=True)
 def _patch_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "DaemonClient", _FakeClient)
     # Force the API path for validate tests (no offline daemon binary).
     monkeypatch.setattr(cli, "_find_daemon_bin", lambda: None)
+    _FakeClient.submissions = []
+    _FakeClient.activated = []
+    _FakeClient.run_states = {}
+    _FakeClient.next_run_seq = [1]
 
 
 def _write(tmp_path: Path, body: str = "[[task]]\nname='t'\n") -> Path:
@@ -96,6 +158,76 @@ def test_validate_uses_offline_daemon_binary(
     assert captured["cmd"][:2] == ["ralphus-daemon", "validate"]
 
 
+def test_validate_offline_single_file_uses_real_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A single-file offline validation shells out with the real on-disk path
+    # (not a scratch copy), so any reported line numbers stay meaningful.
+    monkeypatch.setattr(cli, "_find_daemon_bin", lambda: "ralphus-daemon")
+    path = _write(tmp_path)
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd: list[str], check: bool) -> _FakeProc:
+        captured["cmd"] = cmd
+        assert check is False
+        return _FakeProc(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    code = cli.main(["validate", str(path)])
+    assert code == 0
+    assert captured["cmd"] == ["ralphus-daemon", "validate", str(path)]
+
+
+def test_validate_multiple_files_combines_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Multiple files combine into one scratch document for the offline
+    # daemon-binary path, mirroring how `submit` combines them into one call.
+    monkeypatch.setattr(cli, "_find_daemon_bin", lambda: "ralphus-daemon")
+    path_a = tmp_path / "a.toml"
+    path_a.write_text("[[task]]\nname='a'\n", encoding="utf-8")
+    path_b = tmp_path / "b.toml"
+    path_b.write_text("[[task]]\nname='b'\n", encoding="utf-8")
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd: list[str], check: bool) -> _FakeProc:
+        captured["cmd"] = cmd
+        assert check is False
+        # The scratch file exists and contains both files' contents combined.
+        scratch = Path(cmd[2])
+        text = scratch.read_text(encoding="utf-8")
+        assert "name='a'" in text
+        assert "name='b'" in text
+        return _FakeProc(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    code = cli.main(["validate", str(path_a), str(path_b)])
+    assert code == 0
+    assert captured["cmd"][:2] == ["ralphus-daemon", "validate"]
+    # The scratch file used for validation is cleaned up afterward.
+    assert not Path(captured["cmd"][2]).exists()
+
+
+def test_validate_multiple_files_combines_via_api(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With no offline daemon binary available (the default in this test
+    # module), multiple files still combine into ONE validate() call.
+    path_a = tmp_path / "a.toml"
+    path_a.write_text("[[task]]\nname='a'\n", encoding="utf-8")
+    path_b = tmp_path / "b.toml"
+    path_b.write_text("[[task]]\nname='b'\n", encoding="utf-8")
+
+    code = cli.main(["validate", str(path_a), str(path_b)])
+    assert code == 0
+    assert "valid" in capsys.readouterr().out
+
+
+def test_validate_missing_file_in_multi_file_list(tmp_path: Path) -> None:
+    code = cli.main(["validate", str(_write(tmp_path)), str(tmp_path / "nope.toml")])
+    assert code == 2
+
+
 def test_submit_prints_run_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     code = cli.main(["submit", str(_write(tmp_path)), "--label", "demo"])
     assert code == 0
@@ -109,6 +241,151 @@ def test_submit_hold(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None
     out = capsys.readouterr().out
     assert "queued" in out
     assert _FakeClient.last_submit["hold"] is True
+
+
+def test_submit_multiple_files_combines_into_one_call(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Multiple files must become ONE submission (one client.submit() call) so a
+    # shared `ralphus:new-review/<key>` folds into a single review instead of
+    # minting one guardian per file.
+    path_a = tmp_path / "a.toml"
+    path_a.write_text("[[task]]\nname='a'\n", encoding="utf-8")
+    path_b = tmp_path / "b.toml"
+    path_b.write_text("[[task]]\nname='b'\n", encoding="utf-8")
+    path_c = tmp_path / "c.toml"
+    path_c.write_text("[[task]]\nname='c'\n", encoding="utf-8")
+
+    code = cli.main(["submit", str(path_a), str(path_b), str(path_c)])
+    assert code == 0
+    assert "run-000000000001" in capsys.readouterr().out
+
+    combined = _FakeClient.last_submit["text"]
+    assert "name='a'" in combined
+    assert "name='b'" in combined
+    assert "name='c'" in combined
+
+
+def test_submit_missing_file_in_multi_file_list(tmp_path: Path) -> None:
+    code = cli.main(["submit", str(_write(tmp_path)), str(tmp_path / "nope.toml")])
+    assert code == 2
+
+
+# ── Q6 (CLI_PARITY_PLAN.local.md): submit/author parity ──────────────────────
+
+
+def test_submit_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("[[task]]\nname='from-stdin'\n"))
+    code = cli.main(["submit", "-"])
+    assert code == 0
+    assert "run-000000000001" in capsys.readouterr().out
+    assert "from-stdin" in _FakeClient.last_submit["text"]
+
+
+def test_submit_stdin_empty_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("   "))
+    code = cli.main(["submit", "-"])
+    assert code == 2
+
+
+def test_submit_directory_submits_each_file_as_its_own_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a.toml").write_text("[[task]]\nname='a'\n", encoding="utf-8")
+    (tmp_path / "b.toml").write_text("[[task]]\nname='b'\n", encoding="utf-8")
+    (tmp_path / "not-toml.txt").write_text("ignore me", encoding="utf-8")
+
+    code = cli.main(["submit", str(tmp_path)])
+    assert code == 0
+    assert len(_FakeClient.submissions) == 2
+    texts = [s["text"] for s in _FakeClient.submissions]
+    assert any("name='a'" in t for t in texts)
+    assert any("name='b'" in t for t in texts)
+    # Each submission is separate -- neither combines the other file's content.
+    assert not any("name='a'" in t and "name='b'" in t for t in texts)
+
+
+def test_submit_glob_submits_each_match_as_its_own_run(tmp_path: Path) -> None:
+    (tmp_path / "x.toml").write_text("[[task]]\nname='x'\n", encoding="utf-8")
+    (tmp_path / "y.toml").write_text("[[task]]\nname='y'\n", encoding="utf-8")
+
+    code = cli.main(["submit", str(tmp_path / "*.toml")])
+    assert code == 0
+    assert len(_FakeClient.submissions) == 2
+
+
+def test_submit_empty_glob_is_an_error(tmp_path: Path) -> None:
+    code = cli.main(["submit", str(tmp_path / "*.toml")])
+    assert code == 2
+
+
+def test_submit_empty_directory_is_an_error(tmp_path: Path) -> None:
+    code = cli.main(["submit", str(tmp_path)])
+    assert code == 2
+
+
+def test_submit_activate_forces_hold_then_activates(tmp_path: Path) -> None:
+    code = cli.main(["submit", str(_write(tmp_path)), "--activate"])
+    assert code == 0
+    assert _FakeClient.last_submit["hold"] is True
+    assert _FakeClient.activated == ["run-000000000001"]
+
+
+def test_submit_wait_reports_done_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The base fake reports the state `submit()` set (pending, for a non-hold
+    # submission), which never changes -- `_wait_for_terminal` would poll
+    # forever. Report "done" on the very first poll instead, so the test can't
+    # hang on a real `time.sleep` if the polling logic ever regresses.
+    class _DoneClient(_FakeClient):
+        def run(self, run_id: str) -> dict[str, Any]:
+            return {"id": run_id, "state": "done"}
+
+    monkeypatch.setattr(cli, "DaemonClient", _DoneClient)
+    code = cli.main(["submit", str(_write(tmp_path)), "--wait"])
+    assert code == 0
+    assert "run-000000000001: done" in capsys.readouterr().out
+
+
+def test_submit_wait_reports_failed_as_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _FailingSubmitClient(_FakeClient):
+        def submit(
+            self, text: str, *, hold: bool = False, label: str | None = None
+        ) -> dict[str, Any]:
+            result = super().submit(text, hold=hold, label=label)
+            _FakeClient.run_states[result["run_id"]] = "failed"
+            return result
+
+    monkeypatch.setattr(cli, "DaemonClient", _FailingSubmitClient)
+    code = cli.main(["submit", str(_write(tmp_path)), "--wait"])
+    assert code == 1
+
+
+def test_submit_dry_run_shows_counts_without_submitting(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    body = (
+        "[[task]]\nname='a'\n[[task.session]]\ncwd='.'\ncommand='x'\n"
+        "[[task]]\nname='b'\n[[task.session]]\ncwd='.'\ncommand='y'\n"
+        "[[task.session]]\ncwd='.'\ncommand='z'\n"
+        "[[review]]\nid='r'\n"
+    )
+    code = cli.main(["submit", str(_write(tmp_path, body)), "--dry-run"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "2 task(s)" in out
+    assert "3 session(s)" in out
+    assert "1 review(s)" in out
+    assert not _FakeClient.submissions
 
 
 def test_status_single_run(capsys: pytest.CaptureFixture[str]) -> None:
@@ -206,3 +483,201 @@ def test_initialize_git_rejects_non_repo(
     code = cli.main(["initialize", "git", "--path", str(tmp_path)])
     assert code == 2
     assert "not inside a git working tree" in capsys.readouterr().err
+
+
+# ── Phase 7 (CLI_PARITY_PLAN.local.md): `ralphus get` ─────────────────────────
+
+
+def test_get_run_whole_object_is_json(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "run-000000000001"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert '"id": "run-000000000001"' in out
+
+
+def test_get_run_field(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "run-000000000001", "state"])
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_get_task_field_by_dotted_index(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "run-000000000001/0", "state"])
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_get_unknown_field_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "run-000000000001", "no_such_field"])
+    assert code == 2
+    assert "no field" in capsys.readouterr().err
+
+
+def test_get_guardian_field(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "guardian-000000000001", "status"])
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "in_review"
+
+
+def test_get_guardian_branch_field(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "guardian-000000000001#0", "merge_status"])
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_get_guardian_by_name(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["get", "@my-review", "name"])
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "my-review"
+
+
+def test_project_git_posts_resolved_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _FakeClient.last_register_project = None
+    code = cli.main(
+        [
+            "project",
+            "git",
+            "--path",
+            str(tmp_path),
+            "--name",
+            "my-project",
+            "--description",
+            "the project",
+        ]
+    )
+    assert code == 0
+    assert _FakeClient.last_register_project == {
+        "name": "my-project",
+        "path": str(tmp_path.resolve()),
+        "description": "the project",
+        "vcs": "git",
+    }
+    assert "my-project" in capsys.readouterr().out
+
+
+def test_project_git_defaults_description_empty(tmp_path: Path) -> None:
+    _FakeClient.last_register_project = None
+    code = cli.main(["project", "git", "--path", str(tmp_path), "--name", "my-project"])
+    assert code == 0
+    assert _FakeClient.last_register_project is not None
+    assert _FakeClient.last_register_project["description"] == ""
+
+
+def test_project_list_prints_registered_projects_with_description(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _FakeClient.projects = [
+        {"name": "ralphus", "description": "the ralphus repo", "path": "C:/repo", "vcs": "git"},
+        {"name": "other", "description": "", "path": "C:/other", "vcs": "git"},
+    ]
+    code = cli.main(["project", "list"])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("ralphus")
+    assert "C:/repo" in lines[0]
+    assert lines[1] == "    the ralphus repo"
+    assert lines[2].startswith("other")
+    assert "C:/other" in lines[2]
+    # No description for "other" -> no indented line follows it.
+    assert len(lines) == 3
+
+
+def test_elide_right_leaves_short_text_untouched() -> None:
+    assert cli._elide_right("short", 80) == "short"
+    assert cli._elide_right("x" * 80, 80) == "x" * 80
+
+
+def test_elide_right_truncates_and_appends_ellipsis() -> None:
+    result = cli._elide_right("x" * 200, 80)
+    assert len(result) == 80
+    assert result == "x" * 77 + "..."
+
+
+def test_project_list_short_elides_long_description(capsys: pytest.CaptureFixture[str]) -> None:
+    long_description = "x" * 200
+    _FakeClient.projects = [
+        {"name": "ralphus", "description": long_description, "path": "C:/repo", "vcs": "git"},
+    ]
+    code = cli.main(["project", "list", "--short"])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == "    " + "x" * 77 + "..."
+    assert len(lines[1]) - 4 == cli._SHORT_DESCRIPTION_MAX
+
+
+def test_project_list_short_leaves_short_description_untouched(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _FakeClient.projects = [
+        {"name": "ralphus", "description": "a short one", "path": "C:/repo", "vcs": "git"},
+    ]
+    code = cli.main(["project", "list", "--short"])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == "    a short one"
+
+
+def test_project_list_without_short_prints_full_long_description(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    long_description = "x" * 200
+    _FakeClient.projects = [
+        {"name": "ralphus", "description": long_description, "path": "C:/repo", "vcs": "git"},
+    ]
+    code = cli.main(["project", "list"])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == "    " + long_description
+
+
+def test_project_list_empty(capsys: pytest.CaptureFixture[str]) -> None:
+    _FakeClient.projects = []
+    code = cli.main(["project", "list"])
+    assert code == 0
+    assert "no registered projects" in capsys.readouterr().out
+
+
+def test_project_get_prints_details(capsys: pytest.CaptureFixture[str]) -> None:
+    _FakeClient.projects = [
+        {"name": "ralphus", "description": "the ralphus repo", "path": "C:/repo", "vcs": "git"},
+    ]
+    code = cli.main(["project", "get", "ralphus"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "name:        ralphus" in out
+    assert "vcs:         git" in out
+    assert "path:        C:/repo" in out
+    assert "description: the ralphus repo" in out
+
+
+def test_project_get_unknown_name_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    _FakeClient.projects = []
+    code = cli.main(["project", "get", "nope"])
+    assert code == 2
+    assert "is not registered" in capsys.readouterr().err
+
+
+def test_agent_list_shows_fixed_model_list_for_claude_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main(["agent", "list"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "claude-code" in out
+    assert "sonnet, opus, haiku, fable" in out
+
+
+def test_agent_list_shows_any_model_for_open_agents(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["agent", "list"])
+    assert code == 0
+    out = capsys.readouterr().out
+    ollama_line = next(line for line in out.splitlines() if line.startswith("ollama"))
+    assert "<any model>" in ollama_line
+
+
+def test_bare_agent_command_lists_agents(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["agent"])
+    assert code == 0
+    assert "claude-code" in capsys.readouterr().out

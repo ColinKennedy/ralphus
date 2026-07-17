@@ -1,0 +1,29 @@
+[package]
+name = "ralphus-bench-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RAL-94 in-process, serial, durable-minimum benchmark harness for Rust tests."
+
+[lib]
+name = "ralphus_bench_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ralphus-bench-rs"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ralphus-bench-types = { workspace = true }
+# Only the `ralphus-bench-rs` bin target needs this (to call
+# `ralphus_core::ralphus_bench_tests()`); the lib itself does not depend on
+# ralphus-core, which is what keeps this out of a cycle with `core`'s own
+# dependency on `ralphus-bench-types`/`ralphus-bench-macros`.
+ralphus-core = { workspace = true }

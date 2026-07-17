@@ -165,6 +165,7 @@ const TASK_KEYS: &[&str] = &[
     "args",
     "budget_tokens",
     "max_retries",
+    "priority",
     "timeout_minutes",
     "depends_on",
     "session",
@@ -186,6 +187,7 @@ const SESSION_KEYS: &[&str] = &[
     "args",
     "budget_tokens",
     "timeout_minutes",
+    "priority",
     "verify",
     "review",
     "upstream",
@@ -397,11 +399,21 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
+        check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
 
         let task_agent = table.get("agent").and_then(toml::Value::as_str);
-        validate_sessions(table.get("session"), t, &path, task_agent, ctx);
+        let task_project = table.get("project").and_then(toml::Value::as_str);
+        validate_sessions(
+            table.get("session"),
+            t,
+            &path,
+            task_agent,
+            task_project,
+            header,
+            ctx,
+        );
         validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
     }
 }
@@ -413,6 +425,8 @@ fn validate_sessions(
     task_idx: usize,
     task_path: &str,
     task_agent: Option<&str>,
+    task_project: Option<&str>,
+    task_header: Option<u32>,
     ctx: &mut Ctx,
 ) {
     let Some(value) = value else { return };
@@ -428,6 +442,7 @@ fn validate_sessions(
 
     let mut ids: HashMap<String, usize> = HashMap::new();
     let mut dep_edges: Vec<(usize, String)> = Vec::new();
+    let mut has_placeholder = false;
 
     for (s, item) in arr.iter().enumerate() {
         let path = format!("{task_path}.session[{s}]");
@@ -460,7 +475,16 @@ fn validate_sessions(
                 );
             }
             Some(v) if !v.is_str() => check_type(ctx, table, "cwd", Ty::Str, &path, header),
-            Some(_) => {}
+            Some(v) => {
+                // A non-empty string (the two guarded arms above handled empty /
+                // non-string cases): check whether it's a worktree placeholder.
+                if v.as_str()
+                    .and_then(crate::schema::parse_worktree_placeholder)
+                    .is_some()
+                {
+                    has_placeholder = true;
+                }
+            }
         }
 
         check_type(ctx, table, "subprojects", Ty::StrArray, &path, header);
@@ -514,6 +538,7 @@ fn validate_sessions(
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
+        check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
 
         if let Some(deps) = table.get("depends_on").and_then(toml::Value::as_array) {
@@ -528,6 +553,16 @@ fn validate_sessions(
         check_type(ctx, table, "review", Ty::Str, &path, header);
 
         validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
+    }
+
+    if has_placeholder && task_project.is_none() {
+        ctx.error(
+            task_path,
+            ErrorKind::MissingRequired,
+            "task 'project' is required when any session uses a placeholder cwd \
+             (\"ralphus:new-worktree/<branch>\")",
+            task_header,
+        );
     }
 
     check_session_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
@@ -1169,6 +1204,27 @@ command = "cargo build"
     }
 
     #[test]
+    fn priority_accepted_on_task_and_session() {
+        let src = "[[task]]\nname=\"t\"\npriority=2\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\npriority=0\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn priority_wrong_type_reported() {
+        let src =
+            "[[task]]\nname=\"t\"\npriority=\"high\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("priority")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn wrong_type_for_budget() {
         let src = "[[task]]\nname=\"t\"\nbudget_tokens=\"lots\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
@@ -1460,13 +1516,14 @@ command = "cargo build"
 
     #[test]
     fn session_review_must_be_string_not_table() {
-        // Old format [[task.session.review]] must fail: review on session is now a string.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.review]]\nid=\"x\"\n";
+        // A session's `review` field opts into a top-level [[review]] block by id
+        // and must be a string; a table value is rejected.
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview={id=\"x\"}\n";
         let r = validate_toml(src);
-        // The session's review field is now a string; an array-of-tables value is WrongType.
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
-            "old [[task.session.review]] format must be rejected: {:?}",
+            "a table-valued session 'review' must be rejected: {:?}",
             r.errors
         );
     }
@@ -1639,6 +1696,49 @@ command = "cargo build"
             "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=123\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    // ── worktree placeholder cwd (RAL-100) ────────────────────────────────────
+
+    #[test]
+    fn placeholder_cwd_with_project_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn placeholder_cwd_without_project_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
+                && e.message.contains("project")
+                && e.message.contains("placeholder")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn old_style_project_prefixed_cwd_is_treated_as_a_plain_path() {
+        // The pre-RAL-100-redesign `<project>:worktree/<branch>` scheme no
+        // longer parses as a placeholder, so it doesn't require 'project' to
+        // be set -- it's just an (unusual, but not our concern here) literal
+        // cwd string.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"my-project:worktree/feat\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn plain_path_cwd_does_not_require_project() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
     }
 
     #[test]

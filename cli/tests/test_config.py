@@ -14,12 +14,16 @@ from ralphus.config import Config, TaskConfig, _apply, _find_git_root, load_conf
 # ---------------------------------------------------------------------------
 
 
-def test_find_git_root_finds_dot_git(tmp_path: Path) -> None:
+def test_find_git_root_finds_dot_git(tmp_path_factory: pytest.TempPathFactory) -> None:
+    # Fresh directory per call (not a fixed tmp_path) so this test tolerates
+    # being invoked more than once in-process by the RAL-94 bench harness.
+    tmp_path = tmp_path_factory.mktemp("find_git_root")
     (tmp_path / ".git").mkdir()
     assert _find_git_root(tmp_path) == tmp_path
 
 
-def test_find_git_root_walks_upward(tmp_path: Path) -> None:
+def test_find_git_root_walks_upward(tmp_path_factory: pytest.TempPathFactory) -> None:
+    tmp_path = tmp_path_factory.mktemp("find_git_root_upward")
     (tmp_path / ".git").mkdir()
     child = tmp_path / "a" / "b"
     child.mkdir(parents=True)

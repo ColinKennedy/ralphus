@@ -18,8 +18,10 @@ import sys
 import time
 from typing import Any
 
+from opentelemetry.trace import SpanKind
 from pydantic_ai import Agent
 
+from ralphus.runner import cartographer, otel
 from ralphus.runner.backend import BackendError, BackendOutcome
 from ralphus.runner.tools import ToolError, Workspace
 
@@ -93,16 +95,34 @@ class PydanticAgentBackend:
             f" prompt_len={len(prompt)} prompt_hash={prompt_hash}",
             file=sys.stderr,
         )
+        cartographer.emit(
+            "llm-invoke",
+            f"agent.run_sync start agent={self._agent!r} model={model!r}",
+            level="debug",
+            payload={"prompt_len": len(prompt), "prompt_hash": prompt_hash},
+        )
         t0 = time.monotonic()
-        try:
-            result = agent.run_sync(prompt)
-        except Exception as exc:
-            elapsed = time.monotonic() - t0
-            print(
-                f"ralphus [llm-invoke] error agent={self._agent!r} elapsed={elapsed:.2f}s: {exc}",
-                file=sys.stderr,
-            )
-            raise BackendError(str(exc)) from exc
+        with otel.start_span("llm-invoke.agent_run", kind=SpanKind.CLIENT) as span:
+            span.set_attribute("agent", self._agent)
+            span.set_attribute("model", model or "")
+            try:
+                result = agent.run_sync(prompt)
+            except Exception as exc:
+                elapsed = time.monotonic() - t0
+                otel.mark_error(span, str(exc))
+                print(
+                    f"ralphus [llm-invoke] error agent={self._agent!r}"
+                    f" elapsed={elapsed:.2f}s: {exc}",
+                    file=sys.stderr,
+                )
+                cartographer.emit(
+                    "llm-invoke",
+                    f"agent.run_sync error: {exc}",
+                    level="error",
+                    payload={"elapsed_sec": elapsed, "error": str(exc)},
+                )
+                raise BackendError(str(exc)) from exc
+            otel.mark_ok(span)
         elapsed = time.monotonic() - t0
 
         usage = result.usage
@@ -112,6 +132,16 @@ class PydanticAgentBackend:
             f"ralphus [llm-invoke] done agent={self._agent!r} elapsed={elapsed:.2f}s"
             f" tokens_in={tokens_in} tokens_out={tokens_out}",
             file=sys.stderr,
+        )
+        cartographer.emit(
+            "llm-invoke",
+            f"agent.run_sync done agent={self._agent!r}",
+            level="debug",
+            payload={
+                "elapsed_sec": elapsed,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+            },
         )
         return BackendOutcome(
             summary=str(result.output)[:2000],

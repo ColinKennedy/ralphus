@@ -1,0 +1,29 @@
+#include <winres.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          0x40004L
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Ralphus"
+            VALUE "FileDescription", "Ralphus"
+            VALUE "FileVersion", "0.1.0.0"
+            VALUE "InternalName", "ralphus-librarian"
+            VALUE "OriginalFilename", "ralphus-librarian.exe"
+            VALUE "ProductName", "Ralphus"
+            VALUE "ProductVersion", "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

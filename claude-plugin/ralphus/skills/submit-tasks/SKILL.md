@@ -68,10 +68,10 @@ that can run in parallel. Then ask me if that order looks right.
 
 Before writing, briefly surface the layout trade-offs and let me choose (don't
 silently pick). Keep it short:
-- **Reviews:** if these branches belong in ONE review, give each
-  `[[task.session.review]]` the same `id = "ralphus:new-review/<key>"` so they
-  link into a single Guardian -- even across separate files. Otherwise say
-  plainly "this will create N separate reviews" so I can confirm that's intended.
+- **Reviews:** if these branches belong in ONE review, define one `[[review]]`
+  and give each `[[task.session]]` the same `review = "ralphus:new-review/<key>"`
+  so they link into a single Guardian -- even across separate files. Otherwise
+  say plainly "this will create N separate reviews" so I can confirm that's intended.
 - **Verifiers:** ask whether the format/lint/test steps should be plain
   `command` gates (pass/fail only) or `prompt` verifiers that AUTO-FIX ("run the
   command; fix and re-run up to 3x; else fail; do not commit/push"). If I asked

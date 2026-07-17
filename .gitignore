@@ -20,12 +20,18 @@ build/
 *.db-shm
 *.pid
 /.ralphus/
-# Guardian review worktrees and task worktrees created at runtime
-/.ralphus_guardian/
+# Task worktrees created at runtime. (Guardian review worktrees now live under
+# .git/.ralphus_guardian/, which git already excludes — no entry needed.)
 /.worktrees/
 
-# Node (only for linting board.html's inline JS — see package.json)
+# Node (only for linting/type-checking board.html's inline JS — see package.json)
 node_modules/
+# tsc --checkJs input: board.html's <script> body extracted to a real .js file
+/.lint-tmp/
+
+# Docs site build output (docs/site/pages/*.md -> HTML). The screenshots
+# under docs/site/pages/screenshots/ ARE committed — only this render is not.
+/docs/site/_site/
 
 # Secure distribution — private key must never be committed
 ralphus-private.key

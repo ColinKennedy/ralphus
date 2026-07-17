@@ -7,6 +7,14 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "httpx>=0.27",
+    # OpenTelemetry tracing (RAL-96) — the `ralphus-runner` entry point below
+    # is always installed (unlike pydantic-ai, gated behind the `runner`
+    # extra), so these are base deps, not optional. Exporting is opt-in at
+    # runtime (OTEL_EXPORTER_OTLP_ENDPOINT unset = no-op, no network calls);
+    # see `ralphus/runner/otel.py`.
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
 ]
 
 [project.optional-dependencies]
@@ -15,10 +23,31 @@ dependencies = [
 runner = [
     "pydantic-ai>=0.0.30",
 ]
+# Docs site build + screenshot generation (see docs/site/). Kept optional —
+# neither the CLI nor the runner need a browser or a static-site generator.
+docs = [
+    "playwright>=1.45",
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
 
 [project.scripts]
 ralphus = "ralphus.__main__:main"
 ralphus-runner = "ralphus.runner.__main__:main"
+ralphus-docs-shots = "ralphus.docsgen.shots:main"
+ralphus-docs-lint = "ralphus.docsgen.lint:main"
+ralphus-bench-py = "ralphus.bench.__main__:main"
+ralphus-bench-graph = "ralphus.bench.graphs:main"
+# RAL-110: the recursive `--verbose --help` walker, standalone (same tree
+# `ralphus show help-map` prints), and the docs/cli-reference.md regenerator.
+ralphus-help-map = "ralphus.helpmap:main"
+ralphus-docs-helpmap = "ralphus.docsgen.helpmap_docs:main"
+
+# Always registered so `--ralphus-bench` is available, but it is a no-op
+# (normal single test invocation) unless that flag is passed — see
+# ralphus/bench/pytest_plugin.py.
+[project.entry-points.pytest11]
+ralphus_bench = "ralphus.bench.pytest_plugin"
 
 [build-system]
 requires = ["hatchling"]
@@ -50,6 +79,13 @@ files = ["src", "tests"]
 # treat it as untyped rather than a hard error.
 [[tool.mypy.overrides]]
 module = "pydantic_ai.*"
+ignore_missing_imports = true
+
+# playwright is the optional `docs` extra (screenshot generation only); the
+# base `python` CI job runs `uv sync --dev` without it, so treat it as
+# untyped rather than a hard error there too.
+[[tool.mypy.overrides]]
+module = "playwright.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -173,7 +173,7 @@ def test_no_append_system_prompt_flag_when_unset(
 
 def test_program_is_overridable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ws = Workspace.create(str(tmp_path))
-    monkeypatch.setenv("RALPHUS_CLAUDE_CMD", "my-claude")
+    monkeypatch.setenv("RALPHUS_CLAUDE_COMMAND", "my-claude")
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     captured: dict[str, Any] = {}
 

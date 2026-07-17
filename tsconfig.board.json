@@ -1,0 +1,14 @@
+{
+  "//": "Type-checks board.html's inline JS via JSDoc annotations only — no .ts files are compiled or shipped. Run `npm run typecheck`, which extracts the <script> body first (see scripts/extract-board-js.mjs).",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": [".lint-tmp/board.js"]
+}

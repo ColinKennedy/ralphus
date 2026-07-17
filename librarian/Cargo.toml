@@ -25,3 +25,9 @@ ralphus-auth = { path = "../auth" }
 ralphus-core.workspace = true
 tiny_http = { workspace = true }
 ureq = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+embed-resource = "3.0.11"

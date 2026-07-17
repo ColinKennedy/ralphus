@@ -1,6 +1,6 @@
 ---
 name: build-worktrees
-description: Create a git worktree per repository for one ticket's feature branch and report back "<branch>,<worktree-path>[,<worktree-path>...]" for use as task cwd(s).
+description: "DEPRECATED (RAL-100): manually creates a git worktree per repository and reports back a real path for use as task cwd. Prefer /submit-tasks2, which registers the repository as a project and lets the daemon materialize the worktree from a placeholder cwd instead. Still used by /submit-tasks for callers who haven't migrated."
 allowed-tools:
   - Bash(git *)
   - Bash(mkdir *)
@@ -9,6 +9,16 @@ allowed-tools:
   - PowerShell(New-Item *)
   - PowerShell(Test-Path *)
 ---
+
+> **DEPRECATED (RAL-100).** This skill manually builds a worktree and hands
+> back a literal filesystem path -- a recurring, error-prone manual step.
+> Prefer `/submit-tasks2`, which registers the repository once with
+> `ralphus project git` and emits a placeholder session `cwd`
+> (`"ralphus:new-worktree/<branch>"`, with the task's `project` field naming
+> the registered repository); the daemon then materializes (or reuses) the
+> worktree deterministically before the session runs. This
+> skill is kept only because `/submit-tasks` still calls it -- new work
+> should use `/submit-tasks2` instead.
 
 ## Inputs
 

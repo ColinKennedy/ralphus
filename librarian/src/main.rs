@@ -25,7 +25,10 @@ fn main() -> ExitCode {
             eprintln!(
                 "ralphus-librarian serving on http://127.0.0.1:{port} (daemon: {daemon_url})"
             );
-            match server::serve(port, &daemon_url) {
+            let otel_provider = ralphus_librarian::otel::init("ralphus-librarian");
+            let result = server::serve(port, &daemon_url);
+            ralphus_librarian::otel::shutdown(otel_provider);
+            match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("librarian failed: {e}");

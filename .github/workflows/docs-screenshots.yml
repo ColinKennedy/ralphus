@@ -1,0 +1,56 @@
+name: Docs screenshots
+
+# Regenerating screenshots is the expensive part of the docs build (headless
+# Chromium via Playwright) -- deliberately NOT run on every pull request
+# (see scripts/docs-screenshots.sh vs scripts/docs-build.sh, and
+# DOCS_PLAN.local.md). This runs once a change actually lands on master and
+# touches board.html or the docsgen fixtures/script, or on demand, and
+# commits any resulting PNG diff straight back to master.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "librarian/assets/board.html"
+      - "cli/src/ralphus/docsgen/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    name: Regenerate docs screenshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Sync dependencies
+        working-directory: cli
+        run: uv sync --extra docs
+      - name: Install headless Chromium
+        working-directory: cli
+        run: uv run playwright install --with-deps chromium
+      - name: Generate screenshots
+        working-directory: cli
+        run: uv run ralphus-docs-shots
+      - name: Every board.html tab still has a screenshot
+        working-directory: cli
+        run: uv run ralphus-docs-lint
+      - name: Commit updated screenshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/site/pages/screenshots/
+          if git diff --staged --quiet; then
+            echo "no screenshot changes"
+          else
+            git commit -m "docs: regenerate screenshots [skip ci]"
+            git push
+          fi

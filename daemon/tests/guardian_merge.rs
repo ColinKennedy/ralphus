@@ -7,10 +7,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ralphus_daemon::guardian_merge::{rebuild_on_base_shift, run_chat, run_feedback, run_merge};
+use ralphus_core::schema::TaskFile;
+use ralphus_daemon::guardian_merge::{
+    purge_worktrees, rebase_on_manual_push, rebuild_on_base_shift, reopen_straggler, run_chat,
+    run_feedback, run_merge,
+};
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
-use ralphus_daemon::store::Store;
+use ralphus_daemon::store::{NodeState, Store};
 
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -103,6 +107,7 @@ impl Runner for StageDoneRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -144,6 +149,7 @@ impl Runner for MarkerStrippingRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -162,6 +168,7 @@ impl Runner for FeedbackRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -180,6 +187,7 @@ impl Runner for NamedFeedbackRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -228,6 +236,185 @@ fn builds_review_branch_from_two_features() {
 
     let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
     assert!(files.contains("base.txt") && files.contains("a.txt") && files.contains("b.txt"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-91: a branch that produced several commits collapses to a single commit
+/// in the review worktree when squash is enabled for its project, while a
+/// non-squashed control review keeps every working commit.
+#[test]
+fn squash_collapses_multi_commit_branch_to_single_commit() {
+    let root = temp_repo();
+    init_repo(&root);
+    // Ensure the daemon's own squash commit has an author identity regardless of
+    // ambient git config.
+    git(&root, &["config", "user.email", "ralphus@example.com"]);
+    git(&root, &["config", "user.name", "ralphus"]);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // feature/a carries THREE separate commits.
+    git(&root, &["checkout", "-b", "feature/a"]);
+    for (f, c) in [
+        ("a1.txt", "one\n"),
+        ("a2.txt", "two\n"),
+        ("a3.txt", "three\n"),
+    ] {
+        write(&root, f, c);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("add {f}")]);
+    }
+    git(&root, &["checkout", "main"]);
+
+    let root_str = root.to_str().unwrap().to_string();
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g.create_guardian("r", "main", &root_str).unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        // Enable squash for this (single) project.
+        g.set_guardian_project_squash(&id, &root_str, true).unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(
+        view.squash_projects.contains(&root_str),
+        "squash_projects should record the project: {:?}",
+        view.squash_projects
+    );
+    let review = view.review_branch.expect("review branch set");
+
+    // The three working commits collapse to exactly one over the base.
+    let count = git(&root, &["rev-list", "--count", &format!("main..{review}")]);
+    assert_eq!(count.trim(), "1", "expected a single squashed commit");
+    // …and the squashed commit still carries every file.
+    let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
+    assert!(
+        files.contains("a1.txt") && files.contains("a2.txt") && files.contains("a3.txt"),
+        "squashed review is missing files: {files}"
+    );
+    // The feature branch itself is untouched — still three commits over main.
+    let feat = git(&root, &["rev-list", "--count", "main..feature/a"]);
+    assert_eq!(feat.trim(), "3", "feature branch must not be rewritten");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-91: a review spanning two git projects honours each project's squash
+/// setting independently — squash on for project A collapses its branch, while
+/// project B (squash off) keeps every commit.
+#[test]
+fn squash_setting_is_per_project_independent() {
+    let make_repo = |feature: &str, commits: &[(&str, &str)]| -> PathBuf {
+        let root = temp_repo();
+        init_repo(&root);
+        git(&root, &["config", "user.email", "ralphus@example.com"]);
+        git(&root, &["config", "user.name", "ralphus"]);
+        write(&root, "base.txt", "base\n");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["checkout", "-b", feature]);
+        for (f, c) in commits {
+            write(&root, f, c);
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", &format!("add {f}")]);
+        }
+        git(&root, &["checkout", "main"]);
+        root
+    };
+    // Project A: two commits, squash ON. Project B: two commits, squash OFF.
+    let root_a = make_repo("feature/a", &[("a1.txt", "1\n"), ("a2.txt", "2\n")]);
+    let root_b = make_repo("feature/b", &[("b1.txt", "1\n"), ("b2.txt", "2\n")]);
+    let a_str = root_a.to_str().unwrap().to_string();
+    let b_str = root_b.to_str().unwrap().to_string();
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g.create_guardian("multi", "main", &a_str).unwrap();
+        g.add_guardian_branch_with_project(&id, "feature/a", Some(&a_str))
+            .unwrap();
+        g.add_guardian_branch_with_project(&id, "feature/b", Some(&b_str))
+            .unwrap();
+        // Squash only project A.
+        g.set_guardian_project_squash(&id, &a_str, true).unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+
+    let rb = |branch: &str| -> String {
+        view.branches
+            .iter()
+            .find(|b| b.branch == branch)
+            .and_then(|b| b.review_branch.clone())
+            .unwrap_or_else(|| panic!("no review branch for {branch}"))
+    };
+    // Project A's branch is squashed to one commit; project B's keeps both.
+    let count_a = git(
+        &root_a,
+        &["rev-list", "--count", &format!("main..{}", rb("feature/a"))],
+    );
+    assert_eq!(count_a.trim(), "1", "project A should be squashed");
+    let count_b = git(
+        &root_b,
+        &["rev-list", "--count", &format!("main..{}", rb("feature/b"))],
+    );
+    assert_eq!(count_b.trim(), "2", "project B should NOT be squashed");
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+/// Control: with squash disabled (the default) the same three-commit branch
+/// keeps all three commits in the review worktree.
+#[test]
+fn without_squash_multi_commit_branch_is_preserved() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    for (f, c) in [
+        ("a1.txt", "one\n"),
+        ("a2.txt", "two\n"),
+        ("a3.txt", "three\n"),
+    ] {
+        write(&root, f, c);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("add {f}")]);
+    }
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    let review = view.review_branch.expect("review branch set");
+    let count = git(&root, &["rev-list", "--count", &format!("main..{review}")]);
+    assert_eq!(
+        count.trim(),
+        "3",
+        "non-squashed review must keep all commits"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -324,7 +511,10 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     run_merge(&store, &NoopRunner, &id);
 
     // Give feedback on branch 0 (feature/a); the agent adds note.txt.
-    run_feedback(&store, &FeedbackRunner, &id, 0, "add a note file");
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    run_feedback(&store, &FeedbackRunner, &id, &bid0, "add a note file");
 
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
@@ -401,6 +591,188 @@ fn failing_check_gate_fails_the_merge() {
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(view.status, "merge_failed");
     assert!(view.detail.unwrap_or_default().contains("check failed"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-101: a review with no `checks` configured (and not opted out) still gets
+// an automatic build/test signal from the project's `.ralphus.toml` default.
+#[test]
+fn auto_build_runs_when_no_checks_configured() {
+    let (root, store, id) = single_feature_repo();
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\nauto_build = \"test -f a.txt\"\n",
+    );
+    run_merge(&store, &NoopRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(
+        view.detail.unwrap_or_default().contains("auto-built"),
+        "expected the auto-build note to surface in the review detail"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failing_auto_build_fails_the_merge() {
+    let (root, store, id) = single_feature_repo();
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
+    );
+    run_merge(&store, &NoopRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "merge_failed");
+    assert!(
+        view.detail
+            .unwrap_or_default()
+            .contains("auto-build failed")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// A review with configured `checks` must not be double-built: the auto_build
+// default here deliberately fails, so if it ran alongside the (passing)
+// explicit check the merge would incorrectly fail.
+#[test]
+fn configured_checks_are_not_double_built_by_auto_build() {
+    let (root, store, id) = single_feature_repo();
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
+    );
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_checks(&id, &["test -f a.txt".to_string()])
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(
+        !view.detail.unwrap_or_default().contains("auto-built"),
+        "the configured check gate should take priority over the auto-build default"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// `guardian_skip_auto_build` opts out of config auto-build too, not just
+// explicit checks (again, the auto_build default here deliberately fails to
+// prove it never ran).
+#[test]
+fn skip_auto_build_also_opts_out_of_config_auto_build() {
+    let (root, store, id) = single_feature_repo();
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
+    );
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_skip_auto_build(&id, true)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-110: nothing configured (no explicit checks, no `.ralphus.toml
+// auto_build`) -> `generate_manual_commands` asks the resolver agent for both
+// the manual check commands AND a build command in the same call, then runs
+// that build command against the combined worktree in advance.
+struct InferredBuildRunner;
+impl Runner for InferredBuildRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.task == "manual_commands" {
+            return RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: r#"{"manual_commands": ["echo verify"], "build_command": "echo built > built_marker.txt"}"#
+                    .into(),
+                error: None,
+                verified: None,
+                claude_session_id: None,
+                ghost: None,
+            };
+        }
+        // Every other task (e.g. "summary") in this single-clean-branch
+        // fixture should never be exercised.
+        RunnerResult::failure("only manual_commands is faked in this test")
+    }
+}
+
+#[test]
+fn nothing_configured_runs_ai_inferred_build_in_advance() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &InferredBuildRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert_eq!(
+        view.detail.as_deref(),
+        Some("auto-built via inferred build command: echo built > built_marker.txt")
+    );
+    let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
+    assert!(
+        combined.join("built_marker.txt").exists(),
+        "the inferred build command should have run against the combined worktree"
+    );
+    assert_eq!(view.manual_commands, vec!["echo verify".to_string()]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-110: `skip_auto_build` also opts out of the AI-inferred build tier (not
+// just explicit checks / config auto_build) -- manual_commands are still
+// generated (that's independent), but no build runs.
+#[test]
+fn skip_auto_build_opts_out_of_ai_inferred_build_too() {
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_skip_auto_build(&id, true)
+        .unwrap();
+    run_merge(&store, &InferredBuildRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert_eq!(view.detail, None);
+    let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
+    assert!(
+        !combined.join("built_marker.txt").exists(),
+        "skip_auto_build must prevent the inferred build from running"
+    );
+    // Manual commands generation is independent of skip_auto_build -- it still
+    // runs (the InferredBuildRunner's fake response still gets parsed and
+    // stored) since only the *build* execution is skipped, not the LLM call.
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-110: `skip_worktree_checks` is an independent axis from `skip_auto_build`
+// -- it must not affect the finalize-time AI-inferred auto-build.
+#[test]
+fn skip_worktree_checks_does_not_affect_auto_build() {
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_skip_worktree_checks(&id, true)
+        .unwrap();
+    run_merge(&store, &InferredBuildRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert_eq!(
+        view.detail.as_deref(),
+        Some("auto-built via inferred build command: echo built > built_marker.txt"),
+        "skip_worktree_checks must not suppress the auto-build tier"
+    );
+    let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
+    assert!(combined.join("built_marker.txt").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -579,6 +951,127 @@ fn base_branch_shift_triggers_rebuild() {
     assert!(
         !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem),
         "no rebuild when base is unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-97/98 regression: a "linked" guardian whose branches are contributed by
+// SEPARATE runs (joined by a shared `review` key rather than one multi-file
+// submission) can leave a later branch stuck at `merge_status = "pending"`
+// forever. This happens when the first run's task finishes, the guardian sees
+// all blocking tasks IT knows about done, and leaves `collecting` (→
+// `in_review`) before the second run's task — and therefore its branch —
+// exists at all. Once the guardian is no longer `collecting`,
+// `try_start_ready_reviews_for_task`'s `collecting_guardians_for_sessions`
+// query never finds it again, so the straggler branch never gets its
+// `worktree`/`review_branch` populated even though its session is `done`.
+// `reopen_straggler` (wired into the periodic `review_maintenance` sweep) must
+// detect and heal exactly this.
+#[test]
+fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+
+    let mut owned_store = Store::open_in_memory().unwrap();
+    let sample: TaskFile =
+        toml::from_str("[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/repo\"\nprompt=\"p\"\n")
+            .unwrap();
+
+    // Guardian created for run A, carrying only feature/a (mirrors RAL-97's task
+    // finishing first, in its own run).
+    let run_a = owned_store.insert_run(&sample, Some("a"), false).unwrap();
+    let id = {
+        let g = &owned_store;
+        let id = g
+            .create_guardian_for_run("linked", "main", root.to_str().unwrap(), Some(&run_a))
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    owned_store
+        .set_session_review_branch(&run_a, 0, 0, "feature/a")
+        .unwrap();
+    owned_store
+        .set_session_state(&run_a, 0, 0, NodeState::Done)
+        .unwrap();
+
+    let store = Arc::new(Mutex::new(owned_store));
+    // Run A's task completing drives the guardian all the way to `in_review`,
+    // exactly as the scheduler would once `feature/a`'s branch is the only one
+    // the guardian knows about yet.
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "in_review"
+    );
+
+    // RAL-98's task now finishes, in a SEPARATE run, contributing a second
+    // branch to the SAME (already `in_review`) guardian by review-key linkage.
+    let run_b = {
+        let mut g = store.lock().unwrap();
+        g.insert_run(&sample, Some("b"), false).unwrap()
+    };
+    {
+        let g = store.lock().unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        g.set_session_review_branch(&run_b, 0, 0, "feature/b")
+            .unwrap();
+        g.set_session_state(&run_b, 0, 0, NodeState::Done).unwrap();
+    }
+
+    // Sanity check: this is the bug. The straggler branch is stuck `pending`
+    // with no worktree even though its contributing session is `done`.
+    let stuck = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(stuck.status, "in_review");
+    let straggler = stuck
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/b")
+        .expect("feature/b present");
+    assert_eq!(straggler.merge_status, "pending");
+    assert!(straggler.worktree.is_none());
+
+    // The self-heal: reopen_straggler (as called by review_maintenance's
+    // periodic sweep) must detect the done-but-pending branch, reopen the
+    // guardian, and rebuild the stack to pick it up.
+    let sem = Semaphore::new(4);
+    let reopened = reopen_straggler(&store, &NoopRunner, &id, &sem);
+    assert!(reopened, "a ready straggler branch must trigger a reopen");
+
+    let healed = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(healed.status, "in_review", "detail: {:?}", healed.detail);
+    assert!(
+        healed.branches.iter().all(|b| b.merge_status == "done"),
+        "both branches must be merged: {:?}",
+        healed.branches
+    );
+    let review = healed.review_branch.expect("review branch set");
+    let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
+    assert!(
+        files.contains("a.txt") && files.contains("b.txt"),
+        "review branch must contain both linked branches' commits: {files}"
+    );
+
+    // A second sweep with nothing new pending is a no-op.
+    assert!(
+        !reopen_straggler(&store, &NoopRunner, &id, &sem),
+        "no reopen when there is no ready straggler"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -824,6 +1317,73 @@ fn resolves_a_conflict_with_the_agent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A fake conflict resolver that also reports a self-summarized handoff note,
+/// like a real backend would when it parses a `RALPHUS_GHOST:` marker out of
+/// the agent's reply (RAL-136).
+struct MarkerStrippingWithGhostRunner;
+impl Runner for MarkerStrippingWithGhostRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let mut r = MarkerStrippingRunner.run(spec);
+        r.ghost = Some("kept both sides of the conflict; worth a follow-up review".to_string());
+        r
+    }
+}
+
+/// RAL-136: a review worktree's conflict resolver publishes a ghost from its
+/// self-summarized handoff note, keyed by the review branch's URI.
+#[test]
+fn conflict_resolution_publishes_a_review_ghost() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("conflict review", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    run_merge(&store, &MarkerStrippingWithGhostRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(y.merge_status, "conflict_resolved");
+
+    let uri = ralphus_daemon::ghost::review_uri(&id, Some(&y.id));
+    let ghost = store
+        .lock()
+        .unwrap()
+        .get_ghost(&uri)
+        .unwrap()
+        .expect("resolver's handoff note was published as a review ghost");
+    assert!(ghost.content.contains("kept both sides of the conflict"));
+    assert_eq!(ghost.kind, "review");
+    assert_eq!(ghost.guardian_id.as_deref(), Some(id.as_str()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // New naming convention: per-branch review refs are
 // `guardian/<id>/wt-<feature_branch>` and the combined ref is
 // `guardian/<id>/review`.
@@ -970,6 +1530,7 @@ command = "cargo test --workspace"
                     error: None,
                     verified: None,
                     claude_session_id: None,
+                    ghost: None,
                 };
             }
 
@@ -1005,6 +1566,7 @@ command = "cargo test --workspace"
                 error: None,
                 verified: None,
                 claude_session_id: None,
+                ghost: None,
             }
         }
     }
@@ -1106,6 +1668,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
         .review_branch
         .clone()
         .expect("review branch");
+    let bid0 = view.branches[0].id.clone();
 
     // Record the review-branch HEAD before feedback so we can check it didn't move.
     let head_before = git(&root, &["rev-parse", &rev]);
@@ -1114,7 +1677,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
         &store,
         &NamedFeedbackRunner("note.txt"),
         &id,
-        0,
+        &bid0,
         "add a note file, don't commit",
     );
 
@@ -1161,13 +1724,14 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     let wt_str = view.branches[0].worktree.clone().expect("worktree");
     let wt = PathBuf::from(&wt_str);
+    let bid0 = view.branches[0].id.clone();
 
     // Turn 1: no-commit — agent writes note1.txt, which stays uncommitted.
     run_feedback(
         &store,
         &NamedFeedbackRunner("note1.txt"),
         &id,
-        0,
+        &bid0,
         "add note1, don't commit",
     );
     assert!(
@@ -1180,7 +1744,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &store,
         &NamedFeedbackRunner("note2.txt"),
         &id,
-        0,
+        &bid0,
         "add note2",
     );
 
@@ -1236,6 +1800,7 @@ impl Runner for RouteBlockRunner {
                 error: None,
                 verified: None,
                 claude_session_id: None,
+                ghost: None,
             };
         }
         let _ = std::fs::write(
@@ -1251,6 +1816,7 @@ impl Runner for RouteBlockRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -1533,6 +2099,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 error: None,
                 verified: None,
                 claude_session_id: None,
+                ghost: None,
             }
         }
     }
@@ -1669,6 +2236,680 @@ fn rerere_autoupdate_resolves_conflict_without_agent() {
     assert!(
         show.contains("X and Y"),
         "rerere resolution not applied: {show}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-92: a reviewer manually commits into an upstream branch's review worktree.
+// A maintenance sweep must detect the moved review-branch ref, rebase the
+// downstream branch onto the manual commit (one at a time, as "Merge / rebase"
+// does), and rebuild the combined worktree — then leave a stable baseline so a
+// second sweep does nothing.
+#[test]
+fn manual_push_to_review_worktree_rebases_downstream() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("manual-push", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    // Right after the build, a sweep must NOT see a manual push (the daemon's own
+    // writes were baselined) — this is the feedback-loop guard.
+    let sem = Semaphore::new(4);
+    assert!(
+        !rebase_on_manual_push(&store, &NoopRunner, &id, &sem),
+        "the daemon's own build must not be mistaken for a manual push"
+    );
+
+    // Reviewer opens a terminal in branch 0's review worktree and commits a fix.
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "manual.txt", "reviewer fix\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual reviewer fix"]);
+
+    // The sweep detects it and rebases downstream onto the manual commit.
+    assert!(
+        rebase_on_manual_push(&store, &NoopRunner, &id, &sem),
+        "a manual push to the review worktree must trigger a downstream rebase"
+    );
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+
+    // The downstream review branch and the combined worktree carry the manual
+    // commit stacked under branch b's own change.
+    let rev1 = after.branches[1].review_branch.clone().unwrap();
+    let files1 = git(&root, &["ls-tree", "-r", "--name-only", &rev1]);
+    assert!(
+        files1.contains("manual.txt") && files1.contains("a.txt") && files1.contains("b.txt"),
+        "downstream branch must be rebased onto the manual commit: {files1}"
+    );
+    let combined = after.combined_worktree.as_deref().expect("combined");
+    assert!(Path::new(combined).join("manual.txt").exists());
+    assert!(Path::new(combined).join("b.txt").exists());
+
+    // A second sweep is a no-op: the baseline advanced to the new tips.
+    assert!(
+        !rebase_on_manual_push(&store, &NoopRunner, &id, &sem),
+        "no rebase when nothing moved since the last build"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-92: a manual push to the LAST branch (no downstream) still refreshes the
+// combined review worktree so the reviewer's commit is reflected there.
+#[test]
+fn manual_push_to_last_branch_refreshes_combined() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "manual.txt", "reviewer fix\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual reviewer fix"]);
+
+    let sem = Semaphore::new(4);
+    assert!(
+        rebase_on_manual_push(&store, &NoopRunner, &id, &sem),
+        "a manual push must trigger a rebuild even with no downstream branch"
+    );
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+    let combined = after.combined_worktree.as_deref().expect("combined");
+    assert!(
+        Path::new(combined).join("manual.txt").exists(),
+        "combined worktree must reflect the manual commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-103: a manual push is a forced regeneration -- the stale manual-checks
+// commands from the previous build must be cleared for the duration of the
+// restack, not left showing as current (which would make `checks_state`
+// report "ready" with out-of-date commands while a rebuild is actually
+// happening underneath).
+#[test]
+fn manual_push_clears_stale_manual_commands() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+
+    // Seed stale commands as if a prior generation had succeeded.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_manual_commands(&id, &["echo stale".to_string()], None, None)
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .checks_state,
+        "ready"
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "manual.txt", "reviewer fix\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual reviewer fix"]);
+
+    let sem = Semaphore::new(4);
+    assert!(rebase_on_manual_push(&store, &NoopRunner, &id, &sem));
+
+    // NoopRunner fails every call, so `generate_manual_commands` cannot have
+    // repopulated the list -- if it's empty, the stale entry was cleared.
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert!(
+        after.manual_commands.is_empty(),
+        "stale manual commands must not survive a forced regeneration: {:?}",
+        after.manual_commands
+    );
+    assert_eq!(after.checks_state, "waiting");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-92: when a manual push introduces a change that conflicts with a downstream
+// branch, the restack must route the conflict through the existing agent
+// conflict-resolution path (not fail outright).
+#[test]
+fn manual_push_conflict_flows_through_resolver() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // feature/a leaves conflict.txt alone (adds an unrelated file), so the initial
+    // stack builds cleanly.
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    // feature/b changes the middle line to Y.
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("manual-conflict", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        id
+    };
+    // Initial build is clean (feature/a and feature/b touch different lines/files).
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "in_review"
+    );
+
+    // Reviewer manually changes the SAME middle line to X on feature/a's review
+    // worktree — this now conflicts with feature/b's Y when restacked.
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "conflict.txt", "line1\nX\nline3\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual conflicting edit"]);
+
+    // The resolver (marker-stripping) must be driven to resolve the downstream
+    // conflict; the merge reaches review rather than failing.
+    let sem = Semaphore::new(4);
+    assert!(rebase_on_manual_push(
+        &store,
+        &MarkerStrippingRunner,
+        &id,
+        &sem
+    ));
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+    let b = after
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/b")
+        .unwrap();
+    assert_eq!(
+        b.merge_status, "conflict_resolved",
+        "downstream conflict must be resolved by the agent"
+    );
+    let review = after.review_branch.expect("review branch");
+    let show = git(&root, &["show", &format!("{review}:conflict.txt")]);
+    assert!(!show.contains("<<<<<<<"), "markers remain: {show}");
+    assert!(
+        show.contains('X') && show.contains('Y'),
+        "both sides kept: {show}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-137: disabling ("dropping") a branch while its review is still
+/// Collecting -- e.g. because the contributing task is stuck -- lets the
+/// review proceed immediately using only the remaining enabled branches. The
+/// dropped branch is not removed: it keeps its stack position and is reset to
+/// a clean `pending` state (RAL-43) so re-enabling it later and re-running the
+/// merge rebuilds it back into its original place in the stack, between the
+/// branches that surround it.
+#[test]
+fn disabled_branch_is_skipped_and_reintroduced_at_its_original_position() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    for (branch, file) in [
+        ("feature/a", "a.txt"),
+        ("feature/b", "b.txt"),
+        ("feature/c", "c.txt"),
+    ] {
+        git(&root, &["checkout", "main"]);
+        git(&root, &["checkout", "-b", branch]);
+        write(&root, file, "content\n");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("add {file}")]);
+    }
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("drop-branch", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        g.add_guardian_branch(&id, "feature/c").unwrap();
+        id
+    };
+
+    // feature/b's task is struggling; drop its branch while the review is
+    // still Collecting and the other two branches' tasks may still be
+    // running too -- run_merge does not require branches to be "done", only
+    // enabled, so this exercises the same immediate-proceed path a real
+    // Collecting review takes once its remaining blocking tasks finish.
+    {
+        let g = store.lock().unwrap();
+        assert_eq!(g.get_guardian(&id).unwrap().status, "collecting");
+        g.set_branch_enabled_by_name(&id, "feature/b", false)
+            .unwrap();
+    }
+
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.status, "in_review",
+        "review must proceed without the dropped branch: {:?}",
+        view.detail
+    );
+    let review = view.review_branch.clone().expect("review branch set");
+    let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
+    assert!(
+        files.contains("a.txt") && files.contains("c.txt"),
+        "{files}"
+    );
+    assert!(
+        !files.contains("b.txt"),
+        "dropped branch's content must not be in the review: {files}"
+    );
+
+    // The dropped branch keeps its position and a clean pending state instead
+    // of being removed or left showing stale done/failed status.
+    let b = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/b")
+        .expect("dropped branch retained in the stack");
+    assert_eq!(b.position, 1, "dropped branch retains its stack position");
+    assert!(!b.enabled);
+    assert_eq!(b.merge_status, "pending");
+    assert!(b.review_branch.is_none());
+    assert!(b.worktree.is_none());
+
+    // Re-enable the branch and re-run the merge: it must be rebuilt back into
+    // its original place in the stack (between a and c), not appended at the
+    // end.
+    store
+        .lock()
+        .unwrap()
+        .set_branch_enabled_by_name(&id, "feature/b", true)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+    let review2 = after.review_branch.clone().expect("review branch set");
+    let files2 = git(&root, &["ls-tree", "-r", "--name-only", &review2]);
+    assert!(
+        files2.contains("a.txt") && files2.contains("b.txt") && files2.contains("c.txt"),
+        "{files2}"
+    );
+
+    let subjects = git(
+        &root,
+        &[
+            "log",
+            "--format=%s",
+            "--reverse",
+            &format!("main..{review2}"),
+        ],
+    );
+    let subjects: Vec<&str> = subjects.lines().collect();
+    assert_eq!(
+        subjects,
+        vec!["add a.txt", "add b.txt", "add c.txt"],
+        "re-enabled branch must be rebuilt between a and c, at its original position: {subjects:?}"
+    );
+
+    let b2 = after
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/b")
+        .expect("branch b retained");
+    assert_eq!(
+        b2.position, 1,
+        "position unchanged across disable/re-enable"
+    );
+    assert!(b2.enabled);
+    assert_eq!(b2.merge_status, "done");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-118: moving a branch from one review into another must recompute the
+/// stacked rebase correctly on both sides -- the source renumbers and rebuilds
+/// without the moved branch, and the destination rebases it into its own
+/// stack (on top of its own base/previous branch), not anything left over
+/// from its original review. This is also the git-level guarantee PR
+/// submission (RAL-117, `pr.rs::submit_pull_requests`) depends on: it reads a
+/// branch's `review_branch` ref and the owning guardian's own `base_branch`
+/// with no special-casing for a moved branch, so if the physical rebase here
+/// is correct, PR base resolution is correct too.
+#[test]
+fn move_branch_rebuilds_correctly_in_both_source_and_destination() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/c"]);
+    write(&root, "c.txt", "from c\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add c"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let (r1, r2) = {
+        let g = store.lock().unwrap();
+        let r1 = g
+            .create_guardian("r1", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&r1, "feature/a").unwrap();
+        g.add_guardian_branch(&r1, "feature/b").unwrap();
+        let r2 = g
+            .create_guardian("r2", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&r2, "feature/c").unwrap();
+        (r1, r2)
+    };
+
+    // Build both stacks once before the move, same as any real workflow.
+    run_merge(&store, &NoopRunner, &r1);
+    run_merge(&store, &NoopRunner, &r2);
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&r1).unwrap().status,
+        "in_review"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&r2).unwrap().status,
+        "in_review"
+    );
+
+    // Move feature/a (r1 position 0) into r2.
+    let bid_a = store.lock().unwrap().get_guardian(&r1).unwrap().branches[0]
+        .id
+        .clone();
+    let new_pos = store
+        .lock()
+        .unwrap()
+        .move_guardian_branch(&r1, &bid_a, &r2)
+        .unwrap();
+    assert_eq!(new_pos, 1, "appended after r2's existing feature/c");
+
+    // Same carry-forward purge the HTTP handler (`server::guardian_move_branch`)
+    // performs on the source guardian before rebuilding it.
+    purge_worktrees(root.to_str().unwrap(), &r1);
+
+    // Rebuild both, exactly as the HTTP handler does.
+    run_merge(&store, &NoopRunner, &r1);
+    run_merge(&store, &NoopRunner, &r2);
+
+    // Source (r1): only feature/b remains, renumbered to position 0, and its
+    // review branch no longer contains feature/a's file.
+    let after_r1 = store.lock().unwrap().get_guardian(&r1).unwrap();
+    assert_eq!(
+        after_r1.status, "in_review",
+        "detail: {:?}",
+        after_r1.detail
+    );
+    assert_eq!(after_r1.branches.len(), 1);
+    assert_eq!(after_r1.branches[0].branch, "feature/b");
+    assert_eq!(after_r1.branches[0].position, 0);
+    let r1_review = after_r1.review_branch.expect("r1 review branch");
+    let r1_files = git(&root, &["ls-tree", "-r", "--name-only", &r1_review]);
+    assert!(r1_files.contains("b.txt"));
+    assert!(
+        !r1_files.contains("a.txt"),
+        "r1's rebuilt stack must not carry the moved-out branch's file: {r1_files}"
+    );
+
+    // Destination (r2): feature/c then feature/a, correctly stacked on r2's
+    // own base -- not on anything from r1.
+    let after_r2 = store.lock().unwrap().get_guardian(&r2).unwrap();
+    assert_eq!(
+        after_r2.status, "in_review",
+        "detail: {:?}",
+        after_r2.detail
+    );
+    assert_eq!(after_r2.branches.len(), 2);
+    assert_eq!(after_r2.branches[0].branch, "feature/c");
+    assert_eq!(after_r2.branches[1].branch, "feature/a");
+    assert_eq!(after_r2.branches[1].position, 1);
+    assert_eq!(
+        after_r2.branches[1].moved_from_guardian_id.as_deref(),
+        Some(r1.as_str()),
+        "provenance must record the original owning review"
+    );
+    assert!(after_r2.branches.iter().all(|b| b.merge_status == "done"));
+    let r2_review = after_r2.review_branch.expect("r2 review branch");
+    let r2_files = git(&root, &["ls-tree", "-r", "--name-only", &r2_review]);
+    assert!(
+        r2_files.contains("base.txt") && r2_files.contains("c.txt") && r2_files.contains("a.txt")
+    );
+
+    // The moved branch's own stacked commit -- exactly what PR submission
+    // would push and diff against r2.base_branch -- is reachable from r2's
+    // base and contains only its own file plus what came before it in r2's
+    // stack (c.txt), never b.txt (which stayed behind in r1).
+    let position_1_tip = after_r2.branches[1]
+        .review_branch
+        .clone()
+        .expect("position 1 review ref");
+    let base_sha = git(&root, &["rev-parse", "main"]).trim().to_string();
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &base_sha, &position_1_tip])
+        .current_dir(&root)
+        .status()
+        .expect("run git")
+        .success();
+    assert!(
+        is_ancestor,
+        "the moved branch's stacked commit must descend from r2's own base"
+    );
+    let position_1_files = git(&root, &["ls-tree", "-r", "--name-only", &position_1_tip]);
+    assert!(position_1_files.contains("a.txt") && position_1_files.contains("c.txt"));
+    assert!(
+        !position_1_files.contains("b.txt"),
+        "the moved branch must not carry r1-only history: {position_1_files}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── RAL-124: bullet-format change summary, live Ollama ──────────────────────
+
+fn ollama_up() -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    "127.0.0.1:11434"
+        .parse()
+        .ok()
+        .and_then(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(400)).ok())
+        .is_some()
+}
+
+/// Whether ollama has `model` pulled (checked via its /api/tags).
+fn ollama_has_model(model: &str) -> bool {
+    match ureq::get("http://127.0.0.1:11434/api/tags").call() {
+        Ok(resp) => resp
+            .into_string()
+            .map(|b| b.contains(model))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Locate a `ralphus-runner` to drive: `RALPHUS_RUNNER_CMD`, else the dev venv.
+fn find_runner() -> Option<String> {
+    if let Ok(cmd) = std::env::var("RALPHUS_RUNNER_CMD") {
+        if !cmd.trim().is_empty() {
+            return Some(cmd);
+        }
+    }
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+    for rel in [
+        "cli/.venv/Scripts/ralphus-runner.exe",
+        "cli/.venv/bin/ralphus-runner",
+    ] {
+        let p = ws.join(rel);
+        if p.exists() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn pydantic_ai_available(runner_cmd: &str) -> bool {
+    let runner_path = Path::new(runner_cmd);
+    let Some(dir) = runner_path.parent() else {
+        return false;
+    };
+    for python in ["python.exe", "python3.exe", "python", "python3"] {
+        let p = dir.join(python);
+        if p.exists() {
+            return Command::new(p)
+                .args(["-c", "import pydantic_ai"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        }
+    }
+    false
+}
+
+/// A real end-to-end run of a two-branch stack (ticket-shaped branch names,
+/// one project) through a live ollama resolver, asserting the produced
+/// `change_summary` is a bullet list with one bullet per branch (RAL-124
+/// default format), each labelled with the branch's extracted ticket id.
+/// Skips unless ollama + a model + `ralphus-runner` are all available locally.
+#[test]
+fn generate_summary_live_ollama_produces_one_bullet_per_branch() {
+    let Some(runner_cmd) = find_runner() else {
+        eprintln!(
+            "SKIP generate_summary_live_ollama: ralphus-runner not found (set RALPHUS_RUNNER_CMD)"
+        );
+        return;
+    };
+    if !pydantic_ai_available(&runner_cmd) {
+        eprintln!(
+            "SKIP generate_summary_live_ollama: pydantic-ai not installed in runner environment (run `uv sync --extra runner` in cli/)"
+        );
+        return;
+    }
+    if !ollama_up() {
+        eprintln!("SKIP generate_summary_live_ollama: ollama not reachable on 127.0.0.1:11434");
+        return;
+    }
+    let model = std::env::var("RALPHUS_RESOLVER_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+    if !ollama_has_model(&model) {
+        eprintln!("SKIP generate_summary_live_ollama: ollama model '{model}' not pulled");
+        return;
+    }
+
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "RAL-201-add-widget"]);
+    write(&root, "widget.txt", "widget\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "Add the widget feature"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "RAL-202-fix-gadget"]);
+    write(&root, "gadget.txt", "gadget\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "Fix a bug in the gadget"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("review", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "RAL-201-add-widget").unwrap();
+        g.add_guardian_branch(&id, "RAL-202-fix-gadget").unwrap();
+        id
+    };
+
+    let runner = ralphus_daemon::runner::SubprocessRunner::new(&runner_cmd);
+    run_merge(&store, &runner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    let summary = view
+        .change_summary
+        .expect("live ollama should have produced a change summary");
+    eprintln!("generated change summary:\n{summary}");
+
+    let bullet_lines: Vec<&str> = summary
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('-'))
+        .collect();
+    assert!(
+        bullet_lines.len() >= 2,
+        "expected at least one bullet per branch, got: {summary:?}"
+    );
+    assert!(
+        summary.contains("RAL-201") && summary.contains("RAL-202"),
+        "each bullet should be labelled with its branch's ticket id: {summary:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

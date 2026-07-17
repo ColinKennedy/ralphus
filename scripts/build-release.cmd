@@ -47,6 +47,7 @@ rem current source; a fresh `uvx --with .` env can serve a cached wheel instead.
 uv run --extra runner --with pyinstaller ^
   pyinstaller --onefile --clean --name ralphus ^
   --distpath "%dist%" --workpath "%root%\target\pyinstaller" --specpath "%root%\target\pyinstaller" ^
+  --version-file "%root%\scripts\version_info_cli.txt" ^
   %PYD_METADATA% ^
   "%root%\scripts\ralphus_entry.py"
 if errorlevel 1 (popd & exit /b 1)
@@ -55,6 +56,7 @@ echo == building Python runner (one-file, with the 'runner' extra) ==
 uv run --extra runner --with pyinstaller ^
   pyinstaller --onefile --clean --name ralphus-runner ^
   --distpath "%dist%" --workpath "%root%\target\pyinstaller" --specpath "%root%\target\pyinstaller" ^
+  --version-file "%root%\scripts\version_info_runner.txt" ^
   %PYD_METADATA% ^
   "%root%\scripts\ralphus_runner_entry.py"
 if errorlevel 1 (popd & exit /b 1)

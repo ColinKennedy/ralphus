@@ -98,6 +98,24 @@ def test_spec_rejects_non_bool_verify() -> None:
         SessionSpec.from_json(_spec_json(verify="yes"))
 
 
+def test_spec_trace_context_defaults_none() -> None:
+    # RAL-96: existing callers/tests that don't supply a trace_context must
+    # keep working — it is not a required field.
+    spec = SessionSpec.from_json(_spec_json())
+    assert spec.trace_context is None
+
+
+def test_spec_parses_trace_context() -> None:
+    traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    spec = SessionSpec.from_json(_spec_json(trace_context=traceparent))
+    assert spec.trace_context == traceparent
+
+
+def test_spec_rejects_non_string_trace_context() -> None:
+    with pytest.raises(SpecError):
+        SessionSpec.from_json(_spec_json(trace_context=123))
+
+
 # ── Workspace tools ──────────────────────────────────────────────────────────
 
 
@@ -465,3 +483,61 @@ def test_main_native_prompt_without_pydantic_ai_is_clear(
     assert code == 1
     assert payload["status"] == "failed"
     assert "runner" in payload["error"] and "pydantic-ai" in payload["error"]
+
+
+# ── __main__ --result-file (RAL-102 tmux mode) ──────────────────────────────
+
+
+def test_main_with_result_file_writes_json_and_prints_sentinel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ralphus.runner.__main__ import TMUX_DONE_MARKER, main
+
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(
+        _spec_json(cwd=str(tmp_path), command="echo done > result.txt"), encoding="utf-8"
+    )
+    result_path = tmp_path / "result.json"
+    code = main([str(spec_path), "--result-file", str(result_path)])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert (tmp_path / "result.txt").exists()
+    # Stdout carries only the sentinel, never the JSON payload — that goes to
+    # the result file instead (the sentinel is what lands in the tmux pane).
+    assert captured.out.strip() == f"{TMUX_DONE_MARKER}: done"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "done"
+
+
+def test_main_with_result_file_reports_failure_status_in_sentinel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ralphus.runner.__main__ import TMUX_DONE_MARKER, main
+
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text("{bad", encoding="utf-8")
+    result_path = tmp_path / "result.json"
+    code = main([str(spec_path), "--result-file", str(result_path)])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.out.strip() == f"{TMUX_DONE_MARKER}: failed"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+
+
+def test_main_result_file_flag_can_appear_before_spec_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ralphus.runner.__main__ import TMUX_DONE_MARKER, main
+
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(_spec_json(cwd=str(tmp_path)), encoding="utf-8")
+    result_path = tmp_path / "result.json"
+    code = main(["--result-file", str(result_path), str(spec_path)])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out.strip() == f"{TMUX_DONE_MARKER}: done"
+    assert json.loads(result_path.read_text(encoding="utf-8"))["status"] == "done"

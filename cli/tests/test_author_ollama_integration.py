@@ -26,6 +26,8 @@ pytest.importorskip("pydantic_ai", reason="pydantic-ai (runner extra) not instal
 from ralphus.author import build_system_prompt, build_user_prompt
 from ralphus.author.core import Budget, VerifyIntent, _split_documents
 
+pytestmark = pytest.mark.ollama  # calls a live LLM; excluded from `--ralphus-bench` (RAL-94)
+
 OLLAMA_URL = os.environ.get("RALPHUS_OLLAMA_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.environ.get("RALPHUS_OLLAMA_MODEL", "qwen3:8b")
 

@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use opentelemetry::Context;
+
 use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key};
 
 use crate::guardian::ActionHint;
@@ -174,7 +176,7 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
 }
 
 /// The upstream (`branch@{upstream}`) of the worktree's branch, if any.
-fn worktree_upstream(cwd: &Path) -> std::result::Result<String, String> {
+pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, String> {
     git(
         cwd,
         &[
@@ -185,6 +187,46 @@ fn worktree_upstream(cwd: &Path) -> std::result::Result<String, String> {
         ],
     )
     .map_err(|_| "no upstream".to_string())
+}
+
+/// The read-only "upstream" value to show for a session's git worktree in the
+/// board's detail pane. Two cases, per the RAL-50 branch-chaining sentinel:
+///
+/// - The session declares `upstream = "<<task:...>>"`: the displayed upstream
+///   is the *referenced* session's own worktree branch name (what this
+///   session's branch gets rebased onto before it runs) — not a plain
+///   tracking-ref lookup, since that sentinel is the authoritative source of
+///   truth for what this session's branch is chained onto.
+/// - No sentinel: falls back to the worktree's own git upstream tracking
+///   branch (typically the non-worktree base branch it was forked from, e.g.
+///   `main`).
+///
+/// `None` when `cwd` is unset, not inside a git worktree, or no upstream can
+/// be resolved (e.g. a chained dependency that hasn't materialized a
+/// worktree yet) — the caller shows this as "no upstream" rather than
+/// guessing, mirroring the fail-closed/best-effort tolerance used by
+/// [`crate::scheduler`]'s own upstream-rebase resolution.
+#[must_use]
+pub(crate) fn session_upstream_display(
+    cwd: Option<&str>,
+    rows: &[SessionRow],
+    task_idx: i64,
+    idx: i64,
+) -> Option<String> {
+    let cwd = cwd?;
+    project_root_of(cwd)?;
+    let row = rows.iter().find(|r| r.task_idx == task_idx && r.idx == idx);
+    if let Some(sentinel) = row.and_then(|r| r.upstream.as_deref()) {
+        let ref_str = ralphus_core::schema::parse_upstream_task_ref(sentinel)?;
+        let (task_name, session_id_filter) = ref_str
+            .split_once('/')
+            .map_or((ref_str, None), |(t, s)| (t, Some(s)));
+        let dep = rows.iter().find(|r| {
+            r.task_name == task_name && session_id_filter.is_none_or(|sid| r.session_id == sid)
+        })?;
+        return worktree_branch(Path::new(dep.cwd.as_deref()?)).ok();
+    }
+    worktree_upstream(Path::new(cwd)).ok()
 }
 
 /// One session's contribution to a review.
@@ -217,6 +259,7 @@ fn rows_from_file<'a>(
         tasks.push(TaskRow {
             idx: ti,
             name: task.name.clone(),
+            project: task.project.clone(),
             depends_on: task.depends_on.clone(),
         });
         for (s_idx, s) in task.session.iter().enumerate() {
@@ -273,12 +316,21 @@ pub fn derive_reviews(
     if file.review.is_empty() {
         return Ok(Vec::new());
     }
-    let (sessions, tasks, sess_info) = rows_from_file(file);
+    let (mut sessions, tasks, sess_info) = rows_from_file(file);
 
     // Check early: are there any sessions that opt into any review?
     if sess_info.iter().all(|(_, rev_id)| rev_id.is_none()) {
         return Ok(Vec::new());
     }
+
+    // A review-opted-in session's `cwd` may still be an unmaterialized
+    // `ralphus:new-worktree/<branch>` placeholder (RAL-100): normally the
+    // scheduler only resolves those when the run is claimed to execute, but
+    // this preflight needs a real worktree path *now* to run git against it.
+    // Resolving here (persisted via `Store::set_session_cwd`, same as the
+    // scheduler's resolution) means a restarted run never re-resolves it.
+    crate::worktrees::resolve_placeholders(store, run_id, &mut sessions, &tasks, &Context::new())
+        .map_err(ReviewError::new)?;
 
     // Topological rank per session position (for branch ordering).
     let execution = plan::plan(&sessions, &tasks).map_err(ReviewError::new)?;
@@ -295,9 +347,12 @@ pub fn derive_reviews(
         .collect();
 
     let mut memberships: Vec<Membership> = Vec::new();
-    for (pos, (cwd_opt, rev_id_opt)) in sess_info.iter().enumerate() {
+    for (pos, (_, rev_id_opt)) in sess_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
-        let cwd = cwd_opt
+        // Use the (now-resolved) cwd from `sessions`, not the raw placeholder
+        // string captured in `sess_info` before `resolve_placeholders` ran above.
+        let cwd = sessions[pos]
+            .cwd
             .as_deref()
             .ok_or_else(|| ReviewError::new("a session declaring a review has no cwd"))?;
         let cwd_path = Path::new(cwd);
@@ -358,9 +413,9 @@ pub fn derive_reviews(
         })
         .collect();
 
-    // Split memberships into link groups (shared across submissions via a stable
-    // `review_key`) and project groups (the classic "one review per repo per
-    // submit"). BTreeMap keys give a deterministic order.
+    // Split memberships into link groups (grouped within THIS submission by the
+    // `ralphus:new-review/<key>` placeholder) and project groups (the classic
+    // "one review per repo per submit"). BTreeMap keys give a deterministic order.
     let mut link_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
     let mut proj_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
     for m in &memberships {
@@ -405,61 +460,52 @@ pub fn derive_reviews(
         created.push(gid);
     }
 
-    // Link groups: find-or-create ONE shared guardian per key, appending this
-    // submission's branches (deduped against whatever is already attached). A
-    // guardian created here is tagged with this run; a pre-existing one keeps its
-    // original run tag and just grows. Branches are tagged with their project root
-    // so the merge engine processes each repo independently (RAL-29).
+    // Link groups: `ralphus:new-review/<key>` is a submission-LOCAL placeholder
+    // for a review id that does not exist yet. Each key group ALWAYS mints a fresh
+    // guardian for this submission — tasks sharing the same <key> within this one
+    // submission collapse into that new guardian, while different keys make
+    // different new guardians. A later submission that reuses the same <key> string
+    // gets its own brand-new guardian; the placeholder never attaches to a guardian
+    // from a previous submission (RAL-* placeholder semantics). The `review_key` is
+    // still recorded on the guardian purely as provenance (which placeholder minted
+    // it), never as a cross-submission link. Branches are tagged with their project
+    // root so the merge engine processes each repo independently (RAL-29).
     for (key, members) in &link_groups {
         let mut members = members.clone();
         members.sort_by_key(|m| m.order);
-        let gid = match store
-            .guardian_id_for_review_key(key)
-            .map_err(|e| ReviewError::new(e.to_string()))?
-        {
-            Some(gid) => gid,
-            None => {
-                // Use the first member's project as the primary git_root.
-                let project = members
-                    .first()
-                    .map(|m| m.project.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let base = members
-                    .first()
-                    .map_or_else(|| "main".to_string(), |m| m.base.clone());
-                let name = members
-                    .iter()
-                    .find(|m| !m.name.is_empty())
-                    .map_or_else(|| key.clone(), |m| m.name.clone());
-                let gid = store
-                    .create_guardian_keyed(&name, &base, &project, Some(run_id), Some(key))
-                    .map_err(|e| ReviewError::new(e.to_string()))?;
-                // Apply skip_worktrees for every distinct project in the group.
-                let distinct_projects: Vec<String> = {
-                    let mut seen = std::collections::HashSet::new();
-                    members
-                        .iter()
-                        .map(|m| m.project.to_string_lossy().into_owned())
-                        .filter(|p| seen.insert(p.clone()))
-                        .collect()
-                };
-                for proj in &distinct_projects {
-                    apply_skip_worktrees(store, &gid, proj)?;
-                }
-                apply_resolver(store, &gid, &members)?;
-                apply_action_hints(store, &gid, &members, &hints_by_id)?;
-                created.push(gid.clone());
-                gid
-            }
+        // Use the first member's project as the primary git_root.
+        let project = members
+            .first()
+            .map(|m| m.project.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let base = members
+            .first()
+            .map_or_else(|| "main".to_string(), |m| m.base.clone());
+        let name = members
+            .iter()
+            .find(|m| !m.name.is_empty())
+            .map_or_else(|| key.clone(), |m| m.name.clone());
+        let gid = store
+            .create_guardian_keyed(&name, &base, &project, Some(run_id), Some(key))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        // Apply skip_worktrees for every distinct project in the group.
+        let distinct_projects: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            members
+                .iter()
+                .map(|m| m.project.to_string_lossy().into_owned())
+                .filter(|p| seen.insert(p.clone()))
+                .collect()
         };
-        let already: Vec<String> = store
-            .guardian_branches(&gid)
-            .map_err(|e| ReviewError::new(e.to_string()))?
-            .into_iter()
-            .map(|b| b.branch)
-            .collect();
-        // Tag each branch with its project root (multi-project link group).
-        add_new_branches(store, &gid, &already, &members, true)?;
+        for proj in &distinct_projects {
+            apply_skip_worktrees(store, &gid, proj)?;
+        }
+        apply_resolver(store, &gid, &members)?;
+        apply_action_hints(store, &gid, &members, &hints_by_id)?;
+        // Freshly minted guardian: no branches attached yet. Tag each branch with
+        // its project root (multi-project link group).
+        add_new_branches(store, &gid, &[], &members, true)?;
+        created.push(gid);
     }
 
     Ok(created)
@@ -683,6 +729,129 @@ mod tests {
             "no unmerged files after abort; status:\n{status}"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── session_upstream_display ─────────────────────────────────────────────
+
+    use super::session_upstream_display;
+    use crate::store::SessionRow;
+
+    fn row(task_idx: i64, task_name: &str, session_id: &str, cwd: Option<&Path>) -> SessionRow {
+        SessionRow {
+            task_idx,
+            idx: 0,
+            task_name: task_name.to_string(),
+            session_id: session_id.to_string(),
+            cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            subprojects: vec![],
+            prompt: None,
+            command: Some("x".to_string()),
+            agent: "claude".to_string(),
+            model: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            upstream: None,
+        }
+    }
+
+    #[test]
+    fn upstream_display_is_none_for_non_git_cwd() {
+        let dir = temp_repo(); // created but never `git init`'d
+        let rows = [row(0, "t", "s", Some(&dir))];
+        assert_eq!(
+            session_upstream_display(rows[0].cwd.as_deref(), &rows, 0, 0),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upstream_display_falls_back_to_tracking_branch() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+
+        let rows = [row(0, "t", "s", Some(&root))];
+        assert_eq!(
+            session_upstream_display(rows[0].cwd.as_deref(), &rows, 0, 0),
+            Some("main".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upstream_display_resolves_chained_dependency_branch_over_tracking_ref() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+
+        let dep_wt = root.join("wt-dep");
+        let work_wt = root.join("wt-work");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "dep-branch",
+                dep_wt.to_str().unwrap(),
+            ],
+        );
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "work-branch",
+                work_wt.to_str().unwrap(),
+            ],
+        );
+        // The work branch also tracks main — this must be ignored in favor of
+        // the chained dependency's own branch.
+        git(&work_wt, &["branch", "--set-upstream-to", "main"]);
+
+        let dep_row = row(0, "dep-task", "work", Some(&dep_wt));
+        let mut work_row = row(1, "work-task", "work", Some(&work_wt));
+        work_row.upstream = Some("<<task:dep-task>>".to_string());
+        let rows = [dep_row, work_row];
+
+        assert_eq!(
+            session_upstream_display(rows[1].cwd.as_deref(), &rows, 1, 0),
+            Some("dep-branch".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upstream_display_none_when_chained_dependency_not_yet_materialized() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["checkout", "-b", "work-branch"]);
+
+        let dep_row = row(0, "dep-task", "work", None); // not materialized yet
+        let mut work_row = row(1, "work-task", "work", Some(&root));
+        work_row.upstream = Some("<<task:dep-task>>".to_string());
+        let rows = [dep_row, work_row];
+
+        assert_eq!(
+            session_upstream_display(rows[1].cwd.as_deref(), &rows, 1, 0),
+            None,
+            "must not fall back to the tracking ref when a chained dependency is declared but unresolved"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -3,11 +3,15 @@
   "private": true,
   "description": "Lint tooling for the librarian's inline board.html JavaScript. Not a runtime dependency — the librarian embeds board.html via include_str! and ships no Node code.",
   "scripts": {
-    "lint": "eslint librarian/assets/board.html"
+    "lint": "eslint librarian/assets/board.html",
+    "extract-board-js": "node scripts/extract-board-js.mjs",
+    "typecheck": "npm run extract-board-js && node scripts/typecheck-board.mjs"
   },
   "devDependencies": {
     "eslint": "^9.13.0",
     "eslint-plugin-html": "^8.1.2",
-    "globals": "^15.11.0"
+    "eslint-plugin-jsdoc": "^50.4.3",
+    "globals": "^15.11.0",
+    "typescript": "^5.6.3"
   }
 }

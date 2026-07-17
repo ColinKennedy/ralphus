@@ -4,8 +4,11 @@
 //! unit-tested quickly and reused across the Rust executables. Heavier concerns
 //! (HTTP, SQLite, process spawning) live in the `daemon` and `librarian` crates.
 
+mod bench_demo;
 pub mod schema;
 pub mod validate;
+
+pub use bench_demo::ralphus_bench_tests;
 
 /// The workspace version, surfaced so every executable reports the same string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

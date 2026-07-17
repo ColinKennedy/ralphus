@@ -26,6 +26,16 @@ for bin in ralphus-daemon ralphus-librarian; do
   done
 done
 
+# PyInstaller's --version-file only means anything on Windows; on other
+# targets the exe has no PE resources to embed it into. $OS=Windows_NT is set
+# by the Windows environment itself, so it's present under git-bash too.
+version_file_cli=()
+version_file_runner=()
+if [ "${OS:-}" = "Windows_NT" ]; then
+  version_file_cli=(--version-file "$root/scripts/version_info_cli.txt")
+  version_file_runner=(--version-file "$root/scripts/version_info_runner.txt")
+fi
+
 echo "== building Python CLI (one-file) =="
 # Build from the project venv (editable install) so PyInstaller bundles the
 # current source; a fresh `uvx --with .` env can serve a cached wheel instead.
@@ -34,6 +44,7 @@ uv sync >/dev/null
 uv run --with pyinstaller \
   pyinstaller --onefile --clean --name ralphus \
   --distpath "$dist" --workpath "$root/target/pyinstaller" --specpath "$root/target/pyinstaller" \
+  "${version_file_cli[@]}" \
   "$root/scripts/ralphus_entry.py"
 
 echo "== building Python runner (one-file, bundles pydantic-ai) =="
@@ -55,6 +66,7 @@ uv run --extra runner --with pyinstaller \
   --hidden-import tiktoken_ext.openai_public \
   --recursive-copy-metadata pydantic-ai-slim \
   --distpath "$dist" --workpath "$root/target/pyinstaller" --specpath "$root/target/pyinstaller" \
+  "${version_file_runner[@]}" \
   "$root/scripts/ralphus_runner_entry.py"
 
 echo "== done; artifacts in $dist =="

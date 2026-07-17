@@ -6,12 +6,18 @@
 //! `main.rs` binary on top) keeps it unit-testable.
 
 pub mod cancel;
+pub mod cartographer;
 pub mod chat_client;
 pub mod config;
+pub mod forge;
+pub mod ghost;
 pub mod guardian;
 pub mod guardian_merge;
+pub mod jobobject;
 pub mod logging;
+pub mod otel;
 pub mod plan;
+pub mod pr;
 pub mod procreg;
 pub mod resources;
 pub mod reviews;
@@ -19,7 +25,10 @@ pub mod runner;
 pub mod scheduler;
 pub mod server;
 pub mod store;
+pub mod summary_worker;
+pub mod tmux;
 pub mod verify;
+pub mod worktrees;
 
 use std::path::PathBuf;
 
@@ -56,30 +65,51 @@ pub enum Command {
     /// Print usage and exit.
     Help,
     /// Run the daemon (serve the HTTP API).
-    Serve,
+    Serve {
+        /// Port the HTTP API binds to on `127.0.0.1`.
+        port: u16,
+    },
     /// Validate a task TOML file offline (no server, no database).
     Validate(String),
+    /// Forward arguments raw to the resolved tmux binary (RAL-102). CLI-only —
+    /// never exposed over the HTTP API.
+    Mux(Vec<String>),
 }
 
 /// Parse daemon CLI arguments (excluding the program name).
 ///
-/// Unknown or missing subcommands fall back to `Help` so the binary always has
-/// a well-defined, non-panicking behavior.
+/// Supports `serve [--port N]`. Unknown or missing subcommands fall back to
+/// `Help` so the binary always has a well-defined, non-panicking behavior.
 #[must_use]
 pub fn parse_args(args: &[String]) -> Command {
     match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => Command::Version,
-        Some("serve") => Command::Serve,
+        Some("serve") => {
+            let port = parse_port_flag(&args[1..]).unwrap_or(DEFAULT_PORT);
+            Command::Serve { port }
+        }
         Some("validate") => Command::Validate(args.get(1).cloned().unwrap_or_default()),
+        Some("mux") => Command::Mux(args[1..].to_vec()),
         _ => Command::Help,
     }
+}
+
+/// Extract `--port <N>` from the argument tail, if present and valid.
+fn parse_port_flag(tail: &[String]) -> Option<u16> {
+    let mut it = tail.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--port" {
+            return it.next().and_then(|v| v.parse::<u16>().ok());
+        }
+    }
+    None
 }
 
 /// The usage string shown for `help` / unknown commands.
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve             Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    version           Print version and exit\n    help              Print this message\n",
+        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    version           Print version and exit\n    help              Print this message\n",
         ralphus_core::version()
     )
 }
@@ -128,7 +158,26 @@ mod tests {
 
     #[test]
     fn parses_serve() {
-        assert_eq!(parse_args(&args(&["serve"])), Command::Serve);
+        assert_eq!(
+            parse_args(&args(&["serve"])),
+            Command::Serve { port: DEFAULT_PORT }
+        );
+    }
+
+    #[test]
+    fn serve_honors_port_flag() {
+        assert_eq!(
+            parse_args(&args(&["serve", "--port", "9000"])),
+            Command::Serve { port: 9000 }
+        );
+    }
+
+    #[test]
+    fn serve_ignores_bad_port() {
+        assert_eq!(
+            parse_args(&args(&["serve", "--port", "notaport"])),
+            Command::Serve { port: DEFAULT_PORT }
+        );
     }
 
     #[test]
@@ -141,6 +190,20 @@ mod tests {
             parse_args(&args(&["validate"])),
             Command::Validate(String::new())
         );
+    }
+
+    #[test]
+    fn parses_mux_with_trailing_args() {
+        assert_eq!(
+            parse_args(&args(&["mux", "capture-pane", "-p", "-t", "foo"])),
+            Command::Mux(vec![
+                "capture-pane".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                "foo".to_string(),
+            ])
+        );
+        assert_eq!(parse_args(&args(&["mux"])), Command::Mux(vec![]));
     }
 
     #[test]

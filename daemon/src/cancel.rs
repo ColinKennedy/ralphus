@@ -79,6 +79,16 @@ impl Cancellations {
         self.lock().remove(run_id);
     }
 
+    /// Whether `run_id` currently has a registered token — i.e. a worker
+    /// thread is actively executing it (registered at the start of
+    /// `execute_run_inner`, removed only once that call returns). Used to
+    /// wait out a still-in-flight worker before a restart re-claims the run;
+    /// see `server::restart_run`'s doc comment.
+    #[must_use]
+    pub fn is_active(&self, run_id: &str) -> bool {
+        self.lock().contains_key(run_id)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancelToken>> {
         self.0.lock().expect("cancellation registry poisoned")
     }
@@ -118,5 +128,15 @@ mod tests {
         reg.remove("run-1");
         reg.cancel("run-1"); // the registry no longer knows it
         assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn is_active_reflects_registration_and_removal() {
+        let reg = Cancellations::new();
+        assert!(!reg.is_active("run-1"));
+        let _ = reg.register("run-1");
+        assert!(reg.is_active("run-1"));
+        reg.remove("run-1");
+        assert!(!reg.is_active("run-1"));
     }
 }

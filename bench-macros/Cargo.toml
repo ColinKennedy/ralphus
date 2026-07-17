@@ -1,0 +1,18 @@
+[package]
+name = "ralphus-bench-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Proc-macro attribute registering RAL-94 Rust benchmark-harness tests."
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

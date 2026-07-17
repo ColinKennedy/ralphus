@@ -260,8 +260,13 @@ def build_system_prompt(
         "Hard rules:",
         "- Output ONLY TOML. To emit multiple independent documents, separate each "
         "with a line containing exactly three dashes.",
-        "- Every [[task.session]] needs a real absolute `cwd` (forward slashes on "
-        "Windows) and exactly one of `prompt` or `command`.",
+        "- Every [[task.session]] needs a `cwd` -- either a real absolute path "
+        '(forward slashes on Windows) or a placeholder "ralphus:new-worktree/<branch>" '
+        "naming a branch to materialize (see the 'Project registry + placeholder "
+        "cwd' section below) -- and exactly one of `prompt` or `command`. A "
+        "placeholder's task MUST set `project` to a project already registered "
+        "via `ralphus project git`; that field names which registered project "
+        "the branch is materialized under.",
         "- Keep task and session names unique; wire ordering with `depends_on`.",
         _review_directive(wants_review),
         _verify_directive(intent),

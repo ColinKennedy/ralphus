@@ -373,6 +373,20 @@ def test_cli_author_dry_run(_patch_cli: _FakeClient, capsys: pytest.CaptureFixtu
     assert not _patch_cli.submitted
 
 
+def test_cli_author_fully_non_interactive_with_no_flags(
+    _patch_cli: _FakeClient, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Q6 (CLI_PARITY_PLAN.local.md): `author` must never block on stdin when
+    it isn't a TTY, even with none of --verify/--review/--hold given. Forces
+    isatty() False regardless of the real pytest stdin state, so this holds
+    even where pytest's own stdin happens to be a real terminal.
+    """
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    code = cli.main(["author", "--goal", "build x"])
+    assert code == 0
+    assert _patch_cli.submitted
+
+
 def test_cli_author_missing_extra(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -19,6 +19,9 @@ def test_no_command_prints_help_and_succeeds(capsys: pytest.CaptureFixture[str])
     assert "usage: ralphus" in captured.out.lower()
 
 
+@pytest.mark.no_bench  # hits a real (refused) socket with a real timeout;
+# under repeated in-process invocation its duration reflects network/OS
+# latency, not this repo's performance (same reasoning as test_health.py)
 def test_check_health_runs(capsys: pytest.CaptureFixture[str]) -> None:
     # Point at an unreachable daemon so the outcome is deterministic (daemon
     # check fails). Real check behaviour is covered in test_health.py.
@@ -26,6 +29,14 @@ def test_check_health_runs(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert code == 1
     assert "daemon" in captured.out.lower()
+
+
+def test_completion_bash_prints_a_sourceable_script(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["completion", "bash"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "_ralphus_complete" in captured.out
+    assert "complete -F _ralphus_complete ralphus" in captured.out
 
 
 def test_bare_check_prints_check_help(capsys: pytest.CaptureFixture[str]) -> None:

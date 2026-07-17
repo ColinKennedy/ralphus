@@ -7,7 +7,8 @@ subscription) with **no API key and no per-token billing**.
 ``--dangerously-skip-permissions`` lets the agent edit files and run commands
 without interactive prompts, which is what makes unattended task execution work
 (the same approach the predecessor used). The ``claude`` program can be
-overridden with ``RALPHUS_CLAUDE_CMD``.
+overridden with ``RALPHUS_CLAUDE_COMMAND`` (also used by ``ralphus quick-start
+claude-code`` and validated by ``ralphus check health`` -- RAL-110).
 
 To avoid OS command-line length limits, the prompt is written to a temporary
 file under ~/.ralphus/task_prompts/ and referenced via the ``@path`` file-
@@ -37,6 +38,7 @@ import time
 from pathlib import Path
 
 from ralphus.config import load_config
+from ralphus.runner import cartographer
 from ralphus.runner.backend import BackendError, BackendOutcome
 from ralphus.runner.tools import Workspace
 
@@ -51,6 +53,35 @@ def _write_prompt_file(prompt: str) -> Path:
     path = prompts_dir / f"{digest}.md"
     path.write_text(prompt, encoding="utf-8")
     return path
+
+
+def _format_tool_input(tool_input: dict[str, object]) -> str:
+    """Render a ``tool_use`` block's input compactly for the live tmux pane (RAL-102)."""
+    parts = []
+    for key, value in tool_input.items():
+        text = str(value)
+        if len(text) > 80:
+            text = text[:80] + "…"
+        parts.append(f"{key}={text!r}")
+    return ", ".join(parts)
+
+
+def _tool_result_text(content: object) -> str:
+    """Extract human-readable text from a ``tool_result`` block's content (RAL-102).
+
+    ``content`` is either a plain string or a list of content blocks (e.g.
+    ``{"type": "text", "text": "..."}``) per the Claude Code stream-json schema.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n".join(text for text in texts if text)
+    return ""
 
 
 def live_session_path(workspace_root: str | Path) -> Path:
@@ -93,9 +124,13 @@ class ClaudeCodeBackend:
         the init event so the daemon's watcher thread can push it to the DB
         while the session is still running.
         """
-        program = os.environ.get("RALPHUS_CLAUDE_CMD", "claude")
+        program = os.environ.get("RALPHUS_CLAUDE_COMMAND", "claude")
         # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
         program = shutil.which(program) or program
+        # Unlike `ralphus quick-start claude-code`, this backend does not support
+        # a compound shell command (e.g. "cd foo && claude") here -- it always
+        # spawns `program` directly (never via a shell), matching this file's
+        # existing streaming-JSON `Popen` + pipe-parsing design.
         config = load_config()
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:8]
         print(
@@ -147,6 +182,10 @@ class ClaudeCodeBackend:
                 )
                 raise BackendError(f"could not run Claude Code ({program!r}): {exc}") from exc
 
+            # Human-readable header for the live tmux pane (RAL-102) -- everything
+            # below this is Claude's own text/tool-call activity, not runner logging.
+            print(f"Claude Code · model={model or 'default'}\ncwd: {workspace.root}\n")
+
             # Drain stderr in a background thread to prevent pipe-buffer deadlock
             # when stdout is being read line-by-line in the main thread.
             _stderr_chunks: list[str] = []
@@ -186,6 +225,47 @@ class ClaudeCodeBackend:
                                 f"ralphus [llm-invoke] claude-code session-id={session_id}",
                                 file=sys.stderr,
                             )
+                            # RALPHUS_EVENT (not just the side-channel file above) so
+                            # `runner.rs`'s existing tmux-pane event forwarder -- which
+                            # every session already streams through -- can persist this
+                            # to the session's own claude_session_id column right away.
+                            # Without this, "Open Agent" stayed disabled in the board
+                            # until the whole session finished, even though the id was
+                            # known and printed to the live pane from the very start.
+                            cartographer.emit(
+                                "llm-invoke",
+                                "claude-code session-id known",
+                                level="debug",
+                                payload={"claude_session_id": session_id},
+                            )
+                elif ev_type == "assistant":
+                    # Claude's own text/tool-call activity -- the whole point of the
+                    # live tmux pane (RAL-102) is to let a human read this, so print
+                    # it plainly rather than folding it into a summary line.
+                    message = ev.get("message") or {}
+                    for block in message.get("content") or []:
+                        block_type = block.get("type")
+                        if block_type == "text":
+                            text = block.get("text", "")
+                            if text:
+                                print(text)
+                        elif block_type == "tool_use":
+                            name = block.get("name", "tool")
+                            args = _format_tool_input(block.get("input") or {})
+                            print(f"[tool] {name}({args})", file=sys.stderr)
+                elif ev_type == "user":
+                    # Tool results fed back to Claude -- shown for the same reason.
+                    message = ev.get("message") or {}
+                    for block in message.get("content") or []:
+                        if block.get("type") != "tool_result":
+                            continue
+                        text = _tool_result_text(block.get("content"))
+                        if not text:
+                            continue
+                        if len(text) > 500:
+                            text = text[:500] + "…"
+                        label = "error" if block.get("is_error") else "result"
+                        print(f"[{label}] {text}", file=sys.stderr)
                 elif ev_type == "result":
                     result_summary = str(ev.get("result", ""))[:2000]
                     session_id = ev.get("session_id") or session_id

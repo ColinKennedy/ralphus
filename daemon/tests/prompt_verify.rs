@@ -11,12 +11,21 @@
 //! venv) — same idiom as `reviews_derive.rs`'s `full_flow` test.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::runner::SubprocessRunner;
 use ralphus_daemon::scheduler::execute_run;
 use ralphus_daemon::store::{RunState, Store};
+
+/// Both tests below build a fresh in-memory `Store` and therefore get the
+/// same deterministic run/task/session ids, which collapse to the same tmux
+/// session name (`session_name` only keys on those ids). Run them one at a
+/// time so two "new-session" calls for that identical name can't race.
+fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Whether an ollama server is listening on the default port.
 fn ollama_up() -> bool {
@@ -80,8 +89,16 @@ fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>
     let base = temp_base(tag);
     let cwd = base.to_string_lossy().replace('\\', "/");
 
+    // The task name feeds `tmux::session_name(run_id, task, session_id)`, and
+    // `run_id` is deterministic per fresh in-memory Store (always
+    // "run-000000000001"). Since cargo runs tests in the same binary
+    // concurrently by default, two tests both named "t" would race on the
+    // *same* tmux session name — one test's setup can kill/overwrite the
+    // other's live session mid-run, so a test can read back its sibling's
+    // pane output instead of its own. `tag` keeps the two tests' sessions
+    // distinct.
     let toml = format!(
-        "[[task]]\nname=\"t\"\n\
+        "[[task]]\nname=\"t-{tag}\"\n\
          [[task.session]]\ncwd=\"{cwd}\"\ncommand=\"echo noop\"\nagent=\"ollama\"\nmodel=\"{model}\"\n\
          [[task.verify]]\nid=\"claim\"\nprompt=\"Confirm this arithmetic claim: {claim}\"\n"
     );
@@ -128,6 +145,7 @@ fn prompt_verify_passes_a_true_claim_via_real_ollama() {
         return;
     }
 
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let (kind, output, run_state) = run_one_claim(&model, "2 + 2 = 4", "true");
     assert_eq!(kind, "prompt");
     assert_eq!(run_state, RunState::Done, "verify output: {output:?}");
@@ -149,6 +167,7 @@ fn prompt_verify_fails_a_false_claim_via_real_ollama() {
         return;
     }
 
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let (kind, output, run_state) = run_one_claim(&model, "2 + 2 = 5", "false");
     assert_eq!(kind, "prompt");
     assert_eq!(run_state, RunState::Failed, "verify output: {output:?}");

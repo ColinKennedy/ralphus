@@ -42,13 +42,21 @@ Tip: validate before submitting -- `ralphus validate file.toml`
 ---------------------------------------------------------------
  Key          Type           Notes / example
  name         string  REQ    Unique task name, e.g. "build"
- project      string         Namespace label (defaults to the git repo name)
+ project      string         Namespace label. REQUIRED, whenever a
+                             placeholder cwd is used
+                             (e.g. "ralphus:new-worktree/<branch>").
+                             `project` MUST match a project from `ralphus project list`.
+ root         string         The VCS root, if any. e.g. a git repository root.
  agent        string         Default agent for the task's sessions
  model        string         Default model for the task's sessions
  args           array<string>  Extra agent CLI flags for every session
  budget_tokens  integer        Default total-token cap (in+out); sessions/verifies
                                inherit it. Exceeding it fails the step.
  max_retries    integer        Auto-retry count on failure
+ priority       integer        Initial Queue priority hint (lower = runs sooner).
+                               Seeds this task's starting position in the Queue tab;
+                               you reorder freely there afterwards, so it's only a
+                               starting nudge, not a hard guarantee.
  timeout_minutes integer       Default wall-clock timeout (minutes) for sessions
                                and verifies; each may override its own.
  depends_on     array<string>  Tasks this task waits on (see formats below)
@@ -63,19 +71,28 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  name                    string         Human-readable display label shown in the board
                                         (card and detail pane). Falls back to `id` when
                                         unset. No structural meaning -- safe to rename.
- cwd                     string  REQ    Absolute path to the session's working dir --
-                                        typically the git WORKTREE the agent operates in.
-                                        On Windows use forward slashes (e.g.
-                                        "C:/Users/me/repo/.wt/feat") -- a backslash after
-                                        C:\U... is an invalid TOML escape.
+ cwd                     string  REQ    RECOMMENDED: "ralphus:new-worktree/<branch>" -- a
+                                        placeholder naming a branch to materialize.
+                                        Requires the task's `project` field to name a
+                                        project registered via `ralphus project git`
+                                        (NOT embedded in `cwd` itself). The daemon
+                                        resolves it, creates (or reuses) a git worktree
+                                        for <branch>, and rewrites `cwd` to that real
+                                        path before the session runs. See "Project
+                                        registry" below.
+                                        ALTERNATIVE: an absolute path to an
+                                        already-built git WORKTREE, if you built it
+                                        yourself. ALWAYS use forward slashes (e.g.
+                                        "C:/Users/me/repo/.wt/feat")!
  subprojects             array<string>  If your project lives inside a monorepo, declare
-                                        which package subdirectories this session focuses
-                                        on, e.g. subprojects = ["packages/foo", "libs/bar"].
-                                        ralphus injects a system-prompt addendum telling
-                                        the agent to scope its edits to those paths (the
-                                        agent can still see the whole repo). The `cwd`
-                                        should always point to the repo root. Omit (or
-                                        leave empty) for single-project repos.
+                                        which package subdirectories this session
+                                        focuses on, e.g.
+                                        `subprojects = ["packages/foo", "libs/bar"]`.
+                                        Ralphus will focus its edits in those
+                                        directories. IMPORTANT: `cwd` should always
+                                        point to the (mono)repo root WORKTREE. Omit
+                                        `subprojects` (or leave empty) for
+                                        single-project repos.
  prompt                  string  ONE-OF AI prompt text (launches an agent session).
                                         May contain {handoff:<task-or-session>} -- replaced
                                         at run time with the summaries of this session's
@@ -103,6 +120,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  args                    array<string>  Per-session agent flags (appended after task args)
  budget_tokens           integer        Per-session total-token cap (falls back to task)
  timeout_minutes         integer        Per-session wall-clock timeout (falls back to task)
+ priority                integer        Initial Queue priority hint (lower = runs sooner);
+                                        seeds this session's starting Queue position.
  depends_on              array<string>  Sessions that must finish first (see formats below)
  upstream               string         Branch-chaining sentinel. Set to
                                         "<<task:task-name>>" or
@@ -120,11 +139,24 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         prompt or finalize session.
 
  Agent selection:
-   agent = "claude"   (default) -- Anthropic. Uses your Claude subscription via
-                       claude-code, or the API if ANTHROPIC_API_KEY is set.
-   agent = "claude-code" -- force the subscription CLI path (no API key needed).
-   agent = "ollama"   -- local model; pair with e.g. model = "qwen3:8b"
-                        (pick a tool-capable model).
+   For `agent = "{<...>}"`
+   Run `ralphus agent list` for the full set of supported agents and, for
+   each, either its fixed set of allowed models or "<any model>".
+
+   PLACEHOLDER NOTATION used below and throughout the EXAMPLES:
+     <<...>>   a LITERAL placeholder to keep as-is -- real ralphus syntax
+               the daemon itself parses at submit/run time, e.g.
+               "<<task:task-name>>" (see `upstream` above).
+     {<...>}   a value YOU must fill in before submitting -- never leave
+               this literal text in a real TOML file.
+
+   IMPORTANT: every `agent = "..."` below (task, session, AND the review's
+   resolver `agent`) is a {<...>} PLACEHOLDER --
+     agent = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
+   -- decide the real value per submission (from the request, ticket, or
+   project convention). Do NOT blindly copy a literal agent value (e.g.
+   "claude" or "claude-code") out of this tutorial into an unrelated
+   submission just because an example happened to show it.
 
 ---------------------------------------------------------------
  [[review]]   (zero or more per file, top-level)
@@ -145,8 +177,16 @@ Tip: validate before submitting -- `ralphus validate file.toml`
      make N reviews with names disambiguated automatically.
    * By LINK KEY (recommended for a planned batch): set
      id = "ralphus:new-review/<key>". Every session naming the
-     same <key> -- across tasks AND across separate `ralphus
-     submit` calls -- attaches to ONE shared review.
+     same <key> attaches to ONE shared review -- but ONLY within
+     the SAME submission (one `ralphus submit` call). The key is a
+     submission-LOCAL placeholder, not a stable cross-submission
+     link: two separate `ralphus submit` invocations that happen to
+     reuse the same <key> mint TWO independent guardians, not one.
+     To fold several TOML files into ONE review, pass them all to a
+     SINGLE `ralphus submit` call --
+       ralphus submit file-a.toml file-b.toml file-c.toml
+     -- which combines them into one submission before sending it
+     to the daemon.
 
  Key    Type    Notes
  id     string  Human-readable review id (also the default label),
@@ -196,7 +236,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                    output must report a PASS/FAIL verdict
                                    (searched for anywhere in its output); no
                                    verdict found = FAIL. Put the fix-and-retry
-                                   instructions in the prompt, e.g. "Run `<cmd>`;
+                                   instructions in the prompt, e.g. "Run `{<cmd>}`;
                                    fix problems and re-run up to 3 times; if still
                                    failing, fail with an error. Do NOT commit and
                                    do NOT push."
@@ -219,6 +259,34 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  NOTE: today the runner executes `command` and `prompt` verifiers; `brain`
  (local-LLM) and `approval` (human) verifiers are still accepted by the schema
  but deferred, and stay pending.
+
+---------------------------------------------------------------
+ Project registry + placeholder cwd
+---------------------------------------------------------------
+ A session `cwd` may be the placeholder "ralphus:new-worktree/<branch>"
+ instead of a real path. Register the project once, up front:
+
+   ralphus project git --path C:/Users/me/repo --name my-project --description "Backend API service"
+
+ Then reference it by name on the TASK (not embedded in `cwd`) -- no need to
+ know or build the worktree path yourself:
+
+   [[task]]
+   name    = "add-feature"
+   project = "my-project"          # REQUIRED: must match a registered name
+
+     [[task.session]]
+     cwd    = "ralphus:new-worktree/RAL-123-add_feature"
+     prompt = "..."
+
+ The daemon resolves "my-project" (the task's `project` field) against its
+ registry, creates (or reuses, across restarts) a git worktree for the
+ branch named after "ralphus:new-worktree/", and rewrites cwd to that real
+ path before the session runs. Both forms of `cwd` are valid -- a plain
+ absolute path (you already built the worktree yourself) or this placeholder
+ (the daemon builds it for you). A near-miss project name (e.g. from
+ speech-to-text) still resolves via fuzzy/description matching, but prefer
+ exact names.
 
 ---------------------------------------------------------------
  depends_on formats
@@ -253,7 +321,7 @@ Guardian exists to surface, and is almost never what you want.
  2. WORK session: do the work, but DO NOT commit or push. Leave the
     tree dirty for the finalize step.
 
-    When using agent = "claude-code", put the "do not commit / do
+    When using agent = "{<...>}", put the "do not commit / do
     not push" constraint in `system_prompt` (with
     system_prompt_position = "append") rather than inside `prompt`.
     A `system_prompt` is more authoritative: agents can
@@ -261,13 +329,14 @@ Guardian exists to surface, and is almost never what you want.
     prompt, whereas system-prompt text is treated as a hard
     constraint for the entire session. Safety rails belong there.
 
+      # cwd's branch materializes under the task's `project` (below).
       [[task.session]]
       id                     = "work"
-      agent                  = "claude-code"
-      cwd                    = "C:/Users/me/repo_worktrees/RAL-X"
+      agent                  = "{<insert recommended agent here>}"  # see "Agent selection" above
+      cwd                    = "ralphus:new-worktree/RAL-X"
       system_prompt          = "Do NOT commit and do NOT push under any circumstances."
       system_prompt_position = "append"
-      prompt                 = "<< ticket text >>"
+      prompt                 = "{<ticket text>}"
 
  3. PROMPT VERIFY steps: one per check (format, lint, test). Each is
     a `prompt` verifier whose text runs the command and fixes on
@@ -303,13 +372,24 @@ Guardian exists to surface, and is almost never what you want.
  5. ONE review for the whole batch (the DEFAULT): add a top-level
     [[review]] block with id = "ralphus:new-review/<key>", then set
     review = "ralphus:new-review/<key>" on every [[task.session]] whose
-    cwd is a git worktree. Every session naming the same <key> -- across
-    tasks AND across separate `ralphus submit` calls -- attaches to ONE
-    shared Guardian. This is the norm for a list of tickets, not a
-    special case. Reach for a second review only when the batch splits
-    into two genuinely independent streams; otherwise keep it to one.
-    Never emit one review per task -- that is the anti-pattern this
-    layout exists to avoid.
+    cwd is a git worktree. Every session naming the same <key> attaches
+    to ONE shared Guardian -- but the <key> only groups WITHIN a single
+    submission. This is the norm for a list of tickets, not a special
+    case. Reach for a second review only when the batch splits into two
+    genuinely independent streams; otherwise keep it to one. Never emit
+    one review per task -- that is the anti-pattern this layout exists
+    to avoid.
+
+    IMPORTANT: if the batch spans MULTIPLE .toml files (one per
+    ticket/branch is the usual layout), every file that shares the same
+    <key> MUST be included in the SAME `ralphus submit` call:
+      ralphus submit ral-1.toml ral-2.toml ral-3.toml
+    Submitting them one file at a time (three separate `ralphus submit`
+    calls) mints THREE separate guardians, even though every file
+    declares the identical <key> -- the link key does not persist
+    across submissions. Every top-level [[review]] block must also be
+    repeated once per file (not just once across the whole batch) so
+    each file's own review-derivation pass has something to key off of.
 
  Ordering: branches that touch the SAME files should be sequenced
  with depends_on (so they stack cleanly); independent branches run in
@@ -322,31 +402,34 @@ Guardian exists to surface, and is almost never what you want.
 -- 1. Hello, world --------------------------------------------
 
 [[task]]
-name = "hello"
+name    = "hello"
+project = "my-project"            # REQUIRED: must match a registered name
 
   [[task.session]]
-  cwd    = "C:/Users/me/repo"
+  cwd    = "ralphus:new-worktree/hello"
   prompt = "Print 'Hello, World!' to a new file hello.txt."
 
 -- 2. A local (Ollama) deterministic check --------------------
 
 [[task]]
-name = "check"
+name    = "check"
+project = "my-project"
 
   [[task.session]]
-  cwd     = "C:/Users/me/repo"
-  agent   = "ollama"
+  cwd     = "ralphus:new-worktree/check"
+  agent   = "{<...put your recommended agent here>}"
   model   = "qwen3:8b"
   command = "cargo test"          # command ignores agent/model anyway
 
 -- 3. Two tasks, a handoff, and a per-project review ----------
 
 [[task]]
-name = "setup"
+name    = "setup"
+project = "my-project"
 
   [[task.session]]
   id     = "init"
-  cwd    = "C:/Users/me/repo/.wt/feature-a"
+  cwd    = "ralphus:new-worktree/feature-a"
   prompt = "Create data.json with {\"version\": 1}."
   review = "backend"              # opt this worktree branch into the review
 
@@ -355,10 +438,11 @@ name = "setup"
 
 [[task]]
 name       = "report"
+project    = "my-project"
 depends_on = ["setup"]            # waits for all of setup's sessions + verifiers
 
   [[task.session]]
-  cwd      = "C:/Users/me/repo/.wt/feature-b"
+  cwd      = "ralphus:new-worktree/feature-b"
   upstream = "<<task:setup>>"     # rebase feature-b onto setup's branch tip first
   prompt   = "Using {handoff:setup}, write a summary to report.md."
   review   = "backend"
@@ -372,12 +456,14 @@ id = "backend"
 
 -- 4. Recommended per-branch shape (agent verify + finalize) --
 
-# One shared review for the whole batch; agent = "claude" resolves conflicts.
+# One shared review for the whole batch. `agent` here is the CONFLICT-RESOLVER
+# backend (see the [[review]] table above), a separate decision from the
+# session `agent` below -- pick both deliberately, per submission.
 # The base branch is always resolved from each worktree's upstream tracking branch.
 [[review]]
 id    = "ralphus:new-review/ral-batch"
 name  = "RAL batch"
-agent = "claude"
+agent = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
 
 # Optional: user-declared test buttons shown in the review pane.
 [[review.action]]
@@ -389,36 +475,42 @@ label  = "Frontend smoke test"
 prompt = "Open localhost:3000 and click through the main workflows"
 
 [[task]]
-name = "ral-2"
+name    = "ral-2"
+project = "my-project"            # both sessions' worktree materializes under this
 
   # work: do the work, leave it uncommitted.
   # system_prompt carries immutable constraints (no commit/push) as a
   # hard directive rather than burying them in the user-turn prompt.
   [[task.session]]
   id                     = "work"
-  agent                  = "claude-code"
-  cwd                    = "C:/Users/me/repo_worktrees/RAL-2"
+  agent                  = "claude-code"  # required for system_prompt (see field reference above)
+  cwd                    = "ralphus:new-worktree/ral-2"
   review                 = "ralphus:new-review/ral-batch"
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
-  prompt                 = "<< the RAL-2 ticket text, pasted verbatim >>"
+  prompt                 = "{<the RAL-2 ticket text, pasted verbatim>}"
 
-    # agent verifiers fix-and-retry, without committing
+    # agent verifiers fix-and-retry, without committing. NOTE: unlike the
+    # work session's system_prompt, this must NOT also forbid file changes --
+    # fixing a lint or a failing test requires editing files, which would
+    # contradict the fix-and-retry instruction in `prompt` above.
     [[task.session.verify]]
     id                     = "fmt"
     prompt                 = "Run cargo fmt --all; re-run up to 3x or fail. No commit/push."
-    system_prompt          = "Do NOT commit, push, or make any file changes."
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances."
     system_prompt_position = "append"
     [[task.session.verify]]
     id                     = "test"
     prompt                 = "Run cargo test; fix and re-run up to 3x, else fail. No commit/push."
-    system_prompt          = "Do NOT commit, push, or make any file changes."
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances."
     system_prompt_position = "append"
 
   # finalize: AI stages only source files and commits (depends on work).
+  # Same placeholder string as "work" -- the daemon materializes it once and
+  # reuses the identical worktree for both sessions.
   [[task.session]]
   id         = "finalize"
-  cwd        = "C:/Users/me/repo_worktrees/RAL-2"
+  cwd        = "ralphus:new-worktree/ral-2"
   depends_on = ["work"]
   prompt     = "Stage only source changes (no build/temp files), commit, push if a remote exists."
 
@@ -426,20 +518,40 @@ name = "ral-2"
 # worktree branch onto ral-2's finalized tip before the agent starts.
 [[task]]
 name       = "ral-3"
+project    = "my-project"
 depends_on = ["ral-2"]
 
   [[task.session]]
   id                     = "work"
-  agent                  = "claude-code"
-  cwd                    = "C:/Users/me/repo_worktrees/RAL-3"
+  agent                  = "claude-code"  # required for system_prompt (see field reference above)
+  cwd                    = "ralphus:new-worktree/ral-3"
   upstream               = "<<task:ral-2>>"
   review                 = "ralphus:new-review/ral-batch"  # same key folds into same review
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
-  prompt                 = "<< the RAL-3 ticket text, pasted verbatim >>"
+  prompt                 = "{<the RAL-3 ticket text, pasted verbatim>}"
+
+-- 5. Placeholder cwd (daemon builds the git worktree) --------
+
+# "my-project" must already be registered: ralphus project git ...
+[[task]]
+name    = "add-widget"
+project = "my-project"
+
+  [[task.session]]
+  cwd    = "ralphus:new-worktree/RAL-999-add_widget"
+  prompt = "Add a widget module."
 
 Submit it:  ralphus submit tasks.toml
 (Adds it as Pending -- schedulable now. Use --hold to stage as Queued.)
+
+Multiple files, one submission: `ralphus submit` accepts more than one
+file --
+  ralphus submit ral-1.toml ral-2.toml ral-3.toml
+combines them into ONE submission before sending it to the daemon, so a
+`ralphus:new-review/<key>` shared across those files' [[review]] blocks
+folds into ONE guardian. Submitting the files one at a time instead
+(three separate `ralphus submit` calls) mints three separate guardians.
 """
 
 

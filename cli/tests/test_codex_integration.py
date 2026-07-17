@@ -17,6 +17,10 @@ from pathlib import Path
 
 import pytest
 
+# Calls a live LLM (via the Codex CLI + OpenAI API), same reasoning as the
+# `ollama`-marked tests: excluded from `--ralphus-bench` (RAL-94).
+pytestmark = pytest.mark.no_bench
+
 
 def _codex_available() -> bool:
     """Return True if a codex executable can be resolved."""

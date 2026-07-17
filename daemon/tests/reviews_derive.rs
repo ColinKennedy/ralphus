@@ -29,6 +29,7 @@ impl Runner for OkRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -80,6 +81,7 @@ impl Runner for ConflictResolvingRunner {
             error: None,
             verified: None,
             claude_session_id: None,
+            ghost: None,
         }
     }
 }
@@ -155,6 +157,19 @@ fn repo_with_worktree_no_upstream(base: &Path, branch: &str) -> String {
 fn session_toml(cwd: &str, review_id: &str, review_attrs: &str) -> String {
     format!(
         "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+         [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
+    )
+}
+
+/// Like [`session_toml`] but with TWO sessions in ONE submission, each in its own
+/// worktree, both opting into the same review. This is how a multi-project (or
+/// multi-branch) link-group guardian is built now that `ralphus:new-review/<key>`
+/// only groups WITHIN a submission.
+fn two_session_toml(cwd_a: &str, cwd_b: &str, review_id: &str, review_attrs: &str) -> String {
+    format!(
+        "[[task]]\nname=\"t\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
          [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
     )
 }
@@ -249,12 +264,16 @@ fn repo_with_two_worktrees(base: &Path, branch_a: &str, branch_b: &str) -> (Stri
 }
 
 #[test]
-fn separate_submissions_link_into_one_review_via_key() {
+fn separate_submissions_each_mint_a_fresh_review() {
+    // `ralphus:new-review/<key>` is a submission-LOCAL placeholder: it always mints
+    // a brand-new guardian for the submission that uses it. Two separate
+    // submissions that happen to reuse the same <key> string get two independent
+    // guardians — the placeholder never links across submissions.
     let base = temp_base("link");
     let (cwd_a, cwd_b) = repo_with_two_worktrees(&base, "feature/a", "feature/b");
     let mut store = Store::open_in_memory().unwrap();
 
-    // Submission 1 (branch a) creates the shared guardian, tagged with run 1.
+    // Submission 1 (branch a) mints a fresh guardian, tagged with run 1.
     let file1: TaskFile = toml::from_str(&session_toml(
         &cwd_a,
         "ralphus:new-review/batch",
@@ -263,11 +282,12 @@ fn separate_submissions_link_into_one_review_via_key() {
     .unwrap();
     let run1 = store.insert_run(&file1, None, false).unwrap();
     let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
-    assert_eq!(ids1.len(), 1, "first submission creates the guardian");
-    let gid = ids1[0].clone();
-    assert_eq!(store.get_guardian(&gid).unwrap().name, "My Batch");
+    assert_eq!(ids1.len(), 1, "first submission mints one guardian");
+    let gid1 = ids1[0].clone();
+    assert_eq!(store.get_guardian(&gid1).unwrap().name, "My Batch");
 
-    // Submission 2 (branch b) links to the SAME guardian by key — no new guardian.
+    // Submission 2 (branch b) reuses the same <key> string but is a SEPARATE
+    // submission, so it mints its OWN new guardian — it does not attach to gid1.
     let file2: TaskFile = toml::from_str(&session_toml(
         &cwd_b,
         "ralphus:new-review/batch",
@@ -276,23 +296,152 @@ fn separate_submissions_link_into_one_review_via_key() {
     .unwrap();
     let run2 = store.insert_run(&file2, None, false).unwrap();
     let ids2 = derive_reviews(&store, &run2, &file2).expect("derive 2");
-    assert!(ids2.is_empty(), "second submission creates no new guardian");
-    assert!(
-        store.guardians_for_run(&run2).unwrap().is_empty(),
-        "the shared guardian keeps its original run tag"
+    assert_eq!(
+        ids2.len(),
+        1,
+        "second submission mints its own new guardian"
+    );
+    let gid2 = ids2[0].clone();
+    assert_ne!(gid1, gid2, "the two submissions must not share a guardian");
+    assert_eq!(
+        store.guardians_for_run(&run2).unwrap(),
+        vec![gid2.clone()],
+        "the new guardian is tagged with the second run"
     );
 
-    // One guardian, both branches, in submission order.
-    let g = store.get_guardian(&gid).unwrap();
-    let branches: Vec<String> = g.branches.iter().map(|b| b.branch.clone()).collect();
-    assert_eq!(branches, vec!["feature/a", "feature/b"]);
-    assert_eq!(
-        store
-            .guardian_id_for_review_key("batch")
-            .unwrap()
-            .as_deref(),
-        Some(gid.as_str())
+    // Each guardian carries only its own submission's branch.
+    let b1: Vec<String> = store
+        .get_guardian(&gid1)
+        .unwrap()
+        .branches
+        .iter()
+        .map(|b| b.branch.clone())
+        .collect();
+    let b2: Vec<String> = store
+        .get_guardian(&gid2)
+        .unwrap()
+        .branches
+        .iter()
+        .map(|b| b.branch.clone())
+        .collect();
+    assert_eq!(b1, vec!["feature/a"]);
+    assert_eq!(b2, vec!["feature/b"]);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// One repo with three linked worktrees on `branch_a` / `branch_b` / `branch_c`.
+/// Returns the repo base plus each worktree's forward-slashed path.
+fn repo_with_three_worktrees(
+    base: &Path,
+    branch_a: &str,
+    branch_b: &str,
+    branch_c: &str,
+) -> (String, String, String) {
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "base"]);
+    let wta = base.join("wt-a");
+    let wtb = base.join("wt-b");
+    let wtc = base.join("wt-c");
+    git(
+        &repo,
+        &["worktree", "add", "-b", branch_a, wta.to_str().unwrap()],
     );
+    git(
+        &repo,
+        &["worktree", "add", "-b", branch_b, wtb.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["worktree", "add", "-b", branch_c, wtc.to_str().unwrap()],
+    );
+    git(&wta, &["branch", "--set-upstream-to=main"]);
+    git(&wtb, &["branch", "--set-upstream-to=main"]);
+    git(&wtc, &["branch", "--set-upstream-to=main"]);
+    (
+        wta.to_string_lossy().replace('\\', "/"),
+        wtb.to_string_lossy().replace('\\', "/"),
+        wtc.to_string_lossy().replace('\\', "/"),
+    )
+}
+
+/// Mirrors what `ralphus submit a.toml b.toml c.toml` now does client-side:
+/// read each file's TOML text independently and join them with a blank line
+/// into ONE combined submission before parsing/deriving reviews. Three
+/// self-contained "files" (each with its own `[[task]]` and its own
+/// `[[review]]` block, per the tutor's documented convention) are combined:
+/// two name the same `ralphus:new-review/<key>` and one names a different key.
+/// Combined in ONE submission, this must produce exactly two guardians — the
+/// shared-key one with two branches, the solo-key one with one branch.
+#[test]
+fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
+    let base = temp_base("threefiles");
+    let (cwd_a, cwd_b, cwd_c) =
+        repo_with_three_worktrees(&base, "feature/a", "feature/b", "feature/c");
+
+    // File 1: task "t1", opts into the shared key.
+    let file1_text = format!(
+        "[[task]]\nname=\"t1\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
+         [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
+    );
+    // File 2: task "t2", opts into the SAME shared key (repeated [[review]]
+    // block, matching the documented multi-file convention).
+    let file2_text = format!(
+        "[[task]]\nname=\"t2\"\n\
+         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
+         [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
+    );
+    // File 3: task "t3", opts into a DIFFERENT key -- must end up in its own review.
+    let file3_text = format!(
+        "[[task]]\nname=\"t3\"\n\
+         [[task.session]]\ncwd=\"{cwd_c}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/solo\"\n\
+         [[review]]\nid=\"ralphus:new-review/solo\"\nname=\"Solo\"\n"
+    );
+
+    // Exactly what `_cmd_submit` does for multiple file args: join with a blank
+    // line, submit once.
+    let combined = format!("{file1_text}\n\n{file2_text}\n\n{file3_text}");
+    let file: TaskFile = toml::from_str(&combined).expect("combined TOML parses");
+
+    let mut store = Store::open_in_memory().unwrap();
+    let run_id = store.insert_run(&file, None, false).unwrap();
+    let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
+
+    assert_eq!(
+        ids.len(),
+        2,
+        "two distinct keys in one submission -> exactly two reviews"
+    );
+
+    let guardians: Vec<_> = ids
+        .iter()
+        .map(|id| store.get_guardian(id).unwrap())
+        .collect();
+    let shared = guardians
+        .iter()
+        .find(|g| g.name == "Shared Batch")
+        .expect("a 'Shared Batch' guardian exists");
+    let solo = guardians
+        .iter()
+        .find(|g| g.name == "Solo")
+        .expect("a 'Solo' guardian exists");
+
+    let shared_branches: Vec<String> = shared.branches.iter().map(|b| b.branch.clone()).collect();
+    let solo_branches: Vec<String> = solo.branches.iter().map(|b| b.branch.clone()).collect();
+
+    assert_eq!(
+        shared_branches.len(),
+        2,
+        "the shared-key review collects both branches: {shared_branches:?}"
+    );
+    assert!(shared_branches.contains(&"feature/a".to_string()));
+    assert!(shared_branches.contains(&"feature/b".to_string()));
+    assert_eq!(solo_branches, vec!["feature/c".to_string()]);
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -338,9 +487,11 @@ fn reviews_auto_start_when_the_run_succeeds() {
         RunState::Done
     );
 
-    // The merge runs on a spawned thread; poll until it reaches review.
+    // The merge runs on a spawned thread; poll until it reaches review. Bounded
+    // generously (30s) since this does real git subprocess work and can be
+    // slow under CPU contention when the full suite runs many tests in parallel.
     let mut status = String::new();
-    for _ in 0..200 {
+    for _ in 0..2000 {
         status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
@@ -392,8 +543,11 @@ fn start_merge_resolves_conflicts_with_agent() {
         Arc::new(Semaphore::new(4)),
     );
 
+    // Generous poll budget: under full-suite parallel load (many git worktree
+    // ops + concurrent tests contending for CPU), this can take much longer
+    // than it does in isolation even though no live network call is involved.
     let mut status = String::new();
-    for _ in 0..200 {
+    for _ in 0..2400 {
         status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
@@ -511,7 +665,7 @@ fn force_push_then_merge_resolves_cleanly() {
     );
 
     let mut status = String::new();
-    for _ in 0..200 {
+    for _ in 0..2000 {
         status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
@@ -536,6 +690,230 @@ fn force_push_then_merge_resolves_cleanly() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// RAL-108: pressing "Merge / rebase" a second time on a review that is
+/// already `in_review` (branches merged and marked done, nothing changed
+/// since) must force a fresh rebase rather than silently 409ing. `start_merge`
+/// is the exact function the HTTP `/merge` endpoint calls, so exercising it
+/// directly proves the button's backend path actually re-runs the full
+/// stacked-rebase walk instead of no-oping on `in_review`.
+#[test]
+fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
+    let base = temp_base("rebutton");
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "base"]);
+
+    let wt_a = base.join("wt-a");
+    let wt_b = base.join("wt-b");
+    git(
+        &repo,
+        &["worktree", "add", "-b", "feature/a", wt_a.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["worktree", "add", "-b", "feature/b", wt_b.to_str().unwrap()],
+    );
+    git(&wt_a, &["branch", "--set-upstream-to=main"]);
+    git(&wt_b, &["branch", "--set-upstream-to=main"]);
+    std::fs::write(wt_a.join("a.txt"), "from a\n").unwrap();
+    git(&wt_a, &["add", "."]);
+    git(&wt_a, &["commit", "-m", "add a"]);
+    std::fs::write(wt_b.join("b.txt"), "from b\n").unwrap();
+    git(&wt_b, &["add", "."]);
+    git(&wt_b, &["commit", "-m", "add b"]);
+
+    let cwd_a = wt_a.to_string_lossy().replace('\\', "/");
+    let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
+    let toml = format!(
+        "[[task]]\nname=\"a\"\n\
+         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
+         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[review]]\nid=\"rev\"\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store
+        .lock()
+        .unwrap()
+        .insert_run(&file, None, false)
+        .unwrap();
+    let gid = {
+        let g = store.lock().unwrap();
+        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
+    };
+
+    // First "Merge / rebase" press: clean stack, reaches in_review with both
+    // branches done.
+    run_merge(&store, &OkRunner, &gid);
+    {
+        let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(view.status, "in_review");
+        assert!(view.branches.iter().all(|b| b.merge_status == "done"));
+    }
+
+    // Press "Merge / rebase" again on the now-`in_review` review — nothing
+    // about the branches changed, so before RAL-108 this 409'd as a no-op
+    // instead of forcing a fresh rebase.
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::new(OkRunner),
+        &gid,
+        Arc::new(Semaphore::new(4)),
+    );
+    assert_eq!(
+        reply.status, 202,
+        "the forced re-rebase must be accepted, not 409'd: {}",
+        reply.body
+    );
+
+    // This test drives two full merge cycles (one synchronous, one via the
+    // spawned background thread), so it needs more headroom than the other
+    // single-merge polling loops in this file (which use 200 * 25ms = 5s).
+    let mut status = String::new();
+    for _ in 0..1200 {
+        status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
+        if status == "in_review" || status == "merge_failed" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        status, "in_review",
+        "forced rebase must complete and return to in_review"
+    );
+    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert!(
+        view.branches.iter().all(|b| b.merge_status == "done"),
+        "branches must be walked back through to done: {:?}",
+        view.branches
+            .iter()
+            .map(|b| (&b.branch, &b.merge_status))
+            .collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ── RAL-101: project-level auto-build fallback ───────────────────────────────
+
+/// A review with no explicit `checks` configured still gets a build/test
+/// signal: the project's `.ralphus.toml` `[review] auto_build` default runs
+/// once the stack finishes merging, and its outcome is recorded on the
+/// guardian for the Reviews UI.
+#[test]
+fn no_checks_configured_runs_project_auto_build_default() {
+    let base = temp_base("autobuild-default");
+    let cwd = repo_with_worktree(&base, "feature/a");
+    let repo = base.join("repo");
+    std::fs::write(
+        repo.join(".ralphus.toml"),
+        "[review]\nauto_build = \"echo built > autobuild_ran.txt\"\n",
+    )
+    .unwrap();
+
+    let toml = session_toml(&cwd, "rev", "");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store
+        .lock()
+        .unwrap()
+        .insert_run(&file, None, false)
+        .unwrap();
+    let gid = {
+        let g = store.lock().unwrap();
+        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
+    };
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .guardian_checks(&gid)
+            .unwrap()
+            .is_empty(),
+        "sanity: this review has no explicit checks configured"
+    );
+
+    run_merge(&store, &OkRunner, &gid);
+
+    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert_eq!(
+        view.status, "in_review",
+        "auto-build must pass and the review must reach in_review: detail={:?}",
+        view.detail
+    );
+    let combined = view
+        .combined_worktree
+        .clone()
+        .expect("combined worktree must exist");
+    assert!(
+        Path::new(&combined).join("autobuild_ran.txt").exists(),
+        "the project's auto_build default must actually have run in the combined worktree"
+    );
+    assert_eq!(
+        view.detail.as_deref(),
+        Some("auto-built via project default: echo built > autobuild_ran.txt"),
+        "the guardian detail must record that the project auto-build ran, for the Reviews UI"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A review WITH explicit `checks` configured must not also run the project's
+/// `auto_build` default — checks take priority and the review is not
+/// double-built. Modeled by making the (unused) auto_build command always fail
+/// while the explicit check passes: if auto-build ran too, the merge would
+/// fail.
+#[test]
+fn checks_configured_does_not_also_run_auto_build() {
+    let base = temp_base("autobuild-skip");
+    let cwd = repo_with_worktree(&base, "feature/a");
+    let repo = base.join("repo");
+    std::fs::write(
+        repo.join(".ralphus.toml"),
+        "[review]\nauto_build = \"exit 1\"\n",
+    )
+    .unwrap();
+
+    let toml = session_toml(&cwd, "rev", "");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store
+        .lock()
+        .unwrap()
+        .insert_run(&file, None, false)
+        .unwrap();
+    let gid = {
+        let g = store.lock().unwrap();
+        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
+    };
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_checks(&gid, &["exit 0".to_string()])
+        .unwrap();
+
+    run_merge(&store, &OkRunner, &gid);
+
+    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert_eq!(
+        view.status, "in_review",
+        "explicit checks passed; the always-failing auto_build default must not have run \
+         (that would have failed the merge): detail={:?}",
+        view.detail
+    );
+    assert_ne!(
+        view.detail.as_deref(),
+        Some("auto-built via project default: exit 1"),
+        "auto-build must not be recorded as having run when explicit checks are configured"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // ── per-task review readiness (RAL-32) ───────────────────────────────────────
 
 fn ok_result() -> RunnerResult {
@@ -548,6 +926,7 @@ fn ok_result() -> RunnerResult {
         error: None,
         verified: None,
         claude_session_id: None,
+        ghost: None,
     }
 }
 
@@ -582,6 +961,7 @@ impl Runner for GatableRunner {
                 error: Some("cancelled".to_string()),
                 verified: None,
                 claude_session_id: None,
+                ghost: None,
             };
         }
         ok_result()
@@ -674,7 +1054,7 @@ fn non_overlapping_task_does_not_block_readiness() {
 }
 
 /// A task that shares the guardian's project directory blocks the review even
-/// when it never declared a `[[task.session.review]]`. The guardian for
+/// when none of its sessions set `review = "<id>"`. The guardian for
 /// project-X must wait for BOTH tasks (A and B) to be Done, even though only A
 /// declared the review.
 #[test]
@@ -967,28 +1347,19 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
 
     let mut store = Store::open_in_memory().unwrap();
 
-    // Submission 1: repo A.
-    let file1: TaskFile = toml::from_str(&session_toml(
+    // One submission with two sessions (repo A + repo B) sharing the key mints one
+    // multi-project guardian.
+    let file: TaskFile = toml::from_str(&two_session_toml(
         &cwd_a,
-        "ralphus:new-review/cross",
-        "name=\"Cross Review\"",
-    ))
-    .unwrap();
-    let run1 = store.insert_run(&file1, None, false).unwrap();
-    let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
-    assert_eq!(ids1.len(), 1, "first submission creates the guardian");
-    let gid = ids1[0].clone();
-
-    // Submission 2: repo B — links to the SAME guardian, no new guardian created.
-    let file2: TaskFile = toml::from_str(&session_toml(
         &cwd_b,
         "ralphus:new-review/cross",
         "name=\"Cross Review\"",
     ))
     .unwrap();
-    let run2 = store.insert_run(&file2, None, false).unwrap();
-    let ids2 = derive_reviews(&store, &run2, &file2).expect("derive 2");
-    assert!(ids2.is_empty(), "second submission creates no new guardian");
+    let run = store.insert_run(&file, None, false).unwrap();
+    let ids = derive_reviews(&store, &run, &file).expect("derive");
+    assert_eq!(ids.len(), 1, "one submission mints one guardian");
+    let gid = ids[0].clone();
 
     // The guardian has both branches.
     let g = store.get_guardian(&gid).unwrap();
@@ -1028,25 +1399,18 @@ fn link_key_same_repo_branches_have_no_project_tag() {
 
     let mut store = Store::open_in_memory().unwrap();
 
-    let file1: TaskFile = toml::from_str(&session_toml(
+    // One submission, two sessions in the SAME repo, sharing the key.
+    let file: TaskFile = toml::from_str(&two_session_toml(
         &cwd_a,
-        "ralphus:new-review/same",
-        "name=\"Same Repo\"",
-    ))
-    .unwrap();
-    let run1 = store.insert_run(&file1, None, false).unwrap();
-    let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
-
-    let file2: TaskFile = toml::from_str(&session_toml(
         &cwd_b,
         "ralphus:new-review/same",
         "name=\"Same Repo\"",
     ))
     .unwrap();
-    let run2 = store.insert_run(&file2, None, false).unwrap();
-    derive_reviews(&store, &run2, &file2).expect("derive 2");
+    let run = store.insert_run(&file, None, false).unwrap();
+    let ids = derive_reviews(&store, &run, &file).expect("derive");
 
-    let g = store.get_guardian(&ids1[0]).unwrap();
+    let g = store.get_guardian(&ids[0]).unwrap();
     // Branches in the same repo still carry a project tag (it just happens to be
     // the same path for both), so the merge engine partitions them into one group.
     assert_eq!(g.branches.len(), 2);
@@ -1123,30 +1487,20 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
 
-    let file1: TaskFile = toml::from_str(&session_toml(
+    // One submission with two sessions (repo A + repo B) sharing the key.
+    let file: TaskFile = toml::from_str(&two_session_toml(
         &cwd_a,
-        "ralphus:new-review/mp",
-        "name=\"MP Review\"",
-    ))
-    .unwrap();
-    let file2: TaskFile = toml::from_str(&session_toml(
         &cwd_b,
         "ralphus:new-review/mp",
         "name=\"MP Review\"",
     ))
     .unwrap();
-    let (gid, run1) = {
+    let gid = {
         let mut g = store.lock().unwrap();
-        let r1 = g.insert_run(&file1, None, false).unwrap();
-        let ids = derive_reviews(&g, &r1, &file1).expect("derive 1");
-        (ids[0].clone(), r1)
+        let r = g.insert_run(&file, None, false).unwrap();
+        let ids = derive_reviews(&g, &r, &file).expect("derive");
+        ids[0].clone()
     };
-    {
-        let mut g = store.lock().unwrap();
-        let r2 = g.insert_run(&file2, None, false).unwrap();
-        derive_reviews(&g, &r2, &file2).expect("derive 2");
-    }
-    drop(run1); // not used further
 
     // The guardian now has branches from two different repos.
     let g = store.lock().unwrap().get_guardian(&gid).unwrap();

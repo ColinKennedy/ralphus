@@ -1,0 +1,35 @@
+# Local OpenTelemetry Collector + Jaeger stack for viewing ralphus traces
+# (RAL-96). Entirely optional dev infrastructure — nothing in
+# `scripts/build-debug.sh` depends on this, and the daemon/librarian/runner
+# export zero spans unless OTEL_EXPORTER_OTLP_ENDPOINT is set. See
+# `docs/otel-tracing.md` for the full walkthrough.
+#
+# Usage:
+#   docker compose -f otel/docker-compose.yml up
+#   # then, in the shell you launch ralphus from:
+#   #   (bash)       export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+#   #   (PowerShell) $env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:4318"
+#   bash scripts/build-debug.sh
+#   # traces: http://127.0.0.1:16686
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      # OTLP/HTTP — point OTEL_EXPORTER_OTLP_ENDPOINT at this port.
+      - "4318:4318"
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      # Jaeger UI — open this in a browser to view traces.
+      - "16686:16686"
+      # OTLP/gRPC — the collector's own exporter target, not for direct use.
+      - "4317:4317"
