@@ -40,6 +40,7 @@ role in the table below, then use it.
 | `--warn` | `#d29922` | *(shared)* | semantic (Cartographer `warning`-level log severity, RAL-98) |
 | `--unverified` | `#e3b341` | *(shared)* | semantic (review reached done with no build/test verification, RAL-101) |
 | `--waiting` | `#f778ba` | *(shared)* | status (a `pending` run held back by a scheduler down-time window, RAL-122) |
+| `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -121,6 +122,15 @@ Distinct from `--pending` (grey, "the scheduler hasn't gotten to this yet")
 and from the caution-reserved `--ignored` (this is expected, configured
 behavior, not a warning) — `--waiting` exists only because no existing role
 fit this new concept (see "Adding a new UI element" below).
+
+### Soloed task — `--solo` only (RAL-157)
+A task marked "soloed" (right-click → Solo task) shows a small `★ solo` badge
+next to its status pill, colored `--solo`. `soloed` is an independent boolean
+flag orthogonal to the task's own `state` (a soloed task can be pending,
+running, or done), so it can't reuse a status color; it also isn't a user
+*selection* (`--accent`), a dependency-driven move (`--teal`), or a caution
+(`--ignored`) — `--solo` exists only because no existing role fit this new
+concept (see "Adding a new UI element" below).
 
 ### Read-only field indicator — `--muted` (no new color)
 A detail-pane field that is purely derived/computed and can never be edited

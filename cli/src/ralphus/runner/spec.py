@@ -81,6 +81,13 @@ class SessionSpec:
     # tracing configured (see `daemon/src/otel.rs`) — not a required field, so
     # existing callers/tests that don't supply it are unaffected.
     trace_context: str | None = None
+    # When set, resume this exact conversation instead of starting a fresh
+    # one -- the daemon's tmux auto-reattach retry sets this
+    # on a retried attempt after a session's tmux pane vanished unexpectedly
+    # mid-run but its agent_session_id was already captured live (see
+    # `daemon/src/runner.rs::SubprocessRunner::run_via_tmux`). `None` for a
+    # normal (first attempt) invocation.
+    resume_agent_session_id: str | None = None
 
     @staticmethod
     def from_json(text: str) -> SessionSpec:
@@ -107,6 +114,7 @@ class SessionSpec:
             timeout_sec=_opt_int(data, "timeout_sec"),
             verify=_opt_bool(data, "verify"),
             trace_context=_opt_str(data, "trace_context"),
+            resume_agent_session_id=_opt_str(data, "resume_agent_session_id"),
         )
         if (spec.prompt is None) == (spec.command is None):
             raise SpecError("exactly one of 'prompt' or 'command' must be set")
@@ -124,7 +132,7 @@ class SessionResult:
     summary: str = ""
     error: str | None = None
     verified: bool | None = None
-    claude_session_id: str | None = None
+    agent_session_id: str | None = None
     # RAL-136: the agent's self-summarized handoff note ("ghost"), extracted
     # from a RALPHUS_GHOST: marker in a normal (non-verify) prompt session's
     # final response. None for command sessions, verify steps, or when the
@@ -139,7 +147,7 @@ class SessionResult:
         tokens_out: int = 0,
         cost_usd: float = 0.0,
         verified: bool | None = None,
-        claude_session_id: str | None = None,
+        agent_session_id: str | None = None,
         ghost: str | None = None,
     ) -> SessionResult:
         """Construct a successful result. ``verified`` is set for verify runs only."""
@@ -150,7 +158,7 @@ class SessionResult:
             tokens_out=tokens_out,
             cost_usd=cost_usd,
             verified=verified,
-            claude_session_id=claude_session_id,
+            agent_session_id=agent_session_id,
             ghost=ghost,
         )
 
@@ -175,7 +183,7 @@ class SessionResult:
                 "summary": self.summary,
                 "error": self.error,
                 "verified": self.verified,
-                "claude_session_id": self.claude_session_id,
+                "agent_session_id": self.agent_session_id,
                 "ghost": self.ghost,
             }
         )

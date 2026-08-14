@@ -47,7 +47,7 @@ Key module map:
 - `daemon/src/logging.rs` — the `rlog!` file/stderr sink (RAL-83) that every Cartographer [`Note::emit`] call also writes through.
 - `auth/src/lib.rs` — Ed25519 license check (`check_license()`; compiles away without `secure-dist`).
 - `keygen/src/main.rs` — keypair generation + license signing CLI.
-- `cli/src/ralphus/runner/` — `spec.py` (wire contract), `tools.py` (workspace-confined file/shell tools), `execute.py`, `backend.py` (Protocol), `pydantic_backend.py` (native agent), `harness_backend.py` + `claude_code_backend.py` (external agents), `__main__.py`.
+- `cli/src/ralphus/runner/` — `spec.py` (wire contract), `tools.py` (workspace-confined file/shell tools), `execute.py`, `backend.py` (Protocol), `pydantic_backend.py` (native agent), `harness_backend.py` + `claude_code_backend.py` + `codex_backend.py` (external CLI agents; `cli_agent_common.py` holds the prompt-file/live-session helpers shared by the two CLI-agent backends), `__main__.py`.
 - `cli/src/ralphus/client.py` + `__main__.py` — CLI over the daemon API.
 - `cli/src/ralphus/author/` — `core.py` (orchestration loop), `agent.py` (pydantic-ai TOML generator).
 - `cli/src/ralphus/bench/` — RAL-94 Python benchmark harness: `durable_min.py`, `stats.py`, `gitinfo.py`, `storage.py`, `pytest_plugin.py` (`--ralphus-bench` opt-in), `graphs.py` (SVG + standalone HTML generation).
@@ -194,6 +194,8 @@ All live-Ollama tests **skip** (print `SKIP`) unless Ollama is up on `127.0.0.1:
 | `test_author.py` | `ralphus author`: intent parsing, token budget, validate loop, dry-run (78 tests) |
 | `test_harness_backend.py` | Harness backend (external tool as stand-in) |
 | `test_claude_code_backend.py` | Claude Code harness integration |
+| `test_codex_backend.py` | Codex CLI harness integration (command construction, no real CLI) |
+| `test_codex_integration.py` | End-to-end Codex prompt/verify session (skips without a real `codex` CLI + `OPENAI_API_KEY`) |
 | `test_ollama_integration.py` | End-to-end Ollama prompt → write file (skips if Ollama down) |
 | `test_verify_ollama_integration.py` | Prompt-kind verify with Ollama (same skip idiom) |
 | `test_author_ollama_integration.py` | `ralphus author` with qwen3:8b (same skip idiom) |
@@ -411,6 +413,18 @@ Two build scripts, two purposes (both in `scripts/`):
 
 **Release build — `bash scripts/build-release.sh`.** Builds copyable standalone binaries into `dist/`: `ralphus-daemon`, `ralphus-librarian`, `ralphus` (CLI), and `ralphus-runner` (PyInstaller one-file bundling the pydantic-ai tree — this is the slow part). Stop any running daemon/librarian first: they lock their own `dist/` exes and the copy step will fail with "Device or resource busy".
 
+**Testing ralphus using ralphus (multi-instance dev stacks, RAL-164).** `ralphus-daemon serve` accepts `--db <path>` alongside `--port`, and `build-debug.sh`/`.cmd` accept a matching `--db-path`. To keep your regular ralphus instance open while exercising a change in another git worktree, give that worktree's stack its own port *and* its own DB explicitly:
+
+```bash
+# worktree A (your regular instance) — unchanged, defaults
+bash scripts/build-debug.sh
+
+# worktree B — fully isolated second stack
+bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~/.ralphus/tasks-worktree-b.db
+```
+
+This is deliberately explicit, not auto-picked: if a script silently chose a port or DB path on `start`, a later `ralphus-daemon stop --port N` (a new shell, a different agent) would have no reliable way to know what to target. Passing a non-default `--daemon-port` without `--db-path` still gets automatic DB isolation (derived as `~/.ralphus/tasks-<port>.db`) — only the *default* port keeps using the plain `~/.ralphus/tasks.db` it always has, so existing setups are unaffected. Point the CLI or a browser at the second instance with `ralphus --daemon-url http://127.0.0.1:7891 ...` / `http://127.0.0.1:7475`, and stop it with `ralphus-daemon stop --port 7891` when done.
+
 Run the pieces directly:
 
 ```bash
@@ -474,6 +488,7 @@ Re-keying: delete `ralphus-private.key`, run `generate` again, commit the new `a
 - **Port clash**: the old claudectl also uses 7474/7890; the daemon port is not yet CLI-configurable, so don't run both.
 - **Submitting goes to `Pending` (schedulable now)**, not `Queued`. `hold=true` stages as `Queued`; `/activate` promotes it. (The predecessor's silently-`Queued`-forever bug — FINDINGS §2.4.)
 - **`keygen` is never shipped.** It is not in the release build scripts and should not be added. It is a workspace member only so `cargo build --all` can catch compile errors in CI.
+- **A tmux-wrapped session's pane can vanish mid-run with no clean explanation** on the Windows tmux-alternative this project targets (`psmux`) — see the gitignored `PSMUX_CRASH_NOTES.local.md` if present for background. `SubprocessRunner::run_via_tmux` (`daemon/src/runner.rs`) mitigates this: once a `claude-code`/`codex` session's `agent_session_id` has been captured live (from the `stream-json` init event or Codex's `thread.started` event, forwarded over the `RALPHUS_EVENT:` marker), a pane that goes unreachable for `MISSING_SESSION_STRIKE_LIMIT` consecutive polls triggers a bounded auto-reattach (`claude -p --resume <id>` or `codex exec resume <id>`, up to `SubprocessRunner::MAX_REATTACH_ATTEMPTS` times) in a fresh tmux session under the *same* deterministic name — so the board's "Show Live View"/"Open Terminal Log" buttons transparently start working again with no UI-side change. The overall `timeout_sec` budget is shared across every attempt, never reset by a reattach. Every stage (session lost / reattach attempt / giving up) is logged via both `rlog!` and a `tmux-reattach`-scoped Cartographer note carrying attempt/elapsed/reason/last-error, so a real occurrence is fully diagnosable from Cartographer alone. Only exercised for `agent = "claude-code"`/`"claude-cli"`/`"codex"`/`"codex-cli"`; other agents still fail outright on a lost pane, exactly as before.
 
 ## Built (Phases 0–5 + authoring)
 

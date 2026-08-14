@@ -489,8 +489,11 @@ fn synthesize_pr_text(
         system_prompt_position: None,
         timeout_sec: None,
         budget_tokens: None,
+        maximum_budget_usd: None,
         verify: false,
         trace_context: trace_context.map(str::to_string),
+        resume_agent_session_id: None,
+        env_overrides: std::collections::BTreeMap::new(),
     };
     crate::rlog!(
         DEBUG,

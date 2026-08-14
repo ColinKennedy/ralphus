@@ -6,7 +6,7 @@
 //! (the predecessor learned this the hard way; see `FINDINGS.local.md` §2.4 and
 //! CCTL-149).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -196,10 +196,11 @@ pub struct VerifyView {
     pub model: Option<String>,
     /// Resolved agent program (inherited from the owning session or task defaults).
     pub agent: String,
-    /// Claude Code session UUID captured when the step ran via the claude-code
-    /// backend. `None` for non-claude-code steps or steps that have not yet run.
+    /// Resumable CLI-agent session/thread id captured when the step ran via a
+    /// CLI backend with a resume mechanism (claude-code, codex). `None` for
+    /// other agents or steps that have not yet run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claude_session_id: Option<String>,
+    pub agent_session_id: Option<String>,
 }
 
 /// A session as shown in the board.
@@ -228,6 +229,11 @@ pub struct SessionView {
     pub tokens_out: i64,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
+    /// Resolved USD spend cap (session overrides task), or `None` for no cap.
+    /// Once `cost_usd` exceeds this the daemon kills the session mid-run
+    /// (RAL-161).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_budget_usd: Option<f64>,
     /// Failure detail, when the session failed.
     pub error: Option<String>,
     /// Dependency references (within-task session ids or `task/session`).
@@ -237,11 +243,24 @@ pub struct SessionView {
     /// Reviews (guardians) this session participates in — those whose stack
     /// includes the session's review branch (RAL-17). Empty for most sessions.
     pub reviews: Vec<RunReviewRef>,
-    /// Claude Code session UUID for `claude --resume`, captured from the
-    /// claude-code backend output. `None` for non-claude-code sessions or
-    /// sessions that have not yet completed.
+    /// Resumable CLI-agent session/thread id (for `claude --resume`/`codex exec
+    /// resume`), captured from the owning backend's output. `None` for other
+    /// agents or sessions that have not yet completed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claude_session_id: Option<String>,
+    pub agent_session_id: Option<String>,
+    /// Persistent environment-variable overrides set directly on this session
+    /// (hierarchical env overrides, extending RAL-150): merged on top of the
+    /// owning task's/run's when the session's own subprocess is spawned. See
+    /// [`Store::resolve_session_env_overrides`]. Empty for the vast majority
+    /// of sessions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_overrides: BTreeMap<String, String>,
+    /// Persistent environment-variable overrides set on this session's own
+    /// verify steps only, merged on top of `env_overrides` (and its
+    /// ancestors) when a session-scoped verify step runs. See
+    /// [`Store::resolve_session_verify_env_overrides`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verify_env_overrides: BTreeMap<String, String>,
 }
 
 /// A task as shown in the board.
@@ -249,8 +268,12 @@ pub struct SessionView {
 pub struct TaskView {
     /// Task name.
     pub name: String,
-    /// Project label.
-    pub project: Option<String>,
+    /// Project identifier: the registered project name when the task's TOML
+    /// set `project`, otherwise a fallback derived from the task's first
+    /// session `cwd` (RAL-141, see [`fallback_project_identifier`]). Always
+    /// present -- never `null` in the API response -- so a project filter
+    /// facet has real data for every task.
+    pub project: String,
     /// Current state string.
     pub state: String,
     /// Sessions in the task.
@@ -259,6 +282,23 @@ pub struct TaskView {
     pub verify: Vec<VerifyView>,
     /// Task-level dependency references (other task names).
     pub depends_on: Vec<String>,
+    /// Persistent environment-variable overrides set directly on this task
+    /// (hierarchical env overrides, extending RAL-150): merged on top of the
+    /// run's, and merged onto every session under this task. See
+    /// [`Store::resolve_session_env_overrides`]. Empty for the vast majority
+    /// of tasks.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_overrides: BTreeMap<String, String>,
+    /// Persistent environment-variable overrides set on this task's own
+    /// (task-scoped) verify steps only, merged on top of `env_overrides` (and
+    /// the run's) when a task-scoped verify step runs. See
+    /// [`Store::resolve_task_verify_env_overrides`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verify_env_overrides: BTreeMap<String, String>,
+    /// Whether this task is "soloed" (RAL-157) — while `true` on any task in
+    /// the run, the scheduler only dispatches soloed tasks' sessions; every
+    /// other task's sessions stay paused (Pending) until un-soloed.
+    pub soloed: bool,
 }
 
 /// A lightweight reference to a review (guardian) derived from a run.
@@ -305,6 +345,14 @@ pub struct RunView {
     pub tasks: Vec<TaskView>,
     /// Reviews (guardians) derived from this run.
     pub reviews: Vec<RunReviewRef>,
+    /// Persistent environment-variable overrides applied to every subprocess
+    /// spawned for this run (RAL-150). Values here are the raw, unredacted
+    /// overrides — safe to show in the board's run detail view per the
+    /// ticket's binding decision (only Cartographer/audit-log payloads mask
+    /// non-allowlisted values, see `daemon::config::EnvOverridesConfig`).
+    /// Empty for the vast majority of runs (no overrides ever set).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_overrides: BTreeMap<String, String>,
 }
 
 /// A node in the cross-run `[[default]] depends_on` gating graph
@@ -381,6 +429,18 @@ pub(crate) fn from_json(s: &str) -> Vec<String> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// Serialize a string-to-string map to the JSON stored in the DB (RAL-150:
+/// `runs.env_overrides`). `BTreeMap` gives deterministic key order, which
+/// keeps Cartographer payloads and API responses stable across calls.
+pub(crate) fn to_json_map(v: &BTreeMap<String, String>) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Parse a string-to-string map from stored JSON, defaulting to empty on error.
+pub(crate) fn from_json_map(s: &str) -> BTreeMap<String, String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
 impl Store {
     /// Open (creating if needed) a store at `path`, in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
@@ -414,7 +474,8 @@ impl Store {
                 depends_on    TEXT NOT NULL DEFAULT '[]',
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                trace_context TEXT
+                trace_context TEXT,
+                env_overrides TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -448,7 +509,8 @@ impl Store {
                 review_branch TEXT,
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
-                claude_session_id TEXT,
+                agent_session_id TEXT,
+                maximum_budget_usd REAL,
                 upstream      TEXT,
                 queue_rank    REAL,
                 PRIMARY KEY (run_id, task_idx, idx)
@@ -466,7 +528,7 @@ impl Store {
                 agent       TEXT NOT NULL DEFAULT 'claude',
                 state       TEXT NOT NULL,
                 output      TEXT,
-                claude_session_id TEXT,
+                agent_session_id TEXT,
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
                 queue_rank    REAL,
@@ -497,6 +559,7 @@ impl Store {
                 review_key        TEXT,
                 resolver_agent    TEXT,
                 resolver_model    TEXT,
+                verify_mid_resolution INTEGER NOT NULL DEFAULT 0,
                 created_at_ms     INTEGER NOT NULL,
                 updated_at_ms     INTEGER NOT NULL
             );
@@ -598,6 +661,21 @@ impl Store {
                 UNIQUE(pr_id, external_comment_id)
             );
             CREATE INDEX IF NOT EXISTS idx_pr_feedback_pr ON guardian_pr_feedback_actioned(pr_id);
+            -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
+            -- of a named CheckInput, one row per (guardian_id, input_name).
+            -- Existence of this table (rather than a JSON blob on `guardians`)
+            -- is what makes the claim in `claim_guardian_input_resolution`
+            -- atomic -- a concurrent duplicate request (double-click, second
+            -- browser tab) is rejected via the UNIQUE-key upsert's WHERE
+            -- clause, not a debounce. status: 'resolving' | 'ready' | 'failed'.
+            CREATE TABLE IF NOT EXISTS guardian_input_resolutions (
+                guardian_id   TEXT NOT NULL,
+                input_name    TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                value         TEXT,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, input_name)
+            );
             -- RAL-136: ephemeral, queryable handoff notes ('ghosts') a task
             -- session or review worktree publishes for downstream work.  One
             -- row per owner (`owner_uri`) -- a rewrite merges onto the
@@ -663,7 +741,6 @@ impl Store {
             "ALTER TABLE guardian_branches ADD COLUMN project TEXT",
             "ALTER TABLE verifies ADD COLUMN model TEXT",
             "ALTER TABLE verifies ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
-            "ALTER TABLE verifies ADD COLUMN claude_session_id TEXT",
             "ALTER TABLE sessions ADD COLUMN review_branch TEXT",
             "ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER",
             "ALTER TABLE sessions ADD COLUMN budget_tokens INTEGER",
@@ -671,7 +748,6 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN system_prompt_position TEXT",
             "ALTER TABLE sessions ADD COLUMN subprojects TEXT",
             "ALTER TABLE sessions ADD COLUMN name TEXT",
-            "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT",
             "ALTER TABLE verifies ADD COLUMN timeout_sec INTEGER",
             "ALTER TABLE verifies ADD COLUMN budget_tokens INTEGER",
             // RAL-50: branch-chaining upstream sentinel.
@@ -684,9 +760,6 @@ impl Store {
             "ALTER TABLE guardians ADD COLUMN action_hints TEXT NOT NULL DEFAULT '[]'",
             // RAL-59: optional base64 image attached to a chat message.
             "ALTER TABLE guardian_messages ADD COLUMN image TEXT",
-            // claude_session_id from the conflict-resolver run on this branch.
-            // Only set when the resolver backend is claude-code; enables terminal resume.
-            "ALTER TABLE guardian_branches ADD COLUMN resolver_claude_session_id TEXT",
             // RAL-88: per-artifact provenance — which resolved agent/model produced
             // the change summary, the manual-check commands, and the feedback-chat
             // replies. Recorded at generation time so a reviewer can inspect and
@@ -742,6 +815,67 @@ impl Store {
             // across a reorder) to `branch_id` -- see the backfill-and-drop block
             // below.
             "ALTER TABLE guardian_pull_requests ADD COLUMN branch_id TEXT",
+            // RAL-164: resolved/submitted values for named CheckInputs referenced
+            // by manual_commands/action_hints, scoped to this guardian/review.
+            // JSON map of {input_name: value}; a value here becomes the new
+            // default the next time that check is viewed.
+            "ALTER TABLE guardians ADD COLUMN input_values TEXT NOT NULL DEFAULT '{}'",
+        ] {
+            let _ = self.conn.execute(stmt, []);
+        }
+        // Codex support: `*claude_session_id` columns were named after the only
+        // CLI harness that existed at the time, but they hold the resumable
+        // session/thread id of *whichever* CLI agent produced it (claude-code or
+        // codex) -- renamed here to `*agent_session_id` for accuracy. A best-effort
+        // rename against a database that still has the old column name; harmless
+        // no-op (old column already renamed, or never existed) otherwise. The
+        // fallback ADD COLUMN afterwards guarantees the new column exists even for
+        // a database old enough to have neither -- mirrors the "fails harmlessly"
+        // idiom of the ADD-COLUMN loop above, just with RENAME COLUMN first.
+        for stmt in [
+            "ALTER TABLE sessions RENAME COLUMN claude_session_id TO agent_session_id",
+            "ALTER TABLE verifies RENAME COLUMN claude_session_id TO agent_session_id",
+            "ALTER TABLE guardian_branches RENAME COLUMN resolver_claude_session_id TO resolver_agent_session_id",
+            "ALTER TABLE guardians RENAME COLUMN manual_commands_claude_session_id TO manual_commands_agent_session_id",
+        ] {
+            let _ = self.conn.execute(stmt, []);
+        }
+        for stmt in [
+            "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT",
+            "ALTER TABLE verifies ADD COLUMN agent_session_id TEXT",
+            "ALTER TABLE guardian_branches ADD COLUMN resolver_agent_session_id TEXT",
+            "ALTER TABLE guardians ADD COLUMN manual_commands_agent_session_id TEXT",
+            // RAL-149: opts the per-branch conflict-resolution fix pass into also
+            // running the quality-bar instructions (formatters/linters/tests),
+            // in addition to always running them in the dedicated final-verify
+            // call that follows a fix pass. Default off -- quality checks may
+            // incur real cost, so they run once (in the final-verify call) by
+            // default rather than twice per conflict-resolution cycle.
+            "ALTER TABLE guardians ADD COLUMN verify_mid_resolution INTEGER NOT NULL DEFAULT 0",
+            // RAL-150: persistent, user-set environment-variable overrides applied
+            // to every subprocess spawned for this run (agent + command sessions,
+            // and verify steps). JSON map of {key: value}; set/unset via
+            // `POST /api/runs/{id}/env`, survives across retries until unset.
+            "ALTER TABLE runs ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // Hierarchical env overrides (RAL-150 extension): task/session-level
+            // layers, plus separate layers for a task's/session's own verify
+            // steps, each overriding its parent's values on a per-key basis --
+            // run < task < session, and run < task < task.verify /
+            // run < task < session < session.verify. See
+            // `Store::resolve_session_env_overrides` and siblings.
+            "ALTER TABLE tasks ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE tasks ADD COLUMN verify_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE sessions ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE sessions ADD COLUMN verify_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-157: a task can be "soloed" to pause its non-soloed siblings
+            // within the same run -- see `Store::solo_task`/`unsolo_task` and the
+            // scheduler dispatcher's live solo gate. Multiple tasks in the same
+            // run can be soloed at once; default 0 (not soloed) preserves today's
+            // behavior for every existing run.
+            "ALTER TABLE tasks ADD COLUMN soloed INTEGER NOT NULL DEFAULT 0",
+            // RAL-161: resolved per-session USD spend cap (session overrides
+            // task). Exceeding the live `cost_usd` kills the session mid-run.
+            "ALTER TABLE sessions ADD COLUMN maximum_budget_usd REAL",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -910,9 +1044,11 @@ impl Store {
                 let timeout_sec =
                     resolve_timeout_sec(session.timeout_minutes, task.timeout_minutes);
                 let budget_tokens = resolve_budget(session.budget_tokens, task.budget_tokens);
+                let maximum_budget_usd =
+                    resolve_maximum_budget_usd(session.maximum_budget_usd, task.maximum_budget_usd);
                 tx.execute(
-                    "INSERT INTO sessions(run_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, state, depends_on, timeout_sec, budget_tokens, upstream, queue_rank)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO sessions(run_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, upstream, queue_rank)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         run_id,
                         t_idx_i,
@@ -931,6 +1067,7 @@ impl Store {
                         to_json(&session.depends_on),
                         timeout_sec,
                         budget_tokens,
+                        maximum_budget_usd,
                         session.upstream,
                         // Seed the queue rank from the session's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -1318,12 +1455,153 @@ impl Store {
         Ok(())
     }
 
+    /// Solo a task within a run (RAL-157): while any task in the run is
+    /// soloed, the scheduler's dispatcher only starts sessions belonging to a
+    /// soloed task — every other task's not-yet-started sessions stay
+    /// paused (Pending) until un-soloed, even once the soloed task itself
+    /// finishes (a dependent must not start racing ahead just because its
+    /// soloed upstream completed). Sessions already `running` when a sibling
+    /// gets soloed are left to finish on their own — there is no per-session
+    /// interrupt in this codebase today (cancellation is run-wide only, see
+    /// `Cancellations`), so "pause" for in-flight work means "don't dispatch
+    /// its task's *next* session," not a mid-session kill. Multiple tasks may
+    /// be soloed simultaneously; soloing one does not un-solo another.
+    /// Idempotent. Errors with [`StoreError::NotFound`] if the task doesn't
+    /// exist.
+    pub fn solo_task(&self, run_id: &str, task_idx: i64) -> Result<()> {
+        self.set_task_soloed(run_id, task_idx, true)
+    }
+
+    /// Un-solo a task (RAL-157) — the reverse of [`Store::solo_task`]. Solo
+    /// state never auto-clears (not on run restart, not on the soloed task's
+    /// own completion); this is the only way to resume paused siblings.
+    /// Idempotent. Errors with [`StoreError::NotFound`] if the task doesn't
+    /// exist.
+    pub fn unsolo_task(&self, run_id: &str, task_idx: i64) -> Result<()> {
+        self.set_task_soloed(run_id, task_idx, false)
+    }
+
+    fn set_task_soloed(&self, run_id: &str, task_idx: i64, soloed: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET soloed=?1 WHERE run_id=?2 AND idx=?3",
+            params![soloed, run_id, task_idx],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [state] task {run_id}/t{task_idx} soloed={soloed}"
+        );
+        // `log_event` also writes this into Cartographer (RAL-98), so a single
+        // call keeps the per-run audit trail and the structured log in sync.
+        let _ = self.log_event(
+            Some(run_id),
+            None,
+            "task",
+            Some(&format!("t{task_idx}")),
+            if soloed {
+                "task soloed"
+            } else {
+                "task un-soloed"
+            },
+        );
+        Ok(())
+    }
+
+    /// Indices of every currently-soloed task in a run (RAL-157), read live so
+    /// the scheduler's dispatcher observes a mid-run solo/unsolo toggle on its
+    /// very next pass rather than only at the run's next (re)start.
+    pub fn soloed_task_indices(&self, run_id: &str) -> Result<HashSet<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idx FROM tasks WHERE run_id=? AND soloed=1")?;
+        let rows = stmt
+            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Current state of one session, or `None` if it doesn't exist. Used by
+    /// the restart handlers (`server::restart_session`/`restart_session_verify`)
+    /// to decide whether cancelling the *whole run's* worker is actually
+    /// necessary — see those functions' doc comments (RAL-1xx: restart
+    /// collateral damage).
+    pub fn session_state(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<NodeState>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|s| NodeState::parse(&s)))
+    }
+
+    /// Current state of one task, or `None` if it doesn't exist. Same purpose
+    /// as [`Store::session_state`], for `server::restart_task_verify`.
+    pub fn task_state(&self, run_id: &str, task_idx: i64) -> Result<Option<NodeState>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|s| NodeState::parse(&s)))
+    }
+
+    /// Whether any session-scope verify step for `(task_idx, session_idx)` at
+    /// index >= `from_idx` is currently `Running`. Verify steps within one
+    /// scope run sequentially, so at most one can be, but this checks
+    /// defensively. Mirrors [`Store::restart_session_verify`]'s own WHERE
+    /// clause; used by `server::restart_session_verify` (RAL-1xx).
+    pub fn session_verify_running_from(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+        from_idx: i64,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM verifies WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=? AND idx>=? AND state='running'",
+            params![run_id, task_idx, session_idx, from_idx],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Whether any task-scope verify step for `task_idx` at index >=
+    /// `from_idx` is currently `Running`. Mirrors
+    /// [`Store::restart_task_verify`]'s own WHERE clause; used by
+    /// `server::restart_task_verify` (RAL-1xx).
+    pub fn task_verify_running_from(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        from_idx: i64,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM verifies WHERE run_id=? AND task_idx=? AND scope='task' AND idx>=? AND state='running'",
+            params![run_id, task_idx, from_idx],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Fetch a single run's full board view.
     pub fn get_run(&self, id: &str) -> Result<RunView> {
         let row = self
             .conn
             .query_row(
-                "SELECT id, label, state, created_at_ms FROM runs WHERE id=?",
+                "SELECT id, label, state, created_at_ms, env_overrides FROM runs WHERE id=?",
                 params![id],
                 |r| {
                     Ok((
@@ -1331,12 +1609,13 @@ impl Store {
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        self.build_run_view(row.0, row.1, row.2, row.3)
+        self.build_run_view(row.0, row.1, row.2, row.3, from_json_map(&row.4))
     }
 
     /// Fetch all runs, newest first.
@@ -1345,7 +1624,7 @@ impl Store {
         // deterministically. Run ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, state, created_at_ms FROM runs ORDER BY created_at_ms DESC, id DESC",
+            "SELECT id, label, state, created_at_ms, env_overrides FROM runs ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -1354,11 +1633,14 @@ impl Store {
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, label, state, ts)| self.build_run_view(id, label, state, ts))
+            .map(|(id, label, state, ts, env)| {
+                self.build_run_view(id, label, state, ts, from_json_map(&env))
+            })
             .collect()
     }
 
@@ -1411,9 +1693,11 @@ impl Store {
         label: Option<String>,
         state: String,
         created_at_ms: i64,
+        env_overrides: BTreeMap<String, String>,
     ) -> Result<RunView> {
         let mut tstmt = self.conn.prepare(
-            "SELECT idx, name, project, state, depends_on FROM tasks WHERE run_id=? ORDER BY idx",
+            "SELECT idx, name, project, state, depends_on, env_overrides, verify_env_overrides, soloed
+             FROM tasks WHERE run_id=? ORDER BY idx",
         )?;
         let task_rows = tstmt
             .query_map(params![id], |r| {
@@ -1423,6 +1707,9 @@ impl Store {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1431,14 +1718,21 @@ impl Store {
         // whose review branch is in a guardian's stack lists that review (RAL-17).
         let review_by_branch = self.reviews_by_branch(&id)?;
         let mut tasks = Vec::with_capacity(task_rows.len());
-        for (t_idx, name, project, tstate, deps) in task_rows {
+        for (t_idx, name, project, tstate, deps, task_env, task_verify_env, soloed) in task_rows {
+            let sessions = self.sessions_for(&id, t_idx, &review_by_branch)?;
+            let project = project.unwrap_or_else(|| {
+                fallback_project_identifier(sessions.first().and_then(|s| s.cwd.as_deref()))
+            });
             tasks.push(TaskView {
                 name,
                 project,
                 state: tstate,
-                sessions: self.sessions_for(&id, t_idx, &review_by_branch)?,
+                sessions,
                 verify: self.verifies_for(&id, t_idx, "task", -1)?,
                 depends_on: from_json(&deps),
+                env_overrides: from_json_map(&task_env),
+                verify_env_overrides: from_json_map(&task_verify_env),
+                soloed,
             });
         }
 
@@ -1450,6 +1744,7 @@ impl Store {
             created_at_ms,
             tasks,
             reviews,
+            env_overrides,
         })
     }
 
@@ -1481,7 +1776,7 @@ impl Store {
         // session's own verify steps — `verifies_for` re-borrows `self.conn`.
         let mut rows: Vec<(i64, SessionView)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, depends_on, review_branch, claude_session_id
+                "SELECT idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, verify_env_overrides
                  FROM sessions WHERE run_id=? AND task_idx=? ORDER BY idx",
             )?;
             stmt.query_map(params![run_id, task_idx], |r| {
@@ -1501,13 +1796,16 @@ impl Store {
                         tokens_in: r.get::<_, i64>(7)?,
                         tokens_out: r.get::<_, i64>(8)?,
                         cost_usd: r.get::<_, f64>(9)?,
+                        maximum_budget_usd: r.get::<_, Option<f64>>(16)?,
                         error: r.get::<_, Option<String>>(10)?,
                         prompt: r.get::<_, Option<String>>(11)?,
                         command: r.get::<_, Option<String>>(12)?,
                         depends_on: from_json(&r.get::<_, String>(13)?),
                         verify: Vec::new(),
                         reviews,
-                        claude_session_id: r.get::<_, Option<String>>(15)?,
+                        agent_session_id: r.get::<_, Option<String>>(15)?,
+                        env_overrides: from_json_map(&r.get::<_, String>(17)?),
+                        verify_env_overrides: from_json_map(&r.get::<_, String>(18)?),
                     },
                 ))
             })?
@@ -1567,7 +1865,7 @@ impl Store {
         session_idx: i64,
     ) -> Result<Vec<VerifyView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, model, agent, claude_session_id FROM verifies
+            "SELECT vid, kind, state, output, spec, model, agent, agent_session_id FROM verifies
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -1580,7 +1878,7 @@ impl Store {
                     spec: r.get::<_, String>(4)?,
                     model: r.get::<_, Option<String>>(5)?,
                     agent: r.get::<_, String>(6)?,
-                    claude_session_id: r.get::<_, Option<String>>(7)?,
+                    agent_session_id: r.get::<_, Option<String>>(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1764,6 +2062,22 @@ fn effective_session_state(raw: &str, verify: &[VerifyView]) -> String {
     raw.to_string()
 }
 
+/// Fallback project identifier for a task whose TOML left `project` unset
+/// (RAL-141): the basename of its first session's `cwd`, so a task that only
+/// sets a literal filesystem path still gets a usable, stable identifier for
+/// a board project filter facet to group by. Falls back further to
+/// `"unassigned"` when there's no session, no `cwd`, or the `cwd` has no
+/// filename component (e.g. `"/"`). Never applied to a task using the
+/// `ralphus:new-worktree/<branch>` placeholder cwd -- `project` is already
+/// structurally required for those (see `core::validate`), so this path is
+/// only reached for plain-path tasks.
+fn fallback_project_identifier(cwd: Option<&str>) -> String {
+    cwd.and_then(|c| Path::new(c).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unassigned".to_string())
+}
+
 /// Resolve an effective timeout in seconds from a step-level and a task-level
 /// value in minutes (step wins; task is the default). `None` means no limit.
 fn resolve_timeout_sec(step_min: Option<u32>, task_min: Option<u32>) -> Option<i64> {
@@ -1774,6 +2088,12 @@ fn resolve_timeout_sec(step_min: Option<u32>, task_min: Option<u32>) -> Option<i
 /// (step wins; task is the default). `None` means no cap.
 fn resolve_budget(step: Option<u64>, task: Option<u64>) -> Option<i64> {
     step.or(task).map(|b| i64::try_from(b).unwrap_or(i64::MAX))
+}
+
+/// Resolve an effective USD spend cap from a session-level and a task-level
+/// value (session wins; task is the default). `None` means no cap.
+fn resolve_maximum_budget_usd(session: Option<f64>, task: Option<f64>) -> Option<f64> {
+    session.or(task)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1862,6 +2182,10 @@ pub struct SessionRow {
     /// Effective total-token budget (resolved from session/task), or `None` for
     /// no cap. The runner fails the session if usage exceeds it.
     pub budget_tokens: Option<i64>,
+    /// Effective USD spend cap (resolved from session/task), or `None` for no
+    /// cap. The runner kills the session mid-run and fails it once the live
+    /// `cost_usd` exceeds this (RAL-161).
+    pub maximum_budget_usd: Option<f64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this session's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
@@ -1897,6 +2221,8 @@ pub struct TaskRow {
     pub project: Option<String>,
     /// Task-level dependency references.
     pub depends_on: Vec<String>,
+    /// Whether this task is currently soloed (RAL-157). See [`TaskView::soloed`].
+    pub soloed: bool,
 }
 
 /// The full set of entities a restart would dirty (RAL-104): sessions/tasks
@@ -1962,7 +2288,7 @@ impl Store {
     /// All sessions of a run, in insertion order.
     pub fn sessions_of(&self, run_id: &str) -> Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd
              FROM sessions s JOIN tasks t ON t.run_id = s.run_id AND t.idx = s.task_idx
              WHERE s.run_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -1988,6 +2314,7 @@ impl Store {
                     timeout_sec: r.get(13)?,
                     budget_tokens: r.get(14)?,
                     upstream: r.get(15)?,
+                    maximum_budget_usd: r.get(16)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1997,7 +2324,7 @@ impl Store {
     /// All tasks of a run with their dependencies, in order.
     pub fn tasks_of(&self, run_id: &str) -> Result<Vec<TaskRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, name, project, depends_on FROM tasks WHERE run_id=? ORDER BY idx",
+            "SELECT idx, name, project, depends_on, soloed FROM tasks WHERE run_id=? ORDER BY idx",
         )?;
         let rows = stmt
             .query_map(params![run_id], |r| {
@@ -2006,6 +2333,7 @@ impl Store {
                     name: r.get(1)?,
                     project: r.get(2)?,
                     depends_on: from_json(&r.get::<_, String>(3)?),
+                    soloed: r.get(4)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2220,6 +2548,11 @@ impl Store {
     }
 
     /// Record a verifier's terminal state and captured output, logging it (CCTL-99).
+    ///
+    /// RAL-163: guarded by `state IN (...)` the same way and for the same
+    /// reason as [`Self::record_session_result`] — a manual `set-status`
+    /// override on this verify step while it's still mid-flight must not be
+    /// clobbered once the scheduler's own runner call for it unblocks.
     #[allow(clippy::too_many_arguments)]
     pub fn set_verify_result(
         &self,
@@ -2230,7 +2563,7 @@ impl Store {
         idx: i64,
         state: NodeState,
         output: &str,
-        claude_session_id: Option<&str>,
+        agent_session_id: Option<&str>,
     ) -> Result<()> {
         // Query old state and vid together before the UPDATE so we have both for
         // logging (vid doesn't change, but reading it before avoids a second round trip).
@@ -2246,17 +2579,18 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE verifies SET state=?, output=?, claude_session_id=?
-             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+            "UPDATE verifies SET state=?, output=?, agent_session_id=?
+             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
                 output,
-                claude_session_id,
+                agent_session_id,
                 run_id,
                 task_idx,
                 scope,
                 session_idx,
-                idx
+                idx,
+                state.as_str(),
             ],
         )?;
         let reference = match &vid {
@@ -2339,6 +2673,269 @@ impl Store {
         } else {
             Ok(())
         }
+    }
+
+    /// The persistent environment-variable overrides currently set on a run
+    /// (RAL-150). Empty when none have ever been set.
+    pub fn get_run_env_overrides(&self, run_id: &str) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_overrides FROM runs WHERE id=?",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Add/replace (`set`) and remove (`unset`) entries in a run's persistent
+    /// environment-variable overrides (RAL-150), returning the resulting map.
+    /// Overrides are persistent by design (Q4 of the ticket): once set, a key
+    /// stays set across any number of retries until explicitly unset — this
+    /// merges into whatever is already stored rather than replacing it
+    /// wholesale. `set` entries win when a key appears in both `set` and
+    /// `unset`.
+    pub fn set_run_env_overrides(
+        &self,
+        run_id: &str,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut current = self.get_run_env_overrides(run_id)?;
+        for key in unset {
+            current.remove(key);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), v.clone());
+        }
+        self.conn.execute(
+            "UPDATE runs SET env_overrides=?, updated_at_ms=? WHERE id=?",
+            params![to_json_map(&current), now_ms(), run_id],
+        )?;
+        Ok(current)
+    }
+
+    // ── Hierarchical env overrides (RAL-150 extension) ─────────────────────
+    //
+    // Task/session-level layers, plus a separate layer for a task's/session's
+    // own verify steps, mirroring `get_run_env_overrides`/
+    // `set_run_env_overrides` exactly (same set-wins-over-unset-for-same-key
+    // merge, same persist-until-unset semantics). The three `resolve_*`
+    // methods below fold each layer on top of its parents in one place, so
+    // scheduler call sites stay a single call and precedence stays
+    // unit-testable independent of dispatch.
+
+    /// The persistent environment-variable overrides set directly on a task
+    /// (not merged with the run's). Empty when none have ever been set.
+    pub fn get_task_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_overrides FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Add/replace (`set`) and remove (`unset`) entries in a task's own
+    /// environment-variable overrides, returning the resulting map.
+    pub fn set_task_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut current = self.get_task_env_overrides(run_id, task_idx)?;
+        for key in unset {
+            current.remove(key);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), v.clone());
+        }
+        self.conn.execute(
+            "UPDATE tasks SET env_overrides=? WHERE run_id=? AND idx=?",
+            params![to_json_map(&current), run_id, task_idx],
+        )?;
+        Ok(current)
+    }
+
+    /// The persistent environment-variable overrides set on a task's own
+    /// (task-scoped) verify steps, not merged with the task's/run's.
+    pub fn get_task_verify_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT verify_env_overrides FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Add/replace (`set`) and remove (`unset`) entries in a task's
+    /// verify-scoped environment-variable overrides, returning the resulting
+    /// map.
+    pub fn set_task_verify_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut current = self.get_task_verify_env_overrides(run_id, task_idx)?;
+        for key in unset {
+            current.remove(key);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), v.clone());
+        }
+        self.conn.execute(
+            "UPDATE tasks SET verify_env_overrides=? WHERE run_id=? AND idx=?",
+            params![to_json_map(&current), run_id, task_idx],
+        )?;
+        Ok(current)
+    }
+
+    /// The persistent environment-variable overrides set directly on a
+    /// session (not merged with its task's/run's). Empty when none have ever
+    /// been set.
+    pub fn get_session_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_overrides FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, session_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Add/replace (`set`) and remove (`unset`) entries in a session's own
+    /// environment-variable overrides, returning the resulting map.
+    pub fn set_session_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut current = self.get_session_env_overrides(run_id, task_idx, session_idx)?;
+        for key in unset {
+            current.remove(key);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), v.clone());
+        }
+        self.conn.execute(
+            "UPDATE sessions SET env_overrides=? WHERE run_id=? AND task_idx=? AND idx=?",
+            params![to_json_map(&current), run_id, task_idx, session_idx],
+        )?;
+        Ok(current)
+    }
+
+    /// The persistent environment-variable overrides set on a session's own
+    /// verify steps, not merged with the session's/task's/run's.
+    pub fn get_session_verify_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT verify_env_overrides FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, session_idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Add/replace (`set`) and remove (`unset`) entries in a session's
+    /// verify-scoped environment-variable overrides, returning the resulting
+    /// map.
+    pub fn set_session_verify_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut current = self.get_session_verify_env_overrides(run_id, task_idx, session_idx)?;
+        for key in unset {
+            current.remove(key);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), v.clone());
+        }
+        self.conn.execute(
+            "UPDATE sessions SET verify_env_overrides=? WHERE run_id=? AND task_idx=? AND idx=?",
+            params![to_json_map(&current), run_id, task_idx, session_idx],
+        )?;
+        Ok(current)
+    }
+
+    /// Effective environment-variable overrides for a session's own
+    /// subprocess: `run < task < session`, each layer's keys winning over its
+    /// parent's.
+    pub fn resolve_session_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut merged = self.get_run_env_overrides(run_id)?;
+        merged.extend(self.get_task_env_overrides(run_id, task_idx)?);
+        merged.extend(self.get_session_env_overrides(run_id, task_idx, session_idx)?);
+        Ok(merged)
+    }
+
+    /// Effective environment-variable overrides for a task-scoped verify
+    /// step: `run < task < task.verify`.
+    pub fn resolve_task_verify_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut merged = self.get_run_env_overrides(run_id)?;
+        merged.extend(self.get_task_env_overrides(run_id, task_idx)?);
+        merged.extend(self.get_task_verify_env_overrides(run_id, task_idx)?);
+        Ok(merged)
+    }
+
+    /// Effective environment-variable overrides for a session-scoped verify
+    /// step: `run < task < session < session.verify`.
+    pub fn resolve_session_verify_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut merged = self.resolve_session_env_overrides(run_id, task_idx, session_idx)?;
+        merged.extend(self.get_session_verify_env_overrides(run_id, task_idx, session_idx)?);
+        Ok(merged)
     }
 
     /// Reset a run and all its nodes back to `Pending` — the dirty→pending gate
@@ -2714,6 +3311,133 @@ impl Store {
         Ok(impact.dirtied_runs.into_iter().map(|r| r.id).collect())
     }
 
+    /// Compute everything [`Store::restart_task`] would dirty, without
+    /// mutating anything: every session belonging to `task_idx` plus every
+    /// session downstream of any of them within the run (forward reachability
+    /// over the plan graph, seeded from the whole task rather than a single
+    /// session — same BFS as [`Store::compute_session_restart_impact`]), the
+    /// tasks that own any of those sessions, and every run transitively
+    /// dependent on this one (RAL-150).
+    pub fn compute_task_restart_impact(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+    ) -> Result<RestartImpact> {
+        let sessions = self.sessions_of(run_id)?;
+        let tasks = self.tasks_of(run_id)?;
+        if !tasks.iter().any(|t| t.idx == task_idx) {
+            return Err(StoreError::NotFound);
+        }
+        let plan = crate::plan::plan(&sessions, &tasks).map_err(StoreError::InvalidTransition)?;
+
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+        for (j, prereqs) in plan.deps.iter().enumerate() {
+            for &p in prereqs {
+                children[p].push(j);
+            }
+        }
+        let targets: Vec<usize> = sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.task_idx == task_idx)
+            .map(|(pos, _)| pos)
+            .collect();
+        let mut affected: HashSet<usize> = HashSet::new();
+        let mut frontier = Vec::new();
+        for t in targets {
+            if affected.insert(t) {
+                frontier.push(t);
+            }
+        }
+        while let Some(cur) = frontier.pop() {
+            for &c in &children[cur] {
+                if affected.insert(c) {
+                    frontier.push(c);
+                }
+            }
+        }
+
+        let mut affected_task_idxs: HashSet<i64> = HashSet::new();
+        affected_task_idxs.insert(task_idx);
+        let mut affected_sessions: Vec<RestartImpactSession> = affected
+            .iter()
+            .map(|&pos| {
+                let s = &sessions[pos];
+                affected_task_idxs.insert(s.task_idx);
+                RestartImpactSession {
+                    task_idx: s.task_idx,
+                    idx: s.idx,
+                    task_name: s.task_name.clone(),
+                    session_id: s.session_id.clone(),
+                }
+            })
+            .collect();
+        affected_sessions.sort_by_key(|s| (s.task_idx, s.idx));
+
+        let mut affected_tasks: Vec<RestartImpactTask> = tasks
+            .iter()
+            .filter(|t| affected_task_idxs.contains(&t.idx))
+            .map(|t| RestartImpactTask {
+                idx: t.idx,
+                name: t.name.clone(),
+            })
+            .collect();
+        affected_tasks.sort_by_key(|t| t.idx);
+
+        let dirtied_runs = self.compute_dirty_dependents(run_id)?;
+
+        Ok(RestartImpact {
+            sessions: affected_sessions,
+            tasks: affected_tasks,
+            dirtied_runs,
+        })
+    }
+
+    /// Restart a whole task: reset every session it owns (and every session
+    /// downstream of them within the run) to Pending, put the run and each
+    /// affected task back to Pending, and dirty every run that depends on this
+    /// one (RAL-150, mirrors [`Store::restart_session`] at task granularity —
+    /// there is deliberately no separate `edit`/`preview` pair for this yet,
+    /// matching the ticket's "don't scale up scope" note). Returns the
+    /// dirtied dependent run ids.
+    pub fn restart_task(&self, run_id: &str, task_idx: i64) -> Result<Vec<String>> {
+        let impact = self.compute_task_restart_impact(run_id, task_idx)?;
+
+        for s in &impact.sessions {
+            self.conn.execute(
+                "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, s.task_idx, s.idx],
+            )?;
+            self.conn.execute(
+                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=?",
+                params![run_id, s.task_idx, s.idx],
+            )?;
+        }
+        for t in &impact.tasks {
+            self.conn.execute(
+                "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
+                params![run_id, t.idx],
+            )?;
+            self.conn.execute(
+                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='task'",
+                params![run_id, t.idx],
+            )?;
+        }
+        self.conn.execute(
+            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
+            params![now_ms(), run_id],
+        )?;
+        let _ = self.log_event(
+            Some(run_id),
+            None,
+            "task",
+            Some(&format!("t{task_idx}")),
+            "restarted (with downstream)",
+        );
+        self.apply_dirty_dependents(&impact.dirtied_runs)?;
+        Ok(impact.dirtied_runs.into_iter().map(|r| r.id).collect())
+    }
+
     /// Read-only BFS over cross-run dependencies: every run transitively
     /// dependent on `run_id`, in discovery order. Does not mutate anything —
     /// shared by the dry-run preview and [`Store::dirty_dependents`] (RAL-104).
@@ -2830,6 +3554,7 @@ impl Store {
             let runs_deleted = tx.execute("DELETE FROM runs", [])?;
             tx.execute("DELETE FROM guardian_branches", [])?;
             tx.execute("DELETE FROM guardian_messages", [])?;
+            tx.execute("DELETE FROM guardian_input_resolutions", [])?;
             let guardians_deleted = tx.execute("DELETE FROM guardians", [])?;
             // Reset id sequences so the next run/guardian id restarts at 1.
             tx.execute(
@@ -2890,14 +3615,27 @@ impl Store {
 
     /// Record a session's final outcome (state, usage, error, and session UUID).
     ///
-    /// `claude_session_id` uses `COALESCE(?, claude_session_id)` rather than a
+    /// `agent_session_id` uses `COALESCE(?, agent_session_id)` rather than a
     /// plain overwrite: a live mid-run scrape
-    /// ([`Self::set_session_claude_session_id_live`]) may already have
-    /// recorded a real Claude Code UUID, but a failed outcome always carries
-    /// `claude_session_id: None` (`RunnerResult::failure`) — a plain
+    /// ([`Self::set_session_agent_session_id_live`]) may already have
+    /// recorded a real session/thread id, but a failed outcome always carries
+    /// `agent_session_id: None` (`RunnerResult::failure`) — a plain
     /// overwrite would clobber that good value back to `NULL` on every
     /// failure, permanently disabling "Open Agent" for a session that really
     /// did start one.
+    ///
+    /// RAL-163: a manual `set-status` override (via
+    /// `server::capture_and_stop_node`) may finalize this session to a state
+    /// other than `pending`/`running` while its agent is still mid-flight —
+    /// that path captures the agent's in-progress pane into a ghost and kills
+    /// it, but the scheduler's own runner call can still unblock and reach
+    /// this write afterward. The `state IN (...)` guard makes that write a
+    /// no-op in that case so the manual override sticks, while still
+    /// allowing the two legitimate callers: the ordinary case (row is
+    /// `running`), a session that never started (`pending` — e.g. blocked by
+    /// a failed dependency), and a same-state re-write (the blocked-by-
+    /// failed-dependency path calls [`Self::set_session_state`] directly
+    /// before also calling this for the other outcome fields).
     pub fn record_session_result(
         &self,
         run_id: &str,
@@ -2906,18 +3644,19 @@ impl Store {
         outcome: &SessionOutcome,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, claude_session_id=COALESCE(?, claude_session_id)
-             WHERE run_id=? AND task_idx=? AND idx=?",
+            "UPDATE sessions SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, agent_session_id=COALESCE(?, agent_session_id)
+             WHERE run_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 outcome.state.as_str(),
                 outcome.tokens_in,
                 outcome.tokens_out,
                 outcome.cost_usd,
                 outcome.error.as_deref(),
-                outcome.claude_session_id.as_deref(),
+                outcome.agent_session_id.as_deref(),
                 run_id,
                 task_idx,
                 idx,
+                outcome.state.as_str(),
             ],
         )?;
         Ok(())
@@ -2944,6 +3683,25 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Fetch every session's `(idx, sid)` pair for a task, ordered by idx.
+    /// Used by manual status-set stop-and-capture (RAL-163) to find every
+    /// tmux pane that might be running under a task-scope status change,
+    /// since a task can have more than one session — unlike
+    /// [`Store::get_session_id`], which addresses exactly one.
+    ///
+    /// Returns an empty vec (not an error) when the run/task has no sessions.
+    pub fn get_task_session_ids(&self, run_id: &str, task_idx: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idx, sid FROM sessions WHERE run_id=? AND task_idx=? ORDER BY idx")?;
+        let rows = stmt
+            .query_map(params![run_id, task_idx], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Fetch a task's declared name for the tmux capture-pane/attach
     /// endpoints (RAL-102) — see [`Store::get_session_id`]'s doc comment for
     /// why the caller needs this alongside the session id.
@@ -2961,29 +3719,33 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Fetch a session's cwd and (if any) recorded Claude Code session id, for
-    /// the "Open Agent" terminal action — resuming the real `claude` CLI
-    /// (`claude --resume <id>`) rather than re-attaching to the runner's tmux
-    /// wrapper, which only shows its log/event stream (see
-    /// `crate::server::open_agent_terminal`).
+    /// Fetch a session's cwd, agent, and (if any) recorded CLI-agent session
+    /// id, for the "Open Agent" terminal action — resuming the real CLI
+    /// (`claude --resume <id>` or `codex exec resume <id>`, depending on
+    /// which agent the session actually ran under) rather than re-attaching
+    /// to the runner's tmux wrapper, which only shows its log/event stream
+    /// (see `crate::server::open_agent_terminal`). The `agent` column is
+    /// what lets `open_agent_terminal` pick the right resume command.
     ///
     /// Returns `Err(StoreError::NotFound)` when the run or session row does
-    /// not exist; `claude_session_id` is `None` when the session hasn't
-    /// started (or run under a non-claude-code agent) rather than an error.
+    /// not exist; `agent_session_id` is `None` when the session hasn't
+    /// started (or ran under an agent with no resume mechanism) rather than
+    /// an error.
     pub fn get_session_agent_resume(
         &self,
         run_id: &str,
         task_idx: i64,
         session_idx: i64,
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<(String, String, Option<String>)> {
         self.conn
             .query_row(
-                "SELECT cwd, claude_session_id FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                "SELECT cwd, agent, agent_session_id FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
                 params![run_id, task_idx, session_idx],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(2)?,
                     ))
                 },
             )
@@ -2991,11 +3753,11 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Persist a session's Claude Code session id as soon as it's known —
+    /// Persist a session's CLI-agent session/thread id as soon as it's known —
     /// before the session finishes — so "Open Agent" activates immediately
     /// rather than only once the whole session completes. Called from
     /// `runner::forward_runner_event` when the runner subprocess emits an
-    /// `llm-invoke` event carrying `claude_session_id` in its payload (RAL-102
+    /// `llm-invoke` event carrying `agent_session_id` in its payload (RAL-102
     /// follow-up; mirrors `guardian::set_branch_resolver_session_id`'s "Watch
     /// Live" idea, applied to plain task sessions instead of a side-channel
     /// file + watcher thread).
@@ -3004,17 +3766,50 @@ impl Store {
     /// doesn't match a session row — e.g. a verify step or a Guardian
     /// resolver invocation, which route through the very same event-forwarding
     /// code path but aren't rows in this table at all.
-    pub fn set_session_claude_session_id_live(
+    pub fn set_session_agent_session_id_live(
         &self,
         run_id: &str,
         task_name: &str,
         session_sid: &str,
-        claude_session_id: &str,
+        agent_session_id: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET claude_session_id=?
+            "UPDATE sessions SET agent_session_id=?
              WHERE run_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE run_id=? AND name=?)",
-            params![claude_session_id, run_id, session_sid, run_id, task_name],
+            params![agent_session_id, run_id, session_sid, run_id, task_name],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a session's running token/cost usage as soon as fresh numbers
+    /// are known -- before the session finishes -- so the board shows live
+    /// cost/tokens for a `running` session instead of `$0.0000` / `0/0` until
+    /// completion (RAL-161). Called from `runner::forward_runner_event`
+    /// alongside [`Self::set_session_claude_session_id_live`], which it
+    /// mirrors: same best-effort, same silent no-op when
+    /// `(run_id, task_name, session_sid)` doesn't match a session row (a
+    /// verify step or Guardian resolver invocation shares the same
+    /// event-forwarding code path but isn't a row in this table).
+    ///
+    /// Unlike [`Self::record_session_result`]'s final write, this is a plain
+    /// overwrite with no `COALESCE` -- a live scrape always carries real
+    /// numbers (never `None`), and the final write always happens after any
+    /// live writes, so it naturally wins as the authoritative last word.
+    pub fn set_session_live_usage(
+        &self,
+        run_id: &str,
+        task_name: &str,
+        session_sid: &str,
+        tokens_in: i64,
+        tokens_out: i64,
+        cost_usd: f64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET tokens_in=?, tokens_out=?, cost_usd=?
+             WHERE run_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE run_id=? AND name=?)",
+            params![
+                tokens_in, tokens_out, cost_usd, run_id, session_sid, run_id, task_name
+            ],
         )?;
         Ok(())
     }
@@ -3037,31 +3832,84 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Fetch a `prompt`-kind verify step's recorded Claude Code session id,
-    /// for its "Open Agent" terminal action — see
+    /// Fetch a `prompt`-kind verify step's agent and recorded CLI-agent
+    /// session id, for its "Open Agent" terminal action — see
     /// [`Store::get_session_agent_resume`]'s doc comment for the same idea
-    /// applied to a plain session.
+    /// (including why `agent` is needed alongside the id) applied to a plain
+    /// session.
     ///
     /// Returns `Err(StoreError::NotFound)` when the verify row does not
     /// exist; the id itself is `None` when the step hasn't run yet (or ran
-    /// under a non-claude-code agent) rather than an error.
-    pub fn get_verify_claude_session_id(
+    /// under an agent with no resume mechanism) rather than an error.
+    pub fn get_verify_agent_session_id(
         &self,
         run_id: &str,
         task_idx: i64,
         scope: &str,
         session_idx: i64,
         idx: i64,
-    ) -> Result<Option<String>> {
+    ) -> Result<(String, Option<String>)> {
         self.conn
             .query_row(
-                "SELECT claude_session_id FROM verifies
+                "SELECT agent, agent_session_id FROM verifies
                  WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
                 params![run_id, task_idx, scope, session_idx, idx],
-                |r| r.get::<_, Option<String>>(0),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(StoreError::NotFound)
+    }
+
+    /// Reset every session downstream of any of `roots` (but not the roots
+    /// themselves) within `run_id` that is currently `Failed` back to
+    /// Pending — clearing its error, resetting its own session-level
+    /// verifies, and resetting its owning task. Used by
+    /// [`Store::restart_session_verify`] and [`Store::restart_task_verify`]
+    /// (RAL-165): retrying a verify can change its outcome, and there's no
+    /// case where a downstream session shouldn't get a fresh chance once
+    /// that new outcome is known — whether it was left Failed by a direct
+    /// cascade from this failure or for its own, independent reason.
+    /// Sessions that are `Done`, `Pending`, or `Running` are left untouched.
+    fn revive_failed_downstream_sessions(&self, run_id: &str, roots: &[(i64, i64)]) -> Result<()> {
+        let mut downstream: HashSet<(i64, i64)> = HashSet::new();
+        for &(task_idx, idx) in roots {
+            let impact = self.compute_session_restart_impact(run_id, task_idx, idx)?;
+            downstream.extend(impact.sessions.iter().map(|s| (s.task_idx, s.idx)));
+        }
+        for r in roots {
+            downstream.remove(r);
+        }
+        for (task_idx, idx) in downstream {
+            let state: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT state FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                    params![run_id, task_idx, idx],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("failed") {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, idx],
+            )?;
+            self.conn.execute(
+                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=?",
+                params![run_id, task_idx, idx],
+            )?;
+            self.conn.execute(
+                "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+            )?;
+        }
+        Ok(())
     }
 
     /// Restart a single session's verify steps from `verify_from` onwards:
@@ -3070,8 +3918,10 @@ impl Store {
     /// are put back to Pending so the scheduler re-enters them. The scheduler
     /// detects that the session is Done with pending verifies via
     /// [`Store::sessions_needing_verify_only`] and skips re-running the
-    /// session body, executing only the verify steps. Returns dirtied
-    /// dependent run ids.
+    /// session body, executing only the verify steps. Any downstream session
+    /// left `Failed` by an earlier pass is revived back to Pending too
+    /// (RAL-165) — see [`Store::revive_failed_downstream_sessions`]. Returns
+    /// dirtied dependent run ids.
     pub fn restart_session_verify(
         &self,
         run_id: &str,
@@ -3097,6 +3947,7 @@ impl Store {
             "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=? AND idx>=?",
             params![run_id, task_idx, session_idx, verify_from],
         )?;
+        self.revive_failed_downstream_sessions(run_id, &[(task_idx, session_idx)])?;
         self.conn.execute(
             "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
             params![run_id, task_idx],
@@ -3119,8 +3970,10 @@ impl Store {
     /// reset only the task-scope verifies at index >= `verify_from` to Pending
     /// while leaving all sessions and their session-level verifies intact. The
     /// task and run are put back to Pending so the scheduler's task finalizer
-    /// fires and re-runs the task-level verifies. Returns dirtied dependent
-    /// run ids.
+    /// fires and re-runs the task-level verifies. Any session downstream of
+    /// this task that was left `Failed` by an earlier pass is revived back to
+    /// Pending too (RAL-165) — see [`Store::revive_failed_downstream_sessions`].
+    /// Returns dirtied dependent run ids.
     pub fn restart_task_verify(
         &self,
         run_id: &str,
@@ -3147,6 +4000,13 @@ impl Store {
             "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='task' AND idx>=?",
             params![run_id, task_idx, verify_from],
         )?;
+        let roots: Vec<(i64, i64)> = self
+            .sessions_of(run_id)?
+            .into_iter()
+            .filter(|s| s.task_idx == task_idx)
+            .map(|s| (s.task_idx, s.idx))
+            .collect();
+        self.revive_failed_downstream_sessions(run_id, &roots)?;
         self.conn.execute(
             "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
             params![run_id, task_idx],
@@ -3578,8 +4438,9 @@ pub struct SessionOutcome {
     pub cost_usd: f64,
     /// Error detail, if failed.
     pub error: Option<String>,
-    /// Claude Code session UUID for `claude --resume`, if captured.
-    pub claude_session_id: Option<String>,
+    /// Resumable CLI-agent session/thread id (for `claude --resume`/`codex exec
+    /// resume`), if captured.
+    pub agent_session_id: Option<String>,
 }
 
 // ── Queue view types + helpers (RAL Queue) ───────────────────────────────────
@@ -3868,6 +4729,136 @@ command = "cargo test"
         toml::from_str(src).expect("valid toml")
     }
 
+    /// `Store::open_in_memory()` always starts from the current schema, so it
+    /// never exercises the `RENAME COLUMN claude_session_id TO
+    /// agent_session_id` migration (and its siblings) added for Codex
+    /// support. This hand-rolls a pre-migration database -- just the four
+    /// affected tables, with the old column names and real data in them --
+    /// and runs the real `init_schema()` migration path
+    /// (`Store::open`/`open_in_memory` both just call this) against it, to
+    /// prove an upgrading user's existing session/resolver ids actually
+    /// survive the rename rather than silently becoming `NULL`.
+    #[test]
+    fn migration_renames_legacy_claude_session_id_columns() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                run_id TEXT NOT NULL, task_idx INTEGER NOT NULL, idx INTEGER NOT NULL,
+                sid TEXT, agent TEXT NOT NULL DEFAULT 'claude', state TEXT NOT NULL,
+                depends_on TEXT NOT NULL DEFAULT '[]', tokens_in INTEGER NOT NULL DEFAULT 0,
+                tokens_out INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+                claude_session_id TEXT,
+                PRIMARY KEY (run_id, task_idx, idx)
+             );
+             CREATE TABLE verifies (
+                run_id TEXT NOT NULL, task_idx INTEGER NOT NULL, scope TEXT NOT NULL,
+                session_idx INTEGER NOT NULL, idx INTEGER NOT NULL, vid TEXT,
+                kind TEXT NOT NULL, spec TEXT NOT NULL, state TEXT NOT NULL,
+                agent TEXT NOT NULL DEFAULT 'claude', claude_session_id TEXT,
+                PRIMARY KEY (run_id, task_idx, scope, session_idx, idx)
+             );
+             CREATE TABLE guardians (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, base_branch TEXT NOT NULL,
+                manual_commands_claude_session_id TEXT
+             );
+             CREATE TABLE guardian_branches (
+                guardian_id TEXT NOT NULL, position INTEGER NOT NULL, branch TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', resolver_claude_session_id TEXT,
+                PRIMARY KEY (guardian_id, position)
+             );",
+        )
+        .expect("create legacy (pre-rename) schema");
+        conn.execute(
+            "INSERT INTO sessions (run_id, task_idx, idx, sid, state, claude_session_id)
+             VALUES ('r1', 0, 0, 's0', 'done', 'legacy-session-id')",
+            [],
+        )
+        .expect("insert legacy session row");
+        conn.execute(
+            "INSERT INTO verifies (run_id, task_idx, scope, session_idx, idx, kind, spec, state, claude_session_id)
+             VALUES ('r1', 0, 'session', 0, 0, 'command', 'true', 'done', 'legacy-verify-sid')",
+            [],
+        )
+        .expect("insert legacy verify row");
+        conn.execute(
+            "INSERT INTO guardians (id, name, base_branch, manual_commands_claude_session_id)
+             VALUES ('g1', 'g', 'main', 'legacy-manual-sid')",
+            [],
+        )
+        .expect("insert legacy guardian row");
+        conn.execute(
+            "INSERT INTO guardian_branches (guardian_id, position, branch, resolver_claude_session_id)
+             VALUES ('g1', 0, 'feature', 'legacy-resolver-sid')",
+            [],
+        )
+        .expect("insert legacy guardian_branches row");
+
+        let store = Store { conn };
+        store
+            .init_schema()
+            .expect("migration must succeed against a legacy schema");
+
+        let session_sid: String = store
+            .conn
+            .query_row(
+                "SELECT agent_session_id FROM sessions WHERE run_id='r1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("agent_session_id column must exist and hold the migrated value");
+        assert_eq!(session_sid, "legacy-session-id");
+
+        let verify_sid: String = store
+            .conn
+            .query_row(
+                "SELECT agent_session_id FROM verifies WHERE run_id='r1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("agent_session_id column must exist and hold the migrated value");
+        assert_eq!(verify_sid, "legacy-verify-sid");
+
+        let manual_sid: String = store
+            .conn
+            .query_row(
+                "SELECT manual_commands_agent_session_id FROM guardians WHERE id='g1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect(
+                "manual_commands_agent_session_id column must exist and hold the migrated value",
+            );
+        assert_eq!(manual_sid, "legacy-manual-sid");
+
+        let resolver_sid: String = store
+            .conn
+            .query_row(
+                "SELECT resolver_agent_session_id FROM guardian_branches WHERE guardian_id='g1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("resolver_agent_session_id column must exist and hold the migrated value");
+        assert_eq!(resolver_sid, "legacy-resolver-sid");
+
+        // The old columns must actually be gone (RENAME COLUMN, not a copy),
+        // confirming this is a real rename rather than an ADD-COLUMN-and-leave-
+        // the-old-one-behind.
+        let old_column_still_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('sessions') WHERE name='claude_session_id'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("pragma_table_info query must succeed")
+            .is_some();
+        assert!(
+            !old_column_still_exists,
+            "old claude_session_id column should have been renamed away, not left behind"
+        );
+    }
+
     #[test]
     fn insert_and_fetch_run() {
         let mut store = Store::open_in_memory().unwrap();
@@ -3882,6 +4873,8 @@ command = "cargo test"
         assert_eq!(run.tasks.len(), 1);
         let task = &run.tasks[0];
         assert_eq!(task.name, "build");
+        // No `project` set in TOML -> falls back to the cwd basename (RAL-141).
+        assert_eq!(task.project, "repo");
         assert_eq!(task.sessions.len(), 1);
         assert_eq!(task.sessions[0].id, "worker");
         assert_eq!(task.sessions[0].agent, "claude");
@@ -3895,6 +4888,45 @@ command = "cargo test"
         assert_eq!(task.verify.len(), 1); // task-level verify
         assert_eq!(task.verify[0].kind, "command");
         assert_eq!(task.verify[0].spec, "cargo test");
+    }
+
+    #[test]
+    fn explicit_project_wins_over_cwd_fallback() {
+        let src = r#"
+[[task]]
+name = "build"
+project = "myrepo"
+[[task.session]]
+cwd = "/some/other/path"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(src), None, false).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert_eq!(run.tasks[0].project, "myrepo");
+    }
+
+    #[test]
+    fn task_with_no_sessions_falls_back_to_unassigned() {
+        let src = r#"
+[[task]]
+name = "empty"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(src), None, false).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert_eq!(run.tasks[0].project, "unassigned");
+    }
+
+    #[test]
+    fn fallback_project_identifier_covers_edge_cases() {
+        assert_eq!(fallback_project_identifier(Some("/repo")), "repo");
+        assert_eq!(
+            fallback_project_identifier(Some("C:/Users/me/repo")),
+            "repo"
+        );
+        assert_eq!(fallback_project_identifier(Some("/")), "unassigned");
+        assert_eq!(fallback_project_identifier(None), "unassigned");
     }
 
     #[test]
@@ -3968,6 +5000,77 @@ command = "cargo test"
         assert_eq!(run.tasks[0].state, "cancelled");
         // …but the session that already completed keeps its real outcome.
         assert_eq!(run.tasks[0].sessions[0].state, "done");
+    }
+
+    // RAL-157: two independent tasks, for solo/unsolo tests.
+    const TWO_TASKS: &str = r#"
+[[task]]
+name = "a"
+[[task.session]]
+cwd = "."
+command = "build a"
+[[task]]
+name = "b"
+[[task.session]]
+cwd = "."
+command = "build b"
+"#;
+
+    #[test]
+    fn solo_task_round_trips_and_is_visible_on_the_run_view() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        assert!(!run.tasks[0].soloed, "not soloed by default");
+        assert!(!run.tasks[1].soloed);
+
+        store.solo_task(&id, 0).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(run.tasks[0].soloed);
+        assert!(!run.tasks[1].soloed, "soloing one task doesn't solo others");
+
+        store.unsolo_task(&id, 0).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(!run.tasks[0].soloed);
+    }
+
+    #[test]
+    fn solo_task_is_idempotent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+        store.solo_task(&id, 0).unwrap();
+        store.solo_task(&id, 0).unwrap();
+        assert!(store.get_run(&id).unwrap().tasks[0].soloed);
+        store.unsolo_task(&id, 0).unwrap();
+        store.unsolo_task(&id, 0).unwrap();
+        assert!(!store.get_run(&id).unwrap().tasks[0].soloed);
+    }
+
+    #[test]
+    fn solo_task_unknown_task_index_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+        assert!(matches!(
+            store.solo_task(&id, 99),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn multiple_tasks_can_be_soloed_at_once_with_no_auto_exclusivity() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+
+        store.solo_task(&id, 0).unwrap();
+        assert_eq!(store.soloed_task_indices(&id).unwrap(), [0].into());
+
+        // Soloing a second task doesn't un-solo the first (RAL-157 Q4).
+        store.solo_task(&id, 1).unwrap();
+        assert_eq!(store.soloed_task_indices(&id).unwrap(), [0, 1].into());
+
+        store.unsolo_task(&id, 0).unwrap();
+        assert_eq!(store.soloed_task_indices(&id).unwrap(), [1].into());
     }
 
     #[test]
@@ -4413,6 +5516,584 @@ command = "y"
     }
 
     #[test]
+    fn restart_task_resets_all_of_its_sessions_and_downstream_but_not_upstream() {
+        // t0/s1 -> t0/s2, t1/s3 depends on t0/s2 (cross-task). Restarting t0
+        // must dirty every t0 session plus t1's downstream session, but leave
+        // an unrelated upstream-only session alone.
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t0\"\n\
+            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task]]\nname=\"t1\"\n\
+            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"t0/s2\"]\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Done)
+            .unwrap();
+        store
+            .set_session_state(&run, 0, 1, NodeState::Done)
+            .unwrap();
+        store
+            .set_session_state(&run, 1, 0, NodeState::Done)
+            .unwrap();
+
+        store.restart_task(&run, 0).unwrap();
+        let done = store.done_sessions(&run).unwrap();
+        assert!(!done.contains(&(0, 0)), "t0/s1 dirtied");
+        assert!(!done.contains(&(0, 1)), "t0/s2 dirtied");
+        assert!(
+            !done.contains(&(1, 0)),
+            "t1/s3 dirtied (downstream of t0/s2)"
+        );
+    }
+
+    #[test]
+    fn restart_task_on_missing_task_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        assert!(matches!(
+            store.restart_task(&run, 5),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    // ── env overrides (RAL-150) ───────────────────────────────────────────
+
+    #[test]
+    fn run_env_overrides_default_to_empty() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        assert!(store.get_run_env_overrides(&run).unwrap().is_empty());
+        assert!(store.get_run(&run).unwrap().env_overrides.is_empty());
+    }
+
+    #[test]
+    fn set_run_env_overrides_persists_and_merges() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        set.insert("B".to_string(), "2".to_string());
+        let result = store.set_run_env_overrides(&run, &set, &[]).unwrap();
+        assert_eq!(result.get("A").map(String::as_str), Some("1"));
+        assert_eq!(result.get("B").map(String::as_str), Some("2"));
+
+        // A second call merges into the existing map rather than replacing it.
+        let mut set2 = BTreeMap::new();
+        set2.insert("C".to_string(), "3".to_string());
+        let result2 = store
+            .set_run_env_overrides(&run, &set2, &["A".to_string()])
+            .unwrap();
+        assert!(!result2.contains_key("A"), "A was unset");
+        assert_eq!(
+            result2.get("B").map(String::as_str),
+            Some("2"),
+            "B untouched"
+        );
+        assert_eq!(result2.get("C").map(String::as_str), Some("3"));
+
+        // Persisted across a fresh fetch, and reflected in the RunView.
+        assert_eq!(store.get_run_env_overrides(&run).unwrap(), result2);
+        assert_eq!(store.get_run(&run).unwrap().env_overrides, result2);
+    }
+
+    #[test]
+    fn set_run_env_overrides_missing_run_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        let set = BTreeMap::new();
+        assert!(matches!(
+            store.set_run_env_overrides("nope", &set, &[]),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn set_run_env_overrides_set_wins_over_unset_for_same_key() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        let result = store
+            .set_run_env_overrides(&run, &set, &["A".to_string()])
+            .unwrap();
+        assert_eq!(result.get("A").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn env_overrides_survive_retry_to_pending() {
+        // Persistence (Q4): overrides must not be cleared by a plain retry.
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("RALPHUS_RESOLVER_MODEL".to_string(), "qwen3:8b".to_string());
+        store.set_run_env_overrides(&run, &set, &[]).unwrap();
+
+        store.reset_run_to_pending(&run).unwrap();
+        assert_eq!(
+            store
+                .get_run_env_overrides(&run)
+                .unwrap()
+                .get("RALPHUS_RESOLVER_MODEL"),
+            Some(&"qwen3:8b".to_string())
+        );
+    }
+
+    // ── hierarchical env overrides (RAL-150 extension) ─────────────────────
+
+    fn two_task_two_session_toml() -> &'static str {
+        "[[task]]\nname=\"t0\"\n\
+         [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+         [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+         [[task]]\nname=\"t1\"\n\
+         [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n"
+    }
+
+    #[test]
+    fn task_env_overrides_default_to_empty() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+        assert!(store.get_task_env_overrides(&run, 0).unwrap().is_empty());
+        assert!(
+            store
+                .get_task_verify_env_overrides(&run, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store.get_run(&run).unwrap().tasks[0]
+                .env_overrides
+                .is_empty()
+        );
+        assert!(
+            store.get_run(&run).unwrap().tasks[0]
+                .verify_env_overrides
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn set_task_env_overrides_persists_and_merges() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        let result = store.set_task_env_overrides(&run, 0, &set, &[]).unwrap();
+        assert_eq!(result.get("A").map(String::as_str), Some("1"));
+
+        let mut set2 = BTreeMap::new();
+        set2.insert("B".to_string(), "2".to_string());
+        let result2 = store
+            .set_task_env_overrides(&run, 0, &set2, &["A".to_string()])
+            .unwrap();
+        assert!(!result2.contains_key("A"));
+        assert_eq!(result2.get("B").map(String::as_str), Some("2"));
+
+        assert_eq!(store.get_task_env_overrides(&run, 0).unwrap(), result2);
+        assert_eq!(store.get_run(&run).unwrap().tasks[0].env_overrides, result2);
+        // Task 1 is untouched.
+        assert!(store.get_task_env_overrides(&run, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_task_env_overrides_missing_task_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+        let set = BTreeMap::new();
+        assert!(matches!(
+            store.set_task_env_overrides(&run, 9, &set, &[]),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn set_task_verify_env_overrides_persists_independent_of_task_env() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "task".to_string());
+        store.set_task_env_overrides(&run, 0, &set, &[]).unwrap();
+        let mut vset = BTreeMap::new();
+        vset.insert("A".to_string(), "task-verify".to_string());
+        store
+            .set_task_verify_env_overrides(&run, 0, &vset, &[])
+            .unwrap();
+
+        assert_eq!(
+            store.get_task_env_overrides(&run, 0).unwrap().get("A"),
+            Some(&"task".to_string())
+        );
+        assert_eq!(
+            store
+                .get_task_verify_env_overrides(&run, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"task-verify".to_string())
+        );
+    }
+
+    #[test]
+    fn session_env_overrides_default_to_empty() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+        assert!(
+            store
+                .get_session_env_overrides(&run, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_session_verify_env_overrides(&run, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn set_session_env_overrides_persists_and_is_scoped_to_that_session() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_session_env_overrides(&run, 0, 0, &set, &[])
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_session_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"1".to_string())
+        );
+        // Sibling session (t0/s1) and the other task's session (t1/s0) are untouched.
+        assert!(
+            store
+                .get_session_env_overrides(&run, 0, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_session_env_overrides(&run, 1, 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        let view = store.get_run(&run).unwrap();
+        assert_eq!(
+            view.tasks[0].sessions[0].env_overrides.get("A"),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn set_session_env_overrides_missing_session_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+        let set = BTreeMap::new();
+        assert!(matches!(
+            store.set_session_env_overrides(&run, 0, 9, &set, &[]),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn resolve_session_env_overrides_precedence_run_lt_task_lt_session() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+
+        // Only a run-level value: flows straight through.
+        let mut run_set = BTreeMap::new();
+        run_set.insert("A".to_string(), "run".to_string());
+        run_set.insert("B".to_string(), "run".to_string());
+        run_set.insert("C".to_string(), "run".to_string());
+        store.set_run_env_overrides(&run, &run_set, &[]).unwrap();
+        let merged = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
+        assert_eq!(merged.get("A"), Some(&"run".to_string()));
+
+        // A task-level value for B wins over the run's, but only for sessions
+        // under that task.
+        let mut task_set = BTreeMap::new();
+        task_set.insert("B".to_string(), "task".to_string());
+        store
+            .set_task_env_overrides(&run, 0, &task_set, &[])
+            .unwrap();
+        let merged = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
+        assert_eq!(merged.get("A"), Some(&"run".to_string()));
+        assert_eq!(merged.get("B"), Some(&"task".to_string()));
+        let other_task_merged = store.resolve_session_env_overrides(&run, 1, 0).unwrap();
+        assert_eq!(other_task_merged.get("B"), Some(&"run".to_string()));
+
+        // A session-level value for C wins over both the task's and the run's,
+        // but only for that one session.
+        let mut session_set = BTreeMap::new();
+        session_set.insert("C".to_string(), "session".to_string());
+        store
+            .set_session_env_overrides(&run, 0, 0, &session_set, &[])
+            .unwrap();
+        let merged = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
+        assert_eq!(merged.get("C"), Some(&"session".to_string()));
+        let sibling_merged = store.resolve_session_env_overrides(&run, 0, 1).unwrap();
+        assert_eq!(sibling_merged.get("C"), Some(&"run".to_string()));
+    }
+
+    #[test]
+    fn resolve_task_verify_env_overrides_precedence_run_lt_task_lt_task_verify() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+
+        let mut run_set = BTreeMap::new();
+        run_set.insert("A".to_string(), "run".to_string());
+        store.set_run_env_overrides(&run, &run_set, &[]).unwrap();
+
+        let mut task_set = BTreeMap::new();
+        task_set.insert("A".to_string(), "task".to_string());
+        store
+            .set_task_env_overrides(&run, 0, &task_set, &[])
+            .unwrap();
+        // Task-verify has no value of its own yet -- inherits the task's.
+        assert_eq!(
+            store
+                .resolve_task_verify_env_overrides(&run, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"task".to_string())
+        );
+
+        let mut verify_set = BTreeMap::new();
+        verify_set.insert("A".to_string(), "task-verify".to_string());
+        store
+            .set_task_verify_env_overrides(&run, 0, &verify_set, &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_task_verify_env_overrides(&run, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"task-verify".to_string())
+        );
+        // The plain (non-verify) task resolution is untouched by the
+        // task-verify-only override.
+        assert_eq!(
+            store
+                .resolve_session_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"task".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_session_verify_env_overrides_precedence_full_chain() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store
+            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+            .unwrap();
+
+        let mut run_set = BTreeMap::new();
+        run_set.insert("A".to_string(), "run".to_string());
+        store.set_run_env_overrides(&run, &run_set, &[]).unwrap();
+        let mut task_set = BTreeMap::new();
+        task_set.insert("A".to_string(), "task".to_string());
+        store
+            .set_task_env_overrides(&run, 0, &task_set, &[])
+            .unwrap();
+        let mut session_set = BTreeMap::new();
+        session_set.insert("A".to_string(), "session".to_string());
+        store
+            .set_session_env_overrides(&run, 0, 0, &session_set, &[])
+            .unwrap();
+        // No session-verify value yet -- inherits the session's.
+        assert_eq!(
+            store
+                .resolve_session_verify_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"session".to_string())
+        );
+
+        let mut verify_set = BTreeMap::new();
+        verify_set.insert("A".to_string(), "session-verify".to_string());
+        store
+            .set_session_verify_env_overrides(&run, 0, 0, &verify_set, &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_session_verify_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"session-verify".to_string())
+        );
+        // The plain session resolution is untouched by the session-verify-only
+        // override, and a sibling session's verify resolution never sees it.
+        assert_eq!(
+            store
+                .resolve_session_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"session".to_string())
+        );
+        assert_eq!(
+            store
+                .resolve_session_verify_env_overrides(&run, 0, 1)
+                .unwrap()
+                .get("A"),
+            Some(&"task".to_string())
+        );
+    }
+
+    #[test]
+    fn get_task_session_ids_returns_all_sessions_ordered() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"u\"\n[[task.session]]\nid=\"other\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        assert_eq!(
+            store.get_task_session_ids(&run, 0).unwrap(),
+            vec![(0, "s1".to_string()), (1, "s2".to_string())]
+        );
+        assert_eq!(
+            store.get_task_session_ids(&run, 1).unwrap(),
+            vec![(0, "other".to_string())]
+        );
+    }
+
+    #[test]
+    fn get_task_session_ids_empty_for_unknown_task() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(store.get_task_session_ids(&run, 99).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn record_session_result_does_not_clobber_a_manually_finalized_session() {
+        // RAL-163: a manual set-status override (server::capture_and_stop_node)
+        // can finalize a session's state while the scheduler's own runner call
+        // for it is still in flight. When that call eventually unblocks and
+        // reaches `record_session_result`, it must not stomp the manual
+        // override back to whatever the runner actually returned.
+        // Deliberately no session-level verify step here (unlike SAMPLE) --
+        // `get_run`'s view folds a raw `done` state through
+        // `effective_session_state`, which would otherwise mask the very
+        // column this test is asserting on.
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Running)
+            .unwrap();
+
+        // The user manually finalizes it to `done` while the agent (unknown to
+        // the store) is still actually running.
+        store
+            .set_session_state(&run, 0, 0, NodeState::Done)
+            .unwrap();
+
+        // The scheduler's in-flight runner call finally returns -- too late,
+        // the node is no longer `running`/`pending`, so this must be a no-op.
+        let outcome = SessionOutcome {
+            state: NodeState::Failed,
+            tokens_in: 7,
+            tokens_out: 9,
+            cost_usd: 1.5,
+            error: Some("late result".to_string()),
+            agent_session_id: None,
+        };
+        store.record_session_result(&run, 0, 0, &outcome).unwrap();
+
+        assert_eq!(
+            store.session_state(&run, 0, 0).unwrap(),
+            Some(NodeState::Done),
+            "the manual override must stick, not be overwritten by the late runner result"
+        );
+        let run_view = store.get_run(&run).unwrap();
+        let session = &run_view.tasks[0].sessions[0];
+        assert_eq!(
+            session.tokens_in, 0,
+            "late outcome fields must not land either"
+        );
+        assert!(session.error.is_none());
+    }
+
+    #[test]
+    fn record_session_result_applies_normally_when_session_is_still_running() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Running)
+            .unwrap();
+        let outcome = SessionOutcome {
+            state: NodeState::Done,
+            tokens_in: 3,
+            tokens_out: 4,
+            cost_usd: 0.1,
+            error: None,
+            agent_session_id: None,
+        };
+        store.record_session_result(&run, 0, 0, &outcome).unwrap();
+        assert_eq!(
+            store.session_state(&run, 0, 0).unwrap(),
+            Some(NodeState::Done)
+        );
+        let run_view = store.get_run(&run).unwrap();
+        let session = &run_view.tasks[0].sessions[0];
+        assert_eq!(session.tokens_in, 3);
+    }
+
+    #[test]
+    fn record_session_result_applies_to_a_never_started_pending_session() {
+        // Mirrors the "blocked by a failed dependency" scheduler path: the
+        // session never left `pending` before its outcome is recorded.
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store.insert_run(&parse(SAMPLE), Some("r"), false).unwrap();
+        let outcome = SessionOutcome {
+            state: NodeState::Failed,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            error: Some("blocked by a failed dependency".to_string()),
+            agent_session_id: None,
+        };
+        store.record_session_result(&run, 0, 0, &outcome).unwrap();
+        let run_view = store.get_run(&run).unwrap();
+        let session = &run_view.tasks[0].sessions[0];
+        assert_eq!(session.state, "failed");
+        assert_eq!(
+            session.error.as_deref(),
+            Some("blocked by a failed dependency")
+        );
+    }
+
+    #[test]
     fn done_sessions_excludes_sessions_with_pending_session_verifies() {
         // RAL-64: if the daemon stopped between record_session_result and
         // run_verifies, the session is 'done' in the DB but its verifies are
@@ -4613,6 +6294,87 @@ command = "y"
     }
 
     #[test]
+    fn restart_session_verify_revives_downstream_session_left_failed_by_cascade() {
+        // Mirrors RAL-159/run-000000000147: "work" -> "finalize" in one task.
+        // work's own checks verify failed, which cascaded finalize (its
+        // dependent) to Failed with "blocked by a failed dependency". Only
+        // work's verify then gets retried (not a full session restart) --
+        // finalize must come back to Pending too, or a now-passing verify
+        // can never actually unstick the task (RAL-165).
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"checks\"\ncommand=\"true\"\n\
+            [[task.session]]\nid=\"finalize\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"work\"]\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Done)
+            .unwrap(); // work's body succeeded
+        store
+            .set_verify_state(&run, 0, "session", 0, 0, NodeState::Failed)
+            .unwrap(); // work's checks verify failed
+        store
+            .record_session_result(
+                &run,
+                0,
+                1,
+                &SessionOutcome {
+                    state: NodeState::Failed,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    error: Some("blocked by a failed dependency".to_string()),
+                    agent_session_id: None,
+                },
+            )
+            .unwrap(); // finalize cascaded to Failed
+        store.set_task_state(&run, 0, NodeState::Failed).unwrap();
+        store.set_run_state(&run, RunState::Failed).unwrap();
+
+        store.restart_session_verify(&run, 0, 0, 0).unwrap();
+
+        let run_view = store.get_run(&run).unwrap();
+        let finalize = &run_view.tasks[0].sessions[1];
+        assert_eq!(
+            finalize.state, "pending",
+            "finalize must be revived to pending, not left stuck failed"
+        );
+        assert_eq!(
+            finalize.error, None,
+            "finalize's stale cascade error must be cleared"
+        );
+    }
+
+    #[test]
+    fn restart_session_verify_does_not_touch_a_done_downstream_session() {
+        // If the downstream session already succeeded, a verify retry on its
+        // upstream must not force it to redo work (e.g. re-commit).
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"checks\"\ncommand=\"true\"\n\
+            [[task.session]]\nid=\"finalize\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"work\"]\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Done)
+            .unwrap();
+        store
+            .set_verify_state(&run, 0, "session", 0, 0, NodeState::Done)
+            .unwrap();
+        store
+            .set_session_state(&run, 0, 1, NodeState::Done)
+            .unwrap();
+        store.set_task_state(&run, 0, NodeState::Done).unwrap();
+        store.set_run_state(&run, RunState::Done).unwrap();
+
+        store.restart_session_verify(&run, 0, 0, 0).unwrap();
+
+        let run_view = store.get_run(&run).unwrap();
+        assert_eq!(
+            run_view.tasks[0].sessions[1].state, "done",
+            "an already-done downstream session must not be reset"
+        );
+    }
+
+    #[test]
     fn restart_task_verify_resets_only_task_verifies_sessions_remain_done() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
@@ -4652,6 +6414,58 @@ command = "y"
             store.restart_task_verify(&id, 99, 0),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn restart_task_verify_revives_downstream_session_left_failed_by_cascade() {
+        // Same RAL-165 gap as restart_session_verify, but for a task-level
+        // verify: task "t" -> session "downstream" in a separate task,
+        // dependent on t's own session. t's task-level verify failed,
+        // cascading "downstream" to Failed; retrying only t's task verify
+        // must revive "downstream" too.
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.verify]]\ncommand=\"true\"\n\
+            [[task]]\nname=\"u\"\ndepends_on=[\"t\"]\n\
+            [[task.session]]\nid=\"downstream\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Done)
+            .unwrap();
+        store
+            .set_verify_state(&run, 0, "task", -1, 0, NodeState::Failed)
+            .unwrap();
+        store.set_task_state(&run, 0, NodeState::Failed).unwrap();
+        store
+            .record_session_result(
+                &run,
+                1,
+                0,
+                &SessionOutcome {
+                    state: NodeState::Failed,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    error: Some("blocked by a failed dependency".to_string()),
+                    agent_session_id: None,
+                },
+            )
+            .unwrap();
+        store.set_task_state(&run, 1, NodeState::Failed).unwrap();
+        store.set_run_state(&run, RunState::Failed).unwrap();
+
+        store.restart_task_verify(&run, 0, 0).unwrap();
+
+        let run_view = store.get_run(&run).unwrap();
+        let downstream = &run_view.tasks[1].sessions[0];
+        assert_eq!(
+            downstream.state, "pending",
+            "downstream session must be revived to pending"
+        );
+        assert_eq!(
+            downstream.error, None,
+            "downstream session's stale cascade error must be cleared"
+        );
     }
 
     // Three session-level verify steps: restart from vi=1 leaves vi=0 Done,

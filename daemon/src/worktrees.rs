@@ -250,6 +250,7 @@ mod tests {
             depends_on: vec![],
             timeout_sec: None,
             budget_tokens: None,
+            maximum_budget_usd: None,
             upstream: None,
         }
     }
@@ -260,6 +261,7 @@ mod tests {
             name: format!("task{idx}"),
             project: project.map(str::to_string),
             depends_on: vec![],
+            soloed: false,
         }
     }
 

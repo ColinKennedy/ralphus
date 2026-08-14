@@ -32,27 +32,17 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-from pathlib import Path
 
 from ralphus.config import load_config
 from ralphus.runner import cartographer
 from ralphus.runner.backend import BackendError, BackendOutcome
+from ralphus.runner.cli_agent_common import RESUME_CONTINUATION_PROMPT, live_session_path
+from ralphus.runner.cli_agent_common import write_prompt_file as _write_prompt_file
 from ralphus.runner.tools import Workspace
 
 __all__ = ["ClaudeCodeBackend", "live_session_path"]
-
-
-def _write_prompt_file(prompt: str) -> Path:
-    """Write prompt to ~/.ralphus/task_prompts/<sha256>.md and return the path."""
-    digest = hashlib.sha256(prompt.encode()).hexdigest()[:16]
-    prompts_dir = Path.home() / ".ralphus" / "task_prompts"
-    prompts_dir.mkdir(parents=True, exist_ok=True)
-    path = prompts_dir / f"{digest}.md"
-    path.write_text(prompt, encoding="utf-8")
-    return path
 
 
 def _format_tool_input(tool_input: dict[str, object]) -> str:
@@ -64,6 +54,44 @@ def _format_tool_input(tool_input: dict[str, object]) -> str:
             text = text[:80] + "…"
         parts.append(f"{key}={text!r}")
     return ", ".join(parts)
+
+
+# RAL-161: per-million-token USD rates (input, output), used to estimate a
+# session's *live* running cost from cumulative tokens as stream-json events
+# arrive -- the CLI's `total_cost_usd` is only ever reported once, in the
+# terminal "result" event (see the `elif ev_type == "result":` branch below),
+# so there is no authoritative live cost figure to read. Matched against the
+# model string by substring (loosest-specific-wins is not needed here since
+# entries don't overlap in practice). An unrecognized/future model falls back
+# to Opus-tier rates -- a deliberately conservative (higher) estimate, since
+# this feeds the RAL-161 max-cost kill switch and overestimating spend triggers
+# the safety kill sooner rather than later.
+_MODEL_PRICING_PER_MTOK: list[tuple[str, float, float]] = [
+    ("haiku", 1.00, 5.00),
+    ("sonnet", 3.00, 15.00),
+    ("fable", 10.00, 50.00),
+    ("mythos", 10.00, 50.00),
+    ("opus", 5.00, 25.00),
+]
+_DEFAULT_PRICING_PER_MTOK = (5.00, 25.00)  # Opus-tier fallback
+
+
+def _estimate_cost_usd(model: str | None, tokens_in: int, tokens_out: int) -> float:
+    """Estimate USD cost from cumulative tokens using a per-model rate table.
+
+    Ignores prompt-caching discounts (cache reads/writes are billed below the
+    plain input rate), so this is a conservative overestimate of the true
+    cost -- appropriate for a live figure that only needs to be "close enough,
+    biased high" until the authoritative `total_cost_usd` arrives at session
+    completion (RAL-161).
+    """
+    model_lower = (model or "").lower()
+    input_rate, output_rate = _DEFAULT_PRICING_PER_MTOK
+    for needle, in_rate, out_rate in _MODEL_PRICING_PER_MTOK:
+        if needle in model_lower:
+            input_rate, output_rate = in_rate, out_rate
+            break
+    return (tokens_in / 1_000_000) * input_rate + (tokens_out / 1_000_000) * output_rate
 
 
 def _tool_result_text(content: object) -> str:
@@ -84,22 +112,6 @@ def _tool_result_text(content: object) -> str:
     return ""
 
 
-def live_session_path(workspace_root: str | Path) -> Path:
-    """Return the path where the session ID is written for Watch Live.
-
-    Placed in the system temp dir so it is never tracked by git, never
-    committed accidentally via ``git add -A``, and is accessible to both the
-    Python runner and the Rust daemon on the same machine.
-
-    The filename is derived from the worktree basename (e.g. ``wt-RAL-58-…``),
-    which is globally unique per guardian-branch pair.
-    """
-    basename = Path(workspace_root).name or "unknown"
-    live_dir = Path(tempfile.gettempdir()) / "ralphus"
-    live_dir.mkdir(parents=True, exist_ok=True)
-    return live_dir / f"{basename}.live_session"
-
-
 class ClaudeCodeBackend:
     """A ModelBackend that runs the Claude Code CLI in headless print mode."""
 
@@ -110,6 +122,7 @@ class ClaudeCodeBackend:
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         """Run ``claude -p @<prompt-file>`` in the workspace.
 
@@ -123,6 +136,16 @@ class ClaudeCodeBackend:
         ID is written to a temp-dir side-channel file immediately on receipt of
         the init event so the daemon's watcher thread can push it to the DB
         while the session is still running.
+
+        When ``resume_agent_session_id`` is set (the daemon's tmux
+        auto-reattach retry -- see `daemon/src/runner.rs`'s
+        `run_via_tmux`/`PSMUX_CRASH_NOTES.local.md`), ``--resume <id>`` is
+        added and the original ``prompt`` is replaced with a short
+        continuation directive: on a genuine tmux-pane loss the original
+        conversation already has the real task instructions in its history,
+        so re-sending the full original prompt as a *new* user turn would be
+        redundant (and could confuse the model into thinking it's a distinct,
+        second request) -- all that is needed is a nudge to keep going.
         """
         program = os.environ.get("RALPHUS_CLAUDE_COMMAND", "claude")
         # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
@@ -133,14 +156,33 @@ class ClaudeCodeBackend:
         # existing streaming-JSON `Popen` + pipe-parsing design.
         config = load_config()
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:8]
-        print(
-            f"ralphus [llm-invoke] claude-code start prompt_len={len(prompt)}"
-            f" prompt_hash={prompt_hash} model={model!r}",
-            file=sys.stderr,
-        )
+        if resume_agent_session_id:
+            print(
+                f"ralphus [llm-invoke] claude-code RESUME start"
+                f" resume_from={resume_agent_session_id} prompt_len={len(prompt)}"
+                f" prompt_hash={prompt_hash} model={model!r}",
+                file=sys.stderr,
+            )
+            cartographer.emit(
+                "llm-invoke",
+                "claude-code resuming after dropped tmux session",
+                level="warning",
+                payload={
+                    "resume_from": resume_agent_session_id,
+                    "original_prompt_hash": prompt_hash,
+                    "original_prompt_len": len(prompt),
+                },
+            )
+        else:
+            print(
+                f"ralphus [llm-invoke] claude-code start prompt_len={len(prompt)}"
+                f" prompt_hash={prompt_hash} model={model!r}",
+                file=sys.stderr,
+            )
         t0 = time.monotonic()
         keep_files = config.daemon.keep_temporary_files
-        prompt_file = _write_prompt_file(prompt)
+        effective_prompt = RESUME_CONTINUATION_PROMPT if resume_agent_session_id else prompt
+        prompt_file = _write_prompt_file(effective_prompt)
         sid_path = live_session_path(workspace.root)
         # Remove any stale file from a previous run so the Rust watcher does
         # not see an old session ID before the new one arrives.
@@ -155,6 +197,8 @@ class ClaudeCodeBackend:
                 "--output-format",
                 "stream-json",
             ]
+            if resume_agent_session_id:
+                cmd += ["--resume", resume_agent_session_id]
             if model:
                 cmd += ["--model", model]
             # Deliver the appended system prompt via the CLI's own flag, so it is
@@ -203,6 +247,12 @@ class ClaudeCodeBackend:
             tokens_in = 0
             tokens_out = 0
             cost_usd = 0.0
+            # RAL-161: running totals accumulated across assistant turns, for
+            # the live cost/token side channel -- distinct from tokens_in/
+            # tokens_out/cost_usd above, which stay at 0 until the terminal
+            # "result" event provides the real, authoritative numbers.
+            live_tokens_in = 0
+            live_tokens_out = 0
 
             for raw in proc.stdout or ():
                 line = raw.strip()
@@ -228,7 +278,7 @@ class ClaudeCodeBackend:
                             # RALPHUS_EVENT (not just the side-channel file above) so
                             # `runner.rs`'s existing tmux-pane event forwarder -- which
                             # every session already streams through -- can persist this
-                            # to the session's own claude_session_id column right away.
+                            # to the session's own agent_session_id column right away.
                             # Without this, "Open Agent" stayed disabled in the board
                             # until the whole session finished, even though the id was
                             # known and printed to the live pane from the very start.
@@ -236,7 +286,7 @@ class ClaudeCodeBackend:
                                 "llm-invoke",
                                 "claude-code session-id known",
                                 level="debug",
-                                payload={"claude_session_id": session_id},
+                                payload={"agent_session_id": session_id},
                             )
                 elif ev_type == "assistant":
                     # Claude's own text/tool-call activity -- the whole point of the
@@ -253,6 +303,33 @@ class ClaudeCodeBackend:
                             name = block.get("name", "tool")
                             args = _format_tool_input(block.get("input") or {})
                             print(f"[tool] {name}({args})", file=sys.stderr)
+                    # RAL-161: each assistant turn's own "usage" object reports
+                    # that turn's full request size (Claude Code resends the
+                    # whole growing conversation on every turn), so summing it
+                    # across turns approximates real cumulative spend -- see
+                    # `_estimate_cost_usd`'s docstring for why this leans
+                    # conservative (a safety kill switch should overestimate,
+                    # not underestimate). Forwarded over the same RALPHUS_EVENT
+                    # marker as claude_session_id above so the daemon's
+                    # existing tmux-pane event forwarder picks it up with no
+                    # new plumbing.
+                    usage = message.get("usage") or {}
+                    turn_tokens_in = int(usage.get("input_tokens") or 0)
+                    turn_tokens_out = int(usage.get("output_tokens") or 0)
+                    if turn_tokens_in or turn_tokens_out:
+                        live_tokens_in += turn_tokens_in
+                        live_tokens_out += turn_tokens_out
+                        live_cost_usd = _estimate_cost_usd(model, live_tokens_in, live_tokens_out)
+                        cartographer.emit(
+                            "llm-invoke",
+                            "claude-code live usage",
+                            level="debug",
+                            payload={
+                                "tokens_in": live_tokens_in,
+                                "tokens_out": live_tokens_out,
+                                "cost_usd": live_cost_usd,
+                            },
+                        )
                 elif ev_type == "user":
                     # Tool results fed back to Claude -- shown for the same reason.
                     message = ev.get("message") or {}
@@ -269,8 +346,14 @@ class ClaudeCodeBackend:
                 elif ev_type == "result":
                     result_summary = str(ev.get("result", ""))[:2000]
                     session_id = ev.get("session_id") or session_id
-                    tokens_in = int(ev.get("total_input_tokens") or 0)
-                    tokens_out = int(ev.get("total_output_tokens") or 0)
+                    # Token counts live under the nested "usage" object (there is
+                    # no top-level total_input_tokens/total_output_tokens field) --
+                    # confirmed against real `claude -p --output-format
+                    # stream-json` output, whose terminal "result" event usage
+                    # object looks like {"input_tokens": N, "output_tokens": N, ...}.
+                    usage = ev.get("usage") or {}
+                    tokens_in = int(usage.get("input_tokens") or 0)
+                    tokens_out = int(usage.get("output_tokens") or 0)
                     # stream-json uses total_cost_usd; fall back to cost_usd for
                     # older builds that used the json format field name.
                     cost_usd = float(ev.get("total_cost_usd") or ev.get("cost_usd") or 0.0)
@@ -303,5 +386,5 @@ class ClaudeCodeBackend:
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             cost_usd=cost_usd,
-            claude_session_id=session_id,
+            agent_session_id=session_id,
         )

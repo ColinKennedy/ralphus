@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ralphus_core::schema::TaskFile;
+use ralphus_daemon::guardian::GuardianCheck;
 use ralphus_daemon::guardian_merge::{
-    purge_worktrees, rebase_on_manual_push, rebuild_on_base_shift, reopen_straggler, run_chat,
-    run_feedback, run_merge,
+    purge_worktrees, rebase_command_progress, rebase_on_manual_push, rebuild_on_base_shift,
+    reopen_straggler, run_chat, run_feedback, run_merge,
 };
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
@@ -106,7 +107,7 @@ impl Runner for StageDoneRunner {
             summary: "resolved\nRALPHUS_STAGE: DONE".into(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -148,7 +149,7 @@ impl Runner for MarkerStrippingRunner {
             summary: "resolved".into(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -167,7 +168,7 @@ impl Runner for FeedbackRunner {
             summary: "edited".into(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -186,7 +187,7 @@ impl Runner for NamedFeedbackRunner {
             summary: "edited".into(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -236,6 +237,42 @@ fn builds_review_branch_from_two_features() {
 
     let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
     assert!(files.contains("base.txt") && files.contains("a.txt") && files.contains("b.txt"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-145: `rebase_command_progress` reads git's own interactive-rebase
+/// todo-list bookkeeping (`rebase-merge/done` + `rebase-merge/git-rebase-todo`)
+/// straight off disk -- no rebase actually needs to run; a synthetic pair of
+/// files exercises the counting logic (non-blank, non-comment lines) directly.
+#[test]
+fn rebase_command_progress_reads_synthetic_done_and_todo_files() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // No rebase in progress yet: `None`, not a spurious `0`/`0`.
+    assert_eq!(rebase_command_progress(&root), None);
+
+    // Two commands already done; three queued in the todo file, padded with a
+    // blank line and a comment line that must not be counted as commands.
+    let state_dir = root.join(".git").join("rebase-merge");
+    std::fs::create_dir_all(&state_dir).expect("mkdir rebase-merge");
+    std::fs::write(
+        state_dir.join("done"),
+        "pick aaaaaaa first commit\npick bbbbbbb second commit\n",
+    )
+    .expect("write done");
+    std::fs::write(
+        state_dir.join("git-rebase-todo"),
+        "pick ccccccc third commit\n\n# comment line, should not count\n\
+         pick ddddddd fourth commit\npick eeeeeee fifth commit\n",
+    )
+    .expect("write git-rebase-todo");
+
+    assert_eq!(rebase_command_progress(&root), Some((2, 5)));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -698,7 +735,7 @@ impl Runner for InferredBuildRunner {
                     .into(),
                 error: None,
                 verified: None,
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             };
         }
@@ -723,7 +760,11 @@ fn nothing_configured_runs_ai_inferred_build_in_advance() {
         combined.join("built_marker.txt").exists(),
         "the inferred build command should have run against the combined worktree"
     );
-    assert_eq!(view.manual_commands, vec!["echo verify".to_string()]);
+    assert_eq!(view.manual_commands.len(), 1);
+    assert_eq!(
+        view.manual_commands[0].command.as_deref(),
+        Some("echo verify")
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1262,6 +1303,90 @@ fn carry_forward_refs_are_cleaned_up_when_a_rebuild_fails() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// RAL-72 regression (superseded by RAL-144, see below): `conflicts_found`
+// used to be a one-time snapshot taken before the resolve loop started, so a
+// branch whose rebase hits conflicts on more than one commit kept reporting
+// only the *first* commit's marker count forever after — while
+// `conflicts_committed` kept climbing. This left the board's "N found / M
+// fixed / K committed" progress line either stuck or (when the first commit
+// had zero markers, e.g. a rerere fast path) hidden entirely, even while the
+// resolver was actively fixing later commits.
+//
+// RAL-144 replaced RAL-72's fix (which accumulated `found`/`committed`
+// across the whole branch) with per-commit rescoping: `found` is recomputed
+// fresh from disk every loop iteration, and `committed` resets to 0 every
+// time the rebase advances to its next commit. Both values are now scoped to
+// whichever commit the rebase is presently stopped on, and neither
+// accumulates across the two sequential conflicting commits below —
+// `committed` in particular must reset between resolving y1's conflict and
+// resolving y2's, rather than carrying y1's staged count forward.
+#[test]
+fn conflict_counters_reset_across_sequential_conflicting_commits() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict1.txt", "line1\nBASE\nline3\n");
+    write(&root, "conflict2.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // feature/x changes both files -> stacks cleanly first.
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict1.txt", "line1\nX1\nline3\n");
+    write(&root, "conflict2.txt", "line1\nX2\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    // feature/y (from main) touches the SAME two files across TWO separate
+    // commits, so rebasing it onto the stack hits two distinct conflict
+    // episodes, not one.
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict1.txt", "line1\nY1\nline3\n");
+    git(&root, &["commit", "-am", "y1"]);
+    write(&root, "conflict2.txt", "line1\nY2\nline3\n");
+    git(&root, &["commit", "-am", "y2"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("conflict review", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    run_merge(&store, &MarkerStrippingRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(y.merge_status, "conflict_resolved");
+    // `found` reflects only the last commit resolved (y2's single marker), not
+    // an accumulated total across both of y's commits.
+    assert_eq!(
+        y.conflicts_found,
+        Some(1),
+        "found must be rescoped to the current commit, not accumulated: detail: {:?}",
+        y.detail
+    );
+    // `committed` must reset to 0 once the rebase finishes advancing past the
+    // final resolved commit, not keep climbing across y1 and y2.
+    assert_eq!(
+        y.conflicts_committed,
+        Some(0),
+        "committed must reset between sequential conflicting commits: detail: {:?}",
+        y.detail
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn resolves_a_conflict_with_the_agent() {
     let root = temp_repo();
@@ -1529,7 +1654,7 @@ command = "cargo test --workspace"
                     summary: self.synth_summary.into(),
                     error: None,
                     verified: None,
-                    claude_session_id: None,
+                    agent_session_id: None,
                     ghost: None,
                 };
             }
@@ -1564,8 +1689,13 @@ command = "cargo test --workspace"
                 cost_usd: 0.0,
                 summary: "resolved".into(),
                 error: None,
-                verified: None,
-                claude_session_id: None,
+                // RAL-149: the dedicated final-verify call is `verify: true`;
+                // report a PASS verdict for it so the branch's merge status
+                // still lands on `conflict_resolved` (a FAIL verdict is
+                // otherwise a valid, non-blocking outcome, but this test is
+                // about the resolver/synthesis prompts, not verify verdicts).
+                verified: spec.verify.then_some(true),
+                agent_session_id: None,
                 ghost: None,
             }
         }
@@ -1616,20 +1746,33 @@ command = "cargo test --workspace"
         "synthesis system prompt should forbid commit/push:\n{synth_sys}"
     );
 
-    // 3. The resolver prompt contains the synthesised quality bar.
+    // 3. RAL-149: `verify_mid_resolution` defaults off, so the fix pass's own
+    //    ("resolve") prompt must NOT carry the quality bar...
     let resolve = specs
         .iter()
         .find(|s| s.task == "resolve")
         .expect("resolve spec not found — resolver was never invoked");
-
     let resolve_prompt = resolve.prompt.as_deref().unwrap_or("");
     assert!(
-        resolve_prompt.contains("quality bar"),
-        "resolver prompt missing synthesised quality bar:\n{resolve_prompt}"
+        !resolve_prompt.contains(SYNTH_SUMMARY),
+        "fix pass prompt should not carry the quality bar when verify_mid_resolution is off:\n{resolve_prompt}"
+    );
+
+    // ...it must instead appear in the dedicated final-verify call, which
+    // always runs the quality-bar instructions regardless of that setting.
+    let verify_call = specs
+        .iter()
+        .find(|s| s.task == "resolve-verify")
+        .expect("resolve-verify spec not found — final-verify call was never invoked");
+    assert!(verify_call.verify, "final-verify call must be verify: true");
+    let verify_prompt = verify_call.prompt.as_deref().unwrap_or("");
+    assert!(
+        verify_prompt.contains("quality bar"),
+        "final-verify prompt missing synthesised quality bar:\n{verify_prompt}"
     );
     assert!(
-        resolve_prompt.contains(SYNTH_SUMMARY),
-        "resolver prompt does not contain the synthesised text:\n{resolve_prompt}"
+        verify_prompt.contains(SYNTH_SUMMARY),
+        "final-verify prompt does not contain the synthesised text:\n{verify_prompt}"
     );
 
     // 4. Synthesis events were written to the guardian log.
@@ -1799,7 +1942,7 @@ impl Runner for RouteBlockRunner {
                 ),
                 error: None,
                 verified: None,
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             };
         }
@@ -1815,7 +1958,7 @@ impl Runner for RouteBlockRunner {
             summary: "edited".into(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -2098,7 +2241,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 summary: "resolved".into(),
                 error: None,
                 verified: None,
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             }
         }
@@ -2135,6 +2278,152 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
     assert!(
         sys.contains("git add -A"),
         "resolver system prompt must instruct the agent to run git add -A:\n{sys}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A fake conflict resolver that clears exactly one conflicted file per
+/// invocation (call 1: `conflict.txt`, call 2 and later: `other.txt`),
+/// leaving the rest of the conflict markers untouched and never emitting
+/// `RALPHUS_STAGE: DONE`. This forces `resolve_conflicts_with_agent`'s
+/// fallback path to re-invoke the resolver for the same still-conflicting
+/// commit, with a strictly smaller marker count on the second pass --
+/// exercising the fresh-every-iteration `found` recompute (RAL-144) without
+/// depending on git's rebase auto-continuing straight through a second,
+/// separately-conflicting commit (which it does within a single
+/// `rebase --continue` and which this orchestrator's blind
+/// `is_err() -> --skip` fallback cannot currently pause on).
+struct PartialResolutionRunner {
+    calls: Arc<Mutex<u32>>,
+}
+impl Runner for PartialResolutionRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        // run_merge also invokes the runner for non-conflict tasks (change
+        // summary, manual-commands generation) -- only count/act on actual
+        // conflict-resolver invocations.
+        if spec.task == "resolve" {
+            let call = {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            let target = if call == 1 {
+                "conflict.txt"
+            } else {
+                "other.txt"
+            };
+            let path = PathBuf::from(&spec.cwd).join(target);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if content.contains("<<<<<<<") {
+                    let cleaned: String = content
+                        .lines()
+                        .filter(|l| {
+                            !l.starts_with("<<<<<<<")
+                                && !l.starts_with("=======")
+                                && !l.starts_with(">>>>>>>")
+                        })
+                        .map(|l| format!("{l}\n"))
+                        .collect();
+                    let _ = std::fs::write(&path, cleaned);
+                }
+            }
+        }
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            summary: "resolved".into(),
+            error: None,
+            verified: None,
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+}
+
+#[test]
+fn conflict_counters_are_rescoped_across_resolver_passes() {
+    // RAL-144: `found` must be recomputed fresh every loop iteration instead
+    // of staying frozen at the marker count seeded before the loop started,
+    // and `committed` must reset when the rebase advances past a resolved
+    // commit instead of accumulating for the life of the branch's rebase.
+    //
+    // A single feature/y commit conflicts on two files at once (2 marker
+    // blocks total). PartialResolutionRunner clears only one file per
+    // invocation, so the fallback path re-invokes it for a second pass with
+    // a strictly smaller remaining-marker count (1) before finally staging
+    // and advancing. Against the pre-fix code, `found` stays frozen at the
+    // pre-loop seed (2) and `committed` is never reset after the advance
+    // (staying at 1); the fix yields found=1 (the last fresh recompute) and
+    // committed=0 (reset once the branch's rebase finishes advancing).
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    write(&root, "other.txt", "a\nBASE1\nb\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // feature/x changes both files in one commit -- feature/y's single
+    // commit (also changing both files) conflicts on both simultaneously.
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    write(&root, "other.txt", "a\nX1\nb\n");
+    git(&root, &["commit", "-am", "x"]);
+    git(&root, &["checkout", "main"]);
+
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    write(&root, "other.txt", "a\nY1\nb\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("counter-rescope", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    let calls = Arc::new(Mutex::new(0u32));
+    let runner = PartialResolutionRunner {
+        calls: calls.clone(),
+    };
+    run_merge(&store, &runner, &id);
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "resolver must be invoked twice: once per file, one file per pass"
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(y.merge_status, "conflict_resolved");
+    // A frozen `found` would still read 2 (the pre-loop seed, from before
+    // the first file was cleared).
+    assert_eq!(
+        y.conflicts_found,
+        Some(1),
+        "found must be recomputed fresh on the final pass, not frozen at the pre-loop seed"
+    );
+    // An un-reset `committed` would read 1 (never reset after the advance
+    // that finished the branch's rebase).
+    assert_eq!(
+        y.conflicts_committed,
+        Some(0),
+        "committed must reset once the rebase advances past the resolved commit"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2366,7 +2655,18 @@ fn manual_push_clears_stale_manual_commands() {
     store
         .lock()
         .unwrap()
-        .set_guardian_manual_commands(&id, &["echo stale".to_string()], None, None)
+        .set_guardian_manual_commands(
+            &id,
+            &[GuardianCheck {
+                label: None,
+                command: Some("echo stale".to_string()),
+                prompt: None,
+                cleanup_command: None,
+                inputs: vec![],
+            }],
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(
         store

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from ralphus.runner.backend import BackendError, BackendOutcome
-from ralphus.runner.execute import run_session
+from ralphus.runner.execute import _MAX_ASYNC_ATTEMPTS, run_session
 from ralphus.runner.spec import SessionResult, SessionSpec, SpecError
 from ralphus.runner.tools import ToolError, Workspace
 
@@ -183,6 +183,7 @@ class _WritingBackend:
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         workspace.write_file("agent_output.txt", f"prompt={prompt} model={model}")
         return BackendOutcome(summary="wrote a file", tokens_in=10, tokens_out=5, cost_usd=0.01)
@@ -196,6 +197,7 @@ class _FailingBackend:
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         raise BackendError("model unreachable")
 
@@ -314,6 +316,7 @@ class _ScriptedVerdictBackend:
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         return BackendOutcome(summary=self._summary, tokens_in=1, tokens_out=2, cost_usd=0.1)
 
@@ -394,6 +397,7 @@ def test_agent_verify_sends_verdict_instructions_as_system_prompt(tmp_path: Path
             *,
             model: str | None,
             append_system_prompt: str | None = None,
+            resume_agent_session_id: str | None = None,
         ) -> BackendOutcome:
             seen_prompts.append(prompt)
             seen_system.append(append_system_prompt)
@@ -406,6 +410,124 @@ def test_agent_verify_sends_verdict_instructions_as_system_prompt(tmp_path: Path
     assert seen_system[0] is not None
     assert "RALPHUS_VERIFY: PASS" in seen_system[0]
     assert "RALPHUS_VERIFY: FAIL" in seen_system[0]
+
+
+# ── still-working retry (harness-agnostic async-deferral fix) ───────────────
+
+
+class _SequencedBackend:
+    """A fake backend returning each summary in sequence (repeats the last once
+    exhausted), recording each call's prompt/resume id and returning a distinct
+    ``agent_session_id`` per call so resume-threading across retries is testable.
+    """
+
+    def __init__(self, summaries: list[str]) -> None:
+        self._summaries = summaries
+        self.calls: list[tuple[str, str | None]] = []
+
+    def run(
+        self,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        model: str | None,
+        append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
+    ) -> BackendOutcome:
+        index = len(self.calls)
+        self.calls.append((prompt, resume_agent_session_id))
+        summary = self._summaries[min(index, len(self._summaries) - 1)]
+        return BackendOutcome(
+            summary=summary,
+            tokens_in=1,
+            tokens_out=2,
+            cost_usd=0.1,
+            agent_session_id=f"sess-{index + 1}",
+        )
+
+
+def test_agent_verify_retries_once_on_still_working_then_passes(tmp_path: Path) -> None:
+    backend = _SequencedBackend(
+        [
+            "Monitoring the test run in the background. RALPHUS_STILL_WORKING: waiting on tests",
+            "Confirmed passing.\nRALPHUS_VERIFY: PASS",
+        ]
+    )
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=backend)
+    assert result.ok
+    assert result.verified is True
+    assert len(backend.calls) == 2
+    # the retry resumes the first attempt's own reported session id
+    assert backend.calls[1][1] == "sess-1"
+    # tokens/cost accumulate across both attempts (1 in + 2 out + $0.1, twice)
+    assert result.tokens_in == 2
+    assert result.tokens_out == 4
+    assert result.cost_usd == pytest.approx(0.2)
+
+
+def test_agent_verify_exhausts_retries_still_fails_closed(tmp_path: Path) -> None:
+    backend = _SequencedBackend(["RALPHUS_STILL_WORKING: still waiting on the background job"])
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=backend)
+    assert result.ok, "the verifier itself ran fine; it just never reached a verdict"
+    assert result.verified is False
+    assert len(backend.calls) == _MAX_ASYNC_ATTEMPTS
+    assert "no" in result.summary.lower() and "marker" in result.summary.lower()
+
+
+def test_agent_verify_verdict_on_first_attempt_short_circuits(tmp_path: Path) -> None:
+    backend = _SequencedBackend(["all good\nRALPHUS_VERIFY: PASS", "should never be reached"])
+    spec = SessionSpec.from_json(_verify_spec_json(tmp_path))
+    result = run_session(spec, backend=backend)
+    assert result.verified is True
+    assert len(backend.calls) == 1
+
+
+def test_prompt_session_retries_once_on_still_working_then_finishes(tmp_path: Path) -> None:
+    backend = _SequencedBackend(
+        [
+            "Kicking off a background watcher. RALPHUS_STILL_WORKING: waiting on the build",
+            "All done, build succeeded.",
+        ]
+    )
+    spec = SessionSpec.from_json(
+        json.dumps(
+            {
+                "run_id": "r",
+                "task": "t",
+                "session_id": "s",
+                "cwd": str(tmp_path),
+                "prompt": "build it",
+            }
+        )
+    )
+    result = run_session(spec, backend=backend)
+    assert result.ok
+    assert result.summary == "All done, build succeeded."
+    assert len(backend.calls) == 2
+    assert backend.calls[1][1] == "sess-1"
+    assert result.tokens_in == 2
+    assert result.tokens_out == 4
+
+
+def test_prompt_session_exhausts_retries_fails(tmp_path: Path) -> None:
+    backend = _SequencedBackend(["RALPHUS_STILL_WORKING: still waiting on the background job"])
+    spec = SessionSpec.from_json(
+        json.dumps(
+            {
+                "run_id": "r",
+                "task": "t",
+                "session_id": "s",
+                "cwd": str(tmp_path),
+                "prompt": "build it",
+            }
+        )
+    )
+    result = run_session(spec, backend=backend)
+    assert not result.ok
+    assert "outstanding async work" in (result.error or "")
+    assert len(backend.calls) == _MAX_ASYNC_ATTEMPTS
 
 
 # ── SessionResult ────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@
 
 use std::net::ToSocketAddrs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,12 @@ pub struct Daemon {
     /// that don't want live background threads); handlers only ever enqueue
     /// into it.
     summary_queue: Arc<SummaryQueue>,
+    /// Set by the `POST /api/daemon/shutdown` handler; polled by
+    /// `run_http_loop` (never by `route()`'s own ~100 in-process unit tests)
+    /// to break out of the blocking `tiny_http` accept loop and let `serve()`
+    /// return, so `main()` can exit normally and drop `_job_guard` — see
+    /// `jobobject.rs` for why that's what actually kills every subprocess.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Daemon {
@@ -53,6 +60,7 @@ impl Daemon {
             procs: ProcRegistry::new(),
             sem: Arc::new(Semaphore::new(max_concurrent)),
             summary_queue: SummaryQueue::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -90,6 +98,18 @@ impl Daemon {
 
     fn lock(&self) -> MutexGuard<'_, Store> {
         self.store.lock().expect("store mutex poisoned")
+    }
+
+    /// Request that `run_http_loop` stop accepting new requests and return,
+    /// so `serve()` returns and the daemon process exits. See the `shutdown`
+    /// field's doc comment.
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether shutdown has been requested — polled by `run_http_loop` only.
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -253,6 +273,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
     let segs: Vec<&str> = path_only.trim_matches('/').split('/').collect();
     match (method, segs.as_slice()) {
         ("GET", ["api", "daemon"]) => health(daemon),
+        ("POST", ["api", "daemon", "shutdown"]) => shutdown(daemon, body),
         ("GET", ["api", "tasks"]) => board(daemon, query),
         ("GET", ["api", "projects"]) => list_projects(daemon),
         ("POST", ["api", "projects"]) => register_project(daemon, body),
@@ -306,6 +327,23 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "runs", id, "tasks", ti, "verify", vi, "restart"]) => {
             restart_task_verify(daemon, id, ti, vi)
         }
+        ("POST", ["api", "runs", id, "tasks", ti, "restart", "preview"]) => {
+            restart_task_preview(daemon, id, ti)
+        }
+        ("POST", ["api", "runs", id, "tasks", ti, "restart"]) => restart_task(daemon, id, ti),
+        ("POST", ["api", "runs", id, "env"]) => set_run_env(daemon, id, body),
+        ("POST", ["api", "runs", id, "tasks", ti, "verify", "env"]) => {
+            set_task_verify_env(daemon, id, ti, body)
+        }
+        ("POST", ["api", "runs", id, "tasks", ti, "env"]) => set_task_env(daemon, id, ti, body),
+        ("POST", ["api", "runs", id, "sessions", ti, si, "verify", "env"]) => {
+            set_session_verify_env(daemon, id, ti, si, body)
+        }
+        ("POST", ["api", "runs", id, "sessions", ti, si, "env"]) => {
+            set_session_env(daemon, id, ti, si, body)
+        }
+        ("POST", ["api", "runs", id, "tasks", ti, "solo"]) => solo_task(daemon, id, ti),
+        ("POST", ["api", "runs", id, "tasks", ti, "unsolo"]) => unsolo_task(daemon, id, ti),
         ("POST", ["api", "runs", id, "sessions", ti, si, "open-terminal"]) => {
             open_terminal(daemon, id, ti, si, query)
         }
@@ -393,6 +431,15 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("GET", ["api", "guardians", id, "branches", branch_id, "pane"]) => {
             guardian_branch_pane(daemon, id, branch_id, query)
         }
+        ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
+            guardian_branch_conflicts(daemon, id, branch_id)
+        }
+        ("POST", ["api", "guardians", id, "manual-checks", "open-terminal"]) => {
+            open_guardian_manual_checks_terminal(daemon, id, query)
+        }
+        ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
+            guardian_manual_checks_pane(daemon, id, query)
+        }
         ("POST", ["api", "guardians", id, "merge"]) => guardian_merge(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
@@ -404,6 +451,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         }
         ("POST", ["api", "guardians", id, "run-action-hint"]) => {
             guardian_run_action_hint(daemon, id, body)
+        }
+        ("POST", ["api", "guardians", id, "resolve-input"]) => {
+            guardian_resolve_input(daemon, id, body)
         }
         ("POST", ["api", "guardians", id, "pull-requests"]) => {
             guardian_submit_prs(daemon, id, body)
@@ -1057,6 +1107,40 @@ fn activate(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+/// Solo a task within a run (RAL-157): pauses every other task in the run
+/// (their not-yet-started sessions won't be dispatched) until un-soloed.
+/// Returns the refreshed [`RunView`] so the board reflects the new `soloed`
+/// flag in the same round trip.
+fn solo_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let guard = daemon.lock();
+    match guard.solo_task(id, task_idx) {
+        Ok(()) => match guard.get_run(id) {
+            Ok(run) => json(200, &run),
+            Err(e) => store_error(&e),
+        },
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Un-solo a task (RAL-157) — the reverse of [`solo_task`]. Returns the
+/// refreshed [`RunView`].
+fn unsolo_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let guard = daemon.lock();
+    match guard.unsolo_task(id, task_idx) {
+        Ok(()) => match guard.get_run(id) {
+            Ok(run) => json(200, &run),
+            Err(e) => store_error(&e),
+        },
+        Err(e) => store_error(&e),
+    }
+}
+
 #[derive(Deserialize)]
 struct EditBody {
     kind: String,
@@ -1204,6 +1288,258 @@ fn retry_run(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct EnvOverridesBody {
+    #[serde(default)]
+    set: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    unset: Vec<String>,
+}
+
+/// Add/replace (`set`) and remove (`unset`) a run's persistent
+/// environment-variable overrides (RAL-150, ticket Q1/Q4). Does *not* itself
+/// retry anything — the overrides just sit on the run until the scheduler
+/// next executes one of its sessions/verify steps (see
+/// `RunnerSpec::env_overrides` and `run_command_verify_capture`'s `env`
+/// param); pair this with `POST .../retry` or `POST .../restart` to actually
+/// re-run something under the new values, exactly as the CLI's `ralphus
+/// retry <selector> --environment ...` does.
+///
+/// Every key in `set`/`unset` must be a valid environment-variable
+/// identifier (`[A-Za-z_][A-Za-z0-9_]*`) — rejected with 400 otherwise, both
+/// to catch obvious typos early and because
+/// `crate::tmux::build_command_line_with_env` relies on this same validation
+/// as a shell-injection backstop for the tmux-wrapped runner path.
+///
+/// Logs a Cartographer record with the changed key names in the clear but
+/// **values redacted unless the key is in the project's
+/// `[env_overrides].allowlist`** (ticket Q3) — a values-in-plaintext audit
+/// log would defeat the entire point of the allowlist for a secret-carrying
+/// override (an API key, a token).
+fn set_run_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<EnvOverridesBody>(body) else {
+        return error(400, "bad_request", "invalid env body", vec![]);
+    };
+    if req.set.is_empty() && req.unset.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "at least one of `set`/`unset` is required",
+            vec![],
+        );
+    }
+    for key in req.set.keys().chain(req.unset.iter()) {
+        if !crate::config::is_valid_env_key(key) {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid environment variable name: {key:?}"),
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    if let Err(e) = store.run_state(id) {
+        return store_error(&e);
+    }
+    let result = match store.set_run_env_overrides(id, &req.set, &req.unset) {
+        Ok(m) => m,
+        Err(e) => return store_error(&e),
+    };
+    let allow = crate::config::load_env_overrides_config();
+    let redacted_set: serde_json::Map<String, serde_json::Value> = req
+        .set
+        .iter()
+        .map(|(k, v)| {
+            let shown = if allow.is_allowed(k) {
+                v.clone()
+            } else {
+                "<redacted>".to_string()
+            };
+            (k.clone(), serde_json::Value::String(shown))
+        })
+        .collect();
+    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "server",
+        message: "run env overrides changed",
+        scope: Some("run"),
+        run_id: Some(id),
+        guardian_id: None,
+        session_id: None,
+        task: None,
+        payload: serde_json::json!({"set": redacted_set, "unset": req.unset}),
+    });
+    json(200, &result)
+}
+
+/// Shared body for the hierarchical-env-overrides extension's four
+/// `POST .../env` endpoints (task / task-verify / session / session-verify):
+/// parses `{set, unset}`, validates every key is a syntactically valid
+/// env-var name, applies via `apply` (which does its own existence check —
+/// every `set_*_env_overrides` store method resolves to `StoreError::NotFound`
+/// when the owning task/session doesn't exist, exactly like
+/// `set_run_env_overrides` does for a missing run), and logs an
+/// allowlist-redacted Cartographer record, mirroring [`set_run_env`] in every
+/// respect except which store method `apply` calls and which entity refs the
+/// Cartographer entry carries.
+fn set_env_overrides(
+    daemon: &Daemon,
+    body: &str,
+    scope: &'static str,
+    run_id: Option<&str>,
+    task: Option<&str>,
+    session_id: Option<&str>,
+    apply: impl FnOnce(
+        &Store,
+        &std::collections::BTreeMap<String, String>,
+        &[String],
+    )
+        -> std::result::Result<std::collections::BTreeMap<String, String>, StoreError>,
+) -> Reply {
+    let Ok(req) = serde_json::from_str::<EnvOverridesBody>(body) else {
+        return error(400, "bad_request", "invalid env body", vec![]);
+    };
+    if req.set.is_empty() && req.unset.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "at least one of `set`/`unset` is required",
+            vec![],
+        );
+    }
+    for key in req.set.keys().chain(req.unset.iter()) {
+        if !crate::config::is_valid_env_key(key) {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid environment variable name: {key:?}"),
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    let result = match apply(&store, &req.set, &req.unset) {
+        Ok(m) => m,
+        Err(e) => return store_error(&e),
+    };
+    let allow = crate::config::load_env_overrides_config();
+    let redacted_set: serde_json::Map<String, serde_json::Value> = req
+        .set
+        .iter()
+        .map(|(k, v)| {
+            let shown = if allow.is_allowed(k) {
+                v.clone()
+            } else {
+                "<redacted>".to_string()
+            };
+            (k.clone(), serde_json::Value::String(shown))
+        })
+        .collect();
+    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "server",
+        message: "env overrides changed",
+        scope: Some(scope),
+        run_id,
+        guardian_id: None,
+        session_id,
+        task,
+        payload: serde_json::json!({"set": redacted_set, "unset": req.unset}),
+    });
+    json(200, &result)
+}
+
+/// Add/replace/remove a task's own persistent environment-variable overrides
+/// (hierarchical env overrides, extending RAL-150) — see
+/// [`Store::resolve_session_env_overrides`] for how this merges under the
+/// run's and over into every session under this task.
+fn set_task_env(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let label = format!("t{task_idx}");
+    set_env_overrides(
+        daemon,
+        body,
+        "task",
+        Some(id),
+        Some(&label),
+        None,
+        |store, set, unset| store.set_task_env_overrides(id, task_idx, set, unset),
+    )
+}
+
+/// Add/replace/remove the environment-variable overrides applied only to a
+/// task's own (task-scoped) verify steps — see
+/// [`Store::resolve_task_verify_env_overrides`].
+fn set_task_verify_env(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let label = format!("t{task_idx}");
+    set_env_overrides(
+        daemon,
+        body,
+        "task-verify",
+        Some(id),
+        Some(&label),
+        None,
+        |store, set, unset| store.set_task_verify_env_overrides(id, task_idx, set, unset),
+    )
+}
+
+/// Add/replace/remove a session's own persistent environment-variable
+/// overrides — see [`Store::resolve_session_env_overrides`].
+fn set_session_env(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Reply {
+    let (Ok(task_idx), Ok(session_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session index must be integers",
+            vec![],
+        );
+    };
+    let task_label = format!("t{task_idx}");
+    let session_label = format!("s{session_idx}");
+    set_env_overrides(
+        daemon,
+        body,
+        "session",
+        Some(id),
+        Some(&task_label),
+        Some(&session_label),
+        |store, set, unset| store.set_session_env_overrides(id, task_idx, session_idx, set, unset),
+    )
+}
+
+/// Add/replace/remove the environment-variable overrides applied only to a
+/// session's own (session-scoped) verify steps — see
+/// [`Store::resolve_session_verify_env_overrides`].
+fn set_session_verify_env(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Reply {
+    let (Ok(task_idx), Ok(session_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session index must be integers",
+            vec![],
+        );
+    };
+    let task_label = format!("t{task_idx}");
+    let session_label = format!("s{session_idx}");
+    set_env_overrides(
+        daemon,
+        body,
+        "session-verify",
+        Some(id),
+        Some(&task_label),
+        Some(&session_label),
+        |store, set, unset| {
+            store.set_session_verify_env_overrides(id, task_idx, session_idx, set, unset)
+        },
+    )
+}
+
 #[derive(Serialize)]
 struct RestartResponse {
     state: &'static str,
@@ -1315,11 +1651,24 @@ fn restart_run_preview(daemon: &Daemon, id: &str) -> Reply {
 /// Restart a single session (and its downstream), dirtying dependent runs.
 ///
 /// See [`restart_run`]/[`wait_for_worker_stop`]'s doc comments for why the
-/// owning run's worker (and every run this restart dirties) must be
-/// cancelled *and waited out* first: `Store::restart_session` resets the run
-/// to `Pending` too, and without stopping any still-in-flight worker first, a
-/// restart mid-run causes a double-dispatch race on the deterministic
-/// per-session tmux/spec-file names.
+/// owning run's worker sometimes must be cancelled *and waited out* first:
+/// `Store::restart_session` resets the run to `Pending` too, and without
+/// stopping a still-in-flight worker for the *restarted session itself*
+/// first, a restart mid-run causes a double-dispatch race on the
+/// deterministic per-session tmux/spec-file names.
+///
+/// That cancellation is scoped to whether the restart target is actually
+/// still running, though — not unconditional. A run's worker thread drives
+/// every one of that run's sessions concurrently over one shared
+/// [`crate::cancel::CancelToken`] (see `scheduler::execute_run_inner`), so
+/// cancelling it to restart one *already-terminal* (done/failed) session
+/// used to also kill every other still-running, unrelated sibling session in
+/// the same run as collateral damage (RAL-1xx) — restarting a batch run's
+/// one failed task could take down several of its perfectly healthy
+/// siblings. Skipping the cancel when the target isn't `Running` avoids
+/// that; `claim_ready` (`scheduler.rs`) now defers re-claiming a `Pending`
+/// run until any worker still registered for it exits naturally, so this
+/// stays double-dispatch-safe even without the cancel.
 fn restart_session(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     let (Ok(task_idx), Ok(session_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
         return error(
@@ -1340,8 +1689,17 @@ fn restart_session(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
             wait_for_worker_stop(daemon, &dep.id);
         }
     }
-    daemon.cancellations.cancel(id);
-    wait_for_worker_stop(daemon, id);
+    // Cancel only when we can't positively confirm the target has already
+    // stopped on its own — an unknown/error result stays on the safe
+    // (cancel) side, same as the old unconditional behavior.
+    let target_already_stopped = matches!(
+        daemon.lock().session_state(id, task_idx, session_idx),
+        Ok(Some(state)) if state != NodeState::Running
+    );
+    if !target_already_stopped {
+        daemon.cancellations.cancel(id);
+        wait_for_worker_stop(daemon, id);
+    }
     match daemon.lock().restart_session(id, task_idx, session_idx) {
         Ok(dirtied) => json(
             200,
@@ -1374,9 +1732,59 @@ fn restart_session_preview(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Rep
     }
 }
 
+/// Restart a whole task within a run (and its downstream sessions), dirtying
+/// dependent runs (RAL-150) — the task-granularity counterpart of
+/// [`restart_run`]/[`restart_session`], backing the CLI's generic `ralphus
+/// retry <selector>` when the selector resolves to a task. See
+/// [`wait_for_worker_stop`]'s doc comment for why the owning run's worker
+/// (and every run this restart dirties) must be cancelled *and waited out*
+/// first.
+fn restart_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    if let Ok(impact) = daemon.lock().compute_task_restart_impact(id, task_idx) {
+        for dep in &impact.dirtied_runs {
+            daemon.cancellations.cancel(&dep.id);
+        }
+        for dep in &impact.dirtied_runs {
+            wait_for_worker_stop(daemon, &dep.id);
+        }
+    }
+    daemon.cancellations.cancel(id);
+    wait_for_worker_stop(daemon, id);
+    match daemon.lock().restart_task(id, task_idx) {
+        Ok(dirtied) => json(
+            200,
+            &RestartResponse {
+                state: "pending",
+                dirtied,
+            },
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Dry-run preview of [`restart_task`]: computes the same downstream-impact
+/// set the real restart would dirty, without mutating anything (RAL-104-style).
+fn restart_task_preview(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    match daemon.lock().compute_task_restart_impact(id, task_idx) {
+        Ok(impact) => json(200, &impact),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Restart a single session's verify steps from `vi` onwards: resets
 /// session-level verifies at index >= vi to Pending while leaving the session
 /// body Done so the scheduler re-runs only the affected verify steps.
+///
+/// Like [`restart_session`], only cancels the run's worker when one of the
+/// targeted verify steps is actually still `Running` — see that function's
+/// doc comment for why an unconditional cancel collaterally kills unrelated
+/// sibling sessions in the same run (RAL-1xx).
 fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &str) -> Reply {
     let (Ok(task_idx), Ok(session_idx), Ok(verify_from)) =
         (ti.parse::<i64>(), si.parse::<i64>(), vi.parse::<i64>())
@@ -1388,8 +1796,14 @@ fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &st
             vec![],
         );
     };
-    daemon.cancellations.cancel(id);
-    wait_for_worker_stop(daemon, id);
+    let target_running = daemon
+        .lock()
+        .session_verify_running_from(id, task_idx, session_idx, verify_from)
+        .unwrap_or(true);
+    if target_running {
+        daemon.cancellations.cancel(id);
+        wait_for_worker_stop(daemon, id);
+    }
     match daemon
         .lock()
         .restart_session_verify(id, task_idx, session_idx, verify_from)
@@ -1419,6 +1833,11 @@ fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &st
 /// Restart a task's verify steps from `vi` onwards: resets task-scope verifies
 /// at index >= vi to Pending while leaving all sessions Done so the scheduler
 /// re-runs only the affected task-level verifies.
+///
+/// Like [`restart_session`], only cancels the run's worker when one of the
+/// targeted verify steps is actually still `Running` — see that function's
+/// doc comment for why an unconditional cancel collaterally kills unrelated
+/// sibling sessions in the same run (RAL-1xx).
 fn restart_task_verify(daemon: &Daemon, id: &str, ti: &str, vi: &str) -> Reply {
     let (Ok(task_idx), Ok(verify_from)) = (ti.parse::<i64>(), vi.parse::<i64>()) else {
         return error(
@@ -1428,8 +1847,14 @@ fn restart_task_verify(daemon: &Daemon, id: &str, ti: &str, vi: &str) -> Reply {
             vec![],
         );
     };
-    daemon.cancellations.cancel(id);
-    wait_for_worker_stop(daemon, id);
+    let target_running = daemon
+        .lock()
+        .task_verify_running_from(id, task_idx, verify_from)
+        .unwrap_or(true);
+    if target_running {
+        daemon.cancellations.cancel(id);
+        wait_for_worker_stop(daemon, id);
+    }
     match daemon.lock().restart_task_verify(id, task_idx, verify_from) {
         Ok(dirtied) => {
             for dep_id in &dirtied {
@@ -1507,11 +1932,30 @@ struct OpenTerminalResponse {
 /// (RAL-102). `active` is `false` once the underlying tmux session has ended
 /// (the run/verify/resolver finished and the daemon tore it down, or it was
 /// never started) — the board is expected to degrade gracefully in that case
-/// rather than treat it as an error.
+/// rather than treat it as an error. When inactive, `content` is the
+/// persisted last-pane-content snapshot (`crate::tmux::read_pane_snapshot`,
+/// written by `SubprocessRunner::run_via_tmux_attempt` as each attempt ends)
+/// if one exists — a read-only historical record of what the pane last
+/// showed, not fresh output — or empty if the session never ran under tmux
+/// at all. The board distinguishes the two by whether `content` is non-empty.
 #[derive(Serialize)]
 struct PaneResponse {
     active: bool,
     content: String,
+}
+
+/// An inactive [`PaneResponse`] falling back to the persisted snapshot for
+/// `session_name`, if one exists — shared by every "no live session" branch
+/// in [`capture_pane_reply`] so the read-only historical record degrades the
+/// same way regardless of *why* the session isn't live right now.
+fn inactive_pane_reply(session_name: &str) -> Reply {
+    json(
+        200,
+        &PaneResponse {
+            active: false,
+            content: crate::tmux::read_pane_snapshot(session_name).unwrap_or_default(),
+        },
+    )
 }
 
 /// Capture-pane content for the tmux session keyed by `(run_id, task,
@@ -1530,13 +1974,7 @@ fn capture_pane_reply(run_id: &str, task: &str, session_id: &str, query: &str) -
     };
     let name = crate::tmux::session_name(run_id, task, session_id);
     if !tmux.has_session(&name) {
-        return json(
-            200,
-            &PaneResponse {
-                active: false,
-                content: String::new(),
-            },
-        );
+        return inactive_pane_reply(&name);
     }
     match tmux.capture_pane(&name, lines) {
         Ok(content) => json(
@@ -1546,22 +1984,18 @@ fn capture_pane_reply(run_id: &str, task: &str, session_id: &str, query: &str) -
                 content,
             },
         ),
-        Err(_) => json(
-            200,
-            &PaneResponse {
-                active: false,
-                content: String::new(),
-            },
-        ),
+        Err(_) => inactive_pane_reply(&name),
     }
 }
 
 /// Open an interactive terminal attached to the tmux session keyed by
-/// `(run_id, task, session_id)` — the "open terminal" button (RAL-102).
-/// Requires the session to currently be live; a finished run/verify/resolver
-/// has already had its tmux session torn down (see
-/// `crate::runner::SubprocessRunner::run_via_tmux`), so this reports a clear
-/// `409` rather than spawning a terminal attached to nothing.
+/// `(run_id, task, session_id)` — the "open terminal" button (RAL-102). When
+/// the session is currently live, attaches to it directly. Otherwise
+/// degrades to [`open_readonly_snapshot_terminal`] — a finished
+/// run/verify/resolver has already had its tmux session torn down (see
+/// `crate::runner::SubprocessRunner::run_via_tmux`), but its last pane
+/// content may still be available as a persisted, read-only historical
+/// record.
 fn attach_tmux_terminal(run_id: &str, task: &str, session_id: &str) -> Reply {
     let tmux = match crate::tmux::Tmux::resolve() {
         Ok(t) => t,
@@ -1569,12 +2003,7 @@ fn attach_tmux_terminal(run_id: &str, task: &str, session_id: &str) -> Reply {
     };
     let name = crate::tmux::session_name(run_id, task, session_id);
     if !tmux.has_session(&name) {
-        return error(
-            409,
-            "no_tmux_session",
-            "no live tmux session — it may not be running right now",
-            vec![],
-        );
+        return open_readonly_snapshot_terminal(&name);
     }
     let program = tmux.program().to_string();
     let mut args: Vec<String> = tmux.prefix_args().to_vec();
@@ -1583,6 +2012,208 @@ fn attach_tmux_terminal(run_id: &str, task: &str, session_id: &str) -> Reply {
         Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
         Err(msg) => error(500, "terminal_error", &msg, vec![]),
     }
+}
+
+/// Degraded fallback for [`attach_tmux_terminal`] once the live tmux session
+/// for `session_name` is gone: if a persisted pane snapshot exists
+/// (`crate::tmux::read_pane_snapshot`, written as each attempt of
+/// `SubprocessRunner::run_via_tmux_attempt` ends), copy it to a disposable
+/// temp file and open that copy with the user's preferred external viewer
+/// (RAL-153) — instead of hard-failing. Still reports `409` when there is
+/// genuinely nothing to show: the session never ran under tmux at all, or
+/// produced no pane output before ending.
+///
+/// RAL-153: this used to spawn a `pwsh -NoExit -Command "...Get-Content..."`
+/// string through [`spawn_in_terminal`], which on the `wt.exe` path
+/// re-tokenizes that whole quoted string a second time (the same class of
+/// bug [`spawn_in_terminal`]'s own doc comment describes for cwd/semicolon
+/// handling) — the result was a terminal window that opened but failed to
+/// find/display the file. Writing a plain file and handing its *path* to a
+/// viewer sidesteps that class of bug entirely: there is no complex string
+/// for any layer to re-tokenize.
+///
+/// The viewer is resolved in order: `$VISUAL`, then `$EDITOR` (each split on
+/// whitespace so e.g. `code -w` works, not just a bare command), then the
+/// OS's own default handler for the file type (`start`/`open`/`xdg-open`).
+/// A fresh, uniquely-named copy is written per click into its own directory
+/// under the OS temp dir — distinct from the durable, authoritative
+/// `pane_snapshots/<session>.txt` under `state_dir()` — so a stray edit in
+/// the viewer can never corrupt the real log, and
+/// [`prune_stale_readonly_viewer_copies`] can freely delete old copies from
+/// that directory without ever touching the persisted record.
+fn open_readonly_snapshot_terminal(session_name: &str) -> Reply {
+    let Some(content) = crate::tmux::read_pane_snapshot(session_name) else {
+        return error(
+            409,
+            "no_tmux_session",
+            "no live tmux session, and no historical pane record was saved for it",
+            vec![],
+        );
+    };
+    let dir = readonly_viewer_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return error(
+            500,
+            "terminal_error",
+            &format!("could not create terminal-log viewer directory: {e}"),
+            vec![],
+        );
+    }
+    prune_stale_readonly_viewer_copies(&dir);
+    let snapshot_file = readonly_viewer_copy_path(&dir, session_name);
+    if let Err(e) = std::fs::write(&snapshot_file, &content) {
+        return error(
+            500,
+            "terminal_error",
+            &format!("could not write snapshot file: {e}"),
+            vec![],
+        );
+    }
+    let result = if let Some((program, args)) = resolve_preferred_editor() {
+        std::process::Command::new(&program)
+            .args(&args)
+            .arg(&snapshot_file)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not open viewer '{program}': {e}"))
+    } else {
+        open_with_os_default(&snapshot_file)
+    };
+    match result {
+        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+        Err(msg) => error(500, "terminal_error", &msg, vec![]),
+    }
+}
+
+/// Directory disposable per-click terminal-log viewer copies live under
+/// (RAL-153) — kept separate from `crate::tmux::pane_snapshot_dir` (the
+/// durable, authoritative snapshot under `state_dir()`) so pruning this
+/// directory can never touch that record.
+fn readonly_viewer_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("ralphus-terminal-logs")
+}
+
+/// How long a disposable per-click viewer copy is kept before
+/// [`prune_stale_readonly_viewer_copies`] deletes it (RAL-153 Q2) — long
+/// enough that a slow-to-open `$EDITOR`/OS handler still finds the file,
+/// short enough that repeated "Open Terminal Log" clicks over a project's
+/// lifetime don't leak files into the OS temp directory indefinitely.
+const READONLY_VIEWER_COPY_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Best-effort cleanup of [`readonly_viewer_dir`]: delete every file older
+/// than [`READONLY_VIEWER_COPY_MAX_AGE`]. Called each time a fresh copy is
+/// written rather than on a timer, so cleanup happens without the daemon
+/// needing a background sweep thread; a failure to read the directory or
+/// remove any one file is silently ignored — this is disk-space hygiene,
+/// never load-bearing for the current click's own copy.
+fn prune_stale_readonly_viewer_copies(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if is_stale(modified, now, READONLY_VIEWER_COPY_MAX_AGE) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a file last modified at `modified` counts as stale as of `now`,
+/// given `max_age` — pulled out of [`prune_stale_readonly_viewer_copies`] so
+/// the staleness rule itself is unit-testable without touching real
+/// filesystem timestamps. `modified` at or after `now` (freshly written, or
+/// clock skew) is never stale.
+fn is_stale(
+    modified: std::time::SystemTime,
+    now: std::time::SystemTime,
+    max_age: Duration,
+) -> bool {
+    now.duration_since(modified).is_ok_and(|age| age > max_age)
+}
+
+/// A fresh, unique path for this click's disposable viewer copy of
+/// `session_name`'s snapshot within `dir` — unique per call (not reused
+/// across clicks like the old fixed `{session_name}.readonly.txt` path) so
+/// two "Open Terminal Log" clicks in a row, or a slow viewer still holding
+/// the first copy open, never race each other over the same file.
+fn readonly_viewer_copy_path(dir: &std::path::Path, session_name: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    dir.join(format!("{session_name}-{unique}.txt"))
+}
+
+/// Resolve the user's preferred external viewer for a read-only terminal-log
+/// copy (RAL-153): `$VISUAL`, then `$EDITOR`, each split on whitespace (the
+/// same convention `RALPHUS_RUNNER_CMD`/`RALPHUS_TMUX_CMD` already use — see
+/// `crate::tmux`'s `split_command`) so e.g. `code -w` or a bare `vim` both
+/// resolve to a program plus its fixed leading arguments. `None` when
+/// neither is set (or set to blank), so the caller falls back to the OS's
+/// own default file-type handler.
+fn resolve_preferred_editor() -> Option<(String, Vec<String>)> {
+    resolve_preferred_editor_from(std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok())
+}
+
+/// Implementation behind [`resolve_preferred_editor`], taking the two env
+/// values explicitly so it's unit-testable without mutating real process
+/// environment.
+fn resolve_preferred_editor_from(
+    visual: Option<String>,
+    editor: Option<String>,
+) -> Option<(String, Vec<String>)> {
+    for value in [visual, editor].into_iter().flatten() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace().map(str::to_string);
+        let program = parts.next()?;
+        return Some((program, parts.collect()));
+    }
+    None
+}
+
+/// Open `path` with the OS's default handler for its file type — the
+/// fallback when neither `$VISUAL` nor `$EDITOR` is set (RAL-153).
+#[cfg(target_os = "windows")]
+fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), String> {
+    // `start` is a `cmd.exe` builtin, not its own executable. The empty ""
+    // argument is the (usually-omitted) window-title parameter -- required
+    // here because `start` treats a leading quoted argument as the title,
+    // which would otherwise try to "start" the file path as a window title
+    // instead of opening it.
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", &path.to_string_lossy()])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open default viewer: {e}"))
+}
+
+/// See the Windows overload's doc comment.
+#[cfg(target_os = "macos")]
+fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), String> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open default viewer: {e}"))
+}
+
+/// See the Windows overload's doc comment.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open default viewer: {e}"))
 }
 
 /// Open a terminal for a task session — the "Open Terminal Log" / "Open
@@ -1604,7 +2235,7 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
         );
     };
     if query_param(query, "mode") == Some("agent") {
-        let (cwd, claude_session_id) =
+        let (cwd, agent, agent_session_id) =
             match daemon
                 .lock()
                 .get_session_agent_resume(id, task_idx, session_idx)
@@ -1612,7 +2243,7 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
                 Ok(v) => v,
                 Err(e) => return store_error(&e),
             };
-        return open_agent_terminal(&cwd, claude_session_id.as_deref());
+        return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
     }
     let session_id = match daemon.lock().get_session_id(id, task_idx, session_idx) {
         Ok(v) => v,
@@ -1692,7 +2323,7 @@ fn open_verify_terminal(
         return store_error(&e);
     }
     if query_param(query, "mode") == Some("agent") {
-        let claude_session_id = match daemon.lock().get_verify_claude_session_id(
+        let (agent, agent_session_id) = match daemon.lock().get_verify_agent_session_id(
             id,
             task_idx_n,
             scope,
@@ -1711,13 +2342,13 @@ fn open_verify_terminal(
             daemon
                 .lock()
                 .get_session_agent_resume(id, task_idx_n, session_idx_n)
-                .map(|(cwd, _)| cwd)
+                .map(|(cwd, _, _)| cwd)
         };
         let cwd = match cwd {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
-        return open_agent_terminal(&cwd, claude_session_id.as_deref());
+        return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
     }
     let task = match daemon.lock().get_task_name(id, task_idx_n) {
         Ok(v) => v,
@@ -1829,48 +2460,84 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
                 vec![],
             );
         };
-        let claude_session_id = match daemon
+        let agent_session_id = match daemon
             .lock()
-            .get_branch_resolver_claude_session_id(id, branch_id)
+            .get_branch_resolver_agent_session_id(id, branch_id)
         {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
-        return open_agent_terminal(&wt_path, claude_session_id.as_deref());
+        // The guardian's resolver agent is set once for the whole guardian
+        // (not per-branch) -- see `guardians.resolver_agent`.
+        let resolver_agent = daemon
+            .lock()
+            .get_guardian(id)
+            .ok()
+            .and_then(|g| g.resolver_agent);
+        return open_agent_terminal(
+            &wt_path,
+            resolver_agent.as_deref(),
+            agent_session_id.as_deref(),
+        );
     }
 
     // open: attach to the conflict-resolver's tmux session (RAL-102). Keyed the
     // same way `guardian_merge.rs::resolve_conflicts_with_agent` builds its
     // `RunnerSpec` for this exact branch position -- the tmux session name is
     // ephemeral internal naming (not persistent addressing), so it is still
-    // resolved to the branch's current numeric position here.
-    let position = match daemon.lock().guardian_branches(id) {
-        Ok(branches) => match branches.iter().find(|b| b.id == branch_id) {
-            Some(b) => b.position,
-            None => return error(404, "not_found", "no such branch", vec![]),
-        },
-        Err(e) => return store_error(&e),
+    // resolved to the branch's current numeric position here. RAL-149: while
+    // the branch is `verify_pending`, the live session is the dedicated
+    // final-verify call, not the fix pass -- attach to that one instead.
+    let (task, session_id) = match resolver_task_and_session_id(daemon, id, branch_id) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    attach_tmux_terminal(
-        &format!("guardian-{id}"),
-        crate::guardian_merge::RESOLVER_TASK,
-        &format!("resolver-{position}"),
-    )
+    attach_tmux_terminal(&format!("guardian-{id}"), task, &session_id)
 }
 
-/// Spawn a real, interactive `claude --resume <id> --dangerously-skip-permissions`
-/// session in a new terminal window, rooted at `cwd` — the "Open Agent"
-/// terminal action (RAL-102 follow-up). Unlike `attach_tmux_terminal` (which
-/// re-attaches to the runner's own tmux-wrapped subprocess and only shows its
-/// log/event stream — see `claude_code_backend.py`'s `stream-json` parsing),
-/// this launches the actual Claude Code CLI so a human can keep the
-/// conversation going interactively, exactly as the pre-RAL-102 "resume" flow
-/// did. `claude_session_id` is only ever populated for a session that
-/// actually ran under the `claude-code` agent (see `Store::get_session_agent_resume`'s
-/// doc comment), so this is always a claude-code resume -- `--dangerously-skip-permissions`
-/// is applied unconditionally, matching the headless run's own invocation
-/// (`claude_code_backend.py`), so the resumed conversation doesn't immediately
-/// stall on a permission prompt the human has to notice and click through.
+/// The `(task, session_id)` pair addressing a review branch's currently-live
+/// conflict-resolver tmux session (RAL-102, extended for RAL-149's fix/verify
+/// split) -- shared by [`open_guardian_branch_terminal`] (attach) and
+/// [`guardian_branch_pane`] (read-only peek) so the two never drift on which
+/// call's session they resolve to.
+fn resolver_task_and_session_id(
+    daemon: &Daemon,
+    id: &str,
+    branch_id: &str,
+) -> std::result::Result<(&'static str, String), Reply> {
+    let g = daemon
+        .lock()
+        .get_guardian(id)
+        .map_err(|e| store_error(&e))?;
+    let Some(b) = g.branches.iter().find(|b| b.id == branch_id) else {
+        return Err(error(404, "not_found", "no such branch", vec![]));
+    };
+    Ok(if b.merge_status == "verify_pending" {
+        (
+            crate::guardian_merge::RESOLVER_VERIFY_TASK,
+            format!("resolver-verify-{}", b.position),
+        )
+    } else {
+        (
+            crate::guardian_merge::RESOLVER_TASK,
+            format!("resolver-{}", b.position),
+        )
+    })
+}
+
+/// Spawn a real, interactive resumed CLI session (`claude --resume <id>
+/// --dangerously-skip-permissions` or `codex exec resume <id>
+/// --dangerously-bypass-approvals-and-sandbox`, depending on which agent the
+/// session actually ran under) in a new terminal window, rooted at `cwd` —
+/// the "Open Agent" terminal action (RAL-102 follow-up). Unlike
+/// `attach_tmux_terminal` (which re-attaches to the runner's own
+/// tmux-wrapped subprocess and only shows its log/event stream — see
+/// `claude_code_backend.py`/`codex_backend.py`'s streaming-JSON parsing),
+/// this launches the actual CLI so a human can keep the conversation going
+/// interactively, exactly as the pre-RAL-102 "resume" flow did. Permission
+/// prompts are bypassed unconditionally, matching each backend's own
+/// headless invocation, so the resumed conversation doesn't immediately
+/// stall on a prompt the human has to notice and click through.
 /// The PowerShell `-Command` string that resumes `session_id` via `program`
 /// (single-quoted/escaped for embedding) -- split out from `open_agent_terminal`
 /// so the exact command line is unit-testable without actually spawning a
@@ -1881,30 +2548,60 @@ fn resume_agent_command(program: &str, session_id: &str) -> String {
     format!("& '{safe_program}' --resume '{safe_session}' --dangerously-skip-permissions")
 }
 
-fn open_agent_terminal(cwd: &str, claude_session_id: Option<&str>) -> Reply {
-    let Some(session_id) = claude_session_id else {
+/// The Codex analog of [`resume_agent_command`] -- Codex resumes via a
+/// subcommand (`exec resume <id>`), not a flag, and its permission-bypass
+/// flag is spelled differently (see `codex_backend.py`'s module docstring).
+fn resume_codex_agent_command(program: &str, session_id: &str) -> String {
+    let safe_program = program.replace('\'', "''");
+    let safe_session = session_id.replace('\'', "''");
+    format!(
+        "& '{safe_program}' exec resume '{safe_session}' --dangerously-bypass-approvals-and-sandbox"
+    )
+}
+
+/// True when `agent` identifies a Codex-family backend (`codex`/`codex-cli`).
+/// Anything else -- including `claude-code`/`claude-cli`, `None` (an older
+/// row from before the `agent` column was threaded through this lookup), or
+/// any other string -- resumes via the Claude Code CLI, preserving this
+/// function's pre-Codex-support behavior for every case it used to handle.
+fn is_codex_agent(agent: Option<&str>) -> bool {
+    matches!(agent, Some("codex" | "codex-cli"))
+}
+
+fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
+    let Some(session_id) = agent_session_id else {
         return error(
             409,
             "no_claude_session",
-            "no Claude Code session id recorded yet — it may not have started, \
-             or didn't run under the claude-code agent",
+            "no CLI-agent session id recorded yet — it may not have started, \
+             or didn't run under an agent that supports resume",
             vec![],
         );
     };
-    // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the same
-    // override point resolves both the headless run and this resumed one to
-    // the same binary.
-    let program = std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
     let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
     // No leading `Set-Location ...;` here -- `cwd` is passed as its own
     // argument below so it goes through wt's `-d` flag / `current_dir`
-    // instead of a semicolon `wt.exe` can't pass through to `claude` (see
+    // instead of a semicolon `wt.exe` can't pass through to the agent (see
     // `spawn_in_terminal`'s doc comment).
+    let command = if is_codex_agent(agent) {
+        // Mirrors `RALPHUS_CODEX_CMD` in `codex_backend.py` — the same
+        // override point resolves both the headless run and this resumed
+        // one to the same binary.
+        let program = std::env::var("RALPHUS_CODEX_CMD").unwrap_or_else(|_| "codex".to_string());
+        resume_codex_agent_command(&program, session_id)
+    } else {
+        // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
+        // same override point resolves both the headless run and this
+        // resumed one to the same binary.
+        let program =
+            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+        resume_agent_command(&program, session_id)
+    };
     let shell_args = vec![
         "-NoExit".to_string(),
         "-NoProfile".to_string(),
         "-Command".to_string(),
-        resume_agent_command(&program, session_id),
+        command,
     ];
     match spawn_in_terminal(Some(cwd), &shell_cmd, &shell_args) {
         Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
@@ -1916,23 +2613,122 @@ fn open_agent_terminal(cwd: &str, claude_session_id: Option<&str>) -> Reply {
 /// session, for the auto-refreshing "read-only terminal" peek view in the
 /// Review tab (RAL-102).
 fn guardian_branch_pane(daemon: &Daemon, id: &str, branch_id: &str, query: &str) -> Reply {
+    // The tmux session name is ephemeral internal naming keyed on the branch's
+    // current numeric position (see `open_guardian_branch_terminal`), so resolve
+    // it from the addressed branch_id. RAL-149: `resolver_task_and_session_id`
+    // also picks the dedicated final-verify session while the branch is
+    // `verify_pending`, so this peek view tracks whichever call is actually live.
+    let (task, session_id) = match resolver_task_and_session_id(daemon, id, branch_id) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    capture_pane_reply(&format!("guardian-{id}"), task, &session_id, query)
+}
+
+/// Live list of files with unresolved merge conflicts (`git diff
+/// --diff-filter=U`) in a review branch's worktree, for the auto-refreshing
+/// conflicting-files panel in the Reviews UI (RAL-148).
+#[derive(Debug, Clone, Serialize)]
+struct BranchConflictsView {
+    /// Paths (relative to the worktree root) still carrying unresolved
+    /// `<<<<<<<` conflict markers. Empty once every file is resolved, the
+    /// branch has no worktree yet, or the worktree has been torn down (e.g.
+    /// a base-branch shift triggered a rebuild) -- callers should treat an
+    /// empty list as "no live conflicts to show", not an error.
+    files: Vec<String>,
+    /// Whether the worktree is currently mid-`git rebase` (a `rebase-merge`/
+    /// `rebase-apply` state directory exists). `files` can be non-empty with
+    /// this `false` between rebase steps, so the board should not assume
+    /// "no active rebase" means the conflicts are stale.
+    rebase_in_progress: bool,
+}
+
+/// The live conflicting-files list for one review branch (RAL-148). Computed
+/// on demand (one `git diff --diff-filter=U` call in the branch's worktree)
+/// rather than persisted -- mirrors `run_worktrees`'s "computed on demand,
+/// not on the hot board path" precedent. Returns an empty, non-error list
+/// once the branch has no worktree yet or the worktree directory no longer
+/// exists, so a poller can just stop rendering the entry.
+fn guardian_branch_conflicts(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     if daemon.lock().get_guardian(id).is_err() {
         return error(404, "not_found", "no such guardian", vec![]);
     }
-    // The tmux session name is ephemeral internal naming keyed on the branch's
-    // current numeric position (see `open_guardian_branch_terminal`), so resolve
-    // it from the addressed branch_id.
-    let position = match daemon.lock().guardian_branches(id) {
-        Ok(branches) => match branches.iter().find(|b| b.id == branch_id) {
-            Some(b) => b.position,
-            None => return error(404, "not_found", "no such branch", vec![]),
-        },
+    match daemon.lock().guardian_branches(id) {
+        Ok(branches) => {
+            if !branches.iter().any(|b| b.id == branch_id) {
+                return error(404, "not_found", "no such branch", vec![]);
+            }
+        }
+        Err(e) => return store_error(&e),
+    }
+    let worktree = match daemon.lock().get_branch_worktree(id, branch_id) {
+        Ok(v) => v,
         Err(e) => return store_error(&e),
     };
+    let empty = || {
+        json(
+            200,
+            &BranchConflictsView {
+                files: vec![],
+                rebase_in_progress: false,
+            },
+        )
+    };
+    let Some(worktree) = worktree else {
+        return empty();
+    };
+    let wt = std::path::Path::new(&worktree);
+    if !wt.exists() {
+        return empty();
+    }
+    json(
+        200,
+        &BranchConflictsView {
+            files: crate::guardian_merge::conflicted_files(wt),
+            rebase_in_progress: crate::guardian_merge::rebase_in_progress(wt),
+        },
+    )
+}
+
+/// Open a terminal for a review's manual-checks generation pass (RAL-88
+/// follow-up). `mode` (query param) mirrors `open_guardian_branch_terminal`'s:
+/// - `"open"` (default) — attach to the generation run's live tmux session;
+///   `409` if it isn't currently running.
+/// - `"agent"` — spawn a real, interactive resumed session resuming that
+///   generation's own conversation, if it ran under an agent that supports
+///   resume (see `open_agent_terminal`'s doc comment).
+fn open_guardian_manual_checks_terminal(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    let mode = query_param(query, "mode").unwrap_or("open");
+    if mode != "open" && mode != "agent" {
+        return error(400, "bad_request", "mode must be 'open' or 'agent'", vec![]);
+    }
+    let (cwd, agent, agent_session_id) =
+        match daemon.lock().get_guardian_manual_commands_agent_resume(id) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+    if mode == "agent" {
+        return open_agent_terminal(&cwd, agent.as_deref(), agent_session_id.as_deref());
+    }
+    // open: attach to the generation pass's tmux session — keyed the same way
+    // `guardian_merge.rs::generate_manual_commands` builds its `RunnerSpec`.
+    attach_tmux_terminal(
+        &format!("guardian-{id}"),
+        crate::guardian_merge::MANUAL_COMMANDS_TASK,
+        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
+    )
+}
+
+/// The live pane content of a review's manual-checks generation tmux session,
+/// for the auto-refreshing "read-only terminal" peek view (RAL-88 follow-up).
+fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
     capture_pane_reply(
         &format!("guardian-{id}"),
-        crate::guardian_merge::RESOLVER_TASK,
-        &format!("resolver-{position}"),
+        crate::guardian_merge::MANUAL_COMMANDS_TASK,
+        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
         query,
     )
 }
@@ -2045,11 +2841,25 @@ fn which_program(name: &str) -> Option<String> {
 /// worker at all: it asks psmux directly what's running under this run's
 /// deterministic `ralphus_<run_id>_...` session-name prefix and kills it
 /// immediately, regardless of whether the token mechanism is working.
-fn kill_run_tmux_sessions(run_id: &str) {
+fn kill_run_tmux_sessions(run_id: &str) -> usize {
     let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return;
+        return 0;
     };
-    tmux.kill_sessions_with_prefix(&format!("ralphus_{run_id}_"));
+    tmux.kill_sessions_with_prefix(&format!("ralphus_{run_id}_"))
+}
+
+/// The guardian-session counterpart to [`kill_run_tmux_sessions`]: kills
+/// every live tmux session belonging to guardian `guardian_id`. Guardian
+/// resolver/PR-description/summary sessions are named via
+/// `tmux::session_name(&format!("guardian-{guardian_id}"), ...)` (see the
+/// `RunnerSpec` construction sites in `guardian_merge.rs`), so the same
+/// `ralphus_{run_id}_` scoping `kill_run_tmux_sessions` uses applies here
+/// with that formatted id in place of a plain run id.
+fn kill_guardian_tmux_sessions(guardian_id: &str) -> usize {
+    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
+        return 0;
+    };
+    tmux.kill_sessions_with_prefix(&format!("ralphus_guardian-{guardian_id}_"))
 }
 
 #[derive(Serialize)]
@@ -2094,6 +2904,133 @@ fn cancel_run_preview(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct ShutdownBody {
+    /// When true, every non-terminal run and cancellable guardian is also
+    /// marked `cancelled` in the store before the daemon exits, so history
+    /// records an intentional stop and nothing auto-resumes on next
+    /// `ralphus-daemon serve`. When false (the default), DB state is left
+    /// alone — killed processes' rows stay `running`/`merging`/etc, and the
+    /// existing crash-recovery path (`recover_orphaned_runs`/
+    /// `recover_orphaned_merges`, run at every `serve()` startup) resumes
+    /// them on the next start.
+    #[serde(default)]
+    auto_cancel: bool,
+}
+
+#[derive(Serialize)]
+struct ShutdownResponse {
+    state: &'static str,
+    auto_cancel: bool,
+    cancelled_runs: Vec<String>,
+    cancelled_guardians: Vec<String>,
+}
+
+/// Kill every process this daemon has spawned — session/verify/review/chat/
+/// summary subprocesses, tmux panes, everything — and request that the
+/// daemon exit once this response is sent.
+///
+/// Unconditionally (regardless of `auto_cancel`): trips every registered
+/// cancellation token (stops scheduler-run sessions' subprocesses via their
+/// existing polling loop) and kills every tmux session belonging to a
+/// currently-known run or guardian, one entity at a time, via
+/// [`kill_run_tmux_sessions`] / [`kill_guardian_tmux_sessions`] — each
+/// scoped to that single entity's own deterministic session-name prefix
+/// (see `tmux::session_name`). With `auto_cancel: true`, also
+/// cascade-cancels every non-terminal run and cancellable guardian so their
+/// DB state reflects an intentional stop rather than being left for
+/// crash-recovery to resume.
+///
+/// Previously called `tmux::reap_orphaned_sessions_at_startup` here instead
+/// — a machine-wide, unscoped kill of *every* `ralphus_`-prefixed tmux.exe
+/// process, sound only at actual daemon startup (its own doc comment says
+/// so). Called from this live endpoint, it matches — and kills — the very
+/// pane this handler happens to be running in whenever that pane's own
+/// session name starts with `ralphus_` (which every real daemon-spawned
+/// session's name does, by construction). See `PSMUX_CRASH_NOTES.local.md`'s
+/// "SOLVED" section for the full incident.
+///
+/// Never terminates the process itself — see the `shutdown` field's doc
+/// comment on [`Daemon`] for why that has to happen outside `route()`.
+fn shutdown(daemon: &Daemon, body: &str) -> Reply {
+    let req: ShutdownBody = serde_json::from_str(body).unwrap_or_default();
+
+    daemon.cancellations.cancel_all();
+
+    let runs = daemon.lock().list_runs().unwrap_or_default();
+    let guardians = daemon.lock().list_guardians().unwrap_or_default();
+    let tmux_killed: usize = runs
+        .iter()
+        .map(|r| kill_run_tmux_sessions(&r.id))
+        .sum::<usize>()
+        + guardians
+            .iter()
+            .map(|g| kill_guardian_tmux_sessions(&g.id))
+            .sum::<usize>();
+
+    let mut cancelled_runs = Vec::new();
+    let mut cancelled_guardians = Vec::new();
+    if req.auto_cancel {
+        let active_run_ids: Vec<String> = runs
+            .into_iter()
+            .filter(|r| !RunState::parse(&r.state).is_some_and(RunState::is_terminal))
+            .map(|r| r.id)
+            .collect();
+        for id in active_run_ids {
+            if let Ok(impact) = daemon.lock().cancel_run(&id, false) {
+                for r in &impact.runs {
+                    daemon.cancellations.cancel(&r.id);
+                }
+                cancelled_runs.extend(impact.runs.into_iter().map(|r| r.id));
+            }
+        }
+
+        for g in guardians {
+            if daemon.lock().cancel_guardian(&g.id).is_ok() {
+                cancelled_guardians.push(g.id);
+            }
+        }
+    }
+
+    let _ = daemon
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "daemon",
+            message: "shutdown requested",
+            scope: None,
+            run_id: None,
+            guardian_id: None,
+            session_id: None,
+            task: None,
+            payload: serde_json::json!({
+                "auto_cancel": req.auto_cancel,
+                "tmux_killed": tmux_killed,
+                "cancelled_runs": cancelled_runs.len(),
+                "cancelled_guardians": cancelled_guardians.len(),
+            }),
+        });
+    crate::rlog!(
+        WARNING,
+        "ralphus [daemon] shutdown requested: auto_cancel={} tmux_killed={tmux_killed} \
+         cancelled_runs={} cancelled_guardians={}",
+        req.auto_cancel,
+        cancelled_runs.len(),
+        cancelled_guardians.len()
+    );
+
+    daemon.request_shutdown();
+    json(
+        200,
+        &ShutdownResponse {
+            state: "stopping",
+            auto_cancel: req.auto_cancel,
+            cancelled_runs,
+            cancelled_guardians,
+        },
+    )
+}
+
 #[derive(Deserialize)]
 struct SetStatusBody {
     kind: String,
@@ -2106,6 +3043,125 @@ struct SetStatusBody {
     #[serde(default)]
     verify_scope: String,
     state: String,
+}
+
+/// The tmux pane name(s) and owning-session index that a manual status-set
+/// (RAL-163) on a task/session/verify step must capture and stop, or `None`
+/// if the target doesn't resolve to a real node. Each entry is `(pane_name,
+/// ghost_session_idx)` — the session index whose ghost the captured pane
+/// content is folded into (see [`crate::ghost::session_uri`]), which is not
+/// always the same index as the pane itself (a task-scope verify step's pane
+/// is keyed by [`verify_tmux_keys`], but its ghost is still attributed to the
+/// task's first session, mirroring [`Store::get_task_first_session_cwd`]'s
+/// established "task-scope step ~ its task's first session" convention).
+fn stop_targets_for_status_change(
+    store: &Store,
+    run_id: &str,
+    req: &SetStatusBody,
+) -> Vec<(String, i64)> {
+    let Ok(task) = store.get_task_name(run_id, req.task_idx) else {
+        return Vec::new();
+    };
+    match req.kind.as_str() {
+        "session" => {
+            let Ok(sid) = store.get_session_id(run_id, req.task_idx, req.session_idx) else {
+                return Vec::new();
+            };
+            vec![(
+                crate::tmux::session_name(run_id, &task, &sid),
+                req.session_idx,
+            )]
+        }
+        "task" => store
+            .get_task_session_ids(run_id, req.task_idx)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(idx, sid)| (crate::tmux::session_name(run_id, &task, &sid), idx))
+            .collect(),
+        "verify" => {
+            let ghost_idx = if req.verify_scope == "task" {
+                store
+                    .get_task_session_ids(run_id, req.task_idx)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .map(|(idx, _)| idx)
+            } else {
+                Some(req.session_idx)
+            };
+            let Some(ghost_idx) = ghost_idx else {
+                return Vec::new();
+            };
+            let (vrun_id, vsession_id) =
+                verify_tmux_keys(run_id, &req.verify_scope, &req.verify_idx.to_string());
+            vec![(
+                crate::tmux::session_name(&vrun_id, &task, &vsession_id),
+                ghost_idx,
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// RAL-163: before a manual status change away from `pending` takes effect on
+/// a task/session/verify step, capture whatever the agent running under it
+/// has produced so far and stop it — turning a hard cutoff into a
+/// recoverable checkpoint instead of leaving the agent running in the
+/// background with no relationship to the new status. Capture goes into the
+/// owning session's ghost (`ghost::upsert_ghost`, merged onto whatever that
+/// ghost already held), which `ghost::format_context_block` automatically
+/// prepends to that session's prompt on its next attempt — so no separate
+/// "pass it to the next worker" plumbing is needed.
+///
+/// Best-effort throughout, and never blocks the status change itself: most
+/// of the time there's no live agent to capture (the common case is
+/// overriding an already-finished node), and even a tmux resolution failure
+/// shouldn't stop a user from being able to force a status.
+fn capture_and_stop_node(store: &Store, run_id: &str, req: &SetStatusBody) {
+    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
+        return;
+    };
+    for (pane_name, ghost_idx) in stop_targets_for_status_change(store, run_id, req) {
+        if !tmux.has_session(&pane_name) {
+            continue;
+        }
+        if let Ok(content) = tmux.capture_pane(&pane_name, 2000) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let uri = crate::ghost::session_uri(run_id, req.task_idx, ghost_idx);
+                let cwd = store
+                    .get_session_agent_resume(run_id, req.task_idx, ghost_idx)
+                    .map(|(cwd, _, _)| cwd)
+                    .unwrap_or_default();
+                let revision = crate::ghost::current_revision(&cwd);
+                if store
+                    .upsert_ghost(
+                        &uri,
+                        crate::ghost::KIND_SESSION,
+                        Some(run_id),
+                        None,
+                        trimmed,
+                        revision.as_deref(),
+                    )
+                    .is_ok()
+                {
+                    crate::cartographer::Note::new("set_status")
+                        .run(run_id)
+                        .scope(&req.kind)
+                        .emit(
+                            store,
+                            "captured in-progress agent output before manual status change",
+                            serde_json::json!({
+                                "pane": pane_name,
+                                "len": trimmed.len(),
+                                "target_state": req.state,
+                            }),
+                        );
+                }
+            }
+        }
+        let _ = tmux.kill_session(&pane_name);
+    }
 }
 
 /// Manually override the state of a run, task, session, or verify step (RAL-74).
@@ -2122,6 +3178,19 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "invalid set-status body", vec![]);
     };
     let store = daemon.lock();
+
+    // RAL-163: any status other than "pending" on a task/session/verify step
+    // means "stop the agent running there" (including `ignored`, which is
+    // deliberately non-terminal in the state machine but still means "stop
+    // and save what happened" per the ticket). Capture + kill happens before
+    // the state change itself is applied below, whichever path that takes.
+    if matches!(req.kind.as_str(), "task" | "session" | "verify") {
+        if let Some(state) = NodeState::parse(&req.state) {
+            if state != NodeState::Pending {
+                capture_and_stop_node(&store, id, &req);
+            }
+        }
+    }
 
     // A manual override to "cancelled" of a single task/session/verify within
     // a run reuses the dedicated cancel cascade (`Store::cancel` + tripping
@@ -2417,6 +3486,10 @@ struct GuardianSettingsBody {
     /// comments instead of requiring the manual "Pull in PR feedback" action.
     #[serde(default)]
     auto_pr_feedback: Option<bool>,
+    /// RAL-149: also run the quality-bar checks during the fix pass, not just
+    /// the dedicated final-verification call. Default off.
+    #[serde(default)]
+    verify_mid_resolution: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2581,6 +3654,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_pr_feedback {
         if let Err(e) = store.set_guardian_auto_pr_feedback(id, enabled) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.verify_mid_resolution {
+        if let Err(e) = store.set_guardian_verify_mid_resolution(id, enabled) {
             return store_error(&e);
         }
     }
@@ -2912,13 +3990,77 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+/// Resolve `{name}` placeholders in `text` from a check's declared inputs
+/// (RAL-164): a value submitted with this run wins, then a previously
+/// resolved/submitted value stored on the guardian, then the input's own
+/// literal default.
+fn substitute_check_inputs(
+    text: &str,
+    inputs: &[crate::guardian::CheckInput],
+    submitted: &std::collections::HashMap<String, String>,
+    stored: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out = text.to_string();
+    for input in inputs {
+        let value = submitted
+            .get(&input.name)
+            .or_else(|| stored.get(&input.name))
+            .unwrap_or(&input.default);
+        out = out.replace(&format!("{{{}}}", input.name), value);
+    }
+    out
+}
+
+/// Build the full `cmd /K` command line for running a check (RAL-164):
+/// substitutes input placeholders (see [`substitute_check_inputs`]) and, when
+/// `run_cleanup` is set and the check declares a `cleanup_command`, chains it
+/// before the main command with `&` (not `&&`) so a cleanup that "fails"
+/// because there was nothing to kill doesn't block the main command from
+/// running. `None` when the check has no `command` (e.g. a prompt-kind
+/// action hint).
+fn build_check_command_line(
+    cwd: &str,
+    check: &crate::guardian::GuardianCheck,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    stored_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+) -> Option<String> {
+    let cmd = check.command.as_ref()?;
+    let resolved = substitute_check_inputs(cmd, &check.inputs, submitted_inputs, stored_inputs);
+    let body = if run_cleanup {
+        check.cleanup_command.as_ref().map_or_else(
+            || resolved.clone(),
+            |cleanup| {
+                let resolved_cleanup = substitute_check_inputs(
+                    cleanup,
+                    &check.inputs,
+                    submitted_inputs,
+                    stored_inputs,
+                );
+                format!("({resolved_cleanup}) & {resolved}")
+            },
+        )
+    } else {
+        resolved
+    };
+    // cd /d sets both drive and directory on Windows before running the command.
+    Some(format!("cd /d \"{cwd}\" && {body}"))
+}
+
 /// Run one or all LLM-generated manual review commands as fire-and-forget
-/// terminal subprocesses (RAL-27). Body `{ "index": N }` runs command N only;
-/// no body (or `{}`) runs all commands. Opens each in a new terminal window.
+/// terminal subprocesses (RAL-27). Body `{ "index": N, "inputs": {...},
+/// "run_cleanup": bool }` runs command N only; no body (or `{}`) runs all
+/// commands. Opens each in a new terminal window. `inputs` (RAL-164)
+/// substitutes named `{name}` placeholders and, when non-empty, is persisted
+/// as the new default for those inputs on this guardian.
 fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply {
     #[derive(Deserialize, Default)]
     struct Body {
         index: Option<usize>,
+        #[serde(default)]
+        inputs: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        run_cleanup: bool,
     }
     let req: Body = serde_json::from_str(body).unwrap_or_default();
 
@@ -2936,7 +4078,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         );
     }
 
-    let to_run: Vec<String> = match req.index {
+    let to_run: Vec<crate::guardian::GuardianCheck> = match req.index {
         Some(i) => {
             if i >= g.manual_commands.len() {
                 return error(400, "out_of_range", "command index out of range", vec![]);
@@ -2951,12 +4093,19 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     // Fall back to git_root only if the review hasn't been built yet.
     let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
     let mut errors: Vec<String> = Vec::new();
-    for cmd in &to_run {
-        // cd /d sets both drive and directory on Windows before running the command.
-        let full_cmd = format!("cd /d \"{cwd}\" && {cmd}");
+    for check in &to_run {
+        let Some(full_cmd) =
+            build_check_command_line(&cwd, check, &req.inputs, &g.input_values, req.run_cleanup)
+        else {
+            continue;
+        };
         if let Err(e) = spawn_in_terminal(None, "cmd", &["/K".to_string(), full_cmd]) {
             errors.push(e);
         }
+    }
+
+    if !req.inputs.is_empty() {
+        let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
     }
 
     if errors.is_empty() {
@@ -2967,13 +4116,20 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
 }
 
 /// Run a user-declared action hint from `[[review.action]]` (RAL-77).
-/// Body `{ "index": N }` runs the hint at position N (required).
-/// `command`-kind hints are opened in a terminal; `prompt`-kind hints are not
-/// yet executed (reserved for a future LLM-expansion step) and return 501.
+/// Body `{ "index": N, "inputs": {...}, "run_cleanup": bool }` runs the hint
+/// at position N (required). `command`-kind hints are opened in a terminal;
+/// `prompt`-kind hints are not yet executed (reserved for a future
+/// LLM-expansion step) and return 501. `inputs` (RAL-164) substitutes named
+/// `{name}` placeholders and, when non-empty, is persisted as the new default
+/// for those inputs on this guardian.
 fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     #[derive(Deserialize)]
     struct Body {
         index: usize,
+        #[serde(default)]
+        inputs: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        run_cleanup: bool,
     }
     let Ok(req) = serde_json::from_str::<Body>(body) else {
         return error(400, "bad_request", "body must be {\"index\": N}", vec![]);
@@ -2996,12 +4152,17 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     };
 
-    if let Some(cmd) = &hint.command {
-        // Same reasoning as guardian_run_manual_commands: prefer the built
-        // review worktree over the original repo root.
-        let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
-        let full_cmd = format!("cd /d \"{cwd}\" && {cmd}");
-        match spawn_in_terminal(None, "cmd", &["/K".to_string(), full_cmd]) {
+    // Same reasoning as guardian_run_manual_commands: prefer the built
+    // review worktree over the original repo root.
+    let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
+    if let Some(full_cmd) =
+        build_check_command_line(&cwd, &hint, &req.inputs, &g.input_values, req.run_cleanup)
+    {
+        let result = spawn_in_terminal(None, "cmd", &["/K".to_string(), full_cmd]);
+        if !req.inputs.is_empty() {
+            let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
+        }
+        match result {
             Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
             Err(e) => error(500, "terminal_error", &e, vec![]),
         }
@@ -3014,6 +4175,34 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         )
     }
+}
+
+/// Kick off "set it for me" AI resolution of one named check input
+/// (RAL-164). Body `{ "input_name": "..." }`. Returns `202` immediately —
+/// the board picks up completion through its existing guardian-view poll
+/// (`GuardianView.input_resolutions`), not a dedicated polling endpoint.
+fn guardian_resolve_input(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    #[derive(Deserialize)]
+    struct Body {
+        input_name: String,
+    }
+    let Ok(req) = serde_json::from_str::<Body>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {\"input_name\": \"...\"}",
+            vec![],
+        );
+    };
+    let runner: Arc<dyn Runner> =
+        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    crate::guardian_merge::start_resolve_input(
+        daemon.store_handle(),
+        runner,
+        id,
+        &req.input_name,
+        daemon.semaphore_handle(),
+    )
 }
 
 /// List candidate base branches for the given guardian, scoped to the same
@@ -3383,6 +4572,39 @@ pub fn serve<A: ToSocketAddrs>(
         Ok(_) => {}
         Err(e) => crate::rlog!(ERROR, "ralphus [recovery] merge recovery failed: {e}"),
     }
+    // RAL-164: "set it for me" input resolutions left `resolving` after an
+    // unclean shutdown have no background thread; reset them to `failed` so
+    // the UI never shows a permanently-stuck spinner.
+    match store.recover_orphaned_input_resolutions() {
+        Ok(pairs) if !pairs.is_empty() => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] {} orphaned input resolution(s) reset to failed: {}",
+                pairs.len(),
+                pairs
+                    .iter()
+                    .map(|(g, n)| format!("{g}/{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "recovery",
+                message: "orphaned input resolutions reset to failed",
+                scope: Some("guardian"),
+                run_id: None,
+                guardian_id: None,
+                session_id: None,
+                task: None,
+                payload: serde_json::json!({"pairs": pairs}),
+            });
+        }
+        Ok(_) => {}
+        Err(e) => crate::rlog!(
+            ERROR,
+            "ralphus [recovery] input resolution recovery failed: {e}"
+        ),
+    }
     // Zombie tmux.exe reaping: on the Windows tmux-alternative (psmux) this
     // project targets, `kill-session` frees a session's *name* but never
     // actually terminates the backing OS process (see
@@ -3481,6 +4703,19 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
             .with_status_code(reply.status)
             .with_header(header);
         let _ = request.respond(response);
+        // Requested by `POST /api/daemon/shutdown` (`shutdown()` above).
+        // Breaking here — rather than calling `server.unblock()` — is
+        // sufficient: this request has already been answered and we simply
+        // never call `.next()` again, so `serve()` returns and `main()` can
+        // exit normally, dropping `_job_guard` to kill every remaining
+        // subprocess (see `jobobject.rs`).
+        if daemon.shutdown_requested() {
+            crate::rlog!(
+                INFO,
+                "ralphus [http] shutdown requested — stopping HTTP loop"
+            );
+            break;
+        }
     }
 }
 
@@ -3496,6 +4731,94 @@ mod tests {
 
     fn submit_body(toml: &str) -> String {
         serde_json::to_string(&serde_json::json!({ "toml": toml })).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured check input substitution + cleanup chaining (RAL-164)
+    // -----------------------------------------------------------------------
+
+    fn check_input(name: &str, message: &str, default: &str) -> crate::guardian::CheckInput {
+        crate::guardian::CheckInput {
+            name: name.to_string(),
+            message: message.to_string(),
+            default: default.to_string(),
+        }
+    }
+
+    #[test]
+    fn substitute_check_inputs_prefers_submitted_over_stored_over_default() {
+        let inputs = vec![check_input("port", "Port", "7890")];
+        let submitted = std::collections::HashMap::from([("port".to_string(), "9001".to_string())]);
+        let stored = std::collections::HashMap::from([("port".to_string(), "9002".to_string())]);
+        assert_eq!(
+            substitute_check_inputs("serve --port {port}", &inputs, &submitted, &stored),
+            "serve --port 9001"
+        );
+        assert_eq!(
+            substitute_check_inputs(
+                "serve --port {port}",
+                &inputs,
+                &std::collections::HashMap::new(),
+                &stored
+            ),
+            "serve --port 9002"
+        );
+        assert_eq!(
+            substitute_check_inputs(
+                "serve --port {port}",
+                &inputs,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new()
+            ),
+            "serve --port 7890"
+        );
+    }
+
+    #[test]
+    fn build_check_command_line_without_cleanup_is_plain() {
+        let check = crate::guardian::GuardianCheck {
+            label: None,
+            command: Some("cargo test".to_string()),
+            prompt: None,
+            cleanup_command: Some("echo would-clean".to_string()),
+            inputs: vec![],
+        };
+        let empty = std::collections::HashMap::new();
+        let line =
+            build_check_command_line("C:/repo", &check, &empty, &empty, false).expect("command");
+        assert_eq!(line, "cd /d \"C:/repo\" && cargo test");
+    }
+
+    #[test]
+    fn build_check_command_line_with_cleanup_chains_with_ampersand_not_double() {
+        let check = crate::guardian::GuardianCheck {
+            label: None,
+            command: Some("ralphus-daemon serve --port {port}".to_string()),
+            prompt: None,
+            cleanup_command: Some("ralphus-daemon stop --port {port}".to_string()),
+            inputs: vec![check_input("port", "Port", "7890")],
+        };
+        let submitted = std::collections::HashMap::from([("port".to_string(), "9001".to_string())]);
+        let stored = std::collections::HashMap::new();
+        let line = build_check_command_line("C:/repo", &check, &submitted, &stored, true)
+            .expect("command");
+        assert_eq!(
+            line,
+            "cd /d \"C:/repo\" && (ralphus-daemon stop --port 9001) & ralphus-daemon serve --port 9001"
+        );
+    }
+
+    #[test]
+    fn build_check_command_line_prompt_only_check_is_none() {
+        let check = crate::guardian::GuardianCheck {
+            label: Some("Check UI".to_string()),
+            command: None,
+            prompt: Some("open localhost:3000".to_string()),
+            cleanup_command: None,
+            inputs: vec![],
+        };
+        let empty = std::collections::HashMap::new();
+        assert!(build_check_command_line("C:/repo", &check, &empty, &empty, false).is_none());
     }
 
     #[test]
@@ -3891,11 +5214,11 @@ mod tests {
 
     #[test]
     fn resume_agent_command_always_skips_permissions() {
-        // "Open Agent" is only ever reachable for a session that actually ran
-        // under claude-code (a claude_session_id is required to get here at
-        // all -- see open_agent_terminal), so the resumed conversation should
-        // never immediately stall on a permission prompt a human has to
-        // notice and click through.
+        // "Open Agent" is only reachable for a session that actually ran
+        // under an agent with a resume mechanism (a agent_session_id is
+        // required to get here at all -- see open_agent_terminal), so the
+        // resumed conversation should never immediately stall on a
+        // permission prompt a human has to notice and click through.
         let cmd = resume_agent_command("claude", "abc-123");
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(cmd.contains("--resume 'abc-123'"));
@@ -3907,6 +5230,133 @@ mod tests {
         let cmd = resume_agent_command("my'claude", "sess'123");
         assert!(cmd.contains("my''claude"));
         assert!(cmd.contains("sess''123"));
+    }
+
+    // ── RAL-153: read-only terminal-log viewer copy ─────────────────────────
+
+    #[test]
+    fn resolve_preferred_editor_prefers_visual_over_editor() {
+        let resolved =
+            resolve_preferred_editor_from(Some("code -w".to_string()), Some("vim".to_string()));
+        assert_eq!(resolved, Some(("code".to_string(), vec!["-w".to_string()])));
+    }
+
+    #[test]
+    fn resolve_preferred_editor_falls_back_to_editor_when_visual_unset() {
+        let resolved = resolve_preferred_editor_from(None, Some("vim".to_string()));
+        assert_eq!(resolved, Some(("vim".to_string(), vec![])));
+    }
+
+    #[test]
+    fn resolve_preferred_editor_skips_a_blank_visual() {
+        let resolved =
+            resolve_preferred_editor_from(Some("   ".to_string()), Some("vim".to_string()));
+        assert_eq!(resolved, Some(("vim".to_string(), vec![])));
+    }
+
+    #[test]
+    fn resolve_preferred_editor_none_when_both_unset_or_blank() {
+        assert_eq!(resolve_preferred_editor_from(None, None), None);
+        assert_eq!(
+            resolve_preferred_editor_from(Some(String::new()), Some("  ".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_preferred_editor_splits_multi_word_command() {
+        let resolved = resolve_preferred_editor_from(None, Some("subl -w -n".to_string()));
+        assert_eq!(
+            resolved,
+            Some(("subl".to_string(), vec!["-w".to_string(), "-n".to_string()]))
+        );
+    }
+
+    #[test]
+    fn readonly_viewer_copy_path_is_unique_per_call_and_scoped_to_dir() {
+        let dir = std::path::Path::new("dummy-dir");
+        let a = readonly_viewer_copy_path(dir, "my-session");
+        let b = readonly_viewer_copy_path(dir, "my-session");
+        assert_ne!(a, b, "each click's copy must get its own path");
+        assert!(a.starts_with(dir));
+        assert!(a.to_string_lossy().contains("my-session"));
+    }
+
+    #[test]
+    fn is_stale_true_once_past_max_age() {
+        let modified = std::time::SystemTime::UNIX_EPOCH;
+        let now = modified + Duration::from_secs(3601);
+        assert!(is_stale(modified, now, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn is_stale_false_within_max_age() {
+        let modified = std::time::SystemTime::UNIX_EPOCH;
+        let now = modified + Duration::from_secs(3599);
+        assert!(!is_stale(modified, now, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn is_stale_false_when_modified_is_not_before_now() {
+        // Clock skew (or a file written during this exact instant) must never
+        // be treated as a reason to delete.
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let modified = now + Duration::from_secs(5);
+        assert!(!is_stale(modified, now, Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn prune_stale_readonly_viewer_copies_leaves_a_freshly_written_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-test-readonly-viewer-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("fresh.txt");
+        std::fs::write(&fresh, "new").unwrap();
+
+        prune_stale_readonly_viewer_copies(&dir);
+
+        assert!(fresh.exists(), "a just-written copy must not be pruned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_readonly_snapshot_terminal_reports_409_with_no_snapshot() {
+        let r = open_readonly_snapshot_terminal("definitely-not-a-real-ralphus-session-xyz");
+        assert_eq!(r.status, 409);
+        assert!(r.body.contains("no_tmux_session"));
+    }
+
+    #[test]
+    fn resume_codex_agent_command_always_bypasses_approvals() {
+        let cmd = resume_codex_agent_command("codex", "thread-abc-123");
+        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(cmd.contains("exec resume 'thread-abc-123'"));
+        assert!(cmd.contains("& 'codex'"));
+    }
+
+    #[test]
+    fn resume_codex_agent_command_escapes_single_quotes() {
+        let cmd = resume_codex_agent_command("my'codex", "sess'123");
+        assert!(cmd.contains("my''codex"));
+        assert!(cmd.contains("sess''123"));
+    }
+
+    #[test]
+    fn is_codex_agent_matches_both_aliases() {
+        assert!(is_codex_agent(Some("codex")));
+        assert!(is_codex_agent(Some("codex-cli")));
+    }
+
+    #[test]
+    fn is_codex_agent_false_for_claude_and_unset() {
+        assert!(!is_codex_agent(Some("claude-code")));
+        assert!(!is_codex_agent(Some("claude-cli")));
+        assert!(!is_codex_agent(Some("ollama")));
+        assert!(!is_codex_agent(None));
     }
 
     #[test]
@@ -4168,6 +5618,51 @@ mod tests {
     }
 
     #[test]
+    fn guardian_branch_conflicts_missing_guardian_is_404() {
+        let d = daemon();
+        assert_eq!(
+            route(
+                &d,
+                "GET",
+                "/api/guardians/guardian-999/branches/branch-1/conflicts",
+                ""
+            )
+            .status,
+            404
+        );
+    }
+
+    #[test]
+    fn guardian_branch_conflicts_missing_branch_is_404() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/branch-999/conflicts"),
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_branch_conflicts_no_worktree_yet_is_empty() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{branch_id}/conflicts"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"files\":[]"));
+        assert!(r.body.contains("\"rebase_in_progress\":false"));
+    }
+
+    #[test]
     fn cancel_run() {
         let d = daemon();
         route(&d, "POST", "/api/runs", &submit_body(GOOD));
@@ -4207,6 +5702,92 @@ mod tests {
                 .body
                 .contains("\"state\":\"cancelled\"")
         );
+    }
+
+    #[test]
+    fn shutdown_without_auto_cancel_leaves_run_state_alone_but_requests_shutdown() {
+        // Real production code kills each known run/guardian's own
+        // ralphus_{id}_-prefixed tmux.exe sessions (see
+        // `kill_run_tmux_sessions`) — serialize against `tmux.rs`'s live
+        // tests anyway, since a real `tmux list-sessions`/`kill-session`
+        // round trip still happens even though this test's fixture ids
+        // (`run-000000000001` etc.) never collide with theirs.
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        d.lock()
+            .set_run_state("run-000000000001", RunState::Running)
+            .unwrap();
+
+        assert!(!d.shutdown_requested());
+        let r = route(&d, "POST", "/api/daemon/shutdown", "");
+        assert_eq!(r.status, 200, "body={}", r.body);
+        assert!(r.body.contains("\"state\":\"stopping\""));
+        assert!(r.body.contains("\"auto_cancel\":false"));
+        assert!(d.shutdown_requested());
+
+        // Left running for crash-recovery to resume on next `serve()` startup.
+        assert!(
+            route(&d, "GET", "/api/runs/run-000000000001", "")
+                .body
+                .contains("\"state\":\"running\"")
+        );
+    }
+
+    #[test]
+    fn shutdown_with_auto_cancel_cancels_active_runs_and_guardians() {
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD)); // run-1: pending
+        route(&d, "POST", "/api/runs", &submit_body(GOOD)); // run-2
+        d.lock()
+            .set_run_state("run-000000000002", RunState::Done)
+            .unwrap();
+
+        let gbody =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &gbody);
+        let gid = "guardian-000000000001";
+
+        let body = serde_json::to_string(&serde_json::json!({ "auto_cancel": true })).unwrap();
+        let r = route(&d, "POST", "/api/daemon/shutdown", &body);
+        assert_eq!(r.status, 200, "body={}", r.body);
+        assert!(r.body.contains("\"auto_cancel\":true"));
+        assert!(r.body.contains("run-000000000001"));
+        assert!(!r.body.contains("run-000000000002")); // already terminal — left alone
+        assert!(r.body.contains(gid));
+        assert!(d.shutdown_requested());
+
+        assert!(
+            route(&d, "GET", "/api/runs/run-000000000001", "")
+                .body
+                .contains("\"state\":\"cancelled\"")
+        );
+        assert!(
+            route(&d, "GET", "/api/runs/run-000000000002", "")
+                .body
+                .contains("\"state\":\"done\"")
+        );
+        assert!(
+            route(&d, "GET", &format!("/api/guardians/{gid}"), "")
+                .body
+                .contains("\"status\":\"cancelled\"")
+        );
+    }
+
+    #[test]
+    fn shutdown_body_defaults_auto_cancel_to_false() {
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = daemon();
+        let r = route(&d, "POST", "/api/daemon/shutdown", "");
+        assert_eq!(r.status, 200, "body={}", r.body);
+        assert!(r.body.contains("\"auto_cancel\":false"));
     }
 
     #[test]
@@ -4317,6 +5898,71 @@ mod tests {
         assert_eq!(v["tasks"][0]["state"].as_str(), Some("done"));
     }
 
+    // RAL-157: solo/unsolo a task within a run.
+
+    const TWO_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+
+    #[test]
+    fn solo_task_sets_soloed_and_returns_refreshed_run() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(TWO_TASKS));
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/0/solo", "");
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["soloed"].as_bool(), Some(true));
+        assert_eq!(
+            v["tasks"][1]["soloed"].as_bool(),
+            Some(false),
+            "soloing one task must not solo its sibling"
+        );
+    }
+
+    #[test]
+    fn unsolo_task_clears_soloed() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(TWO_TASKS));
+        route(&d, "POST", "/api/runs/run-000000000001/tasks/0/solo", "");
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/0/unsolo", "");
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["soloed"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn solo_task_multiple_at_once_has_no_auto_exclusivity() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(TWO_TASKS));
+        route(&d, "POST", "/api/runs/run-000000000001/tasks/0/solo", "");
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/1/solo", "");
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["soloed"].as_bool(), Some(true));
+        assert_eq!(v["tasks"][1]["soloed"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn solo_task_unknown_run_is_not_found() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/runs/run-nope/tasks/0/solo", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn solo_task_unknown_task_index_is_not_found() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/99/solo", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn solo_task_non_integer_index_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/nope/solo", "");
+        assert_eq!(r.status, 400);
+    }
+
     #[test]
     fn set_status_session() {
         let d = daemon();
@@ -4370,6 +6016,325 @@ mod tests {
         let body = serde_json::json!({"kind": "wat", "state": "done"}).to_string();
         let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
         assert_eq!(r.status, 400);
+    }
+
+    fn status_req(kind: &str, task_idx: i64, session_idx: i64, state: &str) -> SetStatusBody {
+        SetStatusBody {
+            kind: kind.to_string(),
+            task_idx,
+            session_idx,
+            verify_idx: 0,
+            verify_scope: String::new(),
+            state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn stop_targets_for_session_kind_targets_that_exact_pane() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = "run-000000000001";
+        let guard = d.lock();
+        let req = status_req("session", 0, 0, "done");
+        let targets = stop_targets_for_status_change(&guard, run_id, &req);
+        let task = guard.get_task_name(run_id, 0).unwrap();
+        let sid = guard.get_session_id(run_id, 0, 0).unwrap();
+        assert_eq!(
+            targets,
+            vec![(crate::tmux::session_name(run_id, &task, &sid), 0)]
+        );
+    }
+
+    #[test]
+    fn stop_targets_for_task_kind_covers_every_session_in_the_task() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        route(&d, "POST", "/api/runs", &submit_body(toml));
+        let run_id = "run-000000000001";
+        let guard = d.lock();
+        let req = status_req("task", 0, 0, "failed");
+        let targets = stop_targets_for_status_change(&guard, run_id, &req);
+        assert_eq!(
+            targets,
+            vec![
+                (crate::tmux::session_name(run_id, "t", "s1"), 0),
+                (crate::tmux::session_name(run_id, "t", "s2"), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_targets_for_session_scope_verify_targets_the_verify_pane_but_the_session_ghost() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = "run-000000000001";
+        let guard = d.lock();
+        let mut req = status_req("verify", 0, 0, "failed");
+        req.verify_scope = "session".to_string();
+        req.verify_idx = 3;
+        let targets = stop_targets_for_status_change(&guard, run_id, &req);
+        let task = guard.get_task_name(run_id, 0).unwrap();
+        assert_eq!(
+            targets,
+            vec![(
+                crate::tmux::session_name(run_id, &task, "verify-session-3"),
+                0
+            )]
+        );
+    }
+
+    #[test]
+    fn stop_targets_for_task_scope_verify_attributes_ghost_to_the_first_session() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        route(&d, "POST", "/api/runs", &submit_body(toml));
+        let run_id = "run-000000000001";
+        let guard = d.lock();
+        let mut req = status_req("verify", 0, 0, "failed");
+        req.verify_scope = "task".to_string();
+        req.verify_idx = 1;
+        let targets = stop_targets_for_status_change(&guard, run_id, &req);
+        assert_eq!(
+            targets,
+            // Pane is keyed by the task-scope verify's own name, but the
+            // ghost is attributed to session idx 0 (the task's first
+            // session) -- mirroring `Store::get_task_first_session_cwd`.
+            vec![(crate::tmux::session_name(run_id, "t", "verify-task-1"), 0)]
+        );
+    }
+
+    #[test]
+    fn stop_targets_empty_for_unknown_task() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = "run-000000000001";
+        let guard = d.lock();
+        let req = status_req("session", 99, 0, "done");
+        assert_eq!(stop_targets_for_status_change(&guard, run_id, &req), vec![]);
+    }
+
+    #[test]
+    fn stop_targets_empty_for_run_kind() {
+        // "run" isn't handled by capture_and_stop_node at all -- the run-wide
+        // cancel cascade (`kill_run_tmux_sessions`) already covers it.
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = "run-000000000001";
+        let guard = d.lock();
+        let req = status_req("run", 0, 0, "done");
+        assert_eq!(stop_targets_for_status_change(&guard, run_id, &req), vec![]);
+    }
+
+    fn tmux_available() -> bool {
+        crate::tmux::Tmux::resolve().is_ok()
+    }
+
+    /// A one-task-one-session TOML fixture like `GOOD`, but with a caller-
+    /// chosen task name — so each live-tmux test below derives its own
+    /// unique, never-reused `crate::tmux::session_name`, rather than all of
+    /// them colliding on the literal name `GOOD`'s fixed task name would
+    /// otherwise produce (real OS-level tmux state is shared process-wide,
+    /// unlike the fresh in-memory `Store` each test otherwise gets).
+    fn good_with_task(task: &str) -> String {
+        format!("[[task]]\nname=\"{task}\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n")
+    }
+
+    /// Create a real, detached tmux session named for `(run_id, task,
+    /// session_id)` that echoes `marker` into its pane, then polls until the
+    /// echo actually shows up in `capture-pane` — mirrors
+    /// `tmux.rs::live_tmux_new_session_capture_and_kill_roundtrip`'s idiom, so
+    /// the RAL-163 tests below have a real, non-racy pane to capture from.
+    fn spawn_marker_session(name: &str, marker: &str) -> crate::tmux::Tmux {
+        let tmux = crate::tmux::Tmux::resolve().unwrap();
+        let _ = tmux.kill_session(name);
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let command = crate::tmux::build_command_line("echo", &[marker.to_string()]);
+        tmux.new_detached_session_with_command(name, &cwd, &command)
+            .unwrap();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if tmux
+                .capture_pane(name, 50)
+                .unwrap_or_default()
+                .contains(marker)
+            {
+                break;
+            }
+        }
+        tmux
+    }
+
+    #[test]
+    fn set_status_session_captures_pane_into_ghost_and_kills_it() {
+        // RAL-163: setting a session to a terminal status while its agent is
+        // still running must capture the pane's in-progress output into that
+        // session's ghost, then stop (kill) the pane -- turning the manual
+        // override into a recoverable checkpoint instead of an orphaned
+        // background process.
+        if !tmux_available() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/runs",
+            &submit_body(&good_with_task("ral163-captures")),
+        );
+        let run_id = "run-000000000001";
+
+        let (task, sid) = {
+            let guard = d.lock();
+            (
+                guard.get_task_name(run_id, 0).unwrap(),
+                guard.get_session_id(run_id, 0, 0).unwrap(),
+            )
+        };
+        let name = crate::tmux::session_name(run_id, &task, &sid);
+        let marker = "ral-163-in-progress-marker";
+        spawn_marker_session(&name, marker);
+
+        let body = serde_json::json!({
+            "kind": "session", "task_idx": 0, "session_idx": 0, "state": "done"
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/runs/{run_id}/set-status"), &body);
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["state"].as_str(),
+            Some("done"),
+            "the manually-set status must be applied: {}",
+            r.body
+        );
+
+        let tmux = crate::tmux::Tmux::resolve().unwrap();
+        assert!(
+            !tmux.has_session(&name),
+            "the agent's tmux pane must be stopped"
+        );
+
+        let uri = crate::ghost::session_uri(run_id, 0, 0);
+        let ghost = d.lock().get_ghost(&uri).unwrap();
+        let ghost = ghost.expect("captured pane output must be saved to the session's ghost");
+        assert!(
+            ghost.content.contains(marker),
+            "ghost must contain the captured in-progress output: {}",
+            ghost.content
+        );
+    }
+
+    #[test]
+    fn set_status_pending_does_not_stop_a_running_agent() {
+        // Per the ticket: "pending" is the only status that does not imply
+        // "stop running" -- setting it must leave a live agent's pane alone.
+        if !tmux_available() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/runs",
+            &submit_body(&good_with_task("ral163-pending")),
+        );
+        let run_id = "run-000000000001";
+
+        let (task, sid) = {
+            let guard = d.lock();
+            (
+                guard.get_task_name(run_id, 0).unwrap(),
+                guard.get_session_id(run_id, 0, 0).unwrap(),
+            )
+        };
+        let name = crate::tmux::session_name(run_id, &task, &sid);
+        let marker = "ral-163-pending-marker";
+        let tmux = spawn_marker_session(&name, marker);
+
+        let body = serde_json::json!({
+            "kind": "session", "task_idx": 0, "session_idx": 0, "state": "pending"
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/runs/{run_id}/set-status"), &body);
+        assert_eq!(r.status, 200, "body={}", r.body);
+
+        assert!(
+            tmux.has_session(&name),
+            "setting status to pending must not stop a running agent"
+        );
+        let uri = crate::ghost::session_uri(run_id, 0, 0);
+        assert!(
+            d.lock().get_ghost(&uri).unwrap().is_none(),
+            "nothing should have been captured for a pending status change"
+        );
+
+        tmux.kill_session(&name).unwrap();
+    }
+
+    #[test]
+    fn set_status_ignored_still_captures_and_stops() {
+        // Q1 of the ticket's interview: `ignored` is deliberately non-terminal
+        // in the state machine (reversible back to `pending`), but the trigger
+        // condition for stop-and-capture is "any status but pending" -- a user
+        // sets `ignored` specifically to skip past bad-looking output, and
+        // losing that context would defeat the point.
+        if !tmux_available() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/runs",
+            &submit_body(&good_with_task("ral163-ignored")),
+        );
+        let run_id = "run-000000000001";
+
+        let (task, sid) = {
+            let guard = d.lock();
+            (
+                guard.get_task_name(run_id, 0).unwrap(),
+                guard.get_session_id(run_id, 0, 0).unwrap(),
+            )
+        };
+        let name = crate::tmux::session_name(run_id, &task, &sid);
+        let marker = "ral-163-ignored-marker";
+        spawn_marker_session(&name, marker);
+
+        let body = serde_json::json!({
+            "kind": "session", "task_idx": 0, "session_idx": 0, "state": "ignored"
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/runs/{run_id}/set-status"), &body);
+        assert_eq!(r.status, 200, "body={}", r.body);
+
+        let tmux = crate::tmux::Tmux::resolve().unwrap();
+        assert!(
+            !tmux.has_session(&name),
+            "ignored must still stop the running agent"
+        );
+        let uri = crate::ghost::session_uri(run_id, 0, 0);
+        let ghost = d.lock().get_ghost(&uri).unwrap();
+        assert!(
+            ghost.is_some_and(|g| g.content.contains(marker)),
+            "ignored must still capture the agent's in-progress output"
+        );
     }
 
     #[test]
@@ -4639,6 +6604,125 @@ mod tests {
         let d = daemon();
         let r = route(&d, "POST", "/api/runs/run-1/sessions/x/y/restart", "");
         assert_eq!(r.status, 400);
+    }
+
+    /// RAL-1xx regression: `restart_session`/`restart_session_verify`/
+    /// `restart_task_verify` used to cancel a run's *entire* worker thread
+    /// unconditionally, even when the restart target had already finished.
+    /// A run's worker drives every one of that run's independent sessions
+    /// concurrently over one shared `CancelToken` (see
+    /// `scheduler::execute_run_inner`), so restarting one already-terminal
+    /// (failed) session collaterally killed every other still-running,
+    /// unrelated sibling session in the same run — observed in production as
+    /// several healthy tasks in a batch run dying the instant a different,
+    /// already-failed task was restarted, despite having no `depends_on`
+    /// relationship to it. Task "a" fails immediately here; task "b" is still
+    /// genuinely in flight (blocked in `run_cancellable`, standing in for a
+    /// live claude-code session) when "a" is restarted. Before the fix, "b"
+    /// observed `cancel.is_cancelled() == true` and aborted; after the fix,
+    /// restarting "a" (already terminal) never touches the shared token at
+    /// all, so "b" runs to completion undisturbed.
+    #[test]
+    fn restart_session_does_not_cancel_unrelated_sibling_session_in_same_run() {
+        use crate::cancel::CancelToken;
+        use crate::runner::{RunnerResult, RunnerSpec};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const TWO_INDEPENDENT_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\".\"\ncommand=\"x\"\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\".\"\ncommand=\"y\"\n";
+
+        /// Task "a" fails immediately (so its session is already terminal by
+        /// the time the test restarts it); task "b" blocks in
+        /// `run_cancellable`, polling `cancel` like a real subprocess-backed
+        /// session would, so the test can observe whether it ever gets
+        /// collaterally cancelled.
+        struct TwoTaskRunner {
+            b_started: Arc<AtomicBool>,
+            b_cancelled: Arc<AtomicBool>,
+        }
+
+        impl Runner for TwoTaskRunner {
+            fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+                RunnerResult::failure("unused")
+            }
+            fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+                if spec.task == "a" {
+                    return RunnerResult::failure("task a fails immediately");
+                }
+                self.b_started.store(true, Ordering::SeqCst);
+                for _ in 0..60 {
+                    if cancel.is_cancelled() {
+                        self.b_cancelled.store(true, Ordering::SeqCst);
+                        return RunnerResult::failure("cancelled");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                RunnerResult {
+                    status: "done".to_string(),
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cost_usd: 0.0,
+                    summary: "b finished undisturbed".to_string(),
+                    error: None,
+                    verified: None,
+                    agent_session_id: None,
+                    ghost: None,
+                }
+            }
+        }
+
+        let d = daemon();
+        let r = route(&d, "POST", "/api/runs", &submit_body(TWO_INDEPENDENT_TASKS));
+        assert_eq!(r.status, 201);
+        let run_id = "run-000000000001".to_string();
+
+        let b_started = Arc::new(AtomicBool::new(false));
+        let b_cancelled = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn Runner> = Arc::new(TwoTaskRunner {
+            b_started: Arc::clone(&b_started),
+            b_cancelled: Arc::clone(&b_cancelled),
+        });
+
+        let store = d.store_handle();
+        let cancellations = d.cancellations_handle();
+        let worker = {
+            let (store, runner, cancellations, run_id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                cancellations.clone(),
+                run_id.clone(),
+            );
+            std::thread::spawn(move || {
+                // Mirrors what `scheduler::tick` does for a claimed run: register
+                // a token in the shared registry before executing, remove it after.
+                let token = cancellations.register(&run_id);
+                crate::scheduler::execute_run_with(&store, runner.as_ref(), &run_id, &token);
+                cancellations.remove(&run_id);
+            })
+        };
+
+        // Wait until task "b" is genuinely in flight — by then task "a"
+        // (a near-instant command session) has certainly already failed.
+        while !b_started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Restart task "a"'s already-failed session while "b" is still running.
+        let rr = route(
+            &d,
+            "POST",
+            &format!("/api/runs/{run_id}/sessions/0/0/restart"),
+            "",
+        );
+        assert_eq!(rr.status, 200);
+
+        worker.join().unwrap();
+
+        assert!(
+            !b_cancelled.load(Ordering::SeqCst),
+            "restarting task a's already-terminal session must not cancel \
+             task b's still-running, unrelated sibling session"
+        );
     }
 
     #[test]
@@ -5075,6 +7159,296 @@ mod tests {
         let d = daemon();
         let r = route(&d, "POST", "/api/runs/run-1/tasks/x/verify/y/restart", "");
         assert_eq!(r.status, 400);
+    }
+
+    // ── RAL-150: task restart + env overrides ───────────────────────────────
+
+    #[test]
+    fn restart_task_preview_reports_impact_without_mutating() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/restart/preview",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
+
+        // Previewing did not mutate anything.
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["state"], "pending");
+    }
+
+    #[test]
+    fn restart_task_preview_bad_index_is_400() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/runs/run-1/tasks/x/restart/preview", "");
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn restart_task_route_returns_pending() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/0/restart", "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"state\":\"pending\""));
+    }
+
+    #[test]
+    fn restart_task_bad_index_is_400() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/runs/run-1/tasks/x/restart", "");
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn restart_task_missing_task_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/9/restart", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_run_env_sets_and_is_reflected_on_get() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1", "B": "2"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/env", &body);
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "1");
+        assert_eq!(result["B"], "2");
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["env_overrides"]["A"], "1");
+        assert_eq!(run["env_overrides"]["B"], "2");
+    }
+
+    #[test]
+    fn set_run_env_unsets_a_previously_set_key() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/env",
+            &serde_json::json!({"set": {"A": "1"}}).to_string(),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/env",
+            &serde_json::json!({"unset": ["A"]}).to_string(),
+        );
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_run_env_rejects_invalid_key() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"NOT VALID": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/env", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_run_env_requires_set_or_unset() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(&d, "POST", "/api/runs/run-000000000001/env", "{}");
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_run_env_missing_run_is_404() {
+        let d = daemon();
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-999/env", &body);
+        assert_eq!(r.status, 404);
+    }
+
+    // ── hierarchical env overrides (RAL-150 extension) ─────────────────────
+
+    #[test]
+    fn set_task_env_sets_and_is_reflected_on_get() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/0/env", &body);
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "1");
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["tasks"][0]["env_overrides"]["A"], "1");
+    }
+
+    #[test]
+    fn set_task_env_missing_task_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/9/env", &body);
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_task_env_bad_index_is_400() {
+        let d = daemon();
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-1/tasks/x/env", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_task_env_rejects_invalid_key() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"NOT VALID": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/0/env", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_task_verify_env_sets_and_is_reflected_on_get() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/verify/env",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "1");
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["tasks"][0]["verify_env_overrides"]["A"], "1");
+        // The plain task-level map is untouched.
+        assert!(run["tasks"][0].get("env_overrides").is_none());
+    }
+
+    #[test]
+    fn set_task_verify_env_missing_task_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/9/verify/env",
+            &body,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_session_env_sets_and_is_reflected_on_get() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/0/env",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "1");
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["tasks"][0]["sessions"][0]["env_overrides"]["A"], "1");
+    }
+
+    #[test]
+    fn set_session_env_missing_session_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/9/env",
+            &body,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_session_env_bad_index_is_400() {
+        let d = daemon();
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-1/sessions/x/0/env", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_session_verify_env_sets_and_is_reflected_on_get() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/0/verify/env",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "1");
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(
+            run["tasks"][0]["sessions"][0]["verify_env_overrides"]["A"],
+            "1"
+        );
+    }
+
+    #[test]
+    fn set_session_verify_env_missing_session_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/9/verify/env",
+            &body,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_env_overrides_requires_set_or_unset_for_every_scope() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        for path in [
+            "/api/runs/run-000000000001/tasks/0/env",
+            "/api/runs/run-000000000001/tasks/0/verify/env",
+            "/api/runs/run-000000000001/sessions/0/0/env",
+            "/api/runs/run-000000000001/sessions/0/0/verify/env",
+        ] {
+            let r = route(&d, "POST", path, "{}");
+            assert_eq!(r.status, 400, "{path}");
+        }
     }
 
     // ── CLI_PARITY_PLAN.local.md Phase 1 / Q1: server-side `/api/tasks` filter ──

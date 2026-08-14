@@ -384,6 +384,110 @@ class DaemonClient:
         )
         return result
 
+    def restart_task(self, run_id: str, task_idx: int) -> dict[str, Any]:
+        """Restart a whole task (its sessions plus their downstream, RAL-150);
+        returns ``{state, dirtied}``.
+        """
+        result: dict[str, Any] = self._post(f"/api/runs/{run_id}/tasks/{task_idx}/restart")
+        return result
+
+    def set_run_env(
+        self,
+        run_id: str,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace (``set_vars``) and remove (``unset_vars``) a run's
+        persistent environment-variable overrides (RAL-150). Returns the
+        resulting map.
+
+        Overrides persist across any number of retries until explicitly
+        unset -- they take effect the next time the daemon executes one of
+        the run's sessions or verify steps, not immediately. Pair this with
+        ``retry_run``/``restart_run``/``restart_task``/``restart_session`` (or
+        the CLI's ``ralphus retry <selector> --environment ...``, which does
+        exactly that) to actually re-run something under the new values.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(f"/api/runs/{run_id}/env", payload)
+        return result
+
+    def set_task_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace (``set_vars``) and remove (``unset_vars``) a task's own
+        persistent environment-variable overrides (hierarchical env
+        overrides, extending RAL-150) -- merged on top of the owning run's,
+        and merged onto every session under this task. Returns the resulting
+        map.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(f"/api/runs/{run_id}/tasks/{task_idx}/env", payload)
+        return result
+
+    def set_task_verify_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace/remove the environment-variable overrides applied only
+        to a task's own (task-scoped) verify steps -- merged on top of the
+        task's own overrides (and the run's). Returns the resulting map.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(
+            f"/api/runs/{run_id}/tasks/{task_idx}/verify/env", payload
+        )
+        return result
+
+    def set_session_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        session_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace/remove a session's own persistent environment-variable
+        overrides -- merged on top of its task's/run's. Returns the resulting
+        map.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(
+            f"/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/env", payload
+        )
+        return result
+
+    def set_session_verify_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        session_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace/remove the environment-variable overrides applied only
+        to a session's own (session-scoped) verify steps -- merged on top of
+        the session's own overrides (and its task's/run's). Returns the
+        resulting map.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(
+            f"/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/verify/env", payload
+        )
+        return result
+
     def edit_run(self, run_id: str, *, label: str | None) -> dict[str, Any]:
         """Rename a run's label; resets the run to pending."""
         payload: dict[str, Any] = {"kind": "run", "label": label}

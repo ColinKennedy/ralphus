@@ -1,10 +1,19 @@
 //! Verify-step execution.
 //!
-//! MVP scope: `command` verify steps (fmt/lint/test) run as shell commands in
-//! the session's working directory — exit code is the verdict. `agent` and
-//! `brain` verifiers need a model and are deferred (left pending) until the
-//! native backend lands; `approval` verifiers need a human and are deferred too.
+//! `command` verify steps (fmt/lint/test) run as shell commands — exit code
+//! is the verdict. `agent` verifiers need a model; `brain` and `approval`
+//! verifiers are deferred (left pending) until their respective backends
+//! land.
+//!
+//! This module's direct, un-wrapped subprocess execution is used by Guardian
+//! review check gates (`daemon/src/guardian_merge.rs`), which have no live
+//! view of their own to preserve. A task/session `command`-kind verify step
+//! instead runs through [`crate::runner::Runner`] (RAL-151), tmux-wrapped
+//! exactly like a `prompt`-kind verify step, so it can be watched live from
+//! the board — see `daemon/src/scheduler.rs::run_verifies`'s `"command"`
+//! branch.
 
+use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 
 use opentelemetry::Context;
@@ -13,19 +22,25 @@ use opentelemetry::trace::{SpanKind, Status};
 /// Run a `command` verify step in `cwd`. Returns true when the command exits 0.
 ///
 /// Used by callers (e.g. Guardian review checks) that have no trace to
-/// continue; the span it creates starts a fresh trace of its own. Session/task
-/// verify steps go through [`run_command_verify_capture`] directly so they can
-/// pass the run's actual trace context (RAL-96).
+/// continue and no run-scoped env overrides to apply; the span it creates
+/// starts a fresh trace of its own.
 #[must_use]
 pub fn run_command_verify(cwd: &str, command: &str) -> bool {
-    run_command_verify_capture(cwd, command, &Context::new()).0
+    run_command_verify_capture(cwd, command, &Context::new(), &BTreeMap::new()).0
 }
 
 /// Like [`run_command_verify`] but also captures the combined stdout+stderr
 /// (truncated) so it can be shown in the log viewer (CCTL-99). Wraps the
-/// subprocess in an OpenTelemetry span (RAL-96), as a child of `parent`.
+/// subprocess in an OpenTelemetry span (RAL-96), as a child of `parent`, and
+/// applies `env` — the owning run's persistent environment-variable overrides
+/// (RAL-150), if any — on top of the daemon's own inherited environment.
 #[must_use]
-pub fn run_command_verify_capture(cwd: &str, command: &str, parent: &Context) -> (bool, String) {
+pub fn run_command_verify_capture(
+    cwd: &str,
+    command: &str,
+    parent: &Context,
+    env: &BTreeMap<String, String>,
+) -> (bool, String) {
     let span = crate::otel::start_span("verify.command", parent, SpanKind::Internal);
     span.set_attribute("verify.cwd", cwd.to_string());
     span.set_attribute("verify.command", command.to_string());
@@ -42,6 +57,7 @@ pub fn run_command_verify_capture(cwd: &str, command: &str, parent: &Context) ->
         .arg(flag)
         .arg(command)
         .current_dir(cwd)
+        .envs(env)
         .stdin(Stdio::null())
         .output()
     {
@@ -103,9 +119,27 @@ mod tests {
 
     #[test]
     fn capture_returns_output() {
-        let (ok, out) = run_command_verify_capture(".", "echo hello-verify", &Context::new());
+        let (ok, out) =
+            run_command_verify_capture(".", "echo hello-verify", &Context::new(), &BTreeMap::new());
         assert!(ok);
         assert!(out.contains("hello-verify"), "captured: {out:?}");
+    }
+
+    #[test]
+    fn capture_applies_env_overrides() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "RALPHUS_TEST_VAR".to_string(),
+            "hello-env-override".to_string(),
+        );
+        let cmd = if cfg!(windows) {
+            "echo %RALPHUS_TEST_VAR%"
+        } else {
+            "echo $RALPHUS_TEST_VAR"
+        };
+        let (ok, out) = run_command_verify_capture(".", cmd, &Context::new(), &env);
+        assert!(ok);
+        assert!(out.contains("hello-env-override"), "captured: {out:?}");
     }
 
     #[test]

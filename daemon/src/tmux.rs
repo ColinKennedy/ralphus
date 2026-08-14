@@ -14,6 +14,7 @@
 //! fallback binary (see [`embedded`] — Windows-only today, gated behind the
 //! `embedded-tmux` feature since no verified binary is bundled yet).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,6 +23,17 @@ use std::time::{Duration, Instant};
 /// if it's on `PATH` under a different name) of the tmux-compatible binary to
 /// use, skipping both the `PATH` lookup and the embedded fallback.
 pub const TMUX_CMD_ENV: &str = "RALPHUS_TMUX_CMD";
+
+/// Serializes every test that touches *real*, machine-wide tmux.exe process
+/// state — both the live round-trip tests below and `server.rs`'s
+/// `POST /api/daemon/shutdown` tests, which (like production) call
+/// [`force_kill_tmux_processes`] and would otherwise race a concurrently
+/// running `live_tmux_*` test in the same `cargo test` process, killing its
+/// session out from under it. Production code never touches this — it's
+/// only meaningful because `cargo test` runs tests from every module in one
+/// shared process with real OS state.
+#[cfg(test)]
+pub(crate) static LIVE_TMUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A tmux invocation failed, or the binary could not be resolved/spawned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +87,112 @@ pub fn session_name(run_id: &str, task: &str, session_id: &str) -> String {
     }
 }
 
+/// Directory pane snapshots (see [`write_pane_snapshot`]) live under —
+/// `state_dir()` (next to the SQLite DB), not the OS temp dir the
+/// spec/result side-channel files use, since a snapshot is meant to survive
+/// well past the session ending (and a daemon restart), not just long enough
+/// for one runner invocation to hand off its result.
+///
+/// Not yet cleaned up on run/guardian deletion — each snapshot is a small,
+/// bounded text file (`PANE_SNAPSHOT_MAX_LINES`), so this is a modest,
+/// bounded-per-entry disk-space cost over a long project lifetime, not the
+/// unbounded resource leak documented for orphaned tmux/psmux processes in
+/// `PSMUX_CRASH_NOTES.local.md`. Worth revisiting if it ever matters in
+/// practice (e.g. tie deletion to `Store::delete_run`/`clear_all`/
+/// `guardian_delete`, which would need to enumerate each deleted entity's
+/// session names before their rows are gone).
+fn pane_snapshot_dir() -> PathBuf {
+    crate::state_dir().join("pane_snapshots")
+}
+
+/// Path a session's persisted last-pane-content snapshot lives (or would
+/// live) at within `dir`, keyed by its already-sanitized deterministic tmux
+/// session name (see [`session_name`]) — the same name every "peek"/"open
+/// terminal" endpoint already recomputes to address a *live* session, reused
+/// here so no new bookkeeping is needed to find the historical record once
+/// the live one is gone. Takes `dir` explicitly (rather than always calling
+/// [`pane_snapshot_dir`] internally) purely so [`write_pane_snapshot`]/
+/// [`read_pane_snapshot`]'s tests can point it at a throwaway directory
+/// instead of the real `state_dir()`.
+#[must_use]
+fn pane_snapshot_path_in(dir: &std::path::Path, session_name: &str) -> PathBuf {
+    dir.join(format!("{session_name}.txt"))
+}
+
+/// Path a session's persisted last-pane-content snapshot lives (or would
+/// live) at — see [`pane_snapshot_path_in`].
+#[must_use]
+pub fn pane_snapshot_path(session_name: &str) -> PathBuf {
+    pane_snapshot_path_in(&pane_snapshot_dir(), session_name)
+}
+
+/// Bound on a persisted snapshot's size (RAL-102 follow-up) — generous
+/// enough to be a genuinely useful "what was last there" record, small
+/// enough that a long project history's worth of snapshots doesn't grow
+/// disk usage unboundedly the way keeping every full pane transcript
+/// forever would. Mirrors the existing `tail_lines` truncation already
+/// applied to a "no result file" failure's pane-tail diagnostic
+/// (`daemon/src/runner.rs::read_tmux_result`), just with a larger budget
+/// since this is the record a human actually reads after the fact, not a
+/// one-line error-message addendum.
+const PANE_SNAPSHOT_MAX_LINES: usize = 4000;
+
+/// Implementation behind [`write_pane_snapshot`], taking `dir` explicitly so
+/// it's unit-testable against a throwaway directory instead of the real
+/// `state_dir()`.
+fn write_pane_snapshot_in(dir: &std::path::Path, session_name: &str, content: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [tmux] could not create pane snapshot dir {}: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let truncated = crate::runner::tail_lines(content, PANE_SNAPSHOT_MAX_LINES);
+    if let Err(e) = std::fs::write(pane_snapshot_path_in(dir, session_name), truncated) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [tmux] could not write pane snapshot for {session_name}: {e}"
+        );
+    }
+}
+
+/// Persist `content` (the last successfully captured pane content — see
+/// `crate::runner::SubprocessRunner::run_via_tmux_attempt`) as the durable,
+/// read-only historical record for `session_name`, truncated to
+/// [`PANE_SNAPSHOT_MAX_LINES`]. Called unconditionally at the end of every
+/// tmux attempt (done, failed, cancelled, or timed out) so "what was last
+/// there" is always available once the live session is gone — even for an
+/// attempt that never printed anything, `content` may legitimately be empty,
+/// which simply overwrites any stale prior snapshot with an empty one rather
+/// than leaving it stuck showing an older attempt's output. Best-effort: a
+/// write failure (e.g. disk full) is logged but never fails the session
+/// itself, since the snapshot is a diagnostic convenience, not part of the
+/// session's actual result.
+pub fn write_pane_snapshot(session_name: &str, content: &str) {
+    write_pane_snapshot_in(&pane_snapshot_dir(), session_name, content);
+}
+
+/// Implementation behind [`read_pane_snapshot`], taking `dir` explicitly so
+/// it's unit-testable against a throwaway directory instead of the real
+/// `state_dir()`.
+fn read_pane_snapshot_in(dir: &std::path::Path, session_name: &str) -> Option<String> {
+    std::fs::read_to_string(pane_snapshot_path_in(dir, session_name))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read back a session's persisted last-pane-content snapshot, if one was
+/// ever written (see [`write_pane_snapshot`]). `None` when no snapshot
+/// exists (the session never ran under tmux, or its attempt(s) produced no
+/// pane output at all) — the caller degrades to its own "nothing to show"
+/// behavior in that case, never treating a missing file as an error.
+#[must_use]
+pub fn read_pane_snapshot(session_name: &str) -> Option<String> {
+    read_pane_snapshot_in(&pane_snapshot_dir(), session_name)
+}
+
 /// Quote `arg` for the shell that will type/receive it: PowerShell
 /// single-quote escaping on Windows (session start commands are delivered via
 /// `send-keys` into a PowerShell pane there — see [`Tmux::new_detached_session_with_command`]),
@@ -111,6 +229,54 @@ pub fn build_command_line(program: &str, args: &[String]) -> String {
         format!("& {parts}")
     } else {
         parts
+    }
+}
+
+/// Like [`build_command_line`], additionally prefixing `env`'s assignments so
+/// they're set in the pane's shell before the command runs (RAL-150). The
+/// tmux-wrapped runner path has no `std::process::Command::envs`-style hook —
+/// the pane executes a typed/`respawn-pane`-fed command line via its own
+/// shell, not a `Command` this process builds directly — so overrides are
+/// embedded in that same line instead. `env` iterates in `BTreeMap` order for
+/// a deterministic line.
+///
+/// Every key **must** already be a validated identifier
+/// ([`crate::config::is_valid_env_key`]) — enforced at the HTTP boundary
+/// (`crate::server`'s env-override handler) before an override ever reaches
+/// the store. Keys are interpolated unquoted (`$env:KEY = ...` /
+/// `KEY=... cmd`, neither of which accepts a quoted variable name), so this
+/// is the one place downstream of that boundary a bad key could still turn
+/// into shell injection; entries with an invalid key are dropped rather than
+/// trusted, as a defense-in-depth backstop should that invariant ever slip.
+/// Values are always quoted via [`quote_for_shell`], same as every other
+/// argument on the line.
+#[must_use]
+pub fn build_command_line_with_env(
+    program: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> String {
+    let base = build_command_line(program, args);
+    let valid: Vec<(&String, &String)> = env
+        .iter()
+        .filter(|(k, _)| crate::config::is_valid_env_key(k))
+        .collect();
+    if valid.is_empty() {
+        return base;
+    }
+    if cfg!(target_os = "windows") {
+        let assigns: String = valid
+            .iter()
+            .map(|(k, v)| format!("$env:{k} = {}; ", quote_for_shell(v)))
+            .collect();
+        // `base` already starts with the PowerShell call operator `&`.
+        format!("{assigns}{base}")
+    } else {
+        let assigns: String = valid
+            .iter()
+            .map(|(k, v)| format!("{k}={} ", quote_for_shell(v)))
+            .collect();
+        format!("{assigns}{base}")
     }
 }
 
@@ -260,11 +426,15 @@ impl Tmux {
     /// Kill every currently-registered session whose name starts with
     /// `prefix`. Best-effort: a failure killing one name doesn't stop the
     /// rest, and a `list-sessions` failure (e.g. nothing running at all) is
-    /// treated as "nothing to kill", not an error.
-    pub fn kill_sessions_with_prefix(&self, prefix: &str) {
-        for name in self.list_sessions_with_prefix(prefix).unwrap_or_default() {
+    /// treated as "nothing to kill", not an error. Returns how many
+    /// sessions matched (attempted), for callers that log a count.
+    pub fn kill_sessions_with_prefix(&self, prefix: &str) -> usize {
+        let names = self.list_sessions_with_prefix(prefix).unwrap_or_default();
+        let count = names.len();
+        for name in names {
             let _ = self.kill_session(&name);
         }
+        count
     }
 
     /// Create a detached session named `name` rooted at `cwd`, with
@@ -468,6 +638,16 @@ fn force_kill_tmux_processes(needle: &str) -> usize {
 /// own or control the claim protocol for.
 ///
 /// Returns the number of processes killed, for the caller to log.
+///
+/// **Startup-only — do not call this from a live request handler.** It was
+/// briefly (mis)used from `/api/daemon/shutdown`, which runs while real
+/// `ralphus_<run_id>_...`-named sessions (including, when `cargo test`
+/// itself runs inside a daemon-spawned pane, the very pane hosting the
+/// call) are alive — the unscoped `*ralphus_*` match killed its own host.
+/// See `PSMUX_CRASH_NOTES.local.md`'s "SOLVED" section and `server.rs`'s
+/// `shutdown` doc comment. Use `server.rs`'s per-run/per-guardian scoped
+/// kill helpers (`kill_run_tmux_sessions` / `kill_guardian_tmux_sessions`)
+/// from any live-request context instead.
 #[must_use]
 pub fn reap_orphaned_sessions_at_startup() -> usize {
     force_kill_tmux_processes("ralphus_")
@@ -728,6 +908,88 @@ mod tests {
         assert!(name.len() <= 200);
     }
 
+    /// A throwaway directory for a pane-snapshot test, cleaned up on drop —
+    /// keeps these tests off the real `state_dir()`.
+    struct TempSnapshotDir(PathBuf);
+    impl TempSnapshotDir {
+        fn new(unique: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ralphus-test-pane-snapshots-{unique}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+    impl Drop for TempSnapshotDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn pane_snapshot_round_trips() {
+        let dir = TempSnapshotDir::new("round-trip");
+        write_pane_snapshot_in(&dir.0, "ralphus_run-1_build_work", "line one\nline two");
+        assert_eq!(
+            read_pane_snapshot_in(&dir.0, "ralphus_run-1_build_work"),
+            Some("line one\nline two".to_string())
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_missing_file_is_none() {
+        let dir = TempSnapshotDir::new("missing");
+        assert_eq!(read_pane_snapshot_in(&dir.0, "never-written"), None);
+    }
+
+    #[test]
+    fn pane_snapshot_empty_content_reads_back_as_none() {
+        // An attempt that produced no pane output at all writes an empty
+        // file (see `write_pane_snapshot`'s doc comment) — the reader treats
+        // that the same as "no snapshot", not a real-but-blank record, so
+        // callers don't have to special-case an empty string.
+        let dir = TempSnapshotDir::new("empty");
+        write_pane_snapshot_in(&dir.0, "s", "");
+        assert_eq!(read_pane_snapshot_in(&dir.0, "s"), None);
+    }
+
+    #[test]
+    fn pane_snapshot_overwrites_a_prior_attempt() {
+        let dir = TempSnapshotDir::new("overwrite");
+        write_pane_snapshot_in(&dir.0, "s", "first attempt's output");
+        write_pane_snapshot_in(&dir.0, "s", "second attempt's output");
+        assert_eq!(
+            read_pane_snapshot_in(&dir.0, "s"),
+            Some("second attempt's output".to_string())
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_is_truncated_to_the_line_limit() {
+        let dir = TempSnapshotDir::new("truncate");
+        let lines: Vec<String> = (0..PANE_SNAPSHOT_MAX_LINES + 500)
+            .map(|i| format!("line {i}"))
+            .collect();
+        write_pane_snapshot_in(&dir.0, "s", &lines.join("\n"));
+        let saved = read_pane_snapshot_in(&dir.0, "s").expect("snapshot written");
+        assert_eq!(saved.lines().count(), PANE_SNAPSHOT_MAX_LINES);
+        // Keeps the *last* lines (the most recent output), not the first.
+        assert!(saved.ends_with(&format!("line {}", PANE_SNAPSHOT_MAX_LINES + 499)));
+    }
+
+    #[test]
+    fn pane_snapshot_different_sessions_do_not_collide() {
+        let dir = TempSnapshotDir::new("distinct");
+        write_pane_snapshot_in(&dir.0, "session-a", "a's output");
+        write_pane_snapshot_in(&dir.0, "session-b", "b's output");
+        assert_eq!(
+            read_pane_snapshot_in(&dir.0, "session-a"),
+            Some("a's output".to_string())
+        );
+        assert_eq!(
+            read_pane_snapshot_in(&dir.0, "session-b"),
+            Some("b's output".to_string())
+        );
+    }
+
     #[test]
     fn quote_for_shell_escapes_single_quotes() {
         let quoted = quote_for_shell("it's a test");
@@ -752,6 +1014,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_command_line_with_env_empty_matches_plain() {
+        let line = build_command_line_with_env("prog", &["a".to_string()], &BTreeMap::new());
+        assert_eq!(line, build_command_line("prog", &["a".to_string()]));
+    }
+
+    #[test]
+    fn build_command_line_with_env_prefixes_assignments() {
+        let mut env = BTreeMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        env.insert("B".to_string(), "it's".to_string());
+        let line = build_command_line_with_env("prog", &[], &env);
+        if cfg!(target_os = "windows") {
+            assert!(line.starts_with("$env:A = '1'; $env:B = "));
+            assert!(line.contains("& 'prog'"));
+        } else {
+            assert!(line.starts_with("A='1' B="));
+            assert!(line.ends_with("'prog'"));
+        }
+    }
+
+    #[test]
+    fn build_command_line_with_env_drops_invalid_keys() {
+        let mut env = BTreeMap::new();
+        env.insert("$(bad)".to_string(), "x".to_string());
+        let line = build_command_line_with_env("prog", &[], &env);
+        assert_eq!(line, build_command_line("prog", &[]));
+    }
+
     fn tmux_on_path() -> bool {
         find_on_path("tmux").is_some()
     }
@@ -762,6 +1053,9 @@ mod tests {
             println!("SKIP: tmux not found on PATH");
             return;
         }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmux = Tmux::resolve().unwrap();
         let name = session_name("test-run", "build", "roundtrip");
         let _ = tmux.kill_session(&name);

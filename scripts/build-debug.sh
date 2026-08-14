@@ -12,18 +12,25 @@
 # Ctrl-C stops both processes. For a distributable standalone build (slow),
 # use build-release.sh instead.
 #
-# Usage: build-debug.sh [--daemon-port N] [--librarian-port N]
+# Usage: build-debug.sh [--daemon-port N] [--librarian-port N] [--db-path PATH]
 # Defaults to 7890/7474. Pass different ports to run a second stack alongside
-# the regular one -- but both instances still share the same SQLite DB
-# (~/.ralphus/tasks.db) unless USERPROFILE/HOME is also overridden, so this
-# is for a second UI/API endpoint onto the same data, not full isolation.
+# the regular one. RAL-164: --daemon-port + --db-path together give FULL
+# isolation (separate port AND separate SQLite DB) -- the right way to keep
+# your regular ralphus instance open while testing ralphus in another git
+# worktree. Without --db-path, a non-default --daemon-port still gets its own
+# DB automatically (derived as ~/.ralphus/tasks-<port>.db); the *default*
+# port keeps using the plain ~/.ralphus/tasks.db it always has, so existing
+# setups are unaffected. Ports/paths are never silently invented beyond this
+# per-port default -- write down whatever you pass so a later
+# `ralphus-daemon stop --port N` targets the right instance.
 #
 # Example (regular stack, defaults):     ./build-debug.sh
-# Example (second stack, side-by-side):  ./build-debug.sh --daemon-port 7891 --librarian-port 7475
+# Example (second stack, fully isolated): ./build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~/.ralphus/tasks-worktree2.db
 set -euo pipefail
 
 daemon_port=7890
 librarian_port=7474
+db_path=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,13 +42,24 @@ while [[ $# -gt 0 ]]; do
       librarian_port="$2"
       shift 2
       ;;
+    --db-path)
+      db_path="$2"
+      shift 2
+      ;;
     *)
       echo "unknown argument: $1" >&2
-      echo "usage: $0 [--daemon-port N] [--librarian-port N]" >&2
+      echo "usage: $0 [--daemon-port N] [--librarian-port N] [--db-path PATH]" >&2
       exit 1
       ;;
   esac
 done
+
+# Only auto-derive a per-port DB when the daemon port was actually changed
+# from the default -- the default port keeps its existing DB path untouched.
+if [ -z "$db_path" ] && [ "$daemon_port" != "7890" ]; then
+  state_home="${USERPROFILE:-${HOME:-.}}"
+  db_path="${state_home}/.ralphus/tasks-${daemon_port}.db"
+fi
 
 # Root is whichever checkout this script lives in (main or a worktree) --
 # mirrors build-debug.cmd's `%~dp0..` resolution, so a review worktree builds
@@ -68,8 +86,11 @@ export RALPHUS_DAEMON_URL="http://127.0.0.1:${daemon_port}"
 echo "== starting stack =="
 echo "   runner    -> $RALPHUS_RUNNER_CMD"
 echo "   daemon    -> $RALPHUS_DAEMON_URL"
+echo "   db        -> ${db_path:-<default: ~/.ralphus/tasks.db>}"
 echo "   librarian -> http://127.0.0.1:${librarian_port}"
-"$root/target/debug/ralphus-daemon${ext}" serve --port "$daemon_port" &
+daemon_args=(serve --port "$daemon_port")
+[ -n "$db_path" ] && daemon_args+=(--db "$db_path")
+"$root/target/debug/ralphus-daemon${ext}" "${daemon_args[@]}" &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 

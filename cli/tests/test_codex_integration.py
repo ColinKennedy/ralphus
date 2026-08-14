@@ -65,3 +65,46 @@ def test_codex_prompt_session_writes_a_file(tmp_path: Path) -> None:
     produced = tmp_path / "result.txt"
     assert produced.exists(), "the agent did not create result.txt"
     assert "RALPHUS_CODEX_OK" in produced.read_text(encoding="utf-8")
+
+
+def test_codex_verify_step_emits_pass_marker(tmp_path: Path) -> None:
+    """Empirical check that `-c developer_instructions=...` really does steer
+    the model the same way `--append-system-prompt` does for Claude Code:
+    without this, a real `codex exec` call has no way to learn it must end
+    its output with `RALPHUS_VERIFY: PASS`/`FAIL`, and every agent-kind
+    verify step would fail closed regardless of whether the thing being
+    verified actually holds (see `execute.py`'s `_VERIFY_SYSTEM_PROMPT` and
+    `codex_backend.py`'s module docstring)."""
+    _skip_unless_runnable()
+
+    from ralphus.runner.execute import run_session
+    from ralphus.runner.spec import SessionSpec
+
+    (tmp_path / "result.txt").write_text("RALPHUS_CODEX_OK\n", encoding="utf-8")
+
+    spec = SessionSpec.from_json(
+        json.dumps(
+            {
+                "run_id": "run-codex-verify",
+                "task": "write",
+                "session_id": "s0",
+                "cwd": str(tmp_path),
+                "agent": "codex",
+                "verify": True,
+                "prompt": (
+                    "Check whether result.txt exists in the current directory and its "
+                    "exact content is the single line: RALPHUS_CODEX_OK"
+                ),
+            }
+        )
+    )
+
+    from ralphus.runner.codex_backend import CodexBackend
+
+    result = run_session(spec, backend=CodexBackend())
+
+    assert result.ok, f"verify step failed to run: {result.error}"
+    assert result.verified is True, (
+        f"expected the RALPHUS_VERIFY: PASS marker to round-trip via "
+        f"developer_instructions, got summary: {result.summary!r}"
+    )

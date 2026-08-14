@@ -50,7 +50,7 @@ list of candidates.
 | Command | What |
 |---|---|
 | `validate <file>` | Validate a task TOML file offline (no daemon needed if `ralphus-daemon` is on PATH) |
-| `submit <file...\|dir\|glob\|-> [--label] [--hold] [--activate] [--wait] [--dry-run]` | Submit task TOML. See [Submit](#submit) below |
+| `submit <file...\|dir\|glob\|-> [--label] [--hold] [--activate] [--wait] [--no-validate]` | Submit task TOML. See [Submit](#submit) below |
 | `author [--goal\|--prompt-file] [--verify] [--review] [--hold] [--dry-run] ...` | Generate, validate, and submit a TOML from a plain-language goal |
 | `status [run_id] [--concurrency]` | Show one run, or list all runs; `--concurrency` shows scheduler load instead |
 | `resources` | Per-task CPU/RAM/GPU for running sessions |
@@ -79,11 +79,15 @@ aborts the remaining batch).
   `run activate` — "submit held then promote" in one step.
 - `--wait` polls each submitted run and prints its state until terminal;
   exits 0 only if the run reached `done` (1 for `failed`/`cancelled`).
-- `--dry-run` validates and prints a task/session/review count parsed
-  client-side from the TOML — it does **not** preview the run id the daemon
-  would assign or which reviews would actually be created (that requires the
-  daemon's git-dependent review derivation, which a dry run can't invoke
-  without side effects).
+- `submit` **validates before submitting by default** (a client-side
+  `POST /api/runs/validate` call) and prints the full per-line
+  `error [line N]: message` report instead of submitting if it fails. In a
+  batch (directory/glob), each file is validated right before its own
+  submit, so one invalid file blocks the rest of the batch. `--no-validate`
+  skips this pass and submits directly — the daemon still rejects invalid
+  TOML server-side either way, so this doesn't let anything through; it only
+  trades the fuller pre-submit report for the daemon's single summary error
+  message. To validate without submitting at all, use `ralphus validate`.
 
 ## run
 
@@ -158,9 +162,9 @@ aborts the remaining batch).
 | `review base list <selector>` | Candidate base branches |
 | `review base set <selector> <branch>` | Change base branch + rebuild |
 | `review checks list <selector>` | List LLM-synthesized manual review-verification commands |
-| `review checks run <selector> [--index N...] [--all]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
+| `review checks run <selector> [--index N...] [--all] [--input NAME=VALUE...]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
 | `review action list <selector>` | List user-declared `[[review.action]]` hints |
-| `review action run <selector> --index N` | Print the command + cwd for a `command`-kind hint |
+| `review action run <selector> --index N [--input NAME=VALUE...]` | Print the command + cwd for a `command`-kind hint |
 | `review chat send <selector> <text>` | Post to the global feedback thread |
 | `review chat show <selector>` | Show the feedback thread |
 | `review chat fork <selector> --seq N <text>` | Fork the thread at a message |
@@ -181,6 +185,18 @@ endpoints. Those endpoints spawn a GUI terminal window **on whatever machine
 runs `ralphus-daemon`** — meaningful for the browser board (same desktop
 session) but not for a headless/remote CLI invocation. Run the printed
 command yourself instead.
+
+### Structured check inputs (RAL-164)
+
+A check (manual or `[[review.action]]`) may declare named `inputs` —
+placeholders like `{port}` in its command — instead of hardcoding a value
+that could collide across concurrent reviews. `review checks run`/`review
+action run` substitute them before printing: a repeatable `--input
+NAME=VALUE` flag wins, falling back to the review's last-used value for that
+name, falling back to the input's own declared default. If an input ends up
+with no value from any source, the command errors listing the missing
+input name(s) instead of printing a command with a bare, unsubstituted
+`{name}` left in it.
 
 ## show
 
@@ -279,10 +295,11 @@ than directly in the driving agent's main context.
         - set-position paths [str, one or more] --relative --to [int]  {Move item(s) to an absolute index or a relative offset.}
         - set-status path [str] state [str]  {Set a run/task/session/verify status (e.g. ignored) by item path or run id.}
     - resources  {Show per-task resource usage (CPU/RAM/GPU).}
+    - retry selector [str] --env-file [path] --environment [str, repeatable] --unset-environment [str, repeatable]  {Re-run a run/task/session/verify step, optionally overriding environment variables (RAL-150).}
     - review (subagent)  {Inspect and act on reviews (guardians).}
         - action  {User-declared [[review.action]] test/action hints.}
             - list selector [str]  {List the action hints.}
-            - run selector [str] --index [int]  {Print the command + cwd for a command-kind action hint.}
+            - run selector [str] --index [int] --input [str, repeatable]  {Print the command + cwd for a command-kind action hint.}
         - add-branch selector [str] branch [str]  {Add a branch to a review.}
         - approve selector [str]  {Approve a review that is in_review.}
         - base  {Inspect/change a review's base branch.}
@@ -298,7 +315,7 @@ than directly in the driving agent's main context.
             - show selector [str]  {Show the thread.}
         - checks  {LLM-synthesized manual review-verification commands.}
             - list selector [str]  {List the manual checks.}
-            - run selector [str] --all --index [int, repeatable]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
+            - run selector [str] --all --index [int, repeatable] --input [str, repeatable]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
         - create name [str] base_branch [str] git_root [str] --checks [str] --review-type [str] --skip-auto-build --skip-worktree-checks --skip-worktrees  {Create a new review.}
         - delete selector [str] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
@@ -342,12 +359,12 @@ than directly in the driving agent's main context.
         - reviews selector [str]  {The reviews this session's branch participates in.}
         - set-status selector [str] state [str]  {Manually override a session's status.}
         - show selector [str]  {Show a single session's detail.}
-        - terminal selector [str] --mode [open|readonly]  {Print the command to resume a session's claude-code conversation locally.}
+        - terminal selector [str] --mode [open|readonly]  {Print the command to resume a session's conversation locally.}
         - worktree selector [str]  {Show the worktree/project a session is using.}
     - show  {Print machine-readable views of ralphus itself.}
         - help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent) (RAL-110).}
     - status run_id [str, optional] --concurrency  {Show run status from the daemon.}
-    - submit file [str, one or more] --activate --dry-run --hold --label [str] --wait (subagent)  {Submit one or more task TOML files to the daemon.}
+    - submit file [str, one or more] --activate --hold --label [str] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
         - edit selector [str] --name [str] --project [str]  {Edit a task node's name/project.}
         - restart-verify selector [str] --from [int]  {Restart a task's verify steps from an index onwards.}

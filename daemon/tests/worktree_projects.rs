@@ -92,7 +92,7 @@ impl Runner for CapturingRunner {
             summary: "captured".to_string(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }

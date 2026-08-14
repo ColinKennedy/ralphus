@@ -23,6 +23,21 @@ pub struct ExecutionPlan {
     pub order: Vec<usize>,
     /// `deps[i]` is the set of prerequisite session positions for session `i`.
     pub deps: Vec<Vec<usize>>,
+    /// `task_deps[i]` is the set of prerequisite *task* indices for session
+    /// `i`, from a bare task-name entry in that session's owning task's own
+    /// `depends_on` (the "wait for this whole other task" form — see the
+    /// module doc comment's second bullet). Unlike `deps` (satisfied once
+    /// the referenced sessions reach `SessState::Done`), a task index here is
+    /// only satisfied once that *task* itself finalizes (its own task-level
+    /// verify has run) — plain session completion isn't enough. Explicit
+    /// `"task/session"` cross-task references and same-task session-level
+    /// `depends_on` entries only ever populate `deps`, never this — they're
+    /// deliberately fine-grained, not "wait for the whole task". Before this
+    /// field existed, a task-name dependent (e.g. RAL-142 depending on
+    /// RAL-141-project-identifier by name) dispatched the instant the
+    /// upstream task's sessions reached Done, racing ahead of that task's
+    /// own fmt/clippy/test task-level verify — caught live on 2026-08-11.
+    pub task_deps: Vec<Vec<i64>>,
 }
 
 /// Build an execution plan, or return an error message if the dependencies form
@@ -47,8 +62,10 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
     }
 
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut task_level_deps: Vec<Vec<i64>> = vec![Vec::new(); n];
     for (i, s) in sessions.iter().enumerate() {
         let mut prereqs: Vec<usize> = Vec::new();
+        let mut task_prereqs: Vec<i64> = Vec::new();
 
         // Session-level references.
         for dep in &s.depends_on {
@@ -64,7 +81,11 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
             }
         }
 
-        // Task-level references apply to every session in the task.
+        // Task-level references apply to every session in the task. A bare
+        // task-name entry additionally means "wait for that whole task",
+        // not just its sessions — recorded in `task_prereqs` so the
+        // scheduler can gate on the target task's own finalizer, not only
+        // `SessState::Done` on its sessions (see `task_deps`'s doc comment).
         if let Some(tdeps) = task_deps.get(&s.task_idx) {
             for dep in *tdeps {
                 if let Some((tname, sid)) = dep.split_once('/') {
@@ -78,6 +99,9 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
                     if let Some(positions) = task_sessions.get(&tidx) {
                         prereqs.extend(positions.iter().copied());
                     }
+                    if tidx != s.task_idx {
+                        task_prereqs.push(tidx);
+                    }
                 }
             }
         }
@@ -86,10 +110,18 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
         prereqs.sort_unstable();
         prereqs.dedup();
         deps[i] = prereqs;
+
+        task_prereqs.sort_unstable();
+        task_prereqs.dedup();
+        task_level_deps[i] = task_prereqs;
     }
 
     let order = topo_order(&deps)?;
-    Ok(ExecutionPlan { order, deps })
+    Ok(ExecutionPlan {
+        order,
+        deps,
+        task_deps: task_level_deps,
+    })
 }
 
 /// A node in a rendered dependency graph (CLI_PARITY_PLAN.local.md Phase 6):
@@ -201,6 +233,7 @@ mod tests {
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             timeout_sec: None,
             budget_tokens: None,
+            maximum_budget_usd: None,
             upstream: None,
         }
     }
@@ -211,6 +244,7 @@ mod tests {
             name: format!("task{idx}"),
             project: None,
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
+            soloed: false,
         }
     }
 

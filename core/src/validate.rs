@@ -164,6 +164,7 @@ const TASK_KEYS: &[&str] = &[
     "model",
     "args",
     "budget_tokens",
+    "maximum_budget_usd",
     "max_retries",
     "priority",
     "timeout_minutes",
@@ -186,6 +187,7 @@ const SESSION_KEYS: &[&str] = &[
     "system_prompt_position",
     "args",
     "budget_tokens",
+    "maximum_budget_usd",
     "timeout_minutes",
     "priority",
     "verify",
@@ -193,7 +195,8 @@ const SESSION_KEYS: &[&str] = &[
     "upstream",
 ];
 const REVIEW_KEYS: &[&str] = &["id", "name", "agent", "model", "action"];
-const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command"];
+const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
+const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
 const VERIFY_KEYS: &[&str] = &[
     "id",
     "command",
@@ -216,6 +219,7 @@ enum Ty {
     Str,
     Bool,
     Int,
+    Float,
     StrArray,
 }
 
@@ -245,6 +249,7 @@ fn check_type(
         Ty::Str => v.is_str(),
         Ty::Bool => v.is_bool(),
         Ty::Int => v.is_integer(),
+        Ty::Float => v.is_float() || v.is_integer(),
         Ty::StrArray => v
             .as_array()
             .is_some_and(|a| a.iter().all(toml::Value::is_str)),
@@ -256,6 +261,7 @@ fn check_type(
         Ty::Str => "string",
         Ty::Bool => "boolean",
         Ty::Int => "integer",
+        Ty::Float => "number",
         Ty::StrArray => "array of strings",
     };
     let line = ctx.key_line(header, key);
@@ -265,6 +271,31 @@ fn check_type(
         format!("key \"{key}\" must be a {expected}, found {}", type_name(v)),
         line,
     );
+}
+
+/// Reject a numeric key whose value is present, well-typed, and `<= 0`.
+/// Silently returns for a missing or wrong-typed value -- `check_type` already
+/// reports the latter separately.
+fn check_positive_number(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    key: &str,
+    path: &str,
+    header: Option<u32>,
+) {
+    let Some(v) = table.get(key) else { return };
+    let Some(n) = v.as_float().or_else(|| v.as_integer().map(|i| i as f64)) else {
+        return;
+    };
+    if n <= 0.0 {
+        let line = ctx.key_line(header, key);
+        ctx.error(
+            &format!("{path}.{key}"),
+            ErrorKind::InvalidValue,
+            format!("'{key}' must be greater than 0"),
+            line,
+        );
+    }
 }
 
 fn unknown_keys(
@@ -398,6 +429,8 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "model", Ty::Str, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
+        check_type(ctx, table, "maximum_budget_usd", Ty::Float, &path, header);
+        check_positive_number(ctx, table, "maximum_budget_usd", &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
@@ -537,6 +570,8 @@ fn validate_sessions(
         check_system_prompt(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
+        check_type(ctx, table, "maximum_budget_usd", Ty::Float, &path, header);
+        check_positive_number(ctx, table, "maximum_budget_usd", &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
@@ -605,11 +640,12 @@ fn check_subprojects(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
 }
 
 /// Enforce the appended-system-prompt rules (RAL-5). `system_prompt` and
-/// `system_prompt_position` are only accepted for the `claude-code` backend —
-/// the sole one that maps them to a real flag (`--append-system-prompt`) today —
-/// and the position, when set, must be the `"append"` sentinel. The effective
-/// agent is the session's own `agent`, falling back to the task-level `agent`,
-/// then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
+/// `system_prompt_position` are only accepted for backends with a real
+/// delivery mechanism — see
+/// [`agent_supports_system_prompt`](crate::schema::agent_supports_system_prompt)
+/// — and the position, when set, must be the `"append"` sentinel. The
+/// effective agent is the session's own `agent`, falling back to the
+/// task-level `agent`, then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
 fn check_system_prompt(
     ctx: &mut Ctx,
     table: &toml::Table,
@@ -640,7 +676,7 @@ fn check_system_prompt(
             ErrorKind::InvalidValue,
             format!(
                 "'system_prompt'/'system_prompt_position' are only supported for the \
-                 'claude-code' agent right now, not '{agent}'"
+                 'claude-code'/'codex' agents right now, not '{agent}'"
             ),
             line,
         );
@@ -784,6 +820,70 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
                 check_type(ctx, table, "command", Ty::Str, &apath, None);
             }
         }
+
+        // `cleanup_command` is optional and independent of the prompt/command
+        // XOR above -- it coexists with either.
+        check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
+
+        validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
+    }
+}
+
+/// Validate `[[review.action.input]]` entries. Each entry must have `name`
+/// and `message`; `default` is optional (defaults to an empty string).
+fn validate_review_action_input_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(arr) = value.as_array() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "[[review.action.input]] must be an array of tables",
+            None,
+        );
+        return;
+    };
+    for (i, item) in arr.iter().enumerate() {
+        let ipath = format!("{path}[{i}]");
+        let Some(table) = item.as_table() else {
+            ctx.error(
+                &ipath,
+                ErrorKind::WrongType,
+                "each [[review.action.input]] must be a table",
+                None,
+            );
+            continue;
+        };
+        unknown_keys(ctx, table, REVIEW_ACTION_INPUT_KEYS, &ipath, None);
+
+        match table.get("name") {
+            None => ctx.error(
+                &ipath,
+                ErrorKind::MissingRequired,
+                "review action input requires a 'name'",
+                None,
+            ),
+            Some(v) if !v.is_str() => check_type(ctx, table, "name", Ty::Str, &ipath, None),
+            Some(toml::Value::String(s)) if s.trim().is_empty() => ctx.error(
+                &format!("{ipath}.name"),
+                ErrorKind::InvalidValue,
+                "review action input 'name' must not be empty",
+                None,
+            ),
+            Some(_) => {}
+        }
+
+        match table.get("message") {
+            None => ctx.error(
+                &ipath,
+                ErrorKind::MissingRequired,
+                "review action input requires a 'message'",
+                None,
+            ),
+            Some(v) if !v.is_str() => check_type(ctx, table, "message", Ty::Str, &ipath, None),
+            Some(_) => {}
+        }
+
+        check_type(ctx, table, "default", Ty::Str, &ipath, None);
     }
 }
 
@@ -1236,6 +1336,60 @@ command = "cargo build"
     }
 
     #[test]
+    fn maximum_budget_usd_accepted_on_task_and_session() {
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=5.0\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=1.5\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn maximum_budget_usd_accepts_bare_integer() {
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=5\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn maximum_budget_usd_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=\"lots\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
+                && e.message.contains("maximum_budget_usd")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn maximum_budget_usd_zero_rejected() {
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=0.0\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("maximum_budget_usd")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn maximum_budget_usd_negative_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=-1.0\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("maximum_budget_usd")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn verify_needs_exactly_one_kind() {
         let none = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"v\"\n";
         assert!(
@@ -1319,6 +1473,23 @@ command = "cargo build"
     #[test]
     fn system_prompt_valid_for_claude_code() {
         let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn system_prompt_valid_for_codex() {
+        // Codex has no dedicated system-prompt flag but delivers `system_prompt`
+        // via `-c developer_instructions=...` (see `CodexBackend`), so it's
+        // accepted the same as claude-code.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn system_prompt_valid_for_codex_cli_alias() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex-cli\"\nsystem_prompt=\"be terse\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -1448,6 +1619,65 @@ command = "cargo build"
     #[test]
     fn review_action_unknown_key_rejected() {
         let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nfoo=\"bar\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownKey && e.message.contains("foo")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_cleanup_command_alone_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\ncleanup_command=\"ralphus-daemon stop --port {port}\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn review_action_input_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port for the daemon\"\ndefault=\"7890\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn review_action_input_missing_name_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nmessage=\"Port for the daemon\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("name")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_input_missing_message_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("message")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_input_unknown_key_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port\"\nfoo=\"bar\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors

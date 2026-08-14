@@ -145,6 +145,7 @@ def test_quick_start_claude_code_bare_path_invocation(monkeypatch: pytest.Monkey
     assert cmd[0] == "my-claude"
     assert "--dangerously-skip-permissions" in cmd
     assert "a fake help-map" in captured["file_content"]
+    assert "validate it first with `ralphus validate <file>`" in captured["file_content"]
 
 
 def test_quick_start_claude_code_forwards_extra_args(monkeypatch: pytest.MonkeyPatch) -> None:

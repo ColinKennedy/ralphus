@@ -104,6 +104,20 @@ def test_show_help_map_command_registered() -> None:
     assert "help-map" in out
 
 
+def test_show_help_map_prints_the_submit_validate_note(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # RAL-110 guidance notes (`SUBAGENT_NOTE`, `PROJECT_LOOKUP_NOTE`,
+    # `SUBMIT_VALIDATE_NOTE`) are printed alongside the tree, not folded into
+    # it -- assert the recommendation to validate before submitting actually
+    # reaches an agent driving the CLI via `ralphus show help-map`.
+    code = cli.main(["show", "help-map"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "validate it first with `ralphus validate <file>`" in out
+    assert "- ralphus" in out  # the tree itself still follows the notes
+
+
 def test_quick_start_claude_code_help_mentions_passthrough() -> None:
     out = _help_text(["quick-start", "claude-code", "--help"])
     assert "--append-system-prompt" in out

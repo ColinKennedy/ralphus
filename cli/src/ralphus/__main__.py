@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypedDict, TypeVar, cast
@@ -68,7 +67,7 @@ _ralphus_complete() {
     local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local top="validate submit author status resources graph get history listen run task \
+    local top="validate submit author status resources graph get history listen retry run task \
 session verify review clear check completion configuration queue initialize show quick-start"
     local states="queued pending running done failed cancelled ignored"
 
@@ -328,9 +327,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Block and print status until each submitted run reaches a terminal state.",
     )
     p_submit.add_argument(
-        "--dry-run",
+        "--no-validate",
         action="store_true",
-        help="Validate and show the ingest plan (task/session/review counts) without submitting.",
+        help="Skip the client-side validate pass and submit directly. "
+        "The daemon still rejects invalid TOML server-side, but errors are then a single "
+        "message instead of a full per-line report.",
     )
     p_submit.set_defaults(func=_cmd_submit)
 
@@ -480,6 +481,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Give up and exit 1 after SECONDS instead of waiting forever.",
     )
     p_listen.set_defaults(func=_cmd_listen)
+
+    p_retry = _add_parser(
+        subparsers,
+        "retry",
+        help="Re-run a run/task/session/verify step, optionally overriding environment "
+        "variables (RAL-150).",
+    )
+    p_retry.add_argument(
+        "selector",
+        help="A run/task/session/verify selector, e.g. run-1, run-1/build, run-1/build/0, "
+        "or run-1/build/verify/0.",
+    )
+    p_retry.add_argument(
+        "--environment",
+        metavar="KEY=VAL",
+        action="append",
+        help="Set a persistent environment-variable override on the level the selector "
+        "itself names before retrying -- a run selector sets a run-level override, a "
+        "task selector a task-level one, a session selector a session-level one, and a "
+        "verify selector a task-verify/session-verify-level one (child scopes override "
+        "their parents' values); repeat for several. Overrides --env-file on a matching "
+        "key, and persists across future retries until removed with "
+        "--unset-environment.",
+    )
+    p_retry.add_argument(
+        "--env-file",
+        type=Path,
+        help="A KEY=VALUE-per-line file of environment-variable overrides to set on the "
+        "level the selector names before retrying.",
+    )
+    p_retry.add_argument(
+        "--unset-environment",
+        metavar="KEY",
+        action="append",
+        help="Remove a persistent environment-variable override from the level the "
+        "selector names before retrying; repeat for several.",
+    )
+    p_retry.set_defaults(func=_cmd_retry)
 
     p_run = _add_parser(subparsers, "run", help="Inspect and act on runs.")
     run_sub = p_run.add_subparsers(dest="run_command", metavar="SUBCOMMAND")
@@ -687,7 +726,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_session_terminal = _add_parser(
         session_sub,
         "terminal",
-        help="Print the command to resume a session's claude-code conversation locally.",
+        help="Print the command to resume a session's conversation locally.",
     )
     p_session_terminal.add_argument("selector", help="A run/task/session selector.")
     p_session_terminal.add_argument(
@@ -993,6 +1032,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--index", type=int, action="append", help="A check index to run; repeat for several."
     )
     p_review_checks_run.add_argument("--all", action="store_true", help="Print every check.")
+    p_review_checks_run.add_argument(
+        "--input",
+        type=_parse_kv_arg,
+        action="append",
+        metavar="NAME=VALUE",
+        help="Supply a value for a named check input (RAL-164); repeat for several. "
+        "Falls back to the review's last-used value, then the input's own default.",
+    )
     p_review_checks_run.set_defaults(func=_cmd_review_checks_run)
     p_review_checks.set_defaults(func=_help_printer(p_review_checks))
 
@@ -1010,6 +1057,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_review_action_run.add_argument("selector", help="A guardian id or @name.")
     p_review_action_run.add_argument("--index", type=int, required=True, help="Action hint index.")
+    p_review_action_run.add_argument(
+        "--input",
+        type=_parse_kv_arg,
+        action="append",
+        metavar="NAME=VALUE",
+        help="Supply a value for a named check input (RAL-164); repeat for several. "
+        "Falls back to the review's last-used value, then the input's own default.",
+    )
     p_review_action_run.set_defaults(func=_cmd_review_action_run)
     p_review_action.set_defaults(func=_help_printer(p_review_action))
 
@@ -1389,25 +1444,6 @@ def _read_submit_source(source: str) -> str | None:
     return _read_file(Path(source))
 
 
-def _count_toml_entities(text: str) -> tuple[int, int, int]:
-    """`(task_count, session_count, review_count)`, parsed client-side with
-    `tomllib` for `submit --dry-run`'s ingest-plan preview. This is a syntactic
-    count only -- it does not run the daemon's git/worktree-dependent review
-    derivation, so it cannot preview the run id it would get or which reviews
-    would actually be created (that logic lives server-side and touches the
-    filesystem); see CLI_PARITY_PLAN.local.md Q6.
-    """
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
-        return (0, 0, 0)
-    tasks = data.get("task", [])
-    task_count = len(tasks)
-    session_count = sum(len(t.get("session", [])) for t in tasks if isinstance(t, dict))
-    review_count = len(data.get("review", []))
-    return (task_count, session_count, review_count)
-
-
 def _wait_for_terminal(
     client: DaemonClient,
     run_id: str,
@@ -1449,40 +1485,44 @@ def _finish_submission(
     return 0
 
 
+def _print_validation_errors(errors: list[dict[str, Any]]) -> None:
+    for err in errors:
+        print(
+            f"error [line {err.get('line', '?')}]: {err.get('message', '')}",
+            file=sys.stderr,
+        )
+
+
+def _validate_before_submit(
+    client: DaemonClient, text: str, args: argparse.Namespace
+) -> int | None:
+    """Run the client-side validate pass ahead of a real submit.
+
+    Returns an exit code to abort with, or ``None`` to proceed. Skipped
+    entirely when ``--no-validate`` is set. The daemon validates server-side
+    regardless of this pass -- skipping it only trades a full per-line error
+    report (this pass) for a single summary message (the daemon's own submit
+    rejection), it does not let invalid TOML through either way.
+    """
+    if args.no_validate:
+        return None
+    try:
+        outcome = client.validate(text)
+    except DaemonError as exc:
+        _print_daemon_error(exc, json_mode=args.json)
+        return exit_code_for(exc)
+    if not outcome.valid:
+        _print_validation_errors(outcome.errors)
+        return 1
+    return None
+
+
 def _cmd_submit(args: argparse.Namespace) -> int:
     resolved = _resolve_submit_sources(args.file)
     if resolved is None:
         return 2
     sources, is_batch = resolved
     hold = args.hold or args.activate
-
-    if args.dry_run:
-        texts = []
-        for source in sources:
-            text = _read_submit_source(source)
-            if text is None:
-                return 2
-            texts.append(text)
-        combined = "\n\n".join(texts)
-        with DaemonClient(args.daemon_url) as client:
-            try:
-                outcome = client.validate(combined)
-            except DaemonError as exc:
-                _print_daemon_error(exc, json_mode=args.json)
-                return exit_code_for(exc)
-        if not outcome.valid:
-            for err in outcome.errors:
-                print(
-                    f"error [line {err.get('line', '?')}]: {err.get('message', '')}",
-                    file=sys.stderr,
-                )
-            return 1
-        tasks, sessions, reviews = _count_toml_entities(combined)
-        print(
-            f"valid; would create {tasks} task(s), {sessions} session(s), "
-            f"{reviews} review(s) (dry run; nothing submitted)"
-        )
-        return 0
 
     if is_batch:
         exit_code = 0
@@ -1491,6 +1531,9 @@ def _cmd_submit(args: argparse.Namespace) -> int:
                 text = _read_submit_source(source)
                 if text is None:
                     return 2
+                abort = _validate_before_submit(client, text, args)
+                if abort is not None:
+                    return abort  # one failure aborts the batch
                 try:
                     result = client.submit(text, hold=hold, label=args.label)
                 except DaemonError as exc:
@@ -1511,6 +1554,9 @@ def _cmd_submit(args: argparse.Namespace) -> int:
         texts.append(text)
     text = "\n\n".join(texts)
     with DaemonClient(args.daemon_url) as client:
+        abort = _validate_before_submit(client, text, args)
+        if abort is not None:
+            return abort
         try:
             result = client.submit(text, hold=hold, label=args.label)
         except DaemonError as exc:
@@ -2114,7 +2160,15 @@ _LISTEN_STATES: dict[str, tuple[str, ...]] = {
         "cancelled",
         "deployed",
     ),
-    "review-worktree": ("pending", "ready", "in_progress", "done", "conflict_resolved", "failed"),
+    "review-worktree": (
+        "pending",
+        "ready",
+        "in_progress",
+        "done",
+        "verify_pending",
+        "conflict_resolved",
+        "failed",
+    ),
 }
 
 
@@ -2678,13 +2732,16 @@ def _cmd_session_edit(args: argparse.Namespace) -> int:
 
 
 def _cmd_session_terminal(args: argparse.Namespace) -> int:
-    """Print the `claude --resume` command instead of spawning a terminal.
+    """Print the resume command instead of spawning a terminal.
 
     The daemon's own `open-terminal` endpoints spawn a GUI terminal window on
     the *daemon host*, which is meaningless for a headless CLI (Q2 in
     CLI_PARITY_PLAN.local.md). Everything needed to resume the conversation
-    yourself -- the claude-code session uuid and the working directory -- is
-    already on the session view, so print it instead of calling that endpoint.
+    yourself -- the session id, which agent produced it, and the working
+    directory -- is already on the session view, so print the right command
+    (`claude --resume` or `codex exec resume`, depending on which agent the
+    session actually ran under -- see `daemon/src/server.rs::open_agent_terminal`
+    for the daemon-side equivalent dispatch) instead of calling that endpoint.
     """
     with DaemonClient(args.daemon_url) as client:
         resolved = _resolve_selector_or_none(client, args, want_kind="session")
@@ -2696,26 +2753,36 @@ def _cmd_session_terminal(args: argparse.Namespace) -> int:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
     session = run["tasks"][resolved.task_idx]["sessions"][resolved.session_idx]
-    claude_session_id = session.get("claude_session_id")
-    if not claude_session_id:
+    agent_session_id = session.get("agent_session_id")
+    if not agent_session_id:
         _print_selector_error(
             SelectorError(
-                f"no claude_session_id available for '{args.selector}' "
+                f"no agent_session_id available for '{args.selector}' "
                 "-- the session may not have completed yet"
             ),
             json_mode=args.json,
         )
         return 1
+    is_codex = session.get("agent") in ("codex", "codex-cli")
+    readonly_instructions = (
+        "You are in read-only mode. You may only read files. Do NOT write, "
+        "edit, delete, commit, or push anything."
+    )
 
     def _render(_s: dict[str, Any]) -> None:
-        cmd = ["claude", "--resume", claude_session_id]
-        if args.mode == "readonly":
-            cmd += [
-                "--dangerously-skip-permissions",
-                "--append-system-prompt",
-                "You are in read-only mode. You may only read files. Do NOT write, "
-                "edit, delete, commit, or push anything.",
-            ]
+        if is_codex:
+            cmd = ["codex"]
+            if args.mode == "readonly":
+                cmd += ["-c", f"developer_instructions={readonly_instructions}"]
+            cmd += ["exec", "resume", agent_session_id]
+        else:
+            cmd = ["claude", "--resume", agent_session_id]
+            if args.mode == "readonly":
+                cmd += [
+                    "--dangerously-skip-permissions",
+                    "--append-system-prompt",
+                    readonly_instructions,
+                ]
         print_kv([("cwd", session.get("cwd") or "-"), ("command", " ".join(cmd))])
 
     emit(args.json, session, _render)
@@ -2806,6 +2873,182 @@ def _cmd_verify_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a ``KEY=VALUE``-per-line environment file (RAL-150's
+    ``ralphus retry --env-file``). Blank lines and lines starting with ``#``
+    are ignored; a value may optionally be wrapped in matching single or
+    double quotes, which are stripped. Raises ``ValueError`` (with a
+    human-readable message) on an unreadable file or a malformed line --
+    callers turn that into exit code 2.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"could not read {path}: {exc}") from exc
+    result: dict[str, str] = {}
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"{path}:{lineno}: expected KEY=VALUE, got {raw_line!r}")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        result[key] = value
+    return result
+
+
+def _parse_environment_flags(raw: list[str]) -> dict[str, str]:
+    """Parse repeated ``--environment KEY=VALUE`` flags into a dict -- a
+    later duplicate key overwrites an earlier one, matching plain
+    left-to-right environment-assignment semantics. Raises ``ValueError`` on
+    a malformed entry.
+    """
+    result: dict[str, str] = {}
+    for item in raw:
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"--environment expects KEY=VALUE, got {item!r}")
+        result[key] = value
+    return result
+
+
+def _resolve_any_selector_or_none(
+    client: DaemonClient, args: argparse.Namespace
+) -> ResolvedSelector | None:
+    """Resolve `args.selector` to any run/task/session/verify selector kind --
+    used by `retry` (RAL-150), which acts on whichever kind the selector
+    names rather than requiring one specific kind like most `_cmd_*` helpers.
+    """
+    try:
+        resolved = resolve_run_selector(client, args.selector)
+    except (SelectorError, DaemonError) as exc:
+        if isinstance(exc, SelectorError):
+            _print_selector_error(exc, json_mode=args.json)
+        else:
+            _print_daemon_error(exc, json_mode=args.json)
+        return None
+    return resolved
+
+
+def _set_env_for_resolved_selector(
+    client: DaemonClient,
+    resolved: ResolvedSelector,
+    *,
+    set_vars: dict[str, str],
+    unset_vars: list[str],
+) -> dict[str, str]:
+    """Set/unset persistent environment-variable overrides at the level
+    `resolved` itself names -- a task selector sets a task-level override, a
+    session-verify selector sets a session-verify-level override, and so on
+    (hierarchical env overrides, extending RAL-150; see
+    `Store.resolve_session_env_overrides` and siblings on the daemon side for
+    how a child scope's values win over its parent's). Mirrors the
+    kind/verify_scope dispatch `_cmd_retry` already uses a few lines below to
+    pick which `restart_*` call to make.
+    """
+    if resolved.kind == "run":
+        return client.set_run_env(resolved.run_id, set_vars=set_vars, unset_vars=unset_vars)
+    if resolved.kind == "task":
+        return client.set_task_env(
+            resolved.run_id, resolved.task_idx, set_vars=set_vars, unset_vars=unset_vars
+        )
+    if resolved.kind == "session":
+        return client.set_session_env(
+            resolved.run_id,
+            resolved.task_idx,
+            resolved.session_idx,
+            set_vars=set_vars,
+            unset_vars=unset_vars,
+        )
+    if resolved.verify_scope == "session":
+        return client.set_session_verify_env(
+            resolved.run_id,
+            resolved.task_idx,
+            resolved.session_idx,
+            set_vars=set_vars,
+            unset_vars=unset_vars,
+        )
+    return client.set_task_verify_env(
+        resolved.run_id, resolved.task_idx, set_vars=set_vars, unset_vars=unset_vars
+    )
+
+
+def _cmd_retry(args: argparse.Namespace) -> int:
+    """Re-run any run/task/session/verify selector, optionally setting or
+    unsetting persistent environment-variable overrides first, at the level
+    the selector itself names (hierarchical env overrides, extending
+    RAL-150) -- e.g. a task selector sets a task-level override, a
+    session-verify selector sets a session-verify-level override. A single
+    generic subcommand covering every entity kind, per the ticket's
+    deliberate CLI-surface decision -- see `resolve_run_selector` for the
+    shared selector grammar and `_cmd_verify_restart` for the
+    task-verify-vs-session-verify dispatch this mirrors.
+    """
+    env_set: dict[str, str] = {}
+    if args.env_file is not None:
+        try:
+            env_set.update(_parse_env_file(args.env_file))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if args.environment:
+        try:
+            env_set.update(_parse_environment_flags(args.environment))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    env_unset = list(dict.fromkeys(args.unset_environment or []))
+
+    with DaemonClient(args.daemon_url) as client:
+        resolved = _resolve_any_selector_or_none(client, args)
+        if resolved is None:
+            return 2
+
+        if env_set or env_unset:
+            try:
+                _set_env_for_resolved_selector(
+                    client, resolved, set_vars=env_set, unset_vars=env_unset
+                )
+            except DaemonError as exc:
+                _print_daemon_error(exc, json_mode=args.json)
+                return exit_code_for(exc)
+
+        try:
+            if resolved.kind == "run":
+                result = client.retry_run(resolved.run_id)
+            elif resolved.kind == "task":
+                result = client.restart_task(resolved.run_id, resolved.task_idx)
+            elif resolved.kind == "session":
+                result = client.restart_session(
+                    resolved.run_id, resolved.task_idx, resolved.session_idx
+                )
+            elif resolved.verify_scope == "session":
+                result = client.restart_session_verify(
+                    resolved.run_id, resolved.task_idx, resolved.session_idx, resolved.verify_idx
+                )
+            else:
+                result = client.restart_task_verify(
+                    resolved.run_id, resolved.task_idx, resolved.verify_idx
+                )
+        except DaemonError as exc:
+            _print_daemon_error(exc, json_mode=args.json)
+            return exit_code_for(exc)
+
+    def _render(r: dict[str, Any]) -> None:
+        if "dirtied" in r:
+            _render_dirtied(r)
+        else:
+            print(f"{args.selector} -> {r.get('state')}")
+
+    emit(args.json, result, _render)
+    return 0
+
+
 def _cmd_review_list(args: argparse.Namespace) -> int:
     with DaemonClient(args.daemon_url) as client:
         try:
@@ -2870,8 +3113,8 @@ def _cmd_review_show(args: argparse.Namespace) -> int:
                 print(f"{head}{ready}{detail}")
         if g.get("manual_commands"):
             print("\nmanual checks:")
-            for i, cmd in enumerate(g["manual_commands"]):
-                print(f"  [{i}] {cmd}")
+            for i, check in enumerate(g["manual_commands"]):
+                print(f"  [{i}] {check.get('command')}")
 
     emit(args.json, guardian, _render)
     return 0
@@ -3440,6 +3683,43 @@ def _print_command_with_cwd(cwd: str, command: str) -> None:
     print_kv([("cwd", cwd), ("command", command)])
 
 
+def _parse_kv_arg(raw: str) -> tuple[str, str]:
+    """Parses a `--input NAME=VALUE` argument. Used as an argparse `type=`."""
+    name, sep, value = raw.partition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"expected NAME=VALUE, got {raw!r}")
+    return name, value
+
+
+def _resolve_check_inputs(
+    command: str, check: dict[str, Any], input_values: dict[str, str], overrides: dict[str, str]
+) -> tuple[str, list[str]]:
+    """Substitutes `{name}` placeholders declared in `check["inputs"]` into
+    `command` (RAL-164), preferring `overrides` (CLI `--input` flags), then
+    the guardian's stored `input_values` (the last value used on this
+    review), then the input's own literal default. Returns `(resolved,
+    missing)` -- `missing` lists any input name with no value from any
+    source (an empty literal default and nothing supplied) rather than
+    silently leaving a bare `{name}` in the printed command.
+    """
+    resolved = command
+    missing: list[str] = []
+    for inp in check.get("inputs", []):
+        name = inp["name"]
+        default = inp.get("default", "")
+        if name in overrides:
+            value = overrides[name]
+        elif name in input_values:
+            value = input_values[name]
+        elif default:
+            value = default
+        else:
+            missing.append(name)
+            continue
+        resolved = resolved.replace(f"{{{name}}}", value)
+    return resolved, missing
+
+
 def _cmd_review_checks_list(args: argparse.Namespace) -> int:
     with DaemonClient(args.daemon_url) as client:
         try:
@@ -3451,14 +3731,18 @@ def _cmd_review_checks_list(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    commands = guardian.get("manual_commands", [])
+    commands: list[dict[str, Any]] = guardian.get("manual_commands", [])
+    input_values: dict[str, str] = guardian.get("input_values", {})
 
-    def _render(cmds: list[str]) -> None:
+    def _render(cmds: list[dict[str, Any]]) -> None:
         if not cmds:
             print("no manual checks available (review may still be building)")
             return
-        for i, cmd in enumerate(cmds):
-            print(f"[{i}] {cmd}")
+        for i, check in enumerate(cmds):
+            print(f"[{i}] {check.get('command')}")
+            for inp in check.get("inputs", []):
+                current = input_values.get(inp["name"], inp.get("default", ""))
+                print(f"      input {inp['name']}: {inp.get('message')} (current: {current!r})")
 
     emit(args.json, commands, _render)
     return 0
@@ -3480,7 +3764,7 @@ def _cmd_review_checks_run(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    commands: list[str] = guardian.get("manual_commands", [])
+    commands: list[dict[str, Any]] = guardian.get("manual_commands", [])
     if not commands:
         _print_selector_error(
             SelectorError("no manual checks available (review may still be building)"),
@@ -3501,13 +3785,39 @@ def _cmd_review_checks_run(args: argparse.Namespace) -> int:
     else:
         indices = list(range(len(commands)))
     cwd = str(guardian.get("combined_worktree") or guardian.get("git_root") or "")
+    input_values: dict[str, str] = guardian.get("input_values", {})
+    overrides: dict[str, str] = dict(args.input or [])
 
-    def _render(_cmds: list[str]) -> None:
+    resolved_commands: dict[int, str] = {}
+    all_missing: dict[int, list[str]] = {}
+    for i in indices:
+        command = commands[i].get("command") or ""
+        resolved_commands[i], missing = _resolve_check_inputs(
+            command, commands[i], input_values, overrides
+        )
+        if missing:
+            all_missing[i] = missing
+
+    if all_missing:
+        detail = "; ".join(f"[{i}] needs {names}" for i, names in all_missing.items())
+        _print_selector_error(
+            SelectorError(
+                f"missing required input value(s): {detail} (supply via --input NAME=VALUE)"
+            ),
+            json_mode=args.json,
+        )
+        return 2
+
+    def _render(_cmds: list[dict[str, Any]]) -> None:
         for i in indices:
             print(f"[{i}]")
-            _print_command_with_cwd(cwd, commands[i])
+            _print_command_with_cwd(cwd, resolved_commands[i])
 
-    emit(args.json, [commands[i] for i in indices], _render)
+    emit(
+        args.json,
+        [{"index": i, "command": resolved_commands[i]} for i in indices],
+        _render,
+    )
     return 0
 
 
@@ -3522,7 +3832,8 @@ def _cmd_review_action_list(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    hints = guardian.get("action_hints", [])
+    hints: list[dict[str, Any]] = guardian.get("action_hints", [])
+    input_values: dict[str, str] = guardian.get("input_values", {})
 
     def _render(hs: list[dict[str, Any]]) -> None:
         if not hs:
@@ -3531,6 +3842,9 @@ def _cmd_review_action_list(args: argparse.Namespace) -> int:
         for i, h in enumerate(hs):
             kind = "command" if h.get("command") else "prompt"
             print(f"[{i}] {h.get('label')}  ({kind})")
+            for inp in h.get("inputs", []):
+                current = input_values.get(inp["name"], inp.get("default", ""))
+                print(f"      input {inp['name']}: {inp.get('message')} (current: {current!r})")
 
     emit(args.json, hints, _render)
     return 0
@@ -3565,7 +3879,24 @@ def _cmd_review_action_run(args: argparse.Namespace) -> int:
         )
         return 1
     cwd = str(guardian.get("combined_worktree") or guardian.get("git_root") or "")
-    emit(args.json, hint, lambda h: _print_command_with_cwd(cwd, h["command"]))
+    input_values: dict[str, str] = guardian.get("input_values", {})
+    overrides: dict[str, str] = dict(args.input or [])
+    resolved_command, missing = _resolve_check_inputs(
+        hint["command"], hint, input_values, overrides
+    )
+    if missing:
+        _print_selector_error(
+            SelectorError(
+                f"missing required input value(s): {missing} (supply via --input NAME=VALUE)"
+            ),
+            json_mode=args.json,
+        )
+        return 2
+    emit(
+        args.json,
+        {**hint, "command": resolved_command},
+        lambda h: _print_command_with_cwd(cwd, h["command"]),
+    )
     return 0
 
 
@@ -4050,9 +4381,13 @@ def _cmd_agent_list(_args: argparse.Namespace) -> int:
 
 def _cmd_show_help_map(_args: argparse.Namespace) -> int:
     # deferred: avoids a __main__ <-> helpmap import cycle
-    from ralphus.helpmap import SUBAGENT_NOTE, generate
+    from ralphus.helpmap import PROJECT_LOOKUP_NOTE, SUBAGENT_NOTE, SUBMIT_VALIDATE_NOTE, generate
 
     print(SUBAGENT_NOTE)
+    print()
+    print(PROJECT_LOOKUP_NOTE)
+    print()
+    print(SUBMIT_VALIDATE_NOTE)
     print()
     print(generate())
     return 0
@@ -4167,13 +4502,20 @@ def _cmd_quick_start_claude_code(args: argparse.Namespace) -> int:
     flag whose precedence would be undocumented.
     """
     # deferred: avoids a __main__ <-> helpmap import cycle
-    from ralphus.helpmap import SUBAGENT_NOTE, generate
+    from ralphus.helpmap import PROJECT_LOOKUP_NOTE, SUBAGENT_NOTE, SUBMIT_VALIDATE_NOTE, generate
 
     help_map_file_content = (
         "You are Ralphus. You orchestrate the `ralphus` CLI as an autonomous agent. Its "
         "complete command surface -- every subcommand, flag, and expected value type -- is "
         "documented below. Use `ralphus <command> --help` for details on any specific "
-        "command.\n\n" + SUBAGENT_NOTE + "\n\n" + generate()
+        "command.\n\n"
+        + SUBAGENT_NOTE
+        + "\n\n"
+        + PROJECT_LOOKUP_NOTE
+        + "\n\n"
+        + SUBMIT_VALIDATE_NOTE
+        + "\n\n"
+        + generate()
     )
     fd, tmp_path_str = tempfile.mkstemp(suffix=".md", prefix="ralphus-help-map-")
     tmp_path = Path(tmp_path_str)

@@ -64,6 +64,11 @@ pub struct TaskDef {
     /// is failed. Sessions/verifies inherit this unless they set their own.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
+    /// Task-level max spend cap in USD. A session exceeding it is killed
+    /// mid-run and failed. Sessions inherit this unless they set their own
+    /// `maximum_budget_usd`.
+    #[serde(default)]
+    pub maximum_budget_usd: Option<f64>,
     /// Retry count.
     #[serde(default)]
     pub max_retries: Option<u32>,
@@ -144,6 +149,11 @@ pub struct SessionDef {
     /// task-level `budget_tokens` when unset. Exceeding it fails the session.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
+    /// Per-session max spend cap in USD. Falls back to the task-level
+    /// `maximum_budget_usd` when unset. Once the session's live running cost
+    /// exceeds this, the daemon kills it mid-run and fails it.
+    #[serde(default)]
+    pub maximum_budget_usd: Option<f64>,
     /// Per-session wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
@@ -281,6 +291,31 @@ pub struct ReviewActionDef {
     /// Mutually exclusive with `prompt`.
     #[serde(default)]
     pub command: Option<String>,
+    /// Optional command run before `command`/the expanded `prompt`, e.g. to stop
+    /// a stale process from a previous run. Opt-in at run time via a UI
+    /// checkbox (RAL-164) -- coexists with either `prompt` or `command`, no
+    /// XOR involved.
+    #[serde(default)]
+    pub cleanup_command: Option<String>,
+    /// Named, defaulted values referenced in `command`/`cleanup_command` as
+    /// `{name}` placeholders (RAL-164), e.g. a port number that would
+    /// otherwise be hardcoded and collide across concurrent reviews.
+    #[serde(default)]
+    pub input: Vec<ReviewActionInputDef>,
+}
+
+/// A named, defaulted input referenced by a [`ReviewActionDef`]'s
+/// `command`/`cleanup_command` as a `{name}` placeholder (RAL-164).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewActionInputDef {
+    /// Placeholder key, e.g. `"port"` for a `{port}` placeholder.
+    pub name: String,
+    /// Shown to the user next to the input field, e.g. "Port for the daemon".
+    pub message: String,
+    /// Pre-filled default value, offered until the user (or the resolver
+    /// agent, via "set it for me") submits a different one.
+    #[serde(default)]
+    pub default: String,
 }
 
 /// One verify step. Exactly one of `command` / `brain` / `prompt` must be set.
@@ -345,14 +380,16 @@ pub const SYSTEM_PROMPT_POSITION_APPEND: &str = "append";
 
 /// Whether `agent` is a backend with complete appended-system-prompt support.
 ///
-/// Only the Claude Code CLI (`claude-code`, and its `claude-cli` alias) maps the
-/// appended system prompt to a real backend flag (`--append-system-prompt`)
-/// today. Support for the other backends is best-effort but not complete, so
-/// validation rejects `system_prompt`/`system_prompt_position` for any other
-/// agent (RAL-5).
+/// The Claude Code CLI (`claude-code`, and its `claude-cli` alias) maps the
+/// appended system prompt to a real backend flag (`--append-system-prompt`);
+/// the Codex CLI (`codex`, and its `codex-cli` alias) maps it to its own
+/// config-override mechanism (`-c developer_instructions=...` -- there is no
+/// dedicated flag). Support for other backends is best-effort but not
+/// complete, so validation rejects `system_prompt`/`system_prompt_position`
+/// for any other agent (RAL-5).
 #[must_use]
 pub fn agent_supports_system_prompt(agent: &str) -> bool {
-    matches!(agent, "claude-code" | "claude-cli")
+    matches!(agent, "claude-code" | "claude-cli" | "codex" | "codex-cli")
 }
 
 impl ResolvedAgent {
@@ -400,6 +437,7 @@ mod tests {
             model: model.map(str::to_string),
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
+            maximum_budget_usd: None,
             max_retries: None,
             priority: None,
             timeout_minutes: None,
@@ -425,6 +463,7 @@ mod tests {
             system_prompt_position: None,
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
+            maximum_budget_usd: None,
             timeout_minutes: None,
             priority: None,
             verify: vec![],
@@ -499,6 +538,64 @@ mod tests {
         assert_eq!(review[0].action[1].label, "Frontend check");
         assert!(review[0].action[1].command.is_none());
         assert!(review[0].action[1].prompt.is_some());
+    }
+
+    #[test]
+    fn review_action_cleanup_command_and_input_deserialize() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.session]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "backend"
+
+            [[review]]
+            id = "backend"
+
+            [[review.action]]
+            label = "Serve locally"
+            command = "ralphus-daemon serve --port {port}"
+            cleanup_command = "ralphus-daemon stop --port {port}"
+
+            [[review.action.input]]
+            name = "port"
+            message = "Port for the daemon"
+            default = "7890"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let action = &parsed.review[0].action[0];
+        assert_eq!(
+            action.cleanup_command.as_deref(),
+            Some("ralphus-daemon stop --port {port}")
+        );
+        assert_eq!(action.input.len(), 1);
+        assert_eq!(action.input[0].name, "port");
+        assert_eq!(action.input[0].message, "Port for the daemon");
+        assert_eq!(action.input[0].default, "7890");
+    }
+
+    #[test]
+    fn review_action_cleanup_command_and_input_default_to_empty() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.session]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "backend"
+
+            [[review]]
+            id = "backend"
+
+            [[review.action]]
+            label = "Smoke test"
+            command = "cargo test"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let action = &parsed.review[0].action[0];
+        assert!(action.cleanup_command.is_none());
+        assert!(action.input.is_empty());
     }
 
     #[test]

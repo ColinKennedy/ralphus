@@ -115,7 +115,7 @@ def task(
     name: str,
     *,
     state: str,
-    project: str | None = None,
+    project: str,
     sessions: tuple[Json, ...] = (),
     verify: tuple[Json, ...] = (),
     depends_on: tuple[str, ...] = (),
@@ -183,7 +183,7 @@ def branch(
         "source_run_id": source_run_id,
         "source_task_idx": source_task_idx,
         "source_session_idx": source_session_idx,
-        "resolver_claude_session_id": None,
+        "resolver_agent_session_id": None,
     }
 
 
@@ -236,8 +236,17 @@ def guardian(
         "change_summary": change_summary,
         "projects": [git_root],
         "base_commits": {git_root: base_commit} if base_commit else {},
-        "manual_commands": list(manual_commands),
+        # RAL-164: manual_commands/action_hints are structured GuardianChecks
+        # ({command, prompt, label, cleanup_command, inputs}), not bare
+        # strings -- wrap each example command string into that shape so
+        # generated docs show the real wire format.
+        "manual_commands": [
+            {"command": cmd, "prompt": None, "label": None, "cleanup_command": None, "inputs": []}
+            for cmd in manual_commands
+        ],
         "action_hints": [],
+        "input_values": {},
+        "input_resolutions": {},
         "summary_agent": resolver_agent,
         "summary_model": resolver_model,
         "manual_commands_agent": resolver_agent,

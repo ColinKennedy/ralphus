@@ -79,6 +79,15 @@ impl Cancellations {
         self.lock().remove(run_id);
     }
 
+    /// Signal cancellation for every currently-registered run, regardless of
+    /// id. Used by daemon-wide shutdown (`ralphus-daemon stop`) to stop every
+    /// live worker's subprocess without having to enumerate run ids itself.
+    pub fn cancel_all(&self) {
+        for token in self.lock().values() {
+            token.cancel();
+        }
+    }
+
     /// Whether `run_id` currently has a registered token — i.e. a worker
     /// thread is actively executing it (registered at the start of
     /// `execute_run_inner`, removed only once that call returns). Used to
@@ -138,5 +147,23 @@ mod tests {
         assert!(reg.is_active("run-1"));
         reg.remove("run-1");
         assert!(!reg.is_active("run-1"));
+    }
+
+    #[test]
+    fn cancel_all_trips_every_registered_token() {
+        let reg = Cancellations::new();
+        let a = reg.register("run-1");
+        let b = reg.register("run-2");
+        assert!(!a.is_cancelled());
+        assert!(!b.is_cancelled());
+        reg.cancel_all();
+        assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_all_on_empty_registry_is_a_noop() {
+        let reg = Cancellations::new();
+        reg.cancel_all(); // must not panic
     }
 }

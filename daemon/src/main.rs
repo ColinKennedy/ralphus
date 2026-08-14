@@ -1,6 +1,7 @@
 //! ralphus daemon binary entry point.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use ralphus_daemon::{
     Command, DEFAULT_MAX_CONCURRENT, default_db_path, parse_args, server, usage, validate_file,
@@ -59,7 +60,31 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Serve { port } => {
+        Command::Stop { port, auto_cancel } => {
+            let url = format!("http://127.0.0.1:{port}/api/daemon/shutdown");
+            let body = serde_json::json!({ "auto_cancel": auto_cancel }).to_string();
+            match ureq::post(&url)
+                .timeout(Duration::from_secs(10))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+            {
+                Ok(resp) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    println!("daemon on port {port} is stopping: {text}");
+                    ExitCode::SUCCESS
+                }
+                Err(ureq::Error::Transport(e)) => {
+                    println!("no daemon reachable on 127.0.0.1:{port} ({e}) — nothing to stop");
+                    ExitCode::SUCCESS
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let text = resp.into_string().unwrap_or_default();
+                    eprintln!("error: daemon returned {code}: {text}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Serve { port, db } => {
             if let Err(e) = ralphus_auth::check_license() {
                 eprintln!("Authorization error: {e}");
                 return ExitCode::FAILURE;
@@ -75,7 +100,7 @@ fn main() -> ExitCode {
                 daemon_cfg.log_path.as_deref(),
                 daemon_cfg.log_level.as_deref(),
             );
-            let db = default_db_path();
+            let db = db.unwrap_or_else(default_db_path);
             let addr = ("127.0.0.1", port);
             ralphus_daemon::logging::write_line(
                 ralphus_daemon::logging::LogLevel::INFO,

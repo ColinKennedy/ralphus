@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,42 +12,101 @@ from typing import Any
 import pytest
 
 from ralphus.runner.backend import BackendError
-from ralphus.runner.codex_backend import CodexBackend, _write_prompt_file
+from ralphus.runner.cli_agent_common import live_session_path
+from ralphus.runner.cli_agent_common import write_prompt_file as _write_prompt_file
+from ralphus.runner.codex_backend import CodexBackend
 from ralphus.runner.tools import Workspace
 
 
-class _Proc:
-    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+def _thread_started(thread_id: str) -> str:
+    return json.dumps({"type": "thread.started", "thread_id": thread_id})
+
+
+def _agent_message(text: str) -> str:
+    return json.dumps(
+        {"type": "item.completed", "item": {"id": "item0", "type": "agent_message", "text": text}}
+    )
+
+
+def _turn_completed(tokens_in: int = 0, tokens_out: int = 0) -> str:
+    return json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": tokens_in,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": tokens_out,
+                "reasoning_output_tokens": 0,
+            },
+        }
+    )
+
+
+def _turn_failed(message: str) -> str:
+    return json.dumps({"type": "turn.failed", "error": {"message": message}})
+
+
+class _FakeStdin(io.StringIO):
+    """Records what was written before the writer thread closes it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.written = ""
+
+    def write(self, s: str) -> int:
+        self.written += s
+        return super().write(s)
+
+
+class _FakePopen:
+    """Minimal subprocess.Popen stand-in for Codex's `--json` JSONL output."""
+
+    def __init__(
+        self,
+        returncode: int = 0,
+        stdout_lines: list[str] | None = None,
+        stderr_str: str = "",
+    ) -> None:
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout: list[str] = [line + "\n" for line in (stdout_lines or [])]
+        self.stderr = io.StringIO(stderr_str)
+        self.stdin = _FakeStdin()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
 
 
-def test_builds_exec_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _cmd_prompt_arg_is_stdin_sentinel(cmd: list[str]) -> None:
+    assert cmd[-1] == "-", f"expected trailing '-' stdin sentinel, got {cmd[-1]!r}"
+
+
+def test_builds_exec_command_with_json_and_no_ephemeral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ws = Workspace.create(str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     captured: dict[str, Any] = {}
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> _Proc:
+    def fake_popen(cmd: list[str], **kwargs: Any) -> _FakePopen:
         captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
-        captured["input"] = kwargs.get("input", "")
-        return _Proc(0, stdout="task done")
+        return _FakePopen(0, stdout_lines=[_agent_message("did the thing")])
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     outcome = CodexBackend().run("do the thing", ws, model="o4-mini")
 
-    assert outcome.summary == "task done"
+    assert outcome.summary == "did the thing"
     cmd = captured["cmd"]
     assert cmd[0] == "codex"
     assert cmd[1] == "exec"
+    assert "--json" in cmd
+    assert "--ephemeral" not in cmd, "ephemeral runs can't be resumed later"
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert "--skip-git-repo-check" in cmd
-    assert "--ephemeral" in cmd
-    assert "-C" in cmd
     assert cmd[cmd.index("-C") + 1] == str(ws.root)
-    assert cmd[-1] == "-"
     assert cmd[cmd.index("-m") + 1] == "o4-mini"
+    _cmd_prompt_arg_is_stdin_sentinel(cmd)
     assert captured["cwd"] == ws.root
 
 
@@ -54,17 +115,16 @@ def test_prompt_is_passed_via_stdin(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     captured: dict[str, Any] = {}
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> _Proc:
-        captured["input"] = kwargs.get("input", "")
-        # Verify the prompt is NOT on the command line as a plain argument.
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        popen = _FakePopen(0)
+        captured["popen"] = popen
         captured["cmd"] = cmd
-        return _Proc(0)
+        return popen
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     CodexBackend().run("my prompt text", ws, model=None)
 
-    assert captured["input"] == "my prompt text"
-    # The prompt itself should not appear as a command-line argument.
+    assert captured["popen"].stdin.written == "my prompt text"
     assert "my prompt text" not in captured["cmd"]
 
 
@@ -72,11 +132,12 @@ def test_prompt_file_is_removed_after_run(tmp_path: Path, monkeypatch: pytest.Mo
     ws = Workspace.create(str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("RALPHUS_CONFIGURATION_PATH", raising=False)
 
-    def fake_run(_cmd: list[str], **_kwargs: Any) -> _Proc:
-        return _Proc(0)
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(0)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     CodexBackend().run("hello", ws, model=None)
 
     leftover = list((tmp_path / ".ralphus" / "task_prompts").glob("*.md"))
@@ -89,11 +150,12 @@ def test_prompt_file_is_removed_even_on_error(
     ws = Workspace.create(str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("RALPHUS_CONFIGURATION_PATH", raising=False)
 
-    def fake_run(_cmd: list[str], **_kwargs: Any) -> _Proc:
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
         raise OSError("simulated failure")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     with pytest.raises(BackendError):
         CodexBackend().run("hello", ws, model=None)
 
@@ -106,11 +168,11 @@ def test_no_model_flag_when_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     captured: dict[str, Any] = {}
 
-    def fake_run(cmd: list[str], **_kwargs: Any) -> _Proc:
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
         captured["cmd"] = cmd
-        return _Proc(0)
+        return _FakePopen(0)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     CodexBackend().run("x", ws, model=None)
     assert "-m" not in captured["cmd"]
 
@@ -121,22 +183,209 @@ def test_program_is_overridable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(shutil, "which", lambda _program: None)
     captured: dict[str, Any] = {}
 
-    def fake_run(cmd: list[str], **_kwargs: Any) -> _Proc:
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
         captured["cmd"] = cmd
-        return _Proc(0)
+        return _FakePopen(0)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     CodexBackend().run("x", ws, model=None)
     assert captured["cmd"][0] == "my-codex"
+
+
+def test_developer_instructions_flag_precedes_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`-c developer_instructions=...` is Codex's closest analog to
+    `--append-system-prompt`. It must appear *before* `exec` on the command
+    line -- the `exec` subcommand's own CLI struct skips re-declaring `-c`
+    and only picks it up when threaded in from what was parsed before the
+    subcommand token (see codex_backend.py's module docstring)."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        captured["cmd"] = cmd
+        return _FakePopen(0, stdout_lines=[_agent_message("ok")])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    CodexBackend().run("do work", ws, model=None, append_system_prompt="Follow the house style.")
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-c") + 1] == "developer_instructions=Follow the house style."
+    assert cmd.index("-c") < cmd.index("exec"), "-c must precede exec to be picked up"
+
+
+def test_no_developer_instructions_flag_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        captured["cmd"] = cmd
+        return _FakePopen(0)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    CodexBackend().run("x", ws, model=None)
+    assert "-c" not in captured["cmd"]
+
+
+def test_resume_maps_to_resume_subcommand_and_replaces_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`resume_agent_session_id` (holding a Codex thread id) becomes
+    `exec resume <id> -` and swaps in a short continuation directive instead
+    of re-sending the original prompt, matching ClaudeCodeBackend's same
+    resume behavior."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        popen = _FakePopen(0, stdout_lines=[_agent_message("resumed and finished")])
+        captured["popen"] = popen
+        captured["cmd"] = cmd
+        return popen
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = CodexBackend().run(
+        "the original long task prompt",
+        ws,
+        model=None,
+        resume_agent_session_id="dropped-thread-abc",
+    )
+
+    assert outcome.summary == "resumed and finished"
+    cmd = captured["cmd"]
+    assert cmd[-3:] == ["resume", "dropped-thread-abc", "-"]
+    prompt_sent = captured["popen"].stdin.written
+    assert prompt_sent != "the original long task prompt"
+    assert "continue" in prompt_sent.lower()
+
+
+def test_no_resume_when_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        captured["cmd"] = cmd
+        return _FakePopen(0)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    CodexBackend().run("x", ws, model=None)
+    assert "resume" not in captured["cmd"]
+    assert captured["cmd"][-1] == "-"
+
+
+def test_thread_id_written_to_live_session_file_and_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(
+            0, stdout_lines=[_thread_started("thread-abc-123"), _agent_message("done")]
+        )
+
+    written_sid: list[str] = []
+    original_write = Path.write_text
+
+    def spy_write(self: Path, text: str, **kwargs: Any) -> None:
+        if self.suffix == ".live_session":
+            written_sid.append(text)
+        original_write(self, text, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", spy_write)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = CodexBackend().run("task", ws, model=None)
+
+    assert outcome.agent_session_id == "thread-abc-123"
+    assert "thread-abc-123" in written_sid, "thread id was not written to the live_session file"
+    stderr = capsys.readouterr().err
+    assert "RALPHUS_EVENT: " in stderr
+    event = json.loads(stderr.split("RALPHUS_EVENT: ", 1)[1].splitlines()[0])
+    assert event["payload"]["agent_session_id"] == "thread-abc-123"
+
+
+def test_live_session_file_cleaned_up_after_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(0, stdout_lines=[_thread_started("xyz-789"), _agent_message("ok")])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    CodexBackend().run("task", ws, model=None)
+
+    sid_path = live_session_path(ws.root)
+    assert not sid_path.exists(), "live_session file was not cleaned up after run"
+
+
+def test_usage_parsed_from_turn_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(
+            0,
+            stdout_lines=[_agent_message("done"), _turn_completed(tokens_in=123, tokens_out=45)],
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = CodexBackend().run("task", ws, model=None)
+
+    assert outcome.tokens_in == 123
+    assert outcome.tokens_out == 45
+    # Codex's JSON output has no dollar-cost field anywhere -- unlike Claude
+    # Code's total_cost_usd, this is always 0.0 for this backend.
+    assert outcome.cost_usd == 0.0
+
+
+def test_summary_keeps_tail_not_head_of_long_agent_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A RALPHUS_VERIFY: marker on the model's final output line must survive
+    truncation -- so the summary keeps the trailing chars, not the leading
+    ones, unlike Claude Code's own (front-truncated) `result` field."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    long_message = ("x" * 3000) + "\nRALPHUS_VERIFY: PASS"
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(0, stdout_lines=[_agent_message(long_message)])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = CodexBackend().run("task", ws, model=None)
+
+    assert outcome.summary.endswith("RALPHUS_VERIFY: PASS")
+    assert len(outcome.summary) <= 2000
+
+
+def test_turn_failed_raises_backend_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(1, stdout_lines=[_turn_failed("model exhausted its context")])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    with pytest.raises(BackendError, match="model exhausted its context"):
+        CodexBackend().run("x", ws, model=None)
 
 
 def test_nonzero_exit_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ws = Workspace.create(str(tmp_path))
 
-    def fake_run(_cmd: list[str], **_kwargs: Any) -> _Proc:
-        return _Proc(1, stderr="codex failed")
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(1, stderr_str="codex failed")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     with pytest.raises(BackendError, match="exited 1"):
         CodexBackend().run("x", ws, model=None)
 
@@ -145,10 +394,10 @@ def test_oserror_raises_backend_error(tmp_path: Path, monkeypatch: pytest.Monkey
     ws = Workspace.create(str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda _program: None)
 
-    def fake_run(_cmd: list[str], **_kwargs: Any) -> _Proc:
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
         raise OSError("no such file")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     with pytest.raises(BackendError, match="could not run Codex"):
         CodexBackend().run("x", ws, model=None)
 

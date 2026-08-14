@@ -27,13 +27,7 @@ _VERIFY_FAIL = "RALPHUS_VERIFY: FAIL"
 _VERIFY_SYSTEM_PROMPT = (
     "This is a VERIFICATION step, not a normal task. Investigate whether the "
     "task holds, attempting to fix any problems you find so the check passes "
-    "if you can reasonably do so. Run every command this verification needs "
-    "synchronously in the foreground and wait for each to finish before moving "
-    "on — never launch the thing you are verifying as a background/detached "
-    "process and end your turn while it is still running. This session gets "
-    "no further turns, so if you stop before it finishes, this verification is "
-    "simply never checked. It is fine for this to take a long time; block and "
-    "wait rather than backgrounding. When you are done, your FINAL line of "
+    "if you can reasonably do so. When you are done, your FINAL line of "
     f"output must be exactly one of:\n{_VERIFY_PASS}\n{_VERIFY_FAIL}\nwith "
     "nothing else on that line."
 )
@@ -63,6 +57,42 @@ _GHOST_SYSTEM_PROMPT = (
 )
 
 _GHOST_RE = re.compile(rf"{re.escape(_GHOST_MARKER)}(.*)", re.DOTALL)
+
+# A ralphus-invoked session is one non-interactive, one-shot CLI invocation —
+# an agent that defers real work to an async/background tool (e.g. a
+# "monitor this and notify me" tool) and ends its turn early leaves that work
+# permanently unchecked, since nothing will ever resume it. `_STILL_WORKING_MARKER`
+# gives the agent an explicit, harness-understood way to say "I couldn't finish
+# synchronously" instead of just trailing off — `run_session` retries a bounded
+# number of times when it sees this marker (see `_MAX_ASYNC_ATTEMPTS`).
+_STILL_WORKING_MARKER = "RALPHUS_STILL_WORKING:"
+_STILL_WORKING_RE = re.compile(rf"{re.escape(_STILL_WORKING_MARKER)}(.*)")
+_MAX_ASYNC_ATTEMPTS = 3  # matches the "up to 3 times" retry convention used elsewhere for verify
+
+_ASYNC_SYSTEM_PROMPT = (
+    "This is a single, non-interactive invocation with no later turn — "
+    "nothing will check back on you. Never use an asynchronous/background/"
+    "'notify me later' tool for anything this session depends on, and never "
+    "launch the thing you are checking as a background/detached process and "
+    "end your turn while it is still running; those require a persistent "
+    "session this invocation does not have. If a check genuinely takes a "
+    "long time, block and wait for it synchronously in the foreground within "
+    "this same turn — it is fine for that to take a long time. If, despite "
+    "that, you truly cannot reach a definitive result before you must stop, "
+    f"end your reply with '{_STILL_WORKING_MARKER} <one-line reason>' as the "
+    "last line instead of trailing off — you will be re-invoked shortly to "
+    "continue synchronously from where you left off, though only a bounded "
+    "number of times, so prefer just finishing the check yourself."
+)
+
+_STILL_WORKING_FOLLOWUP = (
+    "Your previous attempt at this task ended without a definitive result, "
+    "saying:\n{prior_tail}\n\nThis session has no later turn to pick this "
+    "back up on — do not defer to background/async monitoring again. Check "
+    "the real current state right now (the workspace/files are unchanged "
+    "since your last attempt) and finish with a definitive result in this "
+    "same turn.\n\nOriginal task:\n{original_prompt}"
+)
 
 # RAL-96 follow-up: every prompt-driven session and verify step runs unattended
 # (no human is available to answer), so the agent must never stop to ask a
@@ -191,10 +221,15 @@ def _run_prompt_traced(
         },
     )
     append_system_prompt = _combine_system_prompts(
-        spec.system_prompt, _NON_INTERACTIVE_SYSTEM_PROMPT, _GHOST_SYSTEM_PROMPT
+        spec.system_prompt,
+        _NON_INTERACTIVE_SYSTEM_PROMPT,
+        _ASYNC_SYSTEM_PROMPT,
+        _GHOST_SYSTEM_PROMPT,
     )
     source = (
-        "session-config+non-interactive+ghost" if spec.system_prompt else "non-interactive+ghost"
+        "session-config+non-interactive+async+ghost"
+        if spec.system_prompt
+        else "non-interactive+async+ghost"
     )
     print(
         f"ralphus [llm] system-prompt applied len={len(append_system_prompt)}"
@@ -215,35 +250,74 @@ def _run_prompt_traced(
             "source": source,
         },
     )
-    try:
-        outcome = backend.run(
-            prompt_text,
-            workspace,
-            model=spec.model,
-            append_system_prompt=append_system_prompt,
-        )
-    except BackendError as exc:
+    resume_id = spec.resume_agent_session_id
+    attempt_prompt = prompt_text
+    total_tokens_in = total_tokens_out = 0
+    total_cost_usd = 0.0
+    outcome = None
+    for attempt in range(1, _MAX_ASYNC_ATTEMPTS + 1):
+        if resume_id:
+            print(
+                f"ralphus [llm] RESUME run={spec.run_id} session={spec.session_id}"
+                f" resume_from={resume_id}"
+                + (" (tmux auto-reattach retry)" if attempt == 1 else " (still-working retry)"),
+                file=sys.stderr,
+            )
+        try:
+            outcome = backend.run(
+                attempt_prompt,
+                workspace,
+                model=spec.model,
+                append_system_prompt=append_system_prompt,
+                resume_agent_session_id=resume_id,
+            )
+        except BackendError as exc:
+            print(
+                f"ralphus [llm] error run={spec.run_id} session={spec.session_id}: {exc}",
+                file=sys.stderr,
+            )
+            cartographer.emit(
+                "llm",
+                f"session error: {exc}",
+                level="error",
+                scope="session",
+                run_id=spec.run_id,
+                session_id=spec.session_id,
+                task=spec.task,
+                payload={"error": str(exc)},
+            )
+            return SessionResult.failed(f"model backend error: {exc}")
         print(
-            f"ralphus [llm] error run={spec.run_id} session={spec.session_id}: {exc}",
+            f"ralphus [llm] done run={spec.run_id} session={spec.session_id}"
+            f" tokens_in={outcome.tokens_in} tokens_out={outcome.tokens_out}"
+            f" cost_usd={outcome.cost_usd:.4f}",
             file=sys.stderr,
         )
+        total_tokens_in += outcome.tokens_in
+        total_tokens_out += outcome.tokens_out
+        total_cost_usd += outcome.cost_usd
+        over = _budget_exceeded(spec, total_tokens_in, total_tokens_out)
+        if over is not None:
+            return SessionResult.failed(over, summary=outcome.summary)
+        still_working = _parse_still_working(outcome.summary)
+        if still_working is None or attempt == _MAX_ASYNC_ATTEMPTS:
+            break
         cartographer.emit(
             "llm",
-            f"session error: {exc}",
-            level="error",
+            f"still-working marker detected, retrying (attempt {attempt}/{_MAX_ASYNC_ATTEMPTS}):"
+            f" {still_working}",
+            level="warning",
             scope="session",
             run_id=spec.run_id,
             session_id=spec.session_id,
             task=spec.task,
-            payload={"error": str(exc)},
+            payload={"attempt": attempt, "reason": still_working},
         )
-        return SessionResult.failed(f"model backend error: {exc}")
-    print(
-        f"ralphus [llm] done run={spec.run_id} session={spec.session_id}"
-        f" tokens_in={outcome.tokens_in} tokens_out={outcome.tokens_out}"
-        f" cost_usd={outcome.cost_usd:.4f}",
-        file=sys.stderr,
-    )
+        resume_id = outcome.agent_session_id or resume_id
+        attempt_prompt = _STILL_WORKING_FOLLOWUP.format(
+            prior_tail=_tail(outcome.summary, 1000), original_prompt=prompt_text
+        )
+    assert outcome is not None  # loop always runs at least once
     cartographer.emit(
         "llm",
         "session done",
@@ -252,14 +326,18 @@ def _run_prompt_traced(
         session_id=spec.session_id,
         task=spec.task,
         payload={
-            "tokens_in": outcome.tokens_in,
-            "tokens_out": outcome.tokens_out,
-            "cost_usd": outcome.cost_usd,
+            "tokens_in": total_tokens_in,
+            "tokens_out": total_tokens_out,
+            "cost_usd": total_cost_usd,
         },
     )
-    over = _budget_exceeded(spec, outcome.tokens_in, outcome.tokens_out)
-    if over is not None:
-        return SessionResult.failed(over, summary=outcome.summary)
+    still_working = _parse_still_working(outcome.summary)
+    if still_working is not None:
+        return SessionResult.failed(
+            f"agent still reported outstanding async work after {_MAX_ASYNC_ATTEMPTS} attempts:"
+            f" {still_working}",
+            summary=outcome.summary,
+        )
     ghost = _parse_ghost(outcome.summary)
     if ghost is not None:
         cartographer.emit(
@@ -274,10 +352,10 @@ def _run_prompt_traced(
         )
     return SessionResult.done(
         summary=outcome.summary,
-        tokens_in=outcome.tokens_in,
-        tokens_out=outcome.tokens_out,
-        cost_usd=outcome.cost_usd,
-        claude_session_id=outcome.claude_session_id,
+        tokens_in=total_tokens_in,
+        tokens_out=total_tokens_out,
+        cost_usd=total_cost_usd,
+        agent_session_id=outcome.agent_session_id,
         ghost=ghost,
     )
 
@@ -309,7 +387,10 @@ def _run_verify_traced(
 ) -> SessionResult:
     prompt_text = spec.prompt or ""
     verify_system = _combine_system_prompts(
-        spec.system_prompt, _NON_INTERACTIVE_SYSTEM_PROMPT, _VERIFY_SYSTEM_PROMPT
+        spec.system_prompt,
+        _NON_INTERACTIVE_SYSTEM_PROMPT,
+        _ASYNC_SYSTEM_PROMPT,
+        _VERIFY_SYSTEM_PROMPT,
     )
     prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()[:8]
     print(
@@ -333,53 +414,94 @@ def _run_verify_traced(
         },
     )
     source = (
-        "verify+session-config+non-interactive" if spec.system_prompt else "verify+non-interactive"
+        "verify+session-config+non-interactive+async"
+        if spec.system_prompt
+        else "verify+non-interactive+async"
     )
     print(
         f"ralphus [llm] system-prompt applied len={len(verify_system)}"
         f" position=append source={source}",
         file=sys.stderr,
     )
-    try:
-        outcome = backend.run(
-            prompt_text,
-            workspace,
-            model=spec.model,
-            append_system_prompt=verify_system,
-        )
-    except BackendError as exc:
+    resume_id = spec.resume_agent_session_id
+    attempt_prompt = prompt_text
+    total_tokens_in = total_tokens_out = 0
+    total_cost_usd = 0.0
+    outcome = None
+    for attempt in range(1, _MAX_ASYNC_ATTEMPTS + 1):
+        if resume_id:
+            print(
+                f"ralphus [llm] verify RESUME run={spec.run_id} session={spec.session_id}"
+                f" resume_from={resume_id}"
+                + (" (tmux auto-reattach retry)" if attempt == 1 else " (still-working retry)"),
+                file=sys.stderr,
+            )
+        try:
+            outcome = backend.run(
+                attempt_prompt,
+                workspace,
+                model=spec.model,
+                append_system_prompt=verify_system,
+                resume_agent_session_id=resume_id,
+            )
+        except BackendError as exc:
+            print(
+                f"ralphus [llm] verify error run={spec.run_id} session={spec.session_id}: {exc}",
+                file=sys.stderr,
+            )
+            cartographer.emit(
+                "llm",
+                f"verify error: {exc}",
+                level="error",
+                scope="verify",
+                run_id=spec.run_id,
+                session_id=spec.session_id,
+                task=spec.task,
+                payload={"error": str(exc)},
+            )
+            return SessionResult.failed(f"model backend error: {exc}")
         print(
-            f"ralphus [llm] verify error run={spec.run_id} session={spec.session_id}: {exc}",
+            f"ralphus [llm] verify done run={spec.run_id} session={spec.session_id}"
+            f" tokens_in={outcome.tokens_in} tokens_out={outcome.tokens_out}"
+            f" cost_usd={outcome.cost_usd:.4f}",
             file=sys.stderr,
         )
+        total_tokens_in += outcome.tokens_in
+        total_tokens_out += outcome.tokens_out
+        total_cost_usd += outcome.cost_usd
+
+        over = _budget_exceeded(spec, total_tokens_in, total_tokens_out)
+        if over is not None:
+            # A verify step that blows its token budget fails closed (not verified).
+            return SessionResult.done(
+                summary=f"{outcome.summary}\n{over}",
+                tokens_in=total_tokens_in,
+                tokens_out=total_tokens_out,
+                cost_usd=total_cost_usd,
+                verified=False,
+            )
+        if _parse_verdict(outcome.summary) is not None:
+            break
+        still_working = _parse_still_working(outcome.summary)
+        if still_working is None or attempt == _MAX_ASYNC_ATTEMPTS:
+            break
         cartographer.emit(
             "llm",
-            f"verify error: {exc}",
-            level="error",
+            f"still-working marker detected, retrying (attempt {attempt}/{_MAX_ASYNC_ATTEMPTS}):"
+            f" {still_working}",
+            level="warning",
             scope="verify",
             run_id=spec.run_id,
             session_id=spec.session_id,
             task=spec.task,
-            payload={"error": str(exc)},
+            payload={"attempt": attempt, "reason": still_working},
         )
-        return SessionResult.failed(f"model backend error: {exc}")
-    print(
-        f"ralphus [llm] verify done run={spec.run_id} session={spec.session_id}"
-        f" tokens_in={outcome.tokens_in} tokens_out={outcome.tokens_out}"
-        f" cost_usd={outcome.cost_usd:.4f}",
-        file=sys.stderr,
-    )
+        resume_id = outcome.agent_session_id or resume_id
+        attempt_prompt = _STILL_WORKING_FOLLOWUP.format(
+            prior_tail=_tail(outcome.summary, 1000), original_prompt=prompt_text
+        )
+    assert outcome is not None  # loop always runs at least once
 
-    over = _budget_exceeded(spec, outcome.tokens_in, outcome.tokens_out)
-    if over is not None:
-        # A verify step that blows its token budget fails closed (not verified).
-        return SessionResult.done(
-            summary=f"{outcome.summary}\n{over}",
-            tokens_in=outcome.tokens_in,
-            tokens_out=outcome.tokens_out,
-            cost_usd=outcome.cost_usd,
-            verified=False,
-        )
     verdict = _parse_verdict(outcome.summary)
     if verdict is None:
         passed = False
@@ -398,18 +520,18 @@ def _run_verify_traced(
         task=spec.task,
         payload={
             "verified": passed,
-            "tokens_in": outcome.tokens_in,
-            "tokens_out": outcome.tokens_out,
-            "cost_usd": outcome.cost_usd,
+            "tokens_in": total_tokens_in,
+            "tokens_out": total_tokens_out,
+            "cost_usd": total_cost_usd,
         },
     )
     return SessionResult.done(
         summary=summary,
-        tokens_in=outcome.tokens_in,
-        tokens_out=outcome.tokens_out,
-        cost_usd=outcome.cost_usd,
+        tokens_in=total_tokens_in,
+        tokens_out=total_tokens_out,
+        cost_usd=total_cost_usd,
         verified=passed,
-        claude_session_id=outcome.claude_session_id,
+        agent_session_id=outcome.agent_session_id,
     )
 
 
@@ -450,6 +572,17 @@ def _parse_ghost(summary: str) -> str | None:
     if not text or text.lower().startswith(_GHOST_NOTHING):
         return None
     return text[:_GHOST_MAX_CHARS]
+
+
+def _parse_still_working(summary: str) -> str | None:
+    """Extract the agent's still-working reason, trusting the last marker.
+
+    Returns ``None`` when no marker is present.
+    """
+    matches = list(_STILL_WORKING_RE.finditer(summary))
+    if not matches:
+        return None
+    return matches[-1].group(1).strip()
 
 
 def _tail(text: str, limit: int = 2000) -> str:

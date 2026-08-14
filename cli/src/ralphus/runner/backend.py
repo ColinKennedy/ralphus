@@ -28,7 +28,7 @@ class BackendOutcome:
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
-    claude_session_id: str | None = None
+    agent_session_id: str | None = None
 
 
 @runtime_checkable
@@ -42,13 +42,34 @@ class ModelBackend(Protocol):
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         """Run ``prompt`` to completion, using ``workspace`` for file/shell tools.
 
-        ``append_system_prompt``, when set, is delivered to the model as an
-        *appended* system prompt via the backend's own mechanism (never
-        concatenated into ``prompt``). Only the Claude Code backend supports it
-        today; other backends accept the argument but ignore it, and TOML
-        validation blocks non-``claude-code`` agents from setting it (RAL-5).
+        ``append_system_prompt``, when set, must be delivered to the model
+        through *some* real mechanism appropriate to the backend's own
+        harness -- a native flag (Claude Code's ``--append-system-prompt``), a
+        config override (Codex's ``-c developer_instructions=...``), or, as a
+        documented last resort for a harness with no instruction channel at
+        all, folded into the prompt text itself (the same approach
+        ``daemon/src/scheduler.rs`` already uses to deliver ghost-memory
+        context, since that goes to every agent regardless of backend).
+        Silently discarding it is not an acceptable implementation -- callers
+        (``execute.py``) rely on this to deliver ralphus's own internal
+        instructions (non-interactive mode, ghost-note requests, and the
+        ``RALPHUS_VERIFY:`` verdict marker for agent-kind verify steps), and a
+        backend that drops it makes those verify steps fail closed every time.
+        TOML validation additionally allows *user-authored* ``system_prompt``
+        only for backends declared in
+        ``core::schema::agent_supports_system_prompt`` (RAL-5) -- keep that
+        allow-list in sync when a backend gains a real delivery mechanism.
+
+        ``resume_agent_session_id``, when set, tells the backend to resume
+        that exact prior conversation instead of starting a fresh one --
+        used by the daemon's tmux auto-reattach retry after a session's tmux
+        pane vanishes unexpectedly mid-run. Implement this when the
+        underlying harness supports resuming a prior session (Claude Code's
+        ``--resume <id>``, Codex's ``exec resume <thread_id>``); a backend
+        with no such concept accepts the argument and ignores it.
         """
         ...

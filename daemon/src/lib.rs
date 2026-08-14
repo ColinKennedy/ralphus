@@ -68,12 +68,27 @@ pub enum Command {
     Serve {
         /// Port the HTTP API binds to on `127.0.0.1`.
         port: u16,
+        /// SQLite database path. Defaults to `default_db_path()` when unset.
+        /// Explicit only (RAL-164) -- multiple instances (e.g. one per git
+        /// worktree) must each be given a distinct `--db` to get real
+        /// isolation; nothing here auto-picks a path.
+        db: Option<PathBuf>,
     },
     /// Validate a task TOML file offline (no server, no database).
     Validate(String),
     /// Forward arguments raw to the resolved tmux binary (RAL-102). CLI-only —
     /// never exposed over the HTTP API.
     Mux(Vec<String>),
+    /// Ask a running daemon to kill every process it has spawned (sessions,
+    /// verifies, reviews, chats, summaries — everything) and exit.
+    Stop {
+        /// Port the target daemon's HTTP API is listening on.
+        port: u16,
+        /// When true, also mark every in-flight run/guardian as `cancelled`
+        /// in the store instead of leaving them for crash-recovery to
+        /// resume on the next `serve()`.
+        auto_cancel: bool,
+    },
 }
 
 /// Parse daemon CLI arguments (excluding the program name).
@@ -85,11 +100,19 @@ pub fn parse_args(args: &[String]) -> Command {
     match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => Command::Version,
         Some("serve") => {
-            let port = parse_port_flag(&args[1..]).unwrap_or(DEFAULT_PORT);
-            Command::Serve { port }
+            let tail = &args[1..];
+            let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
+            let db = parse_db_flag(tail);
+            Command::Serve { port, db }
         }
         Some("validate") => Command::Validate(args.get(1).cloned().unwrap_or_default()),
         Some("mux") => Command::Mux(args[1..].to_vec()),
+        Some("stop") => {
+            let tail = &args[1..];
+            let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
+            let auto_cancel = tail.iter().any(|a| a == "--auto-cancel");
+            Command::Stop { port, auto_cancel }
+        }
         _ => Command::Help,
     }
 }
@@ -105,11 +128,22 @@ fn parse_port_flag(tail: &[String]) -> Option<u16> {
     None
 }
 
+/// Extract `--db <path>` from the argument tail, if present.
+fn parse_db_flag(tail: &[String]) -> Option<PathBuf> {
+    let mut it = tail.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--db" {
+            return it.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
 /// The usage string shown for `help` / unknown commands.
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    version           Print version and exit\n    help              Print this message\n",
+        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    version           Print version and exit\n    help              Print this message\n",
         ralphus_core::version()
     )
 }
@@ -160,7 +194,10 @@ mod tests {
     fn parses_serve() {
         assert_eq!(
             parse_args(&args(&["serve"])),
-            Command::Serve { port: DEFAULT_PORT }
+            Command::Serve {
+                port: DEFAULT_PORT,
+                db: None
+            }
         );
     }
 
@@ -168,7 +205,10 @@ mod tests {
     fn serve_honors_port_flag() {
         assert_eq!(
             parse_args(&args(&["serve", "--port", "9000"])),
-            Command::Serve { port: 9000 }
+            Command::Serve {
+                port: 9000,
+                db: None
+            }
         );
     }
 
@@ -176,7 +216,38 @@ mod tests {
     fn serve_ignores_bad_port() {
         assert_eq!(
             parse_args(&args(&["serve", "--port", "notaport"])),
-            Command::Serve { port: DEFAULT_PORT }
+            Command::Serve {
+                port: DEFAULT_PORT,
+                db: None
+            }
+        );
+    }
+
+    #[test]
+    fn serve_honors_db_flag() {
+        assert_eq!(
+            parse_args(&args(&["serve", "--db", "C:/tmp/tasks-9000.db"])),
+            Command::Serve {
+                port: DEFAULT_PORT,
+                db: Some(PathBuf::from("C:/tmp/tasks-9000.db"))
+            }
+        );
+    }
+
+    #[test]
+    fn serve_honors_port_and_db_flags_together() {
+        assert_eq!(
+            parse_args(&args(&[
+                "serve",
+                "--port",
+                "9000",
+                "--db",
+                "C:/tmp/tasks-9000.db"
+            ])),
+            Command::Serve {
+                port: 9000,
+                db: Some(PathBuf::from("C:/tmp/tasks-9000.db"))
+            }
         );
     }
 
@@ -218,7 +289,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_stop_with_defaults() {
+        assert_eq!(
+            parse_args(&args(&["stop"])),
+            Command::Stop {
+                port: DEFAULT_PORT,
+                auto_cancel: false
+            }
+        );
+    }
+
+    #[test]
+    fn stop_honors_port_and_auto_cancel_flags() {
+        assert_eq!(
+            parse_args(&args(&["stop", "--port", "9000", "--auto-cancel"])),
+            Command::Stop {
+                port: 9000,
+                auto_cancel: true
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["stop", "--auto-cancel", "--port", "9000"])),
+            Command::Stop {
+                port: 9000,
+                auto_cancel: true
+            }
+        );
+    }
+
+    #[test]
     fn usage_mentions_serve() {
         assert!(usage().contains("serve"));
+    }
+
+    #[test]
+    fn usage_mentions_stop() {
+        assert!(usage().contains("stop"));
     }
 }

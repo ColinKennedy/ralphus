@@ -14,11 +14,9 @@ from typing import Any
 import pytest
 
 from ralphus.runner.backend import BackendError
-from ralphus.runner.claude_code_backend import (
-    ClaudeCodeBackend,
-    _write_prompt_file,
-    live_session_path,
-)
+from ralphus.runner.claude_code_backend import ClaudeCodeBackend
+from ralphus.runner.cli_agent_common import live_session_path
+from ralphus.runner.cli_agent_common import write_prompt_file as _write_prompt_file
 from ralphus.runner.tools import Workspace
 
 
@@ -35,8 +33,7 @@ def _result_event(
             "subtype": "success",
             "result": result,
             "session_id": session_id,
-            "total_input_tokens": tokens_in,
-            "total_output_tokens": tokens_out,
+            "usage": {"input_tokens": tokens_in, "output_tokens": tokens_out},
             "total_cost_usd": cost,
         }
     )
@@ -77,12 +74,23 @@ def test_builds_headless_subscription_command(
         captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
         captured["prompt"] = _prompt_from_cmd(cmd)
-        return _FakePopen(0, stdout_lines=[_result_event("did the thing")])
+        return _FakePopen(
+            0,
+            stdout_lines=[
+                _result_event("did the thing", tokens_in=123, tokens_out=45, cost=0.0678)
+            ],
+        )
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     outcome = ClaudeCodeBackend().run("make a file", ws, model="sonnet")
 
     assert outcome.summary == "did the thing"
+    # Regression guard: the real CLI's "result" event nests token counts under
+    # a "usage" object rather than top-level total_input_tokens/
+    # total_output_tokens fields -- see _result_event's shape above.
+    assert outcome.tokens_in == 123
+    assert outcome.tokens_out == 45
+    assert outcome.cost_usd == pytest.approx(0.0678)
     cmd = captured["cmd"]
     assert cmd[1] == "-p"
     assert cmd[2].startswith("@")
@@ -171,6 +179,55 @@ def test_no_append_system_prompt_flag_when_unset(
     assert "--append-system-prompt" not in captured["cmd"]
 
 
+def test_resume_maps_to_cli_flag_and_replaces_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`resume_agent_session_id` adds `--resume <id>` and swaps in a short
+    continuation directive instead of re-sending the original prompt (the
+    daemon's tmux auto-reattach retry — see PSMUX_CRASH_NOTES.local.md)."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        captured["cmd"] = cmd
+        captured["prompt"] = _prompt_from_cmd(cmd)
+        return _FakePopen(0, stdout_lines=[_result_event("resumed and finished")])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = ClaudeCodeBackend().run(
+        "the original long task prompt",
+        ws,
+        model=None,
+        resume_agent_session_id="dropped-session-abc",
+    )
+
+    assert outcome.summary == "resumed and finished"
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--resume") + 1] == "dropped-session-abc"
+    # The original prompt is NOT re-sent -- the resumed conversation already
+    # has it in history; re-sending it would look like a second, new request.
+    assert captured["prompt"] != "the original long task prompt"
+    assert "continue" in captured["prompt"].lower()
+
+
+def test_no_resume_flag_when_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        captured["cmd"] = cmd
+        captured["prompt"] = _prompt_from_cmd(cmd)
+        return _FakePopen(0, stdout_lines=[_result_event("ok")])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    ClaudeCodeBackend().run("the real prompt", ws, model=None)
+
+    assert "--resume" not in captured["cmd"]
+    assert captured["prompt"] == "the real prompt"
+
+
 def test_program_is_overridable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ws = Workspace.create(str(tmp_path))
     monkeypatch.setenv("RALPHUS_CLAUDE_COMMAND", "my-claude")
@@ -226,7 +283,7 @@ def test_session_id_written_to_temp_file(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     outcome = ClaudeCodeBackend().run("task", ws, model=None)
 
-    assert outcome.claude_session_id == "abc-123"
+    assert outcome.agent_session_id == "abc-123"
     assert "abc-123" in written_sid, "session ID was not written to live_session file"
 
 

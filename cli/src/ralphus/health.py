@@ -5,10 +5,10 @@ Checks are grouped into sections:
 - ``core``: things every user needs (daemon reachable, git, every registered
   project's on-disk path/git-repo validity (RAL-100+), the runner binary,
   Ollama for local-model runs, ``nvidia-smi`` for GPU metrics in the
-  resource view, ``$RALPHUS_CLAUDE_COMMAND`` when set (RAL-110)). These are
-  hard requirements (`fail`) — Ollama included, since it is what runs local
-  models — except ``nvidia-smi``, which is advisory (`warn`): the GPU column
-  in the resource view degrades to N/A without it.
+  resource view, ``$RALPHUS_CLAUDE_COMMAND``/``$RALPHUS_CODEX_CMD`` when set
+  (RAL-110)). These are hard requirements (`fail`) — Ollama included, since
+  it is what runs local models — except ``nvidia-smi``, which is advisory
+  (`warn`): the GPU column in the resource view degrades to N/A without it.
 - ``developer``: things only someone building/authoring against ralphus
   needs (``cargo`` to build the Rust binaries; pydantic-ai — the ``runner``
   extra — for ``ralphus author``). Both are hard `fail`s here. This whole
@@ -101,10 +101,26 @@ def _check_claude_command() -> CheckResult:
     that path must exist and be executable. A compound command is trusted
     as-is -- there's nothing meaningful to path-check about shell syntax.
     """
-    name = "claude-command"
-    raw = os.environ.get("RALPHUS_CLAUDE_COMMAND")
+    return _check_agent_command("claude-command", "RALPHUS_CLAUDE_COMMAND", "claude")
+
+
+def _check_codex_command() -> CheckResult:
+    """Validate `$RALPHUS_CODEX_CMD`, the Codex-backend analog of RAL-110's
+    `$RALPHUS_CLAUDE_COMMAND` check (see `CodexBackend`).
+    """
+    return _check_agent_command("codex-command", "RALPHUS_CODEX_CMD", "codex")
+
+
+def _check_agent_command(name: str, env_var: str, default_program: str) -> CheckResult:
+    """Shared body of `_check_claude_command`/`_check_codex_command`: when
+    `env_var` names a single bare path (not a compound shell command -- see
+    `is_compound_shell_command`), that path must exist and be executable. A
+    compound command is trusted as-is -- there's nothing meaningful to
+    path-check about shell syntax.
+    """
+    raw = os.environ.get(env_var)
     if raw is None:
-        return CheckResult(name, _PASS, "not set (defaults to 'claude' on PATH)")
+        return CheckResult(name, _PASS, f"not set (defaults to '{default_program}' on PATH)")
     if is_compound_shell_command(raw):
         return CheckResult(name, _PASS, f"compound shell command, not path-checked: {raw}")
     path = unquote_path(raw)
@@ -284,6 +300,7 @@ def run_checks(daemon_url: str, *, enable_developer_checks: bool = False) -> lis
         _check_nvidia_smi(),
         _check_config(),
         _check_claude_command(),
+        _check_codex_command(),
     ]
     if enable_developer_checks:
         results += [

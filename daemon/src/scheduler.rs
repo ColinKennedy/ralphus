@@ -17,7 +17,6 @@ use crate::cancel::{CancelToken, Cancellations};
 use crate::otel;
 use crate::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 use crate::store::{NodeState, RunState, SessionOutcome, Store};
-use crate::verify;
 
 /// How long a worker holds nothing; the poll interval between ticks.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -193,7 +192,7 @@ pub fn tick(
     if crate::config::scheduler_in_downtime() {
         return;
     }
-    let to_start = claim_ready(store);
+    let to_start = claim_ready(store, cancellations);
     for run_id in to_start {
         let store = Arc::clone(store);
         let runner = Arc::clone(runner);
@@ -221,11 +220,26 @@ pub fn tick(
 /// it) and return the claimed ids. Readiness — Pending with cross-run deps Done
 /// — is decided by [`Store::list_ready`]; the concurrency cap is enforced later,
 /// per session, by the shared [`Semaphore`].
-fn claim_ready(store: &Arc<Mutex<Store>>) -> Vec<String> {
+///
+/// A run whose worker is still registered (`cancellations.is_active`) is
+/// skipped even if the store shows it `Pending` — a targeted restart
+/// (`server::restart_session`/`restart_session_verify`/`restart_task_verify`)
+/// may reset a run to `Pending` without stopping that run's still-live
+/// worker when the restarted target is already terminal, specifically so it
+/// doesn't have to cancel unrelated sibling sessions the same worker is
+/// still driving (RAL-1xx). Claiming the run again here, while that worker
+/// is still going, would double-dispatch it — the exact race the old
+/// unconditional cancel-and-wait dance existed to prevent. Deferring is
+/// safe: once the live worker finishes and removes its token, the next tick
+/// claims the run fresh and picks up whatever was reset in the meantime.
+fn claim_ready(store: &Arc<Mutex<Store>>, cancellations: &Cancellations) -> Vec<String> {
     let guard = store.lock().expect("store mutex poisoned");
     let ready = guard.list_ready().unwrap_or_default();
     let mut claimed = Vec::new();
     for run_id in ready {
+        if cancellations.is_active(&run_id) {
+            continue;
+        }
         if guard.set_run_state(&run_id, RunState::Running).is_ok() {
             // A short-lived span for the claim itself (RAL-96) — continues the
             // trace persisted at submit time, if any. Session/verify execution
@@ -326,6 +340,14 @@ struct Progress {
     /// Task indices with at least one failed session, session-verify, or
     /// task-verify — i.e. tasks that must finalize as `Failed`.
     failed: HashSet<i64>,
+    /// Task indices whose finalizer (`run_task_finalizer`) has *completed* —
+    /// its own task-level verify has run and its terminal state is decided
+    /// (check `failed` for which). Distinct from a task's sessions merely
+    /// reaching `SessState::Done`: a `task_deps` entry (see `plan::ExecutionPlan`)
+    /// must wait for membership here, not just for its sessions, so a
+    /// task-name dependent never starts before the upstream task's own
+    /// fmt/clippy/test-style verify has actually finished.
+    task_finalized: HashSet<i64>,
 }
 
 /// Execute a run's sessions concurrently: a session starts the moment all its
@@ -480,6 +502,7 @@ fn execute_run_inner(
                     .map(|&(task_idx, _)| task_idx),
             )
             .collect(),
+        task_finalized: HashSet::new(),
     });
 
     // Indices of sessions that need verify-only dispatch (precomputed so the
@@ -542,6 +565,77 @@ fn execute_run_inner(
             if cancel.is_cancelled() {
                 return;
             }
+
+            // RAL-1xx: a sibling task in this same run may have been restarted
+            // via `server::restart_session`/`restart_session_verify`/
+            // `restart_task_verify` without cancelling *this* worker — those
+            // handlers skip cancellation when the restart target was already
+            // terminal, specifically so they don't collaterally kill sessions
+            // this worker is still actively driving (see their doc comments).
+            // That means a task this worker already finalized as Done/Failed
+            // can have its row (and its sessions') reset to Pending in the
+            // store out from under it. Reconcile that before deciding what to
+            // dispatch this pass, so the restarted sibling starts on this same
+            // worker immediately — with whatever concurrency slots are free —
+            // instead of sitting Pending until the whole run drains and a
+            // fresh worker gets claimed for it.
+            {
+                let (reclaimed_tasks, reclaimed_sessions): (Vec<i64>, Vec<usize>) = {
+                    let guard = store.lock().expect("store mutex poisoned");
+                    let reclaimed_tasks: Vec<i64> = finalized
+                        .iter()
+                        .copied()
+                        .filter(|&t| {
+                            matches!(guard.task_state(run_id, t), Ok(Some(NodeState::Pending)))
+                        })
+                        .collect();
+                    let reclaimed_sessions: Vec<usize> = reclaimed_tasks
+                        .iter()
+                        .flat_map(|t| task_sessions.get(t).into_iter().flatten().copied())
+                        .filter(|&i| {
+                            let row = &sessions[i];
+                            matches!(
+                                guard.session_state(run_id, row.task_idx, row.idx),
+                                Ok(Some(NodeState::Pending))
+                            )
+                        })
+                        .collect();
+                    (reclaimed_tasks, reclaimed_sessions)
+                };
+                if !reclaimed_tasks.is_empty() {
+                    for &t in &reclaimed_tasks {
+                        finalized.remove(&t);
+                    }
+                    let mut prog = progress.lock().expect("progress mutex poisoned");
+                    for &t in &reclaimed_tasks {
+                        prog.failed.remove(&t);
+                        prog.task_finalized.remove(&t);
+                    }
+                    for &i in &reclaimed_sessions {
+                        prog.status[i] = SessState::Pending;
+                        prog.summaries[i] = None;
+                    }
+                }
+            }
+
+            // RAL-157: read live so a solo/unsolo toggled mid-run takes effect
+            // on this very pass, not just at the run's next (re)start. While
+            // any task in the run is soloed, a not-yet-started session may
+            // only dispatch if its own task is one of the soloed ones — this
+            // applies uniformly regardless of whether `deps`/`task_deps` are
+            // already satisfied, so a dependent of a *finished* soloed task
+            // still stays paused until the run is un-soloed (a soloed task
+            // completing must not let its dependents race ahead). Sessions
+            // already `Running` are left alone — there is no per-session
+            // interrupt in this codebase (see `Cancellations`), so pausing an
+            // in-flight session's task only takes effect at its next session.
+            let soloed_tasks = store
+                .lock()
+                .expect("store mutex poisoned")
+                .soloed_task_indices(run_id)
+                .unwrap_or_default();
+            let any_soloed = !soloed_tasks.is_empty();
+
             let mut to_dispatch: Vec<usize> = Vec::new();
             let mut blocked: Vec<usize> = Vec::new();
             let mut to_finalize: Vec<i64> = Vec::new();
@@ -557,16 +651,38 @@ fn execute_run_inner(
                         SessState::Running => active = true,
                         SessState::Pending => {
                             let deps = &plan.deps[i];
-                            if deps.iter().any(|&d| prog.status[d] == SessState::Failed) {
+                            let task_deps = &plan.task_deps[i];
+                            let session_dep_failed =
+                                deps.iter().any(|&d| prog.status[d] == SessState::Failed);
+                            // A task-name dependency only counts as failed once that
+                            // task has actually finalized as Failed — a task whose
+                            // sessions are still in flight isn't failed yet.
+                            let task_dep_failed = task_deps.iter().any(|&t| {
+                                prog.task_finalized.contains(&t) && prog.failed.contains(&t)
+                            });
+                            if session_dep_failed || task_dep_failed {
                                 prog.status[i] = SessState::Failed;
                                 prog.failed.insert(sessions[i].task_idx);
                                 blocked.push(i);
-                            } else if deps.iter().all(|&d| prog.status[d] == SessState::Done) {
-                                prog.status[i] = SessState::Running;
-                                to_dispatch.push(i);
-                                active = true;
                             } else {
-                                active = true;
+                                let sessions_ready =
+                                    deps.iter().all(|&d| prog.status[d] == SessState::Done);
+                                // A task-name dependency isn't satisfied by its
+                                // sessions reaching Done alone — it must wait for
+                                // that task's own finalizer (task-level verify) to
+                                // actually complete, or a dependent starts racing
+                                // ahead of its upstream's fmt/clippy/test.
+                                let tasks_ready =
+                                    task_deps.iter().all(|&t| prog.task_finalized.contains(&t));
+                                let solo_ok =
+                                    !any_soloed || soloed_tasks.contains(&sessions[i].task_idx);
+                                if sessions_ready && tasks_ready && solo_ok {
+                                    prog.status[i] = SessState::Running;
+                                    to_dispatch.push(i);
+                                    active = true;
+                                } else {
+                                    active = true;
+                                }
                             }
                         }
                     }
@@ -602,7 +718,7 @@ fn execute_run_inner(
                     tokens_out: 0,
                     cost_usd: 0.0,
                     error: Some("blocked by a failed dependency".to_string()),
-                    claude_session_id: None,
+                    agent_session_id: None,
                 };
                 let guard = store.lock().expect("store mutex poisoned");
                 let _ = guard.set_session_state(run_id, row.task_idx, row.idx, NodeState::Failed);
@@ -862,6 +978,11 @@ fn run_session_worker(
         spec.prompt = spec.prompt.map(|p| format!("{ctx}{p}"));
     }
     spec.trace_context = session_trace_context.clone();
+    spec.env_overrides = store
+        .lock()
+        .expect("store mutex poisoned")
+        .resolve_session_env_overrides(run_id, row.task_idx, row.idx)
+        .unwrap_or_default();
 
     // If this session declares an upstream task ref, rebase its branch onto
     // the dependency's current branch tip before handing off to the runner.
@@ -872,7 +993,7 @@ fn run_session_worker(
             tokens_out: 0,
             cost_usd: 0.0,
             error: Some(rebase_err.clone()),
-            claude_session_id: None,
+            agent_session_id: None,
         };
         {
             let guard = store.lock().expect("store mutex poisoned");
@@ -915,7 +1036,7 @@ fn run_session_worker(
         tokens_out: result.tokens_out,
         cost_usd: result.cost_usd,
         error: result.error.clone(),
-        claude_session_id: result.claude_session_id.clone(),
+        agent_session_id: result.agent_session_id.clone(),
     };
     {
         let guard = store.lock().expect("store mutex poisoned");
@@ -997,7 +1118,7 @@ fn run_session_worker(
     // the session is published `Done`, so a dependant (e.g. finalize) still
     // waits for the verifies to finish — matching the old sequential order.
     let cwd = row.cwd.clone().unwrap_or_default();
-    let verified = run_verifies(
+    let verify_outcome = run_verifies(
         store,
         runner,
         run_id,
@@ -1011,14 +1132,40 @@ fn run_session_worker(
         cancel,
         session_trace_context.as_deref(),
     );
+    // RAL-152: fold the ground-truth verify outcome onto this session's own
+    // ghost, independent of whatever the agent self-reported above -- so a
+    // restarted session reading its own ghost gets a reliable "the prior
+    // attempt was already working" signal.
+    note_verify_outcome(
+        store,
+        &verify_outcome,
+        &crate::ghost::session_uri(run_id, row.task_idx, row.idx),
+        run_id,
+        &row.session_id,
+        &row.task_name,
+        &cwd,
+        cancel,
+    );
     // Publish the terminal status and the failure flag together, so the
     // dispatcher never sees this session Done before its verify verdict is
     // recorded — otherwise a task finalizer could launch and mark the task Done
-    // while a failing session-verify is still in flight.
+    // while a failing session-verify is still in flight. A failed verify
+    // publishes `SessState::Failed`, not `Done` — the dispatch loop's
+    // same-run `depends_on` check (above, in the caller's caller) only ever
+    // consults `SessState`, never `prog.failed` (task-scoped, used by
+    // `run_task_finalizer`), so a same-run dependent (e.g. `finalize`) would
+    // otherwise be dispatched right past a failing prerequisite the instant
+    // its verify verdict lands. This reuses the exact same `SessState::Failed`
+    // handling the body-failure branch above already relies on to block/
+    // cascade to dependents — no dispatcher change needed.
     let mut prog = progress.lock().expect("progress mutex poisoned");
     prog.summaries[i] = Some(result.summary.clone());
-    prog.status[i] = SessState::Done;
-    if !verified {
+    prog.status[i] = if verify_outcome.all_ok {
+        SessState::Done
+    } else {
+        SessState::Failed
+    };
+    if !verify_outcome.all_ok {
         prog.failed.insert(row.task_idx);
     }
 }
@@ -1061,7 +1208,7 @@ fn run_verify_only_worker(
         let _ = guard.set_task_state(run_id, row.task_idx, NodeState::Running);
     }
     let cwd = row.cwd.clone().unwrap_or_default();
-    let verified = run_verifies(
+    let verify_outcome = run_verifies(
         store,
         runner,
         run_id,
@@ -1075,9 +1222,31 @@ fn run_verify_only_worker(
         cancel,
         span_trace_context.as_deref(),
     );
+    // RAL-152: same ground-truth ghost note as `run_session_worker` — applies
+    // here too since a verify-only restart (`restart_session_verify`) is one
+    // of the paths this ticket calls out explicitly.
+    note_verify_outcome(
+        store,
+        &verify_outcome,
+        &crate::ghost::session_uri(run_id, row.task_idx, row.idx),
+        run_id,
+        &row.session_id,
+        &row.task_name,
+        &cwd,
+        cancel,
+    );
+    // Same fix as `run_session_worker`'s equivalent publish step (see its
+    // comment): a failed verify must publish `SessState::Failed`, not
+    // `Done`, so the same-run `depends_on` dispatch loop actually blocks a
+    // dependent instead of only recording the failure in the task-scoped
+    // `prog.failed` set that loop never reads.
     let mut prog = progress.lock().expect("progress mutex poisoned");
-    prog.status[i] = SessState::Done;
-    if !verified {
+    prog.status[i] = if verify_outcome.all_ok {
+        SessState::Done
+    } else {
+        SessState::Failed
+    };
+    if !verify_outcome.all_ok {
         prog.failed.insert(row.task_idx);
     }
 }
@@ -1148,7 +1317,7 @@ fn run_task_finalizer(
                 let _ = guard.set_task_state(run_id, task_idx, NodeState::Running);
             }
         }
-        if !run_verifies(
+        let verify_outcome = run_verifies(
             store,
             runner,
             run_id,
@@ -1161,7 +1330,26 @@ fn run_task_finalizer(
             model.as_deref(),
             cancel,
             span_trace_context.as_deref(),
-        ) {
+        );
+        // RAL-152: task-level verify has no ghost of its own (ghosts are keyed
+        // per session/review, see `ghost.rs`), so fold the ground-truth
+        // outcome onto the task's representative session's ghost instead —
+        // the same session whose `cwd`/`agent`/`model` this task-level verify
+        // already borrowed above, and the one a restart of that session
+        // actually reads back.
+        if let Some(ts) = task_session {
+            note_verify_outcome(
+                store,
+                &verify_outcome,
+                &crate::ghost::session_uri(run_id, task_idx, ts.idx),
+                run_id,
+                &ts.session_id,
+                &task_name,
+                &cwd,
+                cancel,
+            );
+        }
+        if !verify_outcome.all_ok {
             failed = true;
             progress
                 .lock()
@@ -1181,6 +1369,17 @@ fn run_task_finalizer(
     } else {
         NodeState::Done
     };
+    // Mark this task finalized (regardless of `did_write` below — even if the
+    // store write is skipped because a mid-flight edit reset the run, this
+    // dispatcher pass's `progress` instance is being abandoned either way, so
+    // any dependent still consulting `task_finalized` this pass should see
+    // the true outcome) so a `task_deps` entry waiting on this task's own
+    // finalizer (not just its sessions) can now proceed or cascade-fail.
+    progress
+        .lock()
+        .expect("progress mutex poisoned")
+        .task_finalized
+        .insert(task_idx);
     let did_write = {
         let guard = store.lock().expect("store mutex poisoned");
         // Don't clobber a run an edit reset to Pending mid-flight (mirrors the
@@ -1421,8 +1620,23 @@ fn resolve_handoffs(prompt: &str, dep_positions: &[usize], summaries: &[Option<S
     out
 }
 
+/// Ground-truth outcome of a [`run_verifies`] pass, for the RAL-152
+/// daemon-injected ghost note (see [`crate::ghost::verify_outcome_note`]) —
+/// distinct from a plain `bool`, since callers need to know whether any step
+/// actually ran before claiming anything was validated (a scope with no
+/// verify steps at all must not be reported as "passed").
+struct VerifyOutcome {
+    /// `true` iff every step that ran passed (vacuously `true` when none ran).
+    all_ok: bool,
+    /// How many verify steps actually executed (`ignored` steps and
+    /// deferred/unimplemented kinds skipped via `continue` don't count).
+    steps_run: usize,
+    /// How many of `steps_run` passed.
+    steps_passed: usize,
+}
+
 /// Run the `command` and `prompt` verify steps of one scope, updating each
-/// step's state. Returns false if any of them fails. Other verifier kinds
+/// step's state. `all_ok` is false if any of them fails. Other verifier kinds
 /// (`brain` / `approval`) are still deferred and left pending.
 ///
 /// `agent` verifiers run through the same [`Runner`] as sessions do — a
@@ -1444,8 +1658,17 @@ fn run_verifies(
     session_model: Option<&str>,
     cancel: &CancelToken,
     trace_context: Option<&str>,
-) -> bool {
+) -> VerifyOutcome {
     let cx = otel::context_from_traceparent(trace_context);
+    let env_overrides = {
+        let guard = store.lock().expect("store mutex poisoned");
+        if scope == "task" {
+            guard.resolve_task_verify_env_overrides(run_id, task_idx)
+        } else {
+            guard.resolve_session_verify_env_overrides(run_id, task_idx, session_idx)
+        }
+        .unwrap_or_default()
+    };
     let specs = {
         let guard = store.lock().expect("store mutex poisoned");
         guard
@@ -1453,9 +1676,15 @@ fn run_verifies(
             .unwrap_or_default()
     };
     let mut all_ok = true;
+    let mut steps_run = 0usize;
+    let mut steps_passed = 0usize;
     for (idx, kind, spec, verify_model, verify_timeout, verify_budget) in specs {
         if cancel.is_cancelled() {
-            return all_ok;
+            return VerifyOutcome {
+                all_ok,
+                steps_run,
+                steps_passed,
+            };
         }
         // A user may have manually set this step to `ignored` (RAL Queue /
         // set-status) while an earlier step in this same scope was still
@@ -1501,7 +1730,33 @@ fn run_verifies(
                     });
                 }
                 set_verify_running(store, run_id, task_idx, scope, session_idx, idx);
-                let (passed, output) = verify::run_command_verify_capture(cwd, &spec, &cx);
+                // RAL-151: run through the same `Runner` (tmux-wrapped) path
+                // a `prompt`-kind verify step already does, rather than
+                // `verify::run_command_verify_capture` directly, so it can
+                // be watched live and reuses the exact same peek/pane-
+                // capture endpoints (keyed by `verify-{scope}-{idx}`, which
+                // `server.rs::verify_tmux_keys` already assumes for any
+                // verify kind).
+                let verify_span =
+                    otel::start_span("scheduler.verify_command", &cx, SpanKind::Internal);
+                let mut runner_spec = RunnerSpec::for_command_verify(
+                    run_id,
+                    task_name,
+                    &format!("verify-{scope}-{idx}"),
+                    cwd,
+                    &spec,
+                    session_agent,
+                    verify_timeout.and_then(|s| u64::try_from(s).ok()),
+                );
+                runner_spec.trace_context = otel::traceparent_from_context(&verify_span.cx);
+                runner_spec.env_overrides = env_overrides.clone();
+                let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
+                let passed = result.is_done();
+                let output = match &result.error {
+                    Some(err) if result.summary.is_empty() => err.clone(),
+                    Some(err) => format!("{}\n{err}", result.summary),
+                    None => result.summary.clone(),
+                };
                 (passed, output, None)
             }
             "prompt" => {
@@ -1548,6 +1803,7 @@ fn run_verifies(
                     verify_budget.and_then(|b| u64::try_from(b).ok()),
                 );
                 runner_spec.trace_context = otel::traceparent_from_context(&verify_span.cx);
+                runner_spec.env_overrides = env_overrides.clone();
                 let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
                 let passed = result.verify_passed();
                 let output = match &result.error {
@@ -1555,7 +1811,7 @@ fn run_verifies(
                     Some(err) => format!("{}\n{err}", result.summary),
                     None => result.summary.clone(),
                 };
-                (passed, output, result.claude_session_id)
+                (passed, output, result.agent_session_id)
             }
             "brain" | "approval" | "unknown" => continue, // deferred (intentional; not yet built)
             other => {
@@ -1577,6 +1833,10 @@ fn run_verifies(
                 (false, msg, None)
             }
         };
+        steps_run += 1;
+        if passed {
+            steps_passed += 1;
+        }
         let state = if passed {
             NodeState::Done
         } else {
@@ -1599,7 +1859,63 @@ fn run_verifies(
             all_ok = false;
         }
     }
-    all_ok
+    VerifyOutcome {
+        all_ok,
+        steps_run,
+        steps_passed,
+    }
+}
+
+/// Fold a daemon-observed (ground-truth) verify outcome onto the ghost at
+/// `uri` (RAL-152), independent of whatever the owning agent self-reported —
+/// so a restarted session/resolver has a reliable "was the prior attempt
+/// already working" signal even when the agent didn't self-report a ghost at
+/// all. No-op when no verify step actually ran (`steps_run == 0`, so there is
+/// nothing to ground the claim in) or the run was cancelled mid-verify (a
+/// partial pass is not a meaningful signal either way).
+#[allow(clippy::too_many_arguments)]
+fn note_verify_outcome(
+    store: &Arc<Mutex<Store>>,
+    outcome: &VerifyOutcome,
+    uri: &str,
+    run_id: &str,
+    session_id: &str,
+    task_name: &str,
+    cwd: &str,
+    cancel: &CancelToken,
+) {
+    if outcome.steps_run == 0 || cancel.is_cancelled() {
+        return;
+    }
+    let note = crate::ghost::verify_outcome_note(outcome.steps_passed, outcome.steps_run);
+    let revision = crate::ghost::current_revision(cwd);
+    let guard = store.lock().expect("store mutex poisoned");
+    if guard
+        .upsert_ghost(
+            uri,
+            crate::ghost::KIND_SESSION,
+            Some(run_id),
+            None,
+            &note,
+            revision.as_deref(),
+        )
+        .is_ok()
+    {
+        crate::cartographer::Note::new("ghost")
+            .run(run_id)
+            .session(session_id)
+            .task(task_name)
+            .scope("session")
+            .emit(
+                &guard,
+                "ghost verify-outcome note recorded",
+                serde_json::json!({
+                    "passed": outcome.all_ok,
+                    "steps_run": outcome.steps_run,
+                    "steps_passed": outcome.steps_passed,
+                }),
+            );
+    }
 }
 
 /// Mark one verify step `Running` before executing it.
@@ -1627,6 +1943,20 @@ mod tests {
     use super::*;
     use crate::runner::{RunnerResult, RunnerSpec};
 
+    /// Simulates the `"exit N"` shell-command convention this test module's
+    /// TOML fixtures use for a `command`-kind verify step. Since RAL-151
+    /// routes `command`-kind verify steps through the same `Runner` sessions
+    /// already use (rather than a real subprocess via
+    /// `verify::run_command_verify_capture`, which genuinely executed the
+    /// shell and observed its exit code), a fake `Runner` that always
+    /// reports success would silently break every test relying on
+    /// `"exit 1"` (or any other nonzero exit) actually failing.
+    fn fake_exit_code_fails(text: &str) -> bool {
+        text.strip_prefix("exit ")
+            .and_then(|n| n.trim().parse::<i32>().ok())
+            .is_some_and(|code| code != 0)
+    }
+
     /// A runner that succeeds or fails based on the session command (or, for
     /// an agent verify spec, its prompt), without any subprocess — lets us
     /// test the scheduler deterministically. Agent verify specs pass unless
@@ -1642,7 +1972,7 @@ mod tests {
                 .clone()
                 .or_else(|| spec.prompt.clone())
                 .unwrap_or_default();
-            if self.fail_on.as_deref() == Some(text.as_str()) {
+            if self.fail_on.as_deref() == Some(text.as_str()) || fake_exit_code_fails(&text) {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
@@ -1653,7 +1983,7 @@ mod tests {
                     summary: "ok".to_string(),
                     error: None,
                     verified: spec.verify.then_some(true),
-                    claude_session_id: None,
+                    agent_session_id: None,
                     ghost: None,
                 }
             }
@@ -1694,7 +2024,7 @@ mod tests {
                 summary: "ok".to_string(),
                 error: None,
                 verified: None,
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             }
         }
@@ -1753,6 +2083,64 @@ mod tests {
         assert_eq!(guard.get_run(&id).unwrap().tasks[0].state, "failed");
     }
 
+    // RAL-157: soloing task 0 ("a") must keep task 1 ("b")'s session Pending
+    // for as long as the solo is active, even though the two tasks have no
+    // dependency between them and would otherwise run concurrently (as
+    // `independent_sessions_run_concurrently` above proves) -- and un-soloing
+    // must let the paused sibling dispatch and the run reach Done.
+    #[test]
+    fn soloing_a_task_pauses_its_independent_sibling_until_unsoloed() {
+        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
+        store.lock().unwrap().solo_task(&id, 0).unwrap();
+
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        let run_store = Arc::clone(&store);
+        let run_id = id.clone();
+        let handle = std::thread::spawn(move || {
+            execute_run(&run_store, runner.as_ref(), &run_id);
+        });
+
+        // Wait for the soloed task to finish.
+        let mut waited = 0;
+        loop {
+            let done = store.lock().unwrap().get_run(&id).unwrap().tasks[0].state == "done";
+            if done {
+                break;
+            }
+            assert!(waited < 200, "soloed task a never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            waited += 1;
+        }
+        // Give the dispatcher several more passes' worth of time to (wrongly)
+        // dispatch task b's session if the solo gate didn't hold.
+        std::thread::sleep(Duration::from_millis(150));
+        {
+            let guard = store.lock().unwrap();
+            let run = guard.get_run(&id).unwrap();
+            assert_eq!(
+                run.tasks[1].state, "pending",
+                "un-soloed task's sibling must stay paused while any task in the run is soloed"
+            );
+            assert_eq!(run.tasks[1].sessions[0].state, "pending");
+            assert_eq!(
+                guard.run_state(&id).unwrap(),
+                RunState::Running,
+                "run can't finish while a task is gated by an active solo"
+            );
+        }
+
+        store.lock().unwrap().unsolo_task(&id, 0).unwrap();
+        handle.join().unwrap();
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.run_state(&id).unwrap(), RunState::Done);
+        assert_eq!(
+            guard.get_run(&id).unwrap().tasks[1].state,
+            "done",
+            "un-soloing resumes the paused sibling"
+        );
+    }
+
     #[test]
     fn tick_claims_and_runs_pending() {
         let (store, id) = store_with(ONE_SESSION);
@@ -1779,7 +2167,7 @@ mod tests {
         let (store, id) = store_with(ONE_SESSION);
         // Claiming is no longer rationed by a run-count limit; every ready run
         // is claimed and the semaphore bounds concurrency per session instead.
-        assert_eq!(claim_ready(&store), vec![id.clone()]);
+        assert_eq!(claim_ready(&store, &Cancellations::new()), vec![id.clone()]);
         let page = store
             .lock()
             .unwrap()
@@ -1877,6 +2265,121 @@ mod tests {
         assert_eq!(run.tasks[0].sessions[0].state, "cancelled");
     }
 
+    /// RAL-1xx follow-up: `server::restart_session` (and friends) now skip
+    /// cancelling a run's worker when the restart target is already
+    /// terminal, so an unrelated still-running sibling isn't collaterally
+    /// killed (see `restart_session_does_not_cancel_unrelated_sibling_session_in_same_run`
+    /// in `server.rs`). But without this reconciliation, the run's *worker*
+    /// itself never learns the restarted task was reset — it already
+    /// finalized that task and won't look at it again — so the restarted
+    /// task would just sit `Pending` in the store until the whole run drains
+    /// and a fresh worker gets claimed for it, silently serializing what
+    /// should be two independent tasks running in parallel. The dispatcher
+    /// loop's reclaim step must pick the restarted task back up on *this*
+    /// same worker, immediately, while task "b" is still genuinely in flight.
+    #[test]
+    fn dispatcher_loop_picks_up_a_sibling_task_restarted_while_the_worker_is_still_running() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// Task "a" fails on its first invocation, succeeds on any later one
+        /// (standing in for "restarted after being fixed"). Task "b" blocks
+        /// for a while so the worker's dispatcher loop stays alive long
+        /// enough to observe "a" being externally restarted mid-flight.
+        struct ReclaimRunner {
+            a_calls: Arc<AtomicUsize>,
+            b_started: Arc<AtomicBool>,
+        }
+        impl Runner for ReclaimRunner {
+            fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+                if spec.task == "a" {
+                    let n = self.a_calls.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        RunnerResult::failure("first attempt fails")
+                    } else {
+                        RunnerResult {
+                            status: "done".to_string(),
+                            tokens_in: 1,
+                            tokens_out: 1,
+                            cost_usd: 0.0,
+                            summary: "a retried ok".to_string(),
+                            error: None,
+                            verified: None,
+                            agent_session_id: None,
+                            ghost: None,
+                        }
+                    }
+                } else {
+                    self.b_started.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(400));
+                    RunnerResult {
+                        status: "done".to_string(),
+                        tokens_in: 1,
+                        tokens_out: 1,
+                        cost_usd: 0.0,
+                        summary: "b finished".to_string(),
+                        error: None,
+                        verified: None,
+                        agent_session_id: None,
+                        ghost: None,
+                    }
+                }
+            }
+        }
+
+        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
+        let a_calls = Arc::new(AtomicUsize::new(0));
+        let b_started = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn Runner> = Arc::new(ReclaimRunner {
+            a_calls: Arc::clone(&a_calls),
+            b_started: Arc::clone(&b_started),
+        });
+        let token = CancelToken::new();
+
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+        };
+
+        // Wait for task a's first failure to land, and for b to be genuinely
+        // in flight (proving the worker is alive and busy elsewhere).
+        while a_calls.load(Ordering::SeqCst) < 1 || !b_started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Restart task a's already-failed session at the store level — what
+        // the HTTP handler does without cancelling the worker once the
+        // target is confirmed terminal.
+        store.lock().unwrap().restart_session(&id, 0, 0).unwrap();
+
+        // The still-running worker (not a fresh claim after b finishes) must
+        // pick this up and re-run task a within a few dispatcher-loop ticks.
+        let mut retried = false;
+        for _ in 0..100 {
+            if a_calls.load(Ordering::SeqCst) >= 2 {
+                retried = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            retried,
+            "the still-running worker must re-dispatch the restarted sibling task itself"
+        );
+        assert!(
+            !worker.is_finished(),
+            "task a must be retried while the worker is still alive driving task b, \
+             not only after a fresh re-claim once the whole run drains"
+        );
+
+        worker.join().unwrap();
+    }
+
     const SESSION_PASSING_VERIFY: &str = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do\"\n[[task.session.verify]]\ncommand=\"exit 0\"\n";
     const TASK_FAILING_VERIFY: &str = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do\"\n[[task.verify]]\ncommand=\"exit 1\"\n";
 
@@ -1890,7 +2393,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             let cmd = spec.command.clone().unwrap_or_default();
             self.order.lock().unwrap().push(cmd.clone());
-            if self.fail_on.as_deref() == Some(cmd.as_str()) {
+            if self.fail_on.as_deref() == Some(cmd.as_str()) || fake_exit_code_fails(&cmd) {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
@@ -1901,7 +2404,7 @@ mod tests {
                     summary: format!("did {cmd}"),
                     error: None,
                     verified: None,
-                    claude_session_id: None,
+                    agent_session_id: None,
                     ghost: None,
                 }
             }
@@ -1946,6 +2449,85 @@ mod tests {
         let b = run.tasks[0].sessions.iter().find(|s| s.id == "b").unwrap();
         assert_eq!(b.state, "failed");
         assert_eq!(b.error.as_deref(), Some("blocked by a failed dependency"));
+    }
+
+    // `a`'s own body succeeds, but it carries a session-scope verify that
+    // always fails; `b` depends on `a`.
+    const SESSION_WITH_FAILING_VERIFY_HAS_DEPENDENT: &str = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"a\"\ncwd=\".\"\ncommand=\"cmd-a\"\n[[task.session.verify]]\ncommand=\"exit 1\"\n[[task.session]]\nid=\"b\"\ncwd=\".\"\ncommand=\"cmd-b\"\ndepends_on=[\"a\"]\n";
+
+    #[test]
+    fn dependent_session_is_blocked_when_prerequisites_verify_fails() {
+        // Regression: `a`'s body finishes cleanly, but its own session-scope
+        // verify fails. Before the fix, `run_session_worker` published
+        // `SessState::Done` unconditionally once the verify finished
+        // (recording the failure only in the task-scoped `prog.failed` set,
+        // which the same-run `depends_on` dispatch loop never reads) — so
+        // `b` was dispatched right past a failing prerequisite the instant
+        // `a`'s verify verdict landed, even though `a` itself never
+        // "succeeded" in any meaningful sense. `b` must never run.
+        let (store, id) = store_with(SESSION_WITH_FAILING_VERIFY_HAS_DEPENDENT);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let runner: Arc<dyn Runner> = Arc::new(RecordingRunner {
+            order: Arc::clone(&order),
+            fail_on: None,
+        });
+        execute_run(&store, runner.as_ref(), &id);
+        // RAL-151: the "exit 1" verify step now runs through the same
+        // `Runner` (and so shows up in `order` too) rather than a direct,
+        // unrecorded subprocess — "b" (`cmd-b`) still must never run.
+        assert_eq!(*order.lock().unwrap(), vec!["cmd-a", "exit 1"]);
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Failed
+        );
+        let run = store.lock().unwrap().get_run(&id).unwrap();
+        let b = run.tasks[0].sessions.iter().find(|s| s.id == "b").unwrap();
+        assert_eq!(b.state, "failed");
+        assert_eq!(b.error.as_deref(), Some("blocked by a failed dependency"));
+    }
+
+    const TASK_LEVEL_DEPENDS_ON_HAS_FAILING_UPSTREAM_VERIFY: &str = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\".\"\ncommand=\"cmd-a\"\n[[task.verify]]\ncommand=\"exit 1\"\n\
+         [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n[[task.session]]\ncwd=\".\"\ncommand=\"cmd-b\"\n";
+
+    #[test]
+    fn task_name_dependent_is_blocked_when_upstream_tasks_own_verify_fails() {
+        // Regression: task "b" declares `depends_on = ["a"]` at the TASK
+        // level (a bare task-name reference, not "a/session"). "a"'s session
+        // body finishes cleanly, but "a"'s own task-level verify (run by
+        // `run_task_finalizer`, separately from and after all of "a"'s
+        // sessions) fails. Before the `task_deps` fix, the same-run dispatch
+        // loop resolved a task-name reference purely to "a"'s session
+        // positions — satisfied the instant those sessions reached
+        // `SessState::Done`, before "a"'s task-level verify even started
+        // running. "b" must never run (caught live in production on
+        // 2026-08-11: RAL-142-project-filter-facet started before
+        // RAL-141-project-identifier's own fmt/clippy/test verify finished).
+        let (store, id) = store_with(TASK_LEVEL_DEPENDS_ON_HAS_FAILING_UPSTREAM_VERIFY);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let runner: Arc<dyn Runner> = Arc::new(RecordingRunner {
+            order: Arc::clone(&order),
+            fail_on: None,
+        });
+        execute_run(&store, runner.as_ref(), &id);
+        // RAL-151: the "exit 1" task-level verify now runs through the same
+        // `Runner` (and so shows up in `order` too) rather than a direct,
+        // unrecorded subprocess — "b" (`cmd-b`) still must never run.
+        assert_eq!(*order.lock().unwrap(), vec!["cmd-a", "exit 1"]);
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Failed
+        );
+        let run = store.lock().unwrap().get_run(&id).unwrap();
+        let a_task = run.tasks.iter().find(|t| t.name == "a").unwrap();
+        assert_eq!(a_task.state, "failed");
+        let b_task = run.tasks.iter().find(|t| t.name == "b").unwrap();
+        assert_eq!(b_task.state, "failed");
+        let b_session = b_task.sessions.first().unwrap();
+        assert_eq!(b_session.state, "failed");
+        assert_eq!(
+            b_session.error.as_deref(),
+            Some("blocked by a failed dependency")
+        );
     }
 
     #[test]
@@ -2011,6 +2593,54 @@ mod tests {
         assert_eq!(
             store.lock().unwrap().run_state(&id).unwrap(),
             RunState::Failed
+        );
+    }
+
+    // RAL-152: a daemon-observed verify outcome must be folded onto the
+    // owning session's ghost, independent of the agent's own self-report
+    // (`FakeRunner` never sets `ghost`, so any note found here can only have
+    // come from `note_verify_outcome`).
+    #[test]
+    fn passing_session_verify_notes_validated_outcome_in_ghost() {
+        let (store, id) = store_with(SESSION_PASSING_VERIFY);
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        execute_run(&store, runner.as_ref(), &id);
+        let uri = crate::ghost::session_uri(&id, 0, 0);
+        let ghost = store.lock().unwrap().get_ghost(&uri).unwrap().unwrap();
+        assert!(
+            ghost.content.contains("internally validated"),
+            "expected a ground-truth validated note in the ghost: {}",
+            ghost.content
+        );
+    }
+
+    // Task-level verify has no ghost of its own -- the outcome must land on
+    // the task's representative session's ghost instead (see
+    // `run_task_finalizer`'s call to `note_verify_outcome`).
+    #[test]
+    fn failing_task_verify_notes_unvalidated_outcome_in_ghost() {
+        let (store, id) = store_with(TASK_FAILING_VERIFY);
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        execute_run(&store, runner.as_ref(), &id);
+        let uri = crate::ghost::session_uri(&id, 0, 0);
+        let ghost = store.lock().unwrap().get_ghost(&uri).unwrap().unwrap();
+        assert!(
+            ghost.content.contains("did NOT all pass"),
+            "expected a ground-truth failed note in the ghost: {}",
+            ghost.content
+        );
+    }
+
+    #[test]
+    fn no_verify_steps_writes_no_ghost_note() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do\"\n";
+        let (store, id) = store_with(toml);
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        execute_run(&store, runner.as_ref(), &id);
+        let uri = crate::ghost::session_uri(&id, 0, 0);
+        assert!(
+            store.lock().unwrap().get_ghost(&uri).unwrap().is_none(),
+            "a scope with no verify steps must never claim its work was validated"
         );
     }
 
@@ -2156,7 +2786,7 @@ mod tests {
                 summary: "ok".to_string(),
                 error: None,
                 verified: spec.verify.then_some(true),
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             }
         }
@@ -2221,7 +2851,7 @@ mod tests {
                 summary: "ok".to_string(),
                 error: None,
                 verified: spec.verify.then_some(true),
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             }
         }
@@ -2365,7 +2995,7 @@ mod tests {
                     summary: "ok".to_string(),
                     error: None,
                     verified: spec.verify.then_some(true),
-                    claude_session_id: None,
+                    agent_session_id: None,
                     ghost: None,
                 }
             }
@@ -2465,6 +3095,7 @@ mod tests {
             depends_on: vec![],
             timeout_sec: None,
             budget_tokens: None,
+            maximum_budget_usd: None,
             upstream: None,
         }
     }
@@ -2588,6 +3219,7 @@ mod tests {
             depends_on: vec![],
             timeout_sec: None,
             budget_tokens: None,
+            maximum_budget_usd: None,
             upstream: None,
         };
         let work_row = crate::store::SessionRow {
@@ -2656,7 +3288,7 @@ mod tests {
                 summary: "ok".to_string(),
                 error: None,
                 verified: spec.verify.then_some(true),
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             }
         }

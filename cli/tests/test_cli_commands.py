@@ -25,6 +25,16 @@ class _FakeClient:
     next_run_seq: ClassVar[list[int]] = [1]
     last_register_project: ClassVar[dict[str, Any] | None] = None
     projects: ClassVar[list[dict[str, Any]]] = []
+    retried_runs: ClassVar[list[str]] = []
+    restarted_tasks: ClassVar[list[tuple[str, int]]] = []
+    restarted_sessions: ClassVar[list[tuple[str, int, int]]] = []
+    restarted_session_verifies: ClassVar[list[tuple[str, int, int, int]]] = []
+    restarted_task_verifies: ClassVar[list[tuple[str, int, int]]] = []
+    env_calls: ClassVar[list[dict[str, Any]]] = []
+    task_env_calls: ClassVar[list[dict[str, Any]]] = []
+    task_verify_env_calls: ClassVar[list[dict[str, Any]]] = []
+    session_env_calls: ClassVar[list[dict[str, Any]]] = []
+    session_verify_env_calls: ClassVar[list[dict[str, Any]]] = []
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
@@ -56,7 +66,128 @@ class _FakeClient:
 
     def run(self, run_id: str) -> dict[str, Any]:
         state = _FakeClient.run_states.get(run_id, "done")
-        return {"id": run_id, "state": state, "tasks": [{"name": "build", "state": "done"}]}
+        return {
+            "id": run_id,
+            "state": state,
+            "tasks": [
+                {
+                    "name": "build",
+                    "state": "done",
+                    "sessions": [{"id": "s0", "name": "compile", "verify": [{}, {}]}],
+                    "verify": [{}],
+                }
+            ],
+        }
+
+    def retry_run(self, run_id: str) -> dict[str, Any]:
+        _FakeClient.retried_runs.append(run_id)
+        return {"state": "pending"}
+
+    def restart_task(self, run_id: str, task_idx: int) -> dict[str, Any]:
+        _FakeClient.restarted_tasks.append((run_id, task_idx))
+        return {"state": "pending", "dirtied": []}
+
+    def restart_session(self, run_id: str, task_idx: int, session_idx: int) -> dict[str, Any]:
+        _FakeClient.restarted_sessions.append((run_id, task_idx, session_idx))
+        return {"state": "pending", "dirtied": []}
+
+    def restart_session_verify(
+        self, run_id: str, task_idx: int, session_idx: int, verify_idx: int
+    ) -> dict[str, Any]:
+        _FakeClient.restarted_session_verifies.append((run_id, task_idx, session_idx, verify_idx))
+        return {"state": "pending"}
+
+    def restart_task_verify(self, run_id: str, task_idx: int, verify_idx: int) -> dict[str, Any]:
+        _FakeClient.restarted_task_verifies.append((run_id, task_idx, verify_idx))
+        return {"state": "pending"}
+
+    def set_run_env(
+        self,
+        run_id: str,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.env_calls.append(
+            {"run_id": run_id, "set": set_vars or {}, "unset": unset_vars or []}
+        )
+        return set_vars or {}
+
+    def set_task_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.task_env_calls.append(
+            {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "set": set_vars or {},
+                "unset": unset_vars or [],
+            }
+        )
+        return set_vars or {}
+
+    def set_task_verify_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.task_verify_env_calls.append(
+            {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "set": set_vars or {},
+                "unset": unset_vars or [],
+            }
+        )
+        return set_vars or {}
+
+    def set_session_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        session_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.session_env_calls.append(
+            {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "session_idx": session_idx,
+                "set": set_vars or {},
+                "unset": unset_vars or [],
+            }
+        )
+        return set_vars or {}
+
+    def set_session_verify_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        session_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.session_verify_env_calls.append(
+            {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "session_idx": session_idx,
+                "set": set_vars or {},
+                "unset": unset_vars or [],
+            }
+        )
+        return set_vars or {}
 
     def tasks(self) -> dict[str, Any]:
         return {"runs": [{"id": "run-000000000001", "state": "done", "label": "x"}]}
@@ -115,6 +246,16 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeClient.activated = []
     _FakeClient.run_states = {}
     _FakeClient.next_run_seq = [1]
+    _FakeClient.retried_runs = []
+    _FakeClient.restarted_tasks = []
+    _FakeClient.restarted_sessions = []
+    _FakeClient.restarted_session_verifies = []
+    _FakeClient.restarted_task_verifies = []
+    _FakeClient.env_calls = []
+    _FakeClient.task_env_calls = []
+    _FakeClient.task_verify_env_calls = []
+    _FakeClient.session_env_calls = []
+    _FakeClient.session_verify_env_calls = []
 
 
 def _write(tmp_path: Path, body: str = "[[task]]\nname='t'\n") -> Path:
@@ -370,22 +511,57 @@ def test_submit_wait_reports_failed_as_error(
     assert code == 1
 
 
-def test_submit_dry_run_shows_counts_without_submitting(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_submit_validates_before_submitting_and_blocks_on_invalid_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    body = (
-        "[[task]]\nname='a'\n[[task.session]]\ncwd='.'\ncommand='x'\n"
-        "[[task]]\nname='b'\n[[task.session]]\ncwd='.'\ncommand='y'\n"
-        "[[task.session]]\ncwd='.'\ncommand='z'\n"
-        "[[review]]\nid='r'\n"
-    )
-    code = cli.main(["submit", str(_write(tmp_path, body)), "--dry-run"])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "2 task(s)" in out
-    assert "3 session(s)" in out
-    assert "1 review(s)" in out
+    class _InvalidClient(_FakeClient):
+        def validate(self, _text: str) -> ValidationOutcome:
+            return ValidationOutcome(
+                valid=False, errors=[{"line": 3, "message": "missing cwd"}], warnings=[]
+            )
+
+    monkeypatch.setattr(cli, "DaemonClient", _InvalidClient)
+    code = cli.main(["submit", str(_write(tmp_path))])
+    assert code == 1
+    assert "error [line 3]: missing cwd" in capsys.readouterr().err
     assert not _FakeClient.submissions
+
+
+def test_submit_no_validate_skips_the_validate_pass_even_when_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _InvalidClient(_FakeClient):
+        def validate(self, _text: str) -> ValidationOutcome:
+            raise AssertionError("validate() must not be called with --no-validate")
+
+    monkeypatch.setattr(cli, "DaemonClient", _InvalidClient)
+    code = cli.main(["submit", str(_write(tmp_path)), "--no-validate"])
+    assert code == 0
+    assert _FakeClient.submissions
+
+
+def test_submit_batch_validates_each_file_and_stops_at_the_first_invalid_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _SecondFileInvalidClient(_FakeClient):
+        def validate(self, text: str) -> ValidationOutcome:
+            if "bad" in text:
+                return ValidationOutcome(
+                    valid=False, errors=[{"line": 1, "message": "bad task"}], warnings=[]
+                )
+            return ValidationOutcome(valid=True, errors=[], warnings=[])
+
+    monkeypatch.setattr(cli, "DaemonClient", _SecondFileInvalidClient)
+    (tmp_path / "a-good.toml").write_text("[[task]]\nname='good'\n", encoding="utf-8")
+    (tmp_path / "b-bad.toml").write_text("[[task]]\nname='bad'\n", encoding="utf-8")
+
+    code = cli.main(["submit", str(tmp_path)])
+    assert code == 1
+    assert "error [line 1]: bad task" in capsys.readouterr().err
+    # The batch loop validates file-by-file: `a-good.toml` (sorted first)
+    # submits before `b-bad.toml` is reached and blocks the rest of the batch.
+    assert len(_FakeClient.submissions) == 1
+    assert "name='good'" in _FakeClient.last_submit["text"]
 
 
 def test_status_single_run(capsys: pytest.CaptureFixture[str]) -> None:
@@ -681,3 +857,221 @@ def test_bare_agent_command_lists_agents(capsys: pytest.CaptureFixture[str]) -> 
     code = cli.main(["agent"])
     assert code == 0
     assert "claude-code" in capsys.readouterr().out
+
+
+# ── retry (RAL-150) ────────────────────────────────────────────────────────
+
+
+def test_retry_run_selector_dispatches_to_retry_run(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["retry", "run-000000000001"])
+    assert code == 0
+    assert _FakeClient.retried_runs == ["run-000000000001"]
+    assert "run-000000000001 -> pending" in capsys.readouterr().out
+
+
+def test_retry_task_selector_dispatches_to_restart_task() -> None:
+    code = cli.main(["retry", "run-000000000001/build"])
+    assert code == 0
+    assert _FakeClient.restarted_tasks == [("run-000000000001", 0)]
+
+
+def test_retry_session_selector_dispatches_to_restart_session() -> None:
+    code = cli.main(["retry", "run-000000000001/build/compile"])
+    assert code == 0
+    assert _FakeClient.restarted_sessions == [("run-000000000001", 0, 0)]
+
+
+def test_retry_task_verify_selector_dispatches_to_restart_task_verify() -> None:
+    code = cli.main(["retry", "run-000000000001/build/verify/0"])
+    assert code == 0
+    assert _FakeClient.restarted_task_verifies == [("run-000000000001", 0, 0)]
+
+
+def test_retry_session_verify_selector_dispatches_to_restart_session_verify() -> None:
+    code = cli.main(["retry", "run-000000000001/build/compile/verify/1"])
+    assert code == 0
+    assert _FakeClient.restarted_session_verifies == [("run-000000000001", 0, 0, 1)]
+
+
+def test_retry_unknown_selector_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["retry", "run-000000000001/nonexistent-task"])
+    assert code == 2
+    assert _FakeClient.restarted_tasks == []
+    assert "no task named" in capsys.readouterr().err
+
+
+def test_retry_with_environment_flag_sets_override_before_retrying() -> None:
+    code = cli.main(["retry", "run-000000000001", "--environment", "A=1", "--environment", "B=2"])
+    assert code == 0
+    assert _FakeClient.env_calls == [
+        {"run_id": "run-000000000001", "set": {"A": "1", "B": "2"}, "unset": []}
+    ]
+    assert _FakeClient.retried_runs == ["run-000000000001"]
+
+
+def test_retry_with_unset_environment_flag() -> None:
+    code = cli.main(
+        ["retry", "run-000000000001", "--unset-environment", "A", "--unset-environment", "B"]
+    )
+    assert code == 0
+    assert _FakeClient.env_calls == [{"run_id": "run-000000000001", "set": {}, "unset": ["A", "B"]}]
+
+
+def test_retry_environment_flag_overrides_env_file_on_conflict(tmp_path: Path) -> None:
+    env_file = tmp_path / "vars.env"
+    env_file.write_text("A=from-file\nB=also-from-file\n", encoding="utf-8")
+    code = cli.main(
+        ["retry", "run-000000000001", "--env-file", str(env_file), "--environment", "A=from-flag"]
+    )
+    assert code == 0
+    assert _FakeClient.env_calls == [
+        {
+            "run_id": "run-000000000001",
+            "set": {"A": "from-flag", "B": "also-from-file"},
+            "unset": [],
+        }
+    ]
+
+
+def test_retry_env_file_supports_comments_blanks_and_quotes(tmp_path: Path) -> None:
+    env_file = tmp_path / "vars.env"
+    env_file.write_text(
+        "# a comment\n\nKEY1=plain\nKEY2='single quoted'\nKEY3=\"double quoted\"\n",
+        encoding="utf-8",
+    )
+    code = cli.main(["retry", "run-000000000001", "--env-file", str(env_file)])
+    assert code == 0
+    assert _FakeClient.env_calls == [
+        {
+            "run_id": "run-000000000001",
+            "set": {"KEY1": "plain", "KEY2": "single quoted", "KEY3": "double quoted"},
+            "unset": [],
+        }
+    ]
+
+
+def test_retry_env_file_missing_file_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = cli.main(["retry", "run-000000000001", "--env-file", str(tmp_path / "nope.env")])
+    assert code == 2
+    assert "could not read" in capsys.readouterr().err
+    assert _FakeClient.env_calls == []
+
+
+def test_retry_environment_flag_malformed_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["retry", "run-000000000001", "--environment", "NOEQUALSSIGN"])
+    assert code == 2
+    assert "expects KEY=VAL" in capsys.readouterr().err
+    assert _FakeClient.env_calls == []
+    assert _FakeClient.retried_runs == []
+
+
+def test_retry_without_environment_flags_does_not_call_set_run_env() -> None:
+    code = cli.main(["retry", "run-000000000001"])
+    assert code == 0
+    assert _FakeClient.env_calls == []
+
+
+# ── hierarchical env overrides (RAL-150 extension): --environment targets
+# the level the selector itself names, not always the run ─────────────────
+
+
+def test_retry_task_selector_with_environment_sets_task_env_not_run_env() -> None:
+    code = cli.main(["retry", "run-000000000001/build", "--environment", "A=1"])
+    assert code == 0
+    assert _FakeClient.task_env_calls == [
+        {"run_id": "run-000000000001", "task_idx": 0, "set": {"A": "1"}, "unset": []}
+    ]
+    assert _FakeClient.env_calls == []
+    assert _FakeClient.restarted_tasks == [("run-000000000001", 0)]
+
+
+def test_retry_session_selector_with_environment_sets_session_env() -> None:
+    code = cli.main(["retry", "run-000000000001/build/compile", "--environment", "A=1"])
+    assert code == 0
+    assert _FakeClient.session_env_calls == [
+        {
+            "run_id": "run-000000000001",
+            "task_idx": 0,
+            "session_idx": 0,
+            "set": {"A": "1"},
+            "unset": [],
+        }
+    ]
+    assert _FakeClient.env_calls == []
+    assert _FakeClient.task_env_calls == []
+
+
+def test_retry_task_verify_selector_with_environment_sets_task_verify_env() -> None:
+    code = cli.main(["retry", "run-000000000001/build/verify/0", "--environment", "A=1"])
+    assert code == 0
+    assert _FakeClient.task_verify_env_calls == [
+        {"run_id": "run-000000000001", "task_idx": 0, "set": {"A": "1"}, "unset": []}
+    ]
+    assert _FakeClient.env_calls == []
+    assert _FakeClient.task_env_calls == []
+
+
+def test_retry_session_verify_selector_with_environment_sets_session_verify_env() -> None:
+    code = cli.main(["retry", "run-000000000001/build/compile/verify/1", "--environment", "A=1"])
+    assert code == 0
+    assert _FakeClient.session_verify_env_calls == [
+        {
+            "run_id": "run-000000000001",
+            "task_idx": 0,
+            "session_idx": 0,
+            "set": {"A": "1"},
+            "unset": [],
+        }
+    ]
+    assert _FakeClient.env_calls == []
+    assert _FakeClient.session_env_calls == []
+
+
+def test_retry_run_selector_with_environment_still_sets_run_env() -> None:
+    code = cli.main(["retry", "run-000000000001", "--environment", "A=1"])
+    assert code == 0
+    assert _FakeClient.env_calls == [{"run_id": "run-000000000001", "set": {"A": "1"}, "unset": []}]
+    assert _FakeClient.task_env_calls == []
+
+
+def test_retry_env_file_malformed_line_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = tmp_path / "vars.env"
+    env_file.write_text("NOEQUALSSIGN\n", encoding="utf-8")
+    code = cli.main(["retry", "run-000000000001", "--env-file", str(env_file)])
+    assert code == 2
+    assert "expected KEY=VALUE" in capsys.readouterr().err
+    assert _FakeClient.env_calls == []
+
+
+def test_parse_env_file_strips_comments_blanks_and_quotes(tmp_path: Path) -> None:
+    env_file = tmp_path / "vars.env"
+    env_file.write_text(
+        "# comment\n\n  \nA=1\nB='two'\nC=\"three\"\n",
+        encoding="utf-8",
+    )
+    assert cli._parse_env_file(env_file) == {"A": "1", "B": "two", "C": "three"}
+
+
+def test_parse_env_file_missing_file_raises() -> None:
+    with pytest.raises(ValueError, match="could not read"):
+        cli._parse_env_file(Path("does-not-exist.env"))
+
+
+def test_parse_env_file_bad_line_raises(tmp_path: Path) -> None:
+    env_file = tmp_path / "vars.env"
+    env_file.write_text("NOTKEYVALUE\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected KEY=VALUE"):
+        cli._parse_env_file(env_file)
+
+
+def test_parse_environment_flags_last_duplicate_wins() -> None:
+    assert cli._parse_environment_flags(["A=1", "A=2"]) == {"A": "2"}
+
+
+def test_parse_environment_flags_bad_entry_raises() -> None:
+    with pytest.raises(ValueError, match="expects KEY=VALUE"):
+        cli._parse_environment_flags(["NOEQUALSSIGN"])

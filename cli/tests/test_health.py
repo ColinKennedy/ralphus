@@ -317,6 +317,55 @@ def test_claude_command_non_executable_file_fails(
     assert "not executable" in result.detail
 
 
+def test_codex_command_not_set_is_a_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RALPHUS_CODEX_CMD", raising=False)
+    results = run_checks(UNREACHABLE)
+    result = next(r for r in results if r.name == "codex-command")
+    assert result.status == "pass"
+    assert not result.is_fail
+
+
+def test_codex_command_compound_skips_path_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RALPHUS_CODEX_CMD", "cd foo bar ; ./codex")
+    results = run_checks(UNREACHABLE)
+    result = next(r for r in results if r.name == "codex-command")
+    assert result.status == "pass"
+    assert "compound" in result.detail
+
+
+def test_codex_command_missing_bare_path_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RALPHUS_CODEX_CMD", "/no/such/codex-binary")
+    results = run_checks(UNREACHABLE)
+    result = next(r for r in results if r.name == "codex-command")
+    assert result.is_fail
+
+
+def test_codex_command_existing_file_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exe = tmp_path / "codex"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setenv("RALPHUS_CODEX_CMD", str(exe))
+    results = run_checks(UNREACHABLE)
+    result = next(r for r in results if r.name == "codex-command")
+    assert result.status == "pass"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX execute bit isn't meaningful on Windows")
+def test_codex_command_non_executable_file_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exe = tmp_path / "codex"
+    exe.write_text("not executable", encoding="utf-8")
+    exe.chmod(0o644)
+    monkeypatch.setenv("RALPHUS_CODEX_CMD", str(exe))
+    results = run_checks(UNREACHABLE)
+    result = next(r for r in results if r.name == "codex-command")
+    assert result.is_fail
+    assert "not executable" in result.detail
+
+
 def test_cli_check_health_reports_a_broken_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

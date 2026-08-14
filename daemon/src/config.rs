@@ -13,6 +13,7 @@
 //! explicit `checks`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{NaiveTime, Utc};
 use serde::Deserialize;
@@ -189,6 +190,39 @@ impl CartographerConfig {
     }
 }
 
+/// Session cost-cap enforcement configuration (`[budget]` table, RAL-161).
+/// Controls how often each running session's own poll loop re-checks its
+/// live `cost_usd` against its resolved `maximum_budget_usd` cap. `None`
+/// means unset (so a lower layer can supply it); resolved callers use
+/// [`poll_interval`](Self::poll_interval), which falls back to the default.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetConfig {
+    /// Milliseconds between cost-cap checks. `0` means "check immediately on
+    /// every event" (no additional throttling beyond the loop's own
+    /// cadence). Defaults to 200ms when unset -- tighter than the 500ms
+    /// `tmux capture-pane` scrape cadence it rides alongside, per RAL-161's
+    /// "bias toward catching an overrun quickly" requirement. The check
+    /// itself is a cheap in-memory float comparison, decoupled from the
+    /// actual (expensive, subprocess-spawning) pane scrape.
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl BudgetConfig {
+    /// The effective poll interval. `0` (explicit or default-absent-config's
+    /// interpretation of "immediate") resolves to a small minimum sleep
+    /// rather than a true busy-loop, so "check every event" doesn't burn a
+    /// CPU core spinning between events that haven't arrived yet.
+    #[must_use]
+    pub fn poll_interval(&self) -> Duration {
+        match self.poll_interval_ms {
+            None => Duration::from_millis(200),
+            Some(0) => Duration::from_millis(20),
+            Some(ms) => Duration::from_millis(ms),
+        }
+    }
+}
+
 /// Forge routing configuration (`[forge]` table, RAL-117). Lets a project pin
 /// which forge (GitHub/GitLab) and remote to submit PRs against, instead of
 /// relying purely on `git remote get-url` autodetection. `None` fields fall
@@ -225,6 +259,61 @@ impl ForgeConfig {
     }
 }
 
+/// Environment-variable-override allowlist configuration (`[env_overrides]`
+/// table, RAL-150). A retry-time env override whose key is **not** in
+/// `allowlist` still takes effect (the allowlist is not a security boundary
+/// against setting arbitrary env vars — the daemon operator already trusts
+/// whoever can submit runs), but its *value* is redacted (masked) wherever
+/// overrides are logged (Cartographer, `rlog!`) or shown in the board's
+/// audit-facing views, since an override value commonly carries a secret
+/// (an API key, a token). Allowlisted keys are logged/displayed in the clear
+/// since their values (model names, feature flags, etc.) are not secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct EnvOverridesConfig {
+    /// Env var key names whose override values are safe to show unredacted.
+    /// A list field: layers are unioned, same as [`ReviewConfig::checks`].
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+}
+
+impl EnvOverridesConfig {
+    /// Layer `self` (global) under `over` (per-project): union the allowlists,
+    /// global entries first then new per-project ones, de-duplicated and
+    /// order-preserving — same semantics as [`ReviewConfig::merge`]'s `checks`.
+    #[must_use]
+    pub fn merge(self, over: EnvOverridesConfig) -> EnvOverridesConfig {
+        let mut allowlist = self.allowlist;
+        for k in over.allowlist {
+            if !allowlist.contains(&k) {
+                allowlist.push(k);
+            }
+        }
+        EnvOverridesConfig { allowlist }
+    }
+
+    /// Whether `key` is in the allowlist (exact match).
+    #[must_use]
+    pub fn is_allowed(&self, key: &str) -> bool {
+        self.allowlist.iter().any(|k| k == key)
+    }
+}
+
+/// Whether `key` is a syntactically valid environment-variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) — required for a RAL-150 env override key.
+/// Enforced at the API boundary ([`crate::server`]'s env-override handler)
+/// so an override key can never smuggle shell metacharacters into the
+/// env-assignment prefix [`crate::tmux::build_command_line_with_env`] embeds
+/// ahead of a tmux-wrapped runner invocation.
+#[must_use]
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// The on-disk file shape: either a `[review]` or a `[defaults]` table.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
@@ -238,6 +327,10 @@ struct ConfigFile {
     cartographer: Option<CartographerConfig>,
     #[serde(default)]
     forge: Option<ForgeConfig>,
+    #[serde(default)]
+    env_overrides: Option<EnvOverridesConfig>,
+    #[serde(default)]
+    budget: Option<BudgetConfig>,
 }
 
 /// Parse a config from TOML text, preferring `[review]` over `[defaults]`.
@@ -360,6 +453,37 @@ pub fn load_cartographer_config() -> CartographerConfig {
     }
 }
 
+/// Parse a `BudgetConfig` from the given TOML text; the default (200ms) when
+/// the `[budget]` table is absent.
+#[must_use]
+pub fn budget_from_toml_str(s: &str) -> BudgetConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .budget
+        .unwrap_or_default()
+}
+
+/// Load the effective session cost-cap poll config by layering the global
+/// config file under the nearest per-project `.ralphus.toml` (per-project
+/// scalars win, following the `[cartographer]`/`[daemon]` pattern).
+#[must_use]
+pub fn load_budget_config() -> BudgetConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| budget_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| budget_from_toml_str(&s))
+        .unwrap_or_default();
+    BudgetConfig {
+        poll_interval_ms: local.poll_interval_ms.or(global.poll_interval_ms),
+    }
+}
+
 /// Resolve the effective review config for a review rooted at `cwd`: the global
 /// config layered under the nearest per-project `.ralphus.toml`.
 #[must_use]
@@ -400,6 +524,38 @@ pub fn resolve_forge(cwd: &Path) -> ForgeConfig {
         .map(|p| load_forge_file(&p))
         .unwrap_or_default();
     global.merge(project)
+}
+
+/// Parse an `EnvOverridesConfig` from the given TOML text.
+#[must_use]
+pub fn env_overrides_from_toml_str(s: &str) -> EnvOverridesConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .env_overrides
+        .unwrap_or_default()
+}
+
+/// Load the effective env-override allowlist using the daemon process's own
+/// current directory to locate the per-project `.ralphus.toml` — the daemon
+/// HTTP handlers have no per-request "review cwd" the way review config does,
+/// so this mirrors [`load_daemon_config`]/[`load_cartographer_config`]
+/// (current-dir-based) rather than [`resolve`]/[`resolve_forge`]
+/// (explicit-cwd, used where a specific review/worktree root is already in
+/// hand).
+#[must_use]
+pub fn load_env_overrides_config() -> EnvOverridesConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| env_overrides_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| env_overrides_from_toml_str(&s))
+        .unwrap_or_default();
+    global.merge(local)
 }
 
 #[cfg(test)]
@@ -600,6 +756,32 @@ mod tests {
         assert_eq!(c.max_rows(), 50_000);
     }
 
+    // ── BudgetConfig (RAL-161) ────────────────────────────────────────────
+
+    #[test]
+    fn budget_defaults_when_absent() {
+        let c = budget_from_toml_str("");
+        assert_eq!(c.poll_interval(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn budget_parses_explicit_interval() {
+        let c = budget_from_toml_str("[budget]\npoll_interval_ms = 50\n");
+        assert_eq!(c.poll_interval(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn budget_zero_means_near_immediate() {
+        let c = budget_from_toml_str("[budget]\npoll_interval_ms = 0\n");
+        assert_eq!(c.poll_interval(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn budget_malformed_toml_is_default() {
+        let c = budget_from_toml_str("not = = valid");
+        assert_eq!(c.poll_interval(), Duration::from_millis(200));
+    }
+
     // ── Downtime windows (RAL-122) ────────────────────────────────────────
 
     fn t(hh: u32, mm: u32) -> NaiveTime {
@@ -746,5 +928,62 @@ mod tests {
         assert_eq!(merged.kind.as_deref(), Some("gitlab"));
         // Unset-in-project field falls back to the global value.
         assert_eq!(merged.remote.as_deref(), Some("origin"));
+    }
+
+    // ── EnvOverridesConfig (RAL-150) ──────────────────────────────────────
+
+    #[test]
+    fn env_overrides_defaults_when_absent() {
+        let c = env_overrides_from_toml_str("");
+        assert!(c.allowlist.is_empty());
+        assert!(!c.is_allowed("ANYTHING"));
+    }
+
+    #[test]
+    fn env_overrides_parses_explicit_values() {
+        let c = env_overrides_from_toml_str(
+            "[env_overrides]\nallowlist = [\"RALPHUS_RESOLVER_MODEL\", \"MY_FLAG\"]\n",
+        );
+        assert!(c.is_allowed("RALPHUS_RESOLVER_MODEL"));
+        assert!(c.is_allowed("MY_FLAG"));
+        assert!(!c.is_allowed("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn env_overrides_malformed_toml_is_default() {
+        let c = env_overrides_from_toml_str("not = = valid");
+        assert!(c.allowlist.is_empty());
+    }
+
+    #[test]
+    fn env_overrides_merge_unions_and_dedupes() {
+        let global = EnvOverridesConfig {
+            allowlist: vec!["A".to_string(), "B".to_string()],
+        };
+        let project = EnvOverridesConfig {
+            allowlist: vec!["B".to_string(), "C".to_string()],
+        };
+        let merged = global.merge(project);
+        assert_eq!(
+            merged.allowlist,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_valid_env_key_accepts_identifiers() {
+        assert!(is_valid_env_key("RALPHUS_RESOLVER_MODEL"));
+        assert!(is_valid_env_key("_PRIVATE"));
+        assert!(is_valid_env_key("a1"));
+    }
+
+    #[test]
+    fn is_valid_env_key_rejects_non_identifiers() {
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("1LEADING_DIGIT"));
+        assert!(!is_valid_env_key("HAS SPACE"));
+        assert!(!is_valid_env_key("HAS=EQUALS"));
+        assert!(!is_valid_env_key("HAS;SEMI"));
+        assert!(!is_valid_env_key("$(injected)"));
     }
 }

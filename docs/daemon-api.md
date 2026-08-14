@@ -23,6 +23,7 @@ where one exists.
 | Method | Path | What |
 |---|---|---|
 | GET | `/api/daemon` | [Health/version probe](#get-apidaemon) |
+| POST | `/api/daemon/shutdown` | [Kill every spawned process and exit](#post-apidaemonshutdown) (`ralphus-daemon stop`) |
 | GET | `/api/tasks` | [Board state](#get-apitasks); `?status=&name=&sort=` filter/sort |
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
 | GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated |
@@ -47,7 +48,7 @@ where one exists.
 | POST | `/api/runs/{id}/activate` | [Queued → Pending](#post-apirunsidactivate) |
 | POST | `/api/runs/{id}/cancel/preview` | [Dry-run preview](#post-apirunsidcancelpreview) of a cascading cancel's impact |
 | POST | `/api/runs/{id}/cancel` | [Cancel the run](#post-apirunsidcancel), cascading to downstream dependents |
-| POST | `/api/runs/{id}/set-status` | Manually override a run/task/session/verify's state |
+| POST | `/api/runs/{id}/set-status` | Manually override a run/task/session/verify's state — for a task/session/verify, any target state but `pending` first captures its running agent's tmux pane into that session's ghost and kills it (RAL-163) |
 | POST | `/api/runs/{id}/edit` | Edit a run/task/session's fields; a run/task edit resets the whole run to Pending, a session edit resets only that session + its downstream |
 | POST | `/api/runs/{id}/retry` | Re-run with existing parameters (reset to Pending) |
 | POST | `/api/runs/{id}/restart/preview` | [Dry-run preview](#post-apirunsidrestartpreview) of a whole-run restart's downstream impact |
@@ -57,7 +58,16 @@ where one exists.
 | POST | `/api/runs/{id}/sessions/{ti}/{si}/restart` | [Restart one session](#post-apirunsidsessionstask_idxsession_idxrestart) + its downstream |
 | POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/{vi}/restart` | Restart a session's verify steps from `vi` |
 | POST | `/api/runs/{id}/tasks/{ti}/verify/{vi}/restart` | Restart a task's verify steps from `vi` |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/open-terminal` | Spawn a `claude --resume` terminal **on the daemon host** (`?mode=readonly\|open`) |
+| POST | `/api/runs/{id}/tasks/{ti}/restart/preview` | [Dry-run preview](#post-apirunsidtaskstirestartpreview) of a task restart's downstream impact |
+| POST | `/api/runs/{id}/tasks/{ti}/restart` | [Restart a whole task](#post-apirunsidtaskstirestart) + its downstream (RAL-150) |
+| POST | `/api/runs/{id}/env` | [Set/unset persistent environment-variable overrides](#post-apirunsidenv) on the run (RAL-150) |
+| POST | `/api/runs/{id}/tasks/{ti}/env` | Set/unset env overrides on a task ([hierarchical env overrides](#hierarchical-env-overrides-tasksessionverify-layers)) |
+| POST | `/api/runs/{id}/tasks/{ti}/verify/env` | Set/unset env overrides on a task's own verify steps |
+| POST | `/api/runs/{id}/sessions/{ti}/{si}/env` | Set/unset env overrides on a session |
+| POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/env` | Set/unset env overrides on a session's own verify steps |
+| POST | `/api/runs/{id}/tasks/{ti}/solo` | [Solo a task](#post-apirunsidtaskstisolo) (RAL-157) — pauses every other task in the run until un-soloed |
+| POST | `/api/runs/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apirunsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
+| POST | `/api/runs/{id}/sessions/{ti}/{si}/open-terminal` | Spawn a resume terminal (`claude --resume` or `codex exec resume`, depending on which agent the session ran under) **on the daemon host** (`?mode=readonly\|open`) |
 | POST | `/api/runs/{id}/verifies/{ti}/{scope}/{si}/{vi}/open-terminal` | Same, for a verify step's resolved session |
 | DELETE | `/api/runs/{id}` | Permanently delete a run |
 
@@ -66,7 +76,7 @@ where one exists.
 |---|---|---|
 | GET | `/api/guardians` | List all reviews (returns a **bare JSON array**, not `{guardians:[...]}`) |
 | POST | `/api/guardians` | Create a review |
-| GET | `/api/guardians/{id}` | One review's full detail |
+| GET | `/api/guardians/{id}` | [One review's full detail](#get-apiguardiansid) |
 | GET | `/api/guardians/{id}/logs` | State-transition audit log (bare array) |
 | POST | `/api/guardians/{id}/rename` | Rename |
 | POST | `/api/guardians/{id}/settings` | Update opt-out settings (only present fields change) |
@@ -84,21 +94,52 @@ where one exists.
 | POST | `/api/guardians/{id}/force_start` | Disable not-yet-done branches, merge immediately |
 | POST | `/api/guardians/{id}/branches/{branch_id}/dismiss_reenable` | Dismiss the "can re-enable" notice |
 | POST | `/api/guardians/{id}/branches/{branch_id}/move` | [Move a branch to another review](#post-apiguardiansidbranchesposmove) (RAL-118) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
+| POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
 | POST | `/api/guardians/{id}/approve` | Approve an in_review guardian |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
 | POST | `/api/guardians/{id}/run-manual-commands` | Spawn manual-check commands **on the daemon host** |
 | POST | `/api/guardians/{id}/run-action-hint` | Spawn a `command`-kind action hint **on the daemon host**; `prompt`-kind is `501` |
+| POST | `/api/guardians/{id}/resolve-input` | [Delegate a named check input to the resolver agent](#post-apiguardiansidresolve-input) ("set it for me", RAL-164) |
 
-Three routes above are flagged "on the daemon host": they call
-`spawn_in_terminal`/open a GUI terminal window on whatever machine runs
+Four routes above are flagged "on the daemon host": they call
+`spawn_in_terminal`/open a GUI terminal window (or, for the read-only
+snapshot case below, an external viewer) on whatever machine runs
 `ralphus-daemon`, which only makes sense when the daemon and the caller share
 a desktop session. The CLI deliberately does **not** call these — see
 `docs/cli-reference.md`'s `session terminal` / `review checks run` / `review
 action run` for the headless equivalent (print the resolved command + cwd
 instead).
+
+**Structured checks (RAL-164).** `manual_commands` and `action_hints` on
+`GuardianView` are both `GuardianCheck[]`, not bare strings —
+`{label?, command?, prompt?, cleanup_command?, inputs?}`, where `inputs` is
+`{name, message, default}[]` naming `{name}` placeholders referenced in
+`command`/`cleanup_command`. `GuardianView` also carries `input_values`
+(`Record<string,string>`, the last value used per input name on this review —
+overrides an input's own literal `default`) and `input_resolutions`
+(`Record<string,{status, value?}>`, `status` one of `resolving`/`ready`/`failed`,
+tracking in-flight/completed `resolve-input` calls). `run-manual-commands` and
+`run-action-hint` both accept an extended body: `{index?, inputs?:
+Record<string,string>, run_cleanup?: boolean}` — `inputs` substitutes named
+placeholders (submitted value wins, then `input_values`, then the input's own
+default) and is persisted as the new `input_values` default; `run_cleanup`
+opts into chaining the check's `cleanup_command` before the main command.
+
+**Read-only terminal-log viewer (RAL-153).** When `open-terminal`'s target
+tmux session has already ended, the daemon degrades to a read-only path
+instead of attaching: it copies the session's persisted last-pane snapshot
+(`crate::tmux::read_pane_snapshot`) to a disposable per-click temp file and
+opens that copy with the user's preferred external viewer — `$VISUAL`, then
+`$EDITOR`, then the OS's own default handler for the file type
+(`start`/`open`/`xdg-open`) — rather than spawning a terminal window running
+`Get-Content`. The copy lives under a dedicated OS-temp subdirectory (not
+`pane_snapshots/` under `state_dir()`, which remains the durable record) and
+is pruned after an hour; `409` if the session never ran under tmux or
+produced no pane output.
 
 **Pull requests (RAL-117)**
 | Method | Path | What |
@@ -151,6 +192,48 @@ Health/version probe. Never requires the DB to be writable.
 
 ```json
 { "name": "ralphus-daemon", "version": "0.1.0", "status": "ok", "db": "ok" }
+```
+
+### `POST /api/daemon/shutdown`
+Kill every process this daemon has spawned — every session, verify,
+review/guardian merge, feedback chat, change-summary, and manual check
+subprocess it started, transitively — then exit the daemon process. This is
+what `ralphus-daemon stop [--port N] [--auto-cancel]` calls.
+
+Unconditionally, regardless of the request body: trips every in-flight run's
+cooperative cancellation token (stops its subprocess within the runner's
+normal poll interval) and force-kills every `ralphus_`-prefixed tmux.exe
+process (covers both run sessions and guardian/review sessions, which share
+that naming prefix). Anything left alive after that — e.g. a `command`-kind
+verify subprocess, which has no cooperative cancellation today — is still
+guaranteed to die: the daemon confines its whole process tree to a Windows
+Job Object at startup (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, see
+`daemon/src/jobobject.rs`), so terminating the daemon process itself takes
+every remaining descendant down with it.
+
+Request (all fields optional; an empty/absent body is equivalent to
+`{"auto_cancel": false}`):
+```json
+{ "auto_cancel": false }
+```
+- `auto_cancel: false` (default) — DB state is left alone. Runs/guardians
+  that were mid-flight stay `running`/`merging`/etc, so the existing
+  crash-recovery path (`Store::recover_orphaned_runs` /
+  `recover_orphaned_merges`, run at every `serve()` startup) resumes them
+  automatically the next time `ralphus-daemon serve` starts.
+- `auto_cancel: true` — additionally cascade-cancels every non-terminal run
+  (same logic as [`POST /api/runs/{id}/cancel`](#post-apirunsidcancel)) and
+  every cancellable guardian, so history reflects an intentional stop and
+  nothing auto-resumes on the next start.
+
+Response `200` (sent before the daemon actually exits):
+```json
+{
+  "state": "stopping",
+  "auto_cancel": false,
+  "cancelled_runs": [],
+  "cancelled_guardians": []
+}
 ```
 
 ### `POST /api/runs/validate`
@@ -285,6 +368,82 @@ reset to Pending (upstream sessions stay Done and are skipped on re-run), the
 run goes back to Pending, and dependent runs are dirtied. Same response shape as
 above. A non-integer index is a `400`.
 
+### `POST /api/runs/{id}/tasks/{task_idx}/restart/preview`
+Dry-run preview of
+[`POST /api/runs/{id}/tasks/{task_idx}/restart`](#post-apirunsidtaskstirestart)
+(RAL-150): every session the task owns, plus every session downstream of any
+of them within the run, the tasks that own any of those sessions, and every
+run transitively dependent on this one — same response shape and computation
+philosophy as the session-level preview above (`Store::compute_task_restart_impact`).
+A non-integer index is a `400`.
+
+### `POST /api/runs/{id}/tasks/{task_idx}/restart`
+Restart a whole task (RAL-150): every session it owns, plus every session
+downstream of any of them within the run, resets to Pending; the run and each
+affected task go back to Pending; dependent runs are dirtied. The
+task-granularity counterpart of the run/session restarts above — same response
+shape. A non-integer index is a `400`; an unknown task index is a `404`.
+
+### `POST /api/runs/{id}/env`
+Set (`set`) and/or remove (`unset`) persistent environment-variable overrides
+on a run (RAL-150). Body:
+```json
+{ "set": { "RALPHUS_RESOLVER_MODEL": "qwen3:8b" }, "unset": ["SOME_OLD_FLAG"] }
+```
+At least one of `set`/`unset` must be non-empty (`400` otherwise). Every key in
+either map/list must be a valid environment-variable identifier
+(`[A-Za-z_][A-Za-z0-9_]*`) — checked with `crate::config::is_valid_env_key`,
+both to catch typos early and because
+`crate::tmux::build_command_line_with_env` relies on the same validation as a
+shell-injection backstop for the tmux-wrapped runner path. `set` entries win
+over `unset` when a key appears in both. Overrides are **persistent** (not a
+one-shot retry parameter): once set, a key stays applied to every
+session/verify-step subprocess this run spawns — across any number of future
+retries/restarts — until explicitly unset. They do not themselves trigger a
+re-run; pair this with `.../retry`, `.../restart`, or a task/session/verify
+restart to actually re-execute something under the new values (the CLI's
+`ralphus retry <selector> --environment KEY=VAL` does exactly that in one
+step). Response `200` is the resulting full override map:
+```json
+{ "RALPHUS_RESOLVER_MODEL": "qwen3:8b" }
+```
+Every change is also recorded to Cartographer with the changed key names in
+the clear but **values redacted unless the key is in the project's
+`[env_overrides].allowlist`** (`.ralphus.toml`) — see `EnvOverridesConfig` in
+`daemon/src/config.rs`. The run detail view (`GET /api/runs/{id}`,
+`RunView.env_overrides`) shows the raw, unredacted current values, since that
+view is scoped to whoever already has run-detail access rather than a shared
+audit log.
+
+#### Hierarchical env overrides (task/session/verify layers)
+
+Env overrides can also be set at task, session, and verify-step granularity,
+each overriding its parent scope's value for the same key:
+
+```
+run  <  task  <  task.verify        (a task's own verify steps)
+run  <  task  <  session  <  session.verify   (a session's own verify steps)
+```
+
+i.e. a session inherits the run's and its task's overrides but wins on a
+shared key; a session-scoped verify step additionally inherits+overrides
+whatever its owning session resolved to. Same request/response shape, same
+validation, persistence, and Cartographer-redaction rules as
+`POST /api/runs/{id}/env` above — only the scope and endpoint differ:
+
+| Endpoint | Scope |
+|---|---|
+| `POST /api/runs/{id}/tasks/{ti}/env` | This task's own overrides — win over the run's, apply to every session under this task. |
+| `POST /api/runs/{id}/tasks/{ti}/verify/env` | This task's own (task-scoped) verify-step overrides — win over the task's own (and the run's), only for this task's verify steps. |
+| `POST /api/runs/{id}/sessions/{ti}/{si}/env` | This session's own overrides — win over its task's (and the run's). |
+| `POST /api/runs/{id}/sessions/{ti}/{si}/verify/env` | This session's own (session-scoped) verify-step overrides — win over the session's own (and its task's/run's), only for this session's verify steps. |
+
+A non-integer task/session index is a `400`; an unknown task/session is a
+`404`. The resolved map for each scope rides along in the corresponding
+`TaskView`/`SessionView` (`env_overrides`/`verify_env_overrides` fields) inside
+the existing `GET /api/runs/{id}` response — there are no separate GET routes
+for these.
+
 ### `POST /api/runs/{id}/add-dependency`
 Wire up a manual cross-run dependency after submission (RAL-105), e.g. from the
 board's "Add Dependency" right-click menu. Body:
@@ -299,6 +458,21 @@ modified. A dependency that is already present is a no-op. Returns `200` with
 the updated run. A self-reference or a reference that would create a cycle in
 the cross-run dependency graph is a `409`; an unknown `id`/`target_id` is a
 `404`; a malformed body is a `400`.
+
+### `GET /api/guardians/{id}`
+A single review's full detail, including its ordered `branches` list. Each
+branch (`BranchView`) carries two rebase-progress fields (RAL-145):
+`rebase_commands_done` / `rebase_commands_total` (`i64`, both `null` unless
+populated). They're read live, straight from git's own interactive-rebase
+todo-list bookkeeping in that branch's worktree (`rebase-merge/done` and
+`rebase-merge/git-rebase-todo` — the same files `git status` summarizes as
+"Last commands done" / "Next commands to do") — no separate bookkeeping is
+kept by the merge engine itself. Populated only for the branch currently
+`merge_status: "in_progress"` that also has a `worktree` (every other branch
+always reports `null`/`null`), and even then only when a rebase is actually
+paused/running there — a transient gap right after `--continue`/`--skip`
+(files briefly absent) also reads as `null`/`null` rather than a stale or
+spurious `0`/`0`.
 
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered
@@ -400,6 +574,58 @@ against its own chain — would need on top of this:
   building one copy do not leak into or corrupt the other's rebuild — this is
   the same isolation `move_guardian_branch`'s source-side rebuild relies on
   (see `guardian_merge::purge_worktrees`).
+
+### `POST /api/guardians/{id}/resolve-input`
+"Set it for me" (RAL-164): asks the resolver agent to propose a value for one
+named `CheckInput` (see "Structured checks (RAL-164)" above) declared by a
+check in `manual_commands`/`action_hints` (searched in that order, first
+match wins — the request only needs the input's name, not which check it
+belongs to). Body:
+```json
+{ "input_name": "port" }
+```
+Returns `202` immediately; the caller polls the normal guardian view (this is
+not a dedicated polling endpoint) and reads
+`input_resolutions[input_name]` — `{"status": "resolving"}` while the
+resolver agent call is in flight, then `{"status": "ready", "value": "..."}`
+on success or `{"status": "failed"}` on error. On success the value is also
+folded into `input_values[input_name]`, so it becomes the new default the
+next time that input is shown, exactly as if a human had submitted it.
+
+Spam-proofed **server-side**, not just by disabling a button client-side: a
+concurrent duplicate request for the same `(guardian_id, input_name)` pair —
+a double-click, a second browser tab, a direct API call — races an atomic
+SQL upsert (`Store::claim_guardian_input_resolution`) and loses, getting
+`409 already_in_progress`. `400 unknown_input` if no check on this review
+declares an input with that name. A daemon restart while a resolution is
+`resolving` resets it to `failed` on the next startup (crash recovery,
+mirrors merge recovery) so the UI never shows a permanently-stuck spinner.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
+The live list of files still carrying unresolved `<<<<<<<` merge-conflict
+markers in one review branch's worktree (RAL-148), for the Reviews UI's
+auto-refreshing conflicting-files panel. `branch_id` is the branch's stable
+id (RAL-122), not its stack position. Computed on demand — runs `git diff
+--name-only --diff-filter=U` in the branch's worktree, the same call
+`guardian_merge::conflicted_files` already makes mid-rebase — rather than
+persisted, so it is not on the hot board path (same convention as `GET
+/api/runs/{id}/worktrees`):
+```json
+{ "files": ["src/foo.rs", "src/bar.rs"], "rebase_in_progress": true }
+```
+- `files` — paths relative to the worktree root. Empty (not an error) once
+  the branch has no worktree yet, the worktree directory no longer exists
+  (e.g. purged by a base-branch-shift rebuild), or every conflict in it has
+  been resolved and staged — a poller can treat an empty list as "nothing to
+  show" without special-casing those cases.
+- `rebase_in_progress` — whether the worktree is currently mid-`git rebase`.
+  Can be `false` while `files` is still non-empty (e.g. between rebase steps,
+  or after a resolver commits an intermediate fix), so the board should not
+  infer "no active rebase" means the conflicts are stale.
+
+`404` if `id` or `branch_id` doesn't address a real guardian/branch. Never
+`409`/`5xx` for "no conflicts right now" — that is the ordinary `files: []`
+response above.
 
 ### `POST /api/guardians/{id}/squash`
 Toggle per-commit squashing for one git project within a review (RAL-91). Body:
@@ -522,7 +748,8 @@ keeps the default newest-first order).
           "name": "build",
           "project": "myrepo",
           "state": "running",
-          "sessions": [ { "id": "session-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "verify": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
+          "soloed": false,
+          "sessions": [ { "id": "session-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "verify": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
           "verify":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null } ]
         }
       ]
@@ -530,6 +757,18 @@ keeps the default newest-first order).
   ]
 }
 ```
+`TaskView.project` is always a non-null, non-empty string (RAL-141), so a
+project filter facet always has real data to group by. It is the registered
+project name when the task's TOML sets `project` (used to resolve the
+`ralphus:new-worktree/<branch>` placeholder via `POST /api/projects` -- see
+above); otherwise it falls back to the basename of the task's first
+session's `cwd` (e.g. `cwd = "/home/me/myrepo"` -> `"myrepo"`), or the literal
+string `"unassigned"` when there's no session, no `cwd`, or the `cwd` has no
+filename component (e.g. `"/"`). This fallback is display-only: it never
+writes back to the task's stored `project` value and has no effect on
+worktree-placeholder resolution, which still requires an explicit, registered
+`project`.
+
 Both *task*-level verify steps (`[[task.verify]]`, on `TaskView.verify`) and
 *session*-level verify steps (`[[task.session.verify]]`, on `SessionView.verify`)
 are exposed here, each in task/session declaration order. A verify entry carries:
@@ -546,6 +785,21 @@ are exposed here, each in task/session declaration order. A verify entry carries
 `done`/`failed`); `brain`/`approval` steps are accepted but deferred and stay
 `pending` forever. A `prompt` step's `output` is the AI's final response
 text (used to derive its pass/fail verdict), not command stdout.
+
+Each run also carries an `env_overrides` field (RAL-150): the run's persistent
+environment-variable overrides, as raw unredacted `{key: value}` pairs (see
+[`POST /api/runs/{id}/env`](#post-apirunsidenv)). Omitted from the JSON
+entirely when empty — true for the vast majority of runs.
+
+Each `TaskView` likewise carries `env_overrides` (this task's own overrides,
+set via `POST /api/runs/{id}/tasks/{ti}/env`) and `verify_env_overrides`
+(this task's own verify-step overrides, set via
+`POST /api/runs/{id}/tasks/{ti}/verify/env`); each `SessionView` carries the
+same pair scoped to the session (`POST /api/runs/{id}/sessions/{ti}/{si}/env`
+and `.../verify/env`) -- see
+[Hierarchical env overrides](#hierarchical-env-overrides-tasksessionverify-layers)
+above for how these merge with the run's. All four are raw unredacted
+`{key: value}` pairs, omitted from the JSON when empty, same as the run's.
 
 ### `GET /api/resources`
 Per-task OS resource usage for the board's Resources tab (RAL-11). One entry per
@@ -649,6 +903,28 @@ plus per-session and per-verifier log references (drives the Logs modal tabs).
 ### `POST /api/runs/{id}/activate`
 Move a held `Queued` run to `Pending`. Returns the new state.
 
+### `POST /api/runs/{id}/tasks/{ti}/solo`
+Solo a task within a run (RAL-157): while any task in the run is soloed, the
+scheduler only dispatches soloed tasks' not-yet-started sessions — every
+other task's sessions stay `pending` until un-soloed, even once the soloed
+task itself finishes (a dependent task must not start racing ahead just
+because its soloed upstream completed). A session already `running` when a
+sibling gets soloed is left to finish on its own — there is no per-session
+interrupt in this codebase (cancellation is run-wide only), so pausing an
+in-flight session's task takes effect starting at that task's *next*
+session, not mid-session. Multiple tasks in the same run may be soloed at
+once; soloing one does not un-solo another. Idempotent. Solo state is
+sticky — it never auto-clears (not on the soloed task's own completion, not
+on a run restart); [`POST /api/runs/{id}/tasks/{ti}/unsolo`](#post-apirunsidtaskstiunsolo)
+is the only way to resume paused siblings. Returns the refreshed `RunView`
+(so `tasks[].soloed` reflects the change in the same round trip). An unknown
+run or task index is a `404`; a non-integer `{ti}` is a `400`.
+
+### `POST /api/runs/{id}/tasks/{ti}/unsolo`
+Un-solo a task (RAL-157) — the reverse of
+[`POST /api/runs/{id}/tasks/{ti}/solo`](#post-apirunsidtaskstisolo). Returns
+the refreshed `RunView`. Idempotent; same error responses as `solo`.
+
 ### `POST /api/runs/{id}/cancel/preview`
 Dry-run preview of [`POST /api/runs/{id}/cancel`](#post-apirunsidcancel)
 (RAL-116): computes the exact same cascade-cancel impact set the real cancel
@@ -732,6 +1008,16 @@ ghost row per owner — a session/review that publishes again merges onto its
 existing note rather than adding a second row. `404` if that owner has never
 published one.
 
+Content isn't only the agent's own self-report: when the daemon can determine
+the ground-truth pass/fail of a scope's verify/check step(s), it folds an
+advisory note onto the same ghost (RAL-152), e.g. "the prior run's 2/2
+verify/check step(s) passed -- you internally validated that the code works.
+... re-test/re-verify the existing work first rather than assuming it's
+broken." This is phrased as a hint, not a guarantee — it can go stale (e.g. a
+rebase or conflict resolution since it was written) — and applies wherever a
+ghost is written: task session restarts, verify-only restarts, and Guardian
+resolver restarts.
+
 ```json
 {
   "owner_uri": "session:run-000000000001:0:0",
@@ -779,9 +1065,13 @@ tables of its own:
   snapshot. If the id's tmux session is currently live, this is the same
   `.../pane` content the board's "Show Live View" reads (see `GET
   .../sessions/{ti}/{si}/pane` / `GET .../verifies/{ti}/{scope}/{si}/{vi}/pane`
-  above). Once the tmux session is gone, there is nothing left in tmux to
-  read — instead this falls back to whatever was already durably persisted
-  for that entity by mechanisms that predate this ticket:
+  above). Once the tmux session is gone, `.../pane` itself may still return a
+  persisted last-pane-content snapshot (RAL-102 follow-up —
+  `crate::tmux::write_pane_snapshot`/`read_pane_snapshot`, a read-only
+  historical record of what the pane last showed) if one was captured, but
+  `ralphus history` prefers a more stable, curated record over a raw
+  transcript replay — it falls back to whatever was already durably
+  persisted for that entity by mechanisms that predate this ticket:
   - A **session**'s fallback is its RAL-136 ghost — `GET
     /api/ghosts/session:{run_id}:{task_idx}:{session_idx}` (see above). A
     `404` (no ghost ever published) is rendered as "no history recorded yet",

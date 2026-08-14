@@ -37,12 +37,17 @@ class HarnessBackend:
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         """Run the harness in the workspace, passing the prompt as the final arg.
 
         ``append_system_prompt`` is accepted for Protocol compatibility but not
         yet wired for generic harnesses (there is no portable flag); TOML
         validation blocks non-``claude-code`` agents from setting it (RAL-5).
+
+        ``resume_agent_session_id`` is accepted for Protocol compatibility but
+        not wired: the daemon's tmux auto-reattach retry only ever sets it for
+        the ``claude-code`` agent, never a generic harness.
         """
         cmd = [self._program, *self._args]
         if model:

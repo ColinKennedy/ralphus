@@ -202,6 +202,91 @@ def test_restart_session_verify() -> None:
         assert result["state"] == "pending"
 
 
+def test_restart_task() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/tasks/0/restart"
+        return httpx.Response(200, json={"state": "pending", "dirtied": []})
+
+    with _client(handler) as client:
+        result = client.restart_task("run-1", 0)
+        assert result["state"] == "pending"
+
+
+def test_set_run_env_sends_set_and_unset() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/env"
+        body = json.loads(request.content)
+        assert body == {"set": {"A": "1"}, "unset": ["B"]}
+        return httpx.Response(200, json={"A": "1"})
+
+    with _client(handler) as client:
+        result = client.set_run_env("run-1", set_vars={"A": "1"}, unset_vars=["B"])
+        assert result == {"A": "1"}
+
+
+def test_set_run_env_defaults_missing_args_to_empty() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body == {"set": {}, "unset": []}
+        return httpx.Response(200, json={})
+
+    with _client(handler) as client:
+        client.set_run_env("run-1")
+
+
+def test_set_task_env_sends_set_and_unset() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/tasks/0/env"
+        body = json.loads(request.content)
+        assert body == {"set": {"A": "1"}, "unset": ["B"]}
+        return httpx.Response(200, json={"A": "1"})
+
+    with _client(handler) as client:
+        result = client.set_task_env("run-1", 0, set_vars={"A": "1"}, unset_vars=["B"])
+        assert result == {"A": "1"}
+
+
+def test_set_task_verify_env_sends_set_and_unset() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/tasks/0/verify/env"
+        body = json.loads(request.content)
+        assert body == {"set": {"A": "1"}, "unset": []}
+        return httpx.Response(200, json={"A": "1"})
+
+    with _client(handler) as client:
+        result = client.set_task_verify_env("run-1", 0, set_vars={"A": "1"})
+        assert result == {"A": "1"}
+
+
+def test_set_session_env_sends_set_and_unset() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/sessions/0/1/env"
+        body = json.loads(request.content)
+        assert body == {"set": {"A": "1"}, "unset": ["B"]}
+        return httpx.Response(200, json={"A": "1"})
+
+    with _client(handler) as client:
+        result = client.set_session_env("run-1", 0, 1, set_vars={"A": "1"}, unset_vars=["B"])
+        assert result == {"A": "1"}
+
+
+def test_set_session_verify_env_sends_set_and_unset() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/sessions/0/1/verify/env"
+        body = json.loads(request.content)
+        assert body == {"set": {}, "unset": ["A"]}
+        return httpx.Response(200, json={})
+
+    with _client(handler) as client:
+        client.set_session_verify_env("run-1", 0, 1, unset_vars=["A"])
+
+
 def test_edit_session_prefers_command_over_prompt() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/runs/run-1/edit"

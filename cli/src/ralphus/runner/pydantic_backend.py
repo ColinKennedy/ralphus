@@ -51,6 +51,7 @@ class PydanticAgentBackend:
         *,
         model: str | None,
         append_system_prompt: str | None = None,
+        resume_agent_session_id: str | None = None,
     ) -> BackendOutcome:
         """Drive the prompt to completion using the workspace tools.
 
@@ -58,6 +59,10 @@ class PydanticAgentBackend:
         (never concatenated into ``prompt``). This is best-effort: TOML
         validation currently blocks non-``claude-code`` agents from setting it,
         so it is not exercised in production yet (RAL-5).
+
+        ``resume_agent_session_id`` is accepted for Protocol compatibility but
+        not wired: the daemon's tmux auto-reattach retry only ever sets it for
+        the ``claude-code`` agent, never a pydantic-ai-backed one.
         """
         llm = _build_model(self._agent, model)
 

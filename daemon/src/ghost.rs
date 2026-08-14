@@ -200,6 +200,41 @@ pub fn current_revision(cwd: &str) -> Option<String> {
     }
 }
 
+/// Advisory ghost note describing the *daemon-observed* (ground-truth, not
+/// self-reported) outcome of a scope's verify/check steps (RAL-152). Callers
+/// fold this onto the owning ghost with [`Store::upsert_ghost`] independent
+/// of whatever the agent itself self-reported, so a restarted session/resolver
+/// gets a reliable signal even when the agent didn't report one -- or
+/// didn't report one honestly. Phrased as a hint, not a guarantee: staleness
+/// (module docs) applies just as much to a daemon-observed outcome as to a
+/// self-reported one, since the code can change underneath it (e.g. a rebase
+/// or conflict resolution) between when this was written and when it's read.
+///
+/// `passed`/`total` must satisfy `total > 0` and `passed <= total` -- callers
+/// should skip writing a note entirely when no step actually ran, rather than
+/// calling this with `total == 0`.
+#[must_use]
+pub fn verify_outcome_note(passed: usize, total: usize) -> String {
+    debug_assert!(total > 0, "verify_outcome_note called with no steps run");
+    debug_assert!(passed <= total, "passed count exceeds total");
+    if passed == total {
+        format!(
+            "Daemon note (ground truth, not self-reported): the prior run's {passed}/{total} \
+             verify/check step(s) passed -- you internally validated that the code works. This \
+             can go stale (e.g. a rebase or conflict resolution since this was written), so \
+             re-test/re-verify the existing work first rather than assuming it's broken and \
+             redoing it from scratch."
+        )
+    } else {
+        format!(
+            "Daemon note (ground truth, not self-reported): the prior run's verify/check step(s) \
+             did NOT all pass ({passed}/{total} passed) -- the existing work was not fully \
+             validated. Investigate and fix the failure(s) before trusting or building further on \
+             top of this code."
+        )
+    }
+}
+
 /// Build the context block to prepend to a session's prompt from its own
 /// prior ghost (if any) and its direct dependencies' ghosts, labelled
 /// `"<task>/<session>"`. Returns `None` when there is nothing to inject, so
@@ -545,6 +580,29 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn verify_outcome_note_all_passed_signals_validated() {
+        let note = verify_outcome_note(2, 2);
+        assert!(note.contains("2/2"));
+        assert!(note.contains("internally validated"));
+        assert!(note.contains("re-test/re-verify"));
+    }
+
+    #[test]
+    fn verify_outcome_note_partial_pass_signals_not_validated() {
+        let note = verify_outcome_note(1, 2);
+        assert!(note.contains("1/2 passed"));
+        assert!(note.contains("did NOT all pass"));
+        assert!(!note.contains("internally validated"));
+    }
+
+    #[test]
+    fn verify_outcome_note_all_failed_signals_not_validated() {
+        let note = verify_outcome_note(0, 1);
+        assert!(note.contains("0/1 passed"));
+        assert!(note.contains("did NOT all pass"));
     }
 
     #[test]

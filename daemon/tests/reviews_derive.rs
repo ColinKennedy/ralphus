@@ -14,7 +14,7 @@ use ralphus_daemon::guardian_merge::{run_merge, start_merge};
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 use ralphus_daemon::scheduler::{Semaphore, execute_run, execute_run_with};
-use ralphus_daemon::store::{RunState, Store};
+use ralphus_daemon::store::{NodeState, RunState, Store};
 
 /// A runner that reports every session done without touching disk.
 struct OkRunner;
@@ -28,7 +28,7 @@ impl Runner for OkRunner {
             summary: "ok".to_string(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -80,7 +80,7 @@ impl Runner for ConflictResolvingRunner {
             summary: "conflicts resolved".to_string(),
             error: None,
             verified: None,
-            claude_session_id: None,
+            agent_session_id: None,
             ghost: None,
         }
     }
@@ -925,7 +925,7 @@ fn ok_result() -> RunnerResult {
         summary: "ok".to_string(),
         error: None,
         verified: None,
-        claude_session_id: None,
+        agent_session_id: None,
         ghost: None,
     }
 }
@@ -960,7 +960,7 @@ impl Runner for GatableRunner {
                 summary: String::new(),
                 error: Some("cancelled".to_string()),
                 verified: None,
-                claude_session_id: None,
+                agent_session_id: None,
                 ghost: None,
             };
         }
@@ -1635,4 +1635,195 @@ fn per_project_base_commits_stored_and_retrieved() {
         "legacy column unchanged for non-primary"
     );
     assert_eq!(g.base_commits.len(), 2);
+}
+
+// ── RAL-159: implicit worktree-sharing review membership ────────────────────
+
+/// A session with no `review = "<id>"` of its own, but whose cwd is a nested
+/// subfolder of another session's review-linked worktree, implicitly joins
+/// that same branch's review (matched by literal worktree root, not mere
+/// project identity) -- so it shows up in the session's "in reviews" list
+/// (RAL-17) exactly like the explicitly-linked session. A THIRD session in a
+/// DIFFERENT linked worktree of the SAME repo must NOT match, proving the
+/// match is worktree-scoped rather than project-scoped (project identity
+/// already collapses every linked worktree of a repo together, per
+/// `undeclared_overlapping_task_blocks_readiness` above -- this is a
+/// narrower, worktree-literal match, not a re-run of that broader check).
+#[test]
+fn nested_cwd_session_implicitly_joins_review_and_reviews_list() {
+    let base = temp_base("worktree-share");
+    let (cwd_share, cwd_other) = repo_with_two_worktrees(&base, "feature/share", "feature/other");
+    let sub = format!("{cwd_share}/sub");
+    std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
+
+    let toml = format!(
+        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_share}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+         [[task]]\nname=\"c\"\n[[task.session]]\ncwd=\"{cwd_other}\"\nprompt=\"p\"\n\
+         [[review]]\nid=\"r\"\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+
+    let mut store = Store::open_in_memory().unwrap();
+    let run_id = store.insert_run(&file, None, false).unwrap();
+    let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
+
+    assert_eq!(ids.len(), 1, "only one project declares a review");
+    let gid = ids[0].clone();
+    let g = store.get_guardian(&gid).unwrap();
+    assert_eq!(g.branches.len(), 1);
+    assert_eq!(g.branches[0].branch, "feature/share");
+
+    let view = store.get_run(&run_id).unwrap();
+    let a_reviews = view.tasks[0].sessions[0].reviews.clone();
+    let b_reviews = view.tasks[1].sessions[0].reviews.clone();
+    let c_reviews = view.tasks[2].sessions[0].reviews.clone();
+
+    assert_eq!(a_reviews.len(), 1, "explicit session is in the review");
+    assert_eq!(
+        b_reviews.len(),
+        1,
+        "nested-cwd sibling implicitly joins the same review"
+    );
+    assert_eq!(a_reviews[0].id, b_reviews[0].id);
+    assert_eq!(a_reviews[0].branch, b_reviews[0].branch);
+    assert!(
+        c_reviews.is_empty(),
+        "a session in a DIFFERENT worktree of the same repo must not match"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The review-ready gate withholds `MergeStatus::Ready` on a branch until
+/// EVERY session sharing that worktree is done -- not just the explicitly
+/// review-linked one. Once the last sibling (here, the implicit nested-cwd
+/// session) finishes, the branch promotes to `ready` in that same call.
+#[test]
+fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
+    let base = temp_base("worktree-gate");
+    let cwd = repo_with_worktree(&base, "feature/gate");
+    let sub = format!("{cwd}/sub");
+    std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
+
+    let toml = format!(
+        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+         [[review]]\nid=\"r\"\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+
+    let mut store = Store::open_in_memory().unwrap();
+    let run_id = store.insert_run(&file, None, false).unwrap();
+    let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
+    let gid = ids[0].clone();
+
+    // Task A (explicit) finishes -- branch must stay `pending`: task B (the
+    // implicit worktree sibling) hasn't finished yet.
+    store
+        .set_session_state(&run_id, 0, 0, NodeState::Done)
+        .unwrap();
+    let n = store.mark_ready_branches_with_done_sessions(&gid).unwrap();
+    assert_eq!(n, 0, "must not promote while a sibling is still pending");
+    assert_eq!(
+        store.get_guardian(&gid).unwrap().branches[0].merge_status,
+        "pending"
+    );
+
+    // Task B finishes too -- now every worktree-sharing session is done.
+    store
+        .set_session_state(&run_id, 1, 0, NodeState::Done)
+        .unwrap();
+    let n = store.mark_ready_branches_with_done_sessions(&gid).unwrap();
+    assert_eq!(n, 1, "promotes exactly the one branch");
+    assert_eq!(
+        store.get_guardian(&gid).unwrap().branches[0].merge_status,
+        "ready"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Two sessions sharing a worktree finishing at (near-)simultaneously must
+/// transition the branch to `ready` exactly once -- no double-trigger, no
+/// missed trigger (RAL-159 interview Q4). Phase 1 races both sessions' `done`
+/// writes to land as close together as possible; phase 2 then races two
+/// threads both calling the readiness check right after, simulating two
+/// scheduler task-completion paths discovering "all done" at once. The daemon
+/// serializes all `Store` access through one `Mutex`, and the promotion SQL
+/// itself is guarded by `WHERE merge_status='pending'`, so only one of the
+/// racing calls can ever actually flip it -- no extra locking is needed.
+#[test]
+fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
+    let base = temp_base("worktree-race");
+    let cwd = repo_with_worktree(&base, "feature/race");
+    let sub = format!("{cwd}/sub");
+    std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
+
+    let toml = format!(
+        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+         [[review]]\nid=\"r\"\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let (run_id, gid) = {
+        let mut g = store.lock().unwrap();
+        let run_id = g.insert_run(&file, None, false).unwrap();
+        let ids = derive_reviews(&g, &run_id, &file).expect("derive");
+        (run_id, ids[0].clone())
+    };
+
+    // Phase 1: race both sessions' `done` transitions.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let set_handles: Vec<_> = [(0i64, 0i64), (1i64, 0i64)]
+        .into_iter()
+        .map(|(task_idx, idx)| {
+            let store = Arc::clone(&store);
+            let run_id = run_id.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .lock()
+                    .unwrap()
+                    .set_session_state(&run_id, task_idx, idx, NodeState::Done)
+                    .unwrap();
+            })
+        })
+        .collect();
+    for h in set_handles {
+        h.join().unwrap();
+    }
+
+    // Phase 2: race two concurrent "task just finished" readiness checks.
+    let barrier2 = Arc::new(std::sync::Barrier::new(2));
+    let mark_handles: Vec<_> = (0..2)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let gid = gid.clone();
+            let barrier2 = Arc::clone(&barrier2);
+            std::thread::spawn(move || {
+                barrier2.wait();
+                store
+                    .lock()
+                    .unwrap()
+                    .mark_ready_branches_with_done_sessions(&gid)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let total: usize = mark_handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+    assert_eq!(
+        total, 1,
+        "the branch must be promoted to ready exactly once, not zero or twice"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&gid).unwrap().branches[0].merge_status,
+        "ready"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }

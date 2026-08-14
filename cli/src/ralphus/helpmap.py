@@ -30,7 +30,7 @@ import argparse
 import re
 from dataclasses import dataclass
 
-__all__ = ["SUBAGENT_NOTE", "generate", "main"]
+__all__ = ["PROJECT_LOOKUP_NOTE", "SUBAGENT_NOTE", "SUBMIT_VALIDATE_NOTE", "generate", "main"]
 
 _POSITIONAL_SECTION = "positional arguments"
 _OPTIONS_SECTION = "options"
@@ -46,6 +46,37 @@ SUBAGENT_NOTE = (
     "Commands tagged `(subagent)` below are slow, blocking, or otherwise best run inside a "
     "subagent (e.g. Claude Code's Task tool) rather than directly in your main context -- "
     "everything else is cheap enough to invoke directly."
+)
+
+# A user will often refer to a codebase by its registered project name rather
+# than a path -- "in {project_a}, do X", "add a new feature to {project_b}",
+# "fix {project_c}" -- since they don't know (or don't want to type) where it
+# lives on disk. Resolve the name with `ralphus project get <name>` (see
+# `p_project_get` in `ralphus.__main__`) before acting, rather than guessing
+# a path or asking the user to spell it out.
+PROJECT_LOOKUP_NOTE = (
+    'A user will often name a project instead of giving a path, e.g. "in {project_a}, do X", '
+    '"add a new feature to {project_b}", "fix {project_c}" -- {project_a}/{project_b}/'
+    "{project_c} each stand in for whatever project name the user actually says, not a literal "
+    "value to type. When that happens, run `ralphus project get <project name>` (substituting "
+    "the real name) to resolve it to its on-disk path before acting."
+)
+
+# Before `submit` on a freshly-written or freshly-edited TOML file, validate it
+# directly first -- `validate` is deliberately left untagged in
+# `_SUBAGENT_PATHS` above precisely because it's meant for a tight, cheap
+# edit-loop, unlike the slower/blocking `submit`. `submit` itself also
+# validates client-side before it actually submits and refuses invalid TOML
+# (see its `--no-validate` flag's own help text), but that check only runs
+# once `submit` is invoked and needs the daemon reachable -- validating up
+# front catches the same per-line errors sooner, without a daemon round-trip.
+SUBMIT_VALIDATE_NOTE = (
+    "Before running `submit` on a TOML file you just wrote or edited, validate it first with "
+    "`ralphus validate <file>` -- a fast, fully offline check (no daemon needed) that reports "
+    "every error with its line number, so you can fix a draft in a tight edit loop. `submit` "
+    "itself also validates before submitting by default and refuses invalid TOML, but that only "
+    "happens once `submit` runs and needs the daemon reachable; validating first catches the "
+    "same errors sooner and more cheaply."
 )
 
 # `author` starts its own agentic authoring loop (`ralphus.author`) that
@@ -228,6 +259,10 @@ def generate() -> str:
 
 def main() -> None:
     print(SUBAGENT_NOTE)
+    print()
+    print(PROJECT_LOOKUP_NOTE)
+    print()
+    print(SUBMIT_VALIDATE_NOTE)
     print()
     print(generate())
 

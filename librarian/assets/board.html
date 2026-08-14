@@ -14,6 +14,7 @@
         --warn: #d29922;
         --unverified: #e3b341;
         --waiting: #f778ba;
+        --solo: #ffa657;
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -127,7 +128,9 @@
       .p-cancelled { color: var(--cancelled); }
       .p-waiting { color: var(--waiting); border-color: var(--waiting); }
       .p-warn { color: var(--warn); border-color: var(--warn); }
+      .p-solo { color: var(--solo); border-color: var(--solo); }
       .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
+      .p-verify_pending { color: var(--running); border-color: var(--running); }
       .p-in_progress { color: var(--running); border-color: var(--running); }
       .p-ready { color: var(--teal); border-color: var(--teal); }
       .badge.ready { color: var(--teal); border-color: var(--teal); }
@@ -161,6 +164,10 @@
       .peek-jump-btn { position: absolute; right: 10px; bottom: 14px; font-size: 11px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-2); color: var(--text); cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,.35); }
       .peek-jump-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
       .peek-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--running); margin-right: 5px; flex: none; }
+      /* Confirmed-ended peek box (RAL-102 follow-up): read-only historical
+         record, not live output -- docs/colors.md's read-only convention
+         (--muted), not the caution-reserved --ignored or a status color. */
+      .peek-dot.ended { background: var(--muted); }
       .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
       /* RAL-108: review-action failure toasts. Fixed bottom-right stack so a
          rejected action (e.g. a 409) is visible without blocking the UI like
@@ -204,6 +211,9 @@
       .branch-conflict-bar { margin: 2px 8px 4px; }
       .branch-conflict-label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
       .branch-conflict-label .conflict-icon { font-size: 12px; }
+      .branch-conflict-files { margin: 0 8px 6px; padding: 4px 8px; border: 1px solid var(--failed); border-radius: 6px; background: rgba(248,81,73,.08); }
+      .branch-conflict-file { font-size: 11px; color: var(--failed); padding: 1px 0; }
+      .branch-conflict-files-empty { font-size: 11px; color: var(--muted); }
       .branch-row[draggable=true] { cursor: grab; }
       .branch-row.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
       .branch-row .grip { color: var(--muted); }
@@ -214,6 +224,7 @@
       .badge { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
       .badge.warn2 { color: var(--queued); border-color: var(--queued); }
       .badge.bad { color: var(--failed); border-color: var(--failed); }
+      .badge.live { color: var(--running); border-color: var(--running); }
       .chat-bubble-wrap { display: flex; margin: 5px 0; }
       .chat-bubble-wrap.user { justify-content: flex-end; }
       .chat-bubble-wrap.guardian { justify-content: flex-start; }
@@ -456,7 +467,7 @@
        * @property {string} spec
        * @property {string|null} model
        * @property {string} [agent]
-       * @property {string} [claude_session_id]
+       * @property {string} [agent_session_id]
        */
       /**
        * @typedef {object} SessionView
@@ -469,22 +480,28 @@
        * @property {number} [tokens_in]
        * @property {number} [tokens_out]
        * @property {number} [cost_usd]
+       * @property {number} [maximum_budget_usd]
        * @property {string|null} [error]
        * @property {VerifyView[]} [verify]
        * @property {string[]} [depends_on]
        * @property {string} [command]
        * @property {string} [prompt]
-       * @property {string} [claude_session_id]
+       * @property {string} [agent_session_id]
        * @property {{id: string, name: string, status: string, branch?: string}[]} [reviews]
+       * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this session (hierarchical env overrides, extending RAL-150); merged on top of the owning task's/run's when the session's own subprocess is spawned. Empty/absent for the vast majority of sessions.
+       * @property {{[key: string]: string}} [verify_env_overrides] - Persistent environment-variable overrides applied only to this session's own verify steps, merged on top of `env_overrides` (and its ancestors).
        */
       /**
        * @typedef {object} TaskView
        * @property {string} name
-       * @property {string|null} [project]
+       * @property {string} project - Registered project name, or a server-derived fallback (cwd basename, or "unassigned") when the task's TOML left `project` unset (RAL-141). Always present.
        * @property {string} state
        * @property {SessionView[]} sessions
        * @property {VerifyView[]} [verify]
        * @property {string[]} [depends_on]
+       * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this task (hierarchical env overrides, extending RAL-150); merged on top of the run's, and merged onto every session under this task. Empty/absent for the vast majority of tasks.
+       * @property {{[key: string]: string}} [verify_env_overrides] - Persistent environment-variable overrides applied only to this task's own (task-scoped) verify steps, merged on top of `env_overrides` (and the run's).
+       * @property {boolean} soloed
        */
       /**
        * One session's derived git info from `GET /api/runs/{id}/worktrees`
@@ -505,6 +522,7 @@
        * @property {number} created_at_ms
        * @property {TaskView[]} tasks
        * @property {{id: string, name: string, status: string}[]} [reviews]
+       * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every session/verify subprocess this run spawns from now on, until unset. Empty/absent for the vast majority of runs.
        */
       /**
        * @typedef {object} DaemonStatus
@@ -520,7 +538,7 @@
        * @property {boolean} [enabled]
        * @property {string} [name]
        * @property {string} [project]
-       * @property {string} [merge_status] - "pending" | "in_progress" | "done" | "conflict" | ...
+       * @property {string} [merge_status] - "pending" | "in_progress" | "done" | "verify_pending" | "conflict_resolved" | "failed" | ...
        * @property {string} [moved_from_guardian_id]
        * @property {string} [source_run_id]
        * @property {number} [source_task_idx]
@@ -531,14 +549,41 @@
        * @property {number} [conflicts_found]
        * @property {number} [conflicts_fixed]
        * @property {number} [conflicts_committed]
+       * @property {number|null} [rebase_commands_done] - Live rebase-todo position (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
+       * @property {number|null} [rebase_commands_total] - Live rebase-todo total (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
        * @property {boolean} [can_reenable]
-       * @property {string} [resolver_claude_session_id]
+       * @property {string} [resolver_agent_session_id]
        */
       /**
-       * @typedef {object} ActionHint
-       * @property {string} label
+       * A named, defaulted value referenced by a GuardianCheck's
+       * command/cleanup_command as a `{name}` placeholder (RAL-164).
+       * @typedef {object} CheckInput
+       * @property {string} name
+       * @property {string} message
+       * @property {string} default
+       */
+      /**
+       * One runnable review check (RAL-164): either a user-declared
+       * `[[review.action]]` hint (has a `label`) or an AI-synthesized manual
+       * check (no `label`). Exactly one of `command`/`prompt` is set.
+       * @typedef {object} GuardianCheck
+       * @property {string} [label]
        * @property {string} [command]
        * @property {string} [prompt]
+       * @property {string} [cleanup_command]
+       * @property {CheckInput[]} [inputs]
+       */
+      /**
+       * @typedef {object} BranchConflicts
+       * @property {string[]} files - Paths (relative to the branch's worktree root) still carrying unresolved conflict markers. Empty once resolved, or if the worktree doesn't exist (yet, or anymore).
+       * @property {boolean} rebase_in_progress - Whether the worktree is currently mid-`git rebase`. Can be false while `files` is still non-empty.
+       */
+      /**
+       * Status of a "set it for me" AI resolution for one named CheckInput
+       * (RAL-164). `value` is only present once `status` is "ready".
+       * @typedef {object} InputResolution
+       * @property {string} status - "resolving" | "ready" | "failed"
+       * @property {string} [value]
        */
       /**
        * @typedef {object} GuardianView
@@ -556,10 +601,13 @@
        * @property {string} [combined_worktree]
        * @property {string[]} [checks]
        * @property {string} [checks_state] - "ready" | "generating" | "waiting"
-       * @property {string[]} [manual_commands]
+       * @property {GuardianCheck[]} [manual_commands]
        * @property {string} [manual_commands_agent]
        * @property {string} [manual_commands_model]
-       * @property {ActionHint[]} [action_hints]
+       * @property {string} [manual_commands_agent_session_id]
+       * @property {GuardianCheck[]} [action_hints]
+       * @property {Record<string,string>} [input_values]
+       * @property {Record<string,InputResolution>} [input_resolutions]
        * @property {string} [resolver_agent]
        * @property {string} [resolver_model]
        * @property {string} [chat_agent]
@@ -575,6 +623,7 @@
        * @property {number} [conflicts_found]
        * @property {number} [conflicts_fixed]
        * @property {number} [conflicts_committed]
+       * @property {boolean} [verify_mid_resolution] - RAL-149: also runs the quality-bar checks during the per-branch fix pass, not just the dedicated final-verification call. Default false.
        */
       /**
        * @typedef {object} ChatMessage
@@ -721,6 +770,8 @@
       let expandedBranches = new Set();
       /** @type {{[key: string]: boolean}} gid -> whether the manual-checks dropdown is open */
       let manualMenuOpen = {};
+      /** @type {{[key: string]: boolean}} "<gid>:<manual|action>:<index>" -> whether that check's inline input form is open (RAL-164) */
+      let checkFormOpen = {};
       /** @type {{[key: string]: boolean}} peek-key -> whether the terminal actions dropdown ("Open Terminal Log" / "Open Agent") is open */
       let terminalMenuOpen = {};
       /** @type {Set<string>} */
@@ -739,8 +790,14 @@
       let peekOpen = {};
       /** @type {{[key: string]: string}} peek key -> last-fetched pane text, so a full pane re-render (every 2s tick) redisplays the last content instead of flashing back to "Loading…" (RAL-102 follow-up) */
       let peekContent = {};
+      /** @type {{[key: string]: boolean}} peek key -> whether the last-fetched poll reported the session as truly, confirmedly ended (past PEEK_MISSING_STRIKE_LIMIT) -- distinct from a single transient miss, which is not treated as ended (RAL-102 follow-up) */
+      let peekEnded = {};
+      /** @type {{[key: string]: number}} peek key -> consecutive inactive-poll count, reset to 0 on any active response */
+      let peekMissingStrikes = {};
       /** @type {{[key: string]: string|null}} gid -> branch name, the currently selected branch in the review pane */
       let selectedBranch = {};
+      /** @type {{[key: string]: BranchConflicts}} "gid:branch_id" -> last-fetched live conflicting-files list (RAL-148) */
+      let branchConflicts = {};
 
       // ---------- helpers ----------
       /**
@@ -779,6 +836,15 @@
        */
       const pill = (s) => `<span class="pill p-${s}">${s}</span>`;
       /**
+       * Renders a "soloed" badge for a task (RAL-157), or an empty string when
+       * the task isn't soloed.
+       * @param {TaskView} t
+       * @returns {string}
+       */
+      const soloBadge = (t) => t.soloed
+        ? `<span class="pill p-solo" data-tip="This task is soloed — every other task in the run is paused (their not-yet-started sessions won't launch) until un-soloed.\nRight-click this task and choose \"Un-solo task\" to resume the others.">★ solo</span>`
+        : "";
+      /**
        * Looks up a run by id from the in-memory `runs` list.
        * @param {string|null|undefined} id
        * @returns {RunView|undefined}
@@ -790,6 +856,15 @@
       // reason. This is a display-only relabeling — the underlying state is
       // still "pending" (filters, menus, and the API all use the real state).
       const WAITING_TIP = "Waiting for the configured scheduler down-time window to end before this run can be picked up.\nShown instead of \"pending\" when the daemon is currently inside a down-time window (see [daemon] in .ralphus.toml).\nIn-progress runs are never paused — this only affects new automatic pickups.";
+      // RAL-160: token/cost figures shown in the session detail pane reflect
+      // only this session's current run — a restart overwrites them rather
+      // than accumulating, so they are never a running total across retries.
+      const TOKENS_COST_TIP = "Input tokens: text sent to the model (prompt, system prompt, tool results).\nOutput tokens: text the model generated in response.\n$ cost is for this run only — it is not cumulative across restarts of this session.";
+      // RAL-160: restarting a session overwrites its tokens/cost in place, so
+      // the running total across every attempt only survives in Cartographer's
+      // "session completed" event history — load it on demand rather than on
+      // every render, since it's an extra API call the 2s poll should not repeat.
+      const LIFETIME_COST_TIP = "Sums tokens and cost across every completed attempt of this session (including restarts), not just the current one.\nWho/when: check this to see total spend on a session that's been restarted multiple times.\nLoaded on demand from the Cartographer event log — click to fetch; older attempts may be missing if Cartographer retention has pruned them.";
       /**
        * True when a run is Pending only because the scheduler down-time window is active.
        * @param {RunView} r
@@ -1530,9 +1605,30 @@
           alert('Failed to open terminal: network error');
         }
       }
+      // mode is "open" (attach to the manual-checks generation's live tmux
+      // session) or "agent" (resume the real `claude` CLI on that generation's
+      // own conversation, if it ran under claude-code).
       /**
-       * Resumes the real Claude Code CLI on a task session's own conversation,
-       * in a new terminal window — unlike `openTerminal`, this is an actual
+       * Spawns a review's manual-checks generation terminal on the daemon host.
+       * @param {string} guardianId
+       * @param {string} mode
+       * @returns {Promise<void>}
+       */
+      async function openGuardianManualChecksTerminal(guardianId, mode) {
+        try {
+          const resp = await fetch(`/api/guardians/${guardianId}/manual-checks/open-terminal?mode=${mode}`, {method:'POST'});
+          if (!resp.ok) {
+            const e = await resp.json().catch(() => ({}));
+            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+          }
+        } catch (_) {
+          alert('Failed to open terminal: network error');
+        }
+      }
+      /**
+       * Resumes the real CLI agent (Claude Code or Codex, whichever the
+       * session ran under) on a task session's own conversation, in a new
+       * terminal window — unlike `openTerminal`, this is an actual
        * interactive agent session, not a re-attach to the runner's tmux wrapper.
        * @param {string} runId
        * @param {number} ti
@@ -1551,7 +1647,7 @@
         }
       }
       /**
-       * Resumes the real Claude Code CLI on a verify step's own conversation,
+       * Resumes the real CLI agent on a verify step's own conversation,
        * in a new terminal window — see `openAgentTerminal`'s doc comment.
        * @param {string} runId
        * @param {number} taskIdx
@@ -1644,6 +1740,7 @@
         if (kind === "session") { const [runId, ti, si] = rest; return `/api/runs/${runId}/sessions/${ti}/${si}/pane?lines=500`; }
         if (kind === "verify") { const [runId, ti, scope, si, vi] = rest; return `/api/runs/${runId}/verifies/${ti}/${scope}/${si}/${vi}/pane?lines=500`; }
         if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/pane?lines=500`; }
+        if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/pane?lines=500`; }
         return null;
       }
       /**
@@ -1654,7 +1751,11 @@
        */
       function togglePeek(key) {
         peekOpen[key] = !peekOpen[key];
-        if (!peekOpen[key]) delete peekContent[key]; // stale content shouldn't reappear next time this box is opened
+        if (!peekOpen[key]) {
+          delete peekContent[key]; // stale content shouldn't reappear next time this box is opened
+          delete peekEnded[key];
+          delete peekMissingStrikes[key];
+        }
         terminalMenuOpen[key] = false; // pressing the primary button should collapse the actions dropdown too
         if (sel.kind) renderDetails();
         if (selectedGuardian) renderReviewDetail();
@@ -1681,8 +1782,18 @@
         // the terminal itself had changed (RAL-102 follow-up).
         const cached = peekContent[key];
         const cssKey = peekCssKey(key);
-        return `<div class="peek-box" data-tip="Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nShows 'terminal session has ended' once the underlying tmux session is gone.">
-            <div class="peek-head"><span><span class="peek-dot"></span>Live terminal (read-only)</span><span style="display:flex;gap:4px;align-items:center"><button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." onclick="copyPeekText(event,'${key}')">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" onclick="togglePeek('${key}');event.stopPropagation()" data-tip="Collapse this live view.">✕ Hide</button></span></div>
+        // Confirmed-ended (not just a single missed poll — see
+        // PEEK_MISSING_STRIKE_LIMIT/fetchPeek) shows as a distinct read-only
+        // historical record rather than the live auto-refreshing view, per
+        // docs/colors.md's "read-only field indicator" convention: --muted,
+        // never the caution-reserved --ignored or --danger/--failed.
+        const ended = !!peekEnded[key];
+        const headLabel = ended ? "Historical record (read-only) — session ended" : "Live terminal (read-only)";
+        const headTip = ended
+          ? "This tmux session has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf the agent reattaches under this same session, this box returns to auto-refreshing live output on its own."
+          : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux session ends.";
+        return `<div class="peek-box" data-tip="${headTip}">
+            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}</span><span style="display:flex;gap:4px;align-items:center"><button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." onclick="copyPeekText(event,'${key}')">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" onclick="togglePeek('${key}');event.stopPropagation()" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             <div class="peek-pre-wrap">
               <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" onscroll="onPeekScroll('${key}')" onkeydown="handlePeekKeydown(event,'${key}')" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${cached ? esc(cached) : "Loading…"}</pre>
               <button id="peek-jump-${cssKey}" class="peek-jump-btn" style="display:none" onclick="peekScrollToBottom('${key}')" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button>
@@ -1690,6 +1801,15 @@
             </div>
           </div>`;
       }
+      // A lone `active:false` poll is often just a transient psmux hiccup
+      // (see PSMUX_CRASH_NOTES.local.md) rather than a real session death —
+      // confirmed live: a session flashed "terminal session has ended" in
+      // this exact peek box while the daemon's own Cartographer trail showed
+      // a completely clean run with no missed-session detection at all.
+      // Mirrors the daemon's own tolerance (`MISSING_SESSION_STRIKE_LIMIT`,
+      // 3 misses at its 500ms poll interval — daemon/src/runner.rs) scaled to
+      // this box's slower 2s poll cadence.
+      const PEEK_MISSING_STRIKE_LIMIT = 2;
       /**
        * Fetches one peek box's live pane content and patches it into the DOM in
        * place. Scrolls the box to the bottom when `forceBottom` is set (a fresh
@@ -1697,29 +1817,66 @@
        * box was already scrolled to its bottom before this update (so it keeps
        * following new output rather than getting stuck wherever it happened to
        * be when the box was last recreated).
+       *
+       * A single inactive poll is not immediately treated as "ended" —
+       * `peekMissingStrikes` must reach `PEEK_MISSING_STRIKE_LIMIT` first (see
+       * that constant's comment). Below the limit, the box keeps showing
+       * whatever it last displayed rather than flashing to "ended" and back.
+       * Once confirmed ended, `data.content` (if any) is the daemon's
+       * persisted last-pane-content snapshot (RAL-102 follow-up) — a
+       * read-only historical record, not fresh output — and `peekEnded[key]`
+       * is set so {@link peekBox} can render the header accordingly.
        * @param {string} key
        * @param {boolean} forceBottom
        * @returns {Promise<void>}
        */
       async function fetchPeek(key, forceBottom) {
         const el = document.getElementById(`peek-pre-${peekCssKey(key)}`);
-        if (!el) { delete peekOpen[key]; delete peekContent[key]; return; } // no longer rendered (navigated away)
+        // Not currently rendered (navigated to a different session/tab) —
+        // leave peekOpen alone so the toggle is remembered per-session
+        // (RAL-162) and skip fetching until it's rendered again.
+        if (!el) return;
         const url = peekUrlFor(key);
         if (!url) { delete peekOpen[key]; delete peekContent[key]; return; }
+        const wasEnded = !!peekEnded[key];
         try {
           const resp = await fetch(url);
           if (!resp.ok) { el.textContent = "Could not load terminal output."; return; }
           const data = await resp.json();
           const atBottom = forceBottom || el.scrollTop + el.clientHeight >= el.scrollHeight - 4;
-          const text = !data.active
-            ? ((data.content && data.content.trim())
-                ? data.content + "\n\n[terminal session has ended]"
-                : "Terminal session has ended.")
-            : (data.content || "(no output yet)");
+          let text;
+          if (data.active) {
+            peekMissingStrikes[key] = 0;
+            peekEnded[key] = false;
+            text = data.content || "(no output yet)";
+          } else {
+            const strikes = (peekMissingStrikes[key] || 0) + 1;
+            peekMissingStrikes[key] = strikes;
+            if (strikes < PEEK_MISSING_STRIKE_LIMIT) {
+              // Not confirmed yet -- keep showing the last known content
+              // instead of flashing "ended" for what may be a transient miss.
+              text = peekContent[key] || "Loading…";
+            } else {
+              peekEnded[key] = true;
+              text = (data.content && data.content.trim())
+                ? data.content + "\n\n[Read-only historical record — this terminal session has ended.]"
+                : "Terminal session has ended. No output was recorded before it ended.";
+            }
+          }
           peekContent[key] = text;
           el.textContent = text;
           if (atBottom) el.scrollTop = el.scrollHeight;
           updatePeekJumpVisibility(key);
+          // The head banner's live/historical wording+dot depend on
+          // peekEnded, which the periodic full re-render (every 2s tick)
+          // already reflects on its own -- only force one here on the rare
+          // false->true transition itself, so the banner updates promptly
+          // instead of waiting up to one more tick, without re-rendering
+          // (and losing scroll position on) every single fetch.
+          if (peekEnded[key] && !wasEnded) {
+            if (sel.kind) renderDetails();
+            if (selectedGuardian) renderReviewDetail();
+          }
         } catch (_) {
           el.textContent = "Could not load terminal output (network error).";
         }
@@ -2155,15 +2312,34 @@
       function openTaskNodeMenu(e, runId, ti) {
         e.preventDefault(); e.stopPropagation(); closeGraphMenu();
         const r = findRun(runId); if (!r) return;
+        const t = r.tasks[ti];
+        const soloed = !!(t && t.soloed);
+        const soloTip = soloed
+          ? "Un-solo this task — resumes every other task in the run so their not-yet-started sessions can dispatch again."
+          : "Solo this task — pauses every other task in the run (their not-yet-started sessions won't launch) until un-soloed.\nSessions already running keep running; the pause takes effect for their task's next session.\nMultiple tasks can be soloed at once.";
         const items = [
           `<div title="Re-run all sessions of this task from the first, and dirty every downstream run so it re-executes too. This cannot be undone." onclick="closeGraphMenu();restartRun('${runId}')">⟳ Restart task</div>`,
-          `<div onclick="event.stopPropagation();closeGraphMenu();openStatusPickerForTask(event,'${runId}',${ti})" data-tip="Manually override this task's status — any valid state can be set. A confirmation dialog will appear before applying.\nThis cannot be undone for terminal states.">⚙ Set Status</div>`
+          `<div onclick="event.stopPropagation();closeGraphMenu();openStatusPickerForTask(event,'${runId}',${ti})" data-tip="Manually override this task's status — any valid state can be set. A confirmation dialog will appear before applying.\nThis cannot be undone for terminal states.">⚙ Set Status</div>`,
+          `<div data-tip="${soloTip}" onclick="closeGraphMenu();soloTaskAct('${runId}',${ti},${soloed ? "false" : "true"})">${soloed ? "☆ Un-solo task" : "★ Solo task"}</div>`
         ];
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "graph-node-menu"; menu.innerHTML = items.join("");
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 80) + "px";
+      }
+      /**
+       * Solos or un-solos a task within a run (RAL-157). Soloing pauses every
+       * other task in the run until un-soloed.
+       * @param {string} runId
+       * @param {number} ti
+       * @param {boolean} solo
+       * @returns {Promise<void>}
+       */
+      async function soloTaskAct(runId, ti, solo) {
+        closeGraphMenu();
+        await post(`/api/runs/${runId}/tasks/${ti}/${solo ? "solo" : "unsolo"}`);
+        tick();
       }
       /**
        * Opens the context menu for a session graph node (restart / set status).
@@ -2337,7 +2513,7 @@
           const tverify = (t.verify || []).map((v, vi) => `<span class="vchip selectable ${selCls("verify", ti, -1, vi)}" id="v-${ti}-${vi}" data-tip="Task verify step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after all sessions finish to validate the task result.\nState: ${esc(v.state)}.\nRight-click to restart or set status." onclick="event.stopPropagation();pick('verify',${ti},-1,${vi})" oncontextmenu="event.preventDefault();event.stopPropagation();openVerifyMenu(event,'${run.id}',${ti},-1,${vi})">${sdot(v.state)} ${esc(v.id || v.kind)}</span>`).join("");
           const tdep = (t.depends_on || []).length ? `<span class="k" style="font-size:11px" data-tip="This task depends on ${esc((t.depends_on||[]).join(", "))}.\nIt will not start until the upstream task(s) finish successfully.">⇠ ${esc((t.depends_on||[]).join(", "))}</span>` : "";
           return `<div class="task" id="tk-${ti}">
-            <div class="task-head selectable ${selCls("task", ti)}" onclick="pick('task',${ti})" oncontextmenu="openTaskNodeMenu(event,'${run.id}',${ti})">${sdot(t.state)} <span>${esc(t.name)}</span> ${pill(t.state)} ${tdep}</div>
+            <div class="task-head selectable ${selCls("task", ti)}" onclick="pick('task',${ti})" oncontextmenu="openTaskNodeMenu(event,'${run.id}',${ti})">${sdot(t.state)} <span>${esc(t.name)}</span> ${pill(t.state)} ${soloBadge(t)} ${tdep}</div>
             <div class="task-body">${sessions || '<span class="kv">no sessions</span>'}</div>
             ${tverify ? `<div class="verify-chain"><span class="label">verify</span>${tverify}</div>` : ""}
           </div>`;
@@ -2508,7 +2684,147 @@
           <div class="kv-row"><span class="k">state</span><span class="v"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${pill(runDisplayState(r))}${["pending","queued"].includes(r.state) ? "" : runLogsBtn(r.id)}</span></div>
           ${tasks}
           ${reviews}
+          ${envOverridesSection(r)}
           ${editBtn()}`;
+      }
+      /**
+       * Shared markup for an "environment overrides" section at any scope
+       * (run/task/task-verify/session/session-verify; hierarchical env
+       * overrides, extending RAL-150): a warning banner when non-empty, a
+       * row per KEY/VALUE with a "Remove" button, and an "+ Add override"
+       * button. Always rendered, even when empty, so the add-override
+       * affordance stays reachable. `label` is the human-readable scope name
+       * used in the heading/tooltips (e.g. "run", "task", "task verify
+       * steps"); `apiPath` is the `POST .../env`-shaped endpoint this
+       * scope's overrides live at.
+       * @param {{[key: string]: string} | undefined} overrides
+       * @param {string} label
+       * @param {string} apiPath
+       * @returns {string}
+       */
+      function renderEnvOverrides(overrides, label, apiPath) {
+        const map = overrides || {};
+        const keys = Object.keys(map).sort();
+        const banner = keys.length
+          ? `<div class="kv-row" data-tip="Retries scoped to this ${esc(label)} will use these overridden values instead of the environment ralphus would otherwise use.\nA parent scope's value for the same key is shadowed here.">⚠ ${keys.length} override${keys.length === 1 ? "" : "s"} active — retries are not identical replays</div>`
+          : "";
+        const rows = keys.length
+          ? keys.map((k) =>
+              `<div class="kv-row"><span class="v mono" style="flex:1">${esc(k)}</span>` +
+              `<span class="v mono" style="flex:1">${esc(map[k])}</span>` +
+              `<button class="btn" onclick="removeEnvOverrideAt('${apiPath}','${esc(k)}')" data-tip="Remove this environment-variable override from this ${esc(label)}.\nFuture retries here fall back to whatever the next-higher scope resolves to.\nThis cannot be undone.">✕ Remove</button></div>`).join("")
+          : `<div class="kv-row"><span class="v">None</span></div>`;
+        return `<h3 class="section">environment overrides (${esc(label)})</h3>
+          ${banner}
+          ${rows}
+          <div class="kv-row"><button class="btn" onclick="addEnvOverrideAt('${apiPath}')" data-tip="Set a persistent environment-variable override for this ${esc(label)} (hierarchical env overrides, extending RAL-150).\nUse this to retry with a different model/resolver, feature flag, or credential scoped to just this ${esc(label)}, without editing and resubmitting the TOML.\nOverrides a parent scope's value for the same key; applies the next time this ${esc(label)} executes, and stays set across any number of retries until removed.">+ Add override</button></div>`;
+      }
+      /**
+       * Renders the "environment overrides" section of the run details pane.
+       * @param {RunView} r
+       * @returns {string}
+       */
+      function envOverridesSection(r) {
+        return renderEnvOverrides(r.env_overrides, "run", `/api/runs/${r.id}/env`);
+      }
+      /**
+       * Renders the task-level "environment overrides" section of the task
+       * details pane — overrides here win over the run's, for every session
+       * under this task.
+       * @param {RunView} r
+       * @param {number} ti
+       * @param {TaskView} t
+       * @returns {string}
+       */
+      function taskEnvOverridesSection(r, ti, t) {
+        return renderEnvOverrides(t.env_overrides, "task", `/api/runs/${r.id}/tasks/${ti}/env`);
+      }
+      /**
+       * Renders the "environment overrides" section for a task's own
+       * (task-scoped) verify steps — overrides here win over the task's own
+       * (and the run's), but only for this task's verify steps.
+       * @param {RunView} r
+       * @param {number} ti
+       * @param {TaskView} t
+       * @returns {string}
+       */
+      function taskVerifyEnvOverridesSection(r, ti, t) {
+        return renderEnvOverrides(
+          t.verify_env_overrides,
+          "task verify steps",
+          `/api/runs/${r.id}/tasks/${ti}/verify/env`,
+        );
+      }
+      /**
+       * Renders the session-level "environment overrides" section of the
+       * session details pane — overrides here win over the owning task's
+       * (and the run's), for this session's own subprocess.
+       * @param {RunView} r
+       * @param {number} ti
+       * @param {number} si
+       * @param {SessionView} s
+       * @returns {string}
+       */
+      function sessionEnvOverridesSection(r, ti, si, s) {
+        return renderEnvOverrides(
+          s.env_overrides,
+          "session",
+          `/api/runs/${r.id}/sessions/${ti}/${si}/env`,
+        );
+      }
+      /**
+       * Renders the "environment overrides" section for a session's own
+       * (session-scoped) verify steps — overrides here win over the
+       * session's own (and its task's/run's), but only for this session's
+       * verify steps.
+       * @param {RunView} r
+       * @param {number} ti
+       * @param {number} si
+       * @param {SessionView} s
+       * @returns {string}
+       */
+      function sessionVerifyEnvOverridesSection(r, ti, si, s) {
+        return renderEnvOverrides(
+          s.verify_env_overrides,
+          "session verify steps",
+          `/api/runs/${r.id}/sessions/${ti}/${si}/verify/env`,
+        );
+      }
+      /**
+       * Prompts for a KEY and VALUE and sets it as a persistent
+       * environment-variable override at `apiPath` (hierarchical env
+       * overrides, extending RAL-150) — shared by every scope's "+ Add
+       * override" button.
+       * @param {string} apiPath
+       * @returns {Promise<void>}
+       */
+      async function addEnvOverrideAt(apiPath) {
+        const rawKey = prompt("Environment variable name (e.g. RALPHUS_RESOLVER_MODEL):");
+        if (rawKey === null) return;
+        const key = rawKey.trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+          alert(`"${key}" is not a valid environment variable name.`);
+          return;
+        }
+        const value = prompt(`Value for ${key}:`);
+        if (value === null) return;
+        const res = await post(apiPath, { set: { [key]: value } });
+        if (!res.ok) { alert("Failed to set the environment override."); return; }
+        tick();
+      }
+      /**
+       * Removes a persistent environment-variable override at `apiPath`
+       * (hierarchical env overrides, extending RAL-150) — shared by every
+       * scope's "Remove" button.
+       * @param {string} apiPath
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function removeEnvOverrideAt(apiPath, key) {
+        if (!confirm(`Remove environment override "${key}"?\nThis cannot be undone.`)) return;
+        const res = await post(apiPath, { unset: [key] });
+        if (!res.ok) { alert("Failed to remove the environment override."); return; }
+        tick();
       }
       /**
        * Navigates to the Reviews tab for a given guardian id.
@@ -2586,10 +2902,11 @@
           : `<h3 class="section">verify steps</h3><div class="kv-row"><span class="v">None</span></div>`;
         return `<div class="dhead"><span class="k">⯀ task</span></div>
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project || "—")}</span></div>
+          <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${["pending","queued"].includes(t.state) ? "" : runLogsBtn(r.id)}</span></div>
           ${sessions}
           ${verify}
+          ${taskEnvOverridesSection(r, ti, t)}
           ${editBtn()}`;
       }
       /**
@@ -2601,14 +2918,16 @@
         const ti = sel.taskIdx, si = sel.sessionIdx, vi = sel.verifyIdx ?? -1;
         const t = r.tasks[ti];
         if (!t) return `<div class="empty">Task not found.</div>`;
-        let v, scopeLabel;
+        let v, scopeLabel, envSection;
         if (si === -1) {
           v = (t.verify || [])[vi];
           scopeLabel = "task";
+          envSection = taskVerifyEnvOverridesSection(r, ti, t);
         } else {
           const s = (t.sessions || [])[si];
           v = s && (s.verify || [])[vi];
           scopeLabel = s ? `session · ${esc(s.name ?? s.id)}` : "session";
+          envSection = s ? sessionVerifyEnvOverridesSection(r, ti, si, s) : "";
         }
         if (!v) return `<div class="empty">Verify step not found.</div>`;
         const logBtn = v.output
@@ -2619,23 +2938,31 @@
           : (v.spec ? `<h3 class="section">prompt</h3><div class="prompt-box">${esc(v.spec)}</div>` : "");
         const terminalBtns = (() => {
           const scope = si === -1 ? "task" : "session";
-          if (v.kind !== "prompt") {
-            const tip = "Terminal access is not available — this verify step runs a shell command rather than an AI agent.";
+          const liveViewCapable = v.kind === "prompt" || v.kind === "command";
+          if (!liveViewCapable) {
+            const tip = "Terminal access is not available — this verify step has no execution backend to show a live view for.";
             return `<div class="btn-row"><span data-tip="${tip}"><button class="btn primary" disabled style="pointer-events:none">Show Live View</button></span></div>`;
           }
-          // RAL-102: every prompt/agent verify step runs inside tmux, so the
-          // dropdown is available for any agent — "not currently live" is
-          // handled gracefully at click/peek time, not by pre-disabling.
+          // RAL-102/RAL-151: every command/prompt verify step runs inside
+          // tmux, so the dropdown is available for either kind — "not
+          // currently live" is handled gracefully at click/peek time, not by
+          // pre-disabling. "Open Agent" only makes sense for a prompt-kind
+          // step (there is no agent conversation to resume for a plain
+          // shell command), so it's omitted outright for command-kind
+          // rather than shown disabled.
           const key = `verify|${r.id}|${ti}|${scope}|${si}|${vi}`;
           const previewBtn = `<button class="btn primary" onclick="togglePeek('${key}')" style="border-radius:6px 0 0 6px" data-tip="Peek at this verify step's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the verify step isn't running.">${peekOpen[key] ? "Hide Live View" : "Show Live View"}</button>`;
+          const openAgentItem = v.kind === "prompt"
+            ? (v.agent_session_id
+                ? terminalMenuItem(key, "Open Agent",
+                    `openAgentVerifyTerminal('${r.id}',${ti},'${scope}',${si},${vi})`,
+                    "Resume the real CLI agent, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the step is still running or already finished.")
+                : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this verify step.", true))
+            : "";
           const items = terminalMenuItem(key, "Open Terminal Log",
               `openVerifyTerminal('${r.id}',${ti},'${scope}',${si},${vi})`,
-              "Attach an interactive terminal to this verify step's live tmux session.\nShows the runner's own log/event stream, not Claude's actual conversation.\nOnly available while the verify step is actively running — fails gracefully otherwise.")
-            + (v.claude_session_id
-              ? terminalMenuItem(key, "Open Agent",
-                  `openAgentVerifyTerminal('${r.id}',${ti},'${scope}',${si},${vi})`,
-                  "Resume the real Claude Code CLI, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the step is still running or already finished.")
-              : terminalMenuItem(key, "Open Agent", "", "Not available yet — no Claude Code session has started for this verify step.", true));
+              "Attach an interactive terminal to this verify step's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the verify step is actively running — fails gracefully otherwise.")
+            + openAgentItem;
           return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key)}`;
         })();
         return `<div class="dhead"><span class="k">✓ verify step</span></div>
@@ -2646,7 +2973,8 @@
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}</span></div>
           ${v.model ? `<div class="kv-row"><span class="k">model</span><span class="v">${esc(v.model)}</span></div>` : ""}
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
-          ${specSection}${terminalBtns}`;
+          ${specSection}${terminalBtns}
+          ${envSection}`;
       }
 
       // CCTL-148: worktree (the session's own cwd) and project (its shared git
@@ -2720,35 +3048,40 @@
           <div class="kv-row"><span class="k">project</span><span class="v mono">${esc(project)}${paths && paths.project ? copyBtn(paths.project) : ""}</span></div>
           <div class="kv-row"><span class="k">worktree</span><span class="v mono">${esc(s.cwd || "—")}${s.cwd ? copyBtn(s.cwd) : ""}</span></div>
           ${upstreamRow}
-          <div class="kv-row"><span class="k">tokens</span><span class="v">${s.tokens_in}/${s.tokens_out} · $${(s.cost_usd||0).toFixed(4)}</span></div>
+          <div class="kv-row" data-tip="${TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">input ${s.tokens_in} · output ${s.tokens_out} · $${(s.cost_usd||0).toFixed(4)} USD${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}</span></div>
+          <div class="kv-row" data-tip="${LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="cum-cost-${esc(s.id)}">—</span> <button class="btn" onclick="loadCumulativeCost('${esc(s.id)}')" data-tip="${LIFETIME_COST_TIP}">Σ load total</button></span></div>
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : `<div id="prompt-box-${sel.taskIdx}-${sel.sessionIdx}" class="prompt-box">${esc(s.prompt || "—")}</div>`}
           ${inReviews}
           ${verifySteps}
+          ${sessionEnvOverridesSection(r, sel.taskIdx, sel.sessionIdx, s)}
           <div class="btn-row">
             <button class="btn primary" onclick="startEdit()" data-tip="Edit this session — change its prompt, agent, model, command, or working directory.\nIf the run is currently running it will be stopped and reset to Pending.">✎ Edit</button>
             <button class="btn" onclick="restartSession('${r.id}',${sel.taskIdx},${sel.sessionIdx})" data-tip="Re-run this session and all downstream sessions within this run.\nDependent runs in other tasks are also re-queued.\nThis cannot be undone.">⟳ Restart session</button>
           </div>
           ${(() => {
-            // RAL-102: every prompt/agent session runs inside tmux, so both
-            // buttons are available for any agent (not just claude-code) —
-            // "not currently live" is handled gracefully at click/peek time
-            // rather than by pre-emptively disabling the buttons.
-            const enabled = !s.command;
+            // RAL-102/RAL-151: every command/prompt session runs inside
+            // tmux, so both a session's kind is always live-view capable
+            // ("prompt" XOR "command" is enforced by the schema) — "not
+            // currently live" is handled gracefully at click/peek time
+            // rather than by pre-emptively disabling the buttons. "Open
+            // Agent" only makes sense for a prompt-kind session (there is
+            // no agent conversation to resume for a plain shell command),
+            // so it's omitted outright for a command session rather than
+            // shown disabled.
             const key = `session|${r.id}|${sel.taskIdx}|${sel.sessionIdx}`;
-            const disabledTip = "Terminal access is not available — this session runs a shell command rather than an AI agent.";
-            if (!enabled) {
-              return `<div class="btn-row"><span data-tip="${disabledTip}"><button class="btn primary" disabled style="pointer-events:none">Show Live View</button></span></div>`;
-            }
             const previewBtn = `<button class="btn primary" onclick="togglePeek('${key}')" style="border-radius:6px 0 0 6px" data-tip="Peek at this session's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the session isn't running.">${peekOpen[key] ? "Hide Live View" : "Show Live View"}</button>`;
+            const openAgentItem = s.command
+              ? ""
+              : (s.agent_session_id
+                  ? terminalMenuItem(key, "Open Agent",
+                      `openAgentTerminal('${r.id}',${sel.taskIdx},${sel.sessionIdx})`,
+                      "Resume the real CLI agent, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the session is still running or already finished.")
+                  : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this session.", true));
             const items = terminalMenuItem(key, "Open Terminal Log",
                 `openTerminal('${r.id}',${sel.taskIdx},${sel.sessionIdx})`,
-                "Attach an interactive terminal to this session's live tmux session.\nShows the runner's own log/event stream, not Claude's actual conversation.\nOnly available while the session is actively running — fails gracefully otherwise.")
-              + (s.claude_session_id
-                ? terminalMenuItem(key, "Open Agent",
-                    `openAgentTerminal('${r.id}',${sel.taskIdx},${sel.sessionIdx})`,
-                    "Resume the real Claude Code CLI, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the session is still running or already finished.")
-                : terminalMenuItem(key, "Open Agent", "", "Not available yet — no Claude Code session has started for this session.", true));
+                "Attach an interactive terminal to this session's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the session is actively running — fails gracefully otherwise.")
+              + openAgentItem;
             return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key)}`;
           })()}`;
       }
@@ -2832,14 +3165,14 @@
         } else if (sel.kind === "task") {
           const t = r.tasks[sel.taskIdx];
           fields = `<label>name<input id="e-name" value="${esc(t.name)}"></label>
-            <label>project<input id="e-project" value="${esc(t.project || "")}"></label>`;
+            <label>project<input id="e-project" value="${esc(t.project)}"></label>`;
         } else {
           const s = r.tasks[sel.taskIdx].sessions[sel.sessionIdx];
           const isCmd = !!s.command;
           // Known agents in this codebase (core/src/schema.rs default is "claude";
           // the runner dispatches "claude"/"anthropic", "claude-code"/"claude-cli",
           // "codex"/"codex-cli", and "ollama"). Backed by a datalist so the input stays free-text.
-          const agents = ["claude", "claude-code", "codex-cli", "ollama"];
+          const agents = ["claude", "claude-code", "codex", "codex-cli", "ollama"];
           fields = `<label>mode<select id="e-mode" onchange="onModeChange()">
               <option value="agent"${isCmd ? "" : " selected"}>Agent</option>
               <option value="command"${isCmd ? " selected" : ""}>Command</option>
@@ -2952,12 +3285,14 @@
         const reviewList = (/** @type {any} */ (window)._daemonStatus && /** @type {any} */ (window)._daemonStatus.running_reviews) || [];
         for (const rv of reviewList) {
           const g = guardians.find((x) => x.id === rv.id);
-          const inProg = g && g.branches.find((b) => b.merge_status === "in_progress");
+          const inProg = g && g.branches.find((b) => b.merge_status === "in_progress" || b.merge_status === "verify_pending");
           const onclick = inProg
             ? `gotoReviewBranch('${rv.id}','${esc(inProg.branch)}');document.getElementById('running-menu').classList.add('hidden')`
             : `gotoReview('${rv.id}');document.getElementById('running-menu').classList.add('hidden')`;
           const tip = inProg
-            ? `Guardian review '${esc(rv.name)}' is rebasing branch ${esc(inProg.branch)}.\nClick to jump to this worktree row and expand it.`
+            ? inProg.merge_status === "verify_pending"
+              ? `Guardian review '${esc(rv.name)}' is running final verification on branch ${esc(inProg.branch)}.\nClick to jump to this worktree row and expand it.`
+              : `Guardian review '${esc(rv.name)}' is rebasing branch ${esc(inProg.branch)}.\nClick to jump to this worktree row and expand it.`
             : `Guardian review '${esc(rv.name)}' is building its stacked rebase.\nClick to navigate to this review.`;
           const label = inProg
             ? `${esc(rv.name)} <span style="color:var(--muted);font-size:10px">/ ${esc(inProg.branch)}</span>`
@@ -3033,6 +3368,39 @@
           if (!r.ok) return { rows: [], total: 0 };
           return { rows: [await r.json()], total: 1 };
         } catch (_) { return { rows: [], total: 0 }; }
+      }
+      /**
+       * RAL-160: fetches every "session completed" Cartographer event for a
+       * session and sums their tokens/cost, so a session's lifetime spend
+       * across restarts is visible — not just the current attempt shown in
+       * its `tokens`/`cost_usd` fields (which a restart overwrites in place).
+       * Writes the result directly into the `cum-cost-<sessionId>` span rather
+       * than going through renderDetails(), since this is triggered on demand
+       * by a button click, not on every poll tick.
+       * @param {string} sessionId
+       * @returns {Promise<void>}
+       */
+      async function loadCumulativeCost(sessionId) {
+        const target = document.getElementById(`cum-cost-${sessionId}`);
+        if (target) target.textContent = "loading…";
+        const { rows } = await cartoFetch({
+          source: "", scope: "session", level: "", run_id: "", guardian_id: "",
+          session_id: sessionId, q: "session completed", limit: 500, offset: 0,
+          sortCol: "time", dir: "desc",
+        });
+        const completed = rows.filter((row) => row.message === "session completed");
+        let tokensIn = 0, tokensOut = 0, cost = 0;
+        for (const row of completed) {
+          const payload = /** @type {{tokens_in?: number, tokens_out?: number, cost_usd?: number}} */ (row.payload || {});
+          tokensIn += payload.tokens_in || 0;
+          tokensOut += payload.tokens_out || 0;
+          cost += payload.cost_usd || 0;
+        }
+        const el = document.getElementById(`cum-cost-${sessionId}`);
+        if (!el) return;
+        el.textContent = completed.length
+          ? `input ${tokensIn} · output ${tokensOut} · $${cost.toFixed(4)} USD across ${completed.length} attempt${completed.length === 1 ? "" : "s"}`
+          : "no completed attempts recorded yet";
       }
       // Restore filter state (and a possible single-row snapshot) from the URL
       // (RAL-112) — mirrors it into both cartoFilter and the filter-bar inputs so
@@ -3642,11 +4010,18 @@
         if (logsTab === "events" && cartoModalCache[`run:${rid}`] === undefined) {
           loadCartoModalRows(`run:${rid}`, { run_id: rid }).then(() => { if (logRunId && logsTab === "events") renderLogs(); });
         }
+        // RAL-160: cumulative token/cost totals across every restart of each
+        // session in this run — sourced from the "session completed"
+        // Cartographer events already logged on every attempt (record_session_result
+        // overwrites the session row itself, so it alone can't show restart history).
+        if (logsTab === "sessions" && cartoModalCache[`sesstotals:${rid}`] === undefined) {
+          loadCartoModalRows(`sesstotals:${rid}`, { run_id: rid, q: "session completed" }).then(() => { if (logRunId && logsTab === "sessions") renderLogs(); });
+        }
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw">
             <h2>Logs — ${esc(run.label || run.id)}</h2>
             <div class="row" style="margin-bottom:10px">
-              ${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" onclick="logsTab='${t}';renderLogs()" data-tip="${{events:"The structured event log (RAL-98), filtered to this run — every state change, scheduler decision, and LLM call.",tasks:"Task-level summary with session count.",sessions:"Per-session state, token usage, and cost breakdown.",verifiers:"Verifier step status and raw output."}[t]||t}">${t}</span>`).join("")}
+              ${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" onclick="logsTab='${t}';renderLogs()" data-tip="${{events:"The structured event log (RAL-98), filtered to this run — every state change, scheduler decision, and LLM call.",tasks:"Task-level summary with session count.",sessions:"Per-session state, token usage, and cost breakdown — plus cumulative totals across restarts.",verifiers:"Verifier step status and raw output."}[t]||t}">${t}</span>`).join("")}
             </div>
             <div style="max-height:60vh;overflow:auto">${logsBody(run)}</div>
             <div class="btn-row">${logsTab === "events" ? `<span style="flex:1;color:var(--muted);font-size:12px;align-self:center" data-tip="See the Logs tab for filtering across every run/session/guardian and full pagination.">${(cartoModalCache[`run:${logRunId}`] || {}).total || 0} total — open the Logs tab for more filters</span>` : ""}<button class="btn" onclick="closeModal()">Close</button></div>
@@ -3681,6 +4056,57 @@
        */
       function tblRow(cells) { return "<tr>" + cells.map((c) => `<td style="padding:5px 10px;border-bottom:1px solid var(--border)">${c}</td>`).join("") + "</tr>"; }
       /**
+       * Sums each session's "session completed" Cartographer events (RAL-160)
+       * into a per-session totals map, keyed by session id.
+       * @param {string} runId
+       * @returns {{[sessionId: string]: {tokensIn: number, tokensOut: number, costUsd: number, attempts: number}}}
+       */
+      function cumulativeSessionTotals(runId) {
+        /** @type {{[sessionId: string]: {tokensIn: number, tokensOut: number, costUsd: number, attempts: number}}} */
+        const totals = {};
+        const cache = cartoModalCache[`sesstotals:${runId}`];
+        if (!cache) return totals;
+        cache.rows.forEach((row) => {
+          const sid = row.session_id;
+          if (!sid) return;
+          const cur = totals[sid] || { tokensIn: 0, tokensOut: 0, costUsd: 0, attempts: 0 };
+          cur.tokensIn += Number(row.payload.tokens_in) || 0;
+          cur.tokensOut += Number(row.payload.tokens_out) || 0;
+          cur.costUsd += Number(row.payload.cost_usd) || 0;
+          cur.attempts += 1;
+          totals[sid] = cur;
+        });
+        return totals;
+      }
+      /**
+       * Renders the Logs modal sessions-tab rows, each with its current-run and
+       * cumulative-across-restarts (RAL-160) token/cost figures.
+       * @param {RunView} run
+       * @returns {string[]}
+       */
+      function cumulativeSessionRows(run) {
+        const totals = cumulativeSessionTotals(run.id);
+        const loading = cartoModalCache[`sesstotals:${run.id}`] === null;
+        /** @type {string[]} */
+        const rows = [];
+        run.tasks.forEach((t) => t.sessions.forEach((s) => {
+          const cum = totals[s.id];
+          const cumText = cum
+            ? `input ${cum.tokensIn} · output ${cum.tokensOut} · $${cum.costUsd.toFixed(4)} USD (${cum.attempts} attempt${cum.attempts === 1 ? "" : "s"})`
+            : (loading ? "…" : "—");
+          rows.push(tblRow([
+            esc(t.name),
+            `<span class="mono">${esc(s.id)}</span>`,
+            pill(s.state),
+            `input ${s.tokens_in} · output ${s.tokens_out}`,
+            `$${(s.cost_usd || 0).toFixed(4)} USD${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}`,
+            cumText,
+            s.error ? `<span style="color:var(--failed)">${esc(s.error)}</span>` : "",
+          ]));
+        }));
+        return rows;
+      }
+      /**
        * Renders the Logs modal's active-tab table body for a run.
        * @param {RunView} run
        * @returns {string}
@@ -3714,10 +4140,9 @@
           });
           return rows.length ? T(["task", "scope", "id", "kind", "state", "output"], rows) : `<div class="empty">No verifiers.</div>`;
         }
-        /** @type {string[]} */
-        const rows = [];
-        run.tasks.forEach((t) => t.sessions.forEach((s) => rows.push(tblRow([esc(t.name), `<span class="mono">${esc(s.id)}</span>`, pill(s.state), `${s.tokens_in}/${s.tokens_out}`, `$${(s.cost_usd || 0).toFixed(4)}`, s.error ? `<span style="color:var(--failed)">${esc(s.error)}</span>` : ""]))));
-        return T(["task", "session", "state", "tokens", "cost", "error"], rows);
+        const cumTip = "Sum of input/output tokens and $ cost across every completed attempt of this session (including restarts), read from the Cartographer event log.\nMay undercount if older attempts have aged out of Cartographer retention (see [cartographer] in .ralphus.toml).";
+        const cumHead = `<span data-tip="${cumTip}">cumulative (all restarts)</span>`;
+        return T(["task", "session", "state", "tokens (this run)", "cost (this run)", cumHead, "error"], cumulativeSessionRows(run));
       }
       // Files tab: validate + queue every loaded file as its own run, named
       // after the file. Files that fail validation or submission stay in the
@@ -3856,7 +4281,10 @@
        * @returns {string}
        */
       function resolverTerminalBtns(g, b) {
-        const isLive = g.status === "merging" && b.merge_status === "in_progress";
+        // RAL-149: verify_pending also has a live resolver tmux session (the
+        // dedicated final-verification call), so it counts as "live" alongside
+        // in_progress (the fix pass / rebase itself).
+        const isLive = g.status === "merging" && (b.merge_status === "in_progress" || b.merge_status === "verify_pending");
         if (!b.worktree) {
           const tip = "No worktree yet — terminal access becomes available once this branch starts being processed.";
           return `<span data-tip="${tip}"><button class="btn primary" disabled style="pointer-events:none">Show Live View</button></span>`;
@@ -3865,16 +4293,16 @@
         const previewLabel = peekOpen[key] ? "Hide Live View" : (isLive ? "Watch Live" : "Show Live View");
         const openLabel = isLive ? "Open Live Terminal Log" : "Open Terminal Log";
         const previewTip = "Peek at the conflict resolver's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the resolver isn't running.";
-        const openTip = "Attach an interactive terminal to the conflict resolver's live tmux session.\nShows the runner's own log/event stream, not Claude's actual conversation.\nOnly available while the resolver is actively running — fails gracefully otherwise.";
-        const agentTip = "Resume the real Claude Code CLI, attached to this exact conflict-resolution conversation.\nWho/when: you want to keep working with the resolver interactively, picking up right where it left off.\nWorks whether the resolver is still running or already finished.";
+        const openTip = "Attach an interactive terminal to the conflict resolver's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the resolver is actively running — fails gracefully otherwise.";
+        const agentTip = "Resume the real CLI agent, attached to this exact conflict-resolution conversation.\nWho/when: you want to keep working with the resolver interactively, picking up right where it left off.\nWorks whether the resolver is still running or already finished.";
         const wtTip = isLive
           ? "Open a shell in the review worktree while the resolver is working.\nRun 'git diff' or 'git status' to watch files change in real time."
           : "Open a shell in the review worktree to manually inspect or fix merge conflicts.";
         const previewBtn = `<button class="btn primary" onclick="togglePeek('${key}')" style="border-radius:6px 0 0 6px" data-tip="${previewTip}">${previewLabel}</button>`;
         const items = terminalMenuItem(key, openLabel, `openGuardianBranchTerminal('${g.id}','${b.id}','open')`, openTip)
-          + (b.resolver_claude_session_id
+          + (b.resolver_agent_session_id
             ? terminalMenuItem(key, "Open Agent", `openGuardianBranchTerminal('${g.id}','${b.id}','agent')`, agentTip)
-            : terminalMenuItem(key, "Open Agent", "", "Not available yet — no Claude Code session has started for this resolver.", true))
+            : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this resolver.", true))
           + terminalMenuItem(key, "Open Worktree Shell", `openGuardianBranchTerminal('${g.id}','${b.id}','worktree')`, wtTip);
         return `${previewBtn}${terminalMenuHtml(key, items)}`;
       }
@@ -3889,6 +4317,127 @@
        */
       function resolverPeekBox(g, b) {
         return b.worktree ? peekBox(`guardian|${g.id}|${b.id}`) : "";
+      }
+
+      // Render manual-checks-generation terminal buttons for a review (RAL-88
+      // follow-up). Generation is a single guardian-level run (not per-branch),
+      // gated on `checks_state` rather than a worktree: "waiting" means
+      // generation hasn't started yet (no tmux session could exist), so the
+      // button stays disabled until it reaches "generating" or "ready".
+      /**
+       * Renders a review's manual-checks-generation terminal button(s), varying by live/agent state.
+       * @param {GuardianView} g
+       * @returns {string}
+       */
+      function manualChecksTerminalBtns(g) {
+        const cmds = g.manual_commands || [];
+        const state = g.checks_state || (cmds.length ? "ready" : "waiting");
+        if (state === "waiting") {
+          const tip = "No terminal yet — becomes available once every enabled branch finishes rebasing and manual-checks generation starts.";
+          return `<span data-tip="${tip}"><button class="btn" disabled style="pointer-events:none;font-size:11px;padding:1px 7px">Show Live View</button></span>`;
+        }
+        const isLive = state === "generating";
+        const key = `guardian-manual|${g.id}`;
+        const previewLabel = peekOpen[key] ? "Hide Live View" : (isLive ? "Watch Live" : "Show Live View");
+        const openLabel = isLive ? "Open Live Terminal Log" : "Open Terminal Log";
+        const previewTip = "Peek at the manual-checks generation's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once generation isn't running.";
+        const openTip = "Attach an interactive terminal to the manual-checks generation's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while generation is actively running — fails gracefully otherwise.";
+        const agentTip = "Resume the real CLI agent, attached to this exact manual-checks generation conversation.\nWho/when: you want to inspect or continue the reasoning behind the suggested commands.\nWorks whether generation is still running or already finished.";
+        const previewBtn = `<button class="btn" onclick="togglePeek('${key}')" style="border-radius:6px 0 0 6px;font-size:11px;padding:1px 7px" data-tip="${previewTip}">${previewLabel}</button>`;
+        const items = terminalMenuItem(key, openLabel, `openGuardianManualChecksTerminal('${g.id}','open')`, openTip)
+          + (g.manual_commands_agent_session_id
+            ? terminalMenuItem(key, "Open Agent", `openGuardianManualChecksTerminal('${g.id}','agent')`, agentTip)
+            : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this generation pass.", true));
+        return `${previewBtn}${terminalMenuHtml(key, items)}`;
+      }
+      // Sibling to manualChecksTerminalBtns — rendered outside the flex
+      // btn-row so the box lays out on its own line.
+      /**
+       * Renders a review's manual-checks-generation live-pane peek box, if generation has started.
+       * @param {GuardianView} g
+       * @returns {string}
+       */
+      function manualChecksPeekBox(g) {
+        const cmds = g.manual_commands || [];
+        const state = g.checks_state || (cmds.length ? "ready" : "waiting");
+        return state !== "waiting" ? peekBox(`guardian-manual|${g.id}`) : "";
+      }
+
+      // ---------- structured check inputs (RAL-164) ----------
+      // A GuardianCheck (either an AI-synthesized manual check or a
+      // user-declared [[review.action]] hint) may declare named `inputs`
+      // (e.g. a port number) referenced in its command as `{name}`
+      // placeholders. A check with no inputs still runs immediately, exactly
+      // as before; a check that declares any renders as a toggle that
+      // expands an inline form instead.
+      /**
+       * Renders one runnable check's trigger: a plain "run immediately" button
+       * when it declares no CheckInputs, or a toggle button (plus its inline
+       * input form when open) when it does. Shared by the "test actions"
+       * (action hints) and "manual checks" sections.
+       * @param {GuardianView} g
+       * @param {"manual"|"action"} kind
+       * @param {number} i
+       * @param {GuardianCheck} check
+       * @param {string} label
+       * @returns {string}
+       */
+      function renderCheckControl(g, kind, i, check, label) {
+        const cmdText = check.command || check.prompt || "";
+        if (!check.inputs || !check.inputs.length) {
+          const action = kind === "manual" ? `runSingleManualCheck('${g.id}',${i})` : `runActionHint('${g.id}',${i})`;
+          return `<button class="btn" onclick="${action}" data-tip="Run: ${esc(cmdText)}\nLaunches in the built review worktree.">${esc(label)}</button>`;
+        }
+        const key = `${g.id}:${kind}:${i}`;
+        const open = !!checkFormOpen[key];
+        const toggleBtn = `<button class="btn" onclick="toggleCheckForm('${key}')" data-tip="Run: ${esc(cmdText)}\nThis check needs some values filled in first — click to expand.">${esc(label)} ${open ? "▲" : "▾"}</button>`;
+        return `<div style="display:inline-block;vertical-align:top">${toggleBtn}${open ? renderCheckInputForm(g, kind, i, check) : ""}</div>`;
+      }
+      /**
+       * Renders the inline input form for a check that declares CheckInputs:
+       * one labelled field per input (pre-filled from the guardian's stored
+       * input_values, falling back to the input's own default), a "set it
+       * for me" button per field that delegates to the resolver agent, an
+       * optional cleanup checkbox when the check declares a cleanup_command,
+       * and Run/Cancel buttons.
+       * @param {GuardianView} g
+       * @param {"manual"|"action"} kind
+       * @param {number} i
+       * @param {GuardianCheck} check
+       * @returns {string}
+       */
+      function renderCheckInputForm(g, kind, i, check) {
+        const key = `${g.id}:${kind}:${i}`;
+        const values = g.input_values || {};
+        const resolutions = g.input_resolutions || {};
+        const fields = (check.inputs || []).map((inp) => {
+          const fieldId = `check-input:${key}:${inp.name}`;
+          const current = Object.prototype.hasOwnProperty.call(values, inp.name) ? values[inp.name] : inp.default;
+          const res = resolutions[inp.name];
+          const resolving = !!res && res.status === "resolving";
+          const setTip = "Ask the resolver agent to pick a value for this input.\nWho/when: you don't know (or don't care) what value to use here — let the AI decide.\nFills the field below with its answer; you still press Run to actually execute.";
+          const setBtn = `<button class="btn" ${resolving ? "disabled" : ""} onclick="resolveCheckInput('${g.id}','${esc(inp.name)}')" data-tip="${setTip}">${resolving ? "Resolving…" : "Set it for me"}</button>`;
+          return `<div style="margin:4px 0">
+            <label style="display:block;font-size:11px;color:var(--dim);margin-bottom:2px" data-tip="${esc(inp.message)}">${esc(inp.message)}</label>
+            <div style="display:flex;gap:4px">
+              <input id="${fieldId}" type="text" value="${esc(current)}" style="flex:1;font-family:monospace;font-size:12px" data-tip="Value substituted for {${esc(inp.name)}} in the command.\nDefaults to the last value used on this review; press Run to use it, or edit first.">
+              ${setBtn}
+            </div>
+          </div>`;
+        }).join("");
+        const cleanupField = check.cleanup_command
+          ? `<label style="display:flex;align-items:center;gap:4px;font-size:11px;margin:4px 0" data-tip="Runs '${esc(check.cleanup_command)}' immediately before the main command — e.g. to stop a stale process from a previous run.\nWho/when: the command binds a port or leaves something running that a rerun would collide with.\nThis cannot be undone once the cleanup command executes.">
+              <input type="checkbox" id="check-cleanup:${key}"> Stop stale process first
+            </label>`
+          : "";
+        return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin:4px 0;background:var(--panel-2);min-width:260px">
+          ${fields}
+          ${cleanupField}
+          <div class="btn-row" style="margin-top:4px">
+            <button class="btn primary" onclick="runCheckWithInputs('${kind}','${g.id}',${i})" data-tip="Run this check with the values above.">▶ Run</button>
+            <button class="btn" onclick="toggleCheckForm('${key}')" data-tip="Close this form without running.">Cancel</button>
+          </div>
+        </div>`;
       }
 
       // Render the inline session-link button for a review branch row.
@@ -3940,7 +4489,7 @@
 
       // ---------- reviews (list + detail, read-only for now) ----------
       /** @type {{[key: string]: string}} */
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", done:"--done", conflict_resolved:"--queued", failed:"--failed" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", done:"--done", verify_pending:"--running", conflict_resolved:"--queued", failed:"--failed" };
       // States in which a review may be cancelled — mirrors the backend's
       // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
       // list menu and the detail pane's upper-right ⋯ menu use this one set so
@@ -4058,7 +4607,11 @@
         const cnt = (f) => g.branches.filter(f).length;
         const done = cnt((b) => b.merge_status === "done");
         const resolved = cnt((b) => b.merge_status === "conflict_resolved");
-        const prog = cnt((b) => b.merge_status === "in_progress");
+        // RAL-149: verify_pending is a transient sub-state of "in progress" —
+        // conflicts are resolved/committed but the dedicated final-verify call
+        // hasn't finished, so it counts toward the same blue "in progress" slice
+        // rather than getting its own bar segment.
+        const prog = cnt((b) => b.merge_status === "in_progress" || b.merge_status === "verify_pending");
         const failed = cnt((b) => b.merge_status === "failed");
         /**
          * @param {number} n
@@ -4097,26 +4650,81 @@
       function branchBadge(b) {
         if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
         if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
+        // RAL-149: all conflict markers for this branch are resolved and committed,
+        // but the dedicated final-verification agent call (a separate LLM call from
+        // the fix pass) hasn't finished yet. Clears automatically once that call
+        // completes — the branch then lands on "conflict_resolved" (pass or fail
+        // reflected in its detail text).
+        if (b.merge_status === "verify_pending") return `<span class="badge live" data-tip="Conflicts are resolved and committed — the dedicated final-verification call is running now to confirm the fix meets the quality bar.\nWho/when: reviewers checking whether 'conflicts resolved' really means done, or still needs confirming.\nClears automatically once verification finishes (pass or fail reflected normally).">⏳ verifying</span>`;
         if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" data-tip="Conflict was resolved by the guardian agent — ${esc(b.detail || "resolved")}">✓ resolved</span>`;
         return "";
       }
-      // RAL-72: per-branch inline conflict progress (found / fixed / committed).
+      // RAL-146: per-branch live progress bars (rebase position + conflict
+      // resolution), shown only while this branch is the one actively
+      // rebasing. Reuses the existing `.progress` CSS pattern also used by
+      // `mergeProgress`.
       /**
-       * Renders a branch's inline conflict-resolution progress line.
+       * Renders an in-progress branch's live rebase-position and conflict-resolution progress bars.
        * @param {GuardianBranch} b
        * @returns {string}
        */
       function branchConflictBar(b) {
-        const found = b.conflicts_found;
-        if (found === null || found === undefined || found <= 0) return "";
-        const fixed = b.conflicts_fixed ?? 0;
-        const committed = b.conflicts_committed ?? 0;
-        const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
-        return `<div class="branch-conflict-bar" data-tip="${tip}">
-          <div class="branch-conflict-label">
-            <span>${found} found · ${fixed} fixed · ${committed} committed</span>
+        if (b.merge_status !== "in_progress") return "";
+        const rDone = b.rebase_commands_done;
+        const rTotal = b.rebase_commands_total;
+        let rebaseBar = "";
+        if (rDone !== null && rDone !== undefined && rTotal !== null && rTotal !== undefined && rTotal > 0) {
+          const pct = (100 * Math.min(rDone, rTotal) / rTotal).toFixed(2) + "%";
+          rebaseBar = `<div class="progress" data-tip="Rebase position — commits processed so far out of the total commits in this branch's interactive rebase.\nRead live from git's own rebase-todo bookkeeping (rebase-merge/done and rebase-merge/git-rebase-todo) in the branch's worktree.\nOnly populated while a rebase is actively paused or running here — briefly disappears between --continue/--skip steps.">
+            <span style="width:${pct};background:var(--running)"></span>
+          </div>`;
+        }
+        const found = b.conflicts_found ?? 0;
+        let conflictBar = "";
+        if (found > 0) {
+          const fixed = b.conflicts_fixed ?? 0;
+          const committed = b.conflicts_committed ?? 0;
+          const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
+          const committedPct = (100 * Math.min(committed, found) / found).toFixed(2) + "%";
+          const fixedPct = (100 * Math.min(fixed, found) / found).toFixed(2) + "%";
+          conflictBar = `<div class="progress" data-tip="${tip}">
+            <span style="width:${committedPct};background:var(--done)"></span>
+            <span style="width:${fixedPct};background:var(--queued)"></span>
           </div>
-        </div>`;
+          <div class="branch-conflict-label"><span>${found} found · ${fixed} fixed · ${committed} committed</span></div>`;
+        }
+        if (!rebaseBar && !conflictBar) return "";
+        return `<div class="branch-conflict-bar">${rebaseBar}${conflictBar}</div>`;
+      }
+      // RAL-148: live, polled list of the files still carrying unresolved
+      // conflict markers in a branch's worktree, so a reviewer can watch files
+      // disappear from the list as the resolver (or a human, via the worktree
+      // terminal) fixes them -- no need to leave the board and run `git status`
+      // by hand. Distinct from `branchConflictBar` above: that one shows
+      // static found/fixed/committed *counts* recorded at resolve time; this
+      // shows the *current* file list, polled live from the daemon.
+      /**
+       * Renders a branch's live conflicting-files list (RAL-148), reading from
+       * the `branchConflicts` cache `pollBranchConflicts` keeps warm. Renders
+       * nothing once the branch isn't in a failed merge state, even if a stale
+       * cache entry still exists (e.g. right after the conflict was resolved,
+       * before the next poll clears it).
+       * @param {string} gid
+       * @param {GuardianBranch} b
+       * @returns {string}
+       */
+      function branchConflictFiles(gid, b) {
+        if (b.merge_status !== "failed") return "";
+        const c = branchConflicts[`${gid}:${b.id}`];
+        const tip = "Files in this branch's worktree that still have unresolved <<<<<<< conflict markers.\nWho/when: watch this list while the guardian agent (or you, via the branch's worktree terminal) resolves conflicts one file at a time -- it updates live as files are fixed.\nRead-only -- resolve conflicts in the worktree itself; this list just reflects what git sees there.";
+        if (!c) {
+          return `<div class="branch-conflict-files" data-tip="${tip}"><div class="branch-conflict-files-empty">loading conflicting files…</div></div>`;
+        }
+        if (c.files.length === 0) {
+          return `<div class="branch-conflict-files" data-tip="${tip}"><div class="branch-conflict-files-empty">${c.rebase_in_progress ? "rebase in progress…" : "no unresolved files right now"}</div></div>`;
+        }
+        const items = c.files.map((f) => `<div class="branch-conflict-file mono">${esc(f)}</div>`).join("");
+        return `<div class="branch-conflict-files" data-tip="${tip}">${items}</div>`;
       }
       // RAL-88: a small inspect button revealing which agent (and model, if known)
       // produced an AI-generated review artifact. `agent`/`model` are the stored
@@ -4210,7 +4818,7 @@
         const allDisabled = visibleBranches.length > 0 && enabledCount === 0;
         const branches = visibleBranches.map((b, i) => {
           const isEnabled = stagedEnabled[b.branch] !== false;
-          const hasDetail = !!(b.worktree || b.detail || b.source_run_id != null || b.resolver_claude_session_id);
+          const hasDetail = !!(b.worktree || b.detail || b.source_run_id != null || b.resolver_agent_session_id);
           const open = expandedBranches.has(`${g.id}:${b.id}`);
           const toggle = hasDetail
             ? `<span class="br-toggle" data-tip="Expand or collapse merge detail for this branch." onclick="event.stopPropagation();toggleBranch(event,'${g.id}','${b.id}')">${open ? "▾" : "▸"}</span>`
@@ -4257,6 +4865,7 @@
               ${enableToggle}${reEnableIcon}${moveBtn}
             </div>
             ${branchConflictBar(b)}
+            ${branchConflictFiles(g.id, b)}
             ${detail}
           </div>`;
         }).join("");
@@ -4287,8 +4896,10 @@
               : `<div class="row"><span class="vchip" style="border-color:var(--unverified);color:var(--unverified)" data-tip="No check gates are configured for this review, the project has no auto_build default in .ralphus.toml, and either the resolver agent found no build step to infer or skip auto-build is on.\nWho/when: relevant to anyone relying on 'in review' meaning 'built and tested' — right now this review reached that status with zero build or test verification.\nAdd checks above, or set [review] auto_build in the project's .ralphus.toml, to close this gap.">⚠ no build verification configured</span></div>`;
         const skipToggles = `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nUseful while iterating on check gates, or to avoid an unwanted inferred build.\nManual checks are still generated — only the automatic build/check step is skipped.">
             <input type="checkbox" ${g.skip_auto_build ? "checked" : ""} onchange="setSkipAutoBuild('${g.id}',this.checked)">skip auto-build${g.skip_auto_build && gChecks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Omit the quality-bar instructions normally folded into each per-branch conflict-resolution prompt (run task/session verify steps, formatters, linters).\nUseful when the resolver agent's self-verification pass is slow or unreliable for this review.\nIndependent of 'skip auto-build' — this only affects the per-branch resolver prompt, not the finalize-time build.">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Omit the quality-bar instructions (run task/session verify steps, formatters, linters) from both the per-branch fix pass and the dedicated final-verification call (RAL-149).\nUseful when the resolver agent's self-verification pass is slow or unreliable for this review.\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts, not the finalize-time build.">
             <input type="checkbox" ${g.skip_worktree_checks ? "checked" : ""} onchange="setSkipWorktreeChecks('${g.id}',this.checked)">skip per-worktree checks</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Also run the quality-bar instructions during the fix pass, not just the dedicated final-verification call that always follows it (RAL-149).\nWho/when: reviewers who want earlier signal on quality-bar issues, at the cost of an extra LLM call's worth of tokens/latency per conflict-resolution cycle.\nDefault off — quality checks (formatters/linters/tests) run once, in the final-verify call, since they may incur real cost (e.g. a paid test suite).">
+            <input type="checkbox" ${g.verify_mid_resolution ? "checked" : ""} onchange="setVerifyMidResolution('${g.id}',this.checked)">verify mid-resolution</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees.\nFaster for large repos but gives less isolation between branches.">
             <input type="checkbox" ${g.skip_worktrees ? "checked" : ""} onchange="setSkipWorktrees('${g.id}',this.checked)">skip per-branch worktrees (build the stack in one shared worktree)</label>`;
         // RAL-91: per-(git-project) squash toggle. Scope is each git project in the
@@ -4448,12 +5059,12 @@
             if (hints.length === 0) return "";
             const btns = hints.map((h, i) => {
               if (h.command) {
-                return `<button class="btn" onclick="runActionHint('${g.id}',${i})" data-tip="Run: ${esc(h.command)}\nUser-declared test action. Launches in the built review worktree.">${esc(h.label)}</button>`;
+                return renderCheckControl(g, "action", i, h, h.label || "Run");
               }
               return `<span data-tip="Prompt: ${esc(h.prompt||'')}\nNot runnable yet — prompt-based test actions expand via the resolver LLM before running, and that expansion isn't wired up.\nOnly command-based [[review.action]] entries are clickable today."><button class="btn" disabled style="opacity:0.6">${esc(h.label)}</button></span>`;
             }).join("");
             return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions</h3>
-              <div class="btn-row">${btns}</div>`;
+              <div class="btn-row" style="flex-wrap:wrap">${btns}</div>`;
           })()}
           ${(() => {
             // RAL-103: checks_state is "ready" (commands available), "generating"
@@ -4467,9 +5078,18 @@
             const state = g.checks_state || (cmds.length ? "ready" : "waiting");
             const isReady = state === "ready";
             const menuOpen = !!manualMenuOpen[g.id];
-            const menuItems = cmds.map((cmd, i) =>
-              `<div onclick="runSingleManualCheck('${g.id}',${i})" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmd)}\nLaunches in the built review worktree." onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmd)}</div>`
-            ).join("");
+            const menuItems = cmds.map((cmd, i) => {
+              const cmdText = cmd.command || "";
+              if (cmd.inputs && cmd.inputs.length) {
+                const key = `${g.id}:manual:${i}`;
+                const open = !!checkFormOpen[key];
+                return `<div style="padding:2px 4px">
+                  <div onclick="toggleCheckForm('${key}')" style="padding:4px 8px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nThis check needs some values filled in first — click to expand." onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)} ${open ? "▲" : "▾"}</div>
+                  ${open ? renderCheckInputForm(g, "manual", i, cmd) : ""}
+                </div>`;
+              }
+              return `<div onclick="runSingleManualCheck('${g.id}',${i})" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nLaunches in the built review worktree." onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)}</div>`;
+            }).join("");
             const gateTip = isReady
               ? `Run all ${cmds.length} suggested manual check command(s) in a new terminal window.\nEach launches in the built review worktree.`
               : state === "generating"
@@ -4482,7 +5102,9 @@
                 ${isReady ? runAllBtn : `<span data-tip="${gateTip}">${runAllBtn}</span>`}
                 ${isReady && cmds.length > 1 ? `<button class="btn" onclick="toggleManualMenu('${g.id}')" style="border-left:none;border-radius:0 6px 6px 0;padding:4px 8px" data-tip="Show individual commands — run one at a time.">▾</button>
                 ${menuOpen ? `<div style="position:absolute;top:100%;left:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;min-width:200px;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.4);padding:4px 0;margin-top:2px">${menuItems}</div>` : ""}` : ""}
-              </div>`;
+              </div>
+              <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
+              ${manualChecksPeekBox(g)}`;
           })()}
           ${chatSection}`;
         const handle = document.getElementById("chat-resize-handle");
@@ -5087,7 +5709,7 @@
                 <label data-tip="Absolute path to the git repository root on this machine. The daemon checks out worktrees here.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
                 <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nGates are still stored — you can re-enable this later."><input type="checkbox" id="cr-skip-auto-build" style="width:auto;margin:0">skip auto-build</label>
-                <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Omit the quality-bar instructions normally folded into each per-branch conflict-resolution prompt (run task/session verify steps, formatters, linters).\nIndependent of 'skip auto-build' — this only affects the per-branch resolver prompt, not the finalize-time build."><input type="checkbox" id="cr-skip-worktree-checks" style="width:auto;margin:0">skip per-worktree checks</label>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Omit the quality-bar instructions (run task/session verify steps, formatters, linters) from both the per-branch fix pass and the dedicated final-verification call (RAL-149).\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts, not the finalize-time build."><input type="checkbox" id="cr-skip-worktree-checks" style="width:auto;margin:0">skip per-worktree checks</label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Use one shared worktree for the entire stack instead of per-branch worktrees. Faster for large repos."><input type="checkbox" id="cr-skip-worktrees" style="width:auto;margin:0">skip per-branch worktrees (large repos)</label>
               </div>
               <div id="cr-other-fields" class="hidden"><div class="empty" style="margin:12px 0">No extra fields for this review type yet.</div></div>
@@ -5150,6 +5772,18 @@
        */
       async function setSkipWorktreeChecks(id, skip) {
         await guardianAction(`/api/guardians/${id}/settings`, { skip_worktree_checks: skip });
+        tick();
+      }
+      /**
+       * Toggles a review's verify-mid-resolution setting (RAL-149) — whether the
+       * fix pass also runs the quality-bar checks, in addition to the dedicated
+       * final-verification call that always runs them.
+       * @param {string} id
+       * @param {boolean} enabled
+       * @returns {Promise<void>}
+       */
+      async function setVerifyMidResolution(id, enabled) {
+        await guardianAction(`/api/guardians/${id}/settings`, { verify_mid_resolution: enabled });
         tick();
       }
       /**
@@ -5390,6 +6024,58 @@
         await guardianAction(`/api/guardians/${id}/run-action-hint`, { index });
       }
 
+      // ---------- structured check inputs (RAL-164) ----------
+      /**
+       * Toggles a check's inline input form open/closed.
+       * @param {string} key - "<gid>:<manual|action>:<index>"
+       * @returns {void}
+       */
+      function toggleCheckForm(key) {
+        checkFormOpen[key] = !checkFormOpen[key];
+        renderReviewDetail();
+      }
+      /**
+       * Runs a manual-check or action-hint check that declares input fields,
+       * reading current values from its inline form (submitted values become
+       * the new default for those inputs on this review).
+       * @param {"manual"|"action"} kind
+       * @param {string} id
+       * @param {number} index
+       * @returns {Promise<void>}
+       */
+      async function runCheckWithInputs(kind, id, index) {
+        const g = guardians.find((x) => x.id === id);
+        const check = g && (kind === "manual" ? (g.manual_commands || [])[index] : (g.action_hints || [])[index]);
+        const key = `${id}:${kind}:${index}`;
+        /** @type {Record<string,string>} */
+        const inputs = {};
+        (check && check.inputs || []).forEach((inp) => {
+          const el = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-input:${key}:${inp.name}`));
+          if (el) inputs[inp.name] = el.value;
+        });
+        const cleanupEl = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-cleanup:${key}`));
+        const run_cleanup = !!(cleanupEl && cleanupEl.checked);
+        checkFormOpen[key] = false;
+        renderReviewDetail();
+        const url = `/api/guardians/${id}/${kind === "manual" ? "run-manual-commands" : "run-action-hint"}`;
+        await guardianAction(url, { index, inputs, run_cleanup });
+        tick();
+      }
+      // "Set it for me" (RAL-164): delegates resolution of one named check
+      // input to the resolver agent. Spam-proofing is enforced server-side
+      // via an atomic claim (a concurrent duplicate request 409s) — this
+      // button only disables itself for UX; it is not the actual guard.
+      /**
+       * Delegates "set it for me" resolution of one named check input to the resolver agent.
+       * @param {string} id
+       * @param {string} inputName
+       * @returns {Promise<void>}
+       */
+      async function resolveCheckInput(id, inputName) {
+        await guardianAction(`/api/guardians/${id}/resolve-input`, { input_name: inputName });
+        tick();
+      }
+
       // ---------- review-ready banner (CCTL-145) ----------
       // A guardian in `in_review` has its stack built and all check gates passed —
       // the "ready to act on" signal. Show a dismissible banner that jumps to it.
@@ -5570,6 +6256,43 @@
         } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
       }
       /**
+       * Fetches the live conflicting-files list for one review branch (RAL-148)
+       * and caches it for `branchConflictFiles` to render. Silent on failure --
+       * a transient fetch error just leaves the previous cached value in place
+       * until the next poll.
+       * @param {string} gid
+       * @param {string} branchId
+       * @returns {Promise<void>}
+       */
+      async function fetchBranchConflicts(gid, branchId) {
+        try {
+          const res = await fetch(`/api/guardians/${gid}/branches/${branchId}/conflicts`);
+          if (!res.ok) return;
+          /** @type {BranchConflicts} */
+          const data = await res.json();
+          branchConflicts[`${gid}:${branchId}`] = data;
+        } catch (e) { /* transient -- the next poll retries */ }
+      }
+      /**
+       * Refreshes the live conflicting-files list (RAL-148) for every branch of
+       * `gid` currently in a failed merge state, and drops cached entries for
+       * branches that are no longer failed (resolved, disabled, or moved out).
+       * Only polled for the open review -- not the whole guardians list -- to
+       * keep this off the hot board-poll path (mirrors the RAL-121 pattern
+       * `pollReviews` already uses for the per-guardian summary fetch below).
+       * @param {string} gid
+       * @returns {Promise<void>}
+       */
+      async function pollBranchConflicts(gid) {
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        const failedIds = new Set(g.branches.filter((b) => b.merge_status === "failed").map((b) => b.id));
+        Object.keys(branchConflicts).forEach((k) => {
+          if (k.startsWith(`${gid}:`) && !failedIds.has(k.slice(gid.length + 1))) delete branchConflicts[k];
+        });
+        await Promise.all([...failedIds].map((bid) => fetchBranchConflicts(gid, bid)));
+      }
+      /**
        * Polls `/api/guardians` and re-renders the Reviews tab.
        * @returns {Promise<void>}
        */
@@ -5595,6 +6318,7 @@
           // Keep the selected review's feedback thread fresh (RAL-22) so the
           // guardian's async replies appear without a manual refresh.
           if (selectedGuardian) await loadReviewMessages(selectedGuardian, { silent: true });
+          if (selectedGuardian) await pollBranchConflicts(selectedGuardian);
           if (!userIsSelecting()) { renderReviews(); applyChatSmartScroll(() => preserveUserState(document.getElementById("review-detail"), renderReviewDetail)); }
         } catch (e) { byId("conn").className = "dot off"; }
       }

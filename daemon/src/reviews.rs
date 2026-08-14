@@ -15,7 +15,7 @@ use opentelemetry::Context;
 
 use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key};
 
-use crate::guardian::ActionHint;
+use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
 use crate::store::{SessionRow, Store, TaskRow};
 
@@ -75,6 +75,17 @@ fn worktree_project(cwd: &Path) -> std::result::Result<PathBuf, String> {
     // `<root>/.git` -> `<root>`; for a linked worktree the common dir is still the
     // main repo's `.git`, so both map to the same root.
     Ok(common.parent().map_or(common.clone(), Path::to_path_buf))
+}
+
+/// The literal top-level directory of the git worktree containing `cwd` (RAL-159).
+/// Unlike [`worktree_project`] — which collapses every linked worktree of a
+/// repository to one shared project root, so different branches of the same
+/// repo match each other — this resolves the specific worktree: a session at a
+/// nested subfolder `cwd` still matches another session at that worktree's own
+/// root, but two different linked worktrees of the same repo do not match.
+fn worktree_root(cwd: &Path) -> std::result::Result<PathBuf, String> {
+    let top = git(cwd, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(top))
 }
 
 /// The branch currently checked out in the worktree (error if detached).
@@ -261,6 +272,7 @@ fn rows_from_file<'a>(
             name: task.name.clone(),
             project: task.project.clone(),
             depends_on: task.depends_on.clone(),
+            soloed: false,
         });
         for (s_idx, s) in task.session.iter().enumerate() {
             let sid = s.id.clone().unwrap_or_else(|| format!("session-{s_idx}"));
@@ -280,6 +292,7 @@ fn rows_from_file<'a>(
                 depends_on: s.depends_on.clone(),
                 timeout_sec: None,
                 budget_tokens: None,
+                maximum_budget_usd: None,
                 upstream: s.upstream.clone(),
             });
             // Collect the session's cwd and its optional review opt-in id.
@@ -289,14 +302,24 @@ fn rows_from_file<'a>(
     (sessions, tasks, sess_info)
 }
 
-/// Convert `[[review.action]]` entries into `ActionHint` values for storage.
-fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<ActionHint> {
+/// Convert `[[review.action]]` entries into `GuardianCheck` values for storage.
+fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
     actions
         .iter()
-        .map(|a| ActionHint {
-            label: a.label.clone(),
+        .map(|a| GuardianCheck {
+            label: Some(a.label.clone()),
             command: a.command.clone(),
             prompt: a.prompt.clone(),
+            cleanup_command: a.cleanup_command.clone(),
+            inputs: a
+                .input
+                .iter()
+                .map(|i| CheckInput {
+                    name: i.name.clone(),
+                    message: i.message.clone(),
+                    default: i.default.clone(),
+                })
+                .collect(),
         })
         .collect()
 }
@@ -346,6 +369,12 @@ pub fn derive_reviews(
         .filter_map(|rv| rv.id.as_deref().map(|id| (id, rv)))
         .collect();
 
+    // RAL-159: the worktree root and assigned branch of every explicitly
+    // review-linked session, so a second pass below can attach sessions that
+    // merely share that worktree (e.g. a nested cwd subfolder) but declared no
+    // `review = "<id>"` of their own.
+    let mut explicit_roots: Vec<(PathBuf, String)> = Vec::new();
+
     let mut memberships: Vec<Membership> = Vec::new();
     for (pos, (_, rev_id_opt)) in sess_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
@@ -373,6 +402,9 @@ pub fn derive_reviews(
         store
             .set_session_review_branch(run_id, srow.task_idx, srow.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
+        if let Ok(root) = worktree_root(cwd_path) {
+            explicit_roots.push((root, branch.clone()));
+        }
 
         // Look up the top-level review definition by id to get name/agent/model/actions.
         let rv = review_map.get(rev_id).copied();
@@ -400,10 +432,39 @@ pub fn derive_reviews(
         return Ok(Vec::new());
     }
 
+    // RAL-159: sessions that share a worktree with an explicitly review-linked
+    // session -- e.g. one at the worktree root, another at a nested cwd
+    // subfolder -- implicitly belong to that same branch's review too, even
+    // without their own `review = "<id>"`: they can commit to the exact same
+    // branch, since a worktree checks out exactly one branch at a time. This
+    // makes the readiness gate (`Store::mark_ready_branches_with_done_sessions`)
+    // wait for them, and surfaces them in the session's "in reviews" list
+    // (RAL-17) via the same `sessions.review_branch` join used for explicit
+    // members -- no separate UI/query path needed. Matched by literal
+    // worktree root, not mere project identity, so a sibling *linked*
+    // worktree of the same repo (a different branch) does not cross-match.
+    for (pos, (_, rev_id_opt)) in sess_info.iter().enumerate() {
+        if rev_id_opt.is_some() {
+            continue; // already handled explicitly above
+        }
+        let Some(cwd) = sessions[pos].cwd.as_deref() else {
+            continue;
+        };
+        let Ok(root) = worktree_root(Path::new(cwd)) else {
+            continue;
+        };
+        if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
+            let srow = &sessions[pos];
+            store
+                .set_session_review_branch(run_id, srow.task_idx, srow.idx, branch)
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+        }
+    }
+
     // Build per-review action hints, keyed by review id (or link key).
     // For now: action hints from all opted-in reviews are merged per guardian.
     // Since there is one [[review]] per submission, this is straightforward.
-    let hints_by_id: std::collections::HashMap<&str, Vec<ActionHint>> = file
+    let hints_by_id: std::collections::HashMap<&str, Vec<GuardianCheck>> = file
         .review
         .iter()
         .filter_map(|rv| {
@@ -550,13 +611,13 @@ fn apply_action_hints(
     store: &Store,
     gid: &str,
     members: &[&Membership],
-    hints_by_id: &std::collections::HashMap<&str, Vec<ActionHint>>,
+    hints_by_id: &std::collections::HashMap<&str, Vec<GuardianCheck>>,
 ) -> std::result::Result<(), ReviewError> {
     // Collect hints from the review ids referenced by the members (deduplicated).
     // In practice there is typically one review id per group, so this is a single
     // lookup. For link-key groups that span multiple review declarations, we merge.
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut all_hints: Vec<ActionHint> = Vec::new();
+    let mut all_hints: Vec<GuardianCheck> = Vec::new();
     for m in members {
         // Re-derive the review id: for non-link members use the name; for link
         // members reconstruct from the link key. Actually simpler: walk the file's
@@ -754,6 +815,7 @@ mod tests {
             depends_on: vec![],
             timeout_sec: None,
             budget_tokens: None,
+            maximum_budget_usd: None,
             upstream: None,
         }
     }

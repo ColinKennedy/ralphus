@@ -15,18 +15,59 @@ use crate::store::{Result, Store, StoreError, VerifyView};
 /// `(session_verifies, task_verifies, session_system_prompt)`.
 pub type BranchVerifyInfo = (Vec<VerifyView>, Vec<VerifyView>, Option<String>);
 
-/// One user-declared test/action hint from `[[review.action]]` (RAL-77).
-/// Either `command` (verbatim shell) or `prompt` (forwarded to LLM) is set.
+/// A named, defaulted input referenced by a [`GuardianCheck`]'s
+/// `command`/`cleanup_command` as a `{name}` placeholder (RAL-164), e.g. a
+/// port number that would otherwise be hardcoded and collide across
+/// concurrent reviews.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionHint {
-    /// Button label shown in the UI.
-    pub label: String,
+pub struct CheckInput {
+    /// Placeholder key, e.g. `"port"` for a `{port}` placeholder.
+    pub name: String,
+    /// Shown to the user next to the input field, e.g. "Port for the daemon".
+    pub message: String,
+    /// Pre-filled default value, offered until the user (or the resolver
+    /// agent, via "set it for me") submits a different one.
+    #[serde(default)]
+    pub default: String,
+}
+
+/// Status of a "set it for me" AI resolution for one named [`CheckInput`]
+/// (RAL-164). `value` is `None` while `status == "resolving"`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InputResolutionView {
+    /// `"resolving"` | `"ready"` | `"failed"`.
+    pub status: String,
+    /// The resolved value, once `status == "ready"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// One runnable review check (RAL-164): either a user-declared test/action
+/// hint from `[[review.action]]` (RAL-77, has a `label`) or an LLM-synthesized
+/// manual review command (RAL-27, no `label`). Unified onto one shape so both
+/// can carry an optional `cleanup_command` and named, defaulted `inputs`.
+/// Exactly one of `command` (verbatim shell) or `prompt` (forwarded to LLM)
+/// is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianCheck {
+    /// Button label shown in the UI. `None` for AI-synthesized manual checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Verbatim shell command to run (mutually exclusive with `prompt`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Prompt forwarded to the LLM to expand into a command (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Optional command run before `command`/the expanded `prompt`, e.g. to
+    /// stop a stale process from a previous run. Opt-in at run time via a UI
+    /// checkbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_command: Option<String>,
+    /// Named, defaulted values referenced in `command`/`cleanup_command` as
+    /// `{name}` placeholders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<CheckInput>,
 }
 
 /// Lifecycle state of a guardian/review.
@@ -90,7 +131,13 @@ pub enum MergeStatus {
     InProgress,
     /// Rebased cleanly.
     Done,
-    /// Rebased after resolving conflicts.
+    /// All conflict markers for this branch have been resolved and committed,
+    /// but the dedicated final-verification agent call (RAL-149) has not yet
+    /// run. Transient: set right before that call and cleared (to
+    /// [`Self::ConflictResolved`]) once it completes, pass or fail.
+    VerifyPending,
+    /// Rebased after resolving conflicts (and, when the fix pass hit
+    /// conflicts, after the RAL-149 final-verification call has run).
     ConflictResolved,
     /// Failed to rebase.
     Failed,
@@ -105,6 +152,7 @@ impl MergeStatus {
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
             Self::Done => "done",
+            Self::VerifyPending => "verify_pending",
             Self::ConflictResolved => "conflict_resolved",
             Self::Failed => "failed",
         }
@@ -156,9 +204,9 @@ pub struct BranchView {
     pub source_task_idx: Option<i64>,
     /// Session index within the task for the source session.
     pub source_session_idx: Option<i64>,
-    /// claude_session_id from the conflict-resolver run on this branch.
+    /// agent_session_id from the conflict-resolver run on this branch.
     /// Only populated when resolver_agent is "claude-code". Enables terminal resume.
-    pub resolver_claude_session_id: Option<String>,
+    pub resolver_agent_session_id: Option<String>,
     /// `true` when this branch's stacked commit is staged and ready to merge
     /// as-is (`merge_status == "ready"`). Ported from board.html's
     /// `branchBadge` (CLI_PARITY_PLAN.local.md Phase 5).
@@ -174,6 +222,14 @@ pub struct BranchView {
     /// [`Store::move_guardian_branch`] and preserved across any later moves.
     /// `None` for a branch that has never been moved.
     pub moved_from_guardian_id: Option<String>,
+    /// RAL-145: git's own interactive-rebase todo-list "commands done" count
+    /// (`rebase-merge/done`), read live from the worktree. Populated only for
+    /// the branch currently `merge_status == "in_progress"` with a worktree;
+    /// `None` otherwise, or if no rebase is actually paused/running there.
+    pub rebase_commands_done: Option<i64>,
+    /// RAL-145: total rebase-todo commands (done + remaining, from
+    /// `rebase-merge/git-rebase-todo`). See [`Self::rebase_commands_done`].
+    pub rebase_commands_total: Option<i64>,
 }
 
 /// One message in a guardian's global feedback thread (RAL-22).
@@ -267,10 +323,20 @@ pub struct GuardianView {
     pub base_commits: std::collections::HashMap<String, String>,
     /// LLM-generated shell commands for manual review verification (RAL-27).
     /// Regenerated each time the review branch is rebuilt.
-    pub manual_commands: Vec<String>,
+    pub manual_commands: Vec<GuardianCheck>,
     /// User-declared test/action hints from `[[review.action]]` (RAL-77).
     /// Persisted at submit time; not regenerated by the merge engine.
-    pub action_hints: Vec<ActionHint>,
+    pub action_hints: Vec<GuardianCheck>,
+    /// Resolved/submitted values for any [`CheckInput`] referenced by
+    /// `manual_commands`/`action_hints`, keyed by [`CheckInput::name`] and
+    /// scoped to this guardian/review (RAL-164). A value here overrides that
+    /// input's own literal `default` -- this is what makes a submitted or
+    /// AI-resolved value "the new default" the next time the check is viewed.
+    pub input_values: std::collections::HashMap<String, String>,
+    /// In-flight/completed "set it for me" AI resolutions, keyed by
+    /// [`CheckInput::name`] (RAL-164). Absent entries have never had a
+    /// resolution requested.
+    pub input_resolutions: std::collections::HashMap<String, InputResolutionView>,
     /// RAL-88: the resolved agent/model that produced `change_summary`, recorded
     /// at generation time. `None` for guardians whose summary predates provenance
     /// tracking or that have not generated one yet.
@@ -282,6 +348,10 @@ pub struct GuardianView {
     pub manual_commands_agent: Option<String>,
     /// Model behind `manual_commands` (see [`Self::manual_commands_agent`]).
     pub manual_commands_model: Option<String>,
+    /// RAL-88 follow-up: agent_session_id from the most recent manual-checks
+    /// generation pass, for its "Open Agent" terminal action. `None` when the
+    /// resolved agent isn't claude-code, or generation hasn't run yet.
+    pub manual_commands_agent_session_id: Option<String>,
     /// RAL-88: the resolved agent/model that produced the latest feedback-chat
     /// reply. `None` until the guardian has answered at least one chat message.
     pub chat_agent: Option<String>,
@@ -297,6 +367,14 @@ pub struct GuardianView {
     /// action. Data-model only for v1 -- no background poller reads this flag
     /// yet; it exists so a future automatic mode has somewhere to persist to.
     pub auto_pr_feedback: bool,
+    /// RAL-149: when true, the per-branch conflict-resolution quality-bar
+    /// instructions (see [`Self::skip_worktree_checks`]) are also appended to
+    /// the fix pass's system prompt, in addition to always running in the
+    /// dedicated final-verification call that follows it. Default `false`:
+    /// quality checks (formatters/linters/tests) run only in the final-verify
+    /// call, since they may incur real cost (e.g. a paid test suite) and this
+    /// avoids paying for them twice per conflict-resolution cycle.
+    pub verify_mid_resolution: bool,
     /// `true` once the review is built and awaiting human approval
     /// (`status == "in_review"`). Ported from board.html's "ready to act on"
     /// banner condition (`renderReadyBanner`, minus its client-only dismissed
@@ -521,6 +599,108 @@ impl Store {
         Ok(ids)
     }
 
+    /// Atomically claim the right to resolve `input_name` for `guardian_id`
+    /// (RAL-164) via "set it for me". Returns `true` when this call won the
+    /// claim (the caller should proceed to spawn the resolver), `false` when
+    /// a resolution for this exact (guardian, input) pair is already in
+    /// flight. This -- not a disabled button -- is what makes "set it for
+    /// me" spam-proof: a double-click, a second browser tab, or a direct API
+    /// call all race the same atomic UPSERT and only one can win.
+    pub fn claim_guardian_input_resolution(
+        &self,
+        guardian_id: &str,
+        input_name: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT INTO guardian_input_resolutions (guardian_id, input_name, status, value, updated_at_ms)
+             VALUES (?, ?, 'resolving', NULL, ?)
+             ON CONFLICT(guardian_id, input_name) DO UPDATE SET status='resolving', value=NULL, updated_at_ms=excluded.updated_at_ms
+             WHERE guardian_input_resolutions.status != 'resolving'",
+            params![guardian_id, input_name, crate::store::now_ms()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record a resolved value once the resolver LLM call completes
+    /// successfully (RAL-164). Does not itself update
+    /// [`GuardianView::input_values`] -- callers that want the resolved
+    /// value to become the new default also call
+    /// [`Self::merge_guardian_input_values`].
+    pub fn set_guardian_input_resolution_ready(
+        &self,
+        guardian_id: &str,
+        input_name: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_input_resolutions SET status='ready', value=?, updated_at_ms=? \
+             WHERE guardian_id=? AND input_name=?",
+            params![value, crate::store::now_ms(), guardian_id, input_name],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a resolution attempt failed (the LLM call errored, timed
+    /// out, or returned nothing usable) (RAL-164).
+    pub fn set_guardian_input_resolution_failed(
+        &self,
+        guardian_id: &str,
+        input_name: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_input_resolutions SET status='failed', updated_at_ms=? \
+             WHERE guardian_id=? AND input_name=?",
+            params![crate::store::now_ms(), guardian_id, input_name],
+        )?;
+        Ok(())
+    }
+
+    /// Every input-resolution row for `guardian_id` (RAL-164), for
+    /// [`GuardianView::input_resolutions`].
+    fn guardian_input_resolutions(
+        &self,
+        guardian_id: &str,
+    ) -> Result<std::collections::HashMap<String, InputResolutionView>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT input_name, status, value FROM guardian_input_resolutions WHERE guardian_id=?",
+        )?;
+        let rows = stmt
+            .query_map(params![guardian_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    InputResolutionView {
+                        status: r.get(1)?,
+                        value: r.get(2)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Crash recovery: resolutions left `resolving` after an unclean
+    /// shutdown have no background thread to complete them. Reset each to
+    /// `failed` so the UI never shows a permanently-stuck spinner (RAL-164).
+    /// Run at daemon startup, mirrors [`Self::recover_orphaned_merges`].
+    /// Returns the recovered `(guardian_id, input_name)` pairs.
+    pub fn recover_orphaned_input_resolutions(&self) -> Result<Vec<(String, String)>> {
+        let pairs: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT guardian_id, input_name FROM guardian_input_resolutions WHERE status='resolving'",
+            )?;
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !pairs.is_empty() {
+            self.conn.execute(
+                "UPDATE guardian_input_resolutions SET status='failed', updated_at_ms=? \
+                 WHERE status='resolving'",
+                params![crate::store::now_ms()],
+            )?;
+        }
+        Ok(pairs)
+    }
+
     /// Ids of the guardians derived from a run, oldest first.
     pub fn guardians_for_run(&self, run_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
@@ -556,6 +736,10 @@ impl Store {
     /// session-linked branches are excluded (they haven't been triggered yet).
     /// Used at daemon startup to recover guardians that were left `collecting`
     /// because the daemon was restarted after the run completed.
+    ///
+    /// This already requires ALL matching sessions done, not just one — which,
+    /// since RAL-159, includes implicit worktree-sharing siblings alongside the
+    /// explicitly review-linked session (see `mark_ready_branches_with_done_sessions`).
     pub fn collecting_guardians_ready(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM guardians WHERE status = 'collecting'
@@ -603,12 +787,20 @@ impl Store {
     }
 
     /// Promote a guardian's enabled `pending` branches to `ready`, but only those
-    /// whose contributing session has actually finished — unlike
+    /// whose contributing session(s) have ALL actually finished — unlike
     /// [`Self::mark_guardian_branches_ready`], which blindly promotes every
     /// pending branch and is only safe to call once the caller has separately
     /// verified every blocking task is done. Used for the straggler sweep, where
     /// a guardian may still have other, genuinely-unfinished pending branches
     /// that must not be promoted early.
+    ///
+    /// RAL-159: a branch's `sessions.review_branch` set can now contain more
+    /// than one row — an explicitly review-linked session plus any sibling
+    /// sessions that merely share its git worktree (e.g. a nested cwd
+    /// subfolder), attached by `reviews::derive_reviews`. Requiring `NOT
+    /// EXISTS` a non-done contributor (rather than the old `EXISTS` a done
+    /// one) means the branch is only marked `ready` once every one of them —
+    /// explicit or implicit — has finished, not just the first.
     pub fn mark_ready_branches_with_done_sessions(&self, guardian_id: &str) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE guardian_branches
@@ -616,7 +808,11 @@ impl Store {
              WHERE guardian_id=? AND enabled=1 AND merge_status='pending'
                AND EXISTS (
                    SELECT 1 FROM sessions s
-                   WHERE s.review_branch = guardian_branches.branch AND s.state='done'
+                   WHERE s.review_branch = guardian_branches.branch
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM sessions s
+                   WHERE s.review_branch = guardian_branches.branch AND s.state != 'done'
                )",
             params![guardian_id],
         )?;
@@ -876,6 +1072,10 @@ impl Store {
         )?;
         self.conn
             .execute("DELETE FROM ghosts WHERE guardian_id=?", params![id])?;
+        self.conn.execute(
+            "DELETE FROM guardian_input_resolutions WHERE guardian_id=?",
+            params![id],
+        )?;
         let n = self
             .conn
             .execute("DELETE FROM guardians WHERE id=?", params![id])?;
@@ -1082,6 +1282,33 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Set whether the quality-bar instructions also run during the fix pass,
+    /// not just the dedicated final-verification call (RAL-149). Default off.
+    pub fn set_guardian_verify_mid_resolution(&self, id: &str, enabled: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET verify_mid_resolution=?, updated_at_ms=? WHERE id=?",
+            params![i64::from(enabled), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether the review runs quality-bar checks during the fix pass too
+    /// (RAL-149). The final-verify call always runs them regardless.
+    pub fn guardian_verify_mid_resolution(&self, id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT verify_mid_resolution FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
     /// Set whether this review auto-incorporates PR feedback comments instead of
     /// requiring the manual "Pull in PR feedback" action (RAL-117). Data-model
     /// only for v1 -- no background poller reads this flag yet.
@@ -1245,7 +1472,7 @@ impl Store {
         Ok(())
     }
 
-    /// Store the claude_session_id from the most recent conflict-resolver run on
+    /// Store the agent_session_id from the most recent conflict-resolver run on
     /// a branch. Only populated when the resolver backend is claude-code.
     pub fn set_branch_resolver_session_id(
         &self,
@@ -1254,7 +1481,7 @@ impl Store {
         session_id: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_branches SET resolver_claude_session_id=? WHERE guardian_id=? AND id=?",
+            "UPDATE guardian_branches SET resolver_agent_session_id=? WHERE guardian_id=? AND id=?",
             params![session_id, guardian_id, branch_id],
         )?;
         Ok(())
@@ -1317,7 +1544,7 @@ impl Store {
     /// rather than re-attaching to the runner's tmux wrapper) — see
     /// `Store::get_session_agent_resume`'s doc comment for the same idea
     /// applied to a plain session.
-    pub fn get_branch_resolver_claude_session_id(
+    pub fn get_branch_resolver_agent_session_id(
         &self,
         guardian_id: &str,
         branch_id: &str,
@@ -1325,7 +1552,7 @@ impl Store {
         let r: Option<Option<String>> = self
             .conn
             .query_row(
-                "SELECT resolver_claude_session_id FROM guardian_branches WHERE guardian_id=? AND id=?",
+                "SELECT resolver_agent_session_id FROM guardian_branches WHERE guardian_id=? AND id=?",
                 params![guardian_id, branch_id],
                 |r| r.get(0),
             )
@@ -1364,16 +1591,47 @@ impl Store {
     pub fn set_guardian_manual_commands(
         &self,
         id: &str,
-        commands: &[String],
+        commands: &[GuardianCheck],
         agent: Option<&str>,
         model: Option<&str>,
     ) -> Result<()> {
-        let json = crate::store::to_json(commands);
+        let json = serde_json::to_string(commands).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
             "UPDATE guardians SET manual_commands=?, manual_commands_agent=?, manual_commands_model=?, updated_at_ms=? WHERE id=?",
             params![json, agent, model, crate::store::now_ms(), id],
         )?;
         Ok(())
+    }
+
+    /// Store the agent_session_id from the most recent manual-commands
+    /// generation pass. Only populated when the resolved agent is claude-code.
+    /// Mirrors [`Self::set_branch_resolver_session_id`] at the guardian level.
+    pub fn set_guardian_manual_commands_session_id(
+        &self,
+        id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET manual_commands_agent_session_id=? WHERE id=?",
+            params![session_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a guardian's recorded manual-commands agent_session_id, for its
+    /// "Open Agent" terminal action, plus the cwd generation ran/runs in
+    /// (mirrors the chat fallback's own cwd choice — see
+    /// `guardian_merge.rs::resolve_guardian_chat`). `None` in either position
+    /// means the corresponding action isn't available yet.
+    pub fn get_guardian_manual_commands_agent_resume(
+        &self,
+        id: &str,
+    ) -> Result<(String, Option<String>, Option<String>)> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(combined_worktree, git_root), manual_commands_agent, manual_commands_agent_session_id FROM guardians WHERE id=?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
     }
 
     /// Record which resolved `agent`/`model` produced the latest feedback-chat
@@ -1393,10 +1651,39 @@ impl Store {
 
     /// Persist user-declared action hints from `[[review.action]]` (RAL-77).
     /// Stored as a JSON array; set once at submit time and not touched by the merge engine.
-    pub fn set_guardian_action_hints(&self, id: &str, hints: &[ActionHint]) -> Result<()> {
+    pub fn set_guardian_action_hints(&self, id: &str, hints: &[GuardianCheck]) -> Result<()> {
         let json = serde_json::to_string(hints).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
             "UPDATE guardians SET action_hints=?, updated_at_ms=? WHERE id=?",
+            params![json, crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist resolved/submitted [`CheckInput`] values for this guardian
+    /// (RAL-164), merging into whatever is already stored so a value
+    /// submitted for one input never clobbers another's. This is what makes
+    /// a submitted or AI-resolved value "the new default" on subsequent
+    /// views of any check referencing it.
+    pub fn merge_guardian_input_values(
+        &self,
+        id: &str,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let existing_json: Option<String> = self.conn.query_row(
+            "SELECT input_values FROM guardians WHERE id=?",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let mut merged: std::collections::HashMap<String, String> =
+            serde_json::from_str(existing_json.as_deref().unwrap_or("{}")).unwrap_or_default();
+        merged.extend(values.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
+        self.conn.execute(
+            "UPDATE guardians SET input_values=?, updated_at_ms=? WHERE id=?",
             params![json, crate::store::now_ms(), id],
         )?;
         Ok(())
@@ -1565,7 +1852,7 @@ impl Store {
     pub fn reset_branch_to_pending(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE guardian_branches SET merge_status='pending', detail=NULL, review_branch=NULL,
-             worktree=NULL, resolver_claude_session_id=NULL, review_head=NULL
+             worktree=NULL, resolver_agent_session_id=NULL, review_head=NULL
              WHERE guardian_id=? AND id=?",
             params![guardian_id, branch_id],
         )?;
@@ -1582,7 +1869,7 @@ impl Store {
         self.conn.execute(
             "UPDATE guardian_branches
              SET merge_status = CASE WHEN merge_status IN ('pending','ready') THEN merge_status ELSE 'pending' END,
-                 detail=NULL, review_branch=NULL, worktree=NULL, resolver_claude_session_id=NULL, review_head=NULL
+                 detail=NULL, review_branch=NULL, worktree=NULL, resolver_agent_session_id=NULL, review_head=NULL
              WHERE guardian_id=? AND enabled=1",
             params![guardian_id],
         )?;
@@ -1607,7 +1894,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, chat_agent, chat_model, squash_projects, auto_pr_feedback
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_mid_resolution
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -1620,7 +1907,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, chat_agent, chat_model, squash_projects, auto_pr_feedback
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_mid_resolution
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -1660,10 +1947,13 @@ impl Store {
             summary_model: r.get(26)?,
             manual_commands_agent: r.get(27)?,
             manual_commands_model: r.get(28)?,
-            chat_agent: r.get(29)?,
-            chat_model: r.get(30)?,
-            squash_projects: r.get(31)?,
-            auto_pr_feedback: r.get(32)?,
+            manual_commands_agent_session_id: r.get(29)?,
+            chat_agent: r.get(30)?,
+            chat_model: r.get(31)?,
+            squash_projects: r.get(32)?,
+            auto_pr_feedback: r.get(33)?,
+            input_values: r.get(34)?,
+            verify_mid_resolution: r.get(35)?,
         })
     }
 
@@ -1682,7 +1972,7 @@ impl Store {
                     s.run_id AS source_run_id,
                     s.task_idx AS source_task_idx,
                     s.idx AS source_session_idx,
-                    gb.resolver_claude_session_id, gb.moved_from_guardian_id, gb.id
+                    gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id
              FROM guardian_branches gb
              LEFT JOIN sessions s ON s.rowid = (
                  SELECT s2.rowid FROM sessions s2
@@ -1691,7 +1981,7 @@ impl Store {
              )
              WHERE gb.guardian_id=? ORDER BY gb.position",
         )?;
-        let branches = stmt
+        let mut branches = stmt
             .query_map(params![row.id], |r| {
                 let enabled = r.get::<_, i64>(9).map(|v| v != 0).unwrap_or(true);
                 let dismissed = r.get::<_, i64>(11).map(|v| v != 0).unwrap_or(false);
@@ -1701,10 +1991,10 @@ impl Store {
                 let merge_status: String = r.get(2)?;
                 let ready = merge_status == "ready";
                 let worktree: Option<String> = r.get(5)?;
-                let resolver_claude_session_id: Option<String> = r.get(16)?;
+                let resolver_agent_session_id: Option<String> = r.get(16)?;
                 let terminal_modes = terminal_modes_for(
                     row.resolver_agent.as_deref(),
-                    resolver_claude_session_id.is_some(),
+                    resolver_agent_session_id.is_some(),
                     worktree.is_some(),
                 );
                 Ok(BranchView {
@@ -1725,13 +2015,32 @@ impl Store {
                     source_run_id: r.get(13)?,
                     source_task_idx: r.get(14)?,
                     source_session_idx: r.get(15)?,
-                    resolver_claude_session_id,
+                    resolver_agent_session_id,
                     ready,
                     terminal_modes,
                     moved_from_guardian_id: r.get(17)?,
+                    rebase_commands_done: None,
+                    rebase_commands_total: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // RAL-145: git's own rebase-todo progress is a live filesystem read,
+        // so it's gated to the (normally singular) branch actually mid-rebase
+        // rather than scanned across every branch on every board poll.
+        for b in &mut branches {
+            if b.merge_status != "in_progress" {
+                continue;
+            }
+            let Some(wt) = b.worktree.as_deref() else {
+                continue;
+            };
+            if let Some((done, total)) =
+                crate::guardian_merge::rebase_command_progress(std::path::Path::new(wt))
+            {
+                b.rebase_commands_done = Some(done);
+                b.rebase_commands_total = Some(total);
+            }
+        }
 
         // Compute the ordered distinct project roots from the branch list. A branch
         // with project=None uses the guardian's own git_root.
@@ -1762,8 +2071,9 @@ impl Store {
         } else {
             "waiting"
         };
-        let manual_commands: Vec<String> =
-            crate::store::from_json(row.manual_commands.as_deref().unwrap_or("[]"));
+        let manual_commands: Vec<GuardianCheck> =
+            serde_json::from_str(row.manual_commands.as_deref().unwrap_or("[]"))
+                .unwrap_or_default();
         // RAL-103: manual-checks generation only ever runs once every ENABLED
         // branch has finished rebasing cleanly (see `generate_manual_commands`'s
         // call sites in guardian_merge.rs, always after the stack fully
@@ -1792,6 +2102,7 @@ impl Store {
         } else {
             "waiting"
         };
+        let input_resolutions = self.guardian_input_resolutions(&row.id)?;
 
         Ok(GuardianView {
             id: row.id,
@@ -1822,16 +2133,21 @@ impl Store {
             manual_commands,
             action_hints: serde_json::from_str(row.action_hints.as_deref().unwrap_or("[]"))
                 .unwrap_or_default(),
+            input_values: serde_json::from_str(row.input_values.as_deref().unwrap_or("{}"))
+                .unwrap_or_default(),
+            input_resolutions,
             summary_agent: row.summary_agent,
             summary_model: row.summary_model,
             manual_commands_agent: row.manual_commands_agent,
             manual_commands_model: row.manual_commands_model,
+            manual_commands_agent_session_id: row.manual_commands_agent_session_id,
             chat_agent: row.chat_agent,
             chat_model: row.chat_model,
             squash_projects: crate::store::from_json(
                 row.squash_projects.as_deref().unwrap_or("[]"),
             ),
             auto_pr_feedback: row.auto_pr_feedback,
+            verify_mid_resolution: row.verify_mid_resolution,
             ready,
             merge_progress,
             summary_state,
@@ -2049,12 +2365,18 @@ struct GuardianRow {
     summary_model: Option<String>,
     manual_commands_agent: Option<String>,
     manual_commands_model: Option<String>,
+    manual_commands_agent_session_id: Option<String>,
     chat_agent: Option<String>,
     chat_model: Option<String>,
     /// JSON array of project roots with squash enabled (RAL-91).
     squash_projects: Option<String>,
     /// RAL-117: opts this review into auto-incorporating PR feedback.
     auto_pr_feedback: bool,
+    /// JSON map of {input_name: value} -- resolved/submitted [`CheckInput`]
+    /// values, scoped to this guardian (RAL-164).
+    input_values: Option<String>,
+    /// RAL-149: opts the fix pass into also running quality-bar checks.
+    verify_mid_resolution: bool,
 }
 
 #[cfg(test)]
@@ -2161,10 +2483,12 @@ mod tests {
             source_run_id: None,
             source_task_idx: None,
             source_session_idx: None,
-            resolver_claude_session_id: None,
+            resolver_agent_session_id: None,
             ready: merge_status == "ready",
             terminal_modes: Vec::new(),
             moved_from_guardian_id: None,
+            rebase_commands_done: None,
+            rebase_commands_total: None,
         }
     }
 
@@ -2236,10 +2560,205 @@ mod tests {
 
         // commands persisted -> "ready", regardless of status.
         store
-            .set_guardian_manual_commands(&id, &["echo hi".to_string()], None, None)
+            .set_guardian_manual_commands(
+                &id,
+                &[GuardianCheck {
+                    label: None,
+                    command: Some("echo hi".to_string()),
+                    prompt: None,
+                    cleanup_command: None,
+                    inputs: vec![],
+                }],
+                None,
+                None,
+            )
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.checks_state, "ready");
+    }
+
+    // ── RAL-164: structured GuardianCheck + input_values persistence ────────
+
+    #[test]
+    fn manual_commands_round_trip_structured_fields() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let checks = vec![
+            GuardianCheck {
+                label: None,
+                command: Some("cargo test".to_string()),
+                prompt: None,
+                cleanup_command: None,
+                inputs: vec![],
+            },
+            GuardianCheck {
+                label: None,
+                command: Some("ralphus-daemon serve --port {port}".to_string()),
+                prompt: None,
+                cleanup_command: Some("ralphus-daemon stop --port {port}".to_string()),
+                inputs: vec![CheckInput {
+                    name: "port".to_string(),
+                    message: "Port for the daemon".to_string(),
+                    default: "7890".to_string(),
+                }],
+            },
+        ];
+        store
+            .set_guardian_manual_commands(&id, &checks, Some("claude"), Some("opus"))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.manual_commands.len(), 2);
+        assert!(g.manual_commands[0].cleanup_command.is_none());
+        assert_eq!(
+            g.manual_commands[1].cleanup_command.as_deref(),
+            Some("ralphus-daemon stop --port {port}")
+        );
+        assert_eq!(g.manual_commands[1].inputs.len(), 1);
+        assert_eq!(g.manual_commands[1].inputs[0].name, "port");
+        assert_eq!(g.manual_commands[1].inputs[0].default, "7890");
+    }
+
+    #[test]
+    fn action_hints_round_trip_structured_fields() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let hints = vec![GuardianCheck {
+            label: Some("Serve locally".to_string()),
+            command: Some("ralphus-daemon serve --port {port}".to_string()),
+            prompt: None,
+            cleanup_command: Some("ralphus-daemon stop --port {port}".to_string()),
+            inputs: vec![CheckInput {
+                name: "port".to_string(),
+                message: "Port for the daemon".to_string(),
+                default: "7890".to_string(),
+            }],
+        }];
+        store.set_guardian_action_hints(&id, &hints).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.action_hints.len(), 1);
+        assert_eq!(g.action_hints[0].label.as_deref(), Some("Serve locally"));
+        assert_eq!(g.action_hints[0].inputs[0].name, "port");
+    }
+
+    #[test]
+    fn merge_guardian_input_values_merges_without_clobbering() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.input_values.is_empty());
+
+        store
+            .merge_guardian_input_values(
+                &id,
+                &std::collections::HashMap::from([("port".to_string(), "9001".to_string())]),
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_values.get("port"), Some(&"9001".to_string()));
+
+        // A second merge for a different key must not clobber the first.
+        store
+            .merge_guardian_input_values(
+                &id,
+                &std::collections::HashMap::from([("branch".to_string(), "main".to_string())]),
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_values.get("port"), Some(&"9001".to_string()));
+        assert_eq!(g.input_values.get("branch"), Some(&"main".to_string()));
+
+        // Re-submitting the same key overwrites just that value.
+        store
+            .merge_guardian_input_values(
+                &id,
+                &std::collections::HashMap::from([("port".to_string(), "9002".to_string())]),
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_values.get("port"), Some(&"9002".to_string()));
+    }
+
+    #[test]
+    fn merge_guardian_input_values_empty_map_is_a_no_op() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .merge_guardian_input_values(&id, &std::collections::HashMap::new())
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.input_values.is_empty());
+    }
+
+    #[test]
+    fn claim_guardian_input_resolution_is_atomic_and_rejects_concurrent_duplicate() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        // First claim wins.
+        assert!(store.claim_guardian_input_resolution(&id, "port").unwrap());
+        // A concurrent duplicate claim for the SAME input loses -- this is
+        // the actual spam-proofing, not a UI-side disabled button.
+        assert!(!store.claim_guardian_input_resolution(&id, "port").unwrap());
+        // A DIFFERENT input on the same guardian is unaffected.
+        assert!(
+            store
+                .claim_guardian_input_resolution(&id, "branch")
+                .unwrap()
+        );
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_resolutions["port"].status, "resolving");
+        assert!(g.input_resolutions["port"].value.is_none());
+
+        // Once resolved, a fresh claim for the same input is allowed again
+        // (e.g. clicking "set it for me" a second time later).
+        store
+            .set_guardian_input_resolution_ready(&id, "port", "9001")
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_resolutions["port"].status, "ready");
+        assert_eq!(g.input_resolutions["port"].value.as_deref(), Some("9001"));
+        assert!(store.claim_guardian_input_resolution(&id, "port").unwrap());
+    }
+
+    #[test]
+    fn set_guardian_input_resolution_failed_marks_status() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.claim_guardian_input_resolution(&id, "port").unwrap();
+        store
+            .set_guardian_input_resolution_failed(&id, "port")
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_resolutions["port"].status, "failed");
+        assert!(g.input_resolutions["port"].value.is_none());
+        // A failed resolution can be retried.
+        assert!(store.claim_guardian_input_resolution(&id, "port").unwrap());
+    }
+
+    #[test]
+    fn recover_orphaned_input_resolutions_resets_stuck_resolving_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.claim_guardian_input_resolution(&id, "port").unwrap();
+
+        assert!(
+            !store
+                .recover_orphaned_input_resolutions()
+                .unwrap()
+                .is_empty()
+        );
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.input_resolutions["port"].status, "failed");
+
+        // A second sweep finds nothing left to recover.
+        assert!(
+            store
+                .recover_orphaned_input_resolutions()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2870,7 +3389,7 @@ mod tests {
     #[test]
     fn reset_branch_to_pending_clears_review_fields() {
         // RAL-43: reset_branch_to_pending clears review_branch, worktree, and
-        // resolver_claude_session_id so Watch Live never points at a stale session.
+        // resolver_agent_session_id so Watch Live never points at a stale session.
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
@@ -2891,14 +3410,14 @@ mod tests {
         assert!(g.branches[0].review_branch.is_none());
         assert!(g.branches[0].worktree.is_none());
         assert!(
-            g.branches[0].resolver_claude_session_id.is_none(),
+            g.branches[0].resolver_agent_session_id.is_none(),
             "session ID must be cleared so Watch Live doesn't point at a stale session"
         );
     }
 
     #[test]
     fn reset_all_branches_clears_resolver_session_id() {
-        // Regression: bulk reset must clear resolver_claude_session_id so that
+        // Regression: bulk reset must clear resolver_agent_session_id so that
         // pressing Merge/Rebase (or a base-branch auto-rebuild) doesn't leave
         // Watch Live pointing at the previous conflict-resolution session.
         let store = Store::open_in_memory().unwrap();
@@ -2915,7 +3434,7 @@ mod tests {
         store.reset_all_enabled_branches_to_pending(&id).unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert!(
-            g.branches[0].resolver_claude_session_id.is_none(),
+            g.branches[0].resolver_agent_session_id.is_none(),
             "session ID must be cleared on bulk reset"
         );
     }
