@@ -6,6 +6,7 @@ import io
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,38 @@ def test_program_is_overridable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     CodexBackend().run("x", ws, model=None)
     assert captured["cmd"][0] == "my-codex"
+
+
+def test_compound_command_uses_shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = Workspace.create(str(tmp_path))
+    shell = "powershell" if sys.platform.startswith("win") else "sh"
+    monkeypatch.setenv("RALPHUS_SHELL", shell)
+    monkeypatch.setenv("RALPHUS_CODEX_CMD", "cd foo ; codex")
+    captured: dict[str, Any] = {}
+
+    def fake_popen(cmd: str | list[str], **kwargs: Any) -> _FakePopen:
+        popen = _FakePopen(0, stdout_lines=[_agent_message("ok")])
+        captured["popen"] = popen
+        captured["cmd"] = cmd
+        captured["shell"] = kwargs.get("shell")
+        return popen
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    CodexBackend().run(
+        "x", ws, model="o4-mini", append_system_prompt="Follow the house style."
+    )
+
+    if sys.platform.startswith("win"):
+        assert captured["cmd"][:2] == ["powershell", "-NoLogo"]
+        assert captured["shell"] is False
+    else:
+        assert captured["cmd"][:2] == ["sh", "-c"]
+        assert captured["shell"] is False
+    assert "-c" in captured["cmd"][-1]
+    assert "developer_instructions=Follow the house style." in captured["cmd"][-1]
+    assert "exec" in captured["cmd"][-1]
+    assert "--json" in captured["cmd"][-1]
+    assert captured["popen"].stdin.written == "x"
 
 
 def test_developer_instructions_flag_precedes_exec(

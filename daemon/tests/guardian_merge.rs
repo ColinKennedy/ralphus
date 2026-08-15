@@ -931,10 +931,13 @@ fn skip_worktrees_shared_stack_rebases_all_branches() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// A feature branch that adds nothing over the base (already merged) is reported
-// `done` but with an explanatory detail — not a silent, work-free success.
+// A feature branch that adds nothing over the branch beneath it fails the
+// merge outright (RAL-190) — a review must never silently approve a stack
+// containing a branch whose work it does not actually carry. The branch is
+// also flagged `is_empty` so the board can label it, and the failure message
+// names the escape hatch (disable the branch) rather than just refusing.
 #[test]
-fn branch_with_no_new_commits_is_surfaced() {
+fn branch_with_no_new_commits_fails_the_merge() {
     let (root, store, id) = single_feature_repo();
     // Replace the single feature with one that has NO commits beyond main.
     {
@@ -947,10 +950,25 @@ fn branch_with_no_new_commits_is_surfaced() {
         drop(g);
         run_merge(&store, &NoopRunner, &g2);
         let view = store.lock().unwrap().get_guardian(&g2).unwrap();
-        assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
-        assert_eq!(view.branches[0].merge_status, "done");
+        assert_eq!(
+            view.status, "merge_failed",
+            "an empty branch must fail the review, not quietly pass it: detail: {:?}",
+            view.detail
+        );
+        assert_eq!(view.branches[0].merge_status, "failed");
+        assert!(
+            view.branches[0].is_empty,
+            "the branch must also carry the `is_empty` flag the board renders"
+        );
         let detail = view.branches[0].detail.clone().unwrap_or_default();
-        assert!(detail.contains("no new commits"), "detail: {detail}");
+        assert!(
+            detail.contains("branch is empty"),
+            "detail must say why: {detail}"
+        );
+        assert!(
+            detail.contains("disable it"),
+            "detail must name the escape hatch for a deliberately-empty branch: {detail}"
+        );
     }
     let _ = std::fs::remove_dir_all(&root);
     let _ = id;

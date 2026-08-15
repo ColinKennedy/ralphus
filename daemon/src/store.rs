@@ -214,6 +214,13 @@ pub struct VerifyView {
     pub tokens_out: i64,
     /// Cost of this step's most recent run, USD.
     pub cost_usd: f64,
+    /// RAL-191: environment-variable overrides set on **this individual step**,
+    /// the narrowest layer — merged on top of the owning scope's
+    /// `verify_env_overrides` (and its ancestors) when the step runs. Empty for
+    /// the vast majority of steps; omitted from the JSON when empty so the
+    /// common board payload is unchanged.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_overrides: BTreeMap<String, String>,
 }
 
 /// A session as shown in the board.
@@ -594,6 +601,7 @@ impl Store {
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
                 queue_rank    REAL,
+                env_overrides TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (run_id, task_idx, scope, session_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS guardians (
@@ -640,6 +648,7 @@ impl Store {
                 conflicts_fixed     INTEGER,
                 conflicts_committed INTEGER,
                 is_empty            INTEGER NOT NULL DEFAULT 0,
+                env_overrides       TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (guardian_id, position)
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -1011,6 +1020,20 @@ impl Store {
             // RAL-161: resolved per-session USD spend cap (session overrides
             // task). Exceeding the live `cost_usd` kills the session mid-run.
             "ALTER TABLE sessions ADD COLUMN maximum_budget_usd REAL",
+            // RAL-191: the narrowest env-override layer -- one individual verify
+            // step's own variables, merged on top of its owning scope's
+            // `verify_env_overrides`. Per-step rather than per-scope because
+            // `verify` is an array: two `[[task.verify]]` blocks setting the
+            // same key to different values must not collide. See
+            // `Store::resolve_task_verify_step_env_overrides` and its sibling.
+            "ALTER TABLE verifies ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-191: a review branch's own env overrides, layered on top of
+            // whatever its *source session* resolves to, so a review worktree
+            // inherits the environment the work was produced under. Unlike
+            // every other layer this one is a JSON map of {key: value|null},
+            // where `null` is a tombstone meaning "remove this inherited key
+            // entirely" -- see `Store::resolve_guardian_branch_env`.
+            "ALTER TABLE guardian_branches ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -2082,7 +2105,7 @@ impl Store {
         session_idx: i64,
     ) -> Result<Vec<VerifyView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd FROM verifies
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM verifies
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -2100,6 +2123,7 @@ impl Store {
                     tokens_in: r.get::<_, i64>(9)?,
                     tokens_out: r.get::<_, i64>(10)?,
                     cost_usd: r.get::<_, f64>(11)?,
+                    env_overrides: from_json_map(&r.get::<_, String>(12)?),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2440,8 +2464,8 @@ fn insert_verify(
         None
     };
     tx.execute(
-        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, env_overrides)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             run_id,
             task_idx,
@@ -2457,6 +2481,10 @@ fn insert_verify(
             NodeState::Pending.as_str(),
             timeout_sec,
             budget_tokens,
+            // RAL-191: the step's TOML-declared `environment` seeds the same
+            // column `POST .../verify/{vi}/env` writes to, so a declared value
+            // and one set later are indistinguishable from here on.
+            to_json_map(&v.environment),
         ],
     )?;
     Ok(())
@@ -3287,6 +3315,105 @@ impl Store {
     ) -> Result<BTreeMap<String, String>> {
         let mut merged = self.resolve_session_env_overrides(run_id, task_idx, session_idx)?;
         merged.extend(self.get_session_verify_env_overrides(run_id, task_idx, session_idx)?);
+        Ok(merged)
+    }
+
+    /// The environment-variable overrides set on one individual verify step
+    /// (RAL-191), not merged with any ancestor scope. `scope` is `"task"` or
+    /// `"session"`; `session_idx` is the owning session's index for a
+    /// session-scoped step and ignored (stored as the same value the row was
+    /// inserted with) for a task-scoped one.
+    pub fn get_verify_step_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        scope: &str,
+        session_idx: i64,
+        idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_overrides FROM verifies
+                 WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+                params![run_id, task_idx, scope, session_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Add/replace (`set`) and remove (`unset`) entries in one verify step's
+    /// own environment-variable overrides, returning the resulting map.
+    ///
+    /// Eight arguments because a verify step's primary key genuinely is
+    /// five-part (`run, task, scope, session, idx`) — the same key every other
+    /// `verifies` accessor here takes — plus the set/unset pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_verify_step_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        scope: &str,
+        session_idx: i64,
+        idx: i64,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut current =
+            self.get_verify_step_env_overrides(run_id, task_idx, scope, session_idx, idx)?;
+        for key in unset {
+            current.remove(key);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), v.clone());
+        }
+        self.conn.execute(
+            "UPDATE verifies SET env_overrides=?
+             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+            params![
+                to_json_map(&current),
+                run_id,
+                task_idx,
+                scope,
+                session_idx,
+                idx
+            ],
+        )?;
+        Ok(current)
+    }
+
+    /// Effective overrides for one *task-scoped* verify step (RAL-191):
+    /// `run < task < task.verify < this step`.
+    pub fn resolve_task_verify_step_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut merged = self.resolve_task_verify_env_overrides(run_id, task_idx)?;
+        merged.extend(self.get_verify_step_env_overrides(run_id, task_idx, "task", -1, idx)?);
+        Ok(merged)
+    }
+
+    /// Effective overrides for one *session-scoped* verify step (RAL-191):
+    /// `run < task < session < session.verify < this step`.
+    pub fn resolve_session_verify_step_env_overrides(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+        idx: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut merged =
+            self.resolve_session_verify_env_overrides(run_id, task_idx, session_idx)?;
+        merged.extend(self.get_verify_step_env_overrides(
+            run_id,
+            task_idx,
+            "session",
+            session_idx,
+            idx,
+        )?);
         Ok(merged)
     }
 
@@ -5492,6 +5619,34 @@ prompt = "confirm tests"
     }
 
     #[test]
+    fn session_view_keeps_authored_system_prompt_text() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.session]]
+id = "worker"
+cwd = "/repo"
+prompt = "make it build"
+system_prompt = "Do NOT commit and do NOT push under any circumstances."
+system_prompt_position = "append"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(src), Some("system prompt"), false).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        let session = &run.tasks[0].sessions[0];
+        let effective = session.system_prompt.as_deref().unwrap_or("");
+        assert!(
+            effective.contains("Do NOT commit and do NOT push under any circumstances."),
+            "details pane payload should keep the authored session system prompt text"
+        );
+        assert!(
+            effective.contains("non-interactive session"),
+            "details pane payload should still include ralphus-added unattended instructions"
+        );
+    }
+
+    #[test]
     fn explicit_project_wins_over_cwd_fallback() {
         let src = r#"
 [[task]]
@@ -6415,6 +6570,93 @@ command = "y"
         );
         assert_eq!(resolved.get("TASK_ONLY").map(String::as_str), Some("1"));
         assert_eq!(resolved.get("SESSION_ONLY").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn toml_environment_seeds_each_verify_step_separately() {
+        // RAL-191: the whole point of the per-step layer -- two verify steps
+        // under one task set the same key to different values, and neither
+        // clobbers the other.
+        let src = "[[task]]\nname=\"t0\"\n\
+                   [[task.verify]]\ncommand=\"cargo test\"\nenvironment={RUST_LOG=\"debug\"}\n\
+                   [[task.verify]]\ncommand=\"cargo clippy\"\nenvironment={RUST_LOG=\"warn\"}\n\
+                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.session.verify]]\ncommand=\"npm test\"\nenvironment={CI=\"1\"}\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store.insert_run(&parse(src), Some("r"), false).unwrap();
+
+        let step0 = store
+            .get_verify_step_env_overrides(&run, 0, "task", -1, 0)
+            .unwrap();
+        let step1 = store
+            .get_verify_step_env_overrides(&run, 0, "task", -1, 1)
+            .unwrap();
+        assert_eq!(step0.get("RUST_LOG").map(String::as_str), Some("debug"));
+        assert_eq!(step1.get("RUST_LOG").map(String::as_str), Some("warn"));
+
+        let sess_step = store
+            .get_verify_step_env_overrides(&run, 0, "session", 0, 0)
+            .unwrap();
+        assert_eq!(sess_step.get("CI").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn resolve_verify_step_env_precedence_step_wins_over_every_ancestor() {
+        // RAL-191: run < task < task.verify < step, and
+        // run < task < session < session.verify < step.
+        let mut store = Store::open_in_memory().unwrap();
+        let src = "[[task]]\nname=\"t0\"\n\
+                   [[task.verify]]\ncommand=\"c\"\n\
+                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.session.verify]]\ncommand=\"d\"\n";
+        let run = store.insert_run(&parse(src), Some("r"), false).unwrap();
+
+        let mut m = BTreeMap::new();
+        m.insert("A".to_string(), "run".to_string());
+        store.set_run_env_overrides(&run, &m, &[]).unwrap();
+        // With nothing set below it, the step inherits the run's value.
+        assert_eq!(
+            store
+                .resolve_task_verify_step_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"run".to_string())
+        );
+
+        let mut m = BTreeMap::new();
+        m.insert("A".to_string(), "task-verify".to_string());
+        store
+            .set_task_verify_env_overrides(&run, 0, &m, &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_task_verify_step_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"task-verify".to_string())
+        );
+
+        // The step's own value beats the scope-wide verify layer above it.
+        let mut m = BTreeMap::new();
+        m.insert("A".to_string(), "step".to_string());
+        store
+            .set_verify_step_env_overrides(&run, 0, "task", -1, 0, &m, &[])
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_task_verify_step_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"step".to_string())
+        );
+        // ...and does not leak into the session-scoped chain.
+        assert_eq!(
+            store
+                .resolve_session_verify_step_env_overrides(&run, 0, 0, 0)
+                .unwrap()
+                .get("A"),
+            Some(&"run".to_string())
+        );
     }
 
     #[test]

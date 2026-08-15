@@ -1479,6 +1479,10 @@ pub(crate) fn tail_lines(text: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Test harness output (`SKIP:` notices) legitimately goes to stdout so
+    // `cargo test --nocapture` shows it; no JSON contract exists here.
+    #![allow(clippy::print_stdout)]
+
     use super::*;
 
     #[test]

@@ -377,10 +377,21 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         }
         ("POST", ["api", "runs", id, "tasks", ti, "restart"]) => restart_task(daemon, id, ti, body),
         ("POST", ["api", "runs", id, "env"]) => set_run_env(daemon, id, body),
+        // RAL-191: the per-step routes must precede the scope-wide ones, since
+        // `["verify", "env"]` and `["verify", vi, "env"]` are otherwise
+        // ambiguous to a reader (they are not to the matcher, which is
+        // length-sensitive -- but keeping them adjacent and ordered narrow-first
+        // makes the layering obvious).
+        ("POST", ["api", "runs", id, "tasks", ti, "verify", vi, "env"]) => {
+            set_task_verify_step_env(daemon, id, ti, vi, body)
+        }
         ("POST", ["api", "runs", id, "tasks", ti, "verify", "env"]) => {
             set_task_verify_env(daemon, id, ti, body)
         }
         ("POST", ["api", "runs", id, "tasks", ti, "env"]) => set_task_env(daemon, id, ti, body),
+        ("POST", ["api", "runs", id, "sessions", ti, si, "verify", vi, "env"]) => {
+            set_session_verify_step_env(daemon, id, ti, si, vi, body)
+        }
         ("POST", ["api", "runs", id, "sessions", ti, si, "verify", "env"]) => {
             set_session_verify_env(daemon, id, ti, si, body)
         }
@@ -473,6 +484,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
                 "open-terminal",
             ],
         ) => open_guardian_branch_terminal(daemon, id, branch_id, query),
+        ("POST", ["api", "guardians", id, "branches", branch_id, "env"]) => {
+            set_guardian_branch_env(daemon, id, branch_id, body)
+        }
         ("GET", ["api", "guardians", id, "branches", branch_id, "pane"]) => {
             guardian_branch_pane(daemon, id, branch_id, query)
         }
@@ -2374,6 +2388,170 @@ fn set_session_verify_env(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &
             store.set_session_verify_env_overrides(id, task_idx, session_idx, set, unset)
         },
     )
+}
+
+/// Add/replace/remove the environment-variable overrides applied to **one
+/// individual task-scoped verify step** (RAL-191) — the narrowest layer, see
+/// [`Store::resolve_task_verify_step_env_overrides`].
+fn set_task_verify_step_env(daemon: &Daemon, id: &str, ti: &str, vi: &str, body: &str) -> Reply {
+    let (Ok(task_idx), Ok(verify_idx)) = (ti.parse::<i64>(), vi.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/verify index must be integers",
+            vec![],
+        );
+    };
+    let label = format!("t{task_idx}/verify#{verify_idx}");
+    set_env_overrides(
+        daemon,
+        body,
+        "task-verify-step",
+        Some(id),
+        Some(&label),
+        None,
+        |store, set, unset| {
+            // Task-scoped verify rows are stored with `session_idx = -1`.
+            store.set_verify_step_env_overrides(id, task_idx, "task", -1, verify_idx, set, unset)
+        },
+    )
+}
+
+/// Add/replace/remove the environment-variable overrides applied to **one
+/// individual session-scoped verify step** (RAL-191) — see
+/// [`Store::resolve_session_verify_step_env_overrides`].
+fn set_session_verify_step_env(
+    daemon: &Daemon,
+    id: &str,
+    ti: &str,
+    si: &str,
+    vi: &str,
+    body: &str,
+) -> Reply {
+    let (Ok(task_idx), Ok(session_idx), Ok(verify_idx)) =
+        (ti.parse::<i64>(), si.parse::<i64>(), vi.parse::<i64>())
+    else {
+        return error(
+            400,
+            "bad_request",
+            "task/session/verify index must be integers",
+            vec![],
+        );
+    };
+    let task_label = format!("t{task_idx}/verify#{verify_idx}");
+    let session_label = format!("s{session_idx}");
+    set_env_overrides(
+        daemon,
+        body,
+        "session-verify-step",
+        Some(id),
+        Some(&task_label),
+        Some(&session_label),
+        |store, set, unset| {
+            store.set_verify_step_env_overrides(
+                id,
+                task_idx,
+                "session",
+                session_idx,
+                verify_idx,
+                set,
+                unset,
+            )
+        },
+    )
+}
+
+/// Body for `POST /api/guardians/{id}/branches/{bid}/env` (RAL-191). Unlike
+/// the run/task/session layers this one has three operations, because a review
+/// branch's values are *inherited* from its source session rather than being
+/// the branch's own to begin with:
+///
+/// - `set` — override an inherited value (or add a new variable).
+/// - `unset` — tombstone: remove the inherited variable from the review
+///   worktree's environment entirely.
+/// - `clear` — drop the branch's own entry, so the key goes back to inheriting
+///   whatever the source session resolves to.
+#[derive(Deserialize)]
+struct BranchEnvOverridesBody {
+    #[serde(default)]
+    set: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    unset: Vec<String>,
+    #[serde(default)]
+    clear: Vec<String>,
+}
+
+/// Set/unset/clear a review branch's own environment-variable overrides
+/// (RAL-191).
+///
+/// A review worktree is built from a session's work and inherits that
+/// session's resolved environment; this endpoint layers per-branch changes on
+/// top, which then apply to that branch's conflict resolver, final-verify
+/// pass, feedback routing, and check gates. Mirrors [`set_env_overrides`]'s
+/// key validation and allowlist-redacted Cartographer logging.
+fn set_guardian_branch_env(daemon: &Daemon, id: &str, branch_id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<BranchEnvOverridesBody>(body) else {
+        return error(400, "bad_request", "invalid env body", vec![]);
+    };
+    if req.set.is_empty() && req.unset.is_empty() && req.clear.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "at least one of `set`/`unset`/`clear` is required",
+            vec![],
+        );
+    }
+    for key in req
+        .set
+        .keys()
+        .chain(req.unset.iter())
+        .chain(req.clear.iter())
+    {
+        if !crate::config::is_valid_env_key(key) {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid environment variable name: {key:?}"),
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    let result = match store
+        .set_guardian_branch_env_overrides(id, branch_id, &req.set, &req.unset, &req.clear)
+    {
+        Ok(m) => m,
+        Err(e) => return store_error(&e),
+    };
+    let allow = crate::config::load_env_overrides_config();
+    let redacted_set: serde_json::Map<String, serde_json::Value> = req
+        .set
+        .iter()
+        .map(|(k, v)| {
+            let shown = if allow.is_allowed(k) {
+                v.clone()
+            } else {
+                "<redacted>".to_string()
+            };
+            (k.clone(), serde_json::Value::String(shown))
+        })
+        .collect();
+    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "server",
+        message: "review branch env overrides changed",
+        scope: Some("guardian-branch"),
+        run_id: None,
+        guardian_id: Some(id),
+        session_id: None,
+        task: Some(branch_id),
+        payload: serde_json::json!({
+            "set": redacted_set,
+            "unset": req.unset,
+            "clear": req.clear,
+        }),
+    });
+    json(200, &result)
 }
 
 #[derive(Serialize)]
@@ -6172,6 +6350,10 @@ X-Accel-Buffering: no\r\n\
 
 #[cfg(test)]
 mod tests {
+    // Test harness output (`SKIP:` notices) legitimately goes to stdout so
+    // `cargo test --nocapture` shows it; no JSON contract exists here.
+    #![allow(clippy::print_stdout)]
+
     use super::*;
 
     const GOOD: &str = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
@@ -9753,6 +9935,197 @@ command = "true"
             &body,
         );
         assert_eq!(r.status, 404);
+    }
+
+    // ── RAL-191: per-verify-step and per-review-branch env endpoints ──────────
+
+    /// A task with two verify steps plus a session verify step, so the
+    /// per-step routes have distinct indices to address.
+    const VERIFY_STEPS: &str = "[[task]]\nname=\"t\"\n\
+        [[task.verify]]\ncommand=\"a\"\n\
+        [[task.verify]]\ncommand=\"b\"\n\
+        [[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+        [[task.session.verify]]\ncommand=\"c\"\n";
+
+    #[test]
+    fn set_task_verify_step_env_targets_one_step_not_the_whole_scope() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(VERIFY_STEPS));
+        let body = serde_json::json!({"set": {"A": "step-1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/verify/1/env",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["tasks"][0]["verify"][1]["env_overrides"]["A"], "step-1");
+        // The sibling step and the scope-wide layer are both untouched.
+        assert!(run["tasks"][0]["verify"][0].get("env_overrides").is_none());
+        assert!(run["tasks"][0].get("verify_env_overrides").is_none());
+    }
+
+    #[test]
+    fn set_session_verify_step_env_targets_one_step() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(VERIFY_STEPS));
+        let body = serde_json::json!({"set": {"CI": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/0/verify/0/env",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(
+            run["tasks"][0]["sessions"][0]["verify"][0]["env_overrides"]["CI"],
+            "1"
+        );
+    }
+
+    #[test]
+    fn the_scope_wide_verify_env_route_still_resolves_alongside_the_per_step_one() {
+        // `/verify/env` and `/verify/{vi}/env` must not shadow each other.
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(VERIFY_STEPS));
+        let body = serde_json::json!({"set": {"A": "scope"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/verify/env",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+
+        let run = route(&d, "GET", "/api/runs/run-000000000001", "");
+        let run: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(run["tasks"][0]["verify_env_overrides"]["A"], "scope");
+        assert!(run["tasks"][0]["verify"][0].get("env_overrides").is_none());
+    }
+
+    #[test]
+    fn set_verify_step_env_missing_step_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(VERIFY_STEPS));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/verify/9/env",
+            &body,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_verify_step_env_bad_index_is_400() {
+        let d = daemon();
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/runs/run-1/tasks/0/verify/x/env", &body);
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_branch_env_requires_set_unset_or_clear() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            let id = store.create_guardian("r", "main", "/repo").unwrap();
+            store.add_guardian_branch(&id, "feat").unwrap();
+            id
+        };
+        let bid = {
+            let store = d.lock();
+            store.get_guardian(&gid).unwrap().branches[0].id.clone()
+        };
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{bid}/env"),
+            "{}",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_branch_env_rejects_an_invalid_variable_name() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            let id = store.create_guardian("r", "main", "/repo").unwrap();
+            store.add_guardian_branch(&id, "feat").unwrap();
+            id
+        };
+        let bid = {
+            let store = d.lock();
+            store.get_guardian(&gid).unwrap().branches[0].id.clone()
+        };
+        let body = serde_json::json!({"set": {"BAD-KEY": "x"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{bid}/env"),
+            &body,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_branch_env_missing_branch_is_404() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            store.create_guardian("r", "main", "/repo").unwrap()
+        };
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/branch-nope/env"),
+            &body,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn set_branch_env_round_trips_override_and_tombstone_onto_the_view() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            let id = store.create_guardian("r", "main", "/repo").unwrap();
+            store.add_guardian_branch(&id, "feat").unwrap();
+            id
+        };
+        let bid = {
+            let store = d.lock();
+            store.get_guardian(&gid).unwrap().branches[0].id.clone()
+        };
+        let body = serde_json::json!({"set": {"A": "x"}, "unset": ["B"]}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{bid}/env"),
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "x");
+        assert!(result["B"].is_null(), "a tombstone serializes as null");
+
+        let g = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        let g: serde_json::Value = serde_json::from_str(&g.body).unwrap();
+        assert_eq!(g["branches"][0]["env_overrides"]["A"], "x");
+        assert!(g["branches"][0]["env_overrides"]["B"].is_null());
+        // With no source session there is nothing to inherit, so the resolved
+        // environment is just the override -- the tombstone drops out.
+        assert_eq!(g["branches"][0]["resolved_env"]["A"], "x");
+        assert!(g["branches"][0]["resolved_env"].get("B").is_none());
     }
 
     #[test]

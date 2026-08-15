@@ -14,10 +14,17 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-secure-dist = ["dep:ed25519-dalek", "dep:base64", "dep:serde", "dep:serde_json"]
+secure-dist = [
+    "dep:ed25519-dalek",
+    "dep:base64",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:gethostname",
+]
 
 [dependencies]
 ed25519-dalek = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+gethostname = { workspace = true, optional = true }

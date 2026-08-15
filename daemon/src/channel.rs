@@ -206,6 +206,10 @@ pub fn is_open(scheme: &str, uri: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Test harness output (`SKIP:` notices) legitimately goes to stdout so
+    // `cargo test --nocapture` shows it; no JSON contract exists here.
+    #![allow(clippy::print_stdout)]
+
     use super::*;
 
     /// A provider script that echoes each request back with a marker, proving

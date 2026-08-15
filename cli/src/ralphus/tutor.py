@@ -276,6 +276,14 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                    step fires. Grammar:
                                    "task/session/verify?on=pass|fail|both",
                                    with "task/*" and "task/session/*" wildcards.
+ environment        table<string,  Environment variables for THIS ONE verify
+                    string>        step's spawned subprocess, e.g.
+                                   `environment = { RUST_LOG = "debug" }`.
+                                   The narrowest layer: merges with (and wins
+                                   over on a shared key) the owning session's
+                                   and task's `environment`. Per-step, so two
+                                   [[task.verify]] blocks can set the same key
+                                   to different values without colliding.
 
  NOTE: today the runner executes `command` and `prompt` verifiers; `brain`
  (local-LLM) and `approval` (human) verifiers are still accepted by the schema

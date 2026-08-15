@@ -61,6 +61,9 @@ or transport (see **channel**).
 | **ralphus URI** | RAL-188's addressing scheme for any entity: `ralphus:/RUN[label]/TASK[name]/SESSION[name]?id=…`. Distinct from both placeholders above despite sharing the `ralphus:` prefix. |
 | **ghost** | A short handoff note a session or review worktree publishes for whoever picks up dependent work next — what it learned, where it struggled, what it left undone. Advisory, not a document store, and deliberately *not* a changelog (the diff already tells you what changed). |
 | **Cartographer** | The unified, structured, queryable event log across the whole system. The primary logging mechanism; `rlog!` is the plain-text sink that fires alongside it. |
+| **seat** | Secure-dist only: the `user@hostname` a license is locked to, so a copied `ralphus.lic` won't start elsewhere. Deliberately *not* called a **machine** — that word already means "where work runs" (RAL-185), and a seat names a person on a host, not a work destination. A license with no seat runs anywhere. |
+| **env override** | One layer of the environment-variable hierarchy applied to a spawned subprocess: `run < task < session` for sessions, extended by `…< verify scope < that individual step` for verify steps (RAL-150/172/191). A child layer wins per-key over its parents. Seeded from a TOML `environment` table at submit, or set later via the matching `POST …/env` endpoint — the two are indistinguishable once stored. |
+| **tombstone** | An env override whose value is `null` rather than a string: "remove this inherited variable entirely", as opposed to *clearing* the override (which restores the inherited value). Only review-branch overrides (RAL-191) have one, because only they layer over an environment inherited from a *different* entity — the branch's source session. |
 
 ## Scheduling
 
@@ -104,6 +107,7 @@ Already carrying weight; pick something else:
 - **branch** — ambiguous between a review's contributing branch and a git branch generally. Say which.
 - **review** / **guardian** — the same thing; don't add a third name.
 - **verify** — the pipeline step. Use "check" for a review's gates, which is what they're already called.
+- **machine** — where work runs (RAL-185). Use **seat** for a licensing identity (`user@hostname`).
 
 ## See also
 

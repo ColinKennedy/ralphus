@@ -1,18 +1,26 @@
 //! OpenTelemetry tracing (RAL-96) — manual span API only.
 //!
-//! RAL-79 bans the `tracing` crate (and therefore `tracing-opentelemetry`)
-//! workspace-wide: stdout is reserved for the daemon<->runner JSON contract and
-//! `tracing`'s ecosystem defaults too easily leak onto it. Every span here is
-//! created directly through `opentelemetry::global::tracer(...)` /
-//! `start_with_context`, per RAL-96's acceptance criteria — never `tracing`.
+//! Every span here is created directly through
+//! `opentelemetry::global::tracer(...)` / `start_with_context`, per RAL-96's
+//! acceptance criteria — not via the `tracing` crate.
 //!
 //! `opentelemetry-otlp` (the official exporter crate) is deliberately NOT a
-//! dependency: its HTTP transport pulls `reqwest` -> `tokio` -> the `tracing`
-//! crate transitively, which would violate RAL-79 despite never being called
-//! directly (verified against `Cargo.lock`). Instead, [`UreqOtlpJsonExporter`]
-//! below hand-rolls the OTLP/JSON wire format over the already-used
-//! synchronous `ureq` client, so export traffic goes out over its own request
-//! with zero risk of touching stdout/stderr.
+//! dependency: its HTTP transport pulls `reqwest` -> `tokio` -> `hyper`, and
+//! this workspace keeps no async runtime at all (it is synchronous by design —
+//! `ureq`, `tiny_http`, a thread-per-worker scheduler) with a deliberately
+//! small lock file, since build time is a first-class constraint here. Instead,
+//! [`UreqOtlpJsonExporter`] below hand-rolls the OTLP/JSON wire format over the
+//! already-used synchronous `ureq` client, so export traffic goes out over its
+//! own request with zero risk of touching stdout/stderr.
+//!
+//! HISTORICAL NOTE: this module previously justified both choices by citing a
+//! RAL-79 workspace-wide ban on the `tracing` crate. That ban has been retired
+//! — RAL-79 actually said "not right now" about `tracing` (scope control on a
+//! logging ticket), and a transitive `tracing` is inert without a subscriber
+//! registered in this binary. The stdout invariant it was proxying for is now
+//! enforced directly by `clippy::print_stdout = "deny"`. See AGENTS.md's
+//! Logging Policy. The hand-rolled exporter below stays, on the
+//! dependency-weight grounds above.
 //!
 //! Exporting is entirely opt-in: [`init`] only installs a real exporter when
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` is set in the environment. With no endpoint

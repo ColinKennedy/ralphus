@@ -6,6 +6,7 @@
 //! (guardian + branch rows) as methods on [`Store`]; the git mechanics live in
 //! `guardian_git.rs` and the orchestration in the server/merge path.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{OptionalExtension, params};
@@ -161,6 +162,41 @@ impl MergeStatus {
     }
 }
 
+/// Parse a review branch's stored env-override map (RAL-191). Unlike every
+/// other env layer this one is `{key: value|null}`, where `null` is a
+/// tombstone meaning "remove this inherited key". Malformed JSON degrades to
+/// "no overrides" rather than failing the whole guardian view.
+pub(crate) fn branch_env_from_json(s: &str) -> BTreeMap<String, Option<String>> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+/// Serialize a review branch's env-override map back to storage.
+pub(crate) fn branch_env_to_json(m: &BTreeMap<String, Option<String>>) -> String {
+    serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Apply a review branch's own overrides on top of the environment it
+/// inherited from its source session (RAL-191): `Some(v)` replaces the
+/// inherited value (or adds a new one), `None` removes the key entirely.
+#[must_use]
+pub(crate) fn apply_branch_env(
+    inherited: &BTreeMap<String, String>,
+    overrides: &BTreeMap<String, Option<String>>,
+) -> BTreeMap<String, String> {
+    let mut out = inherited.clone();
+    for (k, v) in overrides {
+        match v {
+            Some(value) => {
+                out.insert(k.clone(), value.clone());
+            }
+            None => {
+                out.remove(k);
+            }
+        }
+    }
+    out
+}
+
 /// A branch row in a guardian, for display.
 #[derive(Debug, Clone, Serialize)]
 pub struct BranchView {
@@ -190,10 +226,18 @@ pub struct BranchView {
     /// (RAL-190) — it rebased cleanly but contributed nothing.
     ///
     /// Almost always means the owning task never committed its work: the review
-    /// then looks perfectly healthy while containing none of that task's
-    /// changes. A task is allowed to produce no changes; a *review* containing
-    /// an empty branch is worth flagging, so this surfaces as a warning rather
-    /// than a failure.
+    /// would otherwise look perfectly healthy while containing none of that
+    /// task's changes. A *task* is allowed to produce no changes, but a branch
+    /// in a review stack is there to contribute something — so this **fails the
+    /// merge** (see `guardian_merge::note_if_branch_is_empty` and its
+    /// `fail_branch` call site), leaving the branch `failed` and the guardian
+    /// `merge_failed`. The escape hatch for a deliberately-empty branch is to
+    /// disable it, which drops it from the stack while keeping it visible.
+    ///
+    /// The flag is kept separate from the `failed` status so the board can say
+    /// *why* it failed — `board.html`'s `⌀ empty` badge takes precedence over
+    /// the generic conflict badge, since the fix here is to go look at the
+    /// task's session rather than at a diff.
     pub is_empty: bool,
     /// The machine the session that produced this branch ran on (RAL-185).
     /// `None` means the daemon's own host — every pre-RAL-185 branch, and any
@@ -249,6 +293,23 @@ pub struct BranchView {
     /// RAL-145: total rebase-todo commands (done + remaining, from
     /// `rebase-merge/git-rebase-todo`). See [`Self::rebase_commands_done`].
     pub rebase_commands_total: Option<i64>,
+    /// RAL-191: this branch's *own* environment-variable overrides, layered on
+    /// top of whatever its source session resolves to. A `Some(value)` entry
+    /// overrides the inherited value; a `None` entry is a tombstone meaning
+    /// "remove this inherited variable entirely". A key absent from this map
+    /// is simply inherited. Set via
+    /// `POST /api/guardians/{id}/branches/{bid}/env`.
+    pub env_overrides: BTreeMap<String, Option<String>>,
+    /// RAL-191: the *effective* environment this branch's review worktree runs
+    /// under — the source session's resolved overrides with this branch's own
+    /// [`Self::env_overrides`] applied (values replaced, tombstones removed).
+    /// This is exactly what the conflict resolver, feedback routing, and check
+    /// gates are spawned with.
+    pub resolved_env: BTreeMap<String, String>,
+    /// RAL-191: the environment inherited from the source session *before*
+    /// this branch's own overrides are applied. Lets the board show which keys
+    /// are inherited, overridden, or tombstoned without recomputing the merge.
+    pub inherited_env: BTreeMap<String, String>,
 }
 
 /// One message in a guardian's global feedback thread (RAL-22).
@@ -1896,6 +1957,106 @@ impl Store {
         Ok(not_ready)
     }
 
+    /// A review branch's own environment-variable overrides (RAL-191), not
+    /// merged with the source session's. `Some(v)` is an override, `None` is a
+    /// tombstone — see [`BranchView::env_overrides`].
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such branch exists in that guardian.
+    pub fn get_guardian_branch_env_overrides(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_overrides FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(branch_env_from_json(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Mutate a review branch's own environment-variable overrides (RAL-191),
+    /// returning the resulting map.
+    ///
+    /// Three operations, applied in order so the last one named for a given key
+    /// wins deterministically:
+    /// - `clear` drops the branch's entry entirely, so the key reverts to
+    ///   whatever the source session resolves to.
+    /// - `unset` writes a tombstone, removing the inherited key from the
+    ///   review worktree's environment.
+    /// - `set` writes an override value.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such branch exists in that guardian.
+    pub fn set_guardian_branch_env_overrides(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+        clear: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let mut current = self.get_guardian_branch_env_overrides(guardian_id, branch_id)?;
+        for key in clear {
+            current.remove(key);
+        }
+        for key in unset {
+            current.insert(key.clone(), None);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), Some(v.clone()));
+        }
+        self.conn.execute(
+            "UPDATE guardian_branches SET env_overrides=? WHERE guardian_id=? AND id=?",
+            params![branch_env_to_json(&current), guardian_id, branch_id],
+        )?;
+        Ok(current)
+    }
+
+    /// The effective environment a review branch's worktree runs under
+    /// (RAL-191): the source session's resolved `run < task < session`
+    /// overrides with this branch's own layer applied on top.
+    ///
+    /// A branch with no source session (added manually, or whose session was
+    /// deleted) inherits nothing — its own overrides are the whole map, and a
+    /// tombstone for a key that was never inherited is simply a no-op.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such branch exists in that guardian.
+    pub fn resolve_guardian_branch_env(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let overrides = self.get_guardian_branch_env_overrides(guardian_id, branch_id)?;
+        let source: Option<(String, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT s.run_id, s.task_idx, s.idx
+                 FROM guardian_branches gb
+                 JOIN sessions s ON s.rowid = (
+                     SELECT s2.rowid FROM sessions s2
+                     WHERE s2.review_branch = gb.branch
+                     ORDER BY s2.rowid DESC LIMIT 1
+                 )
+                 WHERE gb.guardian_id=? AND gb.id=?",
+                params![guardian_id, branch_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let inherited = match source {
+            Some((run_id, ti, si)) => self
+                .resolve_session_env_overrides(&run_id, ti, si)
+                .unwrap_or_default(),
+            None => BTreeMap::new(),
+        };
+        Ok(apply_branch_env(&inherited, &overrides))
+    }
+
     /// Permanently dismiss the "can re-enable" notification for a branch (RAL-69).
     /// Idempotent — unknown branch ids are silently ignored.
     pub fn dismiss_branch_reenable(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
@@ -2049,7 +2210,8 @@ impl Store {
                     s.task_idx AS source_task_idx,
                     s.idx AS source_session_idx,
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
-                    gb.is_empty, s.machine AS source_session_machine
+                    gb.is_empty, s.machine AS source_session_machine,
+                    gb.env_overrides
              FROM guardian_branches gb
              LEFT JOIN sessions s ON s.rowid = (
                  SELECT s2.rowid FROM sessions s2
@@ -2102,9 +2264,34 @@ impl Store {
                     moved_from_guardian_id: r.get(17)?,
                     rebase_commands_done: None,
                     rebase_commands_total: None,
+                    // RAL-191: the raw per-branch layer; `inherited_env` and
+                    // `resolved_env` are filled in below, where the source
+                    // session's own resolution is reachable.
+                    env_overrides: branch_env_from_json(&r.get::<_, String>(21)?),
+                    resolved_env: BTreeMap::new(),
+                    inherited_env: BTreeMap::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // RAL-191: resolve each branch's effective environment. The inherited
+        // half needs the source session's full `run < task < session` chain, so
+        // it is a second pass rather than more columns on the query above.
+        for b in &mut branches {
+            b.inherited_env = match (
+                b.source_run_id.as_deref(),
+                b.source_task_idx,
+                b.source_session_idx,
+            ) {
+                (Some(run_id), Some(ti), Some(si)) => self
+                    .resolve_session_env_overrides(run_id, ti, si)
+                    .unwrap_or_default(),
+                // A branch added manually (or whose source session has since
+                // been deleted) has nothing to inherit -- its own overrides are
+                // the whole environment.
+                _ => BTreeMap::new(),
+            };
+            b.resolved_env = apply_branch_env(&b.inherited_env, &b.env_overrides);
+        }
         // RAL-145: git's own rebase-todo progress is a live filesystem read,
         // so it's gated to the (normally singular) branch actually mid-rebase
         // rather than scanned across every branch on every board poll.
@@ -2599,6 +2786,9 @@ mod tests {
             moved_from_guardian_id: None,
             rebase_commands_done: None,
             rebase_commands_total: None,
+            env_overrides: BTreeMap::new(),
+            resolved_env: BTreeMap::new(),
+            inherited_env: BTreeMap::new(),
         }
     }
 
@@ -2635,6 +2825,181 @@ mod tests {
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert!(g.ready);
+    }
+
+    // ── RAL-191: review-worktree environment inheritance + per-branch overrides ──
+
+    /// Build a guardian whose single branch `feat` is linked to a real session
+    /// carrying task- and session-level env, so inheritance has something to
+    /// resolve. Returns `(guardian_id, branch_id)`.
+    fn guardian_with_env_source_session(store: &mut Store) -> (String, String) {
+        let src = "[[task]]\nname=\"t0\"\nenvironment={SHARED=\"from-task\", TASK_ONLY=\"1\"}\n\
+                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={SHARED=\"from-session\", SESSION_ONLY=\"2\"}\n";
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(src).expect("valid fixture");
+        let run = store.insert_run(&tf, Some("r"), false).unwrap();
+        store.set_session_review_branch(&run, 0, 0, "feat").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        (id, bid)
+    }
+
+    #[test]
+    fn a_review_branch_inherits_its_source_sessions_resolved_environment() {
+        // The core of RAL-191: a review worktree is built from a session's
+        // work, so by default it runs under that session's environment --
+        // including the task-level values the session itself inherited.
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, bid) = guardian_with_env_source_session(&mut store);
+
+        let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-session"));
+        assert_eq!(env.get("TASK_ONLY").map(String::as_str), Some("1"));
+        assert_eq!(env.get("SESSION_ONLY").map(String::as_str), Some("2"));
+
+        // ...and the same values are on the view the board renders.
+        let b = &store.get_guardian(&id).unwrap().branches[0];
+        assert_eq!(
+            b.inherited_env.get("TASK_ONLY").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            b.resolved_env.get("TASK_ONLY").map(String::as_str),
+            Some("1")
+        );
+        assert!(b.env_overrides.is_empty(), "no per-branch layer set yet");
+    }
+
+    #[test]
+    fn a_branch_override_shadows_the_inherited_value_without_touching_the_session() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, bid) = guardian_with_env_source_session(&mut store);
+
+        let mut set = BTreeMap::new();
+        set.insert("SHARED".to_string(), "from-review".to_string());
+        store
+            .set_guardian_branch_env_overrides(&id, &bid, &set, &[], &[])
+            .unwrap();
+
+        let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-review"));
+        // Untouched keys still come through from the session.
+        assert_eq!(env.get("SESSION_ONLY").map(String::as_str), Some("2"));
+        // The source session itself is unchanged -- the override is review-only.
+        let run = store.list_runs().unwrap()[0].id.clone();
+        assert_eq!(
+            store
+                .resolve_session_env_overrides(&run, 0, 0)
+                .unwrap()
+                .get("SHARED")
+                .map(String::as_str),
+            Some("from-session")
+        );
+    }
+
+    #[test]
+    fn a_branch_tombstone_removes_an_inherited_variable_entirely() {
+        // The distinguishing case for the tombstone design: `unset` here must
+        // mean "this worktree does not get the variable at all", not "drop my
+        // override and fall back to the session's value" (which is `clear`).
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, bid) = guardian_with_env_source_session(&mut store);
+
+        store
+            .set_guardian_branch_env_overrides(
+                &id,
+                &bid,
+                &BTreeMap::new(),
+                &["SESSION_ONLY".to_string()],
+                &[],
+            )
+            .unwrap();
+
+        let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
+        assert!(
+            !env.contains_key("SESSION_ONLY"),
+            "tombstoned key must not reach the review worktree, got {env:?}"
+        );
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-session"));
+
+        // The stored layer records the tombstone explicitly as `None`.
+        let own = store.get_guardian_branch_env_overrides(&id, &bid).unwrap();
+        assert_eq!(own.get("SESSION_ONLY"), Some(&None));
+    }
+
+    #[test]
+    fn clearing_a_branch_entry_restores_the_inherited_value() {
+        // `clear` is the third operation -- it drops the branch's own entry
+        // (override *or* tombstone) so the key inherits again.
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, bid) = guardian_with_env_source_session(&mut store);
+
+        store
+            .set_guardian_branch_env_overrides(
+                &id,
+                &bid,
+                &BTreeMap::new(),
+                &["SHARED".to_string()],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .resolve_guardian_branch_env(&id, &bid)
+                .unwrap()
+                .contains_key("SHARED")
+        );
+
+        store
+            .set_guardian_branch_env_overrides(
+                &id,
+                &bid,
+                &BTreeMap::new(),
+                &[],
+                &["SHARED".to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_guardian_branch_env(&id, &bid)
+                .unwrap()
+                .get("SHARED")
+                .map(String::as_str),
+            Some("from-session"),
+            "clearing the tombstone must restore inheritance, not leave it removed"
+        );
+    }
+
+    #[test]
+    fn a_branch_with_no_source_session_has_only_its_own_overrides() {
+        // A manually-added branch (or one whose session was deleted) inherits
+        // nothing; a tombstone for a never-inherited key is a harmless no-op.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "orphan").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+
+        let mut set = BTreeMap::new();
+        set.insert("ONLY_HERE".to_string(), "x".to_string());
+        store
+            .set_guardian_branch_env_overrides(&id, &bid, &set, &["NEVER_SET".to_string()], &[])
+            .unwrap();
+
+        let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
+        assert_eq!(env.get("ONLY_HERE").map(String::as_str), Some("x"));
+        assert!(!env.contains_key("NEVER_SET"));
+        assert_eq!(env.len(), 1);
+    }
+
+    #[test]
+    fn branch_env_for_an_unknown_branch_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert!(matches!(
+            store.get_guardian_branch_env_overrides(&id, "branch-nope"),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]

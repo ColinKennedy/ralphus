@@ -65,8 +65,10 @@ where one exists.
 | POST | `/api/runs/{id}/env` | [Set/unset persistent environment-variable overrides](#post-apirunsidenv) on the run (RAL-150) |
 | POST | `/api/runs/{id}/tasks/{ti}/env` | Set/unset env overrides on a task ([hierarchical env overrides](#hierarchical-env-overrides-tasksessionverify-layers)) |
 | POST | `/api/runs/{id}/tasks/{ti}/verify/env` | Set/unset env overrides on a task's own verify steps |
+| POST | `/api/runs/{id}/tasks/{ti}/verify/{vi}/env` | Set/unset env overrides on **one** task-scoped verify step (RAL-191) |
 | POST | `/api/runs/{id}/sessions/{ti}/{si}/env` | Set/unset env overrides on a session |
 | POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/env` | Set/unset env overrides on a session's own verify steps |
+| POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/{vi}/env` | Set/unset env overrides on **one** session-scoped verify step (RAL-191) |
 | POST | `/api/runs/{id}/tasks/{ti}/solo` | [Solo a task](#post-apirunsidtaskstisolo) (RAL-157) — pauses every other task in the run until un-soloed |
 | POST | `/api/runs/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apirunsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
 | POST | `/api/runs/{id}/sessions/{ti}/{si}/open-terminal` | Spawn a resume terminal (`claude --resume` or `codex exec resume`, depending on which agent the session ran under) **on the daemon host** (`?mode=readonly\|open`) |
@@ -96,6 +98,7 @@ where one exists.
 | POST | `/api/guardians/{id}/force_start` | Disable not-yet-done branches, merge immediately |
 | POST | `/api/guardians/{id}/branches/{branch_id}/dismiss_reenable` | Dismiss the "can re-enable" notice |
 | POST | `/api/guardians/{id}/branches/{branch_id}/move` | [Move a branch to another review](#post-apiguardiansidbranchesposmove) (RAL-118) |
+| POST | `/api/guardians/{id}/branches/{branch_id}/env` | [Set/unset/clear this review worktree's env overrides](#post-apiguardiansidbranchesbidenv--review-worktree-overrides) (RAL-191) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
@@ -502,39 +505,98 @@ Env overrides can also be set at task, session, and verify-step granularity,
 each overriding its parent scope's value for the same key:
 
 ```
-run  <  task  <  task.verify        (a task's own verify steps)
-run  <  task  <  session  <  session.verify   (a session's own verify steps)
+run  <  task  <  task.verify     <  that step        (a task's own verify steps)
+run  <  task  <  session  <  session.verify  <  that step
 ```
 
 i.e. a session inherits the run's and its task's overrides but wins on a
 shared key; a session-scoped verify step additionally inherits+overrides
-whatever its owning session resolved to. Same request/response shape, same
-validation, persistence, and Cartographer-redaction rules as
+whatever its owning session resolved to; and **one individual verify step**
+(RAL-191) wins over even the scope-wide verify layer. Same request/response
+shape, same validation, persistence, and Cartographer-redaction rules as
 `POST /api/runs/{id}/env` above — only the scope and endpoint differ:
 
 | Endpoint | Scope |
 |---|---|
 | `POST /api/runs/{id}/tasks/{ti}/env` | This task's own overrides — win over the run's, apply to every session under this task. |
-| `POST /api/runs/{id}/tasks/{ti}/verify/env` | This task's own (task-scoped) verify-step overrides — win over the task's own (and the run's), only for this task's verify steps. |
+| `POST /api/runs/{id}/tasks/{ti}/verify/env` | This task's own (task-scoped) verify-step overrides — win over the task's own (and the run's), for *all* of this task's verify steps. |
+| `POST /api/runs/{id}/tasks/{ti}/verify/{vi}/env` | **One** task-scoped verify step's own overrides (RAL-191) — win over everything above. |
 | `POST /api/runs/{id}/sessions/{ti}/{si}/env` | This session's own overrides — win over its task's (and the run's). |
-| `POST /api/runs/{id}/sessions/{ti}/{si}/verify/env` | This session's own (session-scoped) verify-step overrides — win over the session's own (and its task's/run's), only for this session's verify steps. |
+| `POST /api/runs/{id}/sessions/{ti}/{si}/verify/env` | This session's own (session-scoped) verify-step overrides — win over the session's own (and its task's/run's), for *all* of this session's verify steps. |
+| `POST /api/runs/{id}/sessions/{ti}/{si}/verify/{vi}/env` | **One** session-scoped verify step's own overrides (RAL-191) — win over everything above. |
 
-A non-integer task/session index is a `400`; an unknown task/session is a
-`404`. The resolved map for each scope rides along in the corresponding
-`TaskView`/`SessionView` (`env_overrides`/`verify_env_overrides` fields) inside
-the existing `GET /api/runs/{id}` response — there are no separate GET routes
-for these.
+The per-step layer exists because `verify` is an array: two `[[task.verify]]`
+blocks setting the same key to different values must not collide, which a
+single scope-wide row cannot express.
 
-**TOML-declared environment (RAL-172):** a `[[task]]`/`[[task.session]]`
+A non-integer task/session/verify index is a `400`; an unknown
+task/session/verify step is a `404`. The resolved map for each scope rides
+along in the corresponding `TaskView`/`SessionView`
+(`env_overrides`/`verify_env_overrides` fields) and, for the per-step layer,
+`VerifyView.env_overrides`, inside the existing `GET /api/runs/{id}` response —
+there are no separate GET routes for these.
+
+**TOML-declared environment (RAL-172, extended by RAL-191):** a
+`[[task]]`/`[[task.session]]`/`[[task.verify]]`/`[[task.session.verify]]`
 block may set its own `environment` table (`environment = { KEY = "value" }`)
 right in the submitted TOML. `core::validate::validate_toml` enforces the same
 identifier rule as above (`[A-Za-z_][A-Za-z0-9_]*`) plus string-only values
 before the submission is ever accepted. At submit time (`Store::insert_run`)
-this seeds that task's/session's own `env_overrides` row — the exact column
-`POST /api/runs/{id}/tasks/{ti}/env` / `.../sessions/{ti}/{si}/env` write to —
-so from then on a TOML-declared value is indistinguishable from one set later
-via the API, participates in the same `run < task < session` precedence, and
-can be changed or unset the same way.
+this seeds that task's/session's/step's own `env_overrides` row — the exact
+column the matching `POST .../env` endpoint writes to — so from then on a
+TOML-declared value is indistinguishable from one set later via the API,
+participates in the same precedence chain, and can be changed or unset the
+same way.
+
+#### `POST /api/guardians/{id}/branches/{bid}/env` — review-worktree overrides
+
+A review worktree is assembled from a session's work, so by default it runs
+under **that session's resolved environment** (`run < task < session`): the
+conflict resolver, the dedicated final-verify pass, reviewer-feedback routing,
+and this branch's check gates are all spawned with it. Without that, an agent
+resolving conflicts would verify the code against a different environment than
+the one it was written under.
+
+This endpoint layers per-branch changes on top. Unlike every other layer it
+takes **three** operations, because the values are inherited rather than the
+branch's own to begin with:
+
+```json
+{ "set": { "API_URL": "https://staging" }, "unset": ["DEBUG"], "clear": ["TOKEN"] }
+```
+
+| Field | Meaning |
+|---|---|
+| `set` | Override an inherited value, or add a variable the session never had. |
+| `unset` | **Tombstone** — remove the inherited variable from this worktree's environment entirely. |
+| `clear` | Drop this branch's own entry, so the key goes back to inheriting the session's value. |
+
+At least one of the three is required (`400` otherwise), every key must be a
+valid env-var identifier (`400` otherwise), and an unknown branch is a `404`.
+Applied in the order `clear` → `unset` → `set`, so the last operation naming a
+given key wins deterministically.
+
+The response (and `BranchView.env_overrides` in `GET /api/guardians/{id}`) is a
+`{key: value|null}` map, where `null` is a tombstone. `BranchView` also carries
+`inherited_env` (what the source session resolves to, before this layer) and
+`resolved_env` (the effective environment the worktree actually runs under), so
+a client can show which keys are inherited, overridden, added, or unset without
+recomputing the merge.
+
+A branch with no source session — added manually, or whose session was deleted
+— inherits nothing; its own overrides are the whole environment, and a
+tombstone for a never-inherited key is a harmless no-op.
+
+The **combined** review worktree (the guardian-level chat/triage agent) spans
+every enabled branch at once, so it uses the union of their resolved
+environments in stack order (lowest `position` first) — a key two branches both
+set resolves to the one stacked on top, matching the precedence the rebase
+gives their code. Disabled branches are excluded, since their commits are not
+in the combined worktree either.
+
+**Remote caveat:** a check gate running on a remote machine still runs without
+these overrides — `remote_runner::RunRequest` has no env field, so rather than
+half-applying them the remote path is left exactly as it was.
 
 ### `POST /api/runs/{id}/add-dependency`
 Wire up a manual cross-run dependency after submission (RAL-105), e.g. from the
@@ -556,12 +618,22 @@ A single review's full detail, including its ordered `branches` list.
 
 Each branch also carries `is_empty` (`bool`, RAL-190): `true` when the branch
 rebased cleanly but adds **no diff** over the branch beneath it in the stack.
-That almost always means its task never committed its work — the review then
-reaches `in_review` looking entirely healthy while containing none of that
-task's changes, since verify steps check the *code*, not whether it was
-committed. Deliberately a warning rather than a failure: the branch's
-`merge_status` is still `done`, because a task producing no changes is legal.
-The board renders it as an `⌀ empty` badge on the branch row.
+That almost always means its task never committed its work — the review would
+otherwise reach `in_review` looking entirely healthy while containing none of
+that task's changes, since verify steps check the *code*, not whether it was
+committed.
+
+This **fails the merge**: the branch's `merge_status` becomes `failed` and the
+guardian's status `merge_failed`. A *task* producing no changes is legal, but a
+branch in a review stack is there to contribute something, and approving a
+review that carries none of it is worse than stopping. The escape hatch for a
+deliberately-empty branch is to disable it, which drops it from the stack while
+keeping it visible and re-enableable.
+
+`is_empty` is kept as its own field rather than folded into the failure so a
+client can say *why* the merge failed — the board renders it as an `⌀ empty`
+badge that takes precedence over the generic conflict badge, since the fix here
+is to go look at the task's session rather than at a diff.
 
 Each branch (`BranchView`) carries two rebase-progress fields (RAL-145):
 `rebase_commands_done` / `rebase_commands_total` (`i64`, both `null` unless

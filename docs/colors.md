@@ -42,7 +42,7 @@ role in the table below, then use it.
 | `--waiting` | `#f778ba` | *(shared)* | status (a `pending` run held back by a scheduler down-time window, RAL-122) |
 | `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
 | `--stale` | `#db6d28` | *(shared)* | semantic (Live View: no fresh pane output for a while from a still-running session, RAL-170) |
-| `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that merged cleanly but contributes no changes, RAL-190) |
+| `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that contributes no changes — fails the review, RAL-190) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -95,15 +95,21 @@ if something needs a neutral highlight, use `--accent` (selection) or `--teal`
 (linked), not amber.
 
 ### Empty contribution — `--empty` (RAL-190)
-A review branch that rebased and merged cleanly but adds **no diff** over the
-branch beneath it — almost always because its task never committed. Deliberately
-*not* `--failed` red: nothing failed, the branch's status is genuinely `done`.
-Deliberately *not* `--ignored` amber either, which is reserved for the real
-`ignored` status. The salmon hue sits in the "something is wrong here" family
-while staying distinguishable from a true failure at a glance.
+A review branch that rebased cleanly but adds **no diff** over the branch
+beneath it — almost always because its task never committed. This *fails* the
+review (`note_if_branch_is_empty` → `fail_branch`): a review must never approve
+a stack containing a branch whose work it does not actually carry.
 
-Use it only for "this thing is structurally fine but contains nothing," not as a
-general warning color.
+The branch's status is therefore `failed`, but it deliberately does **not** use
+`--failed` red. A generic red "failed" says only that something went wrong; the
+salmon `--empty` says *which* thing, distinguishing "this branch is empty" from
+a conflict, a check-gate failure, or a rebase error at a glance — the one
+failure whose fix is "go look at the task's session", not "go look at the
+diff". Deliberately *not* `--ignored` amber either, which is reserved for the
+real `ignored` status.
+
+Use it only for "this branch contains nothing," not as a general warning or
+general failure color.
 
 ### Log severity — Cartographer only (RAL-98)
 Cartographer's event table (the global log, a run's Logs "events" tab, and a

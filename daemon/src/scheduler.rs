@@ -1849,15 +1849,6 @@ fn run_verifies(
     trace_context: Option<&str>,
 ) -> VerifyOutcome {
     let cx = otel::context_from_traceparent(trace_context);
-    let env_overrides = {
-        let guard = store.lock().expect("store mutex poisoned");
-        if scope == "task" {
-            guard.resolve_task_verify_env_overrides(run_id, task_idx)
-        } else {
-            guard.resolve_session_verify_env_overrides(run_id, task_idx, session_idx)
-        }
-        .unwrap_or_default()
-    };
     let specs = {
         let guard = store.lock().expect("store mutex poisoned");
         guard
@@ -1892,6 +1883,18 @@ fn run_verifies(
         if current_state.as_deref() == Some("ignored") {
             continue;
         }
+        // RAL-191: resolved per-step, not once per scope -- each verify step
+        // carries its own narrowest env layer on top of the scope's, so two
+        // steps under the same task can set the same key to different values.
+        let env_overrides = {
+            let guard = store.lock().expect("store mutex poisoned");
+            if scope == "task" {
+                guard.resolve_task_verify_step_env_overrides(run_id, task_idx, idx)
+            } else {
+                guard.resolve_session_verify_step_env_overrides(run_id, task_idx, session_idx, idx)
+            }
+            .unwrap_or_default()
+        };
         let (
             passed,
             output,

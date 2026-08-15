@@ -557,6 +557,20 @@ pub struct VerifyStep {
     /// with wildcards `task/*` and `task/session/*`.
     #[serde(default)]
     pub restart_on: Vec<String>,
+    /// Environment variables for **this one verify step's** spawned subprocess
+    /// (RAL-191). The narrowest layer in the hierarchy: merged on top of the
+    /// owning scope's `verify` overrides, which themselves sit on top of the
+    /// session's/task's/run's — see [`TaskDef::environment`].
+    ///
+    /// Kept per-step rather than folded into the owning task's/session's
+    /// single `verify_env_overrides` row precisely because `verify` is an
+    /// array: two `[[task.verify]]` blocks setting the same key to different
+    /// values must not collide. At submission time this seeds that step's own
+    /// row in the daemon's override store (`verifies.env_overrides`), after
+    /// which it is indistinguishable from one set later via
+    /// `POST /api/runs/{id}/tasks/{ti}/verify/{vi}/env`.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 /// Resolved agent config after task→session inheritance is applied.
@@ -869,6 +883,53 @@ mod tests {
         assert_eq!(
             sess.environment.get("SESSION_ONLY").map(String::as_str),
             Some("2")
+        );
+    }
+
+    #[test]
+    fn environment_deserializes_on_task_and_session_verify_steps() {
+        // RAL-191: `environment` is per verify *step*, not per verify scope --
+        // two steps under the same task must be able to set the same key to
+        // different values without colliding.
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.verify]]
+            command = "cargo test"
+            environment = { RUST_LOG = "debug" }
+            [[task.verify]]
+            command = "cargo clippy"
+            environment = { RUST_LOG = "warn" }
+            [[task.session]]
+            cwd = "/repo"
+            prompt = "do work"
+            [[task.session.verify]]
+            command = "npm test"
+            environment = { CI = "1" }
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let task = &parsed.task[0];
+        assert_eq!(
+            task.verify[0]
+                .environment
+                .get("RUST_LOG")
+                .map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(
+            task.verify[1]
+                .environment
+                .get("RUST_LOG")
+                .map(String::as_str),
+            Some("warn"),
+            "each verify step keeps its own value for the same key"
+        );
+        assert_eq!(
+            task.session[0].verify[0]
+                .environment
+                .get("CI")
+                .map(String::as_str),
+            Some("1")
         );
     }
 

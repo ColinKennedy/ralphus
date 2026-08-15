@@ -156,7 +156,12 @@ pub fn usage() -> String {
 
 /// Validate a task TOML file with the core validator, printing findings.
 /// Returns `true` when the file is valid. This needs no server or database.
+///
+/// Writes findings to stdout because this is `ralphus-daemon validate`'s CLI
+/// output — the product of the command, not a log line — hence the local
+/// opt-out from the workspace `clippy::print_stdout = "deny"`.
 #[must_use]
+#[allow(clippy::print_stdout)]
 pub fn validate_file(path: &str) -> bool {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,

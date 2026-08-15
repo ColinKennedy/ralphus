@@ -287,6 +287,33 @@ def test_set_session_verify_env_sends_set_and_unset() -> None:
         client.set_session_verify_env("run-1", 0, 1, unset_vars=["A"])
 
 
+def test_set_task_verify_step_env_targets_the_step_index() -> None:
+    # RAL-191: the per-step route carries the verify index in the path, so it
+    # is addressable separately from the scope-wide `/verify/env` above.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/tasks/0/verify/2/env"
+        body = json.loads(request.content)
+        assert body == {"set": {"RUST_LOG": "debug"}, "unset": []}
+        return httpx.Response(200, json={"RUST_LOG": "debug"})
+
+    with _client(handler) as client:
+        result = client.set_task_verify_step_env("run-1", 0, 2, set_vars={"RUST_LOG": "debug"})
+        assert result == {"RUST_LOG": "debug"}
+
+
+def test_set_session_verify_step_env_targets_the_step_index() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/runs/run-1/sessions/0/1/verify/3/env"
+        body = json.loads(request.content)
+        assert body == {"set": {}, "unset": ["A"]}
+        return httpx.Response(200, json={})
+
+    with _client(handler) as client:
+        client.set_session_verify_step_env("run-1", 0, 1, 3, unset_vars=["A"])
+
+
 def test_edit_session_prefers_command_over_prompt() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/runs/run-1/edit"

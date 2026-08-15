@@ -150,6 +150,24 @@ fn repo_with_worktree_no_upstream(base: &Path, branch: &str) -> String {
     wt.to_string_lossy().replace('\\', "/")
 }
 
+/// Commit a real change on a feature worktree returned by
+/// [`repo_with_worktree`], so its branch actually contributes something to a
+/// review stack.
+///
+/// `repo_with_worktree` branches straight off `main` and commits nothing, and
+/// the runners used here (`OkRunner`/`NoopRunner`) never commit either — so
+/// such a branch adds no diff over the branch beneath it, which a real merge
+/// fails outright (RAL-190, `note_if_branch_is_empty`). Any test that runs a
+/// merge and is *not* itself about that check must commit here first, or it
+/// fails on emptiness long before reaching whatever it means to assert.
+fn commit_on_worktree(cwd: &str, file: &str, contents: &str) {
+    let native = cwd.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let wt = Path::new(&native);
+    std::fs::write(wt.join(file), contents).unwrap();
+    git(wt, &["add", "."]);
+    git(wt, &["commit", "-m", &format!("add {file}")]);
+}
+
 /// Build a minimal task TOML with one session that opts into a review.
 /// `review_id` is the id for both the session's `review` field and the
 /// top-level `[[review]]` block. `review_attrs` is any extra `key = "value"`
@@ -464,6 +482,13 @@ fn upstream_base_without_upstream_is_rejected() {
 #[test]
 fn reviews_auto_start_when_the_run_succeeds() {
     let base = temp_base("autostart");
+    // Deliberately left with NO commits of its own. Unlike the other merge
+    // tests here, this one's merge is auto-started by the *scheduler*, which
+    // builds its own real runner rather than taking `&OkRunner` -- so a branch
+    // with real work would drive the rebase on into the resolver/final-verify
+    // machinery and call a live Ollama model, which this suite must never do
+    // by default (see the Ollama opt-in rule in AGENTS.md). An empty branch
+    // terminates the auto-started merge immediately and hermetically.
     let cwd = repo_with_worktree(&base, "feature/a");
     let toml = format!(
         "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"r\"\n\
@@ -498,9 +523,19 @@ fn reviews_auto_start_when_the_run_succeeds() {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    // What is under test is that the merge started *by itself* when the run
+    // finished -- not its verdict. The lone branch is empty, so RAL-190 fails
+    // it; reaching `merge_failed` (rather than sitting in `collecting`
+    // forever) is proof the auto-start fired.
     assert_eq!(
-        status, "in_review",
-        "review should auto-start and reach review"
+        status, "merge_failed",
+        "review should auto-start when the run succeeds; its lone branch is \
+         empty, so the merge it starts then fails on RAL-190"
+    );
+    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert!(
+        view.branches[0].is_empty,
+        "the merge must have run far enough to evaluate the branch"
     );
 
     let _ = std::fs::remove_dir_all(&base);
@@ -808,6 +843,8 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
 fn no_checks_configured_runs_project_auto_build_default() {
     let base = temp_base("autobuild-default");
     let cwd = repo_with_worktree(&base, "feature/a");
+    // This test is about the auto_build default, not about empty branches.
+    commit_on_worktree(&cwd, "a.txt", "change by a\n");
     let repo = base.join("repo");
     std::fs::write(
         repo.join(".ralphus.toml"),
@@ -871,6 +908,9 @@ fn no_checks_configured_runs_project_auto_build_default() {
 fn checks_configured_does_not_also_run_auto_build() {
     let base = temp_base("autobuild-skip");
     let cwd = repo_with_worktree(&base, "feature/a");
+    // This test is about explicit checks suppressing auto_build, not about
+    // empty branches.
+    commit_on_worktree(&cwd, "a.txt", "change by a\n");
     let repo = base.join("repo");
     std::fs::write(
         repo.join(".ralphus.toml"),

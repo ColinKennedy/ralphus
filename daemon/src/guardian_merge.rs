@@ -700,6 +700,54 @@ fn resolver_backend(store: &Arc<Mutex<Store>>, id: &str) -> (String, Option<Stri
     (agent, model)
 }
 
+/// The effective environment one review branch's worktree runs under
+/// (RAL-191): whatever the branch's *source session* resolved to
+/// (`run < task < session`), with the branch's own overrides and tombstones
+/// applied on top.
+///
+/// A review worktree is assembled from a session's work, so it inherits that
+/// session's environment by default — an agent resolving conflicts in the
+/// worktree needs the same `API_URL`/`PATH`/toolchain variables the code was
+/// written under, or it verifies against the wrong thing entirely. Per-branch
+/// overrides then let a reviewer point one branch at a staging endpoint (or
+/// drop a variable outright) without touching the original task.
+///
+/// Degrades to an empty map for an unknown branch rather than failing the
+/// merge — the same posture every other guardian read here takes.
+fn branch_env(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch_id: &str,
+) -> std::collections::BTreeMap<String, String> {
+    store
+        .lock()
+        .expect("poisoned")
+        .resolve_guardian_branch_env(id, branch_id)
+        .unwrap_or_default()
+}
+
+/// The environment for an invocation against the **combined** review worktree
+/// (RAL-191), which contains every enabled branch's work rather than one
+/// branch's. Unions each enabled branch's resolved environment in stack order
+/// (lowest `position` first), so a key two branches both set resolves to the
+/// one stacked on top — matching the precedence the rebase gives their code.
+///
+/// Disabled branches are excluded: their commits are not in the combined
+/// worktree, so their variables have no business being there either.
+#[must_use]
+fn combined_branch_env(
+    guardian: &crate::guardian::GuardianView,
+) -> std::collections::BTreeMap<String, String> {
+    let mut branches: Vec<&crate::guardian::BranchView> =
+        guardian.branches.iter().filter(|b| b.enabled).collect();
+    branches.sort_by_key(|b| b.position);
+    let mut out = std::collections::BTreeMap::new();
+    for b in branches {
+        out.extend(b.resolved_env.clone());
+    }
+    out
+}
+
 /// Quality-bar instructions + ghost-memory prefix for a branch's dedicated
 /// final-verification call (RAL-149/168). Deliberately lazy: callers compute
 /// this only once they've already decided [`run_final_verify`] will actually
@@ -715,7 +763,8 @@ fn verify_extras(
     agent: &str,
     model: &Option<String>,
 ) -> (String, String) {
-    let quality_note = synthesize_verify_instructions(store, id, branch, runner, agent, model);
+    let quality_note =
+        synthesize_verify_instructions(store, id, branch, branch_id, runner, agent, model);
     let ghost_uri = crate::ghost::review_uri(id, Some(branch_id));
     let ghost_prefix = {
         let guard = store.lock().expect("poisoned");
@@ -823,6 +872,7 @@ fn synthesize_verify_instructions(
     store: &Arc<Mutex<Store>>,
     id: &str,
     branch: &str,
+    branch_id: &str,
     runner: &dyn Runner,
     agent: &str,
     model: &Option<String>,
@@ -951,7 +1001,11 @@ fn synthesize_verify_instructions(
         verify: false,
         trace_context: None,
         resume_agent_session_id: None,
-        env_overrides: std::collections::BTreeMap::new(),
+        // RAL-191: this call only writes an instruction paragraph, but it runs
+        // the branch's own agent -- keep it on the same environment as every
+        // other per-branch invocation so a custom API base/proxy applies here
+        // too.
+        env_overrides: branch_env(store, id, branch_id),
         machine: None,
     };
     let result = runner.run(&spec);
@@ -1263,7 +1317,9 @@ fn resolve_conflicts_with_agent(
             verify: false,
             trace_context: None,
             resume_agent_session_id: None,
-            env_overrides: std::collections::BTreeMap::new(),
+            // RAL-191: the resolver edits this branch's own worktree, so it
+            // runs under the branch's resolved environment.
+            env_overrides: branch_env(store, id, branch_id),
             machine: None,
         };
 
@@ -1535,7 +1591,8 @@ fn run_final_verify(
         verify: true,
         trace_context: None,
         resume_agent_session_id: None,
-        env_overrides: std::collections::BTreeMap::new(),
+        // RAL-191: same worktree, same environment as the fix pass above.
+        env_overrides: branch_env(store, id, branch_id),
         machine: None,
     };
     let result = runner.run(&spec);
@@ -1606,8 +1663,12 @@ fn run_commit_checks(
     if skip_auto_build {
         return Ok(());
     }
+    // RAL-191: check gates run under the branch's resolved environment, same as
+    // the agent invocations against this worktree -- a gate like `cargo test`
+    // is worthless if it runs without the variables the code expects.
+    let env = branch_env(store, id, branch_id);
     for cmd in &checks {
-        if !wt.run_command(cmd).0 {
+        if !wt.run_command_with_env(cmd, &env).0 {
             return Err(format!("check failed after '{branch}': {cmd}"));
         }
     }
@@ -1845,6 +1906,10 @@ fn dispatch_routes(
         wt: Workspace,
         pre_hash: String,
         instructions: String,
+        /// RAL-191: the branch's resolved environment, captured here (from the
+        /// already-hydrated `BranchView`) rather than re-read inside the
+        /// spawned thread, which must not touch the store lock.
+        env: std::collections::BTreeMap<String, String>,
     }
 
     // Map each route block to a branch that has a review worktree, recording the
@@ -1865,6 +1930,7 @@ fn dispatch_routes(
                 wt,
                 pre_hash,
                 instructions: instructions.clone(),
+                env: bv.resolved_env.clone(),
             })
         })
         .collect();
@@ -1885,6 +1951,7 @@ fn dispatch_routes(
             let instructions = t.instructions.clone();
             let r_agent = r_agent.clone();
             let r_model = r_model.clone();
+            let branch_env = t.env.clone();
             let runner_clone = runner.clone();
             std::thread::spawn(move || {
                 // Stash any pre-existing dirty state so we only commit agent-made
@@ -1939,7 +2006,9 @@ fn dispatch_routes(
                     verify: false,
                     trace_context: None,
                     resume_agent_session_id: None,
-                    env_overrides: std::collections::BTreeMap::new(),
+                    // RAL-191: feedback is implemented in the branch's own
+                    // review worktree, so it runs under that branch's env.
+                    env_overrides: branch_env,
                     machine: None,
                 };
                 let _ = runner_clone.run(&spec);
@@ -2467,7 +2536,13 @@ pub fn run_chat(
                     verify: false,
                     trace_context: None,
                     resume_agent_session_id: None,
-                    env_overrides: std::collections::BTreeMap::new(),
+                    // RAL-191: the triage agent works in the COMBINED worktree,
+                    // which holds every enabled branch's work at once, so there
+                    // is no single branch env to use. Union them in stack order
+                    // (lowest position first) so a key set by two branches
+                    // resolves to the one stacked on top -- the same precedence
+                    // the rebase itself gives their code.
+                    env_overrides: combined_branch_env(&guardian),
                     machine: None,
                 };
                 let result = runner.run(&spec);

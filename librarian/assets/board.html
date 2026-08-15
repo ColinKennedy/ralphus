@@ -503,6 +503,7 @@
        * @property {number} [tokens_in]
        * @property {number} [tokens_out]
        * @property {number} [cost_usd]
+       * @property {{[key: string]: string}} [env_overrides] - RAL-191: environment-variable overrides set on this individual verify step — the narrowest layer, merged on top of the owning scope's `verify_env_overrides` and its ancestors. Absent for the vast majority of steps.
        */
       /**
        * @typedef {object} SessionView
@@ -587,11 +588,14 @@
        * @property {number} [conflicts_found]
        * @property {number} [conflicts_fixed]
        * @property {number} [conflicts_committed]
-       * @property {boolean} [is_empty] - Branch rebased cleanly but adds no diff over the branch beneath it (RAL-190).
+       * @property {boolean} [is_empty] - Branch rebased cleanly but adds no diff over the branch beneath it, which fails the review (RAL-190).
        * @property {number|null} [rebase_commands_done] - Live rebase-todo position (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
        * @property {number|null} [rebase_commands_total] - Live rebase-todo total (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
        * @property {boolean} [can_reenable]
        * @property {string} [resolver_agent_session_id]
+       * @property {{[key: string]: (string|null)}} [env_overrides] - RAL-191: this branch's own env-override layer. A string value overrides the inherited one; `null` is a tombstone removing the inherited variable entirely; an absent key is simply inherited.
+       * @property {{[key: string]: string}} [inherited_env] - RAL-191: the environment inherited from this branch's source session (`run < task < session`), before `env_overrides` is applied.
+       * @property {{[key: string]: string}} [resolved_env] - RAL-191: the effective environment this branch's review worktree actually runs under — `inherited_env` with `env_overrides` applied.
        */
       /**
        * A named, defaulted value referenced by a GuardianCheck's
@@ -3877,6 +3881,144 @@
         );
       }
       /**
+       * Renders the "environment overrides" section for **one individual**
+       * verify step (RAL-191) — the narrowest layer, winning over the
+       * scope-wide verify overrides rendered alongside it. Kept separate from
+       * those because `verify` is an array: two steps under the same task can
+       * set the same key to different values.
+       * @param {RunView} r
+       * @param {number} ti
+       * @param {number} si - Owning session index, or -1 for a task-scoped step.
+       * @param {number} vi
+       * @returns {string}
+       */
+      function verifyStepEnvOverridesSection(r, ti, si, vi) {
+        const t = r.tasks[ti];
+        if (!t) return "";
+        const v = si === -1
+          ? (t.verify || [])[vi]
+          : ((t.sessions || [])[si] || /** @type {SessionView} */ ({})).verify?.[vi];
+        if (!v) return "";
+        const apiPath = si === -1
+          ? `/api/runs/${r.id}/tasks/${ti}/verify/${vi}/env`
+          : `/api/runs/${r.id}/sessions/${ti}/${si}/verify/${vi}/env`;
+        return renderEnvOverrides(v.env_overrides, "this verify step", apiPath);
+      }
+      /**
+       * Renders the per-review-worktree "environment overrides" section shown
+       * inside one review branch's expanded row (RAL-191).
+       *
+       * Unlike every other scope's widget (`renderEnvOverrides`), a review
+       * branch does not own its variables to begin with: it inherits its
+       * source session's resolved environment, because the worktree is built
+       * from that session's work. So each key is in one of four states, and
+       * the row shows which:
+       *   - inherited  — value comes from the source session (italic value,
+       *                  per docs/colors.md's "inherited resolved value" rule)
+       *   - overridden — this branch replaced the inherited value
+       *   - added      — this branch set a variable the session never had
+       *   - unset      — this branch tombstoned it; the worktree does not get
+       *                  it at all (struck through, muted)
+       * @param {GuardianView} g
+       * @param {GuardianBranch} b
+       * @returns {string}
+       */
+      function renderBranchEnvOverrides(g, b) {
+        const inherited = b.inherited_env || {};
+        const own = b.env_overrides || {};
+        const apiPath = `/api/guardians/${g.id}/branches/${b.id}/env`;
+        const keys = Array.from(new Set(Object.keys(inherited).concat(Object.keys(own)))).sort();
+        const overrideCount = Object.keys(own).length;
+        const banner = overrideCount
+          ? `<div class="kv-row" style="margin:0 0 2px" data-tip="This review worktree does not run with exactly the environment its source session ran under.\nThe conflict resolver, final-verify pass, feedback routing, and check gates for this branch all use the values shown below.">⚠ ${overrideCount} branch override${overrideCount === 1 ? "" : "s"} — this worktree differs from its source session</div>`
+          : "";
+        const rows = keys.length
+          ? keys.map((k) => {
+              const hasOwn = Object.prototype.hasOwnProperty.call(own, k);
+              const ownVal = hasOwn ? own[k] : undefined;
+              const isUnset = hasOwn && ownVal === null;
+              const isInherited = !hasOwn;
+              const shown = isUnset ? (inherited[k] ?? "") : (hasOwn ? String(ownVal) : inherited[k]);
+              const tag = isUnset
+                ? `<span class="badge" style="color:var(--muted);border-color:var(--muted);font-size:10px" data-tip="Tombstoned by this branch — the variable is removed from this review worktree's environment entirely, even though the source session had it.">unset</span>`
+                : isInherited
+                  ? `<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:10px" data-tip="Inherited from this branch's source session — change it on the session (or override it here) to affect this worktree.">inherited</span>`
+                  : (k in inherited)
+                    ? `<span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:10px" data-tip="Overridden by this branch — replaces the value inherited from the source session.">overridden</span>`
+                    : `<span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:10px" data-tip="Added by this branch — the source session never set this variable.">added</span>`;
+              // docs/colors.md: an inherited resolved value renders italic in
+              // the normal text color — provenance, not a status or a warning.
+              const valStyle = isUnset
+                ? "flex:1;text-decoration:line-through;color:var(--muted)"
+                : isInherited
+                  ? "flex:1;font-style:italic"
+                  : "flex:1";
+              const revertBtn = hasOwn
+                ? `<button class="btn" onclick="clearBranchEnvOverride('${g.id}','${b.id}','${esc(k)}')" data-tip="Drop this branch's own setting for ${esc(k)}, so it goes back to inheriting whatever its source session resolves to.\nWho/when: you overrode or unset a variable for this worktree and now want the session's value back.\nThis cannot be undone.">↩ Inherit</button>`
+                : "";
+              const unsetBtn = isUnset
+                ? ""
+                : `<button class="btn" onclick="unsetBranchEnvOverride('${g.id}','${b.id}','${esc(k)}')" data-tip="Remove ${esc(k)} from this review worktree's environment entirely, even though the source session sets it.\nWho/when: the session needed a variable (a token, a proxy) that the review must run without.\nThis cannot be undone.">⊘ Unset</button>`;
+              return `<div class="kv-row" style="margin:0">
+                  <span class="v mono" style="flex:1;font-size:11px">${esc(k)}</span>
+                  <span class="v mono" style="${valStyle};font-size:11px">${esc(shown)}</span>
+                  ${tag}
+                  <button class="btn" onclick="setBranchEnvOverride('${g.id}','${b.id}','${esc(k)}')" data-tip="Set this branch's own value for ${esc(k)}, replacing the inherited one for this review worktree only.\nWho/when: pointing one branch's review at a staging endpoint or a different toolchain without touching the original task.">✎ Override</button>
+                  ${unsetBtn}${revertBtn}
+                </div>`;
+            }).join("")
+          : `<div class="kv-row" style="margin:0"><span class="v">None</span></div>`;
+        return `<h3 class="section" style="margin-top:8px" data-tip="The environment this branch's review worktree runs under.\nA review worktree is assembled from a session's work, so it inherits that session's resolved environment by default — the conflict resolver needs the same variables the code was written under.\nOverride or unset any of them here to change just this branch's review, leaving the original task untouched.">environment overrides (review worktree)</h3>
+          ${banner}
+          ${rows}
+          <div class="kv-row" style="margin:2px 0 0"><button class="btn" onclick="addEnvOverrideAt('${apiPath}')" data-tip="Add an environment variable for this review worktree only.\nWho/when: the review needs a variable its source session never set — a reviewer-only flag, a different API base, a test credential.\nApplies the next time this branch's resolver, verify pass, feedback routing, or check gates run, and stays set until removed.">+ Add override</button></div>`;
+      }
+      /**
+       * Prompts for a value and sets it as this review branch's own override
+       * for `key` (RAL-191), shadowing the value inherited from its source
+       * session for this worktree only.
+       * @param {string} gid
+       * @param {string} bid
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function setBranchEnvOverride(gid, bid, key) {
+        const value = prompt(`Value for ${key} in this review worktree:`);
+        if (value === null) return;
+        const res = await post(`/api/guardians/${gid}/branches/${bid}/env`, { set: { [key]: value } });
+        if (!res.ok) { alert("Failed to set the environment override."); return; }
+        tick();
+      }
+      /**
+       * Tombstones `key` for this review branch (RAL-191) — the variable is
+       * removed from the worktree's environment even though the source
+       * session sets it.
+       * @param {string} gid
+       * @param {string} bid
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function unsetBranchEnvOverride(gid, bid, key) {
+        if (!confirm(`Remove "${key}" from this review worktree's environment?\nIt will not be set at all here, even though the source session sets it.\nThis cannot be undone.`)) return;
+        const res = await post(`/api/guardians/${gid}/branches/${bid}/env`, { unset: [key] });
+        if (!res.ok) { alert("Failed to unset the environment variable."); return; }
+        tick();
+      }
+      /**
+       * Drops this review branch's own entry for `key` (RAL-191), so it goes
+       * back to inheriting whatever its source session resolves to.
+       * @param {string} gid
+       * @param {string} bid
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function clearBranchEnvOverride(gid, bid, key) {
+        if (!confirm(`Go back to inheriting "${key}" from this branch's source session?\nThis cannot be undone.`)) return;
+        const res = await post(`/api/guardians/${gid}/branches/${bid}/env`, { clear: [key] });
+        if (!res.ok) { alert("Failed to revert the environment override."); return; }
+        tick();
+      }
+      /**
        * Prompts for a KEY and VALUE and sets it as a persistent
        * environment-variable override at `apiPath` (hierarchical env
        * overrides, extending RAL-150) — shared by every scope's "+ Add
@@ -4077,12 +4219,18 @@
           v = (t.verify || [])[vi];
           parentSession = (t.sessions || [])[0];
           scopeLabel = "task";
-          envSection = taskVerifyEnvOverridesSection(r, ti, t);
+          // RAL-191: the scope-wide layer first, then this individual step's
+          // own — narrowest last, matching the order they resolve in.
+          envSection = taskVerifyEnvOverridesSection(r, ti, t)
+            + verifyStepEnvOverridesSection(r, ti, -1, vi);
         } else {
           parentSession = (t.sessions || [])[si];
           v = parentSession && (parentSession.verify || [])[vi];
           scopeLabel = parentSession ? `session · ${esc(parentSession.name ?? parentSession.id)}` : "session";
-          envSection = parentSession ? sessionVerifyEnvOverridesSection(r, ti, si, parentSession) : "";
+          envSection = parentSession
+            ? sessionVerifyEnvOverridesSection(r, ti, si, parentSession)
+              + verifyStepEnvOverridesSection(r, ti, si, vi)
+            : "";
         }
         if (!v) return `<div class="empty">Verify step not found.</div>`;
         const parentModel = parentSession ? parentSession.model : t.model;
@@ -5839,13 +5987,15 @@
        * @returns {string}
        */
       function branchBadge(b) {
-        // Checked before every status badge: an empty branch merges cleanly, so
-        // its status alone reads as a healthy green "done" and the reviewer has
-        // no way to tell the branch contributed nothing (RAL-190).
-        if (b.is_empty) return `<span class="badge empty" data-tip="This branch adds no changes over the branch beneath it in the stack.
-Almost always means its task never committed its work — so the review looks healthy but contains none of that task's changes.
-Who/when: check this before approving; reviewing an empty branch approves nothing.
-Check the task's session output, then re-run it or drop this branch from the stack.">⌀ empty</span>`;
+        // Checked before every status badge — including "failed": an empty
+        // branch fails the review (RAL-190), and the generic red "⚠ conflict"
+        // badge below would say only that something broke. This says *which*
+        // thing, so the reviewer knows to go look at the task's session rather
+        // than at a diff or a rebase conflict.
+        if (b.is_empty) return `<span class="badge empty" data-tip="This branch adds no changes over the branch beneath it in the stack, so it failed the review.
+Almost always means its task never committed its work — the review would otherwise have approved a stack containing none of that task's changes.
+Who/when: you are looking at a failed review and need to know why this branch stopped it.
+Check the task's session output and re-run it — or, if this branch is meant to be empty, disable it to drop it from the stack.">⌀ empty</span>`;
         if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
         if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
         // RAL-149: all conflict markers for this branch are resolved and committed,
@@ -6031,6 +6181,7 @@ Check the task's session output, then re-run it or drop this branch from the sta
                   <input type="text" id="fb-${b.id}" placeholder="reviewer feedback for this branch…" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
                   <button class="btn" onclick="sendFeedback('${g.id}','${b.id}')" data-tip="Send reviewer feedback for this specific branch.\nThe guardian agent routes it to the session that owns this branch.">Send feedback</button>
                 </div>` : ""}
+              ${renderBranchEnvOverrides(g, b)}
             </div>` : "";
           // RAL-43: enable/disable toggle — staged like drag-reorder, takes effect on Save.
           const enableToggle = canReorder

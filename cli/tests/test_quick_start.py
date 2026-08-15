@@ -903,3 +903,36 @@ def test_raw_compound_command_with_a_double_dash_really_forwards_every_arg(
         "--dangerously-skip-permissions",
         "a b",
     ]
+
+
+@_needs_live_shell
+def test_raw_compound_command_with_a_double_dash_and_claude_really_forwards_every_arg(
+    tmp_path: Path,
+) -> None:
+    """AC: `python foo.py -- claude` runs correctly through a real subprocess.
+
+    The parent script itself launches a child Python subprocess and forwards
+    the same argv tail into it, so this covers the nested subprocess shape
+    the quick-start shell planning must preserve.
+    """
+    child = tmp_path / "child.py"
+    child.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+
+    script = tmp_path / "foo.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        f'proc = subprocess.run([sys.executable, r"{child}", *sys.argv[1:]], check=True, capture_output=True, text=True)\n'
+        "print(proc.stdout, end='')\n",
+        encoding="utf-8",
+    )
+    raw = f'{_call(sys.executable)} "{script}" -- claude'
+
+    result = _spawn(raw, ["--dangerously-skip-permissions", "a b"], cwd=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        "--",
+        "claude",
+        "--dangerously-skip-permissions",
+        "a b",
+    ]

@@ -543,6 +543,48 @@ class DaemonClient:
         )
         return result
 
+    def set_task_verify_step_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        verify_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace/remove the environment-variable overrides applied to
+        **one individual** task-scoped verify step (RAL-191) -- the narrowest
+        layer, merged on top of the task-verify scope's (and its ancestors').
+        Returns the resulting map.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(
+            f"/api/runs/{run_id}/tasks/{task_idx}/verify/{verify_idx}/env", payload
+        )
+        return result
+
+    def set_session_verify_step_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        session_idx: int,
+        verify_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Add/replace/remove the environment-variable overrides applied to
+        **one individual** session-scoped verify step (RAL-191) -- the
+        narrowest layer, merged on top of the session-verify scope's (and its
+        ancestors'). Returns the resulting map.
+        """
+        payload: dict[str, Any] = {"set": set_vars or {}, "unset": unset_vars or []}
+        result: dict[str, str] = self._post(
+            f"/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/verify/{verify_idx}/env",
+            payload,
+        )
+        return result
+
     def edit_run(self, run_id: str, *, label: str | None) -> dict[str, Any]:
         """Rename a run's label; resets the run to pending."""
         payload: dict[str, Any] = {"kind": "run", "label": label}

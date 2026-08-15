@@ -19,3 +19,4 @@ base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
+gethostname = { workspace = true }

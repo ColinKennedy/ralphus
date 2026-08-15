@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -264,6 +266,45 @@ def test_program_is_overridable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     ClaudeCodeBackend().run("x", ws, model=None)
     assert captured["cmd"][0] == "my-claude"
+
+
+def test_compound_command_uses_shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = Workspace.create(str(tmp_path))
+    shell = "powershell" if sys.platform.startswith("win") else "sh"
+    monkeypatch.delenv("RALPHUS_CONFIGURATION_PATH", raising=False)
+    monkeypatch.setenv("RALPHUS_SHELL", shell)
+    monkeypatch.setenv("RALPHUS_CLAUDE_COMMAND", "cd foo ; claude")
+    captured: dict[str, Any] = {}
+    system_prompt = "Line one.\n\nYou are running unattended."
+
+    def fake_popen(cmd: str | list[str], **kwargs: Any) -> _FakePopen:
+        captured["cmd"] = cmd
+        captured["shell"] = kwargs.get("shell")
+        line = cmd[-1] if isinstance(cmd, list) else cmd
+        assert "--append-system-prompt " not in line
+        assert "--append-system-prompt-file" in line
+        match = re.search(r"append-system-prompt-file'? ['\"]?([^'\"]+\.md)", line)
+        assert match is not None
+        path_text = match.group(1)
+        captured["system_prompt_file"] = Path(path_text)
+        captured["system_prompt_content"] = captured["system_prompt_file"].read_text(
+            encoding="utf-8"
+        )
+        return _FakePopen(0, stdout_lines=[_result_event("ok")])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    ClaudeCodeBackend().run("x", ws, model="sonnet", append_system_prompt=system_prompt)
+
+    if sys.platform.startswith("win"):
+        assert captured["cmd"][:2] == ["powershell", "-NoLogo"]
+        assert captured["shell"] is False
+    else:
+        assert captured["cmd"][:2] == ["sh", "-c"]
+        assert captured["shell"] is False
+    assert "--dangerously-skip-permissions" in captured["cmd"][-1]
+    assert "--model" in captured["cmd"][-1]
+    assert captured["system_prompt_content"] == system_prompt
+    assert not captured["system_prompt_file"].exists()
 
 
 def test_nonzero_exit_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

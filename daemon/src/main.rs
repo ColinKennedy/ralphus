@@ -1,4 +1,11 @@
 //! ralphus daemon binary entry point.
+//!
+//! This is a CLI: its stdout IS the product (version string, usage text, stop
+//! confirmations), so the workspace-wide `clippy::print_stdout = "deny"` is
+//! relaxed here. That lint guards the daemon<->runner JSON contract carried on
+//! the *runner subprocess's* stdout; nothing in this file writes to that
+//! channel. Log output still goes to stderr — see AGENTS.md's Logging Policy.
+#![allow(clippy::print_stdout)]
 
 use std::process::ExitCode;
 use std::time::Duration;

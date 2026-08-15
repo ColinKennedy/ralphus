@@ -3180,16 +3180,26 @@ def _set_env_for_resolved_selector(
             set_vars=set_vars,
             unset_vars=unset_vars,
         )
+    # RAL-191: a verify selector always names one specific step (`v1`,
+    # `s0v2`), and a step now has its own env layer that wins over the
+    # scope-wide one. Target the step, not the scope -- otherwise an explicit
+    # `--environment` here would be silently shadowed by any value that step
+    # declared in its own TOML `environment` table.
     if resolved.verify_scope == "session":
-        return client.set_session_verify_env(
+        return client.set_session_verify_step_env(
             resolved.run_id,
             resolved.task_idx,
             resolved.session_idx,
+            resolved.verify_idx,
             set_vars=set_vars,
             unset_vars=unset_vars,
         )
-    return client.set_task_verify_env(
-        resolved.run_id, resolved.task_idx, set_vars=set_vars, unset_vars=unset_vars
+    return client.set_task_verify_step_env(
+        resolved.run_id,
+        resolved.task_idx,
+        resolved.verify_idx,
+        set_vars=set_vars,
+        unset_vars=unset_vars,
     )
 
 

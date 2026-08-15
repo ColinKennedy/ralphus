@@ -1,11 +1,11 @@
 //! OpenTelemetry tracing (RAL-96) — manual span API only.
 //!
-//! Mirrors `daemon/src/otel.rs` (same rationale: RAL-79 bans the `tracing`
-//! crate workspace-wide, and `opentelemetry-otlp`'s exporter transitively
-//! pulls it in via reqwest/tokio, so a hand-rolled OTLP/JSON exporter over
-//! `ureq` is used instead). Duplicated rather than shared through
-//! `ralphus-core` because that crate is deliberately dependency-light — see
-//! `AGENTS.md`'s architecture table.
+//! Mirrors `daemon/src/otel.rs` (same rationale: `opentelemetry-otlp`'s
+//! exporter pulls reqwest -> tokio -> hyper, and this workspace keeps no async
+//! runtime and a deliberately small lock file, so a hand-rolled OTLP/JSON
+//! exporter over the already-used synchronous `ureq` is used instead).
+//! Duplicated rather than shared through `ralphus-core` because that crate is
+//! deliberately dependency-light — see `AGENTS.md`'s architecture table.
 //!
 //! Exporting is opt-in: [`init`] only installs a real exporter when
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` is set.

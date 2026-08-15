@@ -43,13 +43,17 @@ Open **http://127.0.0.1:16686** (Jaeger UI) → pick a service from the dropdown
 
 **Rust (`daemon`, `librarian`).** Spans are created directly through the
 `opentelemetry`/`opentelemetry_sdk` crates' manual span API
-(`opentelemetry::global::tracer(...).start_with_context(...)`) — never the
-`tracing` crate. AGENTS.md's Logging Policy (RAL-79) bans `tracing`
-workspace-wide because stdout is reserved for the daemon↔runner JSON
-contract, and `tracing`'s ecosystem defaults (subscribers, layers) too easily
-leak onto it. `opentelemetry-otlp` (the official exporter) is deliberately
-*not* a dependency either — its HTTP transport pulls in `reqwest` → `tokio` →
-`tracing` transitively. Instead, `daemon/src/otel.rs` (duplicated, with a
+(`opentelemetry::global::tracer(...).start_with_context(...)`) rather than the
+`tracing` crate. `opentelemetry-otlp` (the official exporter) is deliberately
+*not* a dependency — its HTTP transport pulls in `reqwest` → `tokio` →
+`hyper`, and this workspace keeps no async runtime at all (it is synchronous
+by design: `ureq`, `tiny_http`, a thread-per-worker scheduler) with a
+deliberately small lock file, because build time is a first-class constraint
+here. See AGENTS.md's Logging Policy for the two rules that replaced the older
+"never use `tracing`" wording: stdout is reserved for the daemon↔runner JSON
+contract (now enforced by `clippy::print_stdout = "deny"`), and no async
+runtime may enter the workspace.
+Instead, `daemon/src/otel.rs` (duplicated, with a
 different service name, as `librarian/src/otel.rs` — `ralphus-core` is kept
 dependency-light by design, so this isn't shared through it) hand-rolls a
 minimal OTLP/JSON `SpanExporter` over the already-used synchronous `ureq`

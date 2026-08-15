@@ -189,6 +189,48 @@ class _FakeClient:
         )
         return set_vars or {}
 
+    def set_task_verify_step_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        verify_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.task_verify_env_calls.append(
+            {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "verify_idx": verify_idx,
+                "set": set_vars or {},
+                "unset": unset_vars or [],
+            }
+        )
+        return set_vars or {}
+
+    def set_session_verify_step_env(
+        self,
+        run_id: str,
+        task_idx: int,
+        session_idx: int,
+        verify_idx: int,
+        *,
+        set_vars: dict[str, str] | None = None,
+        unset_vars: list[str] | None = None,
+    ) -> dict[str, str]:
+        _FakeClient.session_verify_env_calls.append(
+            {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "session_idx": session_idx,
+                "verify_idx": verify_idx,
+                "set": set_vars or {},
+                "unset": unset_vars or [],
+            }
+        )
+        return set_vars or {}
+
     def tasks(self) -> dict[str, Any]:
         return {"runs": [{"id": "run-000000000001", "state": "done", "label": "x"}]}
 
@@ -1003,17 +1045,26 @@ def test_retry_session_selector_with_environment_sets_session_env() -> None:
     assert _FakeClient.task_env_calls == []
 
 
-def test_retry_task_verify_selector_with_environment_sets_task_verify_env() -> None:
+def test_retry_task_verify_selector_with_environment_sets_that_steps_own_env() -> None:
+    # RAL-191: the selector names step 0 specifically, so the override lands on
+    # that step's own layer -- not the task-verify scope, where any value the
+    # step declared in TOML would silently shadow it.
     code = cli.main(["retry", "run-000000000001/build/verify/0", "--environment", "A=1"])
     assert code == 0
     assert _FakeClient.task_verify_env_calls == [
-        {"run_id": "run-000000000001", "task_idx": 0, "set": {"A": "1"}, "unset": []}
+        {
+            "run_id": "run-000000000001",
+            "task_idx": 0,
+            "verify_idx": 0,
+            "set": {"A": "1"},
+            "unset": [],
+        }
     ]
     assert _FakeClient.env_calls == []
     assert _FakeClient.task_env_calls == []
 
 
-def test_retry_session_verify_selector_with_environment_sets_session_verify_env() -> None:
+def test_retry_session_verify_selector_with_environment_sets_that_steps_own_env() -> None:
     code = cli.main(["retry", "run-000000000001/build/compile/verify/1", "--environment", "A=1"])
     assert code == 0
     assert _FakeClient.session_verify_env_calls == [
@@ -1021,6 +1072,7 @@ def test_retry_session_verify_selector_with_environment_sets_session_verify_env(
             "run_id": "run-000000000001",
             "task_idx": 0,
             "session_idx": 0,
+            "verify_idx": 1,
             "set": {"A": "1"},
             "unset": [],
         }

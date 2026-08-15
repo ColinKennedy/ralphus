@@ -215,6 +215,7 @@ const VERIFY_KEYS: &[&str] = &[
     "timeout_minutes",
     "requires_approval",
     "restart_on",
+    "environment",
 ];
 
 // ── Type expectations ────────────────────────────────────────────────────────
@@ -1124,6 +1125,9 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
         };
         unknown_keys(ctx, table, VERIFY_KEYS, &vpath, None);
         check_machine(ctx, table, &vpath, None);
+        // RAL-191: a verify step carries its own `environment`, validated with
+        // exactly the same key/value rules as a task's or session's.
+        check_environment(ctx, table, &vpath, None);
 
         let kinds = ["command", "brain", "prompt"];
         let set: Vec<&str> = kinds
@@ -1592,6 +1596,42 @@ command = "cargo build"
         let src = "[[task]]\nname=\"t\"\nenvironment={A=\"1\"}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={B=\"2\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_accepted_on_verify_steps() {
+        // RAL-191: `environment` on `[[task.verify]]` / `[[task.session.verify]]`.
+        let src = "[[task]]\nname=\"t\"\n[[task.verify]]\ncommand=\"c\"\nenvironment={A=\"1\"}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\ncommand=\"d\"\nenvironment={B=\"2\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_invalid_key_on_a_verify_step_reported() {
+        // The same key/value rules apply at the verify layer -- an invalid
+        // identifier here would otherwise reach `build_command_line_with_env`.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\ncommand=\"c\"\nenvironment={\"BAD-KEY\"=\"x\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("BAD-KEY")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_non_string_value_on_a_verify_step_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.verify]]\ncommand=\"c\"\nenvironment={A=1}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains('A')),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]

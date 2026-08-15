@@ -186,12 +186,29 @@ impl Workspace {
     /// provider may well want to run the two very differently.
     #[must_use]
     pub fn run_command(&self, command: &str) -> (bool, String) {
+        self.run_command_with_env(command, &std::collections::BTreeMap::new())
+    }
+
+    /// Like [`Self::run_command`] but applies `env` on top of the daemon's own
+    /// inherited environment (RAL-191) — used for a review's check gates, so
+    /// they run under the same variables as the branch's agent invocations.
+    ///
+    /// **Local workspaces only.** A remote workspace's
+    /// [`crate::remote_runner::RunRequest`] has no env field, so `env` is
+    /// ignored there rather than silently half-applied; a check gate on a
+    /// remote machine still runs exactly as it did before.
+    #[must_use]
+    pub fn run_command_with_env(
+        &self,
+        command: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> (bool, String) {
         match &self.machine {
             None => crate::verify::run_command_verify_capture(
                 &self.root.to_string_lossy(),
                 command,
                 &opentelemetry::Context::new(),
-                &std::collections::BTreeMap::new(),
+                env,
             ),
             Some(_) => {
                 // Split on whitespace is wrong for a shell command, so the

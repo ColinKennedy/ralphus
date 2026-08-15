@@ -4,6 +4,10 @@
 //! With it, the exe refuses to start unless a valid `ralphus.lic` signed by
 //! the author's private key is present next to the executable (or at the path
 //! in `RALPHUS_LICENSE`).
+//!
+//! A license may additionally be bound to one **seat** — a `user@hostname`
+//! pair naming exactly who, on which host, is allowed to run it. A license
+//! with no seat runs anywhere.
 
 /// Verifies that a valid Ralphus license is present before the daemon or
 /// librarian starts serving.  No-op in non-`secure-dist` builds.
@@ -27,6 +31,9 @@ fn check() -> Result<(), String> {
     #[derive(Deserialize)]
     struct LicenseFile {
         holder: String,
+        /// `user@hostname` this license is locked to. Absent = runs anywhere.
+        #[serde(default)]
+        seat: Option<String>,
         expiry: Option<String>,
         signature: String,
     }
@@ -48,13 +55,6 @@ fn check() -> Result<(), String> {
     let lic: LicenseFile =
         serde_json::from_str(&raw).map_err(|e| format!("Malformed license file: {e}"))?;
 
-    if let Some(ref expiry) = lic.expiry {
-        let today = today_string();
-        if expiry.as_str() < today.as_str() {
-            return Err(format!("License expired on {expiry}."));
-        }
-    }
-
     let vk = VerifyingKey::from_bytes(PUBLIC_KEY).map_err(|_| {
         "Invalid embedded public key — rebuild with a valid public.key.".to_string()
     })?;
@@ -65,18 +65,74 @@ fn check() -> Result<(), String> {
     let sig = Signature::from_slice(&sig_bytes)
         .map_err(|_| "Invalid license signature format.".to_string())?;
 
-    let message = signing_message(&lic.holder, lic.expiry.as_deref());
+    // Verify BEFORE reading any other field: `expiry` and `seat` are only
+    // trustworthy once the signature covering them has checked out. A forged
+    // or hand-edited file must report "not authorized", never "wrong seat".
+    let message = signing_message(&lic.holder, lic.seat.as_deref(), lic.expiry.as_deref());
     vk.verify(message.as_bytes(), &sig).map_err(|_| {
         "License signature verification failed. This copy is not authorized.".to_string()
-    })
+    })?;
+
+    if let Some(ref expiry) = lic.expiry {
+        let today = today_string();
+        if expiry.as_str() < today.as_str() {
+            return Err(format!("License expired on {expiry}."));
+        }
+    }
+
+    if let Some(ref seat) = lic.seat {
+        let local = local_seat().ok_or_else(|| {
+            format!(
+                "License is bound to seat {seat}, but this host's user or \
+                 hostname could not be determined."
+            )
+        })?;
+        if normalize_seat(seat) != normalize_seat(&local) {
+            return Err(format!(
+                "License is bound to seat {seat}, but this is {local}."
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "secure-dist")]
-fn signing_message(holder: &str, expiry: Option<&str>) -> String {
-    match expiry {
-        Some(exp) => format!("RALPHUS|{holder}|{exp}"),
-        None => format!("RALPHUS|{holder}|never"),
+fn signing_message(holder: &str, seat: Option<&str>, expiry: Option<&str>) -> String {
+    format!(
+        "RALPHUS|{holder}|{}|{}",
+        seat.unwrap_or("any"),
+        expiry.unwrap_or("never")
+    )
+}
+
+/// This host's seat as `user@hostname`, or `None` if either half is
+/// unavailable or blank.
+///
+/// The hostname comes from the OS via `gethostname`; the username comes from
+/// the environment (`USERNAME` on Windows, `USER`/`LOGNAME` elsewhere), which
+/// a determined user can override. See `docs/secure-dist.md` — seat binding
+/// is distribution hygiene, not a tamper-proof boundary.
+#[cfg(feature = "secure-dist")]
+fn local_seat() -> Option<String> {
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()?;
+    let host = gethostname::gethostname().into_string().ok()?;
+    let (user, host) = (user.trim(), host.trim());
+    if user.is_empty() || host.is_empty() {
+        return None;
     }
+    Some(format!("{user}@{host}"))
+}
+
+/// Casing- and whitespace-insensitive form used to compare two seats.
+/// Windows reports `COMPUTERNAME` uppercase while a hand-written license
+/// usually is not, so a literal comparison would reject valid licenses.
+#[cfg(feature = "secure-dist")]
+fn normalize_seat(seat: &str) -> String {
+    seat.trim().to_ascii_lowercase()
 }
 
 #[cfg(feature = "secure-dist")]
@@ -96,6 +152,50 @@ fn license_path() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(test, feature = "secure-dist"))]
+mod tests {
+    use super::*;
+
+    /// Pins the exact bytes signed. `ralphus-keygen sign` builds this string
+    /// independently — if either side drifts, no license ever verifies again.
+    #[test]
+    fn signing_message_format_is_pinned() {
+        assert_eq!(
+            signing_message("Alice", None, None),
+            "RALPHUS|Alice|any|never"
+        );
+        assert_eq!(
+            signing_message("Alice", Some("colin@BOX"), Some("2027-01-01")),
+            "RALPHUS|Alice|colin@BOX|2027-01-01"
+        );
+        // A seat-bound, never-expiring license and an unbound, expiring one
+        // must not collapse to the same message.
+        assert_ne!(
+            signing_message("Alice", Some("colin@BOX"), None),
+            signing_message("Alice", None, Some("colin@BOX"))
+        );
+    }
+
+    #[test]
+    fn seat_comparison_ignores_case_and_padding() {
+        assert_eq!(
+            normalize_seat("  Colin.Kennedy@DESKTOP-ABC "),
+            normalize_seat("colin.kennedy@desktop-abc")
+        );
+        assert_ne!(normalize_seat("colin@box-a"), normalize_seat("colin@box-b"));
+        assert_ne!(normalize_seat("alice@box"), normalize_seat("bob@box"));
+    }
+
+    #[test]
+    fn local_seat_is_user_at_host_when_available() {
+        if let Some(seat) = local_seat() {
+            let (user, host) = seat.split_once('@').expect("seat must contain '@'");
+            assert!(!user.is_empty(), "user half empty: {seat}");
+            assert!(!host.is_empty(), "host half empty: {seat}");
+        }
+    }
 }
 
 /// Returns today's date as `"YYYY-MM-DD"` using only `std::time`.

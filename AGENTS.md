@@ -468,8 +468,8 @@ A user action (a `board.html` button click) → librarian → daemon → schedul
 trace, viewable as a flame/waterfall graph. Entirely opt-in — every exporter
 is a no-op unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so the default dev
 loop is unaffected. Rust spans use the `opentelemetry`/`opentelemetry_sdk`
-crates' manual span API directly (never the `tracing` crate — banned by
-RAL-79 above); Python uses the official `opentelemetry-sdk`; the browser
+crates' manual span API directly (not the `tracing` crate — see the Logging
+Policy below); Python uses the official `opentelemetry-sdk`; the browser
 hand-rolls the W3C `traceparent` format (no `opentelemetry-js`, since
 `board.html` has no build step). A local Collector + Jaeger stack for viewing
 traces lives in `otel/docker-compose.yml`. See
@@ -507,10 +507,34 @@ Run the pieces directly:
 ralphus-daemon serve                          # HTTP API on 127.0.0.1:7890 (+ scheduler)
 ralphus-librarian serve [--port 7474]         # web board; RALPHUS_DAEMON_URL points it at the daemon
 cd cli && uv run ralphus submit task.toml     # or: validate / status / author
-.\dist\ralphus.exe submit task.toml           # Windows release build
+.\dist\ralphus\ralphus.exe submit task.toml    # Windows release build (one-dir layout)
 ```
 
-`scripts/build-release.cmd` (Windows) builds all four standalone executables into `.\dist`: the two Rust bins via `cargo build --release`, and `ralphus.exe` / `ralphus-runner.exe` via PyInstaller one-file. Both Python builds run against a venv synced with `uv sync --extra runner` — that sync installs ~90 packages and makes the build take minutes.
+`scripts/build-release.cmd` (Windows) builds all four standalone executables into `.\dist`: the two Rust bins via `cargo build --release`, and `ralphus.exe` / `ralphus-runner.exe` via **PyInstaller one-DIR**. Both Python builds run against a venv synced with `uv sync --extra runner` — that sync installs ~90 packages and makes the build take minutes.
+
+**`dist/` layout — the two Python apps are directories, not bare exes:**
+
+```
+dist/
+  ralphus-daemon.exe                      # Rust, standalone
+  ralphus-librarian.exe                   # Rust, standalone
+  ralphus/ralphus.exe                     # + _internal/  (must stay together)
+  ralphus-runner/ralphus-runner.exe       # + _internal/  (must stay together)
+```
+
+Each PyInstaller exe **must stay beside its sibling `_internal/` directory** —
+copying the `.exe` out on its own breaks it. Put `dist/ralphus` on PATH for the
+CLI, and point `RALPHUS_RUNNER_CMD` at the full path to
+`dist/ralphus-runner/ralphus-runner.exe` (or add that directory to PATH too).
+
+These were `--onefile` until 2026-08-16. A onefile exe self-extracts to
+`%TEMP%\_MEIxxxxxx` and re-executes itself, and its bootloader's cache
+validation failed with `Security validation failure: parent process has
+different executable!` on two machines when launched from a sandboxed /
+reparenting tool layer — while the Rust binaries beside it, from the same zip,
+never did. `--onedir` has no bootloader extraction step, so that failure mode
+cannot occur; see `PERMISSIONS_ISSUE.local.md` and the header comment in
+`scripts/build-release.cmd`.
 
 ## Cryptography / Secure Distribution
 
@@ -524,9 +548,9 @@ See `docs/secure-dist.md` for the full workflow. Summary:
 
 **License file format** (`ralphus.lic`, JSON):
 ```json
-{ "holder": "Alice", "expiry": "2027-01-01", "signature": "<base64-ed25519>" }
+{ "holder": "Alice", "seat": "alice@BOX", "expiry": "2027-01-01", "signature": "<base64-ed25519>" }
 ```
-Message signed: `"RALPHUS|<holder>|<expiry>"` (or `"RALPHUS|<holder>|never"` if no expiry). Expiry is compared as a string (`YYYY-MM-DD` lexicographic order).
+Message signed: `"RALPHUS|<holder>|<seat>|<expiry>"`, where an absent `seat` is the literal `any` and an absent `expiry` is the literal `never`. **`keygen/src/main.rs` builds this string independently of `auth::signing_message` — the two must stay byte-identical, and each has a test pinning the format.** Expiry is compared as a string (`YYYY-MM-DD` lexicographic order). `seat` is a `user@hostname` binding (see the **seat** entry in `docs/glossary.md` — deliberately not called a *machine*, which RAL-185 already took); it is compared case-insensitively against the local `USERNAME`/`USER`/`LOGNAME` plus the `gethostname` crate's hostname. Order of checks is signature → expiry → seat, so a forged file always reports "not authorized" rather than leaking which field was wrong.
 
 **Key files:**
 - `auth/public.key` — 32-byte raw Ed25519 public key; baked into the binary at compile time; **committed**.
@@ -544,7 +568,8 @@ cargo build --release --features ralphus-daemon/secure-dist,ralphus-librarian/se
 cargo run -p ralphus-keygen -- sign \
   --key ralphus-private.key \
   --name "Alice" \
-  --expiry 2027-01-01    # omit for non-expiring license
+  --seat alice@HER-BOX \  # or --this-seat; omit both to run anywhere
+  --expiry 2027-01-01     # omit for non-expiring license
 
 # 4. Recipient drops ralphus.lic next to the executables
 #    (or sets RALPHUS_LICENSE=<path>)
@@ -555,7 +580,7 @@ Re-keying: delete `ralphus-private.key`, run `generate` again, commit the new `a
 ## Gotchas learned the hard way
 
 - **Session `cwd` must be a real path for the OS the daemon runs on.** On Windows, an MSYS/Git-Bash `/tmp/...` path will not resolve in native-Windows Python — use a Windows path. `cwd` is mandatory and validated.
-- **Runner command**: the daemon spawns `RALPHUS_RUNNER_CMD` (default `ralphus-runner`). In dev, point it at the venv script, e.g. `cli/.venv/Scripts/ralphus-runner.exe` — that's an editable install, so source edits under `cli/src/ralphus/runner/` take effect immediately with no build step. `dist/ralphus-runner.exe` (built by `scripts/build-release.cmd`) is a frozen PyInstaller snapshot; only rebuild it when something changed since the last one.
+- **Runner command**: the daemon spawns `RALPHUS_RUNNER_CMD` (default `ralphus-runner`). In dev, point it at the venv script, e.g. `cli/.venv/Scripts/ralphus-runner.exe` — that's an editable install, so source edits under `cli/src/ralphus/runner/` take effect immediately with no build step. `dist/ralphus-runner/ralphus-runner.exe` (built by `scripts/build-release.cmd`) is a frozen PyInstaller snapshot; only rebuild it when something changed since the last one. Note the one-dir layout — it lives in its own directory beside an `_internal/` folder and cannot be moved out on its own.
 - **pydantic-ai is the optional `runner` extra**, not a dev dependency. CI does not install it; `pydantic_backend.py` is imported lazily and a mypy override keeps strict checking green without it.
 - **The full review flow has a live-Ollama integration test** — `daemon/tests/reviews_derive.rs::full_flow_validate_submit_run_and_ollama_resolves_conflict`. It **skips** unless Ollama is up on `127.0.0.1:11434`, the resolver model (`RALPHUS_RESOLVER_MODEL`, default `qwen3:8b`) is pulled, and a `ralphus-runner` is found.
 - **Monorepo integration test** — `daemon/tests/monorepo.rs` has three always-run pipeline tests and one live-Ollama test, `#[ignore]`d by default. Run the live test with `cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture`.
@@ -669,7 +694,43 @@ reads the child's stderr line-by-line (not just at exit) and forwards any
 matching line into Cartographer, enriching `run_id`/`session_id`/`task` from
 the owning `RunnerSpec` when the event omits them.
 
-All log output still goes to **stderr** only (`eprintln!` in Rust; `print(..., file=sys.stderr)` in Python) for the plain-text sink. Never use the `tracing` crate. The stdout channel carries structured JSON between the daemon and runner subprocess — do not pollute it with log lines (Cartographer's runner-side events use the stderr marker above, not stdout).
+All log output still goes to **stderr** only (`eprintln!` in Rust; `print(..., file=sys.stderr)` in Python) for the plain-text sink. The stdout channel carries structured JSON between the daemon and runner subprocess — do not pollute it with log lines (Cartographer's runner-side events use the stderr marker above, not stdout).
+
+**The stdout rule is mechanically enforced.** `[workspace.lints.clippy]` in the
+root `Cargo.toml` sets `print_stdout = "deny"` — note this must be named
+explicitly, because `print_stdout` lives in clippy's `restriction` group and is
+*not* covered by the `all = "deny"` beside it. A stray `println!` does not
+crash anything; it intermittently corrupts a `SessionSpec`/`SessionResult` JSON
+parse only when something prints mid-session, which is exactly the kind of bug
+that costs a day. The legitimate stdout writers — CLI output that *is* the
+program's product (`daemon/src/main.rs`, `librarian/src/main.rs`,
+`validate_file`) and test `SKIP:` notices — each carry a local
+`#[allow(clippy::print_stdout)]` with a reason. `print_stderr` is deliberately
+**not** enabled.
+
+**No async runtime.** Do not add `tokio`, `reqwest`, `hyper`, or a dependency
+that pulls one in. The workspace is synchronous by design (`ureq`,
+`tiny_http`, a thread-per-worker scheduler) and the lock file is deliberately
+small (~197 crates); the root `Cargo.toml`'s profile note is explicit that
+build time is a first-class constraint. This — not log-channel safety — is the
+real reason `opentelemetry-otlp` was rejected in favor of the hand-rolled
+`ureq` exporter in `daemon/src/otel.rs`.
+
+**On the `tracing` crate (superseded).** Earlier revisions of this policy said
+"Never use the `tracing` crate," citing RAL-79. That prohibition has been
+retired, because RAL-79 does not actually support it: its text reads *"Do NOT
+introduce the `tracing` crate right now … Tracing is a future concern"* —
+time-bounded scope control on a ticket about adding `eprintln!` coverage, which
+also asked for output "on stderr/stdout" and so did not treat stdout as
+reserved at all. `tracing` is moreover a *facade*: it emits nothing unless a
+subscriber is registered in our own binary, so a transitive `tracing` is inert
+(`log` 0.4.x already sits in our tree on exactly those terms). The one real
+hazard was always `tracing_subscriber::fmt()`, whose default writer is
+**stdout** — installing a fmt subscriber without `.with_writer(io::stderr)`
+would write log lines straight into the runner JSON channel. That specific
+hazard is now covered by the two rules above. If you do introduce a subscriber,
+it must write to stderr. Judge any candidate dependency on async-runtime weight,
+not on whether `tracing` appears in its tree.
 
 **Log format:** `ralphus [TYPE] message key=value …`
 

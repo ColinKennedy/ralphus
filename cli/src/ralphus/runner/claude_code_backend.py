@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 
+from ralphus import shellcmd
 from ralphus.config import load_config
 from ralphus.runner import cartographer
 from ralphus.runner.backend import BackendError, BackendOutcome
@@ -113,6 +114,18 @@ def _tool_result_text(content: object) -> str:
     return ""
 
 
+def _is_compound_command(value: str) -> bool:
+    """Treat raw shell syntax as compound; a single wrapped path is not compound."""
+    stripped = value.strip()
+    if " " not in stripped:
+        return False
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "'\"":
+        inner = stripped[1:-1]
+        if stripped[0] not in inner:
+            return False
+    return True
+
+
 class ClaudeCodeBackend:
     """A ModelBackend that runs the Claude Code CLI in headless print mode."""
 
@@ -148,13 +161,7 @@ class ClaudeCodeBackend:
         redundant (and could confuse the model into thinking it's a distinct,
         second request) -- all that is needed is a nudge to keep going.
         """
-        program = os.environ.get("RALPHUS_CLAUDE_COMMAND", "claude")
-        # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
-        program = shutil.which(program) or program
-        # Unlike `ralphus quick-start manager|reviewer claude-code`, this backend does not support
-        # a compound shell command (e.g. "cd foo && claude") here -- it always
-        # spawns `program` directly (never via a shell), matching this file's
-        # existing streaming-JSON `Popen` + pipe-parsing design.
+        raw_command = os.environ.get("RALPHUS_CLAUDE_COMMAND", "claude")
         config = load_config()
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:8]
         if resume_agent_session_id:
@@ -184,13 +191,15 @@ class ClaudeCodeBackend:
         keep_files = config.daemon.keep_temporary_files
         effective_prompt = RESUME_CONTINUATION_PROMPT if resume_agent_session_id else prompt
         prompt_file = _write_prompt_file(effective_prompt)
+        system_prompt_file = (
+            _write_prompt_file(append_system_prompt) if append_system_prompt else None
+        )
         sid_path = live_session_path(workspace.root)
         # Remove any stale file from a previous run so the Rust watcher does
         # not see an old session ID before the new one arrives.
         sid_path.unlink(missing_ok=True)
         try:
-            cmd = [
-                program,
+            extra_args = [
                 "-p",
                 f"@{prompt_file}",
                 "--dangerously-skip-permissions",
@@ -199,17 +208,33 @@ class ClaudeCodeBackend:
                 "stream-json",
             ]
             if resume_agent_session_id:
-                cmd += ["--resume", resume_agent_session_id]
+                extra_args += ["--resume", resume_agent_session_id]
             if model:
-                cmd += ["--model", model]
-            # Deliver the appended system prompt via the CLI's own flag, so it is
-            # applied as a system prompt rather than concatenated into the user
-            # prompt (RAL-5).
-            if append_system_prompt:
-                cmd += ["--append-system-prompt", append_system_prompt]
+                extra_args += ["--model", model]
+            if _is_compound_command(raw_command):
+                # Compound launchers go through a real shell command line.
+                # Multiline system-prompt text is therefore shell-sensitive on
+                # Windows, so route it through Claude Code's file-based flag.
+                if system_prompt_file is not None:
+                    extra_args += ["--append-system-prompt-file", str(system_prompt_file)]
+                shell = shellcmd.resolve_shell(os.environ.get("RALPHUS_SHELL"))
+                line = shellcmd.build_compound_command_line(shell, raw_command, extra_args)
+                cmd, use_shell = shellcmd.shell_spawn_args(shell, line)
+                launch_target = raw_command
+            else:
+                # Direct exec never round-trips through a shell, so the inline
+                # text flag remains safe here.
+                if append_system_prompt:
+                    extra_args += ["--append-system-prompt", append_system_prompt]
+                # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
+                program = shutil.which(raw_command) or raw_command
+                cmd = [program, *extra_args]
+                use_shell = False
+                launch_target = program
             try:
                 proc = subprocess.Popen(
                     cmd,
+                    shell=use_shell,
                     cwd=workspace.root,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -225,7 +250,9 @@ class ClaudeCodeBackend:
                     f"ralphus [llm-invoke] claude-code error: {exc}",
                     file=sys.stderr,
                 )
-                raise BackendError(f"could not run Claude Code ({program!r}): {exc}") from exc
+                raise BackendError(
+                    f"could not run Claude Code ({launch_target!r}): {exc}"
+                ) from exc
 
             # Human-readable header for the live tmux pane (RAL-102) -- everything
             # below this is Claude's own text/tool-call activity, not runner logging.
@@ -368,6 +395,8 @@ class ClaudeCodeBackend:
         finally:
             if not keep_files:
                 prompt_file.unlink(missing_ok=True)
+                if system_prompt_file is not None:
+                    system_prompt_file.unlink(missing_ok=True)
             # Always remove the side-channel file — the Rust watcher will have
             # already read it, and leaving it on disk would confuse the next run.
             sid_path.unlink(missing_ok=True)

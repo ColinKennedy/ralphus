@@ -61,6 +61,7 @@ import sys
 import threading
 import time
 
+from ralphus import shellcmd
 from ralphus.config import load_config
 from ralphus.runner import cartographer
 from ralphus.runner.backend import BackendError, BackendOutcome
@@ -69,6 +70,18 @@ from ralphus.runner.cli_agent_common import write_prompt_file as _write_prompt_f
 from ralphus.runner.tools import Workspace
 
 __all__ = ["CodexBackend"]
+
+
+def _is_compound_command(value: str) -> bool:
+    """Treat raw shell syntax as compound; a single wrapped path is not compound."""
+    stripped = value.strip()
+    if " " not in stripped:
+        return False
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "'\"":
+        inner = stripped[1:-1]
+        if stripped[0] not in inner:
+            return False
+    return True
 
 
 class CodexBackend:
@@ -103,9 +116,7 @@ class CodexBackend:
         and the original prompt is replaced with a short continuation
         directive, matching ``ClaudeCodeBackend``'s same resume behavior.
         """
-        program = os.environ.get("RALPHUS_CODEX_CMD", "codex")
-        # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
-        program = shutil.which(program) or program
+        raw_command = os.environ.get("RALPHUS_CODEX_CMD", "codex")
         config = load_config()
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:8]
         if resume_agent_session_id:
@@ -140,12 +151,12 @@ class CodexBackend:
         # not see an old thread id before the new one arrives.
         sid_path.unlink(missing_ok=True)
         try:
-            cmd = [program]
+            extra_args: list[str] = []
             if append_system_prompt:
                 # Must precede `exec` -- see the module docstring on why the
                 # `-c` override only threads through when parsed at the root.
-                cmd += ["-c", f"developer_instructions={append_system_prompt}"]
-            cmd += [
+                extra_args += ["-c", f"developer_instructions={append_system_prompt}"]
+            extra_args += [
                 "exec",
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
@@ -154,15 +165,27 @@ class CodexBackend:
                 str(workspace.root),
             ]
             if model:
-                cmd += ["-m", model]
+                extra_args += ["-m", model]
             if resume_agent_session_id:
-                cmd += ["resume", resume_agent_session_id, "-"]
+                extra_args += ["resume", resume_agent_session_id, "-"]
             else:
-                cmd.append("-")
+                extra_args.append("-")
+            if _is_compound_command(raw_command):
+                shell = shellcmd.resolve_shell(os.environ.get("RALPHUS_SHELL"))
+                line = shellcmd.build_compound_command_line(shell, raw_command, extra_args)
+                cmd, use_shell = shellcmd.shell_spawn_args(shell, line)
+                launch_target = raw_command
+            else:
+                # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
+                program = shutil.which(raw_command) or raw_command
+                cmd = [program, *extra_args]
+                use_shell = False
+                launch_target = program
             prompt_text = prompt_file.read_text(encoding="utf-8")
             try:
                 proc = subprocess.Popen(
                     cmd,
+                    shell=use_shell,
                     cwd=workspace.root,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -175,10 +198,10 @@ class CodexBackend:
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 print(
-                    f"ralphus [llm-invoke] codex error: could not run {program!r}: {exc}",
+                    f"ralphus [llm-invoke] codex error: could not run {launch_target!r}: {exc}",
                     file=sys.stderr,
                 )
-                raise BackendError(f"could not run Codex ({program!r}): {exc}") from exc
+                raise BackendError(f"could not run Codex ({launch_target!r}): {exc}") from exc
 
             # Human-readable header for the live tmux pane (RAL-102) -- everything
             # below this is Codex's own text/tool activity, not runner logging.

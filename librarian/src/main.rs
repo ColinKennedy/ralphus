@@ -1,5 +1,10 @@
 //! ralphus librarian binary entry point.
 
+// This is a CLI: its stdout IS the product (the version string), so the
+// workspace-wide `clippy::print_stdout = "deny"` is relaxed here. Log output
+// still goes to stderr — see AGENTS.md's Logging Policy.
+#![allow(clippy::print_stdout)]
+
 use std::process::ExitCode;
 
 use ralphus_librarian::{Command, DEFAULT_DAEMON_URL, parse_args, server, usage};

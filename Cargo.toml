@@ -24,6 +24,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2", default-features = false }
 ed25519-dalek = "2"
 base64 = "0.22"
+# Hostname lookup for secure-dist seat binding. Used instead of a raw WinAPI /
+# libc call because `[workspace.lints.rust] unsafe_code = "forbid"` bans the
+# syscall from being written here; the crate confines that `unsafe` to itself.
+gethostname = "1"
 # UTC wall-clock parsing only (RAL-122 scheduler down-time windows) — no other
 # crate in the workspace needs date/time handling, so this is deliberately
 # minimal: no "clock"-derived local-time features beyond `Utc::now`.
@@ -32,16 +36,38 @@ syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 
-# OpenTelemetry (manual span API only — the `tracing` crate and
-# `tracing-opentelemetry` are BANNED workspace-wide by RAL-79: stdout is
-# reserved for the daemon<->runner JSON contract and `tracing`'s ecosystem
-# defaults too easily leak onto it). `internal-logs` is excluded from both
-# crates below because it transitively pulls in the `tracing` crate — and
-# `opentelemetry-otlp` itself is deliberately NOT a dependency: its HTTP
-# transport pulls reqwest -> tokio -> `tracing` transitively, which would
-# violate RAL-79 despite never being called directly. Instead, `daemon/src/
-# otel.rs` hand-rolls a minimal OTLP/JSON `SpanExporter` over the already-used
-# synchronous `ureq` client (see that module for the rationale).
+# OpenTelemetry (manual span API only).
+#
+# `opentelemetry-otlp` (the official exporter) is deliberately NOT a
+# dependency, and `internal-logs` is excluded from both crates below. The
+# reason is DEPENDENCY WEIGHT, not log-channel safety: `opentelemetry-otlp`'s
+# HTTP transport pulls reqwest -> tokio -> hyper, which would add roughly half
+# again as many crates to a lock file that is deliberately ~197 entries with
+# no async runtime in it at all. This workspace is synchronous by design
+# (`ureq`, `tiny_http`, a thread-per-worker scheduler), and the profile note
+# below is explicit that build time is a first-class constraint. Instead,
+# `daemon/src/otel.rs` hand-rolls a minimal OTLP/JSON `SpanExporter` over the
+# already-used synchronous `ureq` client (see that module).
+#
+# HISTORICAL NOTE — the `tracing` ban. Earlier revisions of this comment said
+# the `tracing` crate was "BANNED workspace-wide by RAL-79" and rejected
+# `opentelemetry-otlp` for pulling `tracing` transitively. That rationale does
+# not hold up and has been retired:
+#   * RAL-79's actual text is "Do NOT introduce the `tracing` crate right now
+#     ... Tracing is a future concern" — scope control on a ticket about
+#     adding `eprintln!` coverage, explicitly time-bounded. It was never an
+#     architectural prohibition, and it did not treat stdout as reserved (it
+#     asked for output "on stderr/stdout").
+#   * `tracing` is a facade: it emits nothing without a subscriber registered
+#     in THIS binary. A transitive `tracing` is inert. (`log` 0.4.x is already
+#     in our tree on exactly those terms.)
+#   * The real hazard was only ever `tracing_subscriber::fmt()`, whose default
+#     writer is stdout — i.e. installing a fmt subscriber without
+#     `.with_writer(io::stderr)`. That is now covered directly by
+#     `clippy::print_stdout` above plus the Logging Policy, rather than by
+#     banning a crate from the dependency graph.
+# Do not re-derive a `tracing` ban from RAL-79; judge a candidate dependency
+# on async-runtime weight instead.
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 
@@ -60,3 +86,17 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+# THE stdout invariant, mechanically enforced. stdout is the daemon<->runner
+# JSON contract (one `SessionSpec` in, one `SessionResult` out); a stray
+# `println!` there does not crash anything, it intermittently corrupts a JSON
+# parse only when something happens to print mid-session — which is exactly
+# the kind of bug that takes a day to find. `print_stdout` lives in clippy's
+# `restriction` group, so the `all = "deny"` above does NOT cover it; it has
+# to be named explicitly.
+#
+# Log output goes to stderr (`rlog!` / `eprintln!`) plus Cartographer — see
+# AGENTS.md's Logging Policy. `print_stderr` is deliberately NOT enabled.
+#
+# Legitimate stdout writers (CLI output that IS the program's product, and
+# test SKIP messages) carry a local `#[allow(clippy::print_stdout)]`.
+print_stdout = "deny"
