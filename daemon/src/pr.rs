@@ -494,6 +494,7 @@ fn synthesize_pr_text(
         trace_context: trace_context.map(str::to_string),
         resume_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
     };
     crate::rlog!(
         DEBUG,

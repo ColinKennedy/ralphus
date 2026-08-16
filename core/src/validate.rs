@@ -162,6 +162,7 @@ const TASK_KEYS: &[&str] = &[
     "project",
     "agent",
     "model",
+    "machine",
     "args",
     "budget_tokens",
     "maximum_budget_usd",
@@ -169,6 +170,7 @@ const TASK_KEYS: &[&str] = &[
     "priority",
     "timeout_minutes",
     "depends_on",
+    "environment",
     "session",
     "verify",
 ];
@@ -183,6 +185,7 @@ const SESSION_KEYS: &[&str] = &[
     "depends_on",
     "agent",
     "model",
+    "machine",
     "system_prompt",
     "system_prompt_position",
     "args",
@@ -190,11 +193,12 @@ const SESSION_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "timeout_minutes",
     "priority",
+    "environment",
     "verify",
     "review",
     "upstream",
 ];
-const REVIEW_KEYS: &[&str] = &["id", "name", "agent", "model", "action"];
+const REVIEW_KEYS: &[&str] = &["id", "name", "agent", "model", "machine", "base", "action"];
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
 const VERIFY_KEYS: &[&str] = &[
@@ -203,6 +207,7 @@ const VERIFY_KEYS: &[&str] = &[
     "brain",
     "prompt",
     "model",
+    "machine",
     "system_prompt",
     "system_prompt_position",
     "arguments",
@@ -427,6 +432,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "project", Ty::Str, &path, header);
         check_type(ctx, table, "agent", Ty::Str, &path, header);
         check_type(ctx, table, "model", Ty::Str, &path, header);
+        check_machine(ctx, table, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &path, header);
@@ -435,6 +441,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
+        check_environment(ctx, table, &path, header);
 
         let task_agent = table.get("agent").and_then(toml::Value::as_str);
         let task_project = table.get("project").and_then(toml::Value::as_str);
@@ -565,6 +572,7 @@ fn validate_sessions(
         check_type(ctx, table, "role", Ty::Str, &path, header);
         check_type(ctx, table, "agent", Ty::Str, &path, header);
         check_type(ctx, table, "model", Ty::Str, &path, header);
+        check_machine(ctx, table, &path, header);
         check_type(ctx, table, "system_prompt", Ty::Str, &path, header);
         check_type(ctx, table, "system_prompt_position", Ty::Str, &path, header);
         check_system_prompt(ctx, table, task_agent, &path, header);
@@ -575,6 +583,7 @@ fn validate_sessions(
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
+        check_environment(ctx, table, &path, header);
 
         if let Some(deps) = table.get("depends_on").and_then(toml::Value::as_array) {
             for dep in deps.iter().filter_map(toml::Value::as_str) {
@@ -639,6 +648,70 @@ fn check_subprojects(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
     }
 }
 
+/// Whether `key` is a syntactically valid environment-variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Mirrors `daemon::config::is_valid_env_key`
+/// exactly (`core` cannot depend on `daemon`, so the check is duplicated
+/// rather than shared) -- both exist to stop an env-override key from
+/// smuggling shell metacharacters into the `$env:KEY = ...;` prefix
+/// `daemon::tmux::build_command_line_with_env` embeds ahead of a
+/// tmux-wrapped runner invocation (RAL-172, RAL-150).
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate an `environment` table (RAL-172): must be a table whose values
+/// are all strings and whose keys are all valid environment-variable
+/// identifiers. Silently returns when the key is absent.
+fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(v) = table.get("environment") else {
+        return;
+    };
+    let Some(env_table) = v.as_table() else {
+        let line = ctx.key_line(header, "environment");
+        ctx.error(
+            &format!("{path}.environment"),
+            ErrorKind::WrongType,
+            format!(
+                "key \"environment\" must be a table of string values, found {}",
+                type_name(v)
+            ),
+            line,
+        );
+        return;
+    };
+    for (key, value) in env_table {
+        if !value.is_str() {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::WrongType,
+                format!(
+                    "environment value for \"{key}\" must be a string, found {}",
+                    type_name(value)
+                ),
+                line,
+            );
+        }
+        if !is_valid_env_key(key) {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment key \"{key}\" is not a valid identifier \
+                     (must match [A-Za-z_][A-Za-z0-9_]*)"
+                ),
+                line,
+            );
+        }
+    }
+}
+
 /// Enforce the appended-system-prompt rules (RAL-5). `system_prompt` and
 /// `system_prompt_position` are only accepted for backends with a real
 /// delivery mechanism — see
@@ -646,6 +719,47 @@ fn check_subprojects(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
 /// — and the position, when set, must be the `"append"` sentinel. The
 /// effective agent is the session's own `agent`, falling back to the
 /// task-level `agent`, then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
+/// Validate a `machine` value's *syntax* (RAL-185).
+///
+/// Type-checks it as a string, then requires it to be either the literal
+/// `"local"` or a well-formed `scheme:uri`. Whether `scheme` names a
+/// *registered* provider is deliberately NOT checked here: the registry lives
+/// in the daemon's store, which `core` cannot see, so that check happens at
+/// submit time — the same split already used for a task's `project`.
+fn check_machine(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(v) = table.get("machine") else {
+        return;
+    };
+    check_type(ctx, table, "machine", Ty::Str, path, header);
+    let Some(raw) = v.as_str() else { return };
+    let Err(e) = crate::schema::parse_machine(raw) else {
+        return;
+    };
+    use crate::schema::MachineParseError as E;
+    let detail = match e {
+        E::Empty => "must not be empty".to_string(),
+        E::MissingScheme => {
+            "must be \"local\" or \"<provider>:<uri>\" (e.g. \"incredibuild:A\")".to_string()
+        }
+        E::EmptyScheme => "provider name (before the ':') must not be empty".to_string(),
+        E::EmptyUri => "value after the ':' must not be empty".to_string(),
+        E::SchemeTooShort => format!(
+            "provider name must be at least {} characters — a bare drive letter like \"C:\\\\...\" is a path, not a machine",
+            crate::schema::MIN_MACHINE_SCHEME_LEN
+        ),
+        E::InvalidSchemeChar(c) => {
+            format!("provider name may only contain letters, digits, '_' and '-' (found {c:?})")
+        }
+    };
+    let line = ctx.key_line(header, "machine");
+    ctx.error(
+        &format!("{path}.machine"),
+        ErrorKind::InvalidValue,
+        format!("invalid machine {raw:?}: {detail}"),
+        line,
+    );
+}
+
 fn check_system_prompt(
     ctx: &mut Ctx,
     table: &toml::Table,
@@ -732,6 +846,8 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "name", Ty::Str, &rpath, header);
         check_type(ctx, table, "agent", Ty::Str, &rpath, header);
         check_type(ctx, table, "model", Ty::Str, &rpath, header);
+        check_type(ctx, table, "base", Ty::Str, &rpath, header);
+        check_machine(ctx, table, &rpath, header);
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -1007,6 +1123,7 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
             continue;
         };
         unknown_keys(ctx, table, VERIFY_KEYS, &vpath, None);
+        check_machine(ctx, table, &vpath, None);
 
         let kinds = ["command", "brain", "prompt"];
         let set: Vec<&str> = kinds
@@ -1471,6 +1588,53 @@ command = "cargo build"
     }
 
     #[test]
+    fn environment_accepted_on_task_and_session() {
+        let src = "[[task]]\nname=\"t\"\nenvironment={A=\"1\"}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={B=\"2\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\nenvironment=\"nope\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("environment")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_non_string_value_reported() {
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=1}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains('A')),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_invalid_key_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={\"1BAD\"=\"x\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("1BAD")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn system_prompt_valid_for_claude_code() {
         let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
         let r = validate_toml(src);
@@ -1550,6 +1714,89 @@ command = "cargo build"
     #[test]
     fn toplevel_review_block_is_valid() {
         let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"be\"\n[[review]]\nid=\"be\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    // ── machine (RAL-185) ─────────────────────────────────────────────────
+
+    #[test]
+    fn machine_is_valid_at_every_level() {
+        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
+                   [[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmachine=\"incredibuild:A\"\nreview=\"r\"\n\
+                   [[task.session.verify]]\ncommand=\"cargo test\"\nmachine=\"incredibuild:A\"\n\
+                   [[task.verify]]\ncommand=\"cargo fmt\"\nmachine=\"local\"\n\
+                   [[review]]\nid=\"r\"\nmachine=\"incredibuild:C\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn machine_without_a_scheme_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.path == "task[0].machine")
+            .expect("machine error");
+        assert_eq!(e.kind, ErrorKind::InvalidValue);
+        assert!(e.message.contains("incredibuild:A"), "{}", e.message);
+        assert_eq!(e.line, Some(3), "must point at the machine line");
+    }
+
+    #[test]
+    fn machine_with_empty_uri_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.path == "task[0].machine" && e.message.contains("must not be empty")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn machine_that_is_actually_a_windows_path_gets_a_clear_error() {
+        // Without the minimum-scheme-length rule this parses as provider "C",
+        // and the user's first clue would be an unrelated "provider C is not
+        // registered" at submit time.
+        let src = "[[task]]\nname=\"t\"\nmachine=\"C:\\\\build\\\\wt\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.path == "task[0].machine")
+            .expect("machine error");
+        assert!(e.message.contains("path, not a machine"), "{}", e.message);
+    }
+
+    #[test]
+    fn machine_wrong_type_is_reported() {
+        let src = "[[task]]\nname=\"t\"\nmachine=42\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.path == "task[0].machine" && e.kind == ErrorKind::WrongType),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn a_task_file_that_never_mentions_machine_still_validates() {
+        // Regression guard: `machine` is optional everywhere and defaults to
+        // local, so every pre-RAL-185 task file must keep validating untouched.
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",

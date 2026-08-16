@@ -6,6 +6,7 @@
 
 mod bench_demo;
 pub mod schema;
+pub mod uri;
 pub mod validate;
 
 pub use bench_demo::ralphus_bench_tests;

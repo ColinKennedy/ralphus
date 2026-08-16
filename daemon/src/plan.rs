@@ -235,6 +235,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         }
     }
 

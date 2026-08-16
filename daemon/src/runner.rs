@@ -58,7 +58,7 @@ struct LiveUsage {
 /// session id (for tmux auto-reattach) and/or a fresh live-usage snapshot
 /// (for the cost-cap kill check).
 #[derive(Debug, Clone, Default, PartialEq)]
-struct ForwardedEvent {
+pub(crate) struct ForwardedEvent {
     agent_session_id: Option<String>,
     live_usage: Option<LiveUsage>,
 }
@@ -133,6 +133,116 @@ pub struct RunnerSpec {
     /// [`crate::store::Store::get_run_env_overrides`].
     #[serde(skip)]
     pub env_overrides: BTreeMap<String, String>,
+    /// The resolved `machine` this session runs on (RAL-185), as authored —
+    /// e.g. `"incredibuild:A"`. `None` (the common case) means the daemon's
+    /// own host, and the spec is handled by [`SubprocessRunner`] exactly as
+    /// before.
+    ///
+    /// This is daemon-side routing metadata consumed by
+    /// [`crate::remote_runner::MachineRouter`]; it is serialized so a provider
+    /// can see which of its machines a spec was destined for, and the Python
+    /// runner ignores it (`SessionSpec.from_json` reads named fields only, so
+    /// an extra key is inert).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+// Keep these strings in sync with `cli/src/ralphus/runner/execute.py`, which
+// appends them right before invoking the backend. The board shows the effective
+// read-only system prompt the agent actually received, not just the user-authored
+// session config fragment.
+const VERIFY_SYSTEM_PROMPT: &str = "This is a VERIFICATION step, not a normal task. Investigate whether the \
+     task holds, attempting to fix any problems you find so the check passes \
+     if you can reasonably do so. When you are done, your FINAL line of \
+     output must be exactly one of:\nRALPHUS_VERIFY: PASS\nRALPHUS_VERIFY: FAIL\nwith \
+     nothing else on that line.";
+const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
+     ralphus task run keeps a short handoff record for whichever agent picks \
+     up dependent work next. That agent will see your code changes but not \
+     this conversation. After you finish the task above, add one final \
+     section to your reply, starting on its own line with the exact marker \
+     'RALPHUS_GHOST:', followed by up to 5 short bullet points. Only include \
+     things a future agent could NOT already learn by reading `git log` or \
+     the diff: places you struggled, workarounds you used, issues you noticed \
+     but did not fix, and open questions. This is not a changelog. If there \
+     is nothing worth handing off, write 'RALPHUS_GHOST: (nothing to report)'. \
+     Keep it brief.";
+const ASYNC_SYSTEM_PROMPT: &str = "This is a single, non-interactive invocation with no later turn — \
+     nothing will check back on you. Never use an asynchronous/background/\
+     'notify me later' tool for anything this session depends on, and never \
+     launch the thing you are checking as a background/detached process and \
+     end your turn while it is still running; those require a persistent \
+     session this invocation does not have. If a check genuinely takes a long \
+     time, block and wait for it synchronously in the foreground within this \
+     same turn — it is fine for that to take a long time. If, despite that, \
+     you truly cannot reach a definitive result before you must stop, end \
+     your reply with 'RALPHUS_STILL_WORKING: <one-line reason>' as the last \
+     line instead of trailing off — you will be re-invoked shortly to \
+     continue synchronously from where you left off, though only a bounded \
+     number of times, so prefer just finishing the check yourself.";
+const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "You are running unattended in a non-interactive session — no human is \
+     available to answer questions or approve a plan. Never ask a clarifying \
+     question, never stop to present a plan for confirmation, and never pause \
+     waiting for input. Make the most reasonable judgment call yourself and \
+     continue until the task is complete.";
+
+fn combine_system_prompts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let combined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+fn subproject_system_prompt_addendum(subprojects: &[String]) -> Option<String> {
+    if subprojects.is_empty() {
+        return None;
+    }
+    let list = subprojects
+        .iter()
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "This repository is a monorepo. Your task is scoped to the \
+         following package(s): {list}. Focus your edits on those \
+         subdirectories; the entire repository is accessible but your \
+         changes must stay within those paths unless the task \
+         explicitly requires otherwise."
+    ))
+}
+
+pub(crate) fn session_config_system_prompt(
+    stored_system_prompt: Option<&str>,
+    subprojects: &[String],
+) -> Option<String> {
+    let addendum = subproject_system_prompt_addendum(subprojects);
+    combine_system_prompts([stored_system_prompt, addendum.as_deref()])
+}
+
+pub(crate) fn effective_session_system_prompt(
+    stored_system_prompt: Option<&str>,
+    subprojects: &[String],
+) -> String {
+    let base = session_config_system_prompt(stored_system_prompt, subprojects);
+    combine_system_prompts([
+        base.as_deref(),
+        Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+        Some(ASYNC_SYSTEM_PROMPT),
+        Some(GHOST_SYSTEM_PROMPT),
+    ])
+    .expect("session prompts always include ralphus system instructions")
+}
+
+pub(crate) fn effective_verify_system_prompt(spec_system_prompt: Option<&str>) -> String {
+    combine_system_prompts([
+        spec_system_prompt,
+        Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+        Some(ASYNC_SYSTEM_PROMPT),
+        Some(VERIFY_SYSTEM_PROMPT),
+    ])
+    .expect("verify prompts always include ralphus system instructions")
 }
 
 impl RunnerSpec {
@@ -143,23 +253,7 @@ impl RunnerSpec {
     /// (RAL-23). The addendum is appended after any user-supplied system prompt.
     #[must_use]
     pub fn from_row(run_id: &str, row: &SessionRow) -> Self {
-        let subproject_addendum = if row.subprojects.is_empty() {
-            None
-        } else {
-            let list = row
-                .subprojects
-                .iter()
-                .map(|p| format!("`{p}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Some(format!(
-                "This repository is a monorepo. Your task is scoped to the \
-                 following package(s): {list}. Focus your edits on those \
-                 subdirectories; the entire repository is accessible but your \
-                 changes must stay within those paths unless the task \
-                 explicitly requires otherwise."
-            ))
-        };
+        let subproject_addendum = subproject_system_prompt_addendum(&row.subprojects);
         let system_prompt = match (row.system_prompt.clone(), subproject_addendum) {
             (Some(existing), Some(addendum)) => {
                 let combined = format!("{existing}\n\n{addendum}");
@@ -218,7 +312,22 @@ impl RunnerSpec {
             trace_context: None,
             resume_agent_session_id: None,
             env_overrides: BTreeMap::new(),
+            // RAL-185: carried from the row so the router can dispatch this
+            // session to its machine. `None` for every pre-RAL-185 row.
+            machine: row.machine.clone(),
         }
+    }
+
+    /// Set the machine this spec runs on (RAL-185).
+    ///
+    /// A builder rather than a constructor parameter because the verify
+    /// constructors below already take enough arguments, and a verify step's
+    /// machine is always inherited from its owning session/task rather than
+    /// being independently derived here.
+    #[must_use]
+    pub fn with_machine(mut self, machine: Option<String>) -> Self {
+        self.machine = machine;
+        self
     }
 
     /// Build a spec for an `agent`-kind verify step. `agent`/`model` are the
@@ -258,7 +367,27 @@ impl RunnerSpec {
             trace_context: None,
             resume_agent_session_id: None,
             env_overrides: BTreeMap::new(),
+            machine: None,
         }
+    }
+
+    /// The full appended system prompt this runner spec will deliver to the
+    /// backend, after ralphus adds its own non-interactive/async/verify/ghost
+    /// instructions.
+    #[must_use]
+    pub fn effective_system_prompt(&self) -> Option<String> {
+        self.prompt.as_ref()?;
+        Some(if self.verify {
+            effective_verify_system_prompt(self.system_prompt.as_deref())
+        } else {
+            combine_system_prompts([
+                self.system_prompt.as_deref(),
+                Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+                Some(ASYNC_SYSTEM_PROMPT),
+                Some(GHOST_SYSTEM_PROMPT),
+            ])
+            .expect("prompt sessions always include ralphus system instructions")
+        })
     }
 
     /// Build a spec for a `command`-kind verify step (RAL-151). Wrapped in
@@ -294,6 +423,7 @@ impl RunnerSpec {
             trace_context: None,
             resume_agent_session_id: None,
             env_overrides: BTreeMap::new(),
+            machine: None,
         }
     }
 }
@@ -669,6 +799,7 @@ impl SubprocessRunner {
                     result.cost_usd,
                     attempt + 1,
                 );
+                self.clear_live_activity(&session_name);
                 return result;
             }
 
@@ -743,6 +874,7 @@ impl SubprocessRunner {
                         None => note,
                     });
                 }
+                self.clear_live_activity(&session_name);
                 return result;
             }
 
@@ -973,6 +1105,7 @@ impl SubprocessRunner {
                         missing_session_strikes = 0;
                         let all_lines: Vec<&str> = pane.lines().collect();
                         if all_lines.len() > lines_seen {
+                            self.note_live_activity(session_name);
                             for line in &all_lines[lines_seen..] {
                                 if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
                                     let fwd = forward_runner_event(
@@ -1037,6 +1170,9 @@ impl SubprocessRunner {
         // just concluded the session ended), the watcher's own blocking wait
         // should already be finishing, so this rarely actually waits long.
         let mut result = result;
+        // RAL-187: rescue the tokens this attempt really spent before it
+        // failed — see `backfill_live_usage`.
+        backfill_live_usage(&mut result, current_usage);
         if session_died_unexpectedly && !result.is_done() {
             if let Some(observation) =
                 exit_watch.and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok())
@@ -1084,6 +1220,33 @@ impl SubprocessRunner {
                 format!("{message} ({session_name})"),
                 serde_json::json!({"session_name": session_name}),
             );
+    }
+
+    /// Record fresh pane output for `session_name` (RAL-170 liveness signal
+    /// — see `Store::note_live_activity`'s doc comment for why this is an
+    /// in-memory `Store` field rather than a Cartographer note or DB column).
+    /// A no-op when no cartographer store is attached (e.g. in unit tests
+    /// that construct a bare `SubprocessRunner`) or the mutex is poisoned —
+    /// mirrors [`Self::emit_tmux_note`]'s best-effort shape.
+    fn note_live_activity(&self, session_name: &str) {
+        let Some(store) = &self.cartographer else {
+            return;
+        };
+        let Ok(mut guard) = store.lock() else { return };
+        guard.note_live_activity(session_name, crate::store::now_ms());
+    }
+
+    /// Drop the RAL-170 liveness entry for `session_name` once
+    /// [`Self::run_via_tmux`] has a terminal result for good — never after
+    /// just one attempt, since a reattach reuses the same deterministic
+    /// `session_name` and the entry should keep reflecting real activity
+    /// across that gap, not read as "ended" for the moments in between.
+    fn clear_live_activity(&self, session_name: &str) {
+        let Some(store) = &self.cartographer else {
+            return;
+        };
+        let Ok(mut guard) = store.lock() else { return };
+        guard.clear_live_activity(session_name);
     }
 
     /// Emit a Cartographer breadcrumb for the tmux auto-reattach retry (see
@@ -1168,7 +1331,7 @@ impl SubprocessRunner {
 /// so a caller tracking a resumable session id locally (see
 /// `SubprocessRunner::run_via_tmux`'s auto-reattach retry) can pick it up
 /// without a second JSON parse.
-fn forward_runner_event(
+pub(crate) fn forward_runner_event(
     cartographer: Option<&Arc<Mutex<Store>>>,
     run_id: &str,
     session_id: &str,
@@ -1270,6 +1433,32 @@ fn forward_runner_event(
     }
 }
 
+/// Fold the last-known live usage snapshot into a result that reports none
+/// of its own (RAL-187).
+///
+/// `record_session_result`'s write of `tokens_in`/`tokens_out`/`cost_usd` is
+/// a plain overwrite, not a `COALESCE` — so a [`RunnerResult::failure`],
+/// which zeroes all three, erases whatever per-turn usage
+/// [`Store::set_session_live_usage`] already persisted while the session was
+/// running. That is not hypothetical: a Codex session observed in
+/// `run-000000000151` ran for minutes, completed several turns, then lost its
+/// tmux pane before writing a result file — and was recorded as `0` tokens
+/// forever, even though those tokens were genuinely spent. Every mid-run
+/// failure path (cancel, timeout, lost pane, unparseable result file) funnels
+/// through `failure()`, so backfilling once here covers all of them.
+///
+/// Only applies when the result reports nothing at all; a completed run's own
+/// numbers are authoritative and are never overwritten by a stale snapshot.
+/// [`RunnerResult::cost_exceeded`] already carries real figures, so this is a
+/// no-op for it.
+fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
+    if result.tokens_in == 0 && result.tokens_out == 0 && result.cost_usd == 0.0 {
+        result.tokens_in = live.tokens_in;
+        result.tokens_out = live.tokens_out;
+        result.cost_usd = live.cost_usd;
+    }
+}
+
 /// Whether `elapsed` has reached the optional `deadline`. `None` = no limit,
 /// so never times out. Factored out so the timeout rule is unit-testable
 /// without spawning a real subprocess (RAL-15).
@@ -1349,6 +1538,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let json = serde_json::to_string(&spec).unwrap();
@@ -1377,6 +1567,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(
@@ -1387,6 +1578,88 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"system_prompt\":\"Follow the house style.\""));
         assert!(json.contains("\"system_prompt_position\":\"append\""));
+    }
+
+    #[test]
+    fn prompt_session_effective_system_prompt_includes_ralphus_defaults() {
+        let row = SessionRow {
+            task_idx: 0,
+            idx: 0,
+            task_name: "build".to_string(),
+            session_id: "s0".to_string(),
+            cwd: Some("/repo".to_string()),
+            subprojects: vec![],
+            prompt: Some("do work".to_string()),
+            command: None,
+            agent: "claude-code".to_string(),
+            model: None,
+            system_prompt: Some("Follow the house style.".to_string()),
+            system_prompt_position: Some("append".to_string()),
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            maximum_budget_usd: None,
+            upstream: None,
+            machine: None,
+        };
+        let effective = RunnerSpec::from_row("run-1", &row)
+            .effective_system_prompt()
+            .expect("prompt sessions should have a system prompt");
+        assert!(effective.contains("Follow the house style."));
+        assert!(effective.contains("non-interactive session"));
+        assert!(effective.contains("single, non-interactive invocation"));
+        assert!(effective.contains("RALPHUS_GHOST:"));
+        assert!(!effective.contains("RALPHUS_VERIFY: PASS"));
+    }
+
+    #[test]
+    fn prompt_verify_effective_system_prompt_uses_verify_instructions_not_ghost() {
+        let effective = RunnerSpec::for_verify(
+            "run-1",
+            "build",
+            "verify-session-0",
+            "/repo",
+            "check something",
+            "ollama",
+            Some("qwen3:8b"),
+            Some(300),
+            Some(10000),
+        )
+        .effective_system_prompt()
+        .expect("prompt verifies should have a system prompt");
+        assert!(effective.contains("VERIFICATION step"));
+        assert!(effective.contains("RALPHUS_VERIFY: PASS"));
+        assert!(effective.contains("RALPHUS_VERIFY: FAIL"));
+        assert!(!effective.contains("RALPHUS_GHOST:"));
+    }
+
+    #[test]
+    fn command_specs_have_no_effective_system_prompt() {
+        let row = SessionRow {
+            task_idx: 0,
+            idx: 0,
+            task_name: "build".to_string(),
+            session_id: "s0".to_string(),
+            cwd: Some("/repo".to_string()),
+            subprojects: vec![],
+            prompt: None,
+            command: Some("cargo build".to_string()),
+            agent: "claude".to_string(),
+            model: None,
+            system_prompt: Some("unused".to_string()),
+            system_prompt_position: Some("append".to_string()),
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            maximum_budget_usd: None,
+            upstream: None,
+            machine: None,
+        };
+        assert!(
+            RunnerSpec::from_row("run-1", &row)
+                .effective_system_prompt()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1409,6 +1682,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let json = serde_json::to_string(&RunnerSpec::from_row("run-1", &row)).unwrap();
         assert!(!json.contains("system_prompt"));
@@ -1485,6 +1759,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -1522,6 +1797,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -1553,6 +1829,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -1590,6 +1867,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert!(
@@ -1687,9 +1965,85 @@ mod tests {
     }
 
     #[test]
+    fn backfill_live_usage_rescues_tokens_from_a_failed_attempt() {
+        // RAL-187: the real case from `run-000000000151` — a Codex session
+        // completed several turns (so live usage was already persisted
+        // mid-run), then lost its tmux pane before writing a result file.
+        // Without the backfill, the zeroed failure result overwrites those
+        // tokens and the board reports 0 forever.
+        let live = LiveUsage {
+            tokens_in: 8_685_138,
+            tokens_out: 49_415,
+            cost_usd: 0.0,
+        };
+        let mut lost = RunnerResult::failure("runner produced no result file");
+        backfill_live_usage(&mut lost, live);
+        assert_eq!(lost.tokens_in, 8_685_138);
+        assert_eq!(lost.tokens_out, 49_415);
+        // Codex reports no cost anywhere, so this stays 0 — rendered "N/A".
+        assert_eq!(lost.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn backfill_live_usage_never_overwrites_a_results_own_figures() {
+        let live = LiveUsage {
+            tokens_in: 10,
+            tokens_out: 2,
+            cost_usd: 0.5,
+        };
+        // A completed run's own numbers are authoritative, even though the
+        // stale snapshot happens to be larger.
+        let mut done = RunnerResult {
+            tokens_in: 7,
+            tokens_out: 1,
+            cost_usd: 0.25,
+            ..RunnerResult::failure("x")
+        };
+        backfill_live_usage(&mut done, live);
+        assert_eq!(
+            (done.tokens_in, done.tokens_out, done.cost_usd),
+            (7, 1, 0.25)
+        );
+        // `cost_exceeded` already carries real figures: a no-op.
+        let mut capped = RunnerResult::cost_exceeded(99, 9, 1.5, 1.0);
+        backfill_live_usage(&mut capped, live);
+        assert_eq!(
+            (capped.tokens_in, capped.tokens_out, capped.cost_usd),
+            (99, 9, 1.5)
+        );
+    }
+
+    #[test]
     fn registers_pid_while_the_subprocess_is_alive_and_clears_it_after() {
         // A real, briefly-lived subprocess: the runner must register its PID for
         // the resource view while it runs, and drop it once it exits (RAL-11).
+        //
+        // Every spec now runs tmux-wrapped (RAL-151), so this is a real
+        // live-tmux test — serialized under `LIVE_TMUX_TEST_LOCK` and given a
+        // per-invocation-unique run_id (RAL-177) for the same reason every
+        // other live-tmux test below is: a real tmux session name is
+        // machine-wide shared state, and a hardcoded literal would collide
+        // with an identical test running concurrently in a sibling worktree.
+        //
+        // The pane's command (a bare `powershell`/`sleep` call) never speaks
+        // the runner result-file/`RALPHUS_TMUX_DONE` protocol real
+        // `ralphus-runner` invocations do, so the tmux session itself outlives
+        // it (`remain-on-exit`) — a short `timeout_sec` is what eventually
+        // ends the attempt, not a natural "done". That's fine: RAL-11's PID
+        // registration/deregistration is scoped to the whole tmux-wrapped
+        // attempt's lifetime (`find_server_pid`, tied to the session, not the
+        // inner command), not to a successful "done" outcome specifically.
+        if !tmux_and_python_available() {
+            println!("SKIP: tmux and/or python not found on PATH");
+            return;
+        }
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-x");
+        let _cleanup =
+            crate::tmux::KillSessionOnDrop(crate::tmux::session_name(&run_id, "t", "s0"));
         let reg = crate::procreg::ProcRegistry::new();
         #[cfg(target_os = "windows")]
         let runner = SubprocessRunner {
@@ -1723,35 +2077,70 @@ mod tests {
             system_prompt: None,
             system_prompt_position: None,
             depends_on: vec![],
-            timeout_sec: None,
+            // Only a backstop now: the test cancels as soon as it has
+            // observed the PID, so this is never normally reached. It still
+            // has to stay above `PID_POLL_BUDGET`, or a slow-starting session
+            // would race its own timeout-kill (which clears the registered
+            // PID) against the poll loop's first chance to see it — the
+            // original RAL-171/RAL-177 failure signature. Earlier revisions
+            // balanced these two numbers against each other (20s/10s); with
+            // cancel-on-observe the balance no longer costs runtime, so the
+            // margin is simply generous.
+            timeout_sec: Some(120),
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
-        let spec = RunnerSpec::from_row("run-x", &row);
-        let worker = std::thread::spawn(move || runner.run(&spec));
+        let spec = RunnerSpec::from_row(&run_id, &row);
+        // See the sibling `..._for_a_command_kind_spec` test: cancel on
+        // observation so runtime tracks startup, not `timeout_sec`.
+        let cancel = CancelToken::new();
+        let cancel_for_worker = cancel.clone();
+        let worker = std::thread::spawn(move || runner.run_cancellable(&spec, &cancel_for_worker));
 
-        // While the child is alive the PID is registered.
-        let mut seen = None;
-        for _ in 0..300 {
-            if let Some(pid) = reg.pid_of("run-x", "s0") {
-                seen = Some(pid);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        // While the session is alive the PID is registered. Windows-only, per
+        // `find_server_pid`'s own doc comment — see
+        // `live_tmux_registers_and_clears_pid_for_a_command_kind_spec` for
+        // the same platform-conditional pattern.
+        if cfg!(target_os = "windows") {
+            let seen = await_registered_pid(&reg, &run_id, "s0", &worker, PID_POLL_BUDGET);
+            assert!(seen.is_some(), "PID should be registered during the run");
+        } else {
+            std::thread::sleep(Duration::from_millis(300));
         }
-        assert!(seen.is_some(), "PID should be registered during the run");
+        cancel.cancel();
 
-        worker.join().unwrap();
+        let _ = worker.join();
         assert_eq!(
-            reg.pid_of("run-x", "s0"),
+            reg.pid_of(&run_id, "s0"),
             None,
-            "PID should be cleared once the subprocess exits"
+            "PID should be cleared once the tmux-wrapped session ends"
         );
     }
 
     #[test]
     fn missing_program_fails_gracefully() {
+        // Every spec runs tmux-wrapped since RAL-151, so this is a real
+        // live-tmux test — serialized under `LIVE_TMUX_TEST_LOCK` and given a
+        // per-invocation-unique run_id (RAL-177), same as every other
+        // live-tmux test in this module. An unresolvable runner program is
+        // typed into the pane via `send-keys`/`respawn-pane` rather than
+        // spawned directly, so it now surfaces as a bounded timeout (the
+        // pane just shows a shell "command not found" error) rather than an
+        // immediate "could not spawn" — see
+        // `live_tmux_missing_program_times_out_instead_of_spawn_error` below
+        // for the identical, already-established pattern this mirrors.
+        if !tmux_and_python_available() {
+            println!("SKIP: tmux and/or python not found on PATH");
+            return;
+        }
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-1");
+        let _cleanup = crate::tmux::KillSessionOnDrop(crate::tmux::session_name(&run_id, "t", "s"));
         let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz");
         let row = SessionRow {
             task_idx: 0,
@@ -1767,14 +2156,28 @@ mod tests {
             system_prompt: None,
             system_prompt_position: None,
             depends_on: vec![],
-            timeout_sec: None,
+            // Every spec runs tmux-wrapped (RAL-151), so a nonexistent
+            // program doesn't fail spawn itself — the shell inside the pane
+            // reports "not recognized" and stays open (no done sentinel is
+            // ever printed). Without a bound, the runner would only give up
+            // once the underlying tmux server's own idle-exit kicks in,
+            // which is both slow and non-deterministic. Bound it here so the
+            // test fails via the runner's own timeout path instead. Kept at
+            // 1s (rather than a more generous bound) to prevent concurrent
+            // tests from breaking each other.
+            timeout_sec: Some(1),
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
-        let result = runner.run(&RunnerSpec::from_row("run-1", &row));
+        let result = runner.run(&RunnerSpec::from_row(&run_id, &row));
         assert!(!result.is_done());
-        assert!(result.error.unwrap().contains("could not spawn"));
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
     }
 
     // ── tmux-wrapped path (RAL-102, and RAL-151 for `command`-kind specs) ──
@@ -1827,6 +2230,45 @@ mod tests {
     /// A fake runner that never finishes, to exercise the timeout path.
     const HANGING_RUNNER_SCRIPT: &str = "import time; time.sleep(30)";
 
+    /// Wall-clock budget the PID-registration tests allow for a tmux-wrapped
+    /// session to start and become visible in the process table.
+    ///
+    /// Generous on purpose: it is only ever fully consumed when the test is
+    /// about to fail anyway (see [`await_registered_pid`], which returns as
+    /// soon as the PID appears *or* the session dies). The predecessor was an
+    /// iteration count of 100 × 100 ms — a hard 10 s ceiling that a machine
+    /// running the rest of the suite in parallel could genuinely exceed just
+    /// on tmux-server + Python startup, producing a flake indistinguishable
+    /// from a real regression.
+    const PID_POLL_BUDGET: Duration = Duration::from_secs(60);
+
+    /// Poll `reg` until `session_id`'s PID is registered, the `worker` thread
+    /// finishes, or `budget` elapses — whichever happens first.
+    ///
+    /// The `is_finished` check is what keeps a genuine failure fast: once the
+    /// session has ended, no later poll can make a PID appear, so there is no
+    /// reason to burn the remaining budget. That in turn is what lets `budget`
+    /// be large enough to absorb heavy-load startup without making a real
+    /// breakage slow to detect.
+    fn await_registered_pid(
+        reg: &ProcRegistry,
+        run_id: &str,
+        session_id: &str,
+        worker: &std::thread::JoinHandle<RunnerResult>,
+        budget: Duration,
+    ) -> Option<u32> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(pid) = reg.pid_of(run_id, session_id) {
+                return Some(pid);
+            }
+            if worker.is_finished() || Instant::now() >= deadline {
+                return reg.pid_of(run_id, session_id);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// The real `run_via_tmux_attempt` path unconditionally persists a pane
     /// snapshot to the *real* `state_dir()` (`~/.ralphus/pane_snapshots`),
     /// not a test-isolated location — appropriate for production (the whole
@@ -1836,15 +2278,24 @@ mod tests {
     /// there too. Removes the one file this test's own deterministic session
     /// name would have produced, on drop, so running the suite doesn't leave
     /// test fixtures behind in the user's real state directory.
+    ///
+    /// Also kills the real tmux session itself on drop (RAL-177 AC #3) —
+    /// covers both a normal test-fn return and a panic/unwind mid-test.
+    /// Fields are owned `String`s (not `&'static str`) so each test can pass
+    /// its own [`crate::tmux::unique_test_tag`]-derived, per-invocation-
+    /// unique run_id instead of a hardcoded literal.
     struct SnapshotCleanup {
-        run_id: &'static str,
-        task: &'static str,
-        session_id: &'static str,
+        run_id: String,
+        task: String,
+        session_id: String,
     }
     impl Drop for SnapshotCleanup {
         fn drop(&mut self) {
-            let name = crate::tmux::session_name(self.run_id, self.task, self.session_id);
+            let name = crate::tmux::session_name(&self.run_id, &self.task, &self.session_id);
             let _ = std::fs::remove_file(crate::tmux::pane_snapshot_path(&name));
+            if let Ok(tmux) = Tmux::resolve() {
+                let _ = tmux.kill_session(&name);
+            }
         }
     }
 
@@ -1854,10 +2305,15 @@ mod tests {
             println!("SKIP: tmux and/or python not found on PATH");
             return;
         }
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-1");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-1",
-            task: "build",
-            session_id: "fake-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "fake-session".to_string(),
         };
         let runner = SubprocessRunner {
             program: "python".to_string(),
@@ -1867,7 +2323,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_verify(
-            "run-tmux-1",
+            &run_id,
             "build",
             "fake-session",
             &cwd,
@@ -1896,10 +2352,15 @@ mod tests {
             println!("SKIP: tmux and/or python not found on PATH");
             return;
         }
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-cmd");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-cmd",
-            task: "build",
-            session_id: "fake-command-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "fake-command-session".to_string(),
         };
         let runner = SubprocessRunner {
             program: "python".to_string(),
@@ -1909,7 +2370,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_verify(
-            "run-tmux-cmd",
+            &run_id,
             "build",
             "fake-command-session",
             &cwd,
@@ -1935,10 +2396,15 @@ mod tests {
             println!("SKIP: tmux and/or python not found on PATH");
             return;
         }
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-pid");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-pid",
-            task: "build",
-            session_id: "pid-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "pid-session".to_string(),
         };
         let reg = crate::procreg::ProcRegistry::new();
         let runner = SubprocessRunner {
@@ -1948,35 +2414,53 @@ mod tests {
             cartographer: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        // Backstop only — see the identical note on
+        // `registers_pid_while_the_subprocess_is_alive_and_clears_it_after`.
+        // Must stay above `PID_POLL_BUDGET` so a slow-starting session never
+        // races its own timeout-kill against the poll loop (the RAL-171
+        // failure signature); the test itself cancels on observation, so this
+        // value costs no runtime.
         let spec = RunnerSpec::for_command_verify(
-            "run-tmux-pid",
+            &run_id,
             "build",
             "pid-session",
             &cwd,
             "noop",
             "claude",
-            Some(2),
+            Some(120),
         );
-        let worker = std::thread::spawn(move || runner.run(&spec));
+        let run_id_for_poll = run_id.clone();
+        // Cancel once the PID has been observed rather than waiting out
+        // `timeout_sec`: this test's runtime then tracks how long startup
+        // actually took, not the timeout budget, so that budget can be set
+        // generously without making the test slow.
+        let cancel = CancelToken::new();
+        let cancel_for_worker = cancel.clone();
+        let worker = std::thread::spawn(move || runner.run_cancellable(&spec, &cancel_for_worker));
 
         if cfg!(target_os = "windows") {
-            let mut seen = None;
-            for _ in 0..100 {
-                if let Some(pid) = reg.pid_of("run-tmux-pid", "pid-session") {
-                    seen = Some(pid);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            let seen = await_registered_pid(
+                &reg,
+                &run_id_for_poll,
+                "pid-session",
+                &worker,
+                PID_POLL_BUDGET,
+            );
             assert!(
                 seen.is_some(),
                 "PID should be registered while the tmux-wrapped session runs"
             );
+        } else {
+            // No process-table lookup off Windows, so there is nothing to wait
+            // for -- just let the session get far enough to have something to
+            // tear down before cancelling.
+            std::thread::sleep(Duration::from_millis(300));
         }
+        cancel.cancel();
 
         let _ = worker.join();
         assert_eq!(
-            reg.pid_of("run-tmux-pid", "pid-session"),
+            reg.pid_of(&run_id, "pid-session"),
             None,
             "PID should be cleared once the tmux-wrapped session ends"
         );
@@ -1995,15 +2479,17 @@ mod tests {
             println!("SKIP: tmux and/or python not found on PATH");
             return;
         }
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-missing");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-missing",
-            task: "build",
-            session_id: "missing-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "missing-session".to_string(),
         };
         let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz");
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_verify(
-            "run-tmux-missing",
+            &run_id,
             "build",
             "missing-session",
             &cwd,
@@ -2022,10 +2508,12 @@ mod tests {
             println!("SKIP: tmux and/or python not found on PATH");
             return;
         }
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-2");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-2",
-            task: "build",
-            session_id: "hanging-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "hanging-session".to_string(),
         };
         let runner = SubprocessRunner {
             program: "python".to_string(),
@@ -2035,7 +2523,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_verify(
-            "run-tmux-2",
+            &run_id,
             "build",
             "hanging-session",
             &cwd,
@@ -2062,10 +2550,12 @@ mod tests {
             println!("SKIP: tmux and/or python not found on PATH");
             return;
         }
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-3");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-3",
-            task: "build",
-            session_id: "cancel-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "cancel-session".to_string(),
         };
         let runner = SubprocessRunner {
             program: "python".to_string(),
@@ -2075,7 +2565,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_verify(
-            "run-tmux-3",
+            &run_id,
             "build",
             "cancel-session",
             &cwd,
@@ -2144,10 +2634,12 @@ mod tests {
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-reattach");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-reattach",
-            task: "build",
-            session_id: "reattach-session",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "reattach-session".to_string(),
         };
         let store = Store::open_in_memory().expect("open in-memory store");
         let runner = SubprocessRunner {
@@ -2158,7 +2650,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
-            run_id: "run-tmux-reattach".to_string(),
+            run_id: run_id.clone(),
             task: "build".to_string(),
             session_id: "reattach-session".to_string(),
             cwd,
@@ -2175,6 +2667,7 @@ mod tests {
             trace_context: None,
             resume_agent_session_id: None,
             env_overrides: BTreeMap::new(),
+            machine: None,
         };
         let session_name = crate::tmux::session_name(&spec.run_id, &spec.task, &spec.session_id);
 
@@ -2267,10 +2760,12 @@ mod tests {
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-reattach-codex");
         let _cleanup = SnapshotCleanup {
-            run_id: "run-tmux-reattach-codex",
-            task: "build",
-            session_id: "reattach-session-codex",
+            run_id: run_id.clone(),
+            task: "build".to_string(),
+            session_id: "reattach-session-codex".to_string(),
         };
         let store = Store::open_in_memory().expect("open in-memory store");
         let runner = SubprocessRunner {
@@ -2281,7 +2776,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
-            run_id: "run-tmux-reattach-codex".to_string(),
+            run_id: run_id.clone(),
             task: "build".to_string(),
             session_id: "reattach-session-codex".to_string(),
             cwd,
@@ -2298,6 +2793,7 @@ mod tests {
             trace_context: None,
             resume_agent_session_id: None,
             env_overrides: BTreeMap::new(),
+            machine: None,
         };
         let session_name = crate::tmux::session_name(&spec.run_id, &spec.task, &spec.session_id);
 

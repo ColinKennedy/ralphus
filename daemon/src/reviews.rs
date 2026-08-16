@@ -253,6 +253,9 @@ struct Membership {
     /// Optional conflict-resolver backend/model declared on the review.
     agent: Option<String>,
     model: Option<String>,
+    /// The machine this review's worktrees, rebase and conflict resolution run
+    /// on (RAL-185). `None` means the daemon's own host.
+    machine: Option<String>,
 }
 
 /// Build the planner's session/task rows straight from the task file (same order
@@ -294,6 +297,7 @@ fn rows_from_file<'a>(
                 budget_tokens: None,
                 maximum_budget_usd: None,
                 upstream: s.upstream.clone(),
+                machine: ralphus_core::schema::resolve_session_machine(task, s),
             });
             // Collect the session's cwd and its optional review opt-in id.
             sess_info.push((s.cwd.clone(), s.review.as_deref()));
@@ -322,6 +326,88 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                 .collect(),
         })
         .collect()
+}
+
+/// What a remote session contributes to a review, derived without touching the
+/// filesystem (RAL-185 Phase 3b).
+///
+/// A session that ran on another machine keeps its worktree there, so
+/// `worktree_branch` / `worktree_upstream` / `worktree_project` cannot answer
+/// for it — this host has no view of that directory. Every piece is instead
+/// recoverable from what was already declared: the branch from the session's
+/// `ralphus:new-worktree/<branch>` cwd, and the project root from the owning
+/// task's registered `project`. The base is the one thing with no declarative
+/// source, which is why `[[review]] base` exists.
+///
+/// `None` for a local session, which keeps the original inference path.
+struct RemoteDerivation {
+    session_id: String,
+    machine: String,
+    branch: String,
+    project_root: String,
+}
+
+/// Build a [`RemoteDerivation`] for `session`, or `None` when it ran locally.
+///
+/// Each missing piece is its own error rather than a fall-through to the local
+/// inference path: that path runs git against the session's `cwd`, which for a
+/// remote session names a directory on another host — producing an opaque
+/// "directory name is invalid" instead of saying what is actually wrong.
+fn remote_session_derivation(
+    store: &Store,
+    session: &SessionRow,
+    raw_cwd: Option<&str>,
+    task: Option<&TaskRow>,
+) -> std::result::Result<Option<RemoteDerivation>, ReviewError> {
+    let Some(machine) = session
+        .machine
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    else {
+        return Ok(None);
+    };
+    if store
+        .resolve_machine(Some(machine))
+        .is_ok_and(|m| m.is_local())
+    {
+        return Ok(None);
+    }
+    // The branch must come from the *placeholder*, not the resolved cwd: by
+    // this point `resolve_placeholders` has rewritten cwd to a path on the
+    // remote machine, which says nothing about the branch name.
+    let branch = raw_cwd
+        .and_then(ralphus_core::schema::parse_worktree_placeholder)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ReviewError::new(format!(
+                "session \"{}\" runs on machine \"{machine}\" and opts into a review, so its                  branch must be knowable without reading that machine's filesystem. Give it a                  cwd of the form \"ralphus:new-worktree/<branch>\" instead of a literal path.",
+                session.session_id
+            ))
+        })?;
+    let project_name = task.and_then(|t| t.project.as_deref()).ok_or_else(|| {
+        ReviewError::new(format!(
+            "session \"{}\" runs on machine \"{machine}\" and opts into a review, so its              project cannot be discovered from its worktree. Set 'project' on its task.",
+            session.session_id
+        ))
+    })?;
+    let project_root = store
+        .resolve_project(project_name)
+        .ok()
+        .flatten()
+        .map(|p| p.path)
+        .ok_or_else(|| {
+            ReviewError::new(format!(
+                "session \"{}\" references unregistered project \"{project_name}\"",
+                session.session_id
+            ))
+        })?;
+    Ok(Some(RemoteDerivation {
+        session_id: session.session_id.clone(),
+        machine: machine.to_string(),
+        branch,
+        project_root,
+    }))
 }
 
 /// Preflight and materialize the reviews declared in `file` as guardians tagged
@@ -375,6 +461,12 @@ pub fn derive_reviews(
     // `review = "<id>"` of their own.
     let mut explicit_roots: Vec<(PathBuf, String)> = Vec::new();
 
+    // Task rows indexed for the remote-derivation lookup below, which needs the
+    // owning task's `project` (a remote session's project grouping cannot come
+    // from its worktree, since that lives on another machine).
+    let tasks_by_idx: BTreeMap<i64, Option<&TaskRow>> =
+        tasks.iter().map(|t| (t.idx, Some(t))).collect();
+
     let mut memberships: Vec<Membership> = Vec::new();
     for (pos, (_, rev_id_opt)) in sess_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
@@ -385,25 +477,67 @@ pub fn derive_reviews(
             .as_deref()
             .ok_or_else(|| ReviewError::new("a session declaring a review has no cwd"))?;
         let cwd_path = Path::new(cwd);
-        let project =
-            worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-        let branch =
-            worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-        // The base branch is always the worktree's upstream tracking branch.
-        let base = worktree_upstream(cwd_path).map_err(|_| {
-            ReviewError::new(format!(
-                "{cwd}: review base requires an upstream tracking branch for '{branch}', \
-                 but none is configured (set one with 'git branch --set-upstream-to=<branch>')"
-            ))
-        })?;
+        let declared_base = review_map
+            .get(rev_id)
+            .copied()
+            .and_then(|r| r.base.clone())
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+        // RAL-185: a session that ran on another machine keeps its worktree
+        // there, so none of the filesystem reads below can answer for it.
+        // Everything needed is already known declaratively instead: the branch
+        // from its `ralphus:new-worktree/<branch>` cwd, the base from the
+        // review's own `base`, and the project from the owning task.
+        let remote = remote_session_derivation(
+            store,
+            &sessions[pos],
+            sess_info[pos].0.as_deref(),
+            tasks_by_idx.get(&sessions[pos].task_idx).copied().flatten(),
+        )?;
+        let (project, branch, base) = if let Some(rd) = &remote {
+            let base = declared_base.clone().ok_or_else(|| {
+                ReviewError::new(format!(
+                    "review \"{rev_id}\" is fed by session \"{}\" running on machine \"{}\", so \
+                     its base branch cannot be read from that worktree's git upstream — this \
+                     daemon cannot see another machine's filesystem. Declare it explicitly on \
+                     the review: [[review]] base = \"main\".",
+                    rd.session_id, rd.machine
+                ))
+            })?;
+            (PathBuf::from(&rd.project_root), rd.branch.clone(), base)
+        } else {
+            let project =
+                worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+            let branch =
+                worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+            // A declared base wins; otherwise infer it from the worktree's own
+            // upstream, exactly as an all-local review always has.
+            let base = match declared_base.clone() {
+                Some(b) => b,
+                None => worktree_upstream(cwd_path).map_err(|_| {
+                    ReviewError::new(format!(
+                        "{cwd}: review base requires an upstream tracking branch for '{branch}', \
+                         but none is configured (set one with \
+                         'git branch --set-upstream-to=<branch>', or declare it on the review \
+                         as [[review]] base = \"<branch>\")"
+                    ))
+                })?,
+            };
+            (project, branch, base)
+        };
         // Record this session's review branch so the board can link the session
         // back to its review(s) (RAL-17).
         let srow = &sessions[pos];
         store
             .set_session_review_branch(run_id, srow.task_idx, srow.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        if let Ok(root) = worktree_root(cwd_path) {
-            explicit_roots.push((root, branch.clone()));
+        // Only meaningful for a local worktree: a remote session's cwd names a
+        // directory this host cannot stat, and its project grouping already
+        // came from the owning task above.
+        if remote.is_none() {
+            if let Ok(root) = worktree_root(cwd_path) {
+                explicit_roots.push((root, branch.clone()));
+            }
         }
 
         // Look up the top-level review definition by id to get name/agent/model/actions.
@@ -424,6 +558,9 @@ pub fn derive_reviews(
                 .filter(|s| !s.trim().is_empty()),
             model: rv
                 .and_then(|r| r.model.clone())
+                .filter(|s| !s.trim().is_empty()),
+            machine: rv
+                .and_then(|r| r.machine.clone())
                 .filter(|s| !s.trim().is_empty()),
         });
     }
@@ -600,6 +737,14 @@ fn apply_resolver(
     if agent.is_some() || model.is_some() {
         store
             .set_guardian_resolver(gid, agent.as_deref(), model.as_deref())
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-185: where this review's own work runs. Independent of any
+    // contributing task's machine (D3) -- a review may be assigned a machine
+    // none of its tasks used.
+    if let Some(machine) = members.iter().find_map(|m| m.machine.clone()) {
+        store
+            .set_guardian_machine(gid, Some(&machine))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -817,6 +962,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         }
     }
 

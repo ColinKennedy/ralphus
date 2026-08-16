@@ -30,14 +30,23 @@ import argparse
 import re
 from dataclasses import dataclass
 
-__all__ = ["PROJECT_LOOKUP_NOTE", "SUBAGENT_NOTE", "SUBMIT_VALIDATE_NOTE", "generate", "main"]
+__all__ = [
+    "JSON_NOTE",
+    "PROJECT_LOOKUP_NOTE",
+    "SUBAGENT_NOTE",
+    "SUBMIT_REVIEW_NOTE",
+    "SUBMIT_VALIDATE_NOTE",
+    "generate",
+    "main",
+]
 
 _POSITIONAL_SECTION = "positional arguments"
 _OPTIONS_SECTION = "options"
 
 # Guidance surfaced alongside the tree wherever it's shown to an AI agent
-# driving the CLI -- `ralphus show help-map`, `quick-start claude-code`'s
-# injected system prompt, and `ralphus-help-map`'s own stdout. Explains what
+# driving the CLI -- `ralphus show help-map`, the `quick-start manager ...`/
+# `quick-start reviewer ...` injected system prompts (RAL-166), and
+# `ralphus-help-map`'s own stdout. Explains what
 # the inline `[subagent]` tag (see `_SUBAGENT_PATHS`/`_render` below) means;
 # deliberately not folded into `generate()`'s own return value, which stays a
 # pure one-line-per-node tree (see the module docstring and the tests that
@@ -79,14 +88,42 @@ SUBMIT_VALIDATE_NOTE = (
     "same errors sooner and more cheaply."
 )
 
+# Guardian review boundaries follow each `ralphus submit` call: one submit can
+# intentionally mint multiple reviews, and multiple submits can intentionally
+# mint one review each, but new users should not have to infer the default
+# batching recommendation from the more detailed review-linking docs.
+SUBMIT_REVIEW_NOTE = (
+    "Unless the user explicitly asks for a different split, author TOML so each "
+    "`ralphus submit` call produces ONE Guardian review. Multiple reviews are fine when "
+    "intentional; otherwise keep one shared `ralphus:new-review/<key>` across the file(s) in "
+    "that submit instead of fragmenting the batch into per-task reviews."
+)
+
+# `--json` is declared on the root parser (alongside `--daemon-url`), not on
+# any individual subcommand's own parser -- so it never shows up in the tree
+# on a leaf command's own chip line, only on the root `ralphus` line. That's
+# easy to misread as "--json only exists at the top level" or "put it wherever
+# a flag would normally go for that subcommand"; in fact every subcommand
+# accepts it, but only when it precedes the subcommand name on the command
+# line (argparse parses a parent parser's own options before it hands off to
+# a subparser) -- `ralphus --json <command> ...`, never `ralphus <command>
+# --json ...`.
+JSON_NOTE = (
+    "`--json` (emit raw daemon JSON instead of human-readable text) works for every command "
+    "below, even though it's only listed on the root `ralphus` line of the tree -- it's a "
+    "global flag, not a per-command one. It must come BEFORE the subcommand name, not after: "
+    "`ralphus --json <command> ...`, e.g. `ralphus --json status`, not `ralphus status --json`."
+)
+
 # `author` starts its own agentic authoring loop (`ralphus.author`) that
-# writes, validates, and submits a TOML on the caller's behalf, and
-# `quick-start claude-code` launches an entire separate `claude` process.
-# Neither is meant for an AI agent already driving `ralphus` via this
-# help-map to invoke on itself -- the driving agent should write and `submit`
-# TOML directly rather than spinning up a second authoring agent, and should
-# never re-launch its own onboarding flow. Both are excluded from the map
-# entirely rather than left for the driving agent to stumble into.
+# writes, validates, and submits a TOML on the caller's behalf, and every
+# `quick-start manager ...`/`quick-start reviewer ...` entrypoint (RAL-166)
+# launches an entire separate `claude`/`codex` process. Neither is meant for
+# an AI agent already driving `ralphus` via this help-map to invoke on
+# itself -- the driving agent should write and `submit` TOML directly rather
+# than spinning up a second authoring agent, and should never re-launch its
+# own onboarding flow. Both are excluded from the map entirely rather than
+# left for the driving agent to stumble into.
 _HIDDEN_COMMANDS = frozenset({"author", "quick-start"})
 
 # Full command paths (from the root, excluding "ralphus" itself) that get the
@@ -263,6 +300,10 @@ def main() -> None:
     print(PROJECT_LOOKUP_NOTE)
     print()
     print(SUBMIT_VALIDATE_NOTE)
+    print()
+    print(SUBMIT_REVIEW_NOTE)
+    print()
+    print(JSON_NOTE)
     print()
     print(generate())
 

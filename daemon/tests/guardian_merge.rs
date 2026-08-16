@@ -16,6 +16,7 @@ use ralphus_daemon::guardian_merge::{
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
 use ralphus_daemon::store::{NodeState, Store};
+use ralphus_daemon::workspace::Workspace;
 
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -254,7 +255,7 @@ fn rebase_command_progress_reads_synthetic_done_and_todo_files() {
     git(&root, &["commit", "-m", "base"]);
 
     // No rebase in progress yet: `None`, not a spurious `0`/`0`.
-    assert_eq!(rebase_command_progress(&root), None);
+    assert_eq!(rebase_command_progress(&Workspace::local(&root)), None);
 
     // Two commands already done; three queued in the todo file, padded with a
     // blank line and a comment line that must not be counted as commands.
@@ -272,7 +273,10 @@ fn rebase_command_progress_reads_synthetic_done_and_todo_files() {
     )
     .expect("write git-rebase-todo");
 
-    assert_eq!(rebase_command_progress(&root), Some((2, 5)));
+    assert_eq!(
+        rebase_command_progress(&Workspace::local(&root)),
+        Some((2, 5))
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1627,6 +1631,12 @@ command = "cargo test --workspace"
         // during synthesis.
         g.set_session_review_branch(&run_id, 0, 0, "feature/y")
             .unwrap();
+        // RAL-168: "each_branch" scope now also verifies a branch that rebases
+        // cleanly with no conflict at all (feature/x here) -- opt that back out
+        // so this test's single `resolve-verify` spec stays scoped to the
+        // conflict-resolution path (feature/y) it's actually testing.
+        g.set_guardian_verify_skip_auto_clean(&id, Some(true))
+            .unwrap();
         id
     };
 
@@ -1746,8 +1756,9 @@ command = "cargo test --workspace"
         "synthesis system prompt should forbid commit/push:\n{synth_sys}"
     );
 
-    // 3. RAL-149: `verify_mid_resolution` defaults off, so the fix pass's own
-    //    ("resolve") prompt must NOT carry the quality bar...
+    // 3. RAL-168: the fix pass's own ("resolve") prompt never carries the
+    //    quality bar -- that responsibility belongs solely to the dedicated
+    //    final-verify call.
     let resolve = specs
         .iter()
         .find(|s| s.task == "resolve")
@@ -1755,11 +1766,12 @@ command = "cargo test --workspace"
     let resolve_prompt = resolve.prompt.as_deref().unwrap_or("");
     assert!(
         !resolve_prompt.contains(SYNTH_SUMMARY),
-        "fix pass prompt should not carry the quality bar when verify_mid_resolution is off:\n{resolve_prompt}"
+        "fix pass prompt should never carry the quality bar (RAL-168):\n{resolve_prompt}"
     );
 
     // ...it must instead appear in the dedicated final-verify call, which
-    // always runs the quality-bar instructions regardless of that setting.
+    // runs the quality-bar instructions under the default "each_branch"
+    // Verify scope (RAL-168).
     let verify_call = specs
         .iter()
         .find(|s| s.task == "resolve-verify")
@@ -2013,6 +2025,56 @@ fn chat_no_commit_leaves_working_tree_dirty() {
         view2.status, "in_review",
         "guardian status after no-commit chat: {:?}",
         view2.detail
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-169: while a merge/rebase is rebuilding the combined review worktree,
+/// `combined_worktree` in the DB can point at a directory that transiently
+/// doesn't exist. Chat's subprocess-runner fallback must detect that and
+/// reply with a friendly status message instead of spawning the runner
+/// against a missing cwd and leaking a raw filesystem error into the thread.
+#[test]
+fn chat_replies_with_friendly_message_when_workspace_missing() {
+    let (root, store, id) = single_feature_repo();
+    // Use an unsupported resolver agent so call_direct returns Err immediately
+    // and the subprocess fallback path (under test) is used for the triage call.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("noop"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let combined = view
+        .combined_worktree
+        .clone()
+        .expect("combined worktree set");
+    // Simulate the mid-merge window: the worktree directory has been torn
+    // down for a rebuild but the DB still points at its (now missing) path.
+    std::fs::remove_dir_all(&combined).expect("remove combined worktree");
+    assert!(!Path::new(&combined).is_dir());
+
+    run_chat(&store, Arc::new(NoopRunner), &id, "is this stuck?", None);
+
+    let messages = store.lock().unwrap().guardian_messages(&id).unwrap();
+    let reply = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "guardian")
+        .expect("guardian reply recorded");
+    assert!(
+        !reply.text.contains("does not exist") && !reply.text.contains("noop runner"),
+        "raw internal error leaked into chat reply: {:?}",
+        reply.text
+    );
+    assert!(
+        reply.text.to_lowercase().contains("merge")
+            || reply.text.to_lowercase().contains("try again"),
+        "expected a friendly status message, got: {:?}",
+        reply.text
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2991,7 +3053,7 @@ fn move_branch_rebuilds_correctly_in_both_source_and_destination() {
 
     // Same carry-forward purge the HTTP handler (`server::guardian_move_branch`)
     // performs on the source guardian before rebuilding it.
-    purge_worktrees(root.to_str().unwrap(), &r1);
+    purge_worktrees(&store, root.to_str().unwrap(), &r1);
 
     // Rebuild both, exactly as the HTTP handler does.
     run_merge(&store, &NoopRunner, &r1);
@@ -3136,6 +3198,7 @@ fn pydantic_ai_available(runner_cmd: &str) -> bool {
 /// default format), each labelled with the branch's extracted ticket id.
 /// Skips unless ollama + a model + `ralphus-runner` are all available locally.
 #[test]
+#[ignore = "calls a live local Ollama model; run explicitly with `cargo test -- --ignored`"]
 fn generate_summary_live_ollama_produces_one_bullet_per_branch() {
     let Some(runner_cmd) = find_runner() else {
         eprintln!(

@@ -28,7 +28,9 @@ where one exists.
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
 | GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated |
 | GET | `/api/cartographer/{id}` | [One event's full detail](#get-apicartographerid) |
+| GET | `/api/events` | [SSE push stream](#get-apievents-ral-167) — one event per Cartographer write (RAL-167) |
 | GET | `/api/graph` | [Cross-run gating graph](#get-apigraph); `?all=1` includes terminal runs |
+| GET | `/api/resolve` | [Resolve a ralphus URI](#get-apiresolve-ral-188) to positional coordinates; `?uri=` |
 | GET | `/api/ghosts/{owner_uri}` | [Fetch a ghost](#get-apighostsowner_uri) by its owning session/review URI |
 | POST | `/api/ghosts/copy` | [Copy a ghost](#post-apighostscopy) onto another owner, independent of the dependency graph |
 
@@ -312,6 +314,58 @@ repo, without re-registering it. Runs the exact same checks as `POST
 ```
 `404` if no project is registered under that exact name.
 
+### `POST /api/machines`
+Register (or re-register, updating its fields) a **machine provider** (RAL-185)
+— the program the daemon runs to reach machines under one scheme. Lets a task,
+session, verify step or review declare `machine = "<scheme>:<uri>"`; `<uri>` is
+opaque and handed to the provider verbatim.
+
+Request:
+```json
+{ "scheme": "incredibuild", "program": "/opt/ralphus/incredibuild.sh", "description": "build farm", "args": [], "protocol_version": 1 }
+```
+`args` are prepended before the verb, so one program can back several schemes.
+`protocol_version` defaults to the version this daemon implements; a provider
+registered against a different one is refused at dispatch rather than invoked.
+`400` if `scheme` is empty, unusable as a machine scheme (it must be at least
+two characters — a bare drive letter like `C:` is a path, not a machine), a
+built-in (`local`, `ralphus-daemon`), or reserved (`ralphus`, which already
+means the worktree placeholder and the RAL-188 entity URI). Response `201`:
+```json
+{ "scheme": "incredibuild" }
+```
+
+**Registration is deliberately not declarable in a task file.** A provider entry
+names a program the daemon will run, so a TOML that could both *name* and
+*define* one would make `POST /api/runs` equivalent to arbitrary code execution.
+A task file may only ever reference an already-registered scheme.
+
+### `GET /api/machines`
+Every registered provider, plus the built-in schemes that resolve without a
+registry row (so a client doesn't render them as missing).
+
+```json
+{ "machines": [ { "scheme": "incredibuild", "description": "...", "program": "/opt/ib.sh", "args": [], "protocol_version": 1, "created_at_ms": 0 } ],
+  "builtin": ["local", "ralphus-daemon"] }
+```
+
+### `GET /api/machines/{scheme}`
+One registered provider by exact scheme (case-insensitive). `404` if not
+registered — built-in schemes are not returned here, only by the list route.
+
+### `DELETE /api/machines/{scheme}`
+Deregister a provider. `404` if it was not registered. Response `200`:
+```json
+{ "deleted": true }
+```
+Deliberately does **not** check whether any stored run still references the
+scheme: those runs resolved their machines at submit time, so a historical
+record should not block cleaning up the registry. A *new* submission naming a
+deregistered scheme fails at submit.
+
+See [`docs/machine-providers.md`](machine-providers.md) for the provider
+contract (verbs, JSON envelope, versioning) and the publishing model.
+
 ### `POST /api/clear`
 Bulk-delete tasks and reviews (RAL-13).
 
@@ -354,6 +408,28 @@ gating holds each dependent until its upstreams are Done). Response `200`:
 { "state": "pending", "dirtied": ["run-000000000002", "run-000000000003"] }
 ```
 
+Every restart endpoint below (this one, session restart, task restart, and
+the two verify restarts) accepts an optional JSON body attaching a
+human-authored context note to the restart (RAL-174), surfaced to the
+restarted session via the Ghost system (see `GET
+/api/ghosts/{owner_uri}`'s `user_note` above):
+```json
+{ "note": "you were stopped midway through the migration; the schema change is already applied", "apply_to_all": false }
+```
+Both fields are optional; an empty/missing/malformed body is treated as "no
+note" and the restart behaves exactly as it did before this field existed.
+`note` is trimmed and capped to `ghost::MAX_CONTENT_CHARS` (4000 chars).
+`apply_to_all` (default `false`) controls how far the note reaches: **off**
+writes it only onto the exact target(s) this restart directly targets (the
+whole run's sessions for a run restart, the one session for a session
+restart, the task's own sessions for a task restart, the owning session/task
+for a verify restart); **on** additionally writes it onto every session
+downstream of a target within the run's dependency graph — the same
+"children" the restart's own downstream-impact cascade already resets to
+Pending. The note itself never accumulates across restarts (it replaces
+whatever was there before); only the normal agent-authored ghost content
+keeps rolling up as usual.
+
 ### `POST /api/runs/{id}/sessions/{task_idx}/{session_idx}/restart/preview`
 Dry-run preview of
 [`POST /api/runs/{id}/sessions/{task_idx}/{session_idx}/restart`](#post-apirunsidsessionstask_idxsession_idxrestart)
@@ -366,7 +442,9 @@ shape as the run-level preview above. A non-integer index is a `400`.
 Restart a single session: it and every session downstream of it within the run
 reset to Pending (upstream sessions stay Done and are skipped on re-run), the
 run goes back to Pending, and dependent runs are dirtied. Same response shape as
-above. A non-integer index is a `400`.
+above. A non-integer index is a `400`. Accepts the optional `note`/`apply_to_all`
+body documented under [`POST /api/runs/{id}/restart`](#post-apirunsidrestart)
+above (RAL-174) — here the exact target is this one session.
 
 ### `POST /api/runs/{id}/tasks/{task_idx}/restart/preview`
 Dry-run preview of
@@ -383,6 +461,9 @@ downstream of any of them within the run, resets to Pending; the run and each
 affected task go back to Pending; dependent runs are dirtied. The
 task-granularity counterpart of the run/session restarts above — same response
 shape. A non-integer index is a `400`; an unknown task index is a `404`.
+Accepts the optional `note`/`apply_to_all` body documented under
+[`POST /api/runs/{id}/restart`](#post-apirunsidrestart) above (RAL-174) — here
+the exact target is the task's own (directly-owned) sessions.
 
 ### `POST /api/runs/{id}/env`
 Set (`set`) and/or remove (`unset`) persistent environment-variable overrides
@@ -444,6 +525,17 @@ A non-integer task/session index is a `400`; an unknown task/session is a
 the existing `GET /api/runs/{id}` response — there are no separate GET routes
 for these.
 
+**TOML-declared environment (RAL-172):** a `[[task]]`/`[[task.session]]`
+block may set its own `environment` table (`environment = { KEY = "value" }`)
+right in the submitted TOML. `core::validate::validate_toml` enforces the same
+identifier rule as above (`[A-Za-z_][A-Za-z0-9_]*`) plus string-only values
+before the submission is ever accepted. At submit time (`Store::insert_run`)
+this seeds that task's/session's own `env_overrides` row — the exact column
+`POST /api/runs/{id}/tasks/{ti}/env` / `.../sessions/{ti}/{si}/env` write to —
+so from then on a TOML-declared value is indistinguishable from one set later
+via the API, participates in the same `run < task < session` precedence, and
+can be changed or unset the same way.
+
 ### `POST /api/runs/{id}/add-dependency`
 Wire up a manual cross-run dependency after submission (RAL-105), e.g. from the
 board's "Add Dependency" right-click menu. Body:
@@ -460,8 +552,18 @@ the cross-run dependency graph is a `409`; an unknown `id`/`target_id` is a
 `404`; a malformed body is a `400`.
 
 ### `GET /api/guardians/{id}`
-A single review's full detail, including its ordered `branches` list. Each
-branch (`BranchView`) carries two rebase-progress fields (RAL-145):
+A single review's full detail, including its ordered `branches` list.
+
+Each branch also carries `is_empty` (`bool`, RAL-190): `true` when the branch
+rebased cleanly but adds **no diff** over the branch beneath it in the stack.
+That almost always means its task never committed its work — the review then
+reaches `in_review` looking entirely healthy while containing none of that
+task's changes, since verify steps check the *code*, not whether it was
+committed. Deliberately a warning rather than a failure: the branch's
+`merge_status` is still `done`, because a task producing no changes is legal.
+The board renders it as an `⌀ empty` badge on the branch row.
+
+Each branch (`BranchView`) carries two rebase-progress fields (RAL-145):
 `rebase_commands_done` / `rebase_commands_total` (`i64`, both `null` unless
 populated). They're read live, straight from git's own interactive-rebase
 todo-list bookkeeping in that branch's worktree (`rebase-merge/done` and
@@ -473,6 +575,12 @@ always reports `null`/`null`), and even then only when a rebase is actually
 paused/running there — a transient gap right after `--continue`/`--skip`
 (files briefly absent) also reads as `null`/`null` rather than a stale or
 spurious `0`/`0`.
+
+### `POST /api/guardians/{id}/settings`
+Update per-review opt-out/override settings — only the fields present in the
+body are changed, everything else is left as-is. Returns the updated
+`GuardianView`. Most fields are documented by their name alone (see
+`GuardianSettingsBody` in `daemon/src/server.rs` for the exhaustive list).
 
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered
@@ -724,6 +832,57 @@ the `[forge]` config section below) for the full model — the short version is
 `RALPHUS_GITHUB_TOKEN` / `RALPHUS_GITLAB_TOKEN`, or a project-specific name via
 `[forge].token_env`.
 
+### `GET /api/resolve` (RAL-188)
+Translate a **ralphus URI** — the self-describing, name-based addressing form
+documented in [`cli-reference.md`](cli-reference.md#the-ralphus-uri-scheme-ral-188)
+— into the positional coordinates every other route on this page is built on.
+
+```
+GET /api/resolve?uri=ralphus:/RUN[my run]/TASK[ral-178]/SESSION[work]?id=run-000000000151
+```
+
+**Why a query parameter and not a path.** The `/` *between* URI segments
+cannot sit in a REST path segment without percent-encoding as `%2F`, which
+HTTP stacks and proxies routinely normalize or reject. So the URI travels as
+a query value and this endpoint hands back coordinates; the positional routes
+(`/api/runs/{id}/sessions/{ti}/{si}/pane` and friends) are unchanged.
+
+The `uri` value is read as **everything after `uri=` to the end of the query
+string**, because a ralphus URI legitimately contains `?` and `&`
+(`…?id=run-1&combined`). Percent-encoding the whole value works identically.
+No other query parameter may follow it.
+
+Response (`200`), with absent fields omitted:
+
+```json
+{
+  "uri": "ralphus:/RUN[my run]/TASK[ral-178]/SESSION[work]?id=run-000000000151",
+  "kind": "session",
+  "run_id": "run-000000000151",
+  "task_idx": 0,
+  "session_idx": 0,
+  "combined": false
+}
+```
+
+| Field | Notes |
+|---|---|
+| `uri` | The **canonical** URI, rebuilt from the entity's *current* labels and always carrying `?id=`. Resolve a stale or renamed label and you get the fresh form back. |
+| `kind` | `run` \| `task` \| `session` \| `verify` \| `review` |
+| `run_id`, `task_idx`, `session_idx`, `verify_idx` | Positional coordinates for the run family. |
+| `verify_scope` | `task` or `session` — which scope the addressed verify step lives in. |
+| `guardian_id`, `branch_id`, `branch` | Review family; `branch_*` only when `?worktree=` was given. `?worktree=` accepts the branch's label (its feature branch name), its stable `branch-...` id, or `~<position>`; the echoed canonical `uri` always uses the label. |
+| `combined` | The URI addressed the review's combined worktree (`?combined`) rather than one branch. |
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `bad_request` | No `?uri=` parameter. |
+| 400 | `bad_uri` | Malformed URI: unbalanced brackets, unknown segment type or query key, bad percent-escape, a segment sequence that addresses nothing, or `RUN[~N]`/`REVIEW[~N]` (neither has a stable position). |
+| 404 | `not_found` | The URI is well-formed but names no such run/review. |
+| 409 | `ambiguous_uri` | A label or name segment matches more than one candidate, or none. The message lists them; the caller disambiguates with `?id=`. Never silently resolved. |
+
 ### `GET /api/tasks`
 The full board state the librarian polls (every ~2s). Returns all runs with
 their tasks, sessions, and verify steps, plus daemon status. Accepts optional
@@ -747,6 +906,8 @@ keeps the default newest-first order).
         {
           "name": "build",
           "project": "myrepo",
+          "agent": null,
+          "model": null,
           "state": "running",
           "soloed": false,
           "sessions": [ { "id": "session-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "verify": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
@@ -769,6 +930,39 @@ writes back to the task's stored `project` value and has no effect on
 worktree-placeholder resolution, which still requires an explicit, registered
 `project`.
 
+Each `TaskView` also carries raw nullable `agent` and `model` fields: the
+task-level values submitted in TOML, before session inheritance is applied.
+These are distinct from each `SessionView`'s resolved `agent`/`model` fields;
+the board uses the raw task values to explain whether a session's displayed
+resolved value came from the task or was set explicitly on the session.
+
+`tokens_in` / `tokens_out` / `cost_usd` are reported by whichever agent
+backend ran the session or verify step, and how complete they are depends on
+that backend (RAL-187):
+
+- `cost_usd` is `0.0` whenever the backend reported **no dollar figure at
+  all** — it does not mean the work was free. Codex's CLI has no cost field
+  anywhere in its output, and the native pydantic backend does not compute
+  one, so both always report `0.0`; only Claude Code supplies a real
+  `total_cost_usd`. ralphus deliberately does **not** substitute an estimate
+  from a price table here, so a consumer never sees an invented number. The
+  board renders a zero/absent figure as `N/A` rather than `$0.0000 USD` for
+  exactly this reason.
+- Token counts update **while a session is still running**, not only at the
+  end: CLI-agent backends forward a running total over the `RALPHUS_EVENT:`
+  stderr channel as each agent turn completes, which the daemon persists to
+  the session row (see the Logging Policy in `AGENTS.md`). Granularity is
+  therefore per completed turn — both counts read `0` until the first turn
+  finishes. Verify steps have no live channel; their counts appear once the
+  step completes.
+- A session that **fails mid-run** (cancelled, timed out, or its tmux pane
+  died before the runner wrote a result) still reports the tokens it had
+  already spent, carried over from the last live snapshot, rather than
+  collapsing to `0`.
+- The values reflect the session's **current** run only. A restart overwrites
+  them rather than accumulating, so a lifetime total across attempts must be
+  derived from Cartographer's event history instead.
+
 Both *task*-level verify steps (`[[task.verify]]`, on `TaskView.verify`) and
 *session*-level verify steps (`[[task.session.verify]]`, on `SessionView.verify`)
 are exposed here, each in task/session declaration order. A verify entry carries:
@@ -779,6 +973,11 @@ are exposed here, each in task/session declaration order. A verify entry carries
 - `output` — captured output once run; `null` before execution.
 - `spec` — the step definition: command text for `command` kind, prompt text for
   `prompt` / `brain` kind, or empty string for `approval`.
+- `system_prompt` — the read-only effective appended system prompt that the
+  agent actually received for this verify step, including ralphus-added hidden
+  instructions (verify mode, unattended execution, async retry policy, etc.).
+  Omitted for `command` / `brain` / `approval` kinds, and may also be absent on
+  historical rows created before August 15, 2026.
 - `model` — model override for `prompt`-kind steps; `null` when unset.
 
 `command` and `prompt` verify steps actually run (`pending` → `running` →
@@ -800,6 +999,13 @@ and `.../verify/env`) -- see
 [Hierarchical env overrides](#hierarchical-env-overrides-tasksessionverify-layers)
 above for how these merge with the run's. All four are raw unredacted
 `{key: value}` pairs, omitted from the JSON when empty, same as the run's.
+
+For prompt-driven sessions, each `SessionView` may also carry `system_prompt`:
+the read-only effective appended system prompt the agent actually received,
+including ralphus-added hidden instructions (unattended execution, async retry
+policy, ghost handoff, and any stored session/subproject addendum). It is
+omitted for command sessions, and may also be absent on historical rows created
+before August 15, 2026.
 
 ### `GET /api/resources`
 Per-task OS resource usage for the board's Resources tab (RAL-11). One entry per
@@ -996,6 +1202,40 @@ every 10 minutes by the scheduler.
 One Cartographer row's full detail, by its `id`. `404` if it does not exist
 (e.g. already pruned).
 
+### `GET /api/events` (RAL-167)
+A long-lived Server-Sent Events (SSE) stream: the daemon's primary push
+mechanism for `board.html`, replacing its old fixed-interval polling. One
+event is emitted for every [`GET /api/cartographer`](#get-apicartographer) row
+written — i.e. every task/run/session/guardian/queue state change, verify
+start/result, and Guardian review lifecycle event already flowing through
+Cartographer — so this endpoint has no separate instrumentation of its own to
+keep in sync. The queue view is a derived, filtered projection over
+run/task state, so a `run`-kind event also implies "the queue may have
+changed."
+
+Each event's `data:` payload is exactly one Cartographer row (same shape as
+`GET /api/cartographer`'s `rows[]` entries above); its SSE `event:` name is
+one of three kinds, derived from which entity references the row carries:
+
+| `event:` name | When |
+|---|---|
+| `guardian` | The row carries a `guardian_id` — a review changed (branches, chat, checks, merge/rebase state, ...). |
+| `run` | The row carries a `run_id` but no `guardian_id` — a run/task/session (and, by extension, the queue view) changed. |
+| `other` | Neither — still Cartographer-worthy, but not scoped to one run or guardian (e.g. daemon-wide startup recovery events). |
+
+A connection with nothing to report for 15s receives an SSE comment line
+(`: heartbeat`) instead, so idle proxies/browsers don't decide it's dead. The
+librarian proxies this endpoint straight through to the browser byte-for-byte
+(see `librarian/src/server.rs::proxy_events_stream`) rather than inventing its
+own event model — the daemon is the source of truth for state changes.
+
+This is a fan-out broadcast, not a queryable log: a subscriber only sees
+events published *after* it connects (use `GET /api/cartographer` for
+history/backfill), and a slow/stalled client's channel (bounded, capacity
+256) silently drops events past that bound rather than blocking the rest of
+the daemon — `board.html`'s own 60s reconciliation poll (a `tick()` fallback,
+not the primary path) covers any resulting gap.
+
 ### `GET /api/ghosts/{owner_uri}`
 Fetch one "ghost" (RAL-136) — a short, best-effort handoff note a task
 session or Guardian review worktree published for whoever picks up dependent
@@ -1025,6 +1265,7 @@ resolver restarts.
   "run_id": "run-000000000001",
   "guardian_id": null,
   "content": "Left the retry loop untuned -- the 3rd flaky test case needs a longer backoff.",
+  "user_note": "you were stopped midway through the migration; the schema change is already applied",
   "revision": "a1b2c3d4",
   "created_at_ms": 1732300000000,
   "updated_at_ms": 1732300000000
@@ -1038,6 +1279,16 @@ prior ghost, and its direct dependencies' ghosts (one level up in the task
 graph only), are already injected into its prompt automatically at session
 start; this endpoint is for explicit lookups beyond that (tooling, the CLI,
 one review branch checking another's notes).
+
+`user_note` (RAL-174) is free-form text a human attaches when triggering a
+restart via the board's restart popup — see the `note`/`apply_to_all` body
+documented on the restart endpoints below. Unlike `content`, it is *not*
+merged/accumulated on repeated writes: each restart's note replaces whatever
+was there before, while `content` keeps rolling up as usual. `null` when no
+one has ever attached a restart note. When present, it's injected into the
+restarted session's prompt as its own distinct line at the very bottom of the
+prior-context block (after every agent-authored note, never interleaved with
+it).
 
 ### `POST /api/ghosts/copy`
 Explicitly copy `source_uri`'s ghost onto `target_uri`, independent of the
@@ -1097,6 +1348,62 @@ tables of its own:
   /api/guardians/{id}` (for a review/review-worktree selector) endpoint once
   a second until the resolved entity's status equals the caller-supplied
   `--until` value, then exits. No log/tmux content is involved.
+
+### Live View liveness signal (RAL-170)
+
+Every `GET .../pane` response (`GET .../sessions/{ti}/{si}/pane`, `GET
+.../verifies/{ti}/{scope}/{si}/{vi}/pane`, `GET
+.../guardians/{id}/branches/{branch_id}/pane`, `GET
+.../guardians/{id}/manual-checks/pane`) carries a `last_activity_ms` field
+alongside `active`/`content`:
+
+```json
+{ "active": true, "content": "...", "last_activity_ms": 1739400000123 }
+```
+
+`last_activity_ms` is the Unix-epoch-milliseconds time the daemon last
+observed *fresh* pane output (strictly more lines than the previous poll)
+for this session — `null` once the session has ended or before it has
+produced any output yet. The board's Live View ("peek box") uses it to show
+an absolute "last activity" timestamp and to distinguish a quiet-but-healthy
+long-running command (e.g. a `cargo test` pass inside a Guardian
+quality-check) from one that has silently stopped producing output.
+
+**Design decision: tracked continuously, daemon-side, in-memory only —
+not on-demand only while a Live View is open.**
+`SubprocessRunner::run_via_tmux_attempt` already polls every running
+tmux-wrapped session's pane on a fixed 500ms cadence regardless of whether
+any client is watching (it needs to, to detect the completion sentinel and
+forward `RALPHUS_EVENT:` marker lines) — RAL-170 piggybacks on that existing
+poll, storing the timestamp as an in-process `Store` field
+(`Store::note_live_activity`/`live_activity_ms`/`clear_live_activity`,
+`daemon/src/store.rs`) keyed by the same deterministic `crate::tmux::session_name`
+used for task sessions, verify steps, and Guardian resolver/manual-check
+sessions alike. Two consequences of that choice:
+
+- **Always fresh when read.** Because tracking never depends on a Live View
+  being open, there's no "stale from before the view opened" problem to
+  solve — the value read by any `GET .../pane` call is whatever the poll
+  loop most recently observed, full stop.
+- **Deliberately not a DB column.** A SQLite `UPDATE` on every pane-growth
+  tick would scale with the number of *concurrently running* sessions —
+  fine at "hundreds" (a few hundred writes/sec against the single
+  `Store` mutex, comfortably inside SQLite WAL throughput), a real
+  contention/write-amplification risk at "thousands" sharing that one
+  mutex, for a value nobody needs once the process exits. An in-process
+  `HashMap<String, i64>` entry is a pointer-sized insert instead of a WAL
+  write, and is removed (`clear_live_activity`) as soon as the owning
+  `run_via_tmux` call returns for good — so memory stays bounded by
+  currently-running sessions, not lifetime history, and the write cost is
+  independent of how many Live Views happen to be open (zero, one, or many
+  clients polling the same pane all read the same already-computed value).
+
+If the "thousands of concurrent processes" scale is ever actually reached
+and the per-tick `HashMap` insert itself becomes measurable (unlikely — it's
+already gated to at most once per 500ms per session by the same poll
+interval that drives event forwarding), the next step would be debouncing
+the insert further (e.g. only update if the value has advanced by more than
+some threshold), not switching to persistent storage.
 
 ## Notes on future evolution
 

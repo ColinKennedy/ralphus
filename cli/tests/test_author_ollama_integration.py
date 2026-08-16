@@ -5,8 +5,9 @@ simple goal (and validates it offline when a ralphus-daemon binary is around).
 Skipped when pydantic-ai is absent or Ollama is unreachable; fails only if Ollama
 is up but the model is missing — matching ``test_ollama_integration.py``.
 
-Run it explicitly with the runner extra:
-    uv run --extra runner pytest -k author_ollama
+Deselected by default (see `addopts` in cli/pyproject.toml). Run it explicitly
+with the runner extra:
+    uv run --extra runner pytest -m ollama -k author_ollama
 """
 
 from __future__ import annotations

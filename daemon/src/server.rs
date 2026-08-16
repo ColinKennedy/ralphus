@@ -5,13 +5,17 @@
 //! blocking `tiny_http` loop and runs the scheduler on a second thread; both
 //! share the store through an `Arc<Mutex<Store>>`.
 
+use std::collections::{BTreeSet, HashSet};
+use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{SpanKind, Status};
+use ralphus_core::uri::{RalphusUri, Segment, Token, parse_uri};
 use ralphus_core::validate::{ValidationError, validate_toml};
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +191,40 @@ struct ProjectsResponse {
     projects: Vec<crate::store::ProjectView>,
 }
 
+/// `POST /api/machines` body (RAL-185). Registering a machine provider is an
+/// administrative action, deliberately reachable only over this endpoint (and
+/// the CLI wrapping it) and never declarable inside a submitted task file —
+/// see `crate::machines` for why.
+#[derive(Deserialize)]
+struct RegisterMachineBody {
+    scheme: String,
+    #[serde(default)]
+    description: String,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_protocol_version")]
+    protocol_version: i64,
+    /// Whether this provider implements the `channel` verb (RAL-185 D7).
+    /// Defaults false — a provider is spawned per command unless it says
+    /// otherwise.
+    #[serde(default)]
+    supports_channel: bool,
+}
+
+fn default_protocol_version() -> i64 {
+    crate::machines::PROTOCOL_VERSION
+}
+
+#[derive(Serialize)]
+struct MachinesResponse {
+    machines: Vec<crate::machines::MachineProviderView>,
+    /// Schemes that always resolve without a registry row (`local`,
+    /// `ralphus-daemon`), so a client can render them alongside the
+    /// registered ones instead of appearing to be missing.
+    builtin: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct ProjectValidateResponse {
     valid: bool,
@@ -279,6 +317,12 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "projects"]) => register_project(daemon, body),
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
+        // Machine provider registry (RAL-185).
+        ("GET", ["api", "machines"]) => list_machines(daemon),
+        ("POST", ["api", "machines"]) => register_machine(daemon, body),
+        ("GET", ["api", "machines", scheme]) => get_machine(daemon, scheme),
+        ("DELETE", ["api", "machines", scheme]) => deregister_machine(daemon, scheme),
+        ("POST", ["api", "machines", scheme, "check"]) => check_machine(daemon, scheme),
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "cartographer"]) => cartographer_query(daemon, query),
         ("GET", ["api", "cartographer", id]) => cartographer_get(daemon, id),
@@ -291,6 +335,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "queue", "reorder"]) => queue_reorder(daemon, body),
         ("POST", ["api", "queue", "set-position"]) => queue_set_position(daemon, body),
         ("GET", ["api", "graph"]) => global_graph(daemon, query),
+        ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "runs", id]) => get_run(daemon, id),
         ("GET", ["api", "runs", id, "worktrees"]) => run_worktrees(daemon, id),
         ("GET", ["api", "runs", id, "logs"]) => run_logs(daemon, id),
@@ -302,13 +347,13 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "runs", id, "edit"]) => edit_run(daemon, id, body),
         ("POST", ["api", "runs", id, "retry"]) => retry_run(daemon, id),
         ("POST", ["api", "runs", id, "restart", "preview"]) => restart_run_preview(daemon, id),
-        ("POST", ["api", "runs", id, "restart"]) => restart_run(daemon, id),
+        ("POST", ["api", "runs", id, "restart"]) => restart_run(daemon, id, body),
         ("POST", ["api", "runs", id, "add-dependency"]) => add_dependency(daemon, id, body),
         ("POST", ["api", "runs", id, "sessions", ti, si, "restart", "preview"]) => {
             restart_session_preview(daemon, id, ti, si)
         }
         ("POST", ["api", "runs", id, "sessions", ti, si, "restart"]) => {
-            restart_session(daemon, id, ti, si)
+            restart_session(daemon, id, ti, si, body)
         }
         (
             "POST",
@@ -323,14 +368,14 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
                 vi,
                 "restart",
             ],
-        ) => restart_session_verify(daemon, id, ti, si, vi),
+        ) => restart_session_verify(daemon, id, ti, si, vi, body),
         ("POST", ["api", "runs", id, "tasks", ti, "verify", vi, "restart"]) => {
-            restart_task_verify(daemon, id, ti, vi)
+            restart_task_verify(daemon, id, ti, vi, body)
         }
         ("POST", ["api", "runs", id, "tasks", ti, "restart", "preview"]) => {
             restart_task_preview(daemon, id, ti)
         }
-        ("POST", ["api", "runs", id, "tasks", ti, "restart"]) => restart_task(daemon, id, ti),
+        ("POST", ["api", "runs", id, "tasks", ti, "restart"]) => restart_task(daemon, id, ti, body),
         ("POST", ["api", "runs", id, "env"]) => set_run_env(daemon, id, body),
         ("POST", ["api", "runs", id, "tasks", ti, "verify", "env"]) => {
             set_task_verify_env(daemon, id, ti, body)
@@ -710,6 +755,186 @@ fn validate_projects_registered(
     Ok(())
 }
 
+/// Require the declarative inputs a remote-fed review needs, before anything is
+/// provisioned (RAL-185 Phase 3b).
+///
+/// A review normally *infers* each contributing branch and its base by running
+/// the VCS against the session's worktree. That read only works on the machine
+/// holding it, so a review fed by a remote session must instead be told:
+///
+/// - the branch, via a `ralphus:new-worktree/<branch>` cwd, and
+/// - the base, via `[[review]] base`.
+///
+/// Checked here rather than inside `crate::reviews::derive_reviews` so it fails
+/// before the provider is asked to provision a workspace — a missing `base` is
+/// a static authoring mistake, and there is no reason to spend a remote
+/// checkout discovering it. `derive_reviews` keeps its own equivalent errors as
+/// a backstop for paths that don't come through submit.
+fn validate_remote_reviews_are_declarative(
+    store: &Store,
+    file: &ralphus_core::schema::TaskFile,
+) -> std::result::Result<(), String> {
+    for task in &file.task {
+        for (idx, session) in task.session.iter().enumerate() {
+            let Some(review_id) = session.review.as_deref().filter(|r| !r.trim().is_empty()) else {
+                continue;
+            };
+            let machine = ralphus_core::schema::resolve_session_machine(task, session);
+            if store
+                .resolve_machine(machine.as_deref())
+                .is_ok_and(|m| m.is_local())
+            {
+                continue;
+            }
+            let sid = session
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("session-{idx}"));
+            let machine_label = machine.as_deref().unwrap_or("local");
+            if session
+                .cwd
+                .as_deref()
+                .and_then(ralphus_core::schema::parse_worktree_placeholder)
+                .is_none()
+            {
+                return Err(format!(
+                    "session \"{sid}\" runs on machine \"{machine_label}\" and opts into review                      \"{review_id}\", so its branch must be knowable without reading that                      machine's filesystem. Give it a cwd of the form                      \"ralphus:new-worktree/<branch>\" instead of a literal path."
+                ));
+            }
+            let declared = file
+                .review
+                .iter()
+                .find(|r| r.id.as_deref() == Some(review_id))
+                .and_then(|r| r.base.as_deref())
+                .map(str::trim)
+                .filter(|b| !b.is_empty());
+            if declared.is_none() {
+                return Err(format!(
+                    "review \"{review_id}\" is fed by session \"{sid}\" running on machine                      \"{machine_label}\", so its base branch cannot be read from that worktree's                      upstream — this daemon cannot see another machine's filesystem. Declare it                      explicitly: [[review]] base = \"main\"."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enforce the within-task machine affinity rule (RAL-185 Phase 3a).
+///
+/// Every session under one task — and every verify step under those sessions,
+/// plus the task's own verify steps — must resolve to the **same** machine.
+/// A task is one unit of work sharing one workspace: sessions hand off through
+/// files on disk, and a task-scope verify runs against whatever its sessions
+/// produced. Splitting that across machines would silently verify an empty or
+/// stale directory.
+///
+/// Different *tasks* may freely use different machines, and a review's machine
+/// is independent of all of them — that is what makes a fan-out across a build
+/// farm possible in the first place.
+///
+/// Checked at submit rather than discovered at run time: by the point the
+/// scheduler noticed, the first session would already have run somewhere.
+fn validate_machine_affinity(
+    file: &ralphus_core::schema::TaskFile,
+) -> std::result::Result<(), String> {
+    for task in &file.task {
+        // The task's own value is the baseline every member must agree with;
+        // when it is unset, the first session that names one sets the
+        // expectation for the rest.
+        let mut expected: Option<(String, String)> = task
+            .machine
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| (m.to_string(), format!("task \"{}\"", task.name)));
+
+        let mut check = |machine: Option<String>,
+                         whose: String|
+         -> std::result::Result<(), String> {
+            let Some(m) = machine.filter(|m| !m.trim().is_empty()) else {
+                return Ok(());
+            };
+            match &expected {
+                Some((first, first_whose)) if first != &m => Err(format!(
+                    "task \"{}\" spans two machines: {first_whose} runs on \"{first}\" but {whose} \
+                     runs on \"{m}\". Every session and verify step under one task must resolve to \
+                     the same machine — they share one workspace, so splitting them would verify a \
+                     directory the other half never wrote to. Different tasks may use different \
+                     machines.",
+                    task.name
+                )),
+                Some(_) => Ok(()),
+                None => {
+                    expected = Some((m, whose));
+                    Ok(())
+                }
+            }
+        };
+
+        for (idx, session) in task.session.iter().enumerate() {
+            let sid = session
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("session-{idx}"));
+            check(
+                ralphus_core::schema::resolve_session_machine(task, session),
+                format!("session \"{sid}\""),
+            )?;
+            for (vi, verify) in session.verify.iter().enumerate() {
+                check(
+                    ralphus_core::schema::resolve_session_verify_machine(task, session, verify),
+                    format!("session \"{sid}\" verify step #{vi}"),
+                )?;
+            }
+        }
+        for (vi, verify) in task.verify.iter().enumerate() {
+            check(
+                ralphus_core::schema::resolve_task_verify_machine(task, verify),
+                format!("task verify step #{vi}"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_machines_registered(
+    store: &Store,
+    file: &ralphus_core::schema::TaskFile,
+) -> std::result::Result<(), String> {
+    let check = |machine: Option<&str>, whose: &str| -> std::result::Result<(), String> {
+        store
+            .resolve_machine(machine)
+            .map(|_| ())
+            .map_err(|e| format!("{whose}: {e}"))
+    };
+    for task in &file.task {
+        check(task.machine.as_deref(), &format!("task \"{}\"", task.name))?;
+        for verify in &task.verify {
+            check(
+                verify.machine.as_deref(),
+                &format!("task \"{}\" verify step", task.name),
+            )?;
+        }
+        for session in &task.session {
+            let sid = session.id.as_deref().unwrap_or("<unnamed>");
+            check(
+                session.machine.as_deref(),
+                &format!("task \"{}\" session \"{sid}\"", task.name),
+            )?;
+            for verify in &session.verify {
+                check(
+                    verify.machine.as_deref(),
+                    &format!("task \"{}\" session \"{sid}\" verify step", task.name),
+                )?;
+            }
+        }
+    }
+    for review in &file.review {
+        let rid = review.id.as_deref().unwrap_or("<unnamed>");
+        check(review.machine.as_deref(), &format!("review \"{rid}\""))?;
+    }
+    Ok(())
+}
+
 /// Validate a project's on-disk path/vcs kind without persisting anything.
 /// Shared by `register_project` (validate-then-write) and the read-only
 /// `GET /api/projects/{name}/validate` endpoint (validate-only, RAL-101) so
@@ -758,6 +983,149 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
         .register_project(&req.name, &req.description, &req.path, &req.vcs)
     {
         Ok(()) => json(201, &serde_json::json!({"name": req.name})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/machines`: register (or update) a machine provider (RAL-185).
+fn register_machine(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<RegisterMachineBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"scheme\" and \"program\" strings",
+            vec![],
+        );
+    };
+    let scheme = req.scheme.trim();
+    if scheme.is_empty() {
+        return error(400, "invalid_value", "'scheme' must not be empty", vec![]);
+    }
+    // The scheme has to be parseable as the left half of a `machine` value, or
+    // it could be registered but never referenceable.
+    if let Err(e) = ralphus_core::schema::parse_machine(&format!("{scheme}:probe")) {
+        return error(
+            400,
+            "invalid_value",
+            &format!("'scheme' {scheme:?} is not a usable machine scheme ({e:?})"),
+            vec![],
+        );
+    }
+    if crate::machines::is_unregistrable_scheme(scheme) {
+        return error(
+            400,
+            "invalid_value",
+            &format!(
+                "'{scheme}' cannot be registered: built-in schemes are {}, and {} are reserved for other meanings",
+                crate::machines::BUILTIN_SCHEMES.join(", "),
+                crate::machines::RESERVED_SCHEMES.join(", ")
+            ),
+            vec![],
+        );
+    }
+    if req.program.trim().is_empty() {
+        return error(400, "invalid_value", "'program' must not be empty", vec![]);
+    }
+    match daemon.lock().register_machine_provider(
+        scheme,
+        &req.description,
+        req.program.trim(),
+        &req.args,
+        req.protocol_version,
+        req.supports_channel,
+    ) {
+        Ok(()) => json(201, &serde_json::json!({"scheme": scheme.to_lowercase()})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/machines/{scheme}/check`: probe a provider for reachability
+/// (RAL-185 Q3).
+///
+/// Explicit and on demand rather than polled: a probe spawns the provider
+/// program, and a board refreshing every couple of seconds must not turn that
+/// into steady load on a build farm. The result is stored, so the tab shows the
+/// last known answer with its timestamp instead of implying live truth.
+///
+/// The built-in `local` scheme is not probeable — the daemon's own host is
+/// reachable by definition, and pretending otherwise would be theatre.
+fn check_machine(daemon: &Daemon, scheme: &str) -> Reply {
+    let provider = {
+        let store = daemon.lock();
+        match crate::remote_runner::provider_from_store(&store, &format!("{scheme}:probe")) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return json(
+                    200,
+                    &serde_json::json!({"ok": true, "note": "local host — always reachable"}),
+                );
+            }
+            Err(e) => return error(400, "invalid_value", &e, vec![]),
+        }
+    };
+    // A probe belongs to no run; the spec exists only to satisfy the invocation
+    // shape (env overrides, ids for the provider's own logging).
+    let spec = crate::runner::RunnerSpec::for_command_verify(
+        "machine-check",
+        "machine-check",
+        scheme,
+        ".",
+        "",
+        "claude",
+        Some(30),
+    );
+    let (ok, note) = match provider.ping(&spec) {
+        Ok(detail) => (true, detail),
+        Err(e) => (false, Some(e)),
+    };
+    {
+        let store = daemon.lock();
+        let _ = store.record_machine_check(scheme, ok, note.as_deref());
+    }
+    json(200, &serde_json::json!({"ok": ok, "note": note}))
+}
+
+/// `GET /api/machines`: every registered provider plus the built-in schemes.
+fn list_machines(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_machine_providers() {
+        Ok(machines) => json(
+            200,
+            &MachinesResponse {
+                machines,
+                builtin: crate::machines::BUILTIN_SCHEMES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            },
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/machines/{scheme}`.
+fn get_machine(daemon: &Daemon, scheme: &str) -> Reply {
+    match daemon.lock().get_machine_provider(scheme) {
+        Ok(Some(m)) => json(200, &m),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("machine provider \"{scheme}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/machines/{scheme}`.
+fn deregister_machine(daemon: &Daemon, scheme: &str) -> Reply {
+    match daemon.lock().deregister_machine_provider(scheme) {
+        Ok(true) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("machine provider \"{scheme}\" is not registered"),
+            vec![],
+        ),
         Err(e) => store_error(&e),
     }
 }
@@ -854,6 +1222,21 @@ fn submit(daemon: &Daemon, body: &str) -> Reply {
         return error(400, "project_validation_failed", &msg, vec![]);
     }
 
+    // Every `machine` value must name a registered provider at a supported
+    // contract version (RAL-185). Core validated the syntax offline; only the
+    // daemon can see the registry.
+    if let Err(msg) = validate_machines_registered(&daemon.lock(), &file) {
+        return error(400, "machine_validation_failed", &msg, vec![]);
+    }
+    // Phase 3a: every session/verify under one task must share a machine.
+    if let Err(msg) = validate_machine_affinity(&file) {
+        return error(400, "machine_validation_failed", &msg, vec![]);
+    }
+    // Phase 3b: a remote-fed review must declare what cannot be discovered.
+    if let Err(msg) = validate_remote_reviews_are_declarative(&daemon.lock(), &file) {
+        return error(400, "machine_validation_failed", &msg, vec![]);
+    }
+
     let mut store = daemon.lock();
     let run_id = match store.insert_run(&file, req.label.as_deref(), req.hold) {
         Ok(id) => id,
@@ -883,6 +1266,458 @@ fn get_run(daemon: &Daemon, id: &str) -> Reply {
     match daemon.lock().get_run(id) {
         Ok(run) => json(200, &run),
         Err(e) => store_error(&e),
+    }
+}
+
+// ── RAL-188: ralphus URI resolution ──────────────────────────────────────────
+
+/// The positional coordinates a ralphus URI resolves to — the addressing the
+/// rest of this API is built on (`/api/runs/{id}/sessions/{ti}/{si}/pane` and
+/// friends).
+///
+/// RAL-188 §C.7: the URI itself can never *be* a REST path, because the `/`
+/// between its segments cannot sit in a path segment without percent-encoding
+/// as `%2F` (routinely normalized or rejected by HTTP stacks and proxies). So
+/// it travels as a query value and this endpoint hands back the coordinates;
+/// every existing positional route is untouched.
+#[derive(Serialize)]
+struct ResolvedUri {
+    /// The canonical URI for whatever was resolved, rebuilt from the entity's
+    /// *current* labels and always carrying the `?id=` sidecar (§C.3). A
+    /// caller that resolved a stale/renamed label gets the fresh form back.
+    uri: String,
+    /// `run` | `task` | `session` | `verify` | `review`.
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_idx: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_idx: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_idx: Option<usize>,
+    /// `task` or `session` — which scope the addressed verify step lives in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guardian_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    /// The URI addressed the review's combined worktree (`?combined`) rather
+    /// than one stacked branch.
+    combined: bool,
+}
+
+impl ResolvedUri {
+    fn new(kind: &str, uri: String) -> Self {
+        Self {
+            uri,
+            kind: kind.to_string(),
+            run_id: None,
+            task_idx: None,
+            session_idx: None,
+            verify_idx: None,
+            verify_scope: None,
+            guardian_id: None,
+            branch_id: None,
+            branch: None,
+            combined: false,
+        }
+    }
+}
+
+/// A URI was well-formed but did not resolve. Carried separately from
+/// [`UriError`] so a *parse* failure (400) and an *ambiguous or missing entity*
+/// (404 / 409) get different status codes.
+struct ResolveError {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+fn not_found(message: String) -> ResolveError {
+    ResolveError {
+        status: 404,
+        code: "not_found",
+        message,
+    }
+}
+
+fn ambiguous(message: String) -> ResolveError {
+    ResolveError {
+        status: 409,
+        code: "ambiguous_uri",
+        message,
+    }
+}
+
+/// Read the `uri=` query value, taking **everything after it** rather than
+/// stopping at the next `&`.
+///
+/// A ralphus URI legitimately contains `&` (`?id=…&combined`), and callers
+/// hand-writing one by pasting it into a URL is the common case this scheme
+/// exists to support. Percent-encoded input works identically, since `%26`
+/// simply decodes back to `&`. Any trailing `&key=` a caller appends therefore
+/// becomes part of the URI and fails loudly as an unknown query key rather
+/// than being silently dropped.
+fn uri_query_value(query: &str) -> Option<&str> {
+    if let Some(rest) = query.strip_prefix("uri=") {
+        return Some(rest);
+    }
+    query.find("&uri=").map(|at| &query[at + 5..])
+}
+
+/// The addressable name for each verify step: its author-supplied `id`, or
+/// empty for an anonymous step — addressable only as `~N` (RAL-188 §C.4).
+fn verify_candidates(steps: &[crate::store::VerifyView]) -> Vec<String> {
+    steps
+        .iter()
+        .map(|s| s.id.clone().unwrap_or_default())
+        .collect()
+}
+
+/// Find the run a `RUN[label]` segment names when the URI carried no `?id=`.
+///
+/// Matches a run's label *or* its id, since a run with no label renders as its
+/// id (§C.2). Ambiguity lists the candidates and points at `?id=`; it is never
+/// silently resolved to the most recent (§C.3).
+fn run_id_for_label(store: &MutexGuard<'_, Store>, label: &str) -> Result<String, ResolveError> {
+    let runs = store.list_runs().map_err(|e| ResolveError {
+        status: 500,
+        code: "internal",
+        message: e.to_string(),
+    })?;
+    let matches: Vec<&crate::store::RunView> = runs
+        .iter()
+        .filter(|r| r.id == label || r.label.as_deref() == Some(label))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(not_found(format!("no run labelled '{label}'"))),
+        [only] => Ok(only.id.clone()),
+        many => {
+            let ids: Vec<&str> = many.iter().map(|r| r.id.as_str()).collect();
+            Err(ambiguous(format!(
+                "'{label}' matches {} runs ({}) -- add '?id=<run id>' to say which one",
+                many.len(),
+                ids.join(", ")
+            )))
+        }
+    }
+}
+
+/// Rebuild the canonical URI for a resolved run-family entity from the run's
+/// current names, falling back to `~N` at any level that has no name of its own.
+fn canonical_run_uri(
+    run: &crate::store::RunView,
+    task_idx: Option<usize>,
+    session_idx: Option<usize>,
+    verify_idx: Option<usize>,
+) -> String {
+    let label = run
+        .label
+        .clone()
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| run.id.clone());
+    let mut segments = vec![Segment::named("RUN", label)];
+    if let Some(ti) = task_idx {
+        segments.push(match run.tasks.get(ti) {
+            Some(t) if !t.name.is_empty() => Segment::named("TASK", t.name.clone()),
+            _ => Segment::positional("TASK", ti),
+        });
+        let steps = if let Some(si) = session_idx {
+            let session = run.tasks.get(ti).and_then(|t| t.sessions.get(si));
+            segments.push(match session {
+                Some(s) => {
+                    let name = s
+                        .name
+                        .clone()
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| s.id.clone());
+                    if name.is_empty() {
+                        Segment::positional("SESSION", si)
+                    } else {
+                        Segment::named("SESSION", name)
+                    }
+                }
+                None => Segment::positional("SESSION", si),
+            });
+            session.map(|s| s.verify.as_slice()).unwrap_or_default()
+        } else {
+            run.tasks
+                .get(ti)
+                .map(|t| t.verify.as_slice())
+                .unwrap_or_default()
+        };
+        if let Some(vi) = verify_idx {
+            segments.push(match steps.get(vi).and_then(|s| s.id.as_deref()) {
+                Some(id) if !id.is_empty() => Segment::named("VERIFY", id),
+                _ => Segment::positional("VERIFY", vi),
+            });
+        }
+    }
+    RalphusUri {
+        segments,
+        query: vec![("id".to_string(), Some(run.id.clone()))],
+    }
+    .to_string()
+}
+
+fn resolve_run_uri(
+    store: &MutexGuard<'_, Store>,
+    uri: &RalphusUri,
+) -> Result<ResolvedUri, ResolveError> {
+    let run_seg = uri
+        .segment("RUN")
+        .ok_or_else(|| not_found("no RUN[...] segment".to_string()))?;
+    if run_seg.index.is_some() {
+        return Err(ResolveError {
+            status: 400,
+            code: "bad_uri",
+            message: "RUN[~N] is not addressable -- a run has no stable position. \
+                      Use its label or id (and ideally '?id=<run id>')."
+                .to_string(),
+        });
+    }
+    let run_id = match uri.id() {
+        Some(id) => id.to_string(),
+        None => run_id_for_label(store, run_seg.name.as_deref().unwrap_or(""))?,
+    };
+    let run = store
+        .get_run(&run_id)
+        .map_err(|_| not_found(format!("no run '{run_id}'")))?;
+
+    let Some(task_seg) = uri.segment("TASK") else {
+        let mut out = ResolvedUri::new("run", canonical_run_uri(&run, None, None, None));
+        out.run_id = Some(run.id.clone());
+        return Ok(out);
+    };
+    let task_names: Vec<String> = run.tasks.iter().map(|t| t.name.clone()).collect();
+    let task_idx = task_seg
+        .token()
+        .resolve(&task_names, "task")
+        .map_err(|e| ambiguous(e.to_string()))?;
+    let task = &run.tasks[task_idx];
+
+    let verify_seg = uri.segment("VERIFY");
+    let Some(session_seg) = uri.segment("SESSION") else {
+        // No SESSION segment: either the task itself, or one of its own
+        // task-scope verify steps.
+        let Some(verify_seg) = verify_seg else {
+            let mut out =
+                ResolvedUri::new("task", canonical_run_uri(&run, Some(task_idx), None, None));
+            out.run_id = Some(run.id.clone());
+            out.task_idx = Some(task_idx);
+            return Ok(out);
+        };
+        let verify_idx = verify_seg
+            .token()
+            .resolve(&verify_candidates(&task.verify), "task verify")
+            .map_err(|e| ambiguous(e.to_string()))?;
+        let mut out = ResolvedUri::new(
+            "verify",
+            canonical_run_uri(&run, Some(task_idx), None, Some(verify_idx)),
+        );
+        out.run_id = Some(run.id.clone());
+        out.task_idx = Some(task_idx);
+        out.verify_idx = Some(verify_idx);
+        out.verify_scope = Some("task".to_string());
+        return Ok(out);
+    };
+
+    let session_names: Vec<String> = task
+        .sessions
+        .iter()
+        .map(|s| {
+            s.name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| s.id.clone())
+        })
+        .collect();
+    let session_idx = session_seg
+        .token()
+        .resolve(&session_names, "session")
+        .map_err(|e| ambiguous(e.to_string()))?;
+
+    let Some(verify_seg) = verify_seg else {
+        let mut out = ResolvedUri::new(
+            "session",
+            canonical_run_uri(&run, Some(task_idx), Some(session_idx), None),
+        );
+        out.run_id = Some(run.id.clone());
+        out.task_idx = Some(task_idx);
+        out.session_idx = Some(session_idx);
+        return Ok(out);
+    };
+    let session = &task.sessions[session_idx];
+    let verify_idx = verify_seg
+        .token()
+        .resolve(&verify_candidates(&session.verify), "session verify")
+        .map_err(|e| ambiguous(e.to_string()))?;
+    let mut out = ResolvedUri::new(
+        "verify",
+        canonical_run_uri(&run, Some(task_idx), Some(session_idx), Some(verify_idx)),
+    );
+    out.run_id = Some(run.id.clone());
+    out.task_idx = Some(task_idx);
+    out.session_idx = Some(session_idx);
+    out.verify_idx = Some(verify_idx);
+    out.verify_scope = Some("session".to_string());
+    Ok(out)
+}
+
+fn resolve_review_uri(
+    store: &MutexGuard<'_, Store>,
+    uri: &RalphusUri,
+) -> Result<ResolvedUri, ResolveError> {
+    let seg = uri
+        .segment("REVIEW")
+        .ok_or_else(|| not_found("no REVIEW[...] segment".to_string()))?;
+    if seg.index.is_some() {
+        return Err(ResolveError {
+            status: 400,
+            code: "bad_uri",
+            message: "REVIEW[~N] is not addressable -- a review has no stable position. \
+                      Use its name or id (and ideally '?id=<guardian id>')."
+                .to_string(),
+        });
+    }
+    let name = seg.name.clone().unwrap_or_default();
+    let guardian_id = match uri.id() {
+        Some(id) => id.to_string(),
+        None => {
+            let guardians = store.list_guardians().map_err(|e| ResolveError {
+                status: 500,
+                code: "internal",
+                message: e.to_string(),
+            })?;
+            let matches: Vec<&crate::guardian::GuardianView> = guardians
+                .iter()
+                .filter(|g| g.id == name || g.name == name)
+                .collect();
+            match matches.as_slice() {
+                [] => {
+                    let options: Vec<&str> = guardians.iter().map(|g| g.name.as_str()).collect();
+                    let options = if options.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        options.join(", ")
+                    };
+                    return Err(not_found(format!(
+                        "no review named '{name}' (available: {options})"
+                    )));
+                }
+                [only] => only.id.clone(),
+                many => {
+                    let ids: Vec<&str> = many.iter().map(|g| g.id.as_str()).collect();
+                    return Err(ambiguous(format!(
+                        "'{name}' matches {} reviews -- add '?id=<guardian id>' to say which one ({})",
+                        many.len(),
+                        ids.join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    let guardian = store
+        .get_guardian(&guardian_id)
+        .map_err(|_| not_found(format!("no review '{guardian_id}'")))?;
+
+    let display = if guardian.name.is_empty() {
+        guardian.id.clone()
+    } else {
+        guardian.name.clone()
+    };
+    let mut query = vec![("id".to_string(), Some(guardian.id.clone()))];
+    let combined = uri.has("combined");
+
+    let Some(worktree) = uri.get("worktree") else {
+        if combined {
+            query.push(("combined".to_string(), None));
+        }
+        let canonical = RalphusUri {
+            segments: vec![Segment::named("REVIEW", display)],
+            query,
+        }
+        .to_string();
+        let mut out = ResolvedUri::new("review", canonical);
+        out.guardian_id = Some(guardian.id.clone());
+        out.combined = combined;
+        return Ok(out);
+    };
+
+    let token = Token::parse(worktree).map_err(|e| ResolveError {
+        status: 400,
+        code: "bad_uri",
+        message: format!("'?worktree={worktree}': {e}"),
+    })?;
+    let branch = match &token {
+        // A branch's `position` is a display/reorder attribute, so `~N` means
+        // "the branch currently at position N", matched against `position`
+        // rather than the vector index they normally agree with.
+        Token::Index(position) => guardian
+            .branches
+            .iter()
+            .find(|b| usize::try_from(b.position).ok() == Some(*position))
+            .ok_or_else(|| not_found(format!("no branch at position {position} in this review")))?,
+        // A worktree's label is its feature branch name -- what the Reviews UI
+        // lists it under. Its stable id (`branch-000000000001`, RAL-122) is
+        // accepted too, mirroring §C.2's "the label, falling back to its id"
+        // at every other level of the grammar; an id match wins outright,
+        // since ids are unique and a branch name need not be.
+        Token::Name(name) => match guardian.branches.iter().find(|b| &b.id == name) {
+            Some(by_id) => by_id,
+            None => {
+                let names: Vec<String> =
+                    guardian.branches.iter().map(|b| b.branch.clone()).collect();
+                let idx = token
+                    .resolve(&names, "branch")
+                    .map_err(|e| ambiguous(e.to_string()))?;
+                &guardian.branches[idx]
+            }
+        },
+    };
+
+    query.push(("worktree".to_string(), Some(branch.branch.clone())));
+    let canonical = RalphusUri {
+        segments: vec![Segment::named("REVIEW", display)],
+        query,
+    }
+    .to_string();
+    let mut out = ResolvedUri::new("review", canonical);
+    out.guardian_id = Some(guardian.id.clone());
+    out.branch_id = Some(branch.id.clone());
+    out.branch = Some(branch.branch.clone());
+    Ok(out)
+}
+
+/// `GET /api/resolve?uri=<ralphus URI>` — turn a RAL-188 URI into the
+/// positional coordinates the rest of this API speaks (§C.7).
+fn resolve_uri_endpoint(daemon: &Daemon, query: &str) -> Reply {
+    let Some(raw) = uri_query_value(query) else {
+        return error(
+            400,
+            "bad_request",
+            "GET /api/resolve needs a '?uri=' parameter",
+            vec![],
+        );
+    };
+    let decoded = url_decode(raw);
+    let uri = match parse_uri(&decoded) {
+        Ok(uri) => uri,
+        Err(e) => return error(400, "bad_uri", &e.to_string(), vec![]),
+    };
+    let store = daemon.lock();
+    let result = if uri.kinds().first() == Some(&"REVIEW") {
+        resolve_review_uri(&store, &uri)
+    } else {
+        resolve_run_uri(&store, &uri)
+    };
+    match result {
+        Ok(resolved) => json(200, &resolved),
+        Err(e) => error(e.status, e.code, &e.message, vec![]),
     }
 }
 
@@ -1021,6 +1856,7 @@ fn cartographer_query(daemon: &Daemon, query: &str) -> Reply {
         run_id: query_filter(query, "run_id"),
         guardian_id: query_filter(query, "guardian_id"),
         session_id: query_filter(query, "session_id"),
+        task: query_filter(query, "task"),
         q: query_filter(query, "q"),
         since_ms: query_param(query, "since_ms").and_then(|s| s.parse::<i64>().ok()),
         until_ms: query_param(query, "until_ms").and_then(|s| s.parse::<i64>().ok()),
@@ -1546,6 +2382,55 @@ struct RestartResponse {
     dirtied: Vec<String>,
 }
 
+/// A human-authored restart note (RAL-174), parsed from a restart endpoint's
+/// JSON body: `{"note": "...", "apply_to_all": false}`. Both fields are
+/// optional and an empty/malformed body parses to the all-defaults case (no
+/// note, narrow scope) — restarting without opting into this feature must
+/// behave exactly as it did before (ticket AC).
+#[derive(Deserialize, Default)]
+struct RestartNoteBody {
+    #[serde(default)]
+    note: Option<String>,
+    /// The "Apply To All Children" checkbox: when set, the note is written to
+    /// every session downstream of the restart's target(s) within the run,
+    /// not just the exact target(s).
+    #[serde(default)]
+    apply_to_all: bool,
+}
+
+impl RestartNoteBody {
+    fn parse(body: &str) -> Self {
+        if body.trim().is_empty() {
+            return Self::default();
+        }
+        serde_json::from_str(body).unwrap_or_default()
+    }
+
+    /// The note text to attach, trimmed and capped to the same size ghost
+    /// content is capped to (`ghost::MAX_CONTENT_CHARS`) so arbitrarily long
+    /// user input can't blow up prompt construction. `None` when the user
+    /// left the box blank — callers skip writing a ghost note entirely.
+    fn trimmed_note(&self) -> Option<String> {
+        let note = self.note.as_deref()?.trim();
+        if note.is_empty() {
+            return None;
+        }
+        Some(note.chars().take(crate::ghost::MAX_CONTENT_CHARS).collect())
+    }
+}
+
+/// Attach a restart note (if any) to the session(s) a restart request
+/// targets. Best-effort: by the time this runs the restart's own state
+/// transition has already succeeded, so a failure to write the (purely
+/// advisory) ghost note must never fail the restart response itself.
+fn apply_restart_note(daemon: &Daemon, run_id: &str, roots: &[(i64, i64)], req: &RestartNoteBody) {
+    if let Some(note) = req.trimmed_note() {
+        let _ = daemon
+            .lock()
+            .apply_restart_user_note(run_id, roots, req.apply_to_all, &note);
+    }
+}
+
 /// Block until `run_id`'s in-flight worker (if any) has actually exited,
 /// bounded so a wedged worker can never hang the HTTP thread forever.
 ///
@@ -1584,11 +2469,13 @@ fn wait_for_worker_stop(daemon: &Daemon, run_id: &str) {
 /// [`wait_for_worker_stop`] for why cancelling alone isn't enough: this stops
 /// the old worker *and* waits for it to actually exit before the restart's
 /// fresh claim can begin.
-fn restart_run(daemon: &Daemon, id: &str) -> Reply {
+fn restart_run(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let note_req = RestartNoteBody::parse(body);
     // Stop every worker this restart is about to touch — the target run and
     // everything it will dirty — *before* any of them are reset to Pending,
     // so no old worker can still be mid-poll when the fresh claim lands.
-    if let Ok(impact) = daemon.lock().compute_run_restart_impact(id) {
+    let impact = daemon.lock().compute_run_restart_impact(id);
+    if let Ok(impact) = &impact {
         for dep in &impact.dirtied_runs {
             daemon.cancellations.cancel(&dep.id);
         }
@@ -1598,14 +2485,34 @@ fn restart_run(daemon: &Daemon, id: &str) -> Reply {
     }
     daemon.cancellations.cancel(id);
     wait_for_worker_stop(daemon, id);
-    match daemon.lock().restart_run(id) {
-        Ok(dirtied) => json(
-            200,
-            &RestartResponse {
-                state: "pending",
-                dirtied,
-            },
-        ),
+    // Bound to a `let` (not matched directly) so the `MutexGuard` `.lock()`
+    // returns is dropped at the end of *this* statement -- matching on
+    // `daemon.lock().restart_run(id)` directly would keep that guard alive
+    // for the whole arm body below (Rust extends a match scrutinee's
+    // temporaries to the arm), and `apply_restart_note` below takes its own
+    // lock, which would then deadlock against the still-held one.
+    let restarted = daemon.lock().restart_run(id);
+    match restarted {
+        Ok(dirtied) => {
+            // A whole-run restart's target IS every session in the run — there
+            // is no narrower "exact target" to restrict to, so the note always
+            // reaches all of them regardless of "Apply To All Children".
+            if let Ok(impact) = &impact {
+                let roots: Vec<(i64, i64)> = impact
+                    .sessions
+                    .iter()
+                    .map(|s| (s.task_idx, s.idx))
+                    .collect();
+                apply_restart_note(daemon, id, &roots, &note_req);
+            }
+            json(
+                200,
+                &RestartResponse {
+                    state: "pending",
+                    dirtied,
+                },
+            )
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -1669,7 +2576,8 @@ fn restart_run_preview(daemon: &Daemon, id: &str) -> Reply {
 /// that; `claim_ready` (`scheduler.rs`) now defers re-claiming a `Pending`
 /// run until any worker still registered for it exits naturally, so this
 /// stays double-dispatch-safe even without the cancel.
-fn restart_session(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+fn restart_session(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Reply {
+    let note_req = RestartNoteBody::parse(body);
     let (Ok(task_idx), Ok(session_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
         return error(
             400,
@@ -1700,14 +2608,21 @@ fn restart_session(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
         daemon.cancellations.cancel(id);
         wait_for_worker_stop(daemon, id);
     }
-    match daemon.lock().restart_session(id, task_idx, session_idx) {
-        Ok(dirtied) => json(
-            200,
-            &RestartResponse {
-                state: "pending",
-                dirtied,
-            },
-        ),
+    // See `restart_run`'s comment on why this is a `let` and not matched
+    // directly -- `apply_restart_note` below takes its own lock, which would
+    // deadlock against a guard still held by the match scrutinee.
+    let restarted = daemon.lock().restart_session(id, task_idx, session_idx);
+    match restarted {
+        Ok(dirtied) => {
+            apply_restart_note(daemon, id, &[(task_idx, session_idx)], &note_req);
+            json(
+                200,
+                &RestartResponse {
+                    state: "pending",
+                    dirtied,
+                },
+            )
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -1739,11 +2654,13 @@ fn restart_session_preview(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Rep
 /// [`wait_for_worker_stop`]'s doc comment for why the owning run's worker
 /// (and every run this restart dirties) must be cancelled *and waited out*
 /// first.
-fn restart_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+fn restart_task(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let note_req = RestartNoteBody::parse(body);
     let Ok(task_idx) = ti.parse::<i64>() else {
         return error(400, "bad_request", "task index must be an integer", vec![]);
     };
-    if let Ok(impact) = daemon.lock().compute_task_restart_impact(id, task_idx) {
+    let impact = daemon.lock().compute_task_restart_impact(id, task_idx);
+    if let Ok(impact) = &impact {
         for dep in &impact.dirtied_runs {
             daemon.cancellations.cancel(&dep.id);
         }
@@ -1753,14 +2670,33 @@ fn restart_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
     }
     daemon.cancellations.cancel(id);
     wait_for_worker_stop(daemon, id);
-    match daemon.lock().restart_task(id, task_idx) {
-        Ok(dirtied) => json(
-            200,
-            &RestartResponse {
-                state: "pending",
-                dirtied,
-            },
-        ),
+    // See `restart_run`'s comment on why this is a `let` and not matched
+    // directly -- `apply_restart_note` below takes its own lock, which would
+    // deadlock against a guard still held by the match scrutinee.
+    let restarted = daemon.lock().restart_task(id, task_idx);
+    match restarted {
+        Ok(dirtied) => {
+            // The task's own (directly-owned) sessions are exactly the ones
+            // in `impact.sessions` with this task_idx — every session
+            // downstream of them (possibly in other tasks) is a "child" only
+            // reached when "Apply To All Children" is set.
+            if let Ok(impact) = &impact {
+                let roots: Vec<(i64, i64)> = impact
+                    .sessions
+                    .iter()
+                    .filter(|s| s.task_idx == task_idx)
+                    .map(|s| (s.task_idx, s.idx))
+                    .collect();
+                apply_restart_note(daemon, id, &roots, &note_req);
+            }
+            json(
+                200,
+                &RestartResponse {
+                    state: "pending",
+                    dirtied,
+                },
+            )
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -1785,7 +2721,15 @@ fn restart_task_preview(daemon: &Daemon, id: &str, ti: &str) -> Reply {
 /// targeted verify steps is actually still `Running` — see that function's
 /// doc comment for why an unconditional cancel collaterally kills unrelated
 /// sibling sessions in the same run (RAL-1xx).
-fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &str) -> Reply {
+fn restart_session_verify(
+    daemon: &Daemon,
+    id: &str,
+    ti: &str,
+    si: &str,
+    vi: &str,
+    body: &str,
+) -> Reply {
+    let note_req = RestartNoteBody::parse(body);
     let (Ok(task_idx), Ok(session_idx), Ok(verify_from)) =
         (ti.parse::<i64>(), si.parse::<i64>(), vi.parse::<i64>())
     else {
@@ -1804,10 +2748,13 @@ fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &st
         daemon.cancellations.cancel(id);
         wait_for_worker_stop(daemon, id);
     }
-    match daemon
+    // See `restart_run`'s comment on why this is a `let` and not matched
+    // directly -- `apply_restart_note` below takes its own lock, which would
+    // deadlock against a guard still held by the match scrutinee.
+    let restarted = daemon
         .lock()
-        .restart_session_verify(id, task_idx, session_idx, verify_from)
-    {
+        .restart_session_verify(id, task_idx, session_idx, verify_from);
+    match restarted {
         Ok(dirtied) => {
             // No precomputed-impact endpoint exists for verify restarts, so
             // (unlike restart_run/restart_session above) dependents can only
@@ -1818,6 +2765,7 @@ fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &st
                 daemon.cancellations.cancel(dep_id);
                 wait_for_worker_stop(daemon, dep_id);
             }
+            apply_restart_note(daemon, id, &[(task_idx, session_idx)], &note_req);
             json(
                 200,
                 &RestartResponse {
@@ -1838,7 +2786,8 @@ fn restart_session_verify(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &st
 /// targeted verify steps is actually still `Running` — see that function's
 /// doc comment for why an unconditional cancel collaterally kills unrelated
 /// sibling sessions in the same run (RAL-1xx).
-fn restart_task_verify(daemon: &Daemon, id: &str, ti: &str, vi: &str) -> Reply {
+fn restart_task_verify(daemon: &Daemon, id: &str, ti: &str, vi: &str, body: &str) -> Reply {
+    let note_req = RestartNoteBody::parse(body);
     let (Ok(task_idx), Ok(verify_from)) = (ti.parse::<i64>(), vi.parse::<i64>()) else {
         return error(
             400,
@@ -1855,11 +2804,31 @@ fn restart_task_verify(daemon: &Daemon, id: &str, ti: &str, vi: &str) -> Reply {
         daemon.cancellations.cancel(id);
         wait_for_worker_stop(daemon, id);
     }
-    match daemon.lock().restart_task_verify(id, task_idx, verify_from) {
+    // See `restart_run`'s comment on why this is a `let` and not matched
+    // directly -- both `sessions_of` and `apply_restart_note` below take
+    // their own lock, which would deadlock against a guard still held by the
+    // match scrutinee.
+    let restarted = daemon.lock().restart_task_verify(id, task_idx, verify_from);
+    match restarted {
         Ok(dirtied) => {
             for dep_id in &dirtied {
                 daemon.cancellations.cancel(dep_id);
                 wait_for_worker_stop(daemon, dep_id);
+            }
+            // The task's own directly-owned sessions -- mirrors restart_task
+            // above (no separate impact-preview endpoint exists here, so
+            // filter sessions_of directly instead of an already-computed
+            // impact set).
+            // Same `let`-before-`if let` reasoning as above: `sessions_of`'s
+            // guard must be dropped before `apply_restart_note` takes its own.
+            let sessions = daemon.lock().sessions_of(id);
+            if let Ok(sessions) = sessions {
+                let roots: Vec<(i64, i64)> = sessions
+                    .iter()
+                    .filter(|s| s.task_idx == task_idx)
+                    .map(|s| (s.task_idx, s.idx))
+                    .collect();
+                apply_restart_note(daemon, id, &roots, &note_req);
             }
             json(
                 200,
@@ -1938,22 +2907,40 @@ struct OpenTerminalResponse {
 /// if one exists — a read-only historical record of what the pane last
 /// showed, not fresh output — or empty if the session never ran under tmux
 /// at all. The board distinguishes the two by whether `content` is non-empty.
+///
+/// `last_activity_ms` (RAL-170) is the Unix-epoch-milliseconds time the
+/// daemon last observed *fresh* pane output (more lines than the previous
+/// poll) for this session — the liveness signal that lets the Live View
+/// distinguish "still working, just quiet" from "hasn't produced a line in
+/// a suspiciously long time". Tracked continuously and in-memory by
+/// `SubprocessRunner::run_via_tmux_attempt` for every running tmux-wrapped
+/// session regardless of whether a Live View is open (see
+/// `Store::note_live_activity`'s doc comment for the scale tradeoff behind
+/// that decision) — so this is always fresh at the moment it's read, never
+/// backfilled or stale from before the view opened. `None` when the session
+/// has produced no output yet, or has already ended (`active: false` here
+/// too, in that case).
 #[derive(Serialize)]
 struct PaneResponse {
     active: bool,
     content: String,
+    last_activity_ms: Option<i64>,
 }
 
 /// An inactive [`PaneResponse`] falling back to the persisted snapshot for
 /// `session_name`, if one exists — shared by every "no live session" branch
 /// in [`capture_pane_reply`] so the read-only historical record degrades the
-/// same way regardless of *why* the session isn't live right now.
+/// same way regardless of *why* the session isn't live right now. Liveness
+/// tracking (RAL-170) only covers currently-running sessions (see
+/// `Store::clear_live_activity`), so `last_activity_ms` is always `None`
+/// here.
 fn inactive_pane_reply(session_name: &str) -> Reply {
     json(
         200,
         &PaneResponse {
             active: false,
             content: crate::tmux::read_pane_snapshot(session_name).unwrap_or_default(),
+            last_activity_ms: None,
         },
     )
 }
@@ -1964,7 +2951,13 @@ fn inactive_pane_reply(session_name: &str) -> Reply {
 /// failure (no binary available at all) is the only case reported as a real
 /// error, since that reflects a daemon configuration problem rather than
 /// "this run finished".
-fn capture_pane_reply(run_id: &str, task: &str, session_id: &str, query: &str) -> Reply {
+fn capture_pane_reply(
+    daemon: &Daemon,
+    run_id: &str,
+    task: &str,
+    session_id: &str,
+    query: &str,
+) -> Reply {
     let lines: u32 = query_param(query, "lines")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
@@ -1982,6 +2975,7 @@ fn capture_pane_reply(run_id: &str, task: &str, session_id: &str, query: &str) -
             &PaneResponse {
                 active: true,
                 content,
+                last_activity_ms: daemon.lock().live_activity_ms(&name),
             },
         ),
         Err(_) => inactive_pane_reply(&name),
@@ -2275,7 +3269,7 @@ fn session_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> R
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    capture_pane_reply(id, &task, &session_id, query)
+    capture_pane_reply(daemon, id, &task, &session_id, query)
 }
 
 /// The `(run_id, session_id)` pair a `prompt`-kind verify step's tmux session
@@ -2393,7 +3387,7 @@ fn verify_pane(
         Err(e) => return store_error(&e),
     };
     let (run_id, session_id) = verify_tmux_keys(id, scope, verify_idx);
-    capture_pane_reply(&run_id, &task, &session_id, query)
+    capture_pane_reply(daemon, &run_id, &task, &session_id, query)
 }
 
 /// Open a terminal for a review branch.
@@ -2622,7 +3616,7 @@ fn guardian_branch_pane(daemon: &Daemon, id: &str, branch_id: &str, query: &str)
         Ok(v) => v,
         Err(e) => return e,
     };
-    capture_pane_reply(&format!("guardian-{id}"), task, &session_id, query)
+    capture_pane_reply(daemon, &format!("guardian-{id}"), task, &session_id, query)
 }
 
 /// Live list of files with unresolved merge conflicts (`git diff
@@ -2684,8 +3678,10 @@ fn guardian_branch_conflicts(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
     json(
         200,
         &BranchConflictsView {
-            files: crate::guardian_merge::conflicted_files(wt),
-            rebase_in_progress: crate::guardian_merge::rebase_in_progress(wt),
+            files: crate::guardian_merge::conflicted_files(&crate::workspace::Workspace::local(wt)),
+            rebase_in_progress: crate::guardian_merge::rebase_in_progress(
+                &crate::workspace::Workspace::local(wt),
+            ),
         },
     )
 }
@@ -2726,6 +3722,7 @@ fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply 
         return error(404, "not_found", "no such guardian", vec![]);
     }
     capture_pane_reply(
+        daemon,
         &format!("guardian-{id}"),
         crate::guardian_merge::MANUAL_COMMANDS_TASK,
         crate::guardian_merge::MANUAL_COMMANDS_SESSION,
@@ -3031,7 +4028,7 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
     )
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SetStatusBody {
     kind: String,
     #[serde(default)]
@@ -3045,20 +4042,308 @@ struct SetStatusBody {
     state: String,
 }
 
-/// The tmux pane name(s) and owning-session index that a manual status-set
-/// (RAL-163) on a task/session/verify step must capture and stop, or `None`
-/// if the target doesn't resolve to a real node. Each entry is `(pane_name,
-/// ghost_session_idx)` — the session index whose ghost the captured pane
-/// content is folded into (see [`crate::ghost::session_uri`]), which is not
-/// always the same index as the pane itself (a task-scope verify step's pane
-/// is keyed by [`verify_tmux_keys`], but its ghost is still attributed to the
-/// task's first session, mirroring [`Store::get_task_first_session_cwd`]'s
-/// established "task-scope step ~ its task's first session" convention).
-fn stop_targets_for_status_change(
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StopTarget {
+    pane_name: String,
+    ghost_task_idx: i64,
+    ghost_session_idx: i64,
+}
+
+#[derive(Default)]
+struct StopCascadePlan {
+    state_tasks: BTreeSet<i64>,
+    state_sessions: BTreeSet<(i64, i64)>,
+    state_verifies: BTreeSet<(i64, String, i64, i64)>,
+    stop_sessions: BTreeSet<(i64, i64)>,
+    stop_verifies: BTreeSet<(i64, String, i64, i64)>,
+}
+
+impl StopCascadePlan {
+    fn add_task_state(&mut self, task_idx: i64) {
+        self.state_tasks.insert(task_idx);
+    }
+
+    fn add_session(&mut self, task_idx: i64, session_idx: i64) {
+        self.state_sessions.insert((task_idx, session_idx));
+        self.stop_sessions.insert((task_idx, session_idx));
+    }
+
+    fn add_verify(&mut self, task_idx: i64, scope: &str, session_idx: i64, verify_idx: i64) {
+        let key = (task_idx, scope.to_string(), session_idx, verify_idx);
+        self.state_verifies.insert(key.clone());
+        self.stop_verifies.insert(key);
+    }
+
+    fn state_requests(&self) -> Vec<SetStatusBody> {
+        let mut reqs = Vec::new();
+        for &task_idx in &self.state_tasks {
+            reqs.push(SetStatusBody {
+                kind: "task".to_string(),
+                task_idx,
+                session_idx: 0,
+                verify_idx: 0,
+                verify_scope: String::new(),
+                state: "cancelled".to_string(),
+            });
+        }
+        for &(task_idx, session_idx) in &self.state_sessions {
+            reqs.push(SetStatusBody {
+                kind: "session".to_string(),
+                task_idx,
+                session_idx,
+                verify_idx: 0,
+                verify_scope: String::new(),
+                state: "cancelled".to_string(),
+            });
+        }
+        for (task_idx, scope, session_idx, verify_idx) in &self.state_verifies {
+            reqs.push(SetStatusBody {
+                kind: "verify".to_string(),
+                task_idx: *task_idx,
+                session_idx: *session_idx,
+                verify_idx: *verify_idx,
+                verify_scope: scope.clone(),
+                state: "cancelled".to_string(),
+            });
+        }
+        reqs
+    }
+
+    fn stop_requests(&self) -> Vec<SetStatusBody> {
+        let mut reqs = Vec::new();
+        for &(task_idx, session_idx) in &self.stop_sessions {
+            reqs.push(SetStatusBody {
+                kind: "session".to_string(),
+                task_idx,
+                session_idx,
+                verify_idx: 0,
+                verify_scope: String::new(),
+                state: "cancelled".to_string(),
+            });
+        }
+        for (task_idx, scope, session_idx, verify_idx) in &self.stop_verifies {
+            reqs.push(SetStatusBody {
+                kind: "verify".to_string(),
+                task_idx: *task_idx,
+                session_idx: *session_idx,
+                verify_idx: *verify_idx,
+                verify_scope: scope.clone(),
+                state: "cancelled".to_string(),
+            });
+        }
+        reqs
+    }
+}
+
+fn add_verify_range(
+    store: &Store,
+    run_id: &str,
+    plan: &mut StopCascadePlan,
+    task_idx: i64,
+    scope: &str,
+    session_idx: i64,
+    from_idx: i64,
+) -> Result<(), StoreError> {
+    let start = usize::try_from(from_idx).unwrap_or(usize::MAX);
+    for (verify_idx, _) in store
+        .verifies_for(run_id, task_idx, scope, session_idx)?
+        .iter()
+        .enumerate()
+        .skip(start)
+    {
+        plan.add_verify(
+            task_idx,
+            scope,
+            session_idx,
+            i64::try_from(verify_idx).unwrap_or(i64::MAX),
+        );
+    }
+    Ok(())
+}
+
+fn all_task_sessions(
+    store: &Store,
+    run_id: &str,
+    task_idx: i64,
+) -> Result<Vec<(i64, i64)>, StoreError> {
+    Ok(store
+        .get_task_session_ids(run_id, task_idx)?
+        .into_iter()
+        .map(|(session_idx, _)| (task_idx, session_idx))
+        .collect())
+}
+
+fn stop_cascade_plan(
     store: &Store,
     run_id: &str,
     req: &SetStatusBody,
-) -> Vec<(String, i64)> {
+) -> Result<StopCascadePlan, StoreError> {
+    let mut plan = StopCascadePlan::default();
+    match req.kind.as_str() {
+        "task" => {
+            let impact = store.compute_task_restart_impact(run_id, req.task_idx)?;
+            for task in impact.tasks {
+                plan.add_task_state(task.idx);
+                add_verify_range(store, run_id, &mut plan, task.idx, "task", -1, 0)?;
+            }
+            for session in impact.sessions {
+                plan.add_session(session.task_idx, session.idx);
+                add_verify_range(
+                    store,
+                    run_id,
+                    &mut plan,
+                    session.task_idx,
+                    "session",
+                    session.idx,
+                    0,
+                )?;
+            }
+        }
+        "session" => {
+            let impact =
+                store.compute_session_restart_impact(run_id, req.task_idx, req.session_idx)?;
+            for task in impact.tasks {
+                plan.add_task_state(task.idx);
+                add_verify_range(store, run_id, &mut plan, task.idx, "task", -1, 0)?;
+            }
+            for session in impact.sessions {
+                plan.add_session(session.task_idx, session.idx);
+                add_verify_range(
+                    store,
+                    run_id,
+                    &mut plan,
+                    session.task_idx,
+                    "session",
+                    session.idx,
+                    0,
+                )?;
+            }
+        }
+        "verify" if req.verify_scope == "session" => {
+            let impact =
+                store.compute_session_restart_impact(run_id, req.task_idx, req.session_idx)?;
+            for task in &impact.tasks {
+                plan.add_task_state(task.idx);
+                add_verify_range(store, run_id, &mut plan, task.idx, "task", -1, 0)?;
+            }
+            add_verify_range(
+                store,
+                run_id,
+                &mut plan,
+                req.task_idx,
+                "session",
+                req.session_idx,
+                req.verify_idx,
+            )?;
+            for session in impact.sessions {
+                if session.task_idx == req.task_idx && session.idx == req.session_idx {
+                    continue;
+                }
+                plan.add_session(session.task_idx, session.idx);
+                add_verify_range(
+                    store,
+                    run_id,
+                    &mut plan,
+                    session.task_idx,
+                    "session",
+                    session.idx,
+                    0,
+                )?;
+            }
+        }
+        "verify" if req.verify_scope == "task" => {
+            let impact = store.compute_task_restart_impact(run_id, req.task_idx)?;
+            for task in &impact.tasks {
+                plan.add_task_state(task.idx);
+            }
+            add_verify_range(
+                store,
+                run_id,
+                &mut plan,
+                req.task_idx,
+                "task",
+                -1,
+                req.verify_idx,
+            )?;
+            for task in impact.tasks {
+                if task.idx == req.task_idx {
+                    continue;
+                }
+                add_verify_range(store, run_id, &mut plan, task.idx, "task", -1, 0)?;
+            }
+            let root_sessions: HashSet<(i64, i64)> =
+                all_task_sessions(store, run_id, req.task_idx)?
+                    .into_iter()
+                    .collect();
+            for session in impact.sessions {
+                let key = (session.task_idx, session.idx);
+                if root_sessions.contains(&key) {
+                    continue;
+                }
+                plan.add_session(session.task_idx, session.idx);
+                add_verify_range(
+                    store,
+                    run_id,
+                    &mut plan,
+                    session.task_idx,
+                    "session",
+                    session.idx,
+                    0,
+                )?;
+            }
+        }
+        "verify" => {
+            add_verify_range(
+                store,
+                run_id,
+                &mut plan,
+                req.task_idx,
+                &req.verify_scope,
+                req.session_idx,
+                req.verify_idx,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(plan)
+}
+
+fn apply_stop_cascade(
+    store: &Store,
+    run_id: &str,
+    reqs: &[SetStatusBody],
+) -> Result<(), StoreError> {
+    for req in reqs {
+        match req.kind.as_str() {
+            "task" => store.set_task_state(run_id, req.task_idx, NodeState::Cancelled)?,
+            "session" => store.set_session_state(
+                run_id,
+                req.task_idx,
+                req.session_idx,
+                NodeState::Cancelled,
+            )?,
+            "verify" => store.set_verify_state(
+                run_id,
+                req.task_idx,
+                &req.verify_scope,
+                req.session_idx,
+                req.verify_idx,
+                NodeState::Cancelled,
+            )?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The tmux pane name(s) and owning session that a manual status-set
+/// (RAL-163) on a task/session/verify step must capture and stop, or `None`
+/// if the target doesn't resolve to a real node.
+fn stop_targets_for_status_change_full(
+    store: &Store,
+    run_id: &str,
+    req: &SetStatusBody,
+) -> Vec<StopTarget> {
     let Ok(task) = store.get_task_name(run_id, req.task_idx) else {
         return Vec::new();
     };
@@ -3067,19 +4352,24 @@ fn stop_targets_for_status_change(
             let Ok(sid) = store.get_session_id(run_id, req.task_idx, req.session_idx) else {
                 return Vec::new();
             };
-            vec![(
-                crate::tmux::session_name(run_id, &task, &sid),
-                req.session_idx,
-            )]
+            vec![StopTarget {
+                pane_name: crate::tmux::session_name(run_id, &task, &sid),
+                ghost_task_idx: req.task_idx,
+                ghost_session_idx: req.session_idx,
+            }]
         }
         "task" => store
             .get_task_session_ids(run_id, req.task_idx)
             .unwrap_or_default()
             .into_iter()
-            .map(|(idx, sid)| (crate::tmux::session_name(run_id, &task, &sid), idx))
+            .map(|(idx, sid)| StopTarget {
+                pane_name: crate::tmux::session_name(run_id, &task, &sid),
+                ghost_task_idx: req.task_idx,
+                ghost_session_idx: idx,
+            })
             .collect(),
         "verify" => {
-            let ghost_idx = if req.verify_scope == "task" {
+            let ghost_session_idx = if req.verify_scope == "task" {
                 store
                     .get_task_session_ids(run_id, req.task_idx)
                     .unwrap_or_default()
@@ -3089,18 +4379,34 @@ fn stop_targets_for_status_change(
             } else {
                 Some(req.session_idx)
             };
-            let Some(ghost_idx) = ghost_idx else {
+            let Some(ghost_session_idx) = ghost_session_idx else {
                 return Vec::new();
             };
             let (vrun_id, vsession_id) =
                 verify_tmux_keys(run_id, &req.verify_scope, &req.verify_idx.to_string());
-            vec![(
-                crate::tmux::session_name(&vrun_id, &task, &vsession_id),
-                ghost_idx,
-            )]
+            vec![StopTarget {
+                pane_name: crate::tmux::session_name(&vrun_id, &task, &vsession_id),
+                ghost_task_idx: req.task_idx,
+                ghost_session_idx,
+            }]
         }
         _ => Vec::new(),
     }
+}
+
+#[cfg(test)]
+/// The tmux pane name(s) and owning-session index that a manual status-set
+/// (RAL-163) on a task/session/verify step must capture and stop. Kept as the
+/// compact `(pane_name, ghost_session_idx)` shape for the existing unit tests.
+fn stop_targets_for_status_change(
+    store: &Store,
+    run_id: &str,
+    req: &SetStatusBody,
+) -> Vec<(String, i64)> {
+    stop_targets_for_status_change_full(store, run_id, req)
+        .into_iter()
+        .map(|target| (target.pane_name, target.ghost_session_idx))
+        .collect()
 }
 
 /// RAL-163: before a manual status change away from `pending` takes effect on
@@ -3117,20 +4423,37 @@ fn stop_targets_for_status_change(
 /// of the time there's no live agent to capture (the common case is
 /// overriding an already-finished node), and even a tmux resolution failure
 /// shouldn't stop a user from being able to force a status.
-fn capture_and_stop_node(store: &Store, run_id: &str, req: &SetStatusBody) {
+fn capture_and_stop_nodes(store: &Store, run_id: &str, reqs: &[SetStatusBody]) {
     let Ok(tmux) = crate::tmux::Tmux::resolve() else {
         return;
     };
-    for (pane_name, ghost_idx) in stop_targets_for_status_change(store, run_id, req) {
-        if !tmux.has_session(&pane_name) {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for req in reqs {
+        for target in stop_targets_for_status_change_full(store, run_id, req) {
+            if seen.insert(target.clone()) {
+                targets.push(target);
+            }
+        }
+    }
+    for target in targets {
+        if !tmux.has_session(&target.pane_name) {
             continue;
         }
-        if let Ok(content) = tmux.capture_pane(&pane_name, 2000) {
+        if let Ok(content) = tmux.capture_pane(&target.pane_name, 2000) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
-                let uri = crate::ghost::session_uri(run_id, req.task_idx, ghost_idx);
+                let uri = crate::ghost::session_uri(
+                    run_id,
+                    target.ghost_task_idx,
+                    target.ghost_session_idx,
+                );
                 let cwd = store
-                    .get_session_agent_resume(run_id, req.task_idx, ghost_idx)
+                    .get_session_agent_resume(
+                        run_id,
+                        target.ghost_task_idx,
+                        target.ghost_session_idx,
+                    )
                     .map(|(cwd, _, _)| cwd)
                     .unwrap_or_default();
                 let revision = crate::ghost::current_revision(&cwd);
@@ -3147,21 +4470,25 @@ fn capture_and_stop_node(store: &Store, run_id: &str, req: &SetStatusBody) {
                 {
                     crate::cartographer::Note::new("set_status")
                         .run(run_id)
-                        .scope(&req.kind)
+                        .scope("cascade-stop")
                         .emit(
                             store,
                             "captured in-progress agent output before manual status change",
                             serde_json::json!({
-                                "pane": pane_name,
+                                "pane": target.pane_name,
                                 "len": trimmed.len(),
-                                "target_state": req.state,
+                                "target_state": "cancelled",
                             }),
                         );
                 }
             }
         }
-        let _ = tmux.kill_session(&pane_name);
+        let _ = tmux.kill_session(&target.pane_name);
     }
+}
+
+fn capture_and_stop_node(store: &Store, run_id: &str, req: &SetStatusBody) {
+    capture_and_stop_nodes(store, run_id, std::slice::from_ref(req));
 }
 
 /// Manually override the state of a run, task, session, or verify step (RAL-74).
@@ -3169,50 +4496,56 @@ fn capture_and_stop_node(store: &Store, run_id: &str, req: &SetStatusBody) {
 /// Routes through the same store setters used by natural transitions so that
 /// audit log entries are written and the scheduler can observe the new state on
 /// its next tick (e.g. a run moved to Pending will be claimed and re-executed).
-/// Targeting a run at `cancelled` is special-cased to go through the exact
-/// same cascading cancel path as the "Cancel Run" button (RAL-116) — not a
-/// separate DB-only flip — so both entry points stop in-flight agents and
-/// cascade to dependents identically.
+/// Targeting the *run itself* at `cancelled` goes through the same cascading
+/// cancel path as the "Cancel Run" button (RAL-116) — not a separate DB-only
+/// flip — so both entry points stop every in-flight agent in the run and
+/// cascade to dependent runs identically. Targeting a task/session/verify at
+/// `cancelled` is the board's scoped "Stop" path (RAL-181): cancel that node
+/// plus everything downstream of it *within the same run*, while leaving the
+/// rest of the run alive. This is intentionally narrower than the run-wide
+/// `Cancel Run` action and intentionally broader than an arbitrary one-row DB
+/// flip — it follows the run's existing dependency graph rather than treating
+/// sibling branches as collateral damage.
 fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<SetStatusBody>(body) else {
         return error(400, "bad_request", "invalid set-status body", vec![]);
     };
     let store = daemon.lock();
+    let stop_plan =
+        if matches!(req.kind.as_str(), "task" | "session" | "verify") && req.state == "cancelled" {
+            match stop_cascade_plan(&store, id, &req) {
+                Ok(plan) => Some(plan),
+                Err(StoreError::NotFound) => {
+                    return error(404, "not_found", "run or node not found", vec![]);
+                }
+                Err(StoreError::InvalidTransition(msg)) => {
+                    return error(400, "bad_request", &msg, vec![]);
+                }
+                Err(e) => {
+                    return error(500, "internal_error", &e.to_string(), vec![]);
+                }
+            }
+        } else {
+            None
+        };
 
     // RAL-163: any status other than "pending" on a task/session/verify step
     // means "stop the agent running there" (including `ignored`, which is
     // deliberately non-terminal in the state machine but still means "stop
-    // and save what happened" per the ticket). Capture + kill happens before
-    // the state change itself is applied below, whichever path that takes.
+    // and save what happened" per the ticket, and `cancelled`). Capture +
+    // kill happens before the state change itself is applied below. For a
+    // cascading RAL-181 stop, stop every impacted pane in that branch; for any
+    // other manual status change, keep the old single-node behavior.
     if matches!(req.kind.as_str(), "task" | "session" | "verify") {
         if let Some(state) = NodeState::parse(&req.state) {
             if state != NodeState::Pending {
-                capture_and_stop_node(&store, id, &req);
+                if let Some(plan) = &stop_plan {
+                    capture_and_stop_nodes(&store, id, &plan.stop_requests());
+                } else {
+                    capture_and_stop_node(&store, id, &req);
+                }
             }
         }
-    }
-
-    // A manual override to "cancelled" of a single task/session/verify within
-    // a run reuses the dedicated cancel cascade (`Store::cancel` + tripping
-    // the run's `CancelToken`). There is no finer-grained cancel signal than
-    // the run-wide token, so cancelling one node also stops the rest of the
-    // run's in-flight work and kills its subprocess; otherwise the DB row
-    // would read "cancelled" while the real agent — and the concurrency-slot
-    // permit it holds — kept running indefinitely, and the board's `running`
-    // count would never drop. Targeting the run itself is handled separately
-    // below via `Store::cancel_run`, which also cascades to dependents.
-    let wants_cancel = matches!(req.kind.as_str(), "task" | "session" | "verify")
-        && NodeState::parse(&req.state) == Some(NodeState::Cancelled);
-    if wants_cancel {
-        if let Err(e) = store.cancel(id) {
-            return store_error(&e);
-        }
-        daemon.cancellations.cancel(id);
-        kill_run_tmux_sessions(id);
-        return match store.get_run(id) {
-            Ok(run) => json(200, &run),
-            Err(e) => store_error(&e),
-        };
     }
 
     let result = match req.kind.as_str() {
@@ -3245,7 +4578,15 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     vec![],
                 );
             };
-            store.set_task_state(id, req.task_idx, state)
+            if state == NodeState::Cancelled {
+                if let Some(plan) = &stop_plan {
+                    apply_stop_cascade(&store, id, &plan.state_requests())
+                } else {
+                    store.set_task_state(id, req.task_idx, state)
+                }
+            } else {
+                store.set_task_state(id, req.task_idx, state)
+            }
         }
         "session" => {
             let Some(state) = NodeState::parse(&req.state) else {
@@ -3256,7 +4597,15 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     vec![],
                 );
             };
-            store.set_session_state(id, req.task_idx, req.session_idx, state)
+            if state == NodeState::Cancelled {
+                if let Some(plan) = &stop_plan {
+                    apply_stop_cascade(&store, id, &plan.state_requests())
+                } else {
+                    store.set_session_state(id, req.task_idx, req.session_idx, state)
+                }
+            } else {
+                store.set_session_state(id, req.task_idx, req.session_idx, state)
+            }
         }
         "verify" => {
             let Some(state) = NodeState::parse(&req.state) else {
@@ -3267,14 +4616,29 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     vec![],
                 );
             };
-            store.set_verify_state(
-                id,
-                req.task_idx,
-                &req.verify_scope,
-                req.session_idx,
-                req.verify_idx,
-                state,
-            )
+            if state == NodeState::Cancelled {
+                if let Some(plan) = &stop_plan {
+                    apply_stop_cascade(&store, id, &plan.state_requests())
+                } else {
+                    store.set_verify_state(
+                        id,
+                        req.task_idx,
+                        &req.verify_scope,
+                        req.session_idx,
+                        req.verify_idx,
+                        state,
+                    )
+                }
+            } else {
+                store.set_verify_state(
+                    id,
+                    req.task_idx,
+                    &req.verify_scope,
+                    req.session_idx,
+                    req.verify_idx,
+                    state,
+                )
+            }
         }
         other => {
             return error(
@@ -3435,7 +4799,7 @@ fn clear_all(daemon: &Daemon, body: &str) -> Reply {
     let mut worktrees_purged = 0;
     if !req.keep_temporary {
         for (gid, root) in &outcome.guardian_roots {
-            crate::guardian_merge::purge_worktrees(root, gid);
+            crate::guardian_merge::purge_worktrees(&daemon.store_handle(), root, gid);
             worktrees_purged += 1;
         }
     }
@@ -3486,10 +4850,18 @@ struct GuardianSettingsBody {
     /// comments instead of requiring the manual "Pull in PR feedback" action.
     #[serde(default)]
     auto_pr_feedback: Option<bool>,
-    /// RAL-149: also run the quality-bar checks during the fix pass, not just
-    /// the dedicated final-verification call. Default off.
+    /// RAL-168: this review's own Verify-scope override -- `"each_branch"`,
+    /// `"final_branch"`, or `"nothing"`. An empty string resets it to
+    /// "inherit the project default" (same empty-string-means-unset
+    /// convention `resolver_agent`/`resolver_model` above use).
     #[serde(default)]
-    verify_mid_resolution: Option<bool>,
+    verify_scope: Option<String>,
+    /// RAL-168: this review's own override for `"each_branch"` scope's
+    /// auto-clean-skip sub-option. Always an explicit override when present
+    /// -- a boolean has no natural "reset to inherit" sentinel the way an
+    /// empty string works for `verify_scope`.
+    #[serde(default)]
+    verify_skip_auto_clean: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -3657,8 +5029,14 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    if let Some(enabled) = req.verify_mid_resolution {
-        if let Err(e) = store.set_guardian_verify_mid_resolution(id, enabled) {
+    if let Some(scope) = req.verify_scope.as_deref() {
+        let scope = if scope.is_empty() { None } else { Some(scope) };
+        if let Err(e) = store.set_guardian_verify_scope(id, scope) {
+            return store_error(&e);
+        }
+    }
+    if let Some(skip) = req.verify_skip_auto_clean {
+        if let Err(e) = store.set_guardian_verify_skip_auto_clean(id, Some(skip)) {
             return store_error(&e);
         }
     }
@@ -3890,14 +5268,15 @@ fn guardian_squash(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// Delete a review and purge its review worktrees/branches from every project.
 fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
     let store = daemon.lock();
-    // Collect all project roots before deleting (multi-project guardians have >1).
-    let projects = store.get_guardian(id).ok().map(|g| g.projects);
+    // Snapshot everything needed for cleanup before the row is gone
+    // (multi-project guardians span >1 root).
+    let snapshot = store.get_guardian(id).ok();
     match store.delete_guardian(id) {
         Ok(()) => {
             drop(store);
-            if let Some(roots) = projects {
-                for root in &roots {
-                    crate::guardian_merge::purge_worktrees(root, id);
+            if let Some(g) = snapshot {
+                for root in &g.projects {
+                    crate::guardian_merge::purge_worktrees(&daemon.store_handle(), root, id);
                 }
             }
             json(200, &StateResponse { state: "deleted" })
@@ -4353,7 +5732,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
     // rebuild below re-derives them from their own feature-branch tips
     // instead of replaying stale history that still contains the moved
     // branch's commits (see `guardian_merge::purge_worktrees`).
-    crate::guardian_merge::purge_worktrees(&source_git_root, id);
+    crate::guardian_merge::purge_worktrees(&daemon.store_handle(), &source_git_root, id);
 
     let runner: Arc<dyn Runner> =
         Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
@@ -4640,11 +6019,18 @@ pub fn serve<A: ToSocketAddrs>(
     // cancellation registry so a `cancel` request can reach its workers. The
     // runner shares the daemon's PID registry so `/api/resources` can attribute
     // OS metrics to the sessions it spawns (RAL-11).
-    let runner: Arc<dyn Runner> = Arc::new(
+    let local_runner: Arc<dyn Runner> = Arc::new(
         SubprocessRunner::from_env()
             .with_registry(daemon.procs_handle())
             .with_cartographer(daemon.store_handle()),
     );
+    // RAL-185: the scheduler holds a router rather than the local runner
+    // directly, so a session carrying a `machine` is dispatched to its provider
+    // while every local session takes exactly the path it always did.
+    let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
+        local_runner,
+        daemon.store_handle(),
+    ));
     let handle = daemon.store_handle();
     let cancellations = daemon.cancellations_handle();
     let sem = daemon.semaphore_handle();
@@ -4679,6 +6065,12 @@ pub fn serve_with(server: tiny_http::Server, store: Store, max_concurrent: i64) 
     run_http_loop(server, &daemon);
 }
 
+/// The SSE push endpoint (RAL-167). Handled specially in `run_http_loop`
+/// below rather than through `route()`: every other endpoint returns a
+/// bounded `Reply` immediately, but this one holds the connection open
+/// indefinitely.
+const EVENTS_PATH: &str = "/api/events";
+
 fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
     for mut request in server.incoming_requests() {
         let method = request.method().as_str().to_string();
@@ -4686,6 +6078,17 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
         // filtered/paginated endpoints like `/api/cartographer`), so the full
         // URL is forwarded verbatim rather than pre-stripped here.
         let url = request.url().to_string();
+
+        if method == "GET" && url.split('?').next().unwrap_or(&url) == EVENTS_PATH {
+            // A long-lived SSE stream must never block this accept loop from
+            // serving anyone else -- tiny_http is otherwise a synchronous,
+            // one-request-at-a-time server (RAL-167's own risk list). Hand it
+            // off to its own thread; it lives until the client disconnects.
+            let store = daemon.store_handle();
+            std::thread::spawn(move || serve_events_stream(request, &store));
+            continue;
+        }
+
         let traceparent = request
             .headers()
             .iter()
@@ -4717,6 +6120,54 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
             break;
         }
     }
+}
+
+/// How often [`serve_events_stream`] writes an SSE comment/keepalive line
+/// when no real event has arrived — long enough to stay well clear of
+/// "constant chatter," short enough that a proxy/browser doesn't decide the
+/// connection is dead and a disconnect is noticed promptly (RAL-167).
+const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Serve one SSE connection until the client disconnects (RAL-167).
+///
+/// Writes the HTTP response headers manually via `Request::into_writer()` —
+/// tiny_http's escape hatch for a response whose length isn't known upfront
+/// and that isn't produced by a single call to `respond()` — then loops
+/// forever: each event from the subscriber channel becomes one `event: ...\n
+/// data: ...\n\n` block (`event:` is the entity kind — `run`/`guardian`/
+/// `other`, see `crate::events::EventKind` — so the browser can react
+/// differently per surface without a full-page refetch on every event); a
+/// receive timeout with nothing pending becomes an SSE comment line so idle
+/// proxies/browsers don't time the connection out. Any write failure (the
+/// client went away) ends the loop and unsubscribes.
+fn serve_events_stream(request: tiny_http::Request, store: &Arc<Mutex<Store>>) {
+    let (sub_id, rx) = store.lock().unwrap().event_bus().subscribe();
+    crate::rlog!(DEBUG, "ralphus [http] SSE client connected sub_id={sub_id}");
+    let mut writer = request.into_writer();
+    let preamble = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Cache-Control: no-cache\r\n\
+Connection: keep-alive\r\n\
+X-Accel-Buffering: no\r\n\
+\r\n";
+    let mut ok = writer.write_all(preamble).is_ok() && writer.flush().is_ok();
+    while ok {
+        ok = match rx.recv_timeout(SSE_HEARTBEAT) {
+            Ok(event) => {
+                let payload =
+                    serde_json::to_string(&event.row).unwrap_or_else(|_| "{}".to_string());
+                let line = format!("event: {}\ndata: {payload}\n\n", event.kind.as_str());
+                writer.write_all(line.as_bytes()).is_ok()
+            }
+            Err(RecvTimeoutError::Timeout) => writer.write_all(b": heartbeat\n\n").is_ok(),
+            Err(RecvTimeoutError::Disconnected) => false,
+        } && writer.flush().is_ok();
+    }
+    store.lock().unwrap().event_bus().unsubscribe(sub_id);
+    crate::rlog!(
+        DEBUG,
+        "ralphus [http] SSE client disconnected sub_id={sub_id}"
+    );
 }
 
 #[cfg(test)]
@@ -5099,6 +6550,475 @@ mod tests {
         let r = route(&d, "POST", "/api/runs", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("project_validation_failed"));
+    }
+
+    // ── machine provider registry (RAL-185) ───────────────────────────────
+
+    fn machine_body(scheme: &str, program: &str) -> String {
+        serde_json::json!({"scheme": scheme, "program": program, "description": "d"}).to_string()
+    }
+
+    #[test]
+    fn machine_register_list_get_and_deregister_roundtrip() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/machines", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("incredibuild"), "{}", r.body);
+        // The built-in is advertised alongside registered rows so a client
+        // doesn't think `local` is missing.
+        assert!(r.body.contains("\"builtin\":[\"local\"]"), "{}", r.body);
+
+        let r = route(&d, "GET", "/api/machines/incredibuild", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("/opt/ib.sh"), "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/machines/incredibuild", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/machines/incredibuild", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn checking_an_unreachable_machine_records_the_failure_without_erroring() {
+        // The endpoint reports *a result*, not an error: "this machine is down"
+        // is a successful answer to the question the board is asking.
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("ib", "/definitely/not/a/real/provider"),
+        );
+        let r = route(&d, "POST", "/api/machines/ib/check", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"ok\":false"), "{}", r.body);
+
+        // And it is remembered, so the tab shows the last known answer.
+        let m = d.lock().get_machine_provider("ib").unwrap().unwrap();
+        assert_eq!(m.last_check_ok, Some(false));
+        assert!(m.last_check_ms.is_some());
+        assert!(m.last_check_note.is_some_and(|n| !n.is_empty()));
+    }
+
+    #[test]
+    fn a_freshly_registered_machine_reports_not_checked_rather_than_healthy() {
+        // "not checked" must be distinguishable from "reachable" -- claiming a
+        // machine is fine on no evidence is the failure this guards against.
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("ib", "/opt/ib.sh"),
+        );
+        let m = d.lock().get_machine_provider("ib").unwrap().unwrap();
+        assert_eq!(m.last_check_ok, None);
+        assert_eq!(m.last_check_ms, None);
+    }
+
+    #[test]
+    fn machine_register_rejects_overriding_a_builtin_scheme() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/machines", &machine_body("local", "/x.sh"));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("built-in"), "{}", r.body);
+    }
+
+    #[test]
+    fn machine_register_rejects_an_unusable_scheme() {
+        let d = daemon();
+        // A one-character scheme can never be referenced, because `parse_machine`
+        // rejects it to keep Windows drive letters from parsing as schemes.
+        let r = route(&d, "POST", "/api/machines", &machine_body("C", "/x.sh"));
+        assert_eq!(r.status, 400, "{}", r.body);
+        let r = route(&d, "POST", "/api/machines", &machine_body("ib", ""));
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn submit_rejects_an_unregistered_machine_scheme() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\nmachine=\"ghostfarm:A\"\n[[task.session]]\ncwd=\".\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("machine_validation_failed"), "{}", r.body);
+        assert!(r.body.contains("ghostfarm"), "{}", r.body);
+    }
+
+    #[test]
+    fn submit_accepts_a_registered_remote_machine_and_persists_it_on_the_session() {
+        // Phase 2: a registered machine now submits successfully, and the
+        // resolved value is stored on the session so the scheduler's router can
+        // dispatch it without re-deriving inheritance.
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        let toml = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n[[task.session]]\ncwd=\".\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let run_id = serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sessions = d.lock().sessions_of(&run_id).unwrap();
+        assert_eq!(sessions[0].machine.as_deref(), Some("incredibuild:A"));
+    }
+
+    #[test]
+    fn a_session_inherits_its_tasks_machine_when_it_declares_none() {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        // Both sessions resolve to the task's machine: the first by inheriting
+        // it, the second by restating it. They may not diverge — see
+        // `two_sessions_in_one_task_may_not_run_on_different_machines`.
+        let toml = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
+                    [[task.session]]\ncwd=\".\"\nprompt=\"p\"\n\
+                    [[task.session]]\ncwd=\".\"\nprompt=\"q\"\nmachine=\"incredibuild:A\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let run_id = serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sessions = d.lock().sessions_of(&run_id).unwrap();
+        assert_eq!(sessions[0].machine.as_deref(), Some("incredibuild:A"));
+        assert_eq!(sessions[1].machine.as_deref(), Some("incredibuild:A"));
+    }
+
+    #[test]
+    fn submit_accepts_a_remote_session_with_a_worktree_placeholder() {
+        // RAL-185 Phase 2: the placeholder is now materialized by the
+        // provider's `provision` verb on its own machine (see
+        // `crate::worktrees::provision_remote`), so this combination is valid.
+        // It is deliberately NOT resolved at submit -- provisioning happens at
+        // schedule time, alongside local worktree materialization.
+        let d = daemon();
+        let repo = tmp_git_repo("remote-placeholder");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
+                    [[task.session]]\nid=\"work\"\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    #[test]
+    fn a_local_session_may_still_use_a_worktree_placeholder() {
+        // Regression guard: the check above must not affect ordinary local runs.
+        let d = daemon();
+        let repo = tmp_git_repo("local-placeholder-ok");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"local\"\n\
+                    [[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    // ── Phase 3a: within-task machine affinity ────────────────────────────
+
+    /// Submit `toml` against a daemon with `incredibuild` registered, returning
+    /// the reply so a test can assert on accept/reject.
+    fn submit_with_machines(toml: &str) -> Reply {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        route(&d, "POST", "/api/runs", &submit_body(toml))
+    }
+
+    #[test]
+    fn two_sessions_in_one_task_may_not_run_on_different_machines() {
+        // They share one workspace and hand off through files on disk, so
+        // splitting them would leave the second reading a directory the first
+        // never wrote to.
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+             [[task.session]]
+id=\"a\"
+cwd=\".\"
+prompt=\"p\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+id=\"b\"
+cwd=\".\"
+prompt=\"q\"
+machine=\"incredibuild:B\"
+",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("spans two machines"), "{}", r.body);
+        // The message must name both sides, or it is not actionable.
+        assert!(r.body.contains("incredibuild:A"), "{}", r.body);
+        assert!(r.body.contains("incredibuild:B"), "{}", r.body);
+        assert!(r.body.contains("session \\\"b\\\""), "{}", r.body);
+    }
+
+    #[test]
+    fn a_session_may_not_diverge_from_its_own_tasks_machine() {
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+id=\"a\"
+cwd=\".\"
+prompt=\"p\"
+machine=\"incredibuild:B\"
+",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("spans two machines"), "{}", r.body);
+        assert!(r.body.contains("task \\\"t\\\""), "{}", r.body);
+    }
+
+    #[test]
+    fn a_verify_step_may_not_diverge_from_its_owning_session() {
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+id=\"a\"
+cwd=\".\"
+prompt=\"p\"
+             [[task.session.verify]]
+command=\"cargo test\"
+machine=\"incredibuild:B\"
+",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("verify step"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_task_scope_verify_may_not_diverge_from_its_task() {
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+cwd=\".\"
+prompt=\"p\"
+             [[task.verify]]
+command=\"cargo fmt\"
+machine=\"incredibuild:B\"
+",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("task verify step"), "{}", r.body);
+    }
+
+    #[test]
+    fn restating_the_same_machine_throughout_a_task_is_allowed() {
+        // An explicit override that agrees with the task is redundant, not wrong.
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+cwd=\".\"
+prompt=\"p\"
+machine=\"incredibuild:A\"
+             [[task.session.verify]]
+command=\"cargo test\"
+machine=\"incredibuild:A\"
+             [[task.verify]]
+command=\"cargo fmt\"
+machine=\"incredibuild:A\"
+",
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    #[test]
+    fn different_tasks_may_run_on_different_machines() {
+        // The whole point of the feature -- fanning work across a build farm.
+        let r = submit_with_machines(
+            "[[task]]
+name=\"a\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+cwd=\".\"
+prompt=\"p\"
+             [[task]]
+name=\"b\"
+machine=\"incredibuild:B\"
+             [[task.session]]
+cwd=\".\"
+prompt=\"q\"
+",
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    #[test]
+    fn a_task_whose_sessions_are_all_unset_inherits_without_complaint() {
+        // Regression guard: the rule must be inert for every pre-RAL-185 file.
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+             [[task.session]]
+cwd=\".\"
+prompt=\"p\"
+             [[task.session]]
+cwd=\".\"
+prompt=\"q\"
+",
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    #[test]
+    fn one_session_naming_a_machine_sets_the_expectation_for_its_siblings() {
+        // The task itself is unset, so the first session that names a machine
+        // establishes it -- a sibling that disagrees is still a split task.
+        let r = submit_with_machines(
+            "[[task]]
+name=\"t\"
+             [[task.session]]
+id=\"a\"
+cwd=\".\"
+prompt=\"p\"
+machine=\"incredibuild:A\"
+             [[task.session]]
+id=\"b\"
+cwd=\".\"
+prompt=\"q\"
+machine=\"incredibuild:B\"
+",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("spans two machines"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_remote_session_feeding_a_review_must_declare_the_reviews_base() {
+        // A remote session's worktree lives on another machine, so its base
+        // cannot be read from that worktree's git upstream. Declaring it is the
+        // only honest option -- guessing the project default would silently
+        // review against the wrong base.
+        let d = daemon();
+        let repo = tmp_git_repo("remote-review-base");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
+                    [[task.session]]\nid=\"work\"\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\nreview=\"r\"\n\
+                    [[review]]\nid=\"r\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(
+            r.body.contains("base = ") || r.body.contains("base branch"),
+            "the error must point at the missing [[review]] base: {}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn a_remote_session_feeding_a_review_needs_a_placeholder_cwd() {
+        // A literal remote path gives the daemon no way to know the branch
+        // without reading that machine's filesystem, so it must say so rather
+        // than failing later inside git.
+        let d = daemon();
+        let repo = tmp_git_repo("remote-review-litpath");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
+                    [[task.session]]\nid=\"work\"\ncwd=\"/remote/wt\"\nprompt=\"p\"\nreview=\"r\"\n\
+                    [[review]]\nid=\"r\"\nbase=\"main\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("new-worktree"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_session_without_any_machine_stores_none_not_a_sentinel_string() {
+        // The router keys off `None` to take the local path, so a sentinel
+        // like "local" persisted here would send every legacy session through
+        // machine resolution for no reason.
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let run_id = serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sessions = d.lock().sessions_of(&run_id).unwrap();
+        assert_eq!(sessions[0].machine, None);
+    }
+
+    #[test]
+    fn submit_accepts_an_explicitly_local_machine() {
+        let d = daemon();
+        let toml =
+            "[[task]]\nname=\"t\"\nmachine=\"local\"\n[[task.session]]\ncwd=\".\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    #[test]
+    fn submit_is_unaffected_when_no_machine_is_declared_anywhere() {
+        // Regression guard: every pre-RAL-185 task file must submit unchanged.
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/runs", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
     }
 
     #[test]
@@ -5710,16 +7630,26 @@ mod tests {
         // ralphus_{id}_-prefixed tmux.exe sessions (see
         // `kill_run_tmux_sessions`) — serialize against `tmux.rs`'s live
         // tests anyway, since a real `tmux list-sessions`/`kill-session`
-        // round trip still happens even though this test's fixture ids
-        // (`run-000000000001` etc.) never collide with theirs.
+        // round trip still happens. The run_id itself is also given a
+        // per-invocation-unique suffix (RAL-177), not just serialized:
+        // `kill_run_tmux_sessions` kills by `ralphus_{run_id}_` *prefix*, so
+        // a deterministic literal id here would let this shutdown call reach
+        // — and kill — a same-prefixed real session created by an identical
+        // test running concurrently in a sibling worktree against the same
+        // shared, machine-wide psmux server, even with a fully unique task
+        // name on that other session (the prefix kill never looks at the
+        // task portion at all). See `Store::insert_run_with_id`'s doc
+        // comment.
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
         let d = daemon();
-        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = crate::tmux::unique_test_tag("shutdown-no-auto-cancel");
         d.lock()
-            .set_run_state("run-000000000001", RunState::Running)
+            .insert_run_with_id(&run_id, &parse(GOOD), None, false)
             .unwrap();
+        d.lock().set_run_state(&run_id, RunState::Running).unwrap();
 
         assert!(!d.shutdown_requested());
         let r = route(&d, "POST", "/api/daemon/shutdown", "");
@@ -5730,7 +7660,7 @@ mod tests {
 
         // Left running for crash-recovery to resume on next `serve()` startup.
         assert!(
-            route(&d, "GET", "/api/runs/run-000000000001", "")
+            route(&d, "GET", &format!("/api/runs/{run_id}"), "")
                 .body
                 .contains("\"state\":\"running\"")
         );
@@ -5738,15 +7668,23 @@ mod tests {
 
     #[test]
     fn shutdown_with_auto_cancel_cancels_active_runs_and_guardians() {
+        // See `shutdown_without_auto_cancel_leaves_run_state_alone_but_requests_shutdown`'s
+        // comment for why each run_id here is per-invocation-unique
+        // (RAL-177), not just the literal deterministic id.
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
         let d = daemon();
-        route(&d, "POST", "/api/runs", &submit_body(GOOD)); // run-1: pending
-        route(&d, "POST", "/api/runs", &submit_body(GOOD)); // run-2
+        let run_id_1 = crate::tmux::unique_test_tag("shutdown-auto-cancel-1");
+        let run_id_2 = crate::tmux::unique_test_tag("shutdown-auto-cancel-2");
         d.lock()
-            .set_run_state("run-000000000002", RunState::Done)
+            .insert_run_with_id(&run_id_1, &parse(GOOD), None, false)
+            .unwrap(); // pending
+        d.lock()
+            .insert_run_with_id(&run_id_2, &parse(GOOD), None, false)
             .unwrap();
+        d.lock().set_run_state(&run_id_2, RunState::Done).unwrap();
 
         let gbody =
             serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
@@ -5757,18 +7695,18 @@ mod tests {
         let r = route(&d, "POST", "/api/daemon/shutdown", &body);
         assert_eq!(r.status, 200, "body={}", r.body);
         assert!(r.body.contains("\"auto_cancel\":true"));
-        assert!(r.body.contains("run-000000000001"));
-        assert!(!r.body.contains("run-000000000002")); // already terminal — left alone
+        assert!(r.body.contains(&run_id_1));
+        assert!(!r.body.contains(&run_id_2)); // already terminal — left alone
         assert!(r.body.contains(gid));
         assert!(d.shutdown_requested());
 
         assert!(
-            route(&d, "GET", "/api/runs/run-000000000001", "")
+            route(&d, "GET", &format!("/api/runs/{run_id_1}"), "")
                 .body
                 .contains("\"state\":\"cancelled\"")
         );
         assert!(
-            route(&d, "GET", "/api/runs/run-000000000002", "")
+            route(&d, "GET", &format!("/api/runs/{run_id_2}"), "")
                 .body
                 .contains("\"state\":\"done\"")
         );
@@ -5784,6 +7722,7 @@ mod tests {
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
         let d = daemon();
         let r = route(&d, "POST", "/api/daemon/shutdown", "");
         assert_eq!(r.status, 200, "body={}", r.body);
@@ -5901,6 +7840,131 @@ mod tests {
     // RAL-157: solo/unsolo a task within a run.
 
     const TWO_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    const STOP_CASCADE_RUN: &str = r#"
+[[task]]
+name = "alpha"
+[[task.session]]
+id = "work"
+cwd = "/r"
+prompt = "p"
+[[task.session.verify]]
+id = "check-a"
+command = "true"
+[[task.session.verify]]
+id = "check-b"
+command = "true"
+[[task.session]]
+id = "after"
+cwd = "/r"
+prompt = "p"
+depends_on = ["work"]
+[[task.session.verify]]
+id = "after-check"
+command = "true"
+[[task.verify]]
+id = "task-check-a"
+command = "true"
+[[task.verify]]
+id = "task-check-b"
+command = "true"
+
+[[task]]
+name = "beta"
+depends_on = ["alpha/after"]
+[[task.session]]
+id = "downstream"
+cwd = "/r"
+prompt = "p"
+[[task.session.verify]]
+id = "beta-check"
+command = "true"
+[[task.verify]]
+id = "beta-task-check"
+command = "true"
+
+[[task]]
+name = "side"
+[[task.session]]
+id = "unrelated"
+cwd = "/r"
+prompt = "p"
+[[task.session.verify]]
+id = "side-check"
+command = "true"
+[[task.verify]]
+id = "side-task-check"
+command = "true"
+"#;
+    const RUN_1: &str = "run-000000000001";
+
+    fn submit_stop_cascade_run(d: &Daemon) {
+        route(d, "POST", "/api/runs", &submit_body(STOP_CASCADE_RUN));
+    }
+
+    fn set_status_and_parse(d: &Daemon, body: serde_json::Value) -> serde_json::Value {
+        let r = route(
+            d,
+            "POST",
+            &format!("/api/runs/{RUN_1}/set-status"),
+            &body.to_string(),
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        serde_json::from_str(&r.body).unwrap()
+    }
+
+    fn seed_task_stop_states(d: &Daemon) {
+        let guard = d.lock();
+        guard.set_task_state(RUN_1, 0, NodeState::Running).unwrap();
+        guard
+            .set_session_state(RUN_1, 0, 0, NodeState::Running)
+            .unwrap();
+        guard.set_task_state(RUN_1, 2, NodeState::Running).unwrap();
+        guard
+            .set_session_state(RUN_1, 2, 0, NodeState::Running)
+            .unwrap();
+    }
+
+    fn seed_session_verify_stop_states(d: &Daemon) {
+        let guard = d.lock();
+        guard.set_task_state(RUN_1, 0, NodeState::Running).unwrap();
+        guard
+            .set_session_state(RUN_1, 0, 0, NodeState::Done)
+            .unwrap();
+        guard
+            .set_verify_state(RUN_1, 0, "session", 0, 0, NodeState::Running)
+            .unwrap();
+        guard.set_task_state(RUN_1, 2, NodeState::Running).unwrap();
+        guard
+            .set_session_state(RUN_1, 2, 0, NodeState::Running)
+            .unwrap();
+    }
+
+    fn seed_task_verify_stop_states(d: &Daemon) {
+        let guard = d.lock();
+        guard
+            .set_session_state(RUN_1, 0, 0, NodeState::Done)
+            .unwrap();
+        guard
+            .set_verify_state(RUN_1, 0, "session", 0, 0, NodeState::Done)
+            .unwrap();
+        guard
+            .set_verify_state(RUN_1, 0, "session", 0, 1, NodeState::Done)
+            .unwrap();
+        guard
+            .set_session_state(RUN_1, 0, 1, NodeState::Done)
+            .unwrap();
+        guard
+            .set_verify_state(RUN_1, 0, "session", 1, 0, NodeState::Done)
+            .unwrap();
+        guard.set_task_state(RUN_1, 0, NodeState::Running).unwrap();
+        guard
+            .set_verify_state(RUN_1, 0, "task", -1, 0, NodeState::Running)
+            .unwrap();
+        guard.set_task_state(RUN_1, 2, NodeState::Running).unwrap();
+        guard
+            .set_session_state(RUN_1, 2, 0, NodeState::Running)
+            .unwrap();
+    }
 
     #[test]
     fn solo_task_sets_soloed_and_returns_refreshed_run() {
@@ -5978,26 +8042,210 @@ mod tests {
     }
 
     #[test]
-    fn set_status_task_cancelled_cancels_whole_run() {
-        // Regression: forcing a single task/session/verify to "cancelled"
-        // through set-status must reuse the real cancel cascade (Store::cancel
-        // + tripping the run's CancelToken), not just write the one DB row —
-        // otherwise the board's `running` count never drops and any live
-        // subprocess for that run keeps running with its permit held forever.
+    fn set_status_task_cancelled_cascades_only_to_downstream_branch() {
         let d = daemon();
-        route(&d, "POST", "/api/runs", &submit_body(GOOD));
-        let body =
-            serde_json::json!({"kind": "task", "task_idx": 0, "state": "cancelled"}).to_string();
-        let r = route(&d, "POST", "/api/runs/run-000000000001/set-status", &body);
-        assert_eq!(r.status, 200);
-        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        submit_stop_cascade_run(&d);
+        seed_task_stop_states(&d);
+        let v = set_status_and_parse(
+            &d,
+            serde_json::json!({"kind": "task", "task_idx": 0, "state": "cancelled"}),
+        );
         assert_eq!(
+            v["tasks"][0]["state"].as_str(),
+            Some("cancelled"),
+            "target task must be cancelled"
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][1]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][1]["sessions"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][1]["sessions"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][1]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_ne!(v["tasks"][2]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][2]["sessions"][0]["state"].as_str(),
+            Some("running")
+        );
+        assert_ne!(
             v["state"].as_str(),
             Some("cancelled"),
-            "cancelling one task must cancel the whole run: {}",
-            r.body
+            "partial stop must not cancel the whole run"
+        );
+    }
+
+    #[test]
+    fn set_status_session_cancelled_cascades_only_to_downstream_branch() {
+        let d = daemon();
+        submit_stop_cascade_run(&d);
+        seed_task_stop_states(&d);
+        let v = set_status_and_parse(
+            &d,
+            serde_json::json!({
+                "kind": "session", "task_idx": 0, "session_idx": 0, "state": "cancelled"
+            }),
         );
         assert_eq!(v["tasks"][0]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["state"].as_str(),
+            Some("cancelled"),
+            "target session must be cancelled"
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][1]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][1]["sessions"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_ne!(
+            v["tasks"][2]["state"].as_str(),
+            Some("cancelled"),
+            "unrelated task must stay alive"
+        );
+        assert_eq!(
+            v["tasks"][2]["sessions"][0]["state"].as_str(),
+            Some("running")
+        );
+        assert_ne!(
+            v["state"].as_str(),
+            Some("cancelled"),
+            "partial stop must not cancel the whole run"
+        );
+    }
+
+    #[test]
+    fn set_status_session_verify_cancelled_cascades_only_to_downstream_branch() {
+        let d = daemon();
+        submit_stop_cascade_run(&d);
+        seed_session_verify_stop_states(&d);
+        let v = set_status_and_parse(
+            &d,
+            serde_json::json!({
+                "kind": "verify",
+                "task_idx": 0,
+                "session_idx": 0,
+                "verify_idx": 0,
+                "verify_scope": "session",
+                "state": "cancelled"
+            }),
+        );
+        assert_eq!(v["tasks"][0]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["state"].as_str(),
+            Some("done"),
+            "owning session body is upstream of the stopped verify"
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["verify"][1]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][1]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][1]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][1]["sessions"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_ne!(v["tasks"][2]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][2]["sessions"][0]["state"].as_str(),
+            Some("running")
+        );
+        assert_ne!(v["state"].as_str(), Some("cancelled"));
+    }
+
+    #[test]
+    fn set_status_task_verify_cancelled_cascades_only_to_downstream_branch() {
+        let d = daemon();
+        submit_stop_cascade_run(&d);
+        seed_task_verify_stop_states(&d);
+        let v = set_status_and_parse(
+            &d,
+            serde_json::json!({
+                "kind": "verify",
+                "task_idx": 0,
+                "session_idx": -1,
+                "verify_idx": 0,
+                "verify_scope": "task",
+                "state": "cancelled"
+            }),
+        );
+        assert_eq!(v["tasks"][0]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["state"].as_str(),
+            Some("done"),
+            "task verify stop must not retroactively cancel upstream sessions"
+        );
+        assert_eq!(
+            v["tasks"][0]["sessions"][0]["verify"][0]["state"].as_str(),
+            Some("done")
+        );
+        assert_eq!(
+            v["tasks"][0]["verify"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            v["tasks"][0]["verify"][1]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][1]["sessions"][0]["state"].as_str(),
+            Some("cancelled")
+        );
+        assert_ne!(v["tasks"][2]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["tasks"][2]["sessions"][0]["state"].as_str(),
+            Some("running")
+        );
+        assert_ne!(v["state"].as_str(), Some("cancelled"));
     }
 
     #[test]
@@ -6134,13 +8382,36 @@ mod tests {
     }
 
     /// A one-task-one-session TOML fixture like `GOOD`, but with a caller-
-    /// chosen task name — so each live-tmux test below derives its own
-    /// unique, never-reused `crate::tmux::session_name`, rather than all of
-    /// them colliding on the literal name `GOOD`'s fixed task name would
-    /// otherwise produce (real OS-level tmux state is shared process-wide,
-    /// unlike the fresh in-memory `Store` each test otherwise gets).
+    /// chosen task name, so each live-tmux test below gets its own
+    /// distinguishable task in the (already per-invocation-unique, via
+    /// [`submit_unique_run`]) `crate::tmux::session_name` it derives,
+    /// instead of every test sharing `GOOD`'s fixed task name.
     fn good_with_task(task: &str) -> String {
         format!("[[task]]\nname=\"{task}\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n")
+    }
+
+    fn parse(src: &str) -> ralphus_core::schema::TaskFile {
+        toml::from_str(src).expect("valid toml")
+    }
+
+    /// Submit `good_with_task(task_label)` directly through the store
+    /// (bypassing the HTTP `/api/runs` route, which always assigns the
+    /// store's deterministic sequential id) with a per-invocation-unique
+    /// run_id instead (RAL-177) — see [`Store::insert_run_with_id`]'s doc
+    /// comment. A fresh in-memory `Store`'s first run is always
+    /// `run-000000000001`, identical across every worktree's identical
+    /// test; a live-tmux test below both builds a real tmux session name
+    /// from this run_id *and* can trigger a `ralphus_{run_id}_`-prefix-
+    /// scoped kill (`kill_run_tmux_sessions`/`kill_guardian_tmux_sessions`)
+    /// against the same shared, machine-wide psmux server, so a deterministic
+    /// literal here is a collision risk on both counts, not just the exact
+    /// session name. Returns the run_id actually used.
+    fn submit_unique_run(d: &Daemon, task_label: &str) -> String {
+        let run_id = crate::tmux::unique_test_tag(task_label);
+        d.lock()
+            .insert_run_with_id(&run_id, &parse(&good_with_task(task_label)), None, false)
+            .unwrap();
+        run_id
     }
 
     /// Create a real, detached tmux session named for `(run_id, task,
@@ -6182,23 +8453,18 @@ mod tests {
         let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
         let d = daemon();
-        route(
-            &d,
-            "POST",
-            "/api/runs",
-            &submit_body(&good_with_task("ral163-captures")),
-        );
-        let run_id = "run-000000000001";
+        let run_id = submit_unique_run(&d, "ral163-captures");
 
         let (task, sid) = {
             let guard = d.lock();
             (
-                guard.get_task_name(run_id, 0).unwrap(),
-                guard.get_session_id(run_id, 0, 0).unwrap(),
+                guard.get_task_name(&run_id, 0).unwrap(),
+                guard.get_session_id(&run_id, 0, 0).unwrap(),
             )
         };
-        let name = crate::tmux::session_name(run_id, &task, &sid);
+        let name = crate::tmux::session_name(&run_id, &task, &sid);
         let marker = "ral-163-in-progress-marker";
         spawn_marker_session(&name, marker);
 
@@ -6222,7 +8488,7 @@ mod tests {
             "the agent's tmux pane must be stopped"
         );
 
-        let uri = crate::ghost::session_uri(run_id, 0, 0);
+        let uri = crate::ghost::session_uri(&run_id, 0, 0);
         let ghost = d.lock().get_ghost(&uri).unwrap();
         let ghost = ghost.expect("captured pane output must be saved to the session's ghost");
         assert!(
@@ -6243,25 +8509,21 @@ mod tests {
         let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
         let d = daemon();
-        route(
-            &d,
-            "POST",
-            "/api/runs",
-            &submit_body(&good_with_task("ral163-pending")),
-        );
-        let run_id = "run-000000000001";
+        let run_id = submit_unique_run(&d, "ral163-pending");
 
         let (task, sid) = {
             let guard = d.lock();
             (
-                guard.get_task_name(run_id, 0).unwrap(),
-                guard.get_session_id(run_id, 0, 0).unwrap(),
+                guard.get_task_name(&run_id, 0).unwrap(),
+                guard.get_session_id(&run_id, 0, 0).unwrap(),
             )
         };
-        let name = crate::tmux::session_name(run_id, &task, &sid);
+        let name = crate::tmux::session_name(&run_id, &task, &sid);
         let marker = "ral-163-pending-marker";
         let tmux = spawn_marker_session(&name, marker);
+        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
 
         let body = serde_json::json!({
             "kind": "session", "task_idx": 0, "session_idx": 0, "state": "pending"
@@ -6274,7 +8536,7 @@ mod tests {
             tmux.has_session(&name),
             "setting status to pending must not stop a running agent"
         );
-        let uri = crate::ghost::session_uri(run_id, 0, 0);
+        let uri = crate::ghost::session_uri(&run_id, 0, 0);
         assert!(
             d.lock().get_ghost(&uri).unwrap().is_none(),
             "nothing should have been captured for a pending status change"
@@ -6297,23 +8559,18 @@ mod tests {
         let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
         let d = daemon();
-        route(
-            &d,
-            "POST",
-            "/api/runs",
-            &submit_body(&good_with_task("ral163-ignored")),
-        );
-        let run_id = "run-000000000001";
+        let run_id = submit_unique_run(&d, "ral163-ignored");
 
         let (task, sid) = {
             let guard = d.lock();
             (
-                guard.get_task_name(run_id, 0).unwrap(),
-                guard.get_session_id(run_id, 0, 0).unwrap(),
+                guard.get_task_name(&run_id, 0).unwrap(),
+                guard.get_session_id(&run_id, 0, 0).unwrap(),
             )
         };
-        let name = crate::tmux::session_name(run_id, &task, &sid);
+        let name = crate::tmux::session_name(&run_id, &task, &sid);
         let marker = "ral-163-ignored-marker";
         spawn_marker_session(&name, marker);
 
@@ -6329,7 +8586,7 @@ mod tests {
             !tmux.has_session(&name),
             "ignored must still stop the running agent"
         );
-        let uri = crate::ghost::session_uri(run_id, 0, 0);
+        let uri = crate::ghost::session_uri(&run_id, 0, 0);
         let ghost = d.lock().get_ghost(&uri).unwrap();
         assert!(
             ghost.is_some_and(|g| g.content.contains(marker)),
@@ -6590,6 +8847,32 @@ mod tests {
         assert!(rr.body.contains("\"dirtied\":"));
     }
 
+    /// RAL-174: a restart note in the body must actually attach without
+    /// hanging. Regression test for a `Mutex` self-deadlock: matching
+    /// directly on `daemon.lock().restart_run(id)` keeps that `MutexGuard`
+    /// alive for the whole arm (Rust extends a match scrutinee's temporaries
+    /// to the arm body), so writing the note via a second `daemon.lock()`
+    /// call inside that arm deadlocked whenever a note was actually present
+    /// — every route test using an empty `""` body never exercised this path.
+    #[test]
+    fn restart_run_route_with_note_attaches_ghost_without_hanging() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"note": "you were stopped midway through the migration"})
+            .to_string();
+        let r = route(&d, "POST", "/api/runs/run-000000000001/restart", &body);
+        assert_eq!(r.status, 200);
+        let ghost = d
+            .lock()
+            .get_ghost(&crate::ghost::session_uri("run-000000000001", 0, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ghost.user_note.as_deref(),
+            Some("you were stopped midway through the migration")
+        );
+    }
+
     #[test]
     fn restart_run_missing_is_404() {
         let d = daemon();
@@ -6604,6 +8887,30 @@ mod tests {
         let d = daemon();
         let r = route(&d, "POST", "/api/runs/run-1/sessions/x/y/restart", "");
         assert_eq!(r.status, 400);
+    }
+
+    /// RAL-174 deadlock regression (see `restart_run_route_with_note_attaches_ghost_without_hanging`).
+    #[test]
+    fn restart_session_route_with_note_attaches_ghost_without_hanging() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"note": "picking up where you left off"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/0/restart",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let ghost = d
+            .lock()
+            .get_ghost(&crate::ghost::session_uri("run-000000000001", 0, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ghost.user_note.as_deref(),
+            Some("picking up where you left off")
+        );
     }
 
     /// RAL-1xx regression: `restart_session`/`restart_session_verify`/
@@ -6700,12 +9007,29 @@ mod tests {
             })
         };
 
-        // Wait until task "b" is genuinely in flight — by then task "a"
-        // (a near-instant command session) has certainly already failed.
+        // Wait until task "b" is genuinely in flight and task "a"'s failure
+        // has actually been recorded in the store. A fixed sleep was flaky
+        // under full-suite load: "a" had returned, but its `failed` state had
+        // not always been persisted yet, so the restart still looked live and
+        // cancelled the shared worker token.
         while !b_started.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let mut a_failed = false;
+        for _ in 0..500 {
+            if matches!(
+                d.lock().session_state(&run_id, 0, 0),
+                Ok(Some(crate::store::NodeState::Failed))
+            ) {
+                a_failed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            a_failed,
+            "task a should reach a recorded failed state before the restart"
+        );
 
         // Restart task "a"'s already-failed session while "b" is still running.
         let rr = route(
@@ -7128,6 +9452,31 @@ mod tests {
         assert!(r.body.contains("\"state\":\"pending\""));
     }
 
+    /// RAL-174 deadlock regression (see `restart_run_route_with_note_attaches_ghost_without_hanging`).
+    #[test]
+    fn restart_session_verify_route_with_note_attaches_ghost_without_hanging() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body =
+            serde_json::json!({"note": "verify was flaking on the last attempt"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/sessions/0/0/verify/0/restart",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let ghost = d
+            .lock()
+            .get_ghost(&crate::ghost::session_uri("run-000000000001", 0, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ghost.user_note.as_deref(),
+            Some("verify was flaking on the last attempt")
+        );
+    }
+
     #[test]
     fn restart_session_verify_bad_index_is_400() {
         let d = daemon();
@@ -7152,6 +9501,34 @@ mod tests {
         );
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"state\":\"pending\""));
+    }
+
+    /// RAL-174 deadlock regression (see `restart_run_route_with_note_attaches_ghost_without_hanging`).
+    /// This is the endpoint that actually hung during development: unlike the
+    /// other four, its handler unconditionally re-locks the store (via
+    /// `sessions_of`) inside the match arm to compute the task's owned
+    /// sessions, so it deadlocked even before reaching `apply_restart_note`.
+    #[test]
+    fn restart_task_verify_route_with_note_attaches_ghost_without_hanging() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"note": "task verify needs a longer timeout"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/verify/0/restart",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let ghost = d
+            .lock()
+            .get_ghost(&crate::ghost::session_uri("run-000000000001", 0, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ghost.user_note.as_deref(),
+            Some("task verify needs a longer timeout")
+        );
     }
 
     #[test]
@@ -7198,6 +9575,27 @@ mod tests {
         let r = route(&d, "POST", "/api/runs/run-000000000001/tasks/0/restart", "");
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"state\":\"pending\""));
+    }
+
+    /// RAL-174 deadlock regression (see `restart_run_route_with_note_attaches_ghost_without_hanging`).
+    #[test]
+    fn restart_task_route_with_note_attaches_ghost_without_hanging() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let body = serde_json::json!({"note": "task was mid-refactor"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/runs/run-000000000001/tasks/0/restart",
+            &body,
+        );
+        assert_eq!(r.status, 200);
+        let ghost = d
+            .lock()
+            .get_ghost(&crate::ghost::session_uri("run-000000000001", 0, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ghost.user_note.as_deref(), Some("task was mid-refactor"));
     }
 
     #[test]
@@ -7737,5 +10135,248 @@ mod tests {
         let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"auto_pr_feedback\":true"));
+    }
+
+    #[test]
+    fn guardian_settings_sets_and_resets_verify_scope() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let r = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(r.body.contains("\"verify_scope\":null"));
+        assert!(
+            r.body
+                .contains("\"effective_verify_scope\":\"each_branch\"")
+        );
+
+        let body = serde_json::json!({"verify_scope": "final_branch"}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"verify_scope\":\"final_branch\""));
+        assert!(
+            r.body
+                .contains("\"effective_verify_scope\":\"final_branch\"")
+        );
+
+        // Empty string resets it back to "inherit the project default".
+        let body = serde_json::json!({"verify_scope": ""}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"verify_scope\":null"));
+        assert!(
+            r.body
+                .contains("\"effective_verify_scope\":\"each_branch\"")
+        );
+    }
+
+    #[test]
+    fn guardian_settings_sets_verify_skip_auto_clean() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let body = serde_json::json!({"verify_skip_auto_clean": true}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"verify_skip_auto_clean\":true"));
+        assert!(r.body.contains("\"effective_verify_skip_auto_clean\":true"));
+    }
+
+    // -----------------------------------------------------------------------
+    // RAL-188: GET /api/resolve?uri=
+    // -----------------------------------------------------------------------
+
+    /// A run whose names exercise every addressing case the URI grammar has:
+    /// a named session, a named task verify, and an *anonymous* session verify
+    /// that is only reachable as `VERIFY[~0]`.
+    const URI_RUN: &str = "\
+[[task]]
+name=\"ral-178\"
+[[task.session]]
+name=\"work\"
+cwd=\"/r\"
+prompt=\"p\"
+[[task.session.verify]]
+command=\"lint\"
+[[task.verify]]
+id=\"test\"
+command=\"cargo test\"
+";
+
+    /// Submit `URI_RUN` and return its run id.
+    fn uri_run(d: &Daemon) -> String {
+        let r = route(d, "POST", "/api/runs", &submit_body(URI_RUN));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        v["run_id"].as_str().unwrap().to_string()
+    }
+
+    fn resolve(d: &Daemon, uri: &str) -> Reply {
+        route(d, "GET", &format!("/api/resolve?uri={uri}"), "")
+    }
+
+    #[test]
+    fn resolve_uri_maps_a_session_uri_to_positional_coordinates() {
+        let d = daemon();
+        let id = uri_run(&d);
+        let r = resolve(
+            &d,
+            &format!("ralphus:/RUN[{id}]/TASK[ral-178]/SESSION[work]?id={id}"),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["kind"], "session");
+        assert_eq!(v["run_id"], id);
+        assert_eq!(v["task_idx"], 0);
+        assert_eq!(v["session_idx"], 0);
+    }
+
+    #[test]
+    fn resolve_uri_addresses_a_task_scope_verify_by_its_id() {
+        let d = daemon();
+        let id = uri_run(&d);
+        let r = resolve(
+            &d,
+            &format!("ralphus:/RUN[{id}]/TASK[ral-178]/VERIFY[test]?id={id}"),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["kind"], "verify");
+        assert_eq!(v["verify_scope"], "task");
+        assert_eq!(v["verify_idx"], 0);
+        assert_eq!(v["session_idx"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn resolve_uri_addresses_an_anonymous_verify_only_by_its_positional_index() {
+        let d = daemon();
+        let id = uri_run(&d);
+        let base = format!("ralphus:/RUN[{id}]/TASK[ral-178]/SESSION[work]");
+        let r = resolve(&d, &format!("{base}/VERIFY[~0]?id={id}"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["verify_scope"], "session");
+        assert_eq!(v["verify_idx"], 0);
+        // The step has no author-supplied id, so it has no name to match --
+        // a bare `VERIFY[0]` is a *name* lookup and must not silently hit it.
+        assert_eq!(
+            resolve(&d, &format!("{base}/VERIFY[0]?id={id}")).status,
+            409
+        );
+    }
+
+    #[test]
+    fn resolve_uri_echoes_the_canonical_form_with_the_id_sidecar() {
+        let d = daemon();
+        let id = uri_run(&d);
+        // Addressed by id (the run has no label), no `?id=` sidecar supplied.
+        let r = resolve(&d, &format!("ralphus:/RUN[{id}]/TASK[ral-178]"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["uri"],
+            format!("ralphus:/RUN[{id}]/TASK[ral-178]?id={id}")
+        );
+    }
+
+    #[test]
+    fn resolve_uri_rejects_a_malformed_uri_with_400_and_a_missing_run_with_404() {
+        let d = daemon();
+        assert_eq!(resolve(&d, "ralphus:/RUN[unterminated").status, 400);
+        assert_eq!(resolve(&d, "ralphus:/BOGUS[x]").status, 400);
+        assert_eq!(route(&d, "GET", "/api/resolve", "").status, 400);
+        assert_eq!(resolve(&d, "ralphus:/RUN[nope]").status, 404);
+    }
+
+    #[test]
+    fn resolve_uri_reports_an_unknown_name_rather_than_guessing() {
+        let d = daemon();
+        let id = uri_run(&d);
+        let r = resolve(&d, &format!("ralphus:/RUN[{id}]/TASK[nope]?id={id}"));
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body.contains("ral-178"), "{}", r.body);
+    }
+
+    #[test]
+    fn resolve_uri_accepts_a_percent_encoded_uri_query_value() {
+        let d = daemon();
+        let id = uri_run(&d);
+        let raw = format!("ralphus:/RUN[{id}]/TASK[ral-178]?id={id}");
+        let encoded = raw
+            .replace('[', "%5B")
+            .replace(']', "%5D")
+            .replace('?', "%3F");
+        assert_eq!(resolve(&d, &encoded).status, 200);
+    }
+
+    #[test]
+    fn resolve_uri_resolves_a_review_and_its_combined_worktree() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let name = {
+            let v: serde_json::Value =
+                serde_json::from_str(&route(&d, "GET", &format!("/api/guardians/{gid}"), "").body)
+                    .unwrap();
+            v["name"].as_str().unwrap().to_string()
+        };
+        let r = resolve(&d, &format!("ralphus:/REVIEW[{name}]?id={gid}&combined"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["kind"], "review");
+        assert_eq!(v["guardian_id"], gid);
+        assert_eq!(v["combined"], true);
+    }
+
+    /// `?worktree=` reaches one stacked branch three ways: its **label** (the
+    /// feature branch name the Reviews UI lists it under), its stable
+    /// `branch-…` id (§C.2), or `~<position>`. All three land on the same
+    /// branch, and the canonical form always echoes the label back.
+    #[test]
+    fn resolve_uri_addresses_a_review_worktree_by_label_id_or_position() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        for branch in ["RAL-187-codex-token-cost-readout", "RAL-188-uri-scheme"] {
+            let body = serde_json::json!({ "branch": branch }).to_string();
+            let r = route(&d, "POST", &format!("/api/guardians/{gid}/branches"), &body);
+            assert_eq!(r.status, 200, "{}", r.body);
+        }
+        let view: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", &format!("/api/guardians/{gid}"), "").body)
+                .unwrap();
+        let branch_id = view["branches"][1]["id"].as_str().unwrap().to_string();
+
+        let by = |worktree: &str| {
+            let r = resolve(
+                &d,
+                &format!("ralphus:/REVIEW[r]?id={gid}&worktree={worktree}"),
+            );
+            assert_eq!(r.status, 200, "{worktree}: {}", r.body);
+            serde_json::from_str::<serde_json::Value>(&r.body).unwrap()
+        };
+        for worktree in ["RAL-188-uri-scheme", branch_id.as_str(), "~1"] {
+            let v = by(worktree);
+            assert_eq!(v["branch_id"], branch_id, "{worktree}");
+            assert_eq!(v["branch"], "RAL-188-uri-scheme", "{worktree}");
+            // The canonical form is always the label, never the id or position.
+            assert_eq!(
+                v["uri"],
+                format!("ralphus:/REVIEW[r]?id={gid}&worktree=RAL-188-uri-scheme"),
+                "{worktree}"
+            );
+        }
+        assert_eq!(
+            resolve(&d, &format!("ralphus:/REVIEW[r]?id={gid}&worktree=nope")).status,
+            409
+        );
+    }
+
+    #[test]
+    fn uri_query_value_takes_everything_after_uri_so_an_embedded_ampersand_survives() {
+        assert_eq!(
+            uri_query_value("uri=ralphus:/REVIEW[r]?id=g-1&combined"),
+            Some("ralphus:/REVIEW[r]?id=g-1&combined")
+        );
+        assert_eq!(
+            uri_query_value("mode=readonly&uri=ralphus:/RUN[r]"),
+            Some("ralphus:/RUN[r]")
+        );
+        assert_eq!(uri_query_value("mode=readonly"), None);
     }
 }

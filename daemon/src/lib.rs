@@ -7,18 +7,22 @@
 
 pub mod cancel;
 pub mod cartographer;
+pub mod channel;
 pub mod chat_client;
 pub mod config;
+pub mod events;
 pub mod forge;
 pub mod ghost;
 pub mod guardian;
 pub mod guardian_merge;
 pub mod jobobject;
 pub mod logging;
+pub mod machines;
 pub mod otel;
 pub mod plan;
 pub mod pr;
 pub mod procreg;
+pub mod remote_runner;
 pub mod resources;
 pub mod reviews;
 pub mod runner;
@@ -27,7 +31,9 @@ pub mod server;
 pub mod store;
 pub mod summary_worker;
 pub mod tmux;
+pub mod vcs;
 pub mod verify;
+pub mod workspace;
 pub mod worktrees;
 
 use std::path::PathBuf;

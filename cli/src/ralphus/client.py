@@ -235,6 +235,61 @@ class DaemonClient:
         result: dict[str, Any] = self._get(f"/api/projects/{name}")
         return result
 
+    def register_machine(
+        self,
+        scheme: str,
+        program: str,
+        *,
+        description: str = "",
+        args: list[str] | None = None,
+        protocol_version: int | None = None,
+        supports_channel: bool = False,
+    ) -> dict[str, Any]:
+        """Register a machine provider with the daemon (RAL-185).
+
+        ``scheme`` is the left half of a ``machine = "<scheme>:<uri>"`` value;
+        ``program`` is the executable the daemon runs to reach that machine.
+        Re-registering an existing scheme updates it in place.
+
+        Registering is deliberately an administrative action reachable only
+        here and over the API -- never from inside a submitted task file, since
+        a TOML that could both name and define an executable would make
+        ``submit`` equivalent to arbitrary code execution.
+        """
+        payload: dict[str, Any] = {
+            "scheme": scheme,
+            "program": program,
+            "description": description,
+            "args": args or [],
+            "supports_channel": supports_channel,
+        }
+        if protocol_version is not None:
+            payload["protocol_version"] = protocol_version
+        result: dict[str, Any] = self._post("/api/machines", payload)
+        return result
+
+    def list_machines(self) -> dict[str, Any]:
+        """Return every registered machine provider, plus the built-in schemes."""
+        result: dict[str, Any] = self._get("/api/machines")
+        return result
+
+    def get_machine(self, scheme: str) -> dict[str, Any]:
+        """Return one registered machine provider by its exact scheme.
+
+        Raises :class:`DaemonError` (404) if no provider is registered under
+        that scheme.
+        """
+        result: dict[str, Any] = self._get(f"/api/machines/{scheme}")
+        return result
+
+    def deregister_machine(self, scheme: str) -> dict[str, Any]:
+        """Remove a registered machine provider.
+
+        Raises :class:`DaemonError` (404) if it was not registered.
+        """
+        result: dict[str, Any] = self._delete(f"/api/machines/{scheme}")
+        return result
+
     def clear(
         self, *, states: list[str] | None = None, keep_temporary: bool = False
     ) -> dict[str, Any]:

@@ -6,6 +6,8 @@
 //! (guardian + branch rows) as methods on [`Store`]; the git mechanics live in
 //! `guardian_git.rs` and the orchestration in the server/merge path.
 
+use std::path::Path;
+
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +186,23 @@ pub struct BranchView {
     pub conflicts_fixed: Option<i64>,
     /// Files whose conflict resolutions are staged and committed to the branch.
     pub conflicts_committed: Option<i64>,
+    /// `true` when this branch introduced no diff over the stack tip beneath it
+    /// (RAL-190) — it rebased cleanly but contributed nothing.
+    ///
+    /// Almost always means the owning task never committed its work: the review
+    /// then looks perfectly healthy while containing none of that task's
+    /// changes. A task is allowed to produce no changes; a *review* containing
+    /// an empty branch is worth flagging, so this surfaces as a warning rather
+    /// than a failure.
+    pub is_empty: bool,
+    /// The machine the session that produced this branch ran on (RAL-185).
+    /// `None` means the daemon's own host — every pre-RAL-185 branch, and any
+    /// branch whose work was done locally.
+    ///
+    /// When this is set, the branch's commits live on *that* machine, so the
+    /// review must fetch them from the project's shared remote before it can
+    /// stack them (see `guardian_merge::fetch_branch_for_remote_session`).
+    pub source_session_machine: Option<String>,
     /// Whether this branch is included in the rebase stack (RAL-43). Disabled
     /// branches are skipped during merge but remain visible in the branch list.
     pub enabled: bool,
@@ -291,6 +310,10 @@ pub struct GuardianView {
     /// resolver is not told to run task/session verify steps while fixing
     /// conflicts. Independent of [`Self::skip_auto_build`].
     pub skip_worktree_checks: bool,
+    /// The machine this review's worktrees, rebase and conflict resolution run
+    /// on (RAL-185). `None` means the daemon's own host — every pre-RAL-185
+    /// review, and any review that never declared one.
+    pub machine: Option<String>,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
     /// future non-git review kinds (see CCTL-112). Existing/derived reviews are
@@ -367,14 +390,28 @@ pub struct GuardianView {
     /// action. Data-model only for v1 -- no background poller reads this flag
     /// yet; it exists so a future automatic mode has somewhere to persist to.
     pub auto_pr_feedback: bool,
-    /// RAL-149: when true, the per-branch conflict-resolution quality-bar
-    /// instructions (see [`Self::skip_worktree_checks`]) are also appended to
-    /// the fix pass's system prompt, in addition to always running in the
-    /// dedicated final-verification call that follows it. Default `false`:
-    /// quality checks (formatters/linters/tests) run only in the final-verify
-    /// call, since they may incur real cost (e.g. a paid test suite) and this
-    /// avoids paying for them twice per conflict-resolution cycle.
-    pub verify_mid_resolution: bool,
+    /// RAL-168: this review's own Verify-scope override -- `"each_branch"`,
+    /// `"final_branch"`, or `"nothing"`. `None` means "inherit the
+    /// project-level default" (`.ralphus.toml [review] verify_scope`,
+    /// resolved into [`Self::effective_verify_scope`] at hydration time).
+    /// Governs whether/how often the dedicated LLM-based final-verify call
+    /// ([`crate::guardian_merge::run_final_verify`]) fires -- replaces the
+    /// old `verify_mid_resolution` flag outright, not layered alongside it.
+    pub verify_scope: Option<String>,
+    /// RAL-168: this review's own override for whether `"each_branch"` scope
+    /// additionally skips verification on branches whose rebase applied
+    /// cleanly with no conflict (an "auto-clean" branch). `None` means
+    /// "inherit the project-level default".
+    pub verify_skip_auto_clean: Option<bool>,
+    /// RAL-168: [`Self::verify_scope`] resolved against the project-level
+    /// `.ralphus.toml [review] verify_scope` default -- always one of
+    /// `"each_branch"`/`"final_branch"`/`"nothing"`, never empty. This is
+    /// what the merge engine actually gates on; the raw field above is only
+    /// for the UI to distinguish "explicit override" from "inherited".
+    pub effective_verify_scope: String,
+    /// RAL-168: [`Self::verify_skip_auto_clean`] resolved against the
+    /// project-level default.
+    pub effective_verify_skip_auto_clean: bool,
     /// `true` once the review is built and awaiting human approval
     /// (`status == "in_review"`). Ported from board.html's "ready to act on"
     /// banner condition (`renderReadyBanner`, minus its client-only dismissed
@@ -1200,6 +1237,22 @@ impl Store {
     /// Set the conflict-resolver backend/model for this review (from the
     /// top-level `[[review]]` block's `agent`/`model`). Either may be `None` to leave
     /// that side falling back to the env override / built-in default.
+    /// Set the machine this review's worktrees, rebase and conflict resolution
+    /// run on (RAL-185). `None` means the daemon's own host.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_machine(&self, id: &str, machine: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET machine=?, updated_at_ms=? WHERE id=?",
+            params![machine, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            return Err(crate::store::StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     pub fn set_guardian_resolver(
         &self,
         id: &str,
@@ -1282,12 +1335,13 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Set whether the quality-bar instructions also run during the fix pass,
-    /// not just the dedicated final-verification call (RAL-149). Default off.
-    pub fn set_guardian_verify_mid_resolution(&self, id: &str, enabled: bool) -> Result<()> {
+    /// Set this review's own Verify-scope override (RAL-168): one of
+    /// `"each_branch"`/`"final_branch"`/`"nothing"`. `None` resets it to
+    /// "inherit the project-level default".
+    pub fn set_guardian_verify_scope(&self, id: &str, scope: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardians SET verify_mid_resolution=?, updated_at_ms=? WHERE id=?",
-            params![i64::from(enabled), crate::store::now_ms(), id],
+            "UPDATE guardians SET verify_scope=?, updated_at_ms=? WHERE id=?",
+            params![scope, crate::store::now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -1296,17 +1350,19 @@ impl Store {
         }
     }
 
-    /// Whether the review runs quality-bar checks during the fix pass too
-    /// (RAL-149). The final-verify call always runs them regardless.
-    pub fn guardian_verify_mid_resolution(&self, id: &str) -> Result<bool> {
-        self.conn
-            .query_row(
-                "SELECT verify_mid_resolution FROM guardians WHERE id=?",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
+    /// Set this review's own override for whether `"each_branch"` scope skips
+    /// auto-clean branches (RAL-168). `None` resets it to "inherit the
+    /// project-level default".
+    pub fn set_guardian_verify_skip_auto_clean(&self, id: &str, skip: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET verify_skip_auto_clean=?, updated_at_ms=? WHERE id=?",
+            params![skip.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
     }
 
     /// Set whether this review auto-incorporates PR feedback comments instead of
@@ -1451,6 +1507,24 @@ impl Store {
         self.conn.execute(
             "UPDATE guardians SET conflicts_found=?, conflicts_fixed=?, conflicts_committed=?, updated_at_ms=? WHERE id=?",
             params![found, fixed, committed, crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Flag whether a branch introduced no diff over the stack tip beneath it
+    /// (RAL-190). See [`BranchView::is_empty`].
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_branch_empty(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        is_empty: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET is_empty=? WHERE guardian_id=? AND id=?",
+            params![i64::from(is_empty), guardian_id, branch_id],
         )?;
         Ok(())
     }
@@ -1894,7 +1968,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_mid_resolution
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -1907,7 +1981,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_mid_resolution
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -1953,7 +2027,9 @@ impl Store {
             squash_projects: r.get(32)?,
             auto_pr_feedback: r.get(33)?,
             input_values: r.get(34)?,
-            verify_mid_resolution: r.get(35)?,
+            verify_scope: r.get(35)?,
+            verify_skip_auto_clean: r.get::<_, Option<i64>>(36)?.map(|v| v != 0),
+            machine: r.get(37)?,
         })
     }
 
@@ -1972,7 +2048,8 @@ impl Store {
                     s.run_id AS source_run_id,
                     s.task_idx AS source_task_idx,
                     s.idx AS source_session_idx,
-                    gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id
+                    gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
+                    gb.is_empty, s.machine AS source_session_machine
              FROM guardian_branches gb
              LEFT JOIN sessions s ON s.rowid = (
                  SELECT s2.rowid FROM sessions s2
@@ -1983,6 +2060,8 @@ impl Store {
         )?;
         let mut branches = stmt
             .query_map(params![row.id], |r| {
+                let is_empty = r.get::<_, i64>(19).map(|v| v != 0).unwrap_or(false);
+                let source_session_machine: Option<String> = r.get(20)?;
                 let enabled = r.get::<_, i64>(9).map(|v| v != 0).unwrap_or(true);
                 let dismissed = r.get::<_, i64>(11).map(|v| v != 0).unwrap_or(false);
                 let source_session_state: Option<String> = r.get(12)?;
@@ -2008,6 +2087,8 @@ impl Store {
                     conflicts_found: r.get(6)?,
                     conflicts_fixed: r.get(7)?,
                     conflicts_committed: r.get(8)?,
+                    is_empty,
+                    source_session_machine,
                     enabled,
                     project: r.get(10)?,
                     source_session_state,
@@ -2034,9 +2115,9 @@ impl Store {
             let Some(wt) = b.worktree.as_deref() else {
                 continue;
             };
-            if let Some((done, total)) =
-                crate::guardian_merge::rebase_command_progress(std::path::Path::new(wt))
-            {
+            if let Some((done, total)) = crate::guardian_merge::rebase_command_progress(
+                &crate::workspace::Workspace::local(wt),
+            ) {
                 b.rebase_commands_done = Some(done);
                 b.rebase_commands_total = Some(total);
             }
@@ -2104,6 +2185,23 @@ impl Store {
         };
         let input_resolutions = self.guardian_input_resolutions(&row.id)?;
 
+        // RAL-168: resolve this review's own Verify-scope override (if any)
+        // against the project-level `.ralphus.toml [review] verify_scope`
+        // default -- so the UI can show the effective value as the dropdown's
+        // initial selection (interview Q7) without a second round-trip, and
+        // the merge engine (`guardian_merge.rs`) has a single, always-populated
+        // field to gate on.
+        let project_review_config = crate::config::resolve(Path::new(&row.git_root));
+        let effective_verify_scope = row
+            .verify_scope
+            .as_deref()
+            .filter(|s| matches!(*s, "each_branch" | "final_branch" | "nothing"))
+            .unwrap_or_else(|| project_review_config.verify_scope())
+            .to_string();
+        let effective_verify_skip_auto_clean = row
+            .verify_skip_auto_clean
+            .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
+
         Ok(GuardianView {
             id: row.id,
             name: row.name,
@@ -2147,7 +2245,11 @@ impl Store {
                 row.squash_projects.as_deref().unwrap_or("[]"),
             ),
             auto_pr_feedback: row.auto_pr_feedback,
-            verify_mid_resolution: row.verify_mid_resolution,
+            verify_scope: row.verify_scope,
+            verify_skip_auto_clean: row.verify_skip_auto_clean,
+            machine: row.machine,
+            effective_verify_scope,
+            effective_verify_skip_auto_clean,
             ready,
             merge_progress,
             summary_state,
@@ -2375,8 +2477,14 @@ struct GuardianRow {
     /// JSON map of {input_name: value} -- resolved/submitted [`CheckInput`]
     /// values, scoped to this guardian (RAL-164).
     input_values: Option<String>,
-    /// RAL-149: opts the fix pass into also running quality-bar checks.
-    verify_mid_resolution: bool,
+    /// RAL-168: per-review Verify-scope override. `None` inherits the
+    /// project-level default.
+    verify_scope: Option<String>,
+    /// RAL-168: per-review auto-clean-skip override. `None` inherits the
+    /// project-level default.
+    verify_skip_auto_clean: Option<bool>,
+    /// RAL-185: the machine this review runs on. NULL means the daemon's host.
+    machine: Option<String>,
 }
 
 #[cfg(test)]
@@ -2476,6 +2584,8 @@ mod tests {
             conflicts_found: None,
             conflicts_fixed: None,
             conflicts_committed: None,
+            is_empty: false,
+            source_session_machine: None,
             enabled: true,
             project: None,
             source_session_state: None,
@@ -3037,6 +3147,61 @@ mod tests {
                 .set_guardian_skip_worktree_checks("nope", true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn verify_scope_defaults_to_inherited_each_branch_and_toggles_independently() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.verify_scope, None);
+        assert_eq!(g.effective_verify_scope, "each_branch");
+        assert!(!g.effective_verify_skip_auto_clean);
+
+        store
+            .set_guardian_verify_scope(&id, Some("final_branch"))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.verify_scope.as_deref(), Some("final_branch"));
+        assert_eq!(g.effective_verify_scope, "final_branch");
+
+        store
+            .set_guardian_verify_skip_auto_clean(&id, Some(true))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.verify_skip_auto_clean, Some(true));
+        assert!(g.effective_verify_skip_auto_clean);
+        // Independent axis: toggling skip_auto_clean must not affect the scope.
+        assert_eq!(g.effective_verify_scope, "final_branch");
+
+        // Resetting back to None restores "inherit the project default".
+        store.set_guardian_verify_scope(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.verify_scope, None);
+        assert_eq!(g.effective_verify_scope, "each_branch");
+
+        assert!(
+            store
+                .set_guardian_verify_scope("nope", Some("nothing"))
+                .is_err()
+        );
+        assert!(
+            store
+                .set_guardian_verify_skip_auto_clean("nope", Some(true))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_scope_unrecognized_stored_value_falls_back_to_each_branch() {
+        // Defense in depth: a value that somehow got into the DB outside the
+        // three recognized scopes (manual SQL edit, future rollback) must not
+        // silently disable verification.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.set_guardian_verify_scope(&id, Some("bogus")).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.effective_verify_scope, "each_branch");
     }
 
     #[test]

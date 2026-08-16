@@ -8,6 +8,8 @@
 //! the runner (see `FINDINGS.local.md` §2.3). Making both optional and enforcing
 //! "exactly one" in the validator keeps the type and the rules in agreement.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 /// Settings that apply to an entire submission (task file).
@@ -57,6 +59,17 @@ pub struct TaskDef {
     /// Default model for all sessions. Sessions may override.
     #[serde(default)]
     pub model: Option<String>,
+    /// The machine every session (and verify step) under this task runs on
+    /// (RAL-185), written `scheme:uri` — e.g. `"incredibuild:A"`. `scheme`
+    /// names a provider registered with the daemon; `uri` is opaque and
+    /// handed to that provider verbatim. Unset means [`LOCAL_MACHINE`].
+    ///
+    /// Sessions and verify steps inherit this and may override it, exactly
+    /// like `agent`/`model` — but note that the affinity rules reject a
+    /// submission whose sessions within one task disagree, so an override is
+    /// only meaningful for restating the same value.
+    #[serde(default)]
+    pub machine: Option<String>,
     /// Extra CLI args passed to the agent for every session; task-level first.
     #[serde(default)]
     pub args: Vec<String>,
@@ -84,6 +97,17 @@ pub struct TaskDef {
     /// Other tasks/sessions this whole task waits on.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Environment variables for every session (and session verify step)
+    /// under this task's spawned subprocess (RAL-172). A session sets the
+    /// same key to override it just for itself, mirroring `agent`/`model`
+    /// inheritance. At submission time these seed the task's row in the
+    /// daemon's existing hierarchical env-override store (`env_overrides`
+    /// column; see `daemon/src/store.rs`'s `run < task < session` layering,
+    /// RAL-150) rather than being a separate delivery mechanism -- from
+    /// there on they're indistinguishable from an override set later via
+    /// `POST /api/runs/{id}/tasks/{ti}/env`.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     /// The agent sessions.
     #[serde(default)]
     pub session: Vec<SessionDef>,
@@ -124,6 +148,12 @@ pub struct SessionDef {
     /// Override the task-level model for this session.
     #[serde(default)]
     pub model: Option<String>,
+    /// Override the task-level `machine` for this session (RAL-185). See
+    /// [`TaskDef::machine`] — the affinity rules require every session within
+    /// one task to resolve to the same machine, so this may only restate the
+    /// task's value, never diverge from it.
+    #[serde(default)]
+    pub machine: Option<String>,
     /// Subdirectories of a monorepo this session is scoped to (e.g.
     /// `["packages/foo", "packages/bar"]`). At run time the daemon injects a
     /// system-prompt addendum instructing the agent to confine its edits to
@@ -170,6 +200,12 @@ pub struct SessionDef {
     /// block to include this session's worktree branch in that review.
     #[serde(default)]
     pub review: Option<String>,
+    /// Environment variables for this session's spawned subprocess
+    /// (RAL-172). Merges with (and wins over on a shared key) the owning
+    /// task's `environment`; see [`TaskDef::environment`] for how these
+    /// values reach the runner.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     /// Upstream branch source for this session's branch. When set to
     /// `"<<task:task-name>>"` (or `"<<task:task-name/session-id>>"`), the daemon
     /// rebases this session's branch onto the named dependency's current branch
@@ -243,6 +279,140 @@ pub fn review_link_key(id: &str) -> Option<&str> {
         .filter(|k| !k.is_empty())
 }
 
+/// The reserved `machine` value naming the daemon's own host. Also the
+/// implicit default when `machine` is unset anywhere in the inheritance chain,
+/// so an existing task file that never mentions `machine` keeps running
+/// exactly where it always did.
+pub const LOCAL_MACHINE: &str = "local";
+
+/// The minimum length of a `machine` URI scheme (RAL-185).
+///
+/// A one-character scheme is rejected purely to keep a Windows drive-letter
+/// path (`C:\build\wt`) from silently parsing as scheme `C` with opaque
+/// `\build\wt`. `machine` is not a path field, so nothing legitimate is lost,
+/// and the error a user gets for pasting a path is far clearer than a
+/// mysterious "provider C is not registered" at submit time.
+pub const MIN_MACHINE_SCHEME_LEN: usize = 2;
+
+/// A parsed `machine` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineRef<'a> {
+    /// The daemon's own host — `machine` unset, or the literal `"local"`.
+    Local,
+    /// A provider-resolved machine, written `scheme:uri`. The daemon never
+    /// interprets `uri`; it is handed to the registered provider verbatim.
+    Provider {
+        /// Registered provider name, e.g. `"incredibuild"`.
+        scheme: &'a str,
+        /// Opaque, provider-defined remainder, e.g. `"A"` or
+        /// `"https://useful.com/some/website"`.
+        uri: &'a str,
+    },
+}
+
+/// Why a `machine` value could not be parsed. Rendered by
+/// [`crate::validate`] into a user-facing message with a line number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineParseError {
+    /// The value was empty or all whitespace.
+    Empty,
+    /// No `:` separator, so there is no scheme (e.g. `"incredibuild"`).
+    MissingScheme,
+    /// The part before `:` was empty (e.g. `":A"`).
+    EmptyScheme,
+    /// The part after `:` was empty (e.g. `"incredibuild:"`).
+    EmptyUri,
+    /// The scheme was shorter than [`MIN_MACHINE_SCHEME_LEN`] — most often a
+    /// Windows drive letter pasted in by mistake.
+    SchemeTooShort,
+    /// The scheme contained a character outside `[A-Za-z0-9_-]`.
+    InvalidSchemeChar(char),
+}
+
+/// Parse a `machine` value into a [`MachineRef`].
+///
+/// Accepts the literal `"local"` (case-insensitive) or `scheme:uri`. The
+/// `uri` half is deliberately unvalidated beyond "non-empty" — it is opaque
+/// provider input and may be a bare token (`"A"`), a URL, a hostname, or
+/// anything else the provider defines.
+///
+/// This is a *syntactic* check only. Whether `scheme` names a registered
+/// provider cannot be answered here: the registry lives in the daemon's
+/// store, which `core` deliberately cannot see (same split as `project`).
+///
+/// # Errors
+/// Returns a [`MachineParseError`] describing the first problem found.
+pub fn parse_machine(machine: &str) -> Result<MachineRef<'_>, MachineParseError> {
+    let raw = machine.trim();
+    if raw.is_empty() {
+        return Err(MachineParseError::Empty);
+    }
+    if raw.eq_ignore_ascii_case(LOCAL_MACHINE) {
+        return Ok(MachineRef::Local);
+    }
+    let Some((scheme, uri)) = raw.split_once(':') else {
+        return Err(MachineParseError::MissingScheme);
+    };
+    if scheme.is_empty() {
+        return Err(MachineParseError::EmptyScheme);
+    }
+    if let Some(bad) = scheme
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-')
+    {
+        return Err(MachineParseError::InvalidSchemeChar(bad));
+    }
+    if scheme.len() < MIN_MACHINE_SCHEME_LEN {
+        return Err(MachineParseError::SchemeTooShort);
+    }
+    if uri.trim().is_empty() {
+        return Err(MachineParseError::EmptyUri);
+    }
+    Ok(MachineRef::Provider { scheme, uri })
+}
+
+/// The effective `machine` for a session: its own value, else the owning
+/// task's, else `None` (meaning [`LOCAL_MACHINE`]). Mirrors how `agent` and
+/// `model` inherit in [`ResolvedAgent::resolve`].
+#[must_use]
+pub fn resolve_session_machine(task: &TaskDef, session: &SessionDef) -> Option<String> {
+    session
+        .machine
+        .clone()
+        .or_else(|| task.machine.clone())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+}
+
+/// The effective `machine` for a task-scope verify step (one with no owning
+/// session): the step's own value, else the task's.
+#[must_use]
+pub fn resolve_task_verify_machine(task: &TaskDef, verify: &VerifyStep) -> Option<String> {
+    verify
+        .machine
+        .clone()
+        .or_else(|| task.machine.clone())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+}
+
+/// The effective `machine` for a session-scope verify step: the step's own
+/// value, else the owning session's resolved machine (which itself falls back
+/// to the task's).
+#[must_use]
+pub fn resolve_session_verify_machine(
+    task: &TaskDef,
+    session: &SessionDef,
+    verify: &VerifyStep,
+) -> Option<String> {
+    verify
+        .machine
+        .clone()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .or_else(|| resolve_session_machine(task, session))
+}
+
 /// A top-level review (guardian) declaration via `[[review]]`.
 ///
 /// Sessions opt in by declaring `review = "<id>"`. When several sessions resolve
@@ -269,6 +439,29 @@ pub struct ReviewDef {
     /// backend (other backends take their own default).
     #[serde(default)]
     pub model: Option<String>,
+    /// The branch this review's stack rebases onto, declared rather than
+    /// discovered (RAL-185).
+    ///
+    /// A local review normally infers its base from each contributing
+    /// worktree's git upstream. That read only works on the machine holding
+    /// the worktree, so a review fed by a **remote** session must state its
+    /// base here — the daemon has no way to look it up across machines, and
+    /// guessing the project's default branch would silently produce a review
+    /// against the wrong base.
+    ///
+    /// Optional for an all-local review, where inference still applies and
+    /// this simply overrides it.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The machine this review's worktrees and merge live on (RAL-185),
+    /// written `scheme:uri`. Independent of any task's machine — a review may
+    /// run somewhere none of its contributing tasks did. Unset means
+    /// [`LOCAL_MACHINE`].
+    ///
+    /// Every worktree feeding one review must be on this machine: the stacked
+    /// linear rebase needs all of the branches in one repo on one filesystem.
+    #[serde(default)]
+    pub machine: Option<String>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
@@ -339,6 +532,12 @@ pub struct VerifyStep {
     /// session's resolved model when unset).
     #[serde(default)]
     pub model: Option<String>,
+    /// Override the inherited `machine` for this verify step (RAL-185). Falls
+    /// back to the owning session's resolved machine for a session-scope step,
+    /// or the task's for a task-scope one. See [`TaskDef::machine`] — the
+    /// affinity rules require every step under one task to agree.
+    #[serde(default)]
+    pub machine: Option<String>,
     /// Extra CLI args for the prompt-verifier invocation (e.g. `--append-system-prompt`).
     #[serde(default)]
     pub arguments: Vec<String>,
@@ -435,6 +634,7 @@ mod tests {
             project: None,
             agent: agent.map(str::to_string),
             model: model.map(str::to_string),
+            machine: None,
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
             maximum_budget_usd: None,
@@ -442,6 +642,7 @@ mod tests {
             priority: None,
             timeout_minutes: None,
             depends_on: vec![],
+            environment: BTreeMap::new(),
             session: vec![],
             verify: vec![],
         }
@@ -459,6 +660,7 @@ mod tests {
             depends_on: vec![],
             agent: agent.map(str::to_string),
             model: model.map(str::to_string),
+            machine: None,
             system_prompt: None,
             system_prompt_position: None,
             args: args.iter().map(|s| (*s).to_string()).collect(),
@@ -466,6 +668,7 @@ mod tests {
             maximum_budget_usd: None,
             timeout_minutes: None,
             priority: None,
+            environment: BTreeMap::new(),
             verify: vec![],
             review: None,
             upstream: None,
@@ -638,6 +841,52 @@ mod tests {
     }
 
     #[test]
+    fn environment_deserializes_at_task_and_session_level() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            environment = { SHARED = "from-task", TASK_ONLY = "1" }
+            [[task.session]]
+            cwd = "/repo"
+            prompt = "do work"
+            environment = { SHARED = "from-session", SESSION_ONLY = "2" }
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let task = &parsed.task[0];
+        assert_eq!(
+            task.environment.get("SHARED").map(String::as_str),
+            Some("from-task")
+        );
+        assert_eq!(
+            task.environment.get("TASK_ONLY").map(String::as_str),
+            Some("1")
+        );
+        let sess = &task.session[0];
+        assert_eq!(
+            sess.environment.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+        assert_eq!(
+            sess.environment.get("SESSION_ONLY").map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn environment_defaults_to_empty() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.session]]
+            cwd = "/repo"
+            prompt = "do work"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert!(parsed.task[0].environment.is_empty());
+        assert!(parsed.task[0].session[0].environment.is_empty());
+    }
+
+    #[test]
     fn upstream_task_ref_matches_simple_task() {
         assert_eq!(parse_upstream_task_ref("<<task:my-task>>"), Some("my-task"));
     }
@@ -682,6 +931,142 @@ mod tests {
     fn worktree_placeholder_rejects_empty_branch() {
         assert_eq!(parse_worktree_placeholder("ralphus:new-worktree/"), None);
         assert_eq!(parse_worktree_placeholder("ralphus:new-worktree"), None);
+    }
+
+    // ── machine URI parsing (RAL-185) ─────────────────────────────────────
+
+    #[test]
+    fn machine_parses_scheme_and_opaque_uri() {
+        assert_eq!(
+            parse_machine("incredibuild:A"),
+            Ok(MachineRef::Provider {
+                scheme: "incredibuild",
+                uri: "A"
+            })
+        );
+        // The uri half is opaque -- colons, slashes and URLs all pass through
+        // to the provider untouched.
+        assert_eq!(
+            parse_machine("some_machine_provider:https://useful.com/some/website"),
+            Ok(MachineRef::Provider {
+                scheme: "some_machine_provider",
+                uri: "https://useful.com/some/website"
+            })
+        );
+    }
+
+    #[test]
+    fn machine_accepts_the_local_literal_case_insensitively() {
+        assert_eq!(parse_machine("local"), Ok(MachineRef::Local));
+        assert_eq!(parse_machine("Local"), Ok(MachineRef::Local));
+        assert_eq!(parse_machine("  local  "), Ok(MachineRef::Local));
+    }
+
+    #[test]
+    fn machine_rejects_malformed_values() {
+        assert_eq!(parse_machine(""), Err(MachineParseError::Empty));
+        assert_eq!(parse_machine("   "), Err(MachineParseError::Empty));
+        assert_eq!(
+            parse_machine("incredibuild"),
+            Err(MachineParseError::MissingScheme)
+        );
+        assert_eq!(parse_machine(":A"), Err(MachineParseError::EmptyScheme));
+        assert_eq!(
+            parse_machine("incredibuild:"),
+            Err(MachineParseError::EmptyUri)
+        );
+        assert_eq!(
+            parse_machine("incredibuild:   "),
+            Err(MachineParseError::EmptyUri)
+        );
+        assert_eq!(
+            parse_machine("bad scheme:A"),
+            Err(MachineParseError::InvalidSchemeChar(' '))
+        );
+    }
+
+    #[test]
+    fn machine_rejects_a_windows_drive_letter_rather_than_reading_it_as_a_scheme() {
+        // A pasted path would otherwise parse as scheme `C` with opaque
+        // `\build\wt` and only surface much later as "provider C is not
+        // registered", which tells the user nothing useful.
+        assert_eq!(
+            parse_machine(r"C:\build\wt"),
+            Err(MachineParseError::SchemeTooShort)
+        );
+    }
+
+    #[test]
+    fn session_machine_overrides_task_and_unset_falls_through_to_none() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            machine = "incredibuild:A"
+            [[task.session]]
+            cwd = "/tmp"
+            command = "x"
+            [[task.session]]
+            cwd = "/tmp"
+            command = "y"
+            machine = "incredibuild:B"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let task = &parsed.task[0];
+        assert_eq!(
+            resolve_session_machine(task, &task.session[0]).as_deref(),
+            Some("incredibuild:A"),
+            "an unset session machine inherits the task's"
+        );
+        assert_eq!(
+            resolve_session_machine(task, &task.session[1]).as_deref(),
+            Some("incredibuild:B"),
+            "an explicit session machine wins"
+        );
+
+        let bare = r#"
+            [[task]]
+            name = "t"
+            [[task.session]]
+            cwd = "/tmp"
+            command = "x"
+        "#;
+        let parsed: TaskFile = toml::from_str(bare).expect("should deserialize");
+        let task = &parsed.task[0];
+        assert_eq!(
+            resolve_session_machine(task, &task.session[0]),
+            None,
+            "no machine anywhere means local, represented as None"
+        );
+    }
+
+    #[test]
+    fn verify_machine_inherits_from_its_owner() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            machine = "incredibuild:A"
+            [[task.session]]
+            cwd = "/tmp"
+            command = "x"
+            machine = "incredibuild:S"
+            [[task.session.verify]]
+            command = "cargo test"
+            [[task.verify]]
+            command = "cargo fmt"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let task = &parsed.task[0];
+        let session = &task.session[0];
+        assert_eq!(
+            resolve_session_verify_machine(task, session, &session.verify[0]).as_deref(),
+            Some("incredibuild:S"),
+            "a session-scope verify follows its session, not the task"
+        );
+        assert_eq!(
+            resolve_task_verify_machine(task, &task.verify[0]).as_deref(),
+            Some("incredibuild:A"),
+            "a task-scope verify follows the task"
+        );
     }
 
     #[test]

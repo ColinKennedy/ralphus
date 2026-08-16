@@ -90,3 +90,8 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Ollama-marked tests (pytest.mark.ollama) call a live local LLM; keep them
+# out of the default invocation and require an explicit `-m ollama` opt-in —
+# mirrors the Rust side's `#[ignore]` gate on its live-Ollama tests. The
+# marker itself is registered in ralphus/bench/pytest_plugin.py.
+addopts = "-m 'not ollama'"

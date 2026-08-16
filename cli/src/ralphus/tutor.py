@@ -12,7 +12,7 @@ from __future__ import annotations
 
 __all__ = ["TASK_TUTOR", "task_tutor"]
 
-TASK_TUTOR = r"""
+TASK_TUTOR = r'''
 ===============================================================
              ralphus  Task TOML -- Schema Reference
 ===============================================================
@@ -60,6 +60,16 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  timeout_minutes integer       Default wall-clock timeout (minutes) for sessions
                                and verifies; each may override its own.
  depends_on     array<string>  Tasks this task waits on (see formats below)
+ environment    table<string,  Environment variables for every session's spawned
+                 string>       subprocess, e.g.
+                               `environment = { FEATURE_FLAG = "1" }`.
+                               Sessions inherit these; a session setting the
+                               same key overrides it just for itself. Keys
+                               must be valid identifiers
+                               ([A-Za-z_][A-Za-z0-9_]*); values must be
+                               strings. Same mechanism as (and can later be
+                               changed/unset via) `POST /api/runs/{id}/tasks/
+                               {ti}/env` -- see docs/daemon-api.md.
 
 ---------------------------------------------------------------
  [[task.session]]   (zero or more per task)
@@ -118,6 +128,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         the agent's built-in system prompt). Required
                                         whenever `system_prompt` is set.
  args                    array<string>  Per-session agent flags (appended after task args)
+ environment             table<string,  Environment variables for this session's spawned
+                         string>        subprocess, e.g.
+                                        `environment = { FEATURE_FLAG = "1" }`.
+                                        Merges with the owning task's
+                                        `environment`, winning on a shared
+                                        key. Same key/value rules as the
+                                        task-level field above.
  budget_tokens           integer        Per-session total-token cap (falls back to task)
  timeout_minutes         integer        Per-session wall-clock timeout (falls back to task)
  priority                integer        Initial Queue priority hint (lower = runs sooner);
@@ -187,6 +204,10 @@ Tip: validate before submitting -- `ralphus validate file.toml`
        ralphus submit file-a.toml file-b.toml file-c.toml
      -- which combines them into one submission before sending it
      to the daemon.
+     Default recommendation: unless the user explicitly asks for a
+     different split, make ONE Guardian review per `ralphus submit`
+     call. Multiple reviews are fine when intentional; one review
+     per submit is simply the safe default.
 
  Key    Type    Notes
  id     string  Human-readable review id (also the default label),
@@ -354,6 +375,15 @@ Guardian exists to surface, and is almost never what you want.
     it. Keep this an AI session, not `git add -A`, so junk never gets
     committed.
 
+    Put "do not run formatters, linters, or tests" in `system_prompt`
+    (system_prompt_position = "append"), not in `prompt`. The verify
+    steps already ran those checks -- finalize re-running them (and
+    possibly "fixing" something) risks producing a diff that never
+    went through verify, and can distract the agent from its one job.
+    A `system_prompt` is a hard constraint, so it reliably keeps
+    finalize to exactly: stage the intended source files, commit, and
+    push.
+
  4b. BRANCH STACKING (DEFAULT when this task continues prior work in
     the same repo): add `upstream = "<<task:prior-task-name>>"` to the
     WORK session. The scheduler rebases this branch onto that task's
@@ -369,16 +399,17 @@ Guardian exists to surface, and is almost never what you want.
       depends_on             = ["prior-task-name/finalize"]
       ...
 
- 5. ONE review for the whole batch (the DEFAULT): add a top-level
-    [[review]] block with id = "ralphus:new-review/<key>", then set
-    review = "ralphus:new-review/<key>" on every [[task.session]] whose
-    cwd is a git worktree. Every session naming the same <key> attaches
-    to ONE shared Guardian -- but the <key> only groups WITHIN a single
-    submission. This is the norm for a list of tickets, not a special
-    case. Reach for a second review only when the batch splits into two
-    genuinely independent streams; otherwise keep it to one. Never emit
-    one review per task -- that is the anti-pattern this layout exists
-    to avoid.
+ 5. ONE review for the whole batch (the DEFAULT unless the user says
+    otherwise): add a top-level [[review]] block with id =
+    "ralphus:new-review/<key>", then set review =
+    "ralphus:new-review/<key>" on every [[task.session]] whose cwd is a
+    git worktree. Every session naming the same <key> attaches to ONE
+    shared Guardian -- but the <key> only groups WITHIN a single
+    submission. The prescriptive default is one Guardian review per
+    `ralphus submit` call. Reach for a second review only when the batch
+    splits into two genuinely independent streams; otherwise keep it to
+    one. Never emit one review per task -- that is the anti-pattern this
+    layout exists to avoid.
 
     IMPORTANT: if the batch spans MULTIPLE .toml files (one per
     ticket/branch is the usual layout), every file that shares the same
@@ -507,12 +538,18 @@ project = "my-project"            # both sessions' worktree materializes under t
 
   # finalize: AI stages only source files and commits (depends on work).
   # Same placeholder string as "work" -- the daemon materializes it once and
-  # reuses the identical worktree for both sessions.
+  # reuses the identical worktree for both sessions. system_prompt keeps it
+  # to exactly commit + push -- no re-running formatters/linters/tests that
+  # verify already handled.
   [[task.session]]
-  id         = "finalize"
-  cwd        = "ralphus:new-worktree/ral-2"
-  depends_on = ["work"]
-  prompt     = "Stage only source changes (no build/temp files), commit, push if a remote exists."
+  id                     = "finalize"
+  agent                  = "claude-code"  # required for system_prompt (see field reference above)
+  cwd                    = "ralphus:new-worktree/ral-2"
+  depends_on             = ["work"]
+  system_prompt          = "Do NOT run formatters, linters, or tests. Just stage, commit, and push."
+  system_prompt_position = "append"
+  prompt                 = """Stage only source changes (no build/temp files), commit, \
+                             push if a remote exists."""
 
 # A second ticket that stacks on ral-2. `upstream` rebases RAL-3's
 # worktree branch onto ral-2's finalized tip before the agent starts.
@@ -552,7 +589,9 @@ combines them into ONE submission before sending it to the daemon, so a
 `ralphus:new-review/<key>` shared across those files' [[review]] blocks
 folds into ONE guardian. Submitting the files one at a time instead
 (three separate `ralphus submit` calls) mints three separate guardians.
-"""
+Unless the user explicitly asks for a different split, recommend the
+former shape: one submit call, one Guardian review.
+'''
 
 
 def task_tutor() -> str:

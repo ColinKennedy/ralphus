@@ -347,6 +347,95 @@ def test_usage_parsed_from_turn_completed(tmp_path: Path, monkeypatch: pytest.Mo
     assert outcome.cost_usd == 0.0
 
 
+def test_usage_accumulates_across_multiple_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RAL-187: each `turn.completed` reports only *that turn's* usage, so a
+    multi-turn `codex exec` must sum them. Overwriting made the board report
+    just the final turn -- the "Codex shows 0 tokens" symptom."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(
+            0,
+            stdout_lines=[
+                _turn_completed(tokens_in=100, tokens_out=10),
+                _turn_completed(tokens_in=250, tokens_out=25),
+                _agent_message("done"),
+                _turn_completed(tokens_in=7, tokens_out=3),
+            ],
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = CodexBackend().run("task", ws, model=None)
+
+    assert outcome.tokens_in == 357
+    assert outcome.tokens_out == 38
+
+
+def test_usage_survives_a_turn_that_fails_after_an_earlier_one_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RAL-187: a run whose last turn fails still reports what the earlier,
+    completed turns actually spent -- those tokens were really burned."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(
+            0,
+            stdout_lines=[
+                _turn_completed(tokens_in=80, tokens_out=9),
+                _turn_failed("model exhausted its context"),
+            ],
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = CodexBackend().run("task", ws, model=None)
+
+    assert outcome.tokens_in == 80
+    assert outcome.tokens_out == 9
+
+
+def _live_usage_events(stderr: str) -> list[dict[str, Any]]:
+    """The payloads of every `codex live usage` RALPHUS_EVENT line, in order."""
+    marker = "RALPHUS_EVENT: "
+    events = [
+        json.loads(line[len(marker) :]) for line in stderr.splitlines() if line.startswith(marker)
+    ]
+    return [ev["payload"] for ev in events if ev["message"] == "codex live usage"]
+
+
+def test_live_usage_emitted_per_completed_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """RAL-187: the board read 0 tokens for the whole of a running Codex
+    session because usage only reached the daemon at the very end. Each
+    completed turn now forwards the running total over the RALPHUS_EVENT
+    stderr channel, which `runner.rs` already persists to the session row."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    def fake_popen(_cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(
+            0,
+            stdout_lines=[
+                _turn_completed(tokens_in=100, tokens_out=10),
+                _turn_completed(tokens_in=250, tokens_out=25),
+            ],
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    CodexBackend().run("task", ws, model=None)
+
+    payloads = _live_usage_events(capsys.readouterr().err)
+    assert [(p["tokens_in"], p["tokens_out"]) for p in payloads] == [(100, 10), (350, 35)]
+    # Codex reports no dollar cost anywhere; the live event must not invent
+    # one -- the board renders a reported zero as "N/A" instead.
+    assert all(p["cost_usd"] == 0.0 for p in payloads)
+
+
 def test_summary_keeps_tail_not_head_of_long_agent_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

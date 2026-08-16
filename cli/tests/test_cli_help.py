@@ -118,7 +118,35 @@ def test_show_help_map_prints_the_submit_validate_note(
     assert "- ralphus" in out  # the tree itself still follows the notes
 
 
-def test_quick_start_claude_code_help_mentions_passthrough() -> None:
-    out = _help_text(["quick-start", "claude-code", "--help"])
+def test_quick_start_manager_claude_code_help_mentions_passthrough() -> None:
+    out = _help_text(["quick-start", "manager", "claude-code", "--help"])
     assert "--append-system-prompt" in out
+    assert "--command" in out
+
+
+def test_bare_quick_start_manager_prints_group_help() -> None:
+    code = cli.main(["quick-start", "manager"])
+    assert code == 0
+
+
+def test_bare_quick_start_reviewer_prints_group_help() -> None:
+    code = cli.main(["quick-start", "reviewer"])
+    assert code == 0
+
+
+def test_quick_start_manager_codex_help_mentions_command_flag() -> None:
+    out = _help_text(["quick-start", "manager", "codex", "--help"])
+    assert "--command" in out
+    assert "RALPHUS_CODEX_CMD" in out
+
+
+def test_quick_start_reviewer_claude_code_help_mentions_target() -> None:
+    out = _help_text(["quick-start", "reviewer", "claude-code", "--help"])
+    assert "target" in out
+    assert "--command" in out
+
+
+def test_quick_start_reviewer_codex_help_mentions_target() -> None:
+    out = _help_text(["quick-start", "reviewer", "codex", "--help"])
+    assert "target" in out
     assert "--command" in out

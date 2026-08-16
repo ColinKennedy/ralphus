@@ -14,8 +14,9 @@ pipeline itself, rather than a small local model's tool-calling reliability —
 a separate, already-known limitation that isn't specific to this feature (see
 e.g. `ralphus author`'s own live-ollama flakiness).
 
-Run it explicitly with the runner extra:
-    uv run --extra runner pytest -k verify_ollama
+Deselected by default (see `addopts` in cli/pyproject.toml). Run it explicitly
+with the runner extra:
+    uv run --extra runner pytest -m ollama -k verify_ollama
 """
 
 from __future__ import annotations

@@ -6,7 +6,7 @@
 //! never starts the daemon; if the daemon is down, proxied calls return a 502
 //! and the page degrades gracefully.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
 
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
@@ -148,6 +148,10 @@ fn proxy(
     }
 }
 
+/// The SSE push endpoint (RAL-167), proxied straight through rather than via
+/// the buffered `proxy()` path above.
+const EVENTS_PATH: &str = "/api/events";
+
 /// Serve the librarian on `127.0.0.1:port`, proxying the API to `daemon_url`.
 ///
 /// # Errors
@@ -158,6 +162,16 @@ pub fn serve(port: u16, daemon_url: &str) -> std::io::Result<()> {
     for mut request in server.incoming_requests() {
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
+
+        if method == "GET" && url.split('?').next().unwrap_or(&url) == EVENTS_PATH {
+            // Like the daemon's own accept loop, this one is otherwise
+            // synchronous/single-request -- a long-lived SSE connection held
+            // here would starve every other client (RAL-167).
+            let daemon_url = daemon_url.to_string();
+            std::thread::spawn(move || proxy_events_stream(&daemon_url, request));
+            continue;
+        }
+
         let traceparent = request
             .headers()
             .iter()
@@ -181,6 +195,46 @@ pub fn serve(port: u16, daemon_url: &str) -> std::io::Result<()> {
         let _ = request.respond(response);
     }
     Ok(())
+}
+
+/// Stream-proxy the daemon's `/api/events` SSE endpoint straight through to
+/// the browser, byte for byte, on its own thread (RAL-167). Unlike `proxy()`,
+/// this never buffers a full response: `ureq`'s `.call()` returns as soon as
+/// the daemon's response headers arrive (the body is a live, unbounded
+/// stream), and every chunk read from it is written straight to the browser
+/// connection and flushed immediately.
+fn proxy_events_stream(daemon_url: &str, request: tiny_http::Request) {
+    let url = format!("{}{EVENTS_PATH}", daemon_url.trim_end_matches('/'));
+    let mut writer = request.into_writer();
+    let resp = match ureq::get(&url).call() {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = writer.write_all(
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\ndaemon unreachable",
+            );
+            return;
+        }
+    };
+    let preamble = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Cache-Control: no-cache\r\n\
+Connection: keep-alive\r\n\
+X-Accel-Buffering: no\r\n\
+\r\n";
+    if writer.write_all(preamble).is_err() || writer.flush().is_err() {
+        return;
+    }
+    let mut reader = resp.into_reader();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

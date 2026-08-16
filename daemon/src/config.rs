@@ -47,6 +47,21 @@ pub struct ReviewConfig {
     /// layer, same as `skip_worktrees`.
     #[serde(default)]
     pub summary_format: Option<String>,
+    /// RAL-168: project-level default "Verify" scope for the LLM-based
+    /// final-verify pass -- one of `"each_branch"` (default), `"final_branch"`,
+    /// or `"nothing"`. `None` means unset, which resolves to `"each_branch"`
+    /// (see [`Self::verify_scope`]); per-project scalars win over the global
+    /// layer, same as `skip_worktrees`. A per-review override (see
+    /// `Guardian::verify_scope` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub verify_scope: Option<String>,
+    /// RAL-168: within `"each_branch"` scope, additionally skip verification
+    /// on branches whose rebase applied cleanly with no conflict (an
+    /// "auto-clean" branch) -- the old, lighter-weight default behavior.
+    /// `None` means unset, which resolves to `false`; per-project scalars win
+    /// over the global layer, same as `skip_worktrees`.
+    #[serde(default)]
+    pub verify_skip_auto_clean: Option<bool>,
 }
 
 impl ReviewConfig {
@@ -65,6 +80,27 @@ impl ReviewConfig {
         self.summary_format.as_deref() != Some("prose")
     }
 
+    /// The project-level default Verify scope (RAL-168), normalized to one of
+    /// `"each_branch"`/`"final_branch"`/`"nothing"`. Unset or an unrecognized
+    /// value resolves to `"each_branch"` (today's post-RAL-168 default
+    /// behavior), so a typo in `.ralphus.toml` degrades to the safe default
+    /// rather than silently disabling verification.
+    #[must_use]
+    pub fn verify_scope(&self) -> &str {
+        match self.verify_scope.as_deref() {
+            Some("final_branch") => "final_branch",
+            Some("nothing") => "nothing",
+            _ => "each_branch",
+        }
+    }
+
+    /// Whether `"each_branch"` scope additionally skips auto-clean branches
+    /// (unset resolves to `false`).
+    #[must_use]
+    pub fn verify_skip_auto_clean(&self) -> bool {
+        self.verify_skip_auto_clean.unwrap_or(false)
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -81,6 +117,8 @@ impl ReviewConfig {
             checks,
             auto_build: over.auto_build.or(self.auto_build),
             summary_format: over.summary_format.or(self.summary_format),
+            verify_scope: over.verify_scope.or(self.verify_scope),
+            verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
         }
     }
 }
@@ -566,8 +604,7 @@ mod tests {
         ReviewConfig {
             skip_worktrees: skip,
             checks: checks.iter().map(|s| (*s).to_string()).collect(),
-            auto_build: None,
-            summary_format: None,
+            ..ReviewConfig::default()
         }
     }
 
@@ -667,6 +704,52 @@ mod tests {
         assert!(global.clone().merge(project).bullet_summary());
         // Project unset falls back to the global value.
         assert!(!global.merge(ReviewConfig::default()).bullet_summary());
+    }
+
+    // ── verify_scope (RAL-168) ────────────────────────────────────────────────
+
+    #[test]
+    fn verify_scope_defaults_to_each_branch_when_unset() {
+        assert_eq!(ReviewConfig::default().verify_scope(), "each_branch");
+    }
+
+    #[test]
+    fn verify_scope_parses_final_branch_and_nothing() {
+        let c = from_toml_str("[review]\nverify_scope = \"final_branch\"\n");
+        assert_eq!(c.verify_scope(), "final_branch");
+        let c = from_toml_str("[review]\nverify_scope = \"nothing\"\n");
+        assert_eq!(c.verify_scope(), "nothing");
+    }
+
+    #[test]
+    fn verify_scope_unrecognized_value_falls_back_to_each_branch() {
+        let c = from_toml_str("[review]\nverify_scope = \"bogus\"\n");
+        assert_eq!(c.verify_scope(), "each_branch");
+    }
+
+    #[test]
+    fn verify_skip_auto_clean_defaults_to_false() {
+        assert!(!ReviewConfig::default().verify_skip_auto_clean());
+        let c = from_toml_str("[review]\nverify_skip_auto_clean = true\n");
+        assert!(c.verify_skip_auto_clean());
+    }
+
+    #[test]
+    fn merge_verify_scope_project_wins() {
+        let global = ReviewConfig {
+            verify_scope: Some("final_branch".to_string()),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            verify_scope: Some("nothing".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(global.clone().merge(project).verify_scope(), "nothing");
+        // Project unset falls back to the global value.
+        assert_eq!(
+            global.merge(ReviewConfig::default()).verify_scope(),
+            "final_branch"
+        );
     }
 
     // ── merge cases (the four required by CCTL-156) ──────────────────────────

@@ -1223,6 +1223,7 @@ fn two_conflicting_worktrees(base: &Path) -> (String, String) {
 /// conflict resolved by a live ollama agent. Skips unless ollama + a model +
 /// `ralphus-runner` are all available locally.
 #[test]
+#[ignore = "calls a live local Ollama model; run explicitly with `cargo test -- --ignored`"]
 fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     let Some(runner_cmd) = find_runner() else {
         eprintln!("SKIP full_flow: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");

@@ -7,8 +7,9 @@ subscription) with **no API key and no per-token billing**.
 ``--dangerously-skip-permissions`` lets the agent edit files and run commands
 without interactive prompts, which is what makes unattended task execution work
 (the same approach the predecessor used). The ``claude`` program can be
-overridden with ``RALPHUS_CLAUDE_COMMAND`` (also used by ``ralphus quick-start
-claude-code`` and validated by ``ralphus check health`` -- RAL-110).
+overridden with ``RALPHUS_CLAUDE_COMMAND`` (also used by every ``ralphus
+quick-start manager|reviewer claude-code`` entrypoint and validated by
+``ralphus check health`` -- RAL-110/166).
 
 To avoid OS command-line length limits, the prompt is written to a temporary
 file under ~/.ralphus/task_prompts/ and referenced via the ``@path`` file-
@@ -150,7 +151,7 @@ class ClaudeCodeBackend:
         program = os.environ.get("RALPHUS_CLAUDE_COMMAND", "claude")
         # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably.
         program = shutil.which(program) or program
-        # Unlike `ralphus quick-start claude-code`, this backend does not support
+        # Unlike `ralphus quick-start manager|reviewer claude-code`, this backend does not support
         # a compound shell command (e.g. "cd foo && claude") here -- it always
         # spawns `program` directly (never via a shell), matching this file's
         # existing streaming-JSON `Popen` + pipe-parsing design.
@@ -344,7 +345,10 @@ class ClaudeCodeBackend:
                         label = "error" if block.get("is_error") else "result"
                         print(f"[{label}] {text}", file=sys.stderr)
                 elif ev_type == "result":
-                    result_summary = str(ev.get("result", ""))[:2000]
+                    # Trailing chars (not leading) so a marker on the model's final
+                    # output line -- e.g. RALPHUS_VERIFY: PASS/FAIL -- survives
+                    # truncation. Mirrors codex_backend.py's agent_message[-2000:].
+                    result_summary = str(ev.get("result", ""))[-2000:]
                     session_id = ev.get("session_id") or session_id
                     # Token counts live under the nested "usage" object (there is
                     # no top-level total_input_tokens/total_output_tokens field) --

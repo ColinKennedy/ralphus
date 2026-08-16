@@ -63,6 +63,9 @@ def verify_step(
     *,
     agent: str = "claude",
     model: str | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    cost_usd: float = 0.0,
 ) -> Json:
     return {
         "id": id_,
@@ -72,6 +75,9 @@ def verify_step(
         "spec": spec,
         "model": model,
         "agent": agent,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_usd": cost_usd,
     }
 
 

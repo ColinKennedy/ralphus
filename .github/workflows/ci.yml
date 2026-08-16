@@ -25,19 +25,25 @@ jobs:
         run: cargo test --all-targets
 
   web:
-    name: Web (eslint + tsc --checkJs on board.html)
+    name: Web (eslint + tsc --checkJs + knip + node --test on board.html)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # 22+: `node --test "<glob>"` expands the pattern itself, so the test
+          # script behaves identically under sh here and cmd.exe on Windows.
+          node-version: "22"
       - name: Install lint deps
         run: npm install --no-audit --no-fund
       - name: ESLint (inline board.html JS, incl. JSDoc coverage)
         run: npx eslint librarian/assets/board.html
       - name: Type-check board.html's JSDoc-annotated JS (tsc --checkJs)
         run: npm run typecheck
+      - name: Knip (dead code / unused deps)
+        run: npm run knip
+      - name: Unit tests (board.html's pure peek state machine)
+        run: npm test
 
   python:
     name: Python (ruff, mypy --strict, privata, pytest)

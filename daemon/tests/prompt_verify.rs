@@ -130,6 +130,7 @@ fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>
 }
 
 #[test]
+#[ignore = "calls a live local Ollama model; run explicitly with `cargo test -- --ignored`"]
 fn prompt_verify_passes_a_true_claim_via_real_ollama() {
     if find_runner().is_none() {
         eprintln!("SKIP prompt_verify: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");
@@ -152,6 +153,7 @@ fn prompt_verify_passes_a_true_claim_via_real_ollama() {
 }
 
 #[test]
+#[ignore = "calls a live local Ollama model; run explicitly with `cargo test -- --ignored`"]
 fn prompt_verify_fails_a_false_claim_via_real_ollama() {
     if find_runner().is_none() {
         eprintln!("SKIP prompt_verify: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");

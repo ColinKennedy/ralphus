@@ -5,13 +5,16 @@
   "scripts": {
     "lint": "eslint librarian/assets/board.html",
     "extract-board-js": "node scripts/extract-board-js.mjs",
-    "typecheck": "npm run extract-board-js && node scripts/typecheck-board.mjs"
+    "typecheck": "npm run extract-board-js && node scripts/typecheck-board.mjs",
+    "knip": "knip",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "devDependencies": {
     "eslint": "^9.13.0",
     "eslint-plugin-html": "^8.1.2",
     "eslint-plugin-jsdoc": "^50.4.3",
     "globals": "^15.11.0",
+    "knip": "^5.33.3",
     "typescript": "^5.6.3"
   }
 }

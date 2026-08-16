@@ -41,6 +41,8 @@ role in the table below, then use it.
 | `--unverified` | `#e3b341` | *(shared)* | semantic (review reached done with no build/test verification, RAL-101) |
 | `--waiting` | `#f778ba` | *(shared)* | status (a `pending` run held back by a scheduler down-time window, RAL-122) |
 | `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
+| `--stale` | `#db6d28` | *(shared)* | semantic (Live View: no fresh pane output for a while from a still-running session, RAL-170) |
+| `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that merged cleanly but contributes no changes, RAL-190) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -92,6 +94,17 @@ Amber is the project's **only** caution color and is reserved for the genuine
 if something needs a neutral highlight, use `--accent` (selection) or `--teal`
 (linked), not amber.
 
+### Empty contribution — `--empty` (RAL-190)
+A review branch that rebased and merged cleanly but adds **no diff** over the
+branch beneath it — almost always because its task never committed. Deliberately
+*not* `--failed` red: nothing failed, the branch's status is genuinely `done`.
+Deliberately *not* `--ignored` amber either, which is reserved for the real
+`ignored` status. The salmon hue sits in the "something is wrong here" family
+while staying distinguishable from a true failure at a glance.
+
+Use it only for "this thing is structurally fine but contains nothing," not as a
+general warning color.
+
 ### Log severity — Cartographer only (RAL-98)
 Cartographer's event table (the global log, a run's Logs "events" tab, and a
 review's Logs button) colors rows by `level`, a concept distinct from entity
@@ -142,6 +155,27 @@ field is read-only (per the UI Tooltip Rule in `CLAUDE.md`). Do **not** use
 `--ignored` (amber) or `--danger`/`--failed` (red) for this — a read-only
 field isn't a caution or a destructive action, just information with nowhere
 to write back to.
+
+### Stale liveness — `--stale` only (RAL-170)
+The Live View peek box shows the timestamp of the last fresh pane output
+received for a running session; once that gap passes a threshold
+(`PEEK_STALE_WARNING_MS` in `board.html`) the timestamp switches from
+`--muted` to `--stale`, a caution that a still-`running` session may have
+silently hung rather than a normal quiet stretch. Distinct from the
+caution-reserved `--ignored` (that amber is for the genuine `ignored`
+status, not generic "pay attention") and from `--warn` (reserved for
+Cartographer log severity) — `--stale` exists only because no existing role
+fit this new concept (see "Adding a new UI element" below).
+
+### Inherited resolved value — italic text only (no new color)
+A detail-pane field whose displayed value is a resolved fallback from a parent
+scope (for example, a session `agent` inherited from its task, or a verify
+step `model` inherited from its parent session) should render its **value**
+text in italics (`font-style: italic`) with the normal primary text color
+(`--text`) — no new hue. Pair it with a tooltip naming the source scope (per
+the UI Tooltip Rule in `CLAUDE.md`). Do **not** recolor inherited values to
+`--muted`, `--ignored`, or any status hue — inheritance is provenance, not a
+disabled state, warning, or status.
 
 ### Text & surfaces
 - Primary text: `--text`. Secondary/muted/disabled text: `--muted`.

@@ -66,6 +66,8 @@ pub struct CartographerFilter {
     pub guardian_id: Option<String>,
     /// Exact-match session id.
     pub session_id: Option<String>,
+    /// Exact-match owning task name.
+    pub task: Option<String>,
     /// Substring match against the message (case-insensitive).
     pub q: Option<String>,
     /// Only rows at or after this time (Unix epoch milliseconds).
@@ -230,12 +232,19 @@ impl Store {
     /// `crate::logging::write_line` yourself first for lower-level call sites
     /// (e.g. forwarded runner-subprocess events that already carry their own
     /// text line).
+    ///
+    /// Also broadcasts the row to every connected SSE subscriber via
+    /// [`Store::event_bus`] (RAL-167) — this is the single choke point every
+    /// Cartographer-instrumented state change already passes through, so it
+    /// gives push coverage for run/task/session/guardian/queue/cartographer
+    /// events without a second, parallel set of instrumentation call sites.
     pub fn cartographer_log(&self, entry: CartographerEntry<'_>) -> Result<()> {
+        let at_ms = now_ms();
         self.conn.execute(
             "INSERT INTO cartographer_events(at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, payload)
              VALUES(?,?,?,?,?,?,?,?,?,?)",
             params![
-                now_ms(),
+                at_ms,
                 level_str(entry.level),
                 entry.source,
                 entry.message,
@@ -247,6 +256,19 @@ impl Store {
                 entry.payload.to_string(),
             ],
         )?;
+        self.event_bus().publish(CartographerRow {
+            id: self.conn.last_insert_rowid(),
+            at_ms,
+            level: level_str(entry.level).to_string(),
+            source: entry.source.to_string(),
+            message: entry.message.to_string(),
+            scope: entry.scope.map(str::to_string),
+            run_id: entry.run_id.map(str::to_string),
+            guardian_id: entry.guardian_id.map(str::to_string),
+            session_id: entry.session_id.map(str::to_string),
+            task: entry.task.map(str::to_string),
+            payload: entry.payload,
+        });
         Ok(())
     }
 
@@ -269,6 +291,7 @@ impl Store {
         eq_clause!("run_id", filter.run_id);
         eq_clause!("guardian_id", filter.guardian_id);
         eq_clause!("session_id", filter.session_id);
+        eq_clause!("task", filter.task);
         if let Some(q) = filter.q.as_ref() {
             clauses.push("message LIKE ? ESCAPE '\\'".to_string());
             let escaped = q

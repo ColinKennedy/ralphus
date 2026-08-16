@@ -324,6 +324,13 @@ enum SessState {
     Running,
     Done,
     Failed,
+    /// Terminal, but *not* a failure (RAL-185). Seeded from
+    /// [`Store::cancelled_sessions`] for a session a run-level cancel left
+    /// behind, and cascaded onto any still-Pending session whose prerequisite
+    /// is itself Cancelled. Never dispatched, never satisfies a dependency,
+    /// and — unlike [`SessState::Failed`] — never folded into
+    /// `Progress.failed`, so cancelling a task does not mislabel it as failed.
+    Cancelled,
 }
 
 /// Shared progress for a run's sessions, behind one mutex.
@@ -384,6 +391,8 @@ fn execute_run_inner(
         already_failed_sessions,
         verify_only_set,
         ignored_set,
+        cancelled_session_set,
+        cancelled_task_set,
     ) = {
         let guard = store.lock().expect("store mutex poisoned");
         // Mark Running up front so the finalization guard (which leaves an
@@ -417,6 +426,17 @@ fn execute_run_inner(
             // Sessions manually set to `ignored` are seeded satisfied (like Done)
             // so their downstream runs, but are themselves never executed.
             guard.ignored_sessions(run_id).unwrap_or_default(),
+            // RAL-185: same class of bug as `failed_sessions` above, for the
+            // state that seed never covered. A session left `cancelled` by an
+            // earlier run-level cancel must stay terminal instead of falling
+            // through to Pending and being redispatched just because *some
+            // other*, dependency-unrelated session's scoped restart flipped the
+            // whole run back to Pending. Anything the restart genuinely revived
+            // is already `pending` in the DB here, so it is not in this set.
+            guard.cancelled_sessions(run_id).unwrap_or_default(),
+            // ... and the task rows the same cancel flipped, so no finalizer
+            // launches for them (see `cancelled_tasks`' doc comment).
+            guard.cancelled_tasks(run_id).unwrap_or_default(),
         )
     };
     // Resolve every worktree-placeholder `cwd` (RAL-100) before planning: a
@@ -488,6 +508,12 @@ fn execute_run_inner(
                     SessState::Running
                 } else if already_failed_sessions.contains(&key) {
                     SessState::Failed
+                } else if cancelled_session_set.contains(&key) {
+                    // RAL-185: terminal, but deliberately NOT `Failed` —
+                    // reusing `Failed` here would fold this session's
+                    // `task_idx` into `prog.failed` below and report a task
+                    // the user merely *cancelled* as having failed.
+                    SessState::Cancelled
                 } else {
                     SessState::Pending
                 }
@@ -524,9 +550,17 @@ fn execute_run_inner(
         task_sessions.entry(s.task_idx).or_default().push(i);
     }
     let task_indices: Vec<i64> = tasks.iter().map(|t| t.idx).collect();
+    // Task indices currently considered cancelled (dispatcher-thread-local).
+    // Seeded from the DB and extended whenever a session is cascade-cancelled
+    // below; entries are dropped again by the reclaim step when a restart
+    // resets that task to Pending, so it never goes stale (RAL-185).
+    let mut cancelled_tasks: HashSet<i64> = cancelled_task_set;
     // Tasks whose finalizer has already been launched (dispatcher-thread-local,
-    // so no lock needed).
-    let mut finalized: HashSet<i64> = HashSet::new();
+    // so no lock needed). A cancelled task counts as already launched: its
+    // sessions are seeded terminal, so the `all_terminal` check below would
+    // otherwise fire, run its task-level verifies, and flip a task the user
+    // explicitly cancelled to Done (RAL-185).
+    let mut finalized: HashSet<i64> = cancelled_tasks.clone();
 
     // Dispatcher loop: each pass launches every session whose prerequisites are
     // all Done and fails every session whose prerequisite failed, and launches a
@@ -580,7 +614,11 @@ fn execute_run_inner(
             // instead of sitting Pending until the whole run drains and a
             // fresh worker gets claimed for it.
             {
-                let (reclaimed_tasks, reclaimed_sessions): (Vec<i64>, Vec<usize>) = {
+                let (reclaimed_tasks, reclaimed_sessions, reclaimed_verify_only): (
+                    Vec<i64>,
+                    Vec<usize>,
+                    Vec<usize>,
+                ) = {
                     let guard = store.lock().expect("store mutex poisoned");
                     let reclaimed_tasks: Vec<i64> = finalized
                         .iter()
@@ -600,11 +638,48 @@ fn execute_run_inner(
                             )
                         })
                         .collect();
-                    (reclaimed_tasks, reclaimed_sessions)
+                    // A session-scoped verify restart (`restart_session_verify`/
+                    // `restart_task_verify`) deliberately leaves the session row
+                    // itself `done` — only its verify row(s) go back to `pending`
+                    // (see those functions' doc comments) — so such a session
+                    // never matches the `session_state == Pending` filter above
+                    // and would otherwise fall through this reclaim entirely: its
+                    // stale in-memory status (whatever it was before the restart,
+                    // typically `Failed`) would never be refreshed, so the retried
+                    // verify would silently never actually re-run and any
+                    // dependent would stay wrongly blocked on a prerequisite this
+                    // worker thinks already failed. Reclaim these the same way the
+                    // initial `verify_only_indices` pass does: seed `Running` and
+                    // spawn a fresh verify-only worker for each (RAL-1xx, mirrors
+                    // run-000000000148/ral-171's `test` verify restarted while
+                    // ral-169/170/172 kept this run's worker alive).
+                    let verify_only_now = guard
+                        .sessions_needing_verify_only(run_id)
+                        .unwrap_or_default();
+                    let reclaimed_verify_only: Vec<usize> = reclaimed_tasks
+                        .iter()
+                        .flat_map(|t| task_sessions.get(t).into_iter().flatten().copied())
+                        .filter(|&i| {
+                            let row = &sessions[i];
+                            verify_only_now.contains(&(row.task_idx, row.idx))
+                        })
+                        .collect();
+                    (reclaimed_tasks, reclaimed_sessions, reclaimed_verify_only)
                 };
+                // Sessions to actually (re)spawn a verify-only worker for this
+                // pass -- excludes any `reclaimed_verify_only` entry whose worker
+                // is already running (spawned by this same reclaim step on an
+                // earlier tick, or by the initial `verify_only_indices` pass), so
+                // a still-in-flight verify is never spawned twice concurrently.
+                let mut to_spawn_verify_only: Vec<usize> = Vec::new();
                 if !reclaimed_tasks.is_empty() {
                     for &t in &reclaimed_tasks {
                         finalized.remove(&t);
+                        // A restart that reset this task back to Pending
+                        // revives it: it is no longer cancelled, so its
+                        // still-Pending dependents must stop cascading off it
+                        // (RAL-185).
+                        cancelled_tasks.remove(&t);
                     }
                     let mut prog = progress.lock().expect("progress mutex poisoned");
                     for &t in &reclaimed_tasks {
@@ -615,6 +690,27 @@ fn execute_run_inner(
                         prog.status[i] = SessState::Pending;
                         prog.summaries[i] = None;
                     }
+                    for &i in &reclaimed_verify_only {
+                        if prog.status[i] != SessState::Running {
+                            prog.status[i] = SessState::Running;
+                            to_spawn_verify_only.push(i);
+                        }
+                    }
+                }
+                for &i in &to_spawn_verify_only {
+                    scope.spawn(move || {
+                        run_verify_only_worker(
+                            store,
+                            runner,
+                            run_id,
+                            cancel,
+                            sem,
+                            sessions_ref,
+                            progress_ref,
+                            i,
+                            trace_ref,
+                        );
+                    });
                 }
             }
 
@@ -638,6 +734,7 @@ fn execute_run_inner(
 
             let mut to_dispatch: Vec<usize> = Vec::new();
             let mut blocked: Vec<usize> = Vec::new();
+            let mut blocked_cancelled: Vec<usize> = Vec::new();
             let mut to_finalize: Vec<i64> = Vec::new();
             let mut active = false;
             {
@@ -647,7 +744,7 @@ fn execute_run_inner(
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..n {
                     match prog.status[i] {
-                        SessState::Done | SessState::Failed => {}
+                        SessState::Done | SessState::Failed | SessState::Cancelled => {}
                         SessState::Running => active = true,
                         SessState::Pending => {
                             let deps = &plan.deps[i];
@@ -660,10 +757,23 @@ fn execute_run_inner(
                             let task_dep_failed = task_deps.iter().any(|&t| {
                                 prog.task_finalized.contains(&t) && prog.failed.contains(&t)
                             });
+                            // RAL-185: a `Cancelled` prerequisite is terminal
+                            // and will never reach Done, so a dependent left
+                            // Pending would keep `active` set forever and spin
+                            // the dispatcher. Resolve it the same way a failed
+                            // prerequisite is resolved — terminally — but as
+                            // Cancelled, since nothing here actually failed.
+                            let session_dep_cancelled =
+                                deps.iter().any(|&d| prog.status[d] == SessState::Cancelled);
+                            let task_dep_cancelled =
+                                task_deps.iter().any(|&t| cancelled_tasks.contains(&t));
                             if session_dep_failed || task_dep_failed {
                                 prog.status[i] = SessState::Failed;
                                 prog.failed.insert(sessions[i].task_idx);
                                 blocked.push(i);
+                            } else if session_dep_cancelled || task_dep_cancelled {
+                                prog.status[i] = SessState::Cancelled;
+                                blocked_cancelled.push(i);
                             } else {
                                 let sessions_ready =
                                     deps.iter().all(|&d| prog.status[d] == SessState::Done);
@@ -687,6 +797,16 @@ fn execute_run_inner(
                         }
                     }
                 }
+                // A session cascade-cancelled above never ran, so its owning
+                // task must not finalize as Done off the back of it — mark the
+                // task cancelled too (RAL-185). This also lets a `task_deps`
+                // dependent of that task cascade on the next pass instead of
+                // waiting forever for a finalizer that will never launch.
+                for &i in &blocked_cancelled {
+                    let t = sessions[i].task_idx;
+                    cancelled_tasks.insert(t);
+                    finalized.insert(t);
+                }
                 // A task is ready to finalize once every one of its sessions is
                 // terminal. Read this from the same snapshot as `prog.failed` so
                 // the finalizer sees a consistent (done, failed?) pair.
@@ -698,7 +818,10 @@ fn execute_run_inner(
                     let all_terminal = idxs.is_some_and(|idxs| {
                         !idxs.is_empty()
                             && idxs.iter().all(|&i| {
-                                matches!(prog.status[i], SessState::Done | SessState::Failed)
+                                matches!(
+                                    prog.status[i],
+                                    SessState::Done | SessState::Failed | SessState::Cancelled
+                                )
                             })
                     });
                     if all_terminal {
@@ -723,6 +846,37 @@ fn execute_run_inner(
                 let guard = store.lock().expect("store mutex poisoned");
                 let _ = guard.set_session_state(run_id, row.task_idx, row.idx, NodeState::Failed);
                 let _ = guard.record_session_result(run_id, row.task_idx, row.idx, &outcome);
+            }
+
+            // Same, for sessions resolved terminally because a prerequisite was
+            // cancelled (RAL-185). Recorded as `cancelled` rather than `failed`
+            // so the board doesn't report a cancellation as a failure.
+            for &i in &blocked_cancelled {
+                let row = &sessions[i];
+                let outcome = SessionOutcome {
+                    state: NodeState::Cancelled,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    error: Some("blocked by a cancelled dependency".to_string()),
+                    agent_session_id: None,
+                };
+                let guard = store.lock().expect("store mutex poisoned");
+                let _ =
+                    guard.set_session_state(run_id, row.task_idx, row.idx, NodeState::Cancelled);
+                let _ = guard.record_session_result(run_id, row.task_idx, row.idx, &outcome);
+                let _ = guard.set_task_state(run_id, row.task_idx, NodeState::Cancelled);
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::WARNING,
+                    source: "scheduler",
+                    message: "session cancelled: blocked by a cancelled dependency",
+                    scope: Some("session"),
+                    run_id: Some(run_id),
+                    guardian_id: None,
+                    session_id: Some(&row.session_id),
+                    task: Some(&row.task_name),
+                    payload: serde_json::json!({}),
+                });
             }
 
             for i in to_dispatch {
@@ -788,10 +942,23 @@ fn execute_run_inner(
     if !matches!(guard.run_state(run_id), Ok(RunState::Running)) {
         return;
     }
-    let run_state = if failed_tasks.is_empty() {
-        RunState::Done
-    } else {
+    // A task left `cancelled` never ran, so the run did not actually complete —
+    // reporting it Done would be a lie, and would let cross-run dependency
+    // gating (which treats Done as "all its work happened") release dependents
+    // off work that was skipped. `failed` still wins: a real failure is the
+    // more important verdict. Read straight from the DB rather than threading
+    // the dispatcher's local set out of the scope — the finalizers have all
+    // joined, so the rows are settled (RAL-185).
+    let any_cancelled = guard
+        .cancelled_tasks(run_id)
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let run_state = if !failed_tasks.is_empty() {
         RunState::Failed
+    } else if any_cancelled {
+        RunState::Cancelled
+    } else {
+        RunState::Done
     };
     let _ = guard.set_run_state(run_id, run_state);
     // Per-task review triggers fire from `run_task_finalizer` as each task
@@ -983,6 +1150,15 @@ fn run_session_worker(
         .expect("store mutex poisoned")
         .resolve_session_env_overrides(run_id, row.task_idx, row.idx)
         .unwrap_or_default();
+    {
+        let guard = store.lock().expect("store mutex poisoned");
+        let _ = guard.set_session_effective_system_prompt(
+            run_id,
+            row.task_idx,
+            row.idx,
+            spec.effective_system_prompt().as_deref(),
+        );
+    }
 
     // If this session declares an upstream task ref, rebase its branch onto
     // the dependency's current branch tip before handing off to the runner.
@@ -1126,9 +1302,11 @@ fn run_session_worker(
         &row.task_name,
         "session",
         row.idx,
+        Some(&row.session_id),
         &cwd,
         &row.agent,
         row.model.as_deref(),
+        row.machine.as_deref(),
         cancel,
         session_trace_context.as_deref(),
     );
@@ -1216,9 +1394,11 @@ fn run_verify_only_worker(
         &row.task_name,
         "session",
         row.idx,
+        Some(&row.session_id),
         &cwd,
         &row.agent,
         row.model.as_deref(),
+        row.machine.as_deref(),
         cancel,
         span_trace_context.as_deref(),
     );
@@ -1298,6 +1478,11 @@ fn run_task_finalizer(
             .map(|s| s.agent.clone())
             .unwrap_or_else(|| "claude".to_string());
         let model = task_session.and_then(|s| s.model.clone());
+        // RAL-185: a task-scope verify runs on the task's machine. Every
+        // session under one task resolves to the same machine (the affinity
+        // rule), so borrowing the representative session's value is exact
+        // rather than approximate.
+        let machine = task_session.and_then(|s| s.machine.clone());
         // Acquire a slot so task-level verifies count against max_concurrent.
         // Released before calling try_start_ready_reviews_for_task so the review
         // worker can acquire a slot of its own.
@@ -1325,9 +1510,11 @@ fn run_task_finalizer(
             &task_name,
             "task",
             -1,
+            None,
             &cwd,
             &agent,
             model.as_deref(),
+            machine.as_deref(),
             cancel,
             span_trace_context.as_deref(),
         );
@@ -1653,9 +1840,11 @@ fn run_verifies(
     task_name: &str,
     scope: &str,
     session_idx: i64,
+    session_sid: Option<&str>,
     cwd: &str,
     session_agent: &str,
     session_model: Option<&str>,
+    session_machine: Option<&str>,
     cancel: &CancelToken,
     trace_context: Option<&str>,
 ) -> VerifyOutcome {
@@ -1703,7 +1892,14 @@ fn run_verifies(
         if current_state.as_deref() == Some("ignored") {
             continue;
         }
-        let (passed, output, verify_claude_id) = match kind.as_str() {
+        let (
+            passed,
+            output,
+            verify_claude_id,
+            verify_tokens_in,
+            verify_tokens_out,
+            verify_cost_usd,
+        ) = match kind.as_str() {
             "command" => {
                 crate::rlog!(
                     DEBUG,
@@ -1750,6 +1946,8 @@ fn run_verifies(
                 );
                 runner_spec.trace_context = otel::traceparent_from_context(&verify_span.cx);
                 runner_spec.env_overrides = env_overrides.clone();
+                // RAL-185: a verify step runs where its owning session/task does.
+                runner_spec.machine = session_machine.map(str::to_string);
                 let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
                 let passed = result.is_done();
                 let output = match &result.error {
@@ -1757,7 +1955,14 @@ fn run_verifies(
                     Some(err) => format!("{}\n{err}", result.summary),
                     None => result.summary.clone(),
                 };
-                (passed, output, None)
+                (
+                    passed,
+                    output,
+                    None,
+                    result.tokens_in,
+                    result.tokens_out,
+                    result.cost_usd,
+                )
             }
             "prompt" => {
                 let model = verify_model.as_deref().or(session_model);
@@ -1804,6 +2009,19 @@ fn run_verifies(
                 );
                 runner_spec.trace_context = otel::traceparent_from_context(&verify_span.cx);
                 runner_spec.env_overrides = env_overrides.clone();
+                // RAL-185: a verify step runs where its owning session/task does.
+                runner_spec.machine = session_machine.map(str::to_string);
+                {
+                    let guard = store.lock().expect("store mutex poisoned");
+                    let _ = guard.set_verify_effective_system_prompt(
+                        run_id,
+                        task_idx,
+                        scope,
+                        session_idx,
+                        idx,
+                        runner_spec.effective_system_prompt().as_deref(),
+                    );
+                }
                 let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
                 let passed = result.verify_passed();
                 let output = match &result.error {
@@ -1811,7 +2029,14 @@ fn run_verifies(
                     Some(err) => format!("{}\n{err}", result.summary),
                     None => result.summary.clone(),
                 };
-                (passed, output, result.agent_session_id)
+                (
+                    passed,
+                    output,
+                    result.agent_session_id,
+                    result.tokens_in,
+                    result.tokens_out,
+                    result.cost_usd,
+                )
             }
             "brain" | "approval" | "unknown" => continue, // deferred (intentional; not yet built)
             other => {
@@ -1830,7 +2055,7 @@ fn run_verifies(
                     WARNING,
                     "ralphus [scheduler] verify {run_id}/t{task_idx}/{scope}/#{idx} kind={other} unrecognized; failing: {msg}"
                 );
-                (false, msg, None)
+                (false, msg, None, 0, 0, 0.0)
             }
         };
         steps_run += 1;
@@ -1841,6 +2066,16 @@ fn run_verifies(
             NodeState::Done
         } else {
             NodeState::Failed
+        };
+        // RAL-160-style lifetime tracking for verify steps: a stable key
+        // scoped to this exact step (owning session's sid + step position for
+        // a session-scope step, or just the step position for a task-scope
+        // one) rather than the run's own `session_id`/`task_idx`/`idx` --
+        // those are per-run positional identifiers, so a rerun of the same
+        // TOML wouldn't otherwise let the board fold restarts together.
+        let verify_key = match session_sid {
+            Some(sid) => format!("session-verify:{sid}:{idx}"),
+            None => format!("task-verify:{idx}"),
         };
         {
             let guard = store.lock().expect("store mutex poisoned");
@@ -1853,7 +2088,35 @@ fn run_verifies(
                 state,
                 &output,
                 verify_claude_id.as_deref(),
+                verify_tokens_in,
+                verify_tokens_out,
+                verify_cost_usd,
             );
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: if passed {
+                    crate::logging::LogLevel::INFO
+                } else {
+                    crate::logging::LogLevel::WARNING
+                },
+                source: "scheduler",
+                message: "verify completed",
+                scope: Some("verify"),
+                run_id: Some(run_id),
+                guardian_id: None,
+                session_id: Some(&verify_key),
+                task: Some(task_name),
+                payload: serde_json::json!({
+                    "verify_scope": scope,
+                    "task_idx": task_idx,
+                    "session_idx": session_idx,
+                    "idx": idx,
+                    "kind": kind,
+                    "status": if passed { "done" } else { "failed" },
+                    "tokens_in": verify_tokens_in,
+                    "tokens_out": verify_tokens_out,
+                    "cost_usd": verify_cost_usd,
+                }),
+            });
         }
         if !passed {
             all_ok = false;
@@ -2004,9 +2267,70 @@ mod tests {
     const TWO_INDEPENDENT_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\".\"\ncommand=\"x\"\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\".\"\ncommand=\"y\"\n";
 
     /// Records the peak number of sessions executing at the same instant.
+    ///
+    /// Sessions **rendezvous** rather than sleeping a fixed interval and hoping
+    /// they overlap: each arrival bumps `current`, then waits until `expect`
+    /// sessions have arrived together (or `RENDEZVOUS_TIMEOUT` elapses).
+    ///
+    /// A fixed `sleep` here was flaky under full-suite parallel load — the OS
+    /// could finish session A's entire sleep before ever scheduling session B,
+    /// so `peak` observed 1 even though the scheduler had correctly dispatched
+    /// both. The rendezvous inverts that: when the scheduler *is* concurrent
+    /// both threads meet and release immediately (deterministically `peak ==
+    /// expect`, and faster than the old sleep), and when it is genuinely
+    /// serialized the first waits out the timeout and `peak` stays 1 — so a
+    /// real regression is still caught, just no longer confused with CPU
+    /// contention.
     struct ConcurrencyRunner {
         current: Arc<std::sync::atomic::AtomicI64>,
         peak: Arc<std::sync::atomic::AtomicI64>,
+        /// How many sessions must be in flight at once for the rendezvous to
+        /// release early.
+        expect: i64,
+        /// Arrival count + condvar the waiters block on.
+        gate: Arc<(Mutex<i64>, Condvar)>,
+    }
+
+    /// Upper bound on how long a [`ConcurrencyRunner`] session waits for its
+    /// peers. Only reached when the scheduler failed to run them in parallel,
+    /// i.e. when the test is about to fail anyway — so it is generous enough to
+    /// never be hit by mere slowness on a loaded machine.
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+    impl ConcurrencyRunner {
+        fn new(expect: i64) -> Self {
+            Self {
+                current: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                peak: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                expect,
+                gate: Arc::new((Mutex::new(0), Condvar::new())),
+            }
+        }
+
+        /// Block until `expect` sessions have arrived, or the timeout elapses.
+        fn rendezvous(&self) {
+            let (lock, cv) = &*self.gate;
+            let mut arrived = lock.lock().expect("rendezvous mutex poisoned");
+            *arrived += 1;
+            if *arrived >= self.expect {
+                cv.notify_all();
+                return;
+            }
+            let deadline = std::time::Instant::now() + RENDEZVOUS_TIMEOUT;
+            while *arrived < self.expect {
+                let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+                else {
+                    break;
+                };
+                let (guard, timeout) = cv
+                    .wait_timeout(arrived, remaining)
+                    .expect("rendezvous mutex poisoned");
+                arrived = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+        }
     }
 
     impl Runner for ConcurrencyRunner {
@@ -2014,7 +2338,7 @@ mod tests {
             use std::sync::atomic::Ordering;
             let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(60));
+            self.rendezvous();
             self.current.fetch_sub(1, Ordering::SeqCst);
             RunnerResult {
                 status: "done".to_string(),
@@ -2034,14 +2358,11 @@ mod tests {
     // concurrently (peak concurrency 2), not one-at-a-time.
     #[test]
     fn independent_sessions_run_concurrently() {
-        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::atomic::Ordering;
         let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
-        let current = Arc::new(AtomicI64::new(0));
-        let peak = Arc::new(AtomicI64::new(0));
-        let runner: Arc<dyn Runner> = Arc::new(ConcurrencyRunner {
-            current: Arc::clone(&current),
-            peak: Arc::clone(&peak),
-        });
+        let concurrency = Arc::new(ConcurrencyRunner::new(2));
+        let peak = Arc::clone(&concurrency.peak);
+        let runner: Arc<dyn Runner> = concurrency;
         execute_run(&store, runner.as_ref(), &id);
 
         assert_eq!(
@@ -2345,12 +2666,27 @@ mod tests {
             std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
         };
 
-        // Wait for task a's first failure to land, and for b to be genuinely
-        // in flight (proving the worker is alive and busy elsewhere).
+        // Wait for task a's first failure to be recorded in the store, and for
+        // b to be genuinely in flight (proving the worker is alive and busy
+        // elsewhere). A fixed sleep here was flaky under full-suite load.
         while a_calls.load(Ordering::SeqCst) < 1 || !b_started.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let mut a_failed = false;
+        for _ in 0..500 {
+            if matches!(
+                store.lock().unwrap().session_state(&id, 0, 0),
+                Ok(Some(crate::store::NodeState::Failed))
+            ) {
+                a_failed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            a_failed,
+            "task a should reach a recorded failed state before the restart"
+        );
 
         // Restart task a's already-failed session at the store level — what
         // the HTTP handler does without cancelling the worker once the
@@ -2377,6 +2713,170 @@ mod tests {
              not only after a fresh re-claim once the whole run drains"
         );
 
+        worker.join().unwrap();
+    }
+
+    /// Task "a": "work" (one session-level verify) -> "finalize"
+    /// (`depends_on=["work"]`), mirroring ral-171's `work`/`finalize`
+    /// sessions from run-000000000148. Task "b" is a lone long-running
+    /// session that keeps the run's worker thread alive while "a" is
+    /// restarted, the same way ral-169/170/172 kept run-000000000148's
+    /// worker alive while ral-171 was restarted.
+    const WORK_FINALIZE_WITH_VERIFY: &str = "[[task]]\nname=\"a\"\n\
+        [[task.session]]\nid=\"work\"\ncwd=\".\"\ncommand=\"do-work\"\n[[task.session.verify]]\nid=\"test\"\ncommand=\"check\"\n\
+        [[task.session]]\nid=\"finalize\"\ncwd=\".\"\ncommand=\"do-finalize\"\ndepends_on=[\"work\"]\n\
+        [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do-b\"\n";
+
+    /// Task "b"'s single session blocks until released (standing in for a
+    /// still-in-flight sibling); task "a"'s `test` verify fails on its first
+    /// invocation and passes on any later one (standing in for "restarted
+    /// after being fixed"); "finalize" and "work" always succeed and record
+    /// when they ran.
+    struct VerifyReclaimRunner {
+        verify_calls: Arc<std::sync::atomic::AtomicUsize>,
+        finalize_started: Arc<std::sync::atomic::AtomicBool>,
+        b_started: Arc<std::sync::atomic::AtomicBool>,
+        b_release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Runner for VerifyReclaimRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            use std::sync::atomic::Ordering;
+            if spec.task == "b" {
+                self.b_started.store(true, Ordering::SeqCst);
+                while !self.b_release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return RunnerResult {
+                    status: "done".to_string(),
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cost_usd: 0.0,
+                    summary: "b done".to_string(),
+                    error: None,
+                    verified: None,
+                    agent_session_id: None,
+                    ghost: None,
+                };
+            }
+            if spec.session_id.starts_with("verify-") {
+                let n = self.verify_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return RunnerResult::failure("first verify attempt fails");
+                }
+                return RunnerResult {
+                    status: "done".to_string(),
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cost_usd: 0.0,
+                    summary: "verify passed".to_string(),
+                    error: None,
+                    verified: None,
+                    agent_session_id: None,
+                    ghost: None,
+                };
+            }
+            if spec.session_id == "finalize" {
+                self.finalize_started.store(true, Ordering::SeqCst);
+            }
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.0,
+                summary: "ok".to_string(),
+                error: None,
+                verified: None,
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    /// Reproduces run-000000000148: ral-171's `test` verify failed; the user
+    /// restarted it (`restart_session_verify`) while a sibling task in the
+    /// same run (ral-169/170/172) was still actively running, so this run's
+    /// worker never returned and the restart had to be reconciled by the
+    /// dispatcher loop's reclaim step rather than a fresh `execute_run_inner`
+    /// call. The reclaim step (see the previous test) only special-cases
+    /// sessions whose DB row was reset to `pending` — a verify-only restart
+    /// deliberately leaves the session row `done` (only its verify row is
+    /// reset), so it falls through the reclaim filter entirely: "work"'s
+    /// stale in-memory `Failed` status is never refreshed, and the dependent
+    /// "finalize" is either dispatched (or re-failed) off that stale status
+    /// without the verify ever actually being re-run.
+    #[test]
+    fn restart_session_verify_with_live_sibling_reruns_verify_before_dispatching_dependent() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (store, id) = store_with(WORK_FINALIZE_WITH_VERIFY);
+        let verify_calls = Arc::new(AtomicUsize::new(0));
+        let finalize_started = Arc::new(AtomicBool::new(false));
+        let b_started = Arc::new(AtomicBool::new(false));
+        let b_release = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn Runner> = Arc::new(VerifyReclaimRunner {
+            verify_calls: Arc::clone(&verify_calls),
+            finalize_started: Arc::clone(&finalize_started),
+            b_started: Arc::clone(&b_started),
+            b_release: Arc::clone(&b_release),
+        });
+        let token = CancelToken::new();
+
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+        };
+
+        // Wait for the verify's first (failing) attempt to land and for "b"
+        // to be genuinely in flight (the worker is alive and busy elsewhere).
+        while verify_calls.load(Ordering::SeqCst) < 1 || !b_started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Let task "a" actually finalize as Failed before restarting it.
+        let mut a_failed = false;
+        for _ in 0..200 {
+            if matches!(
+                store.lock().unwrap().task_state(&id, 0),
+                Ok(Some(NodeState::Failed))
+            ) {
+                a_failed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            a_failed,
+            "task a must finalize as Failed before the restart"
+        );
+
+        // Restart the failed verify, exactly as the board's right-click
+        // "Restart" action on a verify step does.
+        store
+            .lock()
+            .unwrap()
+            .restart_session_verify(&id, 0, 0, 0)
+            .unwrap();
+
+        // Give the still-alive worker plenty of dispatcher ticks to react.
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            verify_calls.load(Ordering::SeqCst) >= 2,
+            "the still-alive worker must actually re-run the restarted verify, \
+             not silently drop it (verify_calls={})",
+            verify_calls.load(Ordering::SeqCst)
+        );
+        assert!(
+            !finalize_started.load(Ordering::SeqCst) || verify_calls.load(Ordering::SeqCst) >= 2,
+            "finalize must never dispatch before its upstream verify's retry actually completed"
+        );
+
+        b_release.store(true, Ordering::SeqCst);
         worker.join().unwrap();
     }
 
@@ -2699,6 +3199,63 @@ mod tests {
         assert_eq!(v.kind, "prompt");
         assert_eq!(v.state, "done");
         assert_eq!(v.output.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn prompt_verify_persists_token_and_cost_usage() {
+        // Regression (RAL-185 Phase 0): a `prompt`-kind verify's LLM spend was
+        // silently discarded -- `run_verifies` dropped the runner result's
+        // token/cost fields on the floor, so the board's per-verify token row
+        // showed a permanent `input 0 · output 0 · $0.0000`. Nothing errored
+        // and the code compiled clean, so only a test catches a repeat.
+        let (store, id) = store_with(TASK_PROMPT_VERIFY);
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        execute_run(&store, runner.as_ref(), &id);
+        let guard = store.lock().unwrap();
+        let run = guard.get_run(&id).unwrap();
+        let v = &run.tasks[0].verify[0];
+        assert_eq!(v.state, "done");
+        // FakeRunner's success path reports 1 in / 2 out / $0.5.
+        assert_eq!(v.tokens_in, 1, "verify must persist its input tokens");
+        assert_eq!(v.tokens_out, 2, "verify must persist its output tokens");
+        assert!(
+            (v.cost_usd - 0.5).abs() < f64::EPSILON,
+            "verify must persist its cost, got {}",
+            v.cost_usd
+        );
+    }
+
+    #[test]
+    fn verify_completion_emits_cartographer_event_keyed_for_lifetime_totals() {
+        // Regression (RAL-185 Phase 0): the board's "Σ load total" button folds
+        // every attempt of one verify step together by querying Cartographer for
+        // `"verify completed"` rows under a stable `verify_key`. When that
+        // emission went missing the button silently returned nothing, since a
+        // zero-match query is indistinguishable from "never ran".
+        let (store, id) = store_with(TASK_PROMPT_VERIFY);
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        execute_run(&store, runner.as_ref(), &id);
+        let guard = store.lock().unwrap();
+        let page = guard
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                run_id: Some(id.clone()),
+                q: Some("verify completed".to_string()),
+                ..crate::cartographer::CartographerFilter::recent(50)
+            })
+            .unwrap();
+        let row = page
+            .rows
+            .iter()
+            .find(|r| r.message == "verify completed")
+            .expect("a completed verify must emit a 'verify completed' event");
+        // Task-scope steps key on step position alone; session-scope steps key
+        // on the owning session's sid too. TASK_PROMPT_VERIFY has one task-scope
+        // step at position 0.
+        assert_eq!(row.session_id.as_deref(), Some("task-verify:0"));
+        assert_eq!(row.scope.as_deref(), Some("verify"));
+        assert_eq!(row.payload["tokens_in"], 1);
+        assert_eq!(row.payload["tokens_out"], 2);
+        assert_eq!(row.payload["status"], "done");
     }
 
     #[test]
@@ -3069,6 +3626,288 @@ mod tests {
         assert_eq!(run.tasks[1].state, "done", "task 'b' re-ran and succeeded");
     }
 
+    /// Records every invocation like [`CountingRunner`], but parks on one
+    /// specific command until the run's cancel token trips — so a test can
+    /// cancel a run while exactly that session is genuinely `running`, which is
+    /// what leaves it in DB state `cancelled` (RAL-185's live repro).
+    struct BlockingCountingRunner {
+        block_on: String,
+        invoked: Arc<Mutex<Vec<String>>>,
+        blocking: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Runner for BlockingCountingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            let text = spec
+                .command
+                .clone()
+                .or_else(|| spec.prompt.clone())
+                .unwrap_or_default();
+            self.invoked.lock().unwrap().push(text.clone());
+            if text == self.block_on {
+                self.blocking
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                for _ in 0..400 {
+                    if cancel.is_cancelled() {
+                        return RunnerResult::failure("cancelled");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return RunnerResult::failure("blocking runner was never cancelled");
+            }
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 2,
+                cost_usd: 0.5,
+                summary: "ok".to_string(),
+                error: None,
+                verified: spec.verify.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    /// Block until `f` observes what it wants, or panic after ~4s rather than
+    /// hanging the whole test binary.
+    fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+        for _ in 0..2000 {
+            if f() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn restarting_one_session_does_not_redispatch_an_unrelated_cancelled_sibling() {
+        // RAL-185, the exact live repro from run-000000000151: a run-level
+        // cancel left one task's session `cancelled` (it happened to be
+        // genuinely `running` at cancel time); restarting a *dependency-
+        // unrelated* session in the other task flipped the whole run back to
+        // Pending, and `execute_run_inner`'s Progress seed — which recognised
+        // only done/verify-only/failed/ignored — silently coerced that
+        // `cancelled` sibling to Pending and redispatched it.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
+        let invoked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let blocking = Arc::new(AtomicBool::new(false));
+        let token = CancelToken::new();
+
+        let runner: Arc<dyn Runner> = Arc::new(BlockingCountingRunner {
+            block_on: "x".to_string(),
+            invoked: Arc::clone(&invoked),
+            blocking: Arc::clone(&blocking),
+        });
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+        };
+
+        // Wait until task "a"'s session is genuinely in flight AND independent
+        // task "b" has already finished, so the cancel below hits exactly one
+        // running session — mirroring the reported run.
+        wait_until("task 'a' running and task 'b' done", || {
+            let b_done = {
+                let g = store.lock().unwrap();
+                g.get_run(&id).unwrap().tasks[1].sessions[0].state == "done"
+            };
+            b_done && blocking.load(Ordering::SeqCst)
+        });
+
+        store.lock().unwrap().cancel(&id).unwrap();
+        token.cancel();
+        worker.join().unwrap();
+        {
+            let g = store.lock().unwrap();
+            let run = g.get_run(&id).unwrap();
+            assert_eq!(run.tasks[0].sessions[0].state, "cancelled");
+            assert_eq!(run.tasks[1].sessions[0].state, "done");
+        }
+
+        // Restart ONLY task "b"'s session — no dependency relationship to task
+        // "a" in either direction.
+        store.lock().unwrap().restart_session(&id, 1, 0).unwrap();
+
+        // Re-run with a non-blocking runner sharing the same tally, so a
+        // regression shows up as an extra recorded "x" instead of a 2s stall.
+        let rerun = CountingRunner {
+            fail_on: None,
+            invoked: Arc::clone(&invoked),
+        };
+        execute_run(&store, &rerun, &id);
+
+        let invocations = invoked.lock().unwrap().clone();
+        assert_eq!(
+            invocations.iter().filter(|t| t.as_str() == "x").count(),
+            1,
+            "task 'a's cancelled session must NOT be redispatched by an \
+             unrelated restart; invocations: {invocations:?}"
+        );
+        assert_eq!(
+            invocations.iter().filter(|t| t.as_str() == "y").count(),
+            2,
+            "task 'b' ran once per execute_run call (it was the restart \
+             target the second time): {invocations:?}"
+        );
+
+        let guard = store.lock().unwrap();
+        let run = guard.get_run(&id).unwrap();
+        assert_eq!(
+            run.tasks[0].sessions[0].state, "cancelled",
+            "the cancelled sibling stays cancelled — terminal, not revived"
+        );
+        assert_eq!(
+            run.tasks[0].state, "cancelled",
+            "and its task must not be finalized (to Done via its verifies, or \
+             to Failed — the user cancelled it, it did not fail)"
+        );
+        assert_eq!(run.tasks[1].state, "done", "task 'b' re-ran and succeeded");
+        assert_eq!(
+            guard.run_state(&id).unwrap(),
+            RunState::Cancelled,
+            "a run still holding a cancelled task did not complete, so it must \
+             not report Done"
+        );
+    }
+
+    #[test]
+    fn a_dependent_of_a_cancelled_session_is_resolved_cancelled_not_left_spinning() {
+        // RAL-185 cascade: seeding a session terminal-but-Cancelled is only
+        // safe if its dependents are resolved too. The dispatcher marks any
+        // session whose prerequisites are unsatisfied as `active` and sleeps,
+        // so a Pending session waiting on a Cancelled one — which can never
+        // reach Done — would spin the loop forever. This mirrors the existing
+        // "blocked by a failed dependency" handling, but records `cancelled`
+        // rather than `failed`: nothing here actually failed.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // "b" depends on "a", inside one task (ral-171's work/finalize shape).
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"a\"\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.session]]\nid=\"b\"\ncwd=\".\"\ncommand=\"y\"\ndepends_on=[\"a\"]\n";
+        let (store, id) = store_with(toml);
+        let invoked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let blocking = Arc::new(AtomicBool::new(false));
+        let token = CancelToken::new();
+
+        let runner: Arc<dyn Runner> = Arc::new(BlockingCountingRunner {
+            block_on: "x".to_string(),
+            invoked: Arc::clone(&invoked),
+            blocking: Arc::clone(&blocking),
+        });
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+        };
+        wait_until("session 'a' running", || blocking.load(Ordering::SeqCst));
+        store.lock().unwrap().cancel(&id).unwrap();
+        token.cancel();
+        worker.join().unwrap();
+
+        // Restart only the *downstream* session "b". Its upstream "a" is not in
+        // the impact set (the BFS runs forward), so "a" stays cancelled while
+        // "b" goes back to Pending — the one shape that produces a Pending
+        // session with a Cancelled prerequisite.
+        store.lock().unwrap().restart_session(&id, 0, 1).unwrap();
+        {
+            let g = store.lock().unwrap();
+            let run = g.get_run(&id).unwrap();
+            assert_eq!(run.tasks[0].sessions[0].state, "cancelled");
+            assert_eq!(run.tasks[0].sessions[1].state, "pending");
+        }
+
+        let rerun = CountingRunner {
+            fail_on: None,
+            invoked: Arc::clone(&invoked),
+        };
+        // The real assertion is that this returns at all — a spinning
+        // dispatcher would hang here forever.
+        execute_run(&store, &rerun, &id);
+
+        let invocations = invoked.lock().unwrap().clone();
+        assert_eq!(
+            invocations.iter().filter(|t| t.as_str() == "y").count(),
+            0,
+            "'b' must not run while its prerequisite is cancelled: {invocations:?}"
+        );
+        let guard = store.lock().unwrap();
+        let run = guard.get_run(&id).unwrap();
+        assert_eq!(run.tasks[0].sessions[1].state, "cancelled");
+        assert_eq!(
+            run.tasks[0].sessions[1].error.as_deref(),
+            Some("blocked by a cancelled dependency"),
+        );
+    }
+
+    #[test]
+    fn a_full_restart_run_still_revives_previously_cancelled_sessions() {
+        // RAL-185 AC: the new terminal seeds must not shadow `restart_run`.
+        // `reset_run_to_pending` rewrites every session/task row back to
+        // `pending` before the scheduler reads its seeds, so nothing is left in
+        // `cancelled` state and both tasks run again from scratch.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
+        let invoked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let blocking = Arc::new(AtomicBool::new(false));
+        let token = CancelToken::new();
+
+        let runner: Arc<dyn Runner> = Arc::new(BlockingCountingRunner {
+            block_on: "x".to_string(),
+            invoked: Arc::clone(&invoked),
+            blocking: Arc::clone(&blocking),
+        });
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+        };
+        wait_until("task 'a' running", || blocking.load(Ordering::SeqCst));
+        store.lock().unwrap().cancel(&id).unwrap();
+        token.cancel();
+        worker.join().unwrap();
+        assert_eq!(
+            store.lock().unwrap().get_run(&id).unwrap().tasks[0].sessions[0].state,
+            "cancelled"
+        );
+
+        store.lock().unwrap().restart_run(&id).unwrap();
+        let rerun = CountingRunner {
+            fail_on: None,
+            invoked: Arc::clone(&invoked),
+        };
+        execute_run(&store, &rerun, &id);
+
+        let invocations = invoked.lock().unwrap().clone();
+        assert!(
+            invocations.iter().filter(|t| t.as_str() == "x").count() >= 2,
+            "a whole-run restart must re-run the cancelled session: {invocations:?}"
+        );
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.run_state(&id).unwrap(), RunState::Done);
+        let run = guard.get_run(&id).unwrap();
+        assert_eq!(run.tasks[0].state, "done");
+        assert_eq!(run.tasks[1].state, "done");
+    }
+
     // ── per-task review readiness ─────────────────────────────────────────
 
     // `guardian_blocking_tasks` calls `project_root_of` which runs git, so it
@@ -3097,6 +3936,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         }
     }
 
@@ -3221,6 +4061,7 @@ mod tests {
             budget_tokens: None,
             maximum_budget_usd: None,
             upstream: None,
+            machine: None,
         };
         let work_row = crate::store::SessionRow {
             task_idx: 1,
@@ -3229,6 +4070,7 @@ mod tests {
             session_id: "work".into(),
             cwd: Some(work_wt.to_str().unwrap().into()),
             upstream: Some("<<task:dep-task>>".into()),
+            machine: None,
             ..dep_row.clone()
         };
         let sessions = [dep_row, work_row];

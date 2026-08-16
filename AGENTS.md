@@ -79,6 +79,8 @@ python scripts/check_bench_patience_comments.py
 npm install --no-audit --no-fund
 npm run lint                        # eslint, incl. JSDoc-coverage rules (see "Web JSDoc type hints" below)
 npm run typecheck                   # tsc --checkJs over the JSDoc-annotated JS; see tsconfig.board.json
+npm run knip                        # dead code / unused deps; see knip.config.js
+npm test                            # node --test over board.html's pure, DOM-free logic (RAL-186)
 ```
 
 CI is `.github/workflows/ci.yml` (a Rust job, a Python job, and a web job).
@@ -106,7 +108,8 @@ npm run typecheck                  # tsc --checkJs; errors point at board.html d
 **Both must pass clean.** This applies to human and AI-driven changes alike —
 neither the Rust "does the HTML contain X" tests nor `cargo`/`uv` checks catch
 a JS type regression here; the `web` job in `.github/workflows/ci.yml` is the
-only thing that does, and it runs exactly these two commands.
+only thing that does, and it runs exactly these two commands (plus `npm run
+knip` and `npm test` — see "Frontend — board.html" under Testing).
 
 - Every top-level `function name(...) {}` declaration has a JSDoc comment
   with `@param`/`@returns` tags; `jsdoc/require-jsdoc` (in `eslint.config.mjs`)
@@ -160,7 +163,59 @@ only thing that does, and it runs exactly these two commands.
   `@type`/`@typedef`-only comments with no `@param`/`@returns` are fine to
   leave single-line.
 
+## Knip (dead code / unused deps) for board.html
+
+`knip.config.js` (repo root) registers a custom knip **compiler** for the
+`html` extension that lets knip analyze `librarian/assets/board.html`
+directly — no separate extracted file and no path-rewritten output, unlike
+the ESLint/tsc setup above (`scripts/extract-board-js.mjs` +
+`scripts/typecheck-board.mjs`); knip's diagnostics already point at the real
+file. `board.html`, `knip.config.js` itself, and
+`scripts/reformat-jsdoc.mjs` (a manually-invoked tool, never imported or run
+from an npm script) are listed under `entry` so knip doesn't flag them as
+unreachable. `project` is left at knip's default glob
+(`**/*.{js,mjs,cjs,jsx,ts,tsx,mts,cts}`, gitignore-filtered), so `npm run
+knip` also audits every other JS file in this Node package
+(`eslint.config.mjs`, `scripts/*.mjs`), not just board.html.
+
+board.html's script is a plain global script (not an ES module — no
+`import`/`export`), so out of the box knip's cross-file reachability graph
+has nothing to walk inside it — it could only tell whether board.html itself
+is reachable, not whether any function *inside* it is dead. The compiler
+(`compileHtml()` in `knip.config.js`) goes further, faking a module graph
+over the single file so knip also catches **intra-file dead functions**:
+every top-level `function`/`async function`/`const ... = (...) =>` gets
+rewritten to carry `export` (`includeEntryExports: true` is required
+alongside this, since entry-file exports are normally presumed to be public
+API and skipped), and every other occurrence of `declaredName(` anywhere in
+the raw document — including inside `onclick="..."` strings and multi-layer
+indirection like `terminalMenuItem(key, label, \`foo(...)\`, tip)`, neither
+of which any real parser (ESLint included — the same reason
+`no-unused-vars` stays disabled in `eslint.config.mjs`) can see into — is
+collected into a synthetic reference sink appended to the compiled output,
+so those string-only-dispatched handlers don't false-positive as unused
+(`ignoreExportsUsedInFile: true` is also required, since by default knip
+only counts cross-file imports as "used", not same-file references — which
+is exactly what the sink produces). A name with zero occurrences anywhere
+else in the document is genuinely dead. See the comment block at the top of
+`knip.config.js` for the full mechanics and known limitations (it's a
+heuristic, not real reference tracking — safe to miss a dead function, e.g.
+one dispatched via `window[name]()`, but should not false-positive on any
+string-wiring pattern actually used in this codebase). Run it with
+`npm run knip`.
+
 ## Testing
+
+**Authoring rule — Ollama tests are opt-in, never on by default.** Any test
+that calls out to a live Ollama model must be gated off from the normal
+`cargo test` / `uv run pytest` run, the same way every existing Ollama test
+already is: `#[ignore]` in Rust (see `daemon/tests/`), `pytest.mark.ollama`
+in Python (see `cli/pyproject.toml`'s `addopts = -m "not ollama"`). Don't add
+a new Ollama-backed test that runs unconditionally — CI and the normal dev
+loop must never depend on a local model being up. Keep the same
+runtime guard too (skip/return early with a clear message if Ollama isn't
+reachable on `127.0.0.1:11434` or the required model isn't pulled), so even
+an explicit opt-in run degrades gracefully without live infra.
 
 ### Backend — Rust integration tests
 
@@ -169,19 +224,22 @@ only thing that does, and it runs exactly these two commands.
 | File | Scope | Notes |
 |---|---|---|
 | `api_over_http.rs` | HTTP API contract | Two always-run tests; uses `Store::open_in_memory()` |
-| `prompt_verify.rs` | Prompt-kind verify execution | Live Ollama; skips if Ollama down |
-| `guardian_merge.rs` | Stacked rebase + conflict resolution | Uses `CapturingRunner` (no subprocess) |
-| `reviews_derive.rs` | Full review flow end-to-end | Live Ollama; `RALPHUS_RESOLVER_MODEL` (default `qwen3:8b`) |
-| `monorepo.rs` | Monorepo pipeline | 3 always-run + 1 live-Ollama test |
+| `prompt_verify.rs` | Prompt-kind verify execution | Both tests are live-Ollama, `#[ignore]`d by default |
+| `guardian_merge.rs` | Stacked rebase + conflict resolution | Mostly `CapturingRunner`-based (no subprocess); 1 live-Ollama test, `#[ignore]`d by default |
+| `reviews_derive.rs` | Full review flow end-to-end | 1 live-Ollama test, `#[ignore]`d by default; `RALPHUS_RESOLVER_MODEL` (default `qwen3:8b`) |
+| `monorepo.rs` | Monorepo pipeline | 3 always-run + 1 live-Ollama test, `#[ignore]`d by default |
 
-Run a specific live-Ollama integration test:
+**Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo test`/`cargo test --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash
-cargo test -p ralphus-daemon --test reviews_derive full_flow -- --nocapture
-cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --nocapture
-cargo test -p ralphus-daemon --test prompt_verify -- --nocapture
+cargo test -p ralphus-daemon --test reviews_derive full_flow -- --ignored --nocapture
+cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture
+cargo test -p ralphus-daemon --test prompt_verify -- --ignored --nocapture
+cargo test -p ralphus-daemon --test guardian_merge generate_summary_live_ollama -- --ignored --nocapture
+# or, to run every ignored (live-Ollama) test across the workspace at once:
+cargo test --all-targets -- --ignored
 ```
 
-All live-Ollama tests **skip** (print `SKIP`) unless Ollama is up on `127.0.0.1:11434` and the required model is pulled. They never fail CI.
+Each still carries its own runtime guard too (prints `SKIP` and returns early) if Ollama isn't up on `127.0.0.1:11434` or the required model isn't pulled — so even an explicit `--ignored` run degrades gracefully without live infra.
 
 ### Backend — Python tests
 
@@ -200,15 +258,33 @@ All live-Ollama tests **skip** (print `SKIP`) unless Ollama is up on `127.0.0.1:
 | `test_verify_ollama_integration.py` | Prompt-kind verify with Ollama (same skip idiom) |
 | `test_author_ollama_integration.py` | `ralphus author` with qwen3:8b (same skip idiom) |
 
-Ollama integration tests require `uv run --extra runner pytest -k ollama`.
+**Ollama-marked tests (`pytest.mark.ollama`) are deselected by default** — `[tool.pytest.ini_options] addopts` in `cli/pyproject.toml` sets `-m "not ollama"`, so a plain `uv run pytest` never runs them, mirroring the Rust `#[ignore]` gate above. Run them explicitly with `uv run --extra runner pytest -m ollama` (add `-k <name>` to narrow to one file/test). Each still carries its own runtime guard (`pytest.skip("Ollama is not running")`) if Ollama isn't reachable, so an explicit `-m ollama` run degrades gracefully too.
 
 ### Frontend — board.html
 
-There are **no automated frontend tests**. The board is plain HTML + vanilla JS embedded via `include_str!` — testing is manual:
+The board is plain HTML + vanilla JS embedded via `include_str!`, so most of it
+is only testable in a browser. The exception (RAL-186) is its **pure, DOM-free
+logic**, which `npm test` (`node --test`, files in `test/`) exercises directly:
+
+```bash
+npm test                            # from repo root; also a CI step in the `web` job
+```
+
+`test/board-peek-state.mjs` slices the live-view (peek) state machine straight
+out of `board.html` — the region between the `// RALPHUS-PEEK-STATE-MACHINE:BEGIN`
+/ `:END` markers — and evaluates it standalone. **The tests read the real
+shipped source; there is no second copy to drift from.** If that logic moves,
+move the markers with it, or the loader fails loudly. To extend this pattern to
+another piece of board logic, factor the decision-making part free of DOM/`fetch`/
+module-level state (the way `nextPeekPaneState` is: state in, state out) and give
+it its own marker region — that separation is what makes it testable at all.
+
+Everything else about the board is still tested manually:
 
 1. Run `bash scripts/build-debug.sh` (boots daemon + librarian).
 2. Open `http://127.0.0.1:7474` in a browser.
-3. Submit a task and watch the board update (polls every 2 s).
+3. Submit a task and watch the board update (the daemon pushes changes over SSE;
+   open Live View boxes refresh on their own 2 s interval).
 4. Exercise the tab you changed (Runs, Reviews, etc.).
 
 Frontend dev loop: edit `librarian/assets/board.html` → re-run `bash scripts/build-debug.sh` → refresh browser. One incremental librarian recompile is the cost.
@@ -482,7 +558,7 @@ Re-keying: delete `ralphus-private.key`, run `generate` again, commit the new `a
 - **Runner command**: the daemon spawns `RALPHUS_RUNNER_CMD` (default `ralphus-runner`). In dev, point it at the venv script, e.g. `cli/.venv/Scripts/ralphus-runner.exe` — that's an editable install, so source edits under `cli/src/ralphus/runner/` take effect immediately with no build step. `dist/ralphus-runner.exe` (built by `scripts/build-release.cmd`) is a frozen PyInstaller snapshot; only rebuild it when something changed since the last one.
 - **pydantic-ai is the optional `runner` extra**, not a dev dependency. CI does not install it; `pydantic_backend.py` is imported lazily and a mypy override keeps strict checking green without it.
 - **The full review flow has a live-Ollama integration test** — `daemon/tests/reviews_derive.rs::full_flow_validate_submit_run_and_ollama_resolves_conflict`. It **skips** unless Ollama is up on `127.0.0.1:11434`, the resolver model (`RALPHUS_RESOLVER_MODEL`, default `qwen3:8b`) is pulled, and a `ralphus-runner` is found.
-- **Monorepo integration test** — `daemon/tests/monorepo.rs` has three always-run pipeline tests and one live-Ollama test. Run the live test with `cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --nocapture`.
+- **Monorepo integration test** — `daemon/tests/monorepo.rs` has three always-run pipeline tests and one live-Ollama test, `#[ignore]`d by default. Run the live test with `cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture`.
 - **Model selection** is per-session in TOML: `agent = "ollama"` + `model = "qwen3:8b"` for local; `agent = "claude"` (default) uses Anthropic (needs `ANTHROPIC_API_KEY`).
 - **`prompt`-kind verify steps** run for real, reusing the owning session's resolved backend through the same `Runner`/`ralphus-runner` path. The runner wraps the verify prompt and parses the final `RALPHUS_VERIFY: PASS`/`FAIL` line. Small local models don't put the marker alone on its own line — parsing searches the whole output and trusts the last occurrence. No verdict found = FAIL (fail closed).
 - **Port clash**: the old claudectl also uses 7474/7890; the daemon port is not yet CLI-configurable, so don't run both.
@@ -519,6 +595,22 @@ items.push(`<div data-tip="Cancel this run — stops all running sessions." oncl
 ```
 
 **Do not use the native `title` attribute** for new tooltips — it renders with browser default styling and ignores the dark theme. The `title` attribute can remain on existing splitter elements (they already use `data-tip`) but should not be added to new elements.
+
+## Vocabulary
+
+**ralphus has taken words.** `run`, `task`, `session`, `verify`, `review`,
+`guardian`, `agent`, `backend`, `provider`, `machine`, `channel`, `ghost`,
+`project`, `worktree` and others all mean something specific here, and several
+of them nest in a way that matters (a run contains tasks, which contain
+sessions, which contain verify steps).
+
+**Before coining a term — for a concept, a struct, a field, a doc — check
+[`docs/glossary.md`](docs/glossary.md).** Reusing a taken word makes both
+meanings harder to read, and a collision is painful to undo once it has reached
+the schema, the store, and the board. That document also lists the words already
+carrying too much weight to take, with the alternative to use instead.
+
+**When you take a new word, add it to the glossary.**
 
 ## Design / UI colors
 

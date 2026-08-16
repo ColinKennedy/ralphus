@@ -4,8 +4,9 @@ This is the headline "real run through the system with a local model" test. It
 is skipped when pydantic-ai is not installed or Ollama is not reachable, and it
 errors only on a genuine failure of the pipeline (not on environment absence).
 
-Run it explicitly with the runner extra:
-    uv run --extra runner pytest -k ollama
+Deselected by default (see `addopts` in cli/pyproject.toml). Run it explicitly
+with the runner extra:
+    uv run --extra runner pytest -m ollama
 """
 
 from __future__ import annotations

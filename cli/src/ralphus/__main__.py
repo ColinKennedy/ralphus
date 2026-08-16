@@ -9,7 +9,7 @@ import hashlib
 import json
 import math
 import os
-import shlex
+import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypedDict, TypeVar, cast
 
-from ralphus import __version__
+from ralphus import __version__, shellcmd
 from ralphus.agents import KNOWN_AGENTS, OTHER_AGENTS_NOTE
 from ralphus.author import (
     AuthorError,
@@ -45,12 +45,16 @@ from ralphus.health import (
 )
 from ralphus.output import emit, exit_code_for, print_kv, print_table
 from ralphus.selector import (
+    BRANCH_SEPARATOR_TOKENS,
     ResolvedSelector,
     SelectorError,
+    guardian_view_uri,
     resolve_guardian_selector,
     resolve_run_selector,
+    run_view_uri,
 )
 from ralphus.tutor import TASK_TUTOR
+from ralphus.uri import UriError, looks_like_uri, parse_uri
 
 __all__ = ["build_parser", "main"]
 
@@ -96,7 +100,7 @@ dismiss-reenable base branch checks action chat" -- "$cur") ) ;;
         initialize) COMPREPLY=( $(compgen -W "git" -- "$cur") ) ;;
         completion) COMPREPLY=( $(compgen -W "bash" -- "$cur") ) ;;
         show) COMPREPLY=( $(compgen -W "help-map" -- "$cur") ) ;;
-        quick-start) COMPREPLY=( $(compgen -W "claude-code" -- "$cur") ) ;;
+        quick-start) COMPREPLY=( $(compgen -W "manager reviewer" -- "$cur") ) ;;
         *) ;;
     esac
 }
@@ -1199,6 +1203,62 @@ def build_parser() -> argparse.ArgumentParser:
     # `ralphus project` with no subcommand prints the group help.
     p_project.set_defaults(func=_help_printer(p_project))
 
+    p_machine = _add_parser(
+        subparsers,
+        "machine",
+        help="Register and inspect machine providers remote work runs on (RAL-185).",
+    )
+    machine_sub = p_machine.add_subparsers(dest="machine_command", metavar="SUBCOMMAND")
+    p_machine_register = _add_parser(
+        machine_sub,
+        "register",
+        help="Register a provider program a task's 'machine' field can reference.",
+    )
+    p_machine_register.add_argument(
+        "--scheme",
+        required=True,
+        help='Provider name -- the left half of machine = "<scheme>:<uri>". '
+        "Letters, digits, '_' and '-'; at least two characters.",
+    )
+    p_machine_register.add_argument(
+        "--program", required=True, help="Path to the program the daemon runs to reach machines."
+    )
+    p_machine_register.add_argument(
+        "--description", default="", help="Human description, shown in listings and errors."
+    )
+    p_machine_register.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        help="Argument always prepended before the verb; repeatable. Lets one "
+        "program back several schemes.",
+    )
+    p_machine_register.add_argument(
+        "--channel",
+        action="store_true",
+        help="This provider implements the 'channel' verb: one long-lived process "
+        "serves many commands instead of being spawned per command. Worth it only "
+        "when reaching your machines is expensive -- the daemon falls back to "
+        "per-command spawns automatically if a channel cannot be opened.",
+    )
+    p_machine_register.set_defaults(func=_cmd_machine_register)
+    p_machine_list = _add_parser(
+        machine_sub, "list", help="List every registered machine provider, plus built-in schemes."
+    )
+    p_machine_list.set_defaults(func=_cmd_machine_list)
+    p_machine_get = _add_parser(
+        machine_sub, "get", help="Show one registered machine provider by exact scheme."
+    )
+    p_machine_get.add_argument("scheme", help="Registered provider scheme.")
+    p_machine_get.set_defaults(func=_cmd_machine_get)
+    p_machine_remove = _add_parser(
+        machine_sub, "remove", help="Remove a registered machine provider."
+    )
+    p_machine_remove.add_argument("scheme", help="Registered provider scheme.")
+    p_machine_remove.set_defaults(func=_cmd_machine_remove)
+    # Bare `ralphus machine` lists providers (mirrors bare `ralphus agent`).
+    p_machine.set_defaults(func=_cmd_machine_list)
+
     p_agent = _add_parser(subparsers, "agent", help="Inspect agent backends ralphus can run.")
     agent_sub = p_agent.add_subparsers(dest="agent_command", metavar="SUBCOMMAND")
     p_agent_list = _add_parser(
@@ -1225,34 +1285,147 @@ def build_parser() -> argparse.ArgumentParser:
     p_quick_start = _add_parser(
         subparsers,
         "quick-start",
-        help="One-command onboarding paths for driving ralphus with an external tool.",
+        help="One-command onboarding paths for driving ralphus with an external tool (RAL-166).",
     )
     quick_start_sub = p_quick_start.add_subparsers(dest="quick_start_command", metavar="SUBCOMMAND")
-    p_qs_claude_code = _add_parser(
+
+    p_qs_manager = _add_parser(
         quick_start_sub,
+        "manager",
+        help="Launch a harness primed to orchestrate ralphus itself (submit/manage tasks).",
+    )
+    manager_sub = p_qs_manager.add_subparsers(
+        dest="quick_start_manager_command", metavar="SUBCOMMAND"
+    )
+    p_qs_manager_claude_code = _add_parser(
+        manager_sub,
         "claude-code",
         help="Launch Claude Code primed with the full ralphus CLI help-map, "
         "so it can orchestrate ralphus unsupervised (RAL-110).",
     )
-    p_qs_claude_code.description = (
+    p_qs_manager_claude_code.description = (
         "Writes the help-map (same tree `show help-map` prints) to a throwaway temp file and "
         "launches `claude --dangerously-skip-permissions --append-system-prompt-file <tempfile> "
         "...`. Args after a literal `--` are forwarded verbatim to `claude`, e.g. "
-        "`ralphus quick-start claude-code -- --mode auto`. If those forwarded args include their "
-        "own --append-system-prompt-file, its contents are read and folded into ralphus's own "
-        "temp file instead -- ralphus's context first, then a disclaimer, then the user's -- "
-        "rather than forwarding a second, separate flag."
+        "`ralphus quick-start manager claude-code -- --mode auto`. If those forwarded args "
+        "include their own --append-system-prompt-file, its contents are read and folded into "
+        "ralphus's own temp file instead -- ralphus's context first, then a disclaimer, then the "
+        "user's -- rather than forwarding a second, separate flag."
     )
-    p_qs_claude_code.add_argument(
-        "--command",
-        help="Override the `claude` launch command for this invocation only "
-        "(takes precedence over $RALPHUS_CLAUDE_COMMAND).",
+    _add_quick_start_launch_args(
+        p_qs_manager_claude_code, program="claude", env_var="RALPHUS_CLAUDE_COMMAND"
     )
-    p_qs_claude_code.set_defaults(func=_cmd_quick_start_claude_code)
+    p_qs_manager_claude_code.set_defaults(func=_cmd_quick_start_manager_claude_code)
+    p_qs_manager_codex = _add_parser(
+        manager_sub,
+        "codex",
+        help="Launch Codex primed with the full ralphus CLI help-map, "
+        "so it can orchestrate ralphus unsupervised (RAL-166).",
+    )
+    p_qs_manager_codex.description = (
+        "Launches an interactive `codex` session with the help-map (same tree `show help-map` "
+        "prints) injected via `-c developer_instructions=...` -- Codex's closest analog to a "
+        "system prompt (Codex has no file-based injection flag; see `codex_backend.py`). Args "
+        "after a literal `--` are forwarded verbatim to `codex`, e.g. `ralphus quick-start "
+        "manager codex -- --model gpt-5-codex`."
+    )
+    _add_quick_start_launch_args(p_qs_manager_codex, program="codex", env_var="RALPHUS_CODEX_CMD")
+    p_qs_manager_codex.set_defaults(func=_cmd_quick_start_manager_codex)
+    # `ralphus quick-start manager` with no subcommand prints the group help.
+    p_qs_manager.set_defaults(func=_help_printer(p_qs_manager))
+
+    p_qs_reviewer = _add_parser(
+        quick_start_sub,
+        "reviewer",
+        help="Launch a harness primed to operate an existing review (RAL-166).",
+    )
+    reviewer_sub = p_qs_reviewer.add_subparsers(
+        dest="quick_start_reviewer_command", metavar="SUBCOMMAND"
+    )
+    p_qs_reviewer_claude_code = _add_parser(
+        reviewer_sub,
+        "claude-code",
+        help="Launch Claude Code primed with the review (Guardian) control surface, so it can "
+        "act as a reviewer for an existing review (RAL-166).",
+    )
+    p_qs_reviewer_claude_code.description = (
+        "Injects a review-focused system prompt (branch/combined feedback, merge/rebase "
+        "control, branch enable/disable, base-branch changes, manual checks, action hints) via "
+        "the same `--append-system-prompt-file` mechanism as `quick-start manager claude-code`. "
+        "Optionally takes an initial review TARGET (a guardian id, @name, or a review-resolving "
+        "URL, e.g. `http://127.0.0.1:7474/#/reviews/<id>`); the agent can switch to a different "
+        "review at any point in the conversation without relaunching -- TARGET only seeds where "
+        "it starts."
+    )
+    p_qs_reviewer_claude_code.add_argument(
+        "target",
+        nargs="?",
+        help="Optional initial review: a guardian id, @name, or review-resolving URL.",
+    )
+    _add_quick_start_launch_args(
+        p_qs_reviewer_claude_code, program="claude", env_var="RALPHUS_CLAUDE_COMMAND"
+    )
+    p_qs_reviewer_claude_code.set_defaults(func=_cmd_quick_start_reviewer_claude_code)
+    p_qs_reviewer_codex = _add_parser(
+        reviewer_sub,
+        "codex",
+        help="Launch Codex primed with the review (Guardian) control surface, so it can act as "
+        "a reviewer for an existing review (RAL-166).",
+    )
+    p_qs_reviewer_codex.description = (
+        "Injects the same review-focused system prompt as `quick-start reviewer claude-code`, "
+        "via `-c developer_instructions=...` (Codex's closest analog to a system prompt). "
+        "Optionally takes an initial review TARGET (a guardian id, @name, or a review-resolving "
+        "URL); the agent can switch to a different review at any point in the conversation "
+        "without relaunching -- TARGET only seeds where it starts."
+    )
+    p_qs_reviewer_codex.add_argument(
+        "target",
+        nargs="?",
+        help="Optional initial review: a guardian id, @name, or review-resolving URL.",
+    )
+    _add_quick_start_launch_args(p_qs_reviewer_codex, program="codex", env_var="RALPHUS_CODEX_CMD")
+    p_qs_reviewer_codex.set_defaults(func=_cmd_quick_start_reviewer_codex)
+    # `ralphus quick-start reviewer` with no subcommand prints the group help.
+    p_qs_reviewer.set_defaults(func=_help_printer(p_qs_reviewer))
+
     # `ralphus quick-start` with no subcommand prints the group help.
     p_quick_start.set_defaults(func=_help_printer(p_quick_start))
 
     return parser
+
+
+_QUICK_START_COMMAND_HELP = (
+    "Override the `{program}` launch command for this invocation only (takes precedence over "
+    "${env_var}). Accepts a bare executable (`{program}`), a single-name script resolved the "
+    "way the target shell resolves one (`my-{program}.ps1` -- current directory then PATH on "
+    "Windows, PATH only on POSIX), or a raw shell command line (`cd /foo/bar ; {program}`, "
+    "`python some_script.py -- super-{program}`) run through --shell (RAL-189)."
+)
+
+_QUICK_START_SHELL_HELP = (
+    "Which shell interprets a --command that needs one (a script, or a raw command line). "
+    "Default 'auto' is the shell that launched ralphus, so a command line means what it would "
+    "mean typed at your own prompt; name one explicitly to author a command for a different "
+    "shell (e.g. --shell bash from a PowerShell prompt). $RALPHUS_SHELL overrides what 'auto' "
+    "detects (RAL-189)."
+)
+
+
+def _add_quick_start_launch_args(
+    parser: argparse.ArgumentParser, *, program: str, env_var: str
+) -> None:
+    """Add the shared `--command`/`--shell` pair to a quick-start subparser (RAL-110/189)."""
+    parser.add_argument(
+        "--command",
+        help=_QUICK_START_COMMAND_HELP.format(program=program, env_var=env_var),
+    )
+    parser.add_argument(
+        "--shell",
+        choices=list(shellcmd.SHELL_CHOICES),
+        default=shellcmd.SHELL_AUTO,
+        help=_QUICK_START_SHELL_HELP,
+    )
 
 
 def _help_printer(parser: argparse.ArgumentParser) -> Callable[[argparse.Namespace], int]:
@@ -1819,7 +1992,24 @@ def _cmd_graph(args: argparse.Namespace) -> int:
 
 
 def _looks_like_guardian_selector(selector: str) -> bool:
-    return selector.startswith("@") or "#" in selector or selector.startswith("guardian")
+    """Whether `selector` addresses a review rather than a run/task/session.
+
+    RAL-188: a URI declares its own family (`REVIEW[...]`), so that is checked
+    first -- a *run* URI can legitimately contain a `~` (the `VERIFY[~0]`
+    positional sigil) and must not be mistaken for the legacy
+    `<guardian>~<branch>` form. A malformed URI falls through to the run
+    resolver, which reports the parse error properly.
+    """
+    if looks_like_uri(selector):
+        try:
+            return parse_uri(selector).kinds[0] == "REVIEW"
+        except UriError:
+            return False
+    return (
+        selector.startswith("@")
+        or any(token in selector for token in BRANCH_SEPARATOR_TOKENS)
+        or selector.startswith("guardian")
+    )
 
 
 def _cmd_get(args: argparse.Namespace) -> int:
@@ -2301,9 +2491,27 @@ def _cmd_run_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _with_uri(payload: dict[str, Any], uri: str) -> dict[str, Any]:
+    """Attach an entity's canonical RAL-188 URI to a daemon payload before it
+    is emitted.
+
+    Production is the half of RAL-188 that makes the scheme first-class rather
+    than merely tolerated: every `show` prints the exact string that addresses
+    what it just displayed, so a human or an agent can copy it straight into
+    the next command instead of reconstructing it from indices. `uri` leads the
+    dict so it is the first line of `--json` output too.
+    """
+    return {"uri": uri, **payload}
+
+
 def _render_run_detail(run: dict[str, Any]) -> None:
     print_kv(
-        [("id", run.get("id")), ("label", run.get("label") or ""), ("state", run.get("state"))]
+        [
+            *([("uri", run["uri"])] if run.get("uri") else []),
+            ("id", run.get("id")),
+            ("label", run.get("label") or ""),
+            ("state", run.get("state")),
+        ]
     )
     for ti, task in enumerate(run.get("tasks", [])):
         print(f"\n[{ti}] task {task.get('name')}  {task.get('state')}")
@@ -2331,7 +2539,8 @@ def _cmd_run_show(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    emit(args.json, run, _render_run_detail)
+    uri = run_view_uri(run, ResolvedSelector(kind="run", run_id=args.run_id))
+    emit(args.json, _with_uri(run, uri), _render_run_detail)
     return 0
 
 
@@ -2492,11 +2701,12 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    task = run["tasks"][resolved.task_idx]
+    task = _with_uri(run["tasks"][resolved.task_idx], run_view_uri(run, resolved))
 
     def _render(t: dict[str, Any]) -> None:
         print_kv(
             [
+                ("uri", t.get("uri")),
                 ("name", t.get("name")),
                 ("project", t.get("project") or ""),
                 ("state", t.get("state")),
@@ -2568,11 +2778,15 @@ def _cmd_session_show(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    session = run["tasks"][resolved.task_idx]["sessions"][resolved.session_idx]
+    session = _with_uri(
+        run["tasks"][resolved.task_idx]["sessions"][resolved.session_idx],
+        run_view_uri(run, resolved),
+    )
 
     def _render(s: dict[str, Any]) -> None:
         print_kv(
             [
+                ("uri", s.get("uri")),
                 ("id", s.get("id")),
                 ("name", s.get("name") or ""),
                 ("state", s.get("state")),
@@ -2809,11 +3023,12 @@ def _cmd_verify_show(args: argparse.Namespace) -> int:
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
-    step = _verify_step_for(run, resolved)
+    step = _with_uri(_verify_step_for(run, resolved), run_view_uri(run, resolved))
 
     def _render(v: dict[str, Any]) -> None:
         print_kv(
             [
+                ("uri", v.get("uri")),
                 ("kind", v.get("kind")),
                 ("state", v.get("state")),
                 ("scope", resolved.verify_scope),
@@ -3088,10 +3303,13 @@ def _cmd_review_show(args: argparse.Namespace) -> int:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
 
+    guardian = _with_uri(guardian, guardian_view_uri(guardian, resolved))
+
     def _render(g: dict[str, Any]) -> None:
         mp = g.get("merge_progress", {})
         print_kv(
             [
+                ("uri", g.get("uri")),
                 ("id", g.get("id")),
                 ("name", g.get("name")),
                 ("status", g.get("status")),
@@ -4060,6 +4278,67 @@ def _parse_queue_path(path: str) -> _PathParts | None:
     return None
 
 
+def _resolve_queue_path(
+    client: DaemonClient, args: argparse.Namespace, *, json_mode: bool
+) -> _PathParts | None:
+    """Resolve `args.path` -- a RAL-188 URI or a positional queue path -- to
+    the set-status fields. Prints and returns None on failure."""
+    if looks_like_uri(args.path):
+        try:
+            r = resolve_run_selector(client, args.path)
+        except SelectorError as exc:
+            _print_selector_error(exc, json_mode=json_mode)
+            return None
+        except DaemonError as exc:
+            _print_daemon_error(exc, json_mode=json_mode)
+            return None
+        return {
+            "kind": r.kind,
+            "run_id": r.run_id,
+            "task_idx": r.task_idx,
+            "session_idx": r.session_idx,
+            "verify_idx": r.verify_idx,
+            "verify_scope": r.verify_scope,
+        }
+    parsed = _parse_queue_path(args.path)
+    if parsed is None:
+        print(f"error: could not parse item path '{args.path}'", file=sys.stderr)
+    return parsed
+
+
+def _queue_path_for(resolved: ResolvedSelector) -> str:
+    """Render a resolved selector as the daemon's own queue-item path.
+
+    RAL-188: the URI is the grammar a human/agent types, but the queue API
+    speaks the positional `run/t<ti>/s<si>` form -- this is the boundary that
+    converts one to the other (mirroring `_parse_queue_path`, which reads it
+    back). A run/session/verify each have a queue item; a *task* does not, so
+    addressing one is an error rather than a silently-wrong path.
+    """
+    if resolved.kind == "run":
+        return resolved.run_id
+    if resolved.kind == "session":
+        return f"{resolved.run_id}/t{resolved.task_idx}/s{resolved.session_idx}"
+    if resolved.kind == "verify":
+        if resolved.verify_scope == "task":
+            return f"{resolved.run_id}/t{resolved.task_idx}/tv{resolved.verify_idx}"
+        return (
+            f"{resolved.run_id}/t{resolved.task_idx}/s{resolved.session_idx}/v{resolved.verify_idx}"
+        )
+    raise SelectorError(
+        f"a task has no queue item of its own -- address one of its sessions "
+        f"or verify steps instead (got a {resolved.kind} selector)"
+    )
+
+
+def _normalize_queue_paths(client: DaemonClient, paths: Sequence[str]) -> list[str]:
+    """Convert any RAL-188 URI in `paths` to the daemon's queue-item path,
+    leaving an already-positional path untouched."""
+    return [
+        _queue_path_for(resolve_run_selector(client, p)) if looks_like_uri(p) else p for p in paths
+    ]
+
+
 def _print_queue_order(order: list[str]) -> None:
     print("new queue order:")
     for i, p in enumerate(order):
@@ -4097,7 +4376,10 @@ def _cmd_queue_list(args: argparse.Namespace) -> int:
 def _cmd_queue_reorder(args: argparse.Namespace) -> int:
     with DaemonClient(args.daemon_url) as client:
         try:
-            result = client.queue_reorder(list(args.paths))
+            result = client.queue_reorder(_normalize_queue_paths(client, args.paths))
+        except SelectorError as exc:
+            _print_selector_error(exc, json_mode=args.json)
+            return 2
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
@@ -4109,8 +4391,11 @@ def _cmd_queue_set_position(args: argparse.Namespace) -> int:
     with DaemonClient(args.daemon_url) as client:
         try:
             result = client.queue_set_position(
-                list(args.paths), args.to, absolute=not args.relative
+                _normalize_queue_paths(client, args.paths), args.to, absolute=not args.relative
             )
+        except SelectorError as exc:
+            _print_selector_error(exc, json_mode=args.json)
+            return 2
         except DaemonError as exc:
             _print_daemon_error(exc, json_mode=args.json)
             return exit_code_for(exc)
@@ -4119,11 +4404,10 @@ def _cmd_queue_set_position(args: argparse.Namespace) -> int:
 
 
 def _cmd_queue_set_status(args: argparse.Namespace) -> int:
-    parsed = _parse_queue_path(args.path)
-    if parsed is None:
-        print(f"error: could not parse item path '{args.path}'", file=sys.stderr)
-        return 2
     with DaemonClient(args.daemon_url) as client:
+        parsed = _resolve_queue_path(client, args, json_mode=args.json)
+        if parsed is None:
+            return 2
         try:
             result = client.set_status(
                 parsed["run_id"],
@@ -4320,6 +4604,88 @@ def _cmd_project_git(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_machine_register(args: argparse.Namespace) -> int:
+    """Register a machine provider the daemon can dispatch remote work to.
+
+    Once registered, a task/session/verify/review can declare
+    ``machine = "<scheme>:<uri>"``. The daemon never interprets ``<uri>`` --
+    it hands it to this provider's program verbatim (RAL-185).
+
+    This is deliberately an administrative command rather than something a
+    task file can declare: a TOML that could both name and define an
+    program would make ``ralphus submit`` equivalent to arbitrary code
+    execution.
+    """
+    with DaemonClient(args.daemon_url) as client:
+        try:
+            client.register_machine(
+                args.scheme,
+                args.program,
+                description=args.description,
+                args=args.arg,
+                supports_channel=args.channel,
+            )
+        except DaemonError as exc:
+            _print_daemon_error(exc)
+            return 1
+    print(f'registered machine provider "{args.scheme}" -> {args.program}')
+    return 0
+
+
+def _cmd_machine_list(args: argparse.Namespace) -> int:
+    """List every machine provider registered with the daemon."""
+    with DaemonClient(args.daemon_url) as client:
+        try:
+            payload = client.list_machines()
+        except DaemonError as exc:
+            _print_daemon_error(exc)
+            return 2
+    machines = payload.get("machines", [])
+    for m in machines:
+        print(f"{m.get('scheme'):<20}  v{m.get('protocol_version')}  {m.get('program')}")
+        description = m.get("description")
+        if description:
+            print(f"    {description}")
+    # Built-ins never appear in the table but are always usable, so listing
+    # them here keeps `local`/`ralphus-daemon` from looking unavailable.
+    builtin = payload.get("builtin", [])
+    if builtin:
+        print(f"built-in (always available): {', '.join(builtin)}")
+    elif not machines:
+        print("no registered machine providers")
+    return 0
+
+
+def _cmd_machine_get(args: argparse.Namespace) -> int:
+    """Show one registered machine provider's details by its exact scheme."""
+    with DaemonClient(args.daemon_url) as client:
+        try:
+            m = client.get_machine(args.scheme)
+        except DaemonError as exc:
+            _print_daemon_error(exc)
+            return 2
+    print(f"scheme:      {m.get('scheme')}")
+    print(f"program:     {m.get('program')}")
+    print(f"protocol:    v{m.get('protocol_version')}")
+    if m.get("args"):
+        print(f"args:        {' '.join(m['args'])}")
+    if m.get("description"):
+        print(f"description: {m['description']}")
+    return 0
+
+
+def _cmd_machine_remove(args: argparse.Namespace) -> int:
+    """Remove a registered machine provider."""
+    with DaemonClient(args.daemon_url) as client:
+        try:
+            client.deregister_machine(args.scheme)
+        except DaemonError as exc:
+            _print_daemon_error(exc)
+            return 1
+    print(f'removed machine provider "{args.scheme}"')
+    return 0
+
+
 def _cmd_project_list(args: argparse.Namespace) -> int:
     """List every project registered with the daemon."""
     with DaemonClient(args.daemon_url) as client:
@@ -4381,7 +4747,14 @@ def _cmd_agent_list(_args: argparse.Namespace) -> int:
 
 def _cmd_show_help_map(_args: argparse.Namespace) -> int:
     # deferred: avoids a __main__ <-> helpmap import cycle
-    from ralphus.helpmap import PROJECT_LOOKUP_NOTE, SUBAGENT_NOTE, SUBMIT_VALIDATE_NOTE, generate
+    from ralphus.helpmap import (
+        JSON_NOTE,
+        PROJECT_LOOKUP_NOTE,
+        SUBAGENT_NOTE,
+        SUBMIT_REVIEW_NOTE,
+        SUBMIT_VALIDATE_NOTE,
+        generate,
+    )
 
     print(SUBAGENT_NOTE)
     print()
@@ -4389,26 +4762,12 @@ def _cmd_show_help_map(_args: argparse.Namespace) -> int:
     print()
     print(SUBMIT_VALIDATE_NOTE)
     print()
+    print(SUBMIT_REVIEW_NOTE)
+    print()
+    print(JSON_NOTE)
+    print()
     print(generate())
     return 0
-
-
-def _shell_quote(value: str) -> str:
-    """Quote `value` as one token for the platform's `shell=True` shell.
-
-    Best-effort, not bulletproof: this is only reached for the opaque
-    compound-shell-command form of `$RALPHUS_CLAUDE_COMMAND`/`--command`
-    (e.g. "cd foo && claude"), a known-tricky, explicitly-accepted-risk area
-    (RAL-110's own risk list). In particular the Windows branch does not
-    neutralize cmd.exe's `%VAR%` expansion, which happens even inside a
-    double-quoted token -- a forwarded value containing `%SOMENAME%` can be
-    silently expanded by cmd.exe. POSIX's `shlex.quote` has no such gap.
-    """
-    if os.name == "nt":
-        if not value or any(c in value for c in ' \t"'):
-            return '"' + value.replace('"', '""') + '"'
-        return value
-    return shlex.quote(value)
 
 
 _PROMPT_FILE_DISCLAIMER_TEMPLATE = """\
@@ -4483,10 +4842,234 @@ def _resolve_claude_launch_command(args: argparse.Namespace) -> str:
     return getattr(args, "command", None) or os.environ.get("RALPHUS_CLAUDE_COMMAND") or "claude"
 
 
-def _cmd_quick_start_claude_code(args: argparse.Namespace) -> int:
-    """Launch Claude Code primed with the full ralphus CLI help-map (RAL-110).
+def _resolve_codex_launch_command(args: argparse.Namespace) -> str:
+    return getattr(args, "command", None) or os.environ.get("RALPHUS_CODEX_CMD") or "codex"
 
-    Writes the help-map to a throwaway temp file and points Claude Code at it
+
+def _resolve_launch_shell(args: argparse.Namespace) -> str:
+    """The `--shell` value for a quick-start launch (`"auto"` when unset)."""
+    return str(getattr(args, "shell", None) or shellcmd.SHELL_AUTO)
+
+
+def _manager_system_prompt_content() -> str:
+    """Build the shared "orchestrate ralphus itself" system prompt (RAL-110/166).
+
+    Used by both `quick-start manager claude-code` and `quick-start manager
+    codex` -- the framing and injected help-map are harness-agnostic, only
+    the delivery mechanism (file vs. inline `-c` override) differs.
+    """
+    # deferred: avoids a __main__ <-> helpmap import cycle
+    from ralphus.helpmap import (
+        JSON_NOTE,
+        PROJECT_LOOKUP_NOTE,
+        SUBAGENT_NOTE,
+        SUBMIT_REVIEW_NOTE,
+        SUBMIT_VALIDATE_NOTE,
+        generate,
+    )
+
+    return (
+        "You are Ralphus. You orchestrate the `ralphus` CLI as an autonomous agent. Its "
+        "complete command surface -- every subcommand, flag, and expected value type -- is "
+        "documented below. Use `ralphus <command> --help` for details on any specific "
+        "command.\n\n"
+        + SUBAGENT_NOTE
+        + "\n\n"
+        + PROJECT_LOOKUP_NOTE
+        + "\n\n"
+        + SUBMIT_VALIDATE_NOTE
+        + "\n\n"
+        + SUBMIT_REVIEW_NOTE
+        + "\n\n"
+        + JSON_NOTE
+        + "\n\n"
+        + generate()
+    )
+
+
+# The review-resolving URL shape `board.html` itself puts in the address bar
+# (`syncHash()`/`parseHash()` in librarian/assets/board.html): `#/reviews/<id>`,
+# optionally with a trailing `?...` query string. Best-effort only (RAL-166):
+# a URL with no such fragment falls back to being treated as a literal
+# selector rather than being rejected outright.
+_REVIEW_URL_ID_RE = re.compile(r"reviews/([^/?&#]+)")
+
+
+def _parse_review_target(target: str) -> str:
+    """Resolve a reviewer quick-start TARGET to a guardian selector (RAL-166).
+
+    Accepts a raw guardian id / `@name` / `guardian#branch` selector as-is.
+    For a review-resolving URL (anything containing `://`), extracts the id
+    from a `.../reviews/<id>` path/fragment segment if present; otherwise
+    falls back to the URL text itself, best-effort, since a generic web-page
+    URL parser is explicitly out of scope for this landing.
+    """
+    if "://" not in target:
+        return target
+    match = _REVIEW_URL_ID_RE.search(target)
+    return match.group(1) if match else target
+
+
+# Shared framing for both reviewer quick-start harnesses: the agent operates
+# an *existing* review through the CLI's own `review ...` surface, not a
+# fresh ralphus orchestration session (RAL-166).
+_REVIEWER_ROLE_NOTE = (
+    "You are Ralphus operating in REVIEWER mode. You are not orchestrating new ralphus tasks -- "
+    "you are acting as a human reviewer would inside the ralphus Guardian review board (the web "
+    "board's Reviews tab), but through the `ralphus review ...` CLI surface instead of a "
+    "browser. A review (also called a 'guardian') is a stack of one or more branches being "
+    "rebased onto a base branch, with per-branch and combined feedback, checks, and merge "
+    "control.\n\n"
+    "Review operations you should be ready to perform on request, all via `ralphus review "
+    "...` (run `ralphus review --help` / `ralphus review <sub> --help` for exact flags):\n"
+    "  - `review show <selector>` / `review status <selector>` / `review logs <selector>` -- "
+    "inspect a review's current state and audit trail.\n"
+    '  - `review feedback <guardian#branch> "..."` -- feedback on one branch, triggering a '
+    "resolver re-attempt.\n"
+    '  - `review chat send <selector> "..."` / `review chat show <selector>` -- combined/'
+    "global review feedback thread (not tied to one branch).\n"
+    "  - `review merge <selector>` / `review restart-merge <selector>` -- start or restart the "
+    "stacked rebase.\n"
+    "  - `review branch enable <guardian#branch>` / `review branch disable <guardian#branch>` "
+    "-- enable/disable one branch in the stack.\n"
+    "  - `review base list <selector>` / `review base set <selector> <branch>` -- inspect/"
+    "change the base branch.\n"
+    "  - `review checks list <selector>` / `review checks run <selector> [--index N | --all]` "
+    "-- the review's manual (lint/format/test) checks; `checks run` PRINTS the command(s) + cwd "
+    "rather than silently executing writes on your behalf.\n"
+    "  - `review action list <selector>` / `review action run <selector> --index N` -- "
+    "user-declared `[[review.action]]` test/action hints, same print-don't-run shape as checks.\n"
+    "  - `review worktrees <selector>` -- the branches/worktrees a review consumes.\n"
+    "  - `review list` -- list all reviews; use this (or a fresh `review show <selector>`) to "
+    "switch to a different review at any point in this conversation -- you do not need to be "
+    "relaunched to change which review you're operating on.\n\n"
+    "Remote-state caution: do not assume the review's code lives on this machine. The daemon "
+    "(reachable via --daemon-url, defaulting to local) is the authoritative source of truth for "
+    "review state -- the worktree paths `review worktrees` reports may live on a different host "
+    "than this one. Prefer the CLI's own `--json` views and the printed check/action commands "
+    "over assuming a local git checkout. Only run a shell command directly against review code "
+    "if you have independently confirmed the relevant path exists in your own local filesystem, "
+    "and even then keep any such command read-only (inspection, never mutation).\n\n"
+    "Write boundary: every review mutation (feedback, merge/restart-merge, branch enable/"
+    "disable, base-branch change, settings) must go through an explicit `ralphus review ...` "
+    "subcommand. Never edit, commit, or push directly inside an inspected worktree -- that "
+    "bypasses the review's own gating and audit trail."
+)
+
+
+def _reviewer_system_prompt_content(target: str | None) -> str:
+    """Build the review-focused system prompt shared by both reviewer harnesses (RAL-166).
+
+    Distinct from `_manager_system_prompt_content()`: the framing is
+    "operate an existing review", not "orchestrate ralphus itself" -- see
+    `_REVIEWER_ROLE_NOTE`. The full CLI help-map is still appended for
+    reference (flags/positionals for the commands named above, and anything
+    else the agent might need), same as the manager prompt.
+    """
+    # deferred: avoids a __main__ <-> helpmap import cycle
+    from ralphus.helpmap import generate
+
+    target_note = ""
+    if target:
+        selector = _parse_review_target(target)
+        target_note = (
+            f"\n\nInitial review target for this session: `{selector}`. Start by running "
+            f"`ralphus review show {selector}` to confirm it still resolves before acting on it."
+        )
+
+    return (
+        "You are Ralphus. The complete `ralphus` CLI command surface -- every subcommand, flag, "
+        "and expected value type -- is documented below for reference. Use `ralphus <command> "
+        "--help` for details on any specific command.\n\n"
+        + _REVIEWER_ROLE_NOTE
+        + target_note
+        + "\n\n"
+        + generate()
+    )
+
+
+def _quick_start_spawn_plan(
+    *, raw_command: str, extra_args: list[str], shell: str
+) -> tuple[str | list[str], bool, str]:
+    """Decide how to launch `raw_command` with `extra_args` (RAL-110/189).
+
+    Returns `(args, use_shell, mode)` -- the first two go straight to
+    `subprocess.run`, the third is a short label for logging. Three shapes,
+    in the order they're tried (see `ralphus.shellcmd`'s module docstring):
+
+    - ``script`` -- a bare name/path that resolves to a *file the OS cannot
+      exec* (`my-claude.ps1`, a non-`+x` `.sh`). Handed to `shell`, spelled
+      as the absolute path already resolved here -- PowerShell will not run
+      a current-directory `my-claude.ps1` typed without a leading `.\\`, so
+      resolving it here is what makes the bare name work.
+    - ``compound`` -- opaque shell syntax (`cd /foo/bar ; claude`). Passed to
+      `shell` verbatim with `extra_args` quoted for that shell and appended.
+    - ``exec`` -- everything else: a bare name/path that either resolves to a
+      directly-launchable image, or resolves to nothing at all. Run directly
+      with `extra_args` as real argv entries -- no shell, so no quoting can
+      go wrong. The unresolved case stays here rather than falling through to
+      a shell so that the plain `--command claude` path keeps its existing
+      behavior exactly: the OS does its own lookup, and a genuine miss still
+      surfaces as one clean "could not launch" error instead of a shell's.
+    """
+    if not is_compound_shell_command(raw_command):
+        program = unquote_path(raw_command)
+        found = shellcmd.find_program(program)
+        if found is not None and not shellcmd.is_directly_executable(found):
+            line = shellcmd.build_program_command_line(shell, found, extra_args)
+            args, use_shell = shellcmd.shell_spawn_args(shell, line)
+            return args, use_shell, "script"
+        return [found or program, *extra_args], False, "exec"
+
+    line = shellcmd.build_compound_command_line(shell, raw_command, extra_args)
+    args, use_shell = shellcmd.shell_spawn_args(shell, line)
+    return args, use_shell, "compound"
+
+
+def _run_quick_start_subprocess(
+    *, label: str, program_label: str, raw_command: str, extra_args: list[str], shell: str | None
+) -> int:
+    """Spawn `raw_command` (bare path, single-name script, or shell command line).
+
+    Shared tail end of every `quick-start manager|reviewer claude-code|codex`
+    command. `shell` is the `--shell` value: `None`/`"auto"` means "whatever
+    shell launched this `ralphus`", so a command line typed at a PowerShell
+    prompt is interpreted by PowerShell rather than a hardcoded `cmd /C`
+    (RAL-189). See `_quick_start_spawn_plan` for the three launch shapes.
+    """
+    target_shell = shellcmd.resolve_shell(shell)
+    args, use_shell, mode = _quick_start_spawn_plan(
+        raw_command=raw_command, extra_args=extra_args, shell=target_shell
+    )
+    print(
+        f"ralphus [runner] {label} spawning command={raw_command!r} "
+        f"mode={mode} shell={target_shell}",
+        file=sys.stderr,
+    )
+    try:
+        # `use_shell` is only ever True for cmd.exe on Windows, where it means
+        # exactly `%COMSPEC% /c <string>` -- see `shellcmd.shell_spawn_args`.
+        completed = (
+            subprocess.run(args, shell=True, check=False)
+            if use_shell
+            else subprocess.run(args, check=False)
+        )
+    except OSError as exc:
+        print(f"error: could not launch {program_label} ({raw_command!r}): {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"ralphus [runner] {label} exited returncode={completed.returncode}",
+        file=sys.stderr,
+    )
+    return completed.returncode
+
+
+def _launch_claude_quick_start(
+    *, label: str, system_prompt_content: str, args: argparse.Namespace
+) -> int:
+    """Launch Claude Code primed with `system_prompt_content` (RAL-110/166).
+
+    Writes the content to a throwaway temp file and points Claude Code at it
     via the dedicated `--append-system-prompt-file` flag, so the file's
     content becomes Claude Code's system prompt without hitting OS
     command-line length limits. Unlike the `--append-system-prompt @path`
@@ -4501,27 +5084,11 @@ def _cmd_quick_start_claude_code(args: argparse.Namespace) -> int:
     the user's) instead of forwarding a second, separate occurrence of the
     flag whose precedence would be undocumented.
     """
-    # deferred: avoids a __main__ <-> helpmap import cycle
-    from ralphus.helpmap import PROJECT_LOOKUP_NOTE, SUBAGENT_NOTE, SUBMIT_VALIDATE_NOTE, generate
-
-    help_map_file_content = (
-        "You are Ralphus. You orchestrate the `ralphus` CLI as an autonomous agent. Its "
-        "complete command surface -- every subcommand, flag, and expected value type -- is "
-        "documented below. Use `ralphus <command> --help` for details on any specific "
-        "command.\n\n"
-        + SUBAGENT_NOTE
-        + "\n\n"
-        + PROJECT_LOOKUP_NOTE
-        + "\n\n"
-        + SUBMIT_VALIDATE_NOTE
-        + "\n\n"
-        + generate()
-    )
     fd, tmp_path_str = tempfile.mkstemp(suffix=".md", prefix="ralphus-help-map-")
     tmp_path = Path(tmp_path_str)
     try:
-        passthrough = list(getattr(args, "claude_args", None) or [])
-        merged = _merge_append_system_prompt_file(help_map_file_content, passthrough)
+        passthrough = list(getattr(args, "agent_args", None) or [])
+        merged = _merge_append_system_prompt_file(system_prompt_content, passthrough)
         if merged is None:
             os.close(fd)
             return 2
@@ -4530,10 +5097,10 @@ def _cmd_quick_start_claude_code(args: argparse.Namespace) -> int:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(file_content)
 
-        case = "ralphus-only" if file_content == help_map_file_content else "ralphus+user-file"
+        case = "ralphus-only" if file_content == system_prompt_content else "ralphus+user-file"
         print(
-            f"ralphus [spec] quick-start-claude-code system-prompt case={case} "
-            f"ralphus_len={len(help_map_file_content)} combined_len={len(file_content)}",
+            f"ralphus [spec] {label} system-prompt case={case} "
+            f"ralphus_len={len(system_prompt_content)} combined_len={len(file_content)}",
             file=sys.stderr,
         )
 
@@ -4544,41 +5111,85 @@ def _cmd_quick_start_claude_code(args: argparse.Namespace) -> int:
             str(tmp_path),
             *passthrough,
         ]
-        compound = is_compound_shell_command(raw_command)
-        print(
-            f"ralphus [runner] quick-start-claude-code spawning command={raw_command!r} "
-            f"compound={compound}",
-            file=sys.stderr,
+        return _run_quick_start_subprocess(
+            label=label,
+            program_label="claude",
+            raw_command=raw_command,
+            extra_args=extra_args,
+            shell=_resolve_launch_shell(args),
         )
-
-        if compound:
-            # `raw_command` is opaque shell syntax (e.g. "cd foo bar ; ./claude") --
-            # let the platform shell interpret it, with our args appended to its tail.
-            tail = " ".join(_shell_quote(a) for a in extra_args)
-            completed = subprocess.run(f"{raw_command} {tail}", shell=True, check=False)
-        else:
-            program = unquote_path(raw_command)
-            # Resolve to a full path so a Windows shim (.cmd/.exe) is found reliably
-            # (same reasoning as claude_code_backend.py).
-            program = shutil.which(program) or program
-            try:
-                completed = subprocess.run([program, *extra_args], check=False)
-            except OSError as exc:
-                print(f"error: could not launch claude ({program!r}): {exc}", file=sys.stderr)
-                return 2
-        print(
-            f"ralphus [runner] quick-start-claude-code exited returncode={completed.returncode}",
-            file=sys.stderr,
-        )
-        return completed.returncode
     finally:
         with contextlib.suppress(OSError):
             tmp_path.unlink()
 
 
+def _launch_codex_quick_start(
+    *, label: str, developer_instructions: str, args: argparse.Namespace
+) -> int:
+    """Launch an interactive `codex` session primed with `developer_instructions` (RAL-166).
+
+    Codex has no file-based system-prompt injection (see `codex_backend.py`'s
+    module docstring) -- `-c developer_instructions=...` is the closest
+    analog, and it must precede any subcommand to be recognized by codex's
+    root arg parser. This quick-start launches the interactive TUI (not
+    `codex exec`), so there is no subcommand at all: the override is simply
+    a leading argument, followed by any forwarded `--` passthrough args.
+    """
+    passthrough = list(getattr(args, "agent_args", None) or [])
+    print(
+        f"ralphus [spec] {label} system-prompt len={len(developer_instructions)}",
+        file=sys.stderr,
+    )
+    raw_command = _resolve_codex_launch_command(args)
+    extra_args = ["-c", f"developer_instructions={developer_instructions}", *passthrough]
+    return _run_quick_start_subprocess(
+        label=label,
+        program_label="codex",
+        raw_command=raw_command,
+        extra_args=extra_args,
+        shell=_resolve_launch_shell(args),
+    )
+
+
+def _cmd_quick_start_manager_claude_code(args: argparse.Namespace) -> int:
+    """Launch Claude Code primed with the full ralphus CLI help-map (RAL-110/166)."""
+    return _launch_claude_quick_start(
+        label="quick-start-manager-claude-code",
+        system_prompt_content=_manager_system_prompt_content(),
+        args=args,
+    )
+
+
+def _cmd_quick_start_manager_codex(args: argparse.Namespace) -> int:
+    """Launch Codex primed with the full ralphus CLI help-map (RAL-166)."""
+    return _launch_codex_quick_start(
+        label="quick-start-manager-codex",
+        developer_instructions=_manager_system_prompt_content(),
+        args=args,
+    )
+
+
+def _cmd_quick_start_reviewer_claude_code(args: argparse.Namespace) -> int:
+    """Launch Claude Code primed with the review control surface (RAL-166)."""
+    return _launch_claude_quick_start(
+        label="quick-start-reviewer-claude-code",
+        system_prompt_content=_reviewer_system_prompt_content(getattr(args, "target", None)),
+        args=args,
+    )
+
+
+def _cmd_quick_start_reviewer_codex(args: argparse.Namespace) -> int:
+    """Launch Codex primed with the review control surface (RAL-166)."""
+    return _launch_codex_quick_start(
+        label="quick-start-reviewer-codex",
+        developer_instructions=_reviewer_system_prompt_content(getattr(args, "target", None)),
+        args=args,
+    )
+
+
 def _split_passthrough(raw_args: list[str]) -> tuple[list[str], list[str]]:
     """Split `raw_args` at the first bare `--`, but only for a `quick-start
-    claude-code` invocation -- that's the only subcommand with a `-- ARGS`
+    ...` invocation -- that's the only command family with a `-- ARGS`
     passthrough. Every other subcommand keeps argparse's own end-of-options
     handling of `--` untouched (splitting unconditionally would silently eat
     a value any subcommand escaped with the standard `--` idiom, e.g. `review
@@ -4596,20 +5207,47 @@ def _split_passthrough(raw_args: list[str]) -> tuple[list[str], list[str]]:
     return raw_args[:idx], raw_args[idx + 1 :]
 
 
+def _normalize_run_id_arg(args: argparse.Namespace) -> bool:
+    """Rewrite a RAL-188 URI passed as a bare `run_id` positional into the run
+    id the handler expects. Returns False (after printing) on a bad URI.
+
+    Done once here, at the single dispatch point, rather than in each of the
+    ~22 handlers that take a bare `run_id` (`run *`, `status`, `graph`) -- so
+    every one of them, including any added later, accepts the URI form for
+    free. A plain run id is left untouched and costs no extra request; only a
+    URI opens a client to resolve it.
+    """
+    raw = getattr(args, "run_id", None)
+    if not isinstance(raw, str) or not looks_like_uri(raw):
+        return True
+    with DaemonClient(args.daemon_url) as client:
+        try:
+            args.run_id = resolve_run_selector(client, raw).run_id
+        except SelectorError as exc:
+            _print_selector_error(exc, json_mode=getattr(args, "json", False))
+            return False
+        except DaemonError as exc:
+            _print_daemon_error(exc, json_mode=getattr(args, "json", False))
+            return False
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI. Returns a process exit code."""
     _ensure_utf8_streams()
     raw_args = list(argv) if argv is not None else sys.argv[1:]
-    ralphus_args, claude_args = _split_passthrough(raw_args)
+    ralphus_args, agent_args = _split_passthrough(raw_args)
     parser = build_parser()
     args = parser.parse_args(ralphus_args)
-    args.claude_args = claude_args
+    args.agent_args = agent_args
     func = getattr(args, "func", None)
     if func is None:
         parser.print_help()
         return 0
     subcommand = getattr(args, "command", func.__name__)
     print(f"ralphus [cli] {subcommand} {vars(args)}", file=sys.stderr)
+    if not _normalize_run_id_arg(args):
+        return 2
     exit_code: int = func(args)
     return exit_code
 

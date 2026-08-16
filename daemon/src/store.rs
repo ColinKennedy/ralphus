@@ -14,6 +14,8 @@ use ralphus_core::schema::{ResolvedAgent, TaskFile};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+use crate::runner::{effective_session_system_prompt, effective_verify_system_prompt};
+
 /// Errors the store can produce.
 #[derive(Debug)]
 pub enum StoreError {
@@ -192,6 +194,11 @@ pub struct VerifyView {
     pub output: Option<String>,
     /// The step definition: command text, prompt text, or empty for brain/approval.
     pub spec: String,
+    /// Read-only effective system prompt actually appended to this agent
+    /// invocation. Omitted for command/brain/approval kinds and for rows
+    /// created before RAL-180 first populated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<String>,
     /// Resolved agent program (inherited from the owning session or task defaults).
@@ -201,6 +208,12 @@ pub struct VerifyView {
     /// other agents or steps that have not yet run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    /// Input tokens used by this step's most recent run.
+    pub tokens_in: i64,
+    /// Output tokens used by this step's most recent run.
+    pub tokens_out: i64,
+    /// Cost of this step's most recent run, USD.
+    pub cost_usd: f64,
 }
 
 /// A session as shown in the board.
@@ -221,6 +234,11 @@ pub struct SessionView {
     pub prompt: Option<String>,
     /// Shell command, if a command session.
     pub command: Option<String>,
+    /// Read-only effective system prompt actually appended to this agent
+    /// invocation. Omitted for command sessions and for rows created before
+    /// RAL-180 first populated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Current state string.
     pub state: String,
     /// Input tokens recorded so far.
@@ -274,6 +292,13 @@ pub struct TaskView {
     /// present -- never `null` in the API response -- so a project filter
     /// facet has real data for every task.
     pub project: String,
+    /// Raw task-level agent value from the submitted TOML, if any. `None`
+    /// means the task left `agent` unset and sessions inherit further or fall
+    /// back to the built-in default.
+    pub agent: Option<String>,
+    /// Raw task-level model value from the submitted TOML, if any. `None`
+    /// means the task left `model` unset.
+    pub model: Option<String>,
     /// Current state string.
     pub state: String,
     /// Sessions in the task.
@@ -337,7 +362,12 @@ pub struct RunView {
     pub id: String,
     /// Optional human label.
     pub label: Option<String>,
-    /// Current run state string.
+    /// Current run state string. Not a raw passthrough of the `runs.state`
+    /// column — see [`effective_run_state`] — so this reflects whether the
+    /// run's children are actually doing something right now, even in the
+    /// window where a targeted verify/session restart has reset the column
+    /// to `pending` but the run's worker is still busy with unrelated
+    /// sibling sessions.
     pub state: String,
     /// Creation time (Unix epoch milliseconds).
     pub created_at_ms: i64,
@@ -410,6 +440,18 @@ pub struct ClearOutcome {
 /// The task store.
 pub struct Store {
     pub(crate) conn: Connection,
+    /// In-process SSE broadcast registry (RAL-167), fed by
+    /// [`Store::cartographer_log`]. See `crate::events`.
+    event_bus: crate::events::EventBus,
+    /// Liveness signal (RAL-170): last time fresh pane output was observed
+    /// for a running tmux-wrapped session, keyed by `crate::tmux::session_name`
+    /// (the same deterministic key used for task sessions, verify steps, and
+    /// Guardian resolver/manual-check sessions alike — see
+    /// [`Self::note_live_activity`]'s doc comment for why this is in-memory
+    /// only, not a DB column). Entries are removed once the owning
+    /// `run_via_tmux` call returns, so this stays bounded by the number of
+    /// *currently running* tmux-wrapped sessions, not lifetime history.
+    live_activity: HashMap<String, i64>,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -447,7 +489,11 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+        };
         store.init_schema()?;
         Ok(store)
     }
@@ -455,9 +501,20 @@ impl Store {
     /// Open an in-memory store (used by tests).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+        };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// The SSE broadcast registry (RAL-167) — subscribe from the `/api/events`
+    /// HTTP handler, published to automatically by [`Store::cartographer_log`].
+    #[must_use]
+    pub fn event_bus(&self) -> &crate::events::EventBus {
+        &self.event_bus
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -482,6 +539,8 @@ impl Store {
                 idx        INTEGER NOT NULL,
                 name       TEXT NOT NULL,
                 project    TEXT,
+                agent      TEXT,
+                model      TEXT,
                 state      TEXT NOT NULL,
                 depends_on TEXT NOT NULL DEFAULT '[]',
                 queue_rank REAL,
@@ -500,6 +559,7 @@ impl Store {
                 model      TEXT,
                 system_prompt          TEXT,
                 system_prompt_position TEXT,
+                effective_system_prompt TEXT,
                 state      TEXT NOT NULL,
                 depends_on TEXT NOT NULL DEFAULT '[]',
                 tokens_in  INTEGER NOT NULL DEFAULT 0,
@@ -513,6 +573,7 @@ impl Store {
                 maximum_budget_usd REAL,
                 upstream      TEXT,
                 queue_rank    REAL,
+                machine       TEXT,
                 PRIMARY KEY (run_id, task_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS verifies (
@@ -524,6 +585,7 @@ impl Store {
                 vid         TEXT,
                 kind        TEXT NOT NULL,
                 spec        TEXT NOT NULL,
+                effective_system_prompt TEXT,
                 model       TEXT,
                 agent       TEXT NOT NULL DEFAULT 'claude',
                 state       TEXT NOT NULL,
@@ -559,7 +621,8 @@ impl Store {
                 review_key        TEXT,
                 resolver_agent    TEXT,
                 resolver_model    TEXT,
-                verify_mid_resolution INTEGER NOT NULL DEFAULT 0,
+                verify_scope      TEXT,
+                verify_skip_auto_clean INTEGER,
                 created_at_ms     INTEGER NOT NULL,
                 updated_at_ms     INTEGER NOT NULL
             );
@@ -576,6 +639,7 @@ impl Store {
                 conflicts_found     INTEGER,
                 conflicts_fixed     INTEGER,
                 conflicts_committed INTEGER,
+                is_empty            INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (guardian_id, position)
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -621,6 +685,33 @@ impl Store {
                 path          TEXT NOT NULL,
                 vcs           TEXT NOT NULL DEFAULT 'git',
                 created_at_ms INTEGER NOT NULL
+            );
+            -- RAL-185: the machine provider registry. A machine value of the form
+            -- scheme:uri looks `scheme` up here to find the executable the daemon
+            -- runs; `uri` is opaque and handed to that executable verbatim.
+            -- Registration is an explicit admin action and is deliberately NOT
+            -- declarable in a task file -- see `crate::machines` for the reasoning
+            -- (a TOML that could both name and define an executable would make
+            -- submit equivalent to arbitrary code execution).
+            CREATE TABLE IF NOT EXISTS machine_providers (
+                scheme           TEXT PRIMARY KEY,
+                description      TEXT NOT NULL DEFAULT '',
+                program          TEXT NOT NULL,
+                args             TEXT NOT NULL DEFAULT '[]',
+                protocol_version INTEGER NOT NULL DEFAULT 1,
+                created_at_ms    INTEGER NOT NULL,
+                -- RAL-185 Q3: last explicit reachability probe. NULL until one
+                -- has run -- distinct from both reachable and unreachable, so
+                -- the board can say not-checked-yet rather than implying a
+                -- machine is fine or broken on no evidence.
+                last_check_ms    INTEGER,
+                last_check_ok    INTEGER,
+                last_check_note  TEXT,
+                -- RAL-185 D7: whether this provider implements the `channel`
+                -- verb (one long-lived process, many commands) instead of being
+                -- spawned per command. Opt-in; a provider that does not is used
+                -- exactly as before.
+                supports_channel INTEGER NOT NULL DEFAULT 0
             );
             -- RAL-117: a durable, mutable mapping from a guardian's worktree(s) to
             -- the pull request(s) submitted for it. `branch_id` is NULL for a
@@ -691,6 +782,7 @@ impl Store {
                 run_id        TEXT REFERENCES runs(id) ON DELETE CASCADE,
                 guardian_id   TEXT REFERENCES guardians(id) ON DELETE CASCADE,
                 content       TEXT NOT NULL,
+                user_note     TEXT,
                 revision      TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
@@ -741,6 +833,11 @@ impl Store {
             "ALTER TABLE guardian_branches ADD COLUMN project TEXT",
             "ALTER TABLE verifies ADD COLUMN model TEXT",
             "ALTER TABLE verifies ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
+            // Raw task-level agent/model values used by the board to show
+            // whether child resolved values were inherited from the task
+            // rather than set explicitly at the child level (RAL-82).
+            "ALTER TABLE tasks ADD COLUMN agent TEXT",
+            "ALTER TABLE tasks ADD COLUMN model TEXT",
             "ALTER TABLE sessions ADD COLUMN review_branch TEXT",
             "ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER",
             "ALTER TABLE sessions ADD COLUMN budget_tokens INTEGER",
@@ -820,6 +917,44 @@ impl Store {
             // JSON map of {input_name: value}; a value here becomes the new
             // default the next time that check is viewed.
             "ALTER TABLE guardians ADD COLUMN input_values TEXT NOT NULL DEFAULT '{}'",
+            // RAL-168: per-review override of the "Verify" scope -- one of
+            // "each_branch"/"final_branch"/"nothing". NULL means "inherit the
+            // project-level .ralphus.toml [review] verify_scope default"
+            // (same nullable-override pattern as resolver_agent/resolver_model
+            // above), resolved at hydration time into `effective_verify_scope`.
+            "ALTER TABLE guardians ADD COLUMN verify_scope TEXT",
+            // RAL-168: per-review override of the "each_branch" auto-clean-skip
+            // sub-option. NULL means "inherit the project-level default".
+            "ALTER TABLE guardians ADD COLUMN verify_skip_auto_clean INTEGER",
+            // RAL-185: the machine this review's worktrees and merge run on.
+            // NULL means the daemon's own host, which is every pre-RAL-185 row.
+            "ALTER TABLE guardians ADD COLUMN machine TEXT",
+            // Verify steps never recorded their own token/cost usage -- only
+            // sessions did -- so a `prompt`/`command`-kind verify step's LLM
+            // spend was silently discarded instead of being shown in the
+            // board or folded into a lifetime cost total.
+            "ALTER TABLE verifies ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE verifies ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE verifies ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
+            // RAL-180: persist the effective read-only system prompt the board
+            // shows in the details pane, separate from a session's authored
+            // `system_prompt` config so re-runs don't accidentally re-synthesise
+            // from already-expanded text.
+            "ALTER TABLE sessions ADD COLUMN effective_system_prompt TEXT",
+            "ALTER TABLE verifies ADD COLUMN effective_system_prompt TEXT",
+            // RAL-185: the resolved machine a session/verify runs on. NULL means
+            // the daemon's own host, which is what every pre-RAL-185 row is.
+            // RAL-190: a branch that contributes no diff over the stack tip
+            // below it. Almost always means its task never committed, so the
+            // review would otherwise look healthy while containing nothing.
+            "ALTER TABLE guardian_branches ADD COLUMN is_empty INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN machine TEXT",
+            "ALTER TABLE verifies ADD COLUMN machine TEXT",
+            // RAL-174: free-form text a human attaches to a restart via the
+            // board's restart popup. Kept separate from `content` so it can be
+            // overwritten on every restart instead of merged/accumulated --
+            // see `ghost::Store::set_ghost_user_note`.
+            "ALTER TABLE ghosts ADD COLUMN user_note TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -924,6 +1059,30 @@ impl Store {
                 .conn
                 .execute("ALTER TABLE guardians DROP COLUMN skip_checks", []);
         }
+        // RAL-168: `verify_mid_resolution` is retired -- replaced outright by
+        // `verify_scope`/`verify_skip_auto_clean` above, not mapped forward
+        // (its old meaning -- also run quality-bar checks during the fix pass
+        // -- no longer exists now that the fix pass never runs them; see
+        // `resolve_conflicts_with_agent` in `guardian_merge.rs`). No backfill
+        // needed: every existing review simply gets the new columns' default
+        // "inherit the project default" (NULL), which resolves to
+        // "each_branch" -- the documented AC that existing reviews preserve
+        // today's default verify behavior. Same guard-on-column-existing
+        // idiom as the `skip_checks` block above, so the DROP runs exactly once.
+        let has_old_verify_mid_resolution = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('guardians') WHERE name='verify_mid_resolution'",
+            )
+            .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+            .unwrap_or(None)
+            .is_some();
+        if has_old_verify_mid_resolution {
+            let _ = self.conn.execute(
+                "ALTER TABLE guardians DROP COLUMN verify_mid_resolution",
+                [],
+            );
+        }
         // RAL-122: one-time backfill of `guardian_branches.id` for any row
         // created before this change -- naturally idempotent, since the
         // `WHERE id IS NULL` filter makes it a no-op once every row has one.
@@ -1000,6 +1159,33 @@ impl Store {
         hold: bool,
     ) -> Result<String> {
         let run_id = self.next_run_id()?;
+        self.insert_run_with_id(&run_id, file, label, hold)?;
+        Ok(run_id)
+    }
+
+    /// Shared implementation behind [`Self::insert_run`], taking `run_id` as
+    /// a parameter instead of always minting a fresh one — lets a test
+    /// supply its own caller-chosen id (RAL-177) instead of the store's
+    /// deterministic sequential one. A fresh in-memory `Store` always
+    /// assigns the same first id (`run-000000000001`), which is identical
+    /// across every worktree's identical test — fine for a DB-only
+    /// assertion, but a collision risk for a live-tmux test whose fixture
+    /// run_id also seeds a *real*, machine-wide tmux session name
+    /// (`ralphus_{run_id}_...`) or feeds a prefix-scoped kill
+    /// (`kill_run_tmux_sessions`/`kill_guardian_tmux_sessions` in
+    /// `server.rs`) against the same shared psmux server. Letting such a
+    /// test supply its own per-process-unique id (see
+    /// `crate::tmux::unique_test_tag`) closes that gap without touching the
+    /// production id-assignment path or any of `insert_run`'s existing
+    /// callers. `pub(crate)`, not `pub`, since only this crate's own tests
+    /// need direct access to the id.
+    pub(crate) fn insert_run_with_id(
+        &mut self,
+        run_id: &str,
+        file: &TaskFile,
+        label: Option<&str>,
+        hold: bool,
+    ) -> Result<()> {
         let now = now_ms();
         let state = if hold {
             RunState::Queued
@@ -1021,15 +1207,23 @@ impl Store {
         for (t_idx, task) in file.task.iter().enumerate() {
             let t_idx_i = i64::try_from(t_idx).unwrap_or(0);
             tx.execute(
-                "INSERT INTO tasks(run_id, idx, name, project, state, depends_on, queue_rank) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO tasks(run_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 params![
                     run_id,
                     t_idx_i,
                     task.name,
                     task.project,
+                    task.agent,
+                    task.model,
                     NodeState::Pending.as_str(),
                     to_json(&task.depends_on),
                     task.priority.map(f64::from),
+                    // RAL-172: TOML-declared `environment` seeds this task's
+                    // row in the same hierarchical env-override store a
+                    // later `POST /api/runs/{id}/tasks/{ti}/env` call would
+                    // write to (RAL-150) -- from here on the two are
+                    // indistinguishable.
+                    to_json_map(&task.environment),
                 ],
             )?;
 
@@ -1046,9 +1240,15 @@ impl Store {
                 let budget_tokens = resolve_budget(session.budget_tokens, task.budget_tokens);
                 let maximum_budget_usd =
                     resolve_maximum_budget_usd(session.maximum_budget_usd, task.maximum_budget_usd);
+                let effective_system_prompt = session.prompt.as_ref().map(|_| {
+                    effective_session_system_prompt(
+                        session.system_prompt.as_deref(),
+                        &session.subprojects,
+                    )
+                });
                 tx.execute(
-                    "INSERT INTO sessions(run_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, upstream, queue_rank)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO sessions(run_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, upstream, queue_rank, env_overrides, machine)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         run_id,
                         t_idx_i,
@@ -1063,6 +1263,7 @@ impl Store {
                         resolved.model,
                         session.system_prompt,
                         session.system_prompt_position,
+                        effective_system_prompt,
                         NodeState::Pending.as_str(),
                         to_json(&session.depends_on),
                         timeout_sec,
@@ -1073,13 +1274,21 @@ impl Store {
                         // the owning task's priority as a fallback, so a task-level
                         // `priority` nudges all its sessions' starting position.
                         session.priority.or(task.priority).map(f64::from),
+                        // RAL-172: same seeding as the task's own `env_overrides`
+                        // above, scoped to this session -- merges on top of the
+                        // task's/run's via `Store::resolve_session_env_overrides`.
+                        to_json_map(&session.environment),
+                        // RAL-185: resolved once at submit so the scheduler never
+                        // has to re-derive inheritance, and so a later edit to the
+                        // task file can't silently move an in-flight run's machine.
+                        ralphus_core::schema::resolve_session_machine(task, session),
                     ],
                 )?;
 
                 for (v_idx, v) in session.verify.iter().enumerate() {
                     insert_verify(
                         &tx,
-                        &run_id,
+                        run_id,
                         t_idx_i,
                         "session",
                         i64::try_from(s_idx).unwrap_or(0),
@@ -1103,7 +1312,7 @@ impl Store {
             for (v_idx, v) in task.verify.iter().enumerate() {
                 insert_verify(
                     &tx,
-                    &run_id,
+                    run_id,
                     t_idx_i,
                     "task",
                     -1,
@@ -1127,13 +1336,13 @@ impl Store {
             source: "submit",
             message: "run inserted",
             scope: Some("run"),
-            run_id: Some(&run_id),
+            run_id: Some(run_id),
             guardian_id: None,
             session_id: None,
             task: None,
             payload: serde_json::json!({"state": state.as_str(), "tasks": file.task.len()}),
         });
-        Ok(run_id)
+        Ok(())
     }
 
     /// Append an entry to the execution/transition log (CCTL-99). Failures to
@@ -1696,7 +1905,7 @@ impl Store {
         env_overrides: BTreeMap<String, String>,
     ) -> Result<RunView> {
         let mut tstmt = self.conn.prepare(
-            "SELECT idx, name, project, state, depends_on, env_overrides, verify_env_overrides, soloed
+            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, verify_env_overrides, soloed
              FROM tasks WHERE run_id=? ORDER BY idx",
         )?;
         let task_rows = tstmt
@@ -1705,11 +1914,13 @@ impl Store {
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
-                    r.get::<_, bool>(7)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, bool>(9)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1718,7 +1929,9 @@ impl Store {
         // whose review branch is in a guardian's stack lists that review (RAL-17).
         let review_by_branch = self.reviews_by_branch(&id)?;
         let mut tasks = Vec::with_capacity(task_rows.len());
-        for (t_idx, name, project, tstate, deps, task_env, task_verify_env, soloed) in task_rows {
+        for (t_idx, name, project, agent, model, tstate, deps, task_env, task_verify_env, soloed) in
+            task_rows
+        {
             let sessions = self.sessions_for(&id, t_idx, &review_by_branch)?;
             let project = project.unwrap_or_else(|| {
                 fallback_project_identifier(sessions.first().and_then(|s| s.cwd.as_deref()))
@@ -1726,6 +1939,8 @@ impl Store {
             tasks.push(TaskView {
                 name,
                 project,
+                agent,
+                model,
                 state: tstate,
                 sessions,
                 verify: self.verifies_for(&id, t_idx, "task", -1)?,
@@ -1737,6 +1952,7 @@ impl Store {
         }
 
         let reviews = self.reviews_for_run(&id)?;
+        let state = effective_run_state(&self.conn, state, &id)?;
         Ok(RunView {
             id,
             label,
@@ -1776,11 +1992,11 @@ impl Store {
         // session's own verify steps — `verifies_for` re-borrows `self.conn`.
         let mut rows: Vec<(i64, SessionView)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, verify_env_overrides
+                "SELECT idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, verify_env_overrides
                  FROM sessions WHERE run_id=? AND task_idx=? ORDER BY idx",
             )?;
             stmt.query_map(params![run_id, task_idx], |r| {
-                let review_branch: Option<String> = r.get(14)?;
+                let review_branch: Option<String> = r.get(15)?;
                 let reviews = review_branch
                     .and_then(|b| review_by_branch.get(&b).cloned())
                     .unwrap_or_default();
@@ -1796,16 +2012,17 @@ impl Store {
                         tokens_in: r.get::<_, i64>(7)?,
                         tokens_out: r.get::<_, i64>(8)?,
                         cost_usd: r.get::<_, f64>(9)?,
-                        maximum_budget_usd: r.get::<_, Option<f64>>(16)?,
                         error: r.get::<_, Option<String>>(10)?,
                         prompt: r.get::<_, Option<String>>(11)?,
                         command: r.get::<_, Option<String>>(12)?,
-                        depends_on: from_json(&r.get::<_, String>(13)?),
+                        system_prompt: r.get::<_, Option<String>>(13)?,
+                        depends_on: from_json(&r.get::<_, String>(14)?),
                         verify: Vec::new(),
                         reviews,
-                        agent_session_id: r.get::<_, Option<String>>(15)?,
-                        env_overrides: from_json_map(&r.get::<_, String>(17)?),
-                        verify_env_overrides: from_json_map(&r.get::<_, String>(18)?),
+                        agent_session_id: r.get::<_, Option<String>>(16)?,
+                        maximum_budget_usd: r.get::<_, Option<f64>>(17)?,
+                        env_overrides: from_json_map(&r.get::<_, String>(18)?),
+                        verify_env_overrides: from_json_map(&r.get::<_, String>(19)?),
                     },
                 ))
             })?
@@ -1865,7 +2082,7 @@ impl Store {
         session_idx: i64,
     ) -> Result<Vec<VerifyView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, model, agent, agent_session_id FROM verifies
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd FROM verifies
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -1876,9 +2093,13 @@ impl Store {
                     state: r.get::<_, String>(2)?,
                     output: r.get::<_, Option<String>>(3)?,
                     spec: r.get::<_, String>(4)?,
-                    model: r.get::<_, Option<String>>(5)?,
-                    agent: r.get::<_, String>(6)?,
-                    agent_session_id: r.get::<_, Option<String>>(7)?,
+                    system_prompt: r.get::<_, Option<String>>(5)?,
+                    model: r.get::<_, Option<String>>(6)?,
+                    agent: r.get::<_, String>(7)?,
+                    agent_session_id: r.get::<_, Option<String>>(8)?,
+                    tokens_in: r.get::<_, i64>(9)?,
+                    tokens_out: r.get::<_, i64>(10)?,
+                    cost_usd: r.get::<_, f64>(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2012,6 +2233,40 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Persist the effective read-only system prompt shown for a session in
+    /// the board details pane.
+    pub fn set_session_effective_system_prompt(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        idx: i64,
+        system_prompt: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET effective_system_prompt=? WHERE run_id=? AND task_idx=? AND idx=?",
+            params![system_prompt, run_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the effective read-only system prompt shown for a verify step in
+    /// the board details pane.
+    pub fn set_verify_effective_system_prompt(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        scope: &str,
+        session_idx: i64,
+        idx: i64,
+        system_prompt: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE verifies SET effective_system_prompt=? WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+            params![system_prompt, run_id, task_idx, scope, session_idx, idx],
+        )?;
+        Ok(())
+    }
 }
 
 /// Levenshtein edit distance between two strings (byte-oriented; inputs here
@@ -2060,6 +2315,64 @@ fn effective_session_state(raw: &str, verify: &[VerifyView]) -> String {
         return "running".to_string();
     }
     raw.to_string()
+}
+
+/// The state shown for a run in the board API/UI (see [`STATUS_ISSUE.local.md`]
+/// for the full writeup of the bug this fixes).
+///
+/// `runs.state == "pending"` is overloaded. For a fresh submission it means
+/// exactly what it says: nothing has been claimed yet. But
+/// `Store::restart_session_verify`/`restart_task_verify`/`restart_session`
+/// also write the run back to `pending` purely as a "reclaim me on the next
+/// tick" signal to `scheduler::claim_ready` — and, when the run's worker
+/// thread is still alive driving *other*, unrelated sessions (deliberately
+/// left alone rather than cancelled, precisely so an unrelated sibling isn't
+/// interrupted — see `claim_ready`'s doc comment), that worker won't discover
+/// the restarted target until it finishes everything else and a fresh worker
+/// re-claims the run. During that whole window the persisted column reads
+/// `pending` even though the run plainly has live children.
+///
+/// This mirrors [`effective_session_state`] one level up: fold the run's
+/// children's real state back in for display, without touching the
+/// `runs.state` column the scheduler itself reads via `list_ready`/
+/// `claim_ready`. Unlike the board's client-side `isDowntimeWaiting`
+/// relabeling (a purely cosmetic pill swap — that run truly has no live
+/// children, so filters/menus deliberately keep using the raw `pending`),
+/// this run *does* have something genuinely in flight, so the correction
+/// is real, not cosmetic, and is applied here so every consumer (CLI, board
+/// filters/menus, `/api/runs`) sees the same corrected value.
+///
+/// Deliberately queries the raw `sessions`/`verifies` columns rather than
+/// scanning the already-built [`TaskView`]s: [`effective_session_state`]
+/// folds a "done, verify still pending" session's *displayed* state to
+/// `"running"` too (meaning "not fully resolved", not "currently
+/// executing") — reusing that folded value here would fire for the ordinary,
+/// no-live-worker restart case as well (nothing is actually executing, a
+/// verify is merely queued), which is exactly [`Self::restart_session_verify`]'s
+/// own steady-state right after a restart. Only a literal raw `running` row
+/// means an agent process is genuinely executing right now.
+fn effective_run_state(conn: &Connection, raw: String, run_id: &str) -> Result<String> {
+    if raw != "pending" {
+        return Ok(raw);
+    }
+    let running_sessions: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE run_id=? AND state='running'",
+        params![run_id],
+        |r| r.get(0),
+    )?;
+    if running_sessions > 0 {
+        return Ok("running".to_string());
+    }
+    let running_verifies: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM verifies WHERE run_id=? AND state='running'",
+        params![run_id],
+        |r| r.get(0),
+    )?;
+    Ok(if running_verifies > 0 {
+        "running".to_string()
+    } else {
+        raw
+    })
 }
 
 /// Fallback project identifier for a task whose TOML left `project` unset
@@ -2121,9 +2434,14 @@ fn insert_verify(
     };
     let timeout_sec = resolve_timeout_sec(v.timeout_minutes, task.timeout_minutes);
     let budget_tokens = resolve_budget(v.budget_tokens, task.budget_tokens);
+    let effective_system_prompt = if kind == "prompt" {
+        Some(effective_verify_system_prompt(None))
+    } else {
+        None
+    };
     tx.execute(
-        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, model, agent, state, timeout_sec, budget_tokens)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             run_id,
             task_idx,
@@ -2133,6 +2451,7 @@ fn insert_verify(
             v.id,
             kind,
             spec,
+            effective_system_prompt,
             v.model,
             agent,
             NodeState::Pending.as_str(),
@@ -2190,6 +2509,12 @@ pub struct SessionRow {
     /// scheduler rebases this session's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
     pub upstream: Option<String>,
+    /// The resolved machine this session runs on (RAL-185), as authored --
+    /// e.g. `"incredibuild:A"`. `None` means the daemon's own host, which is
+    /// every pre-RAL-185 row and every session that never declared one.
+    /// Resolved at submit so a later edit to the task file cannot move an
+    /// in-flight run's machine.
+    pub machine: Option<String>,
 }
 
 /// Editable session definition fields (from the details pane).
@@ -2288,7 +2613,7 @@ impl Store {
     /// All sessions of a run, in insertion order.
     pub fn sessions_of(&self, run_id: &str) -> Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine
              FROM sessions s JOIN tasks t ON t.run_id = s.run_id AND t.idx = s.task_idx
              WHERE s.run_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -2315,6 +2640,7 @@ impl Store {
                     budget_tokens: r.get(14)?,
                     upstream: r.get(15)?,
                     maximum_budget_usd: r.get(16)?,
+                    machine: r.get(17)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2564,6 +2890,9 @@ impl Store {
         state: NodeState,
         output: &str,
         agent_session_id: Option<&str>,
+        tokens_in: i64,
+        tokens_out: i64,
+        cost_usd: f64,
     ) -> Result<()> {
         // Query old state and vid together before the UPDATE so we have both for
         // logging (vid doesn't change, but reading it before avoids a second round trip).
@@ -2579,12 +2908,15 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE verifies SET state=?, output=?, agent_session_id=?
+            "UPDATE verifies SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cost_usd=?
              WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
                 output,
                 agent_session_id,
+                tokens_in,
+                tokens_out,
+                cost_usd,
                 run_id,
                 task_idx,
                 scope,
@@ -2654,8 +2986,27 @@ impl Store {
         idx: i64,
         edit: &SessionEdit<'_>,
     ) -> Result<()> {
+        let (subprojects, authored_system_prompt): (Vec<String>, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT subprojects, system_prompt FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, idx],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?
+                            .map(|raw| from_json(&raw))
+                            .unwrap_or_default(),
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let effective_system_prompt = edit.prompt.as_ref().map(|_| {
+            effective_session_system_prompt(authored_system_prompt.as_deref(), &subprojects)
+        });
         let n = self.conn.execute(
-            "UPDATE sessions SET cwd=?, agent=?, model=?, prompt=?, command=?
+            "UPDATE sessions SET cwd=?, agent=?, model=?, prompt=?, command=?, effective_system_prompt=?
              WHERE run_id=? AND task_idx=? AND idx=?",
             params![
                 edit.cwd,
@@ -2663,6 +3014,7 @@ impl Store {
                 edit.model,
                 edit.prompt,
                 edit.command,
+                effective_system_prompt,
                 run_id,
                 task_idx,
                 idx
@@ -3108,6 +3460,50 @@ impl Store {
         Ok(rows)
     }
 
+    /// The `(task_idx, idx)` of every session left `cancelled` — e.g. by a
+    /// run-level [`Store::cancel`], which flips every non-terminal session to
+    /// `cancelled` via `cancel_nonterminal_nodes`. The scheduler seeds these as
+    /// terminally Cancelled (never re-dispatched), for exactly the same reason
+    /// [`Store::failed_sessions`] exists: a *scoped* `restart_session` resets
+    /// only its own target + downstream to `pending`, yet still flips the whole
+    /// run back to `pending` so the scheduler reactivates it — without this
+    /// seed, every unrelated `cancelled` sibling in the run silently fell
+    /// through to `Pending` and was redispatched (RAL-185).
+    ///
+    /// A session genuinely revived by a restart (directly, or as downstream of
+    /// a restarted upstream) is already `pending` in the DB by the time this
+    /// runs, so it is excluded here and runs normally. A whole-run
+    /// [`Store::restart_run`] resets *every* session via
+    /// [`Store::reset_run_to_pending`], so this returns nothing for that path.
+    pub fn cancelled_sessions(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT task_idx, idx FROM sessions WHERE run_id=? AND state='cancelled'")?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The `idx` of every task left `cancelled` (companion to
+    /// [`Store::cancelled_sessions`] — `cancel_nonterminal_nodes` cancels
+    /// tasks, sessions *and* verifies together). The scheduler pre-marks these
+    /// as finalized so no task finalizer launches for them: without it, seeding
+    /// a cancelled task's sessions as terminal would make the dispatcher's
+    /// "all sessions terminal" check fire, run that task's verify steps, and
+    /// flip a task you explicitly cancelled to Done (RAL-185).
+    pub fn cancelled_tasks(&self, run_id: &str) -> Result<HashSet<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idx FROM tasks WHERE run_id=? AND state='cancelled'")?;
+        let rows = stmt
+            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Compute everything [`Store::restart_run`] would dirty, without mutating
     /// anything: every session/task in the run (a whole-run restart resets all
     /// of them) plus every run transitively dependent on it. Shared by the
@@ -3436,6 +3832,76 @@ impl Store {
         );
         self.apply_dirty_dependents(&impact.dirtied_runs)?;
         Ok(impact.dirtied_runs.into_iter().map(|r| r.id).collect())
+    }
+
+    /// Session `(task_idx, idx)` pairs forward-reachable from `roots` within
+    /// `run_id`'s dependency plan (RAL-174: the "Apply To All Children"
+    /// restart-note checkbox) -- the same reachability rule as
+    /// [`Store::compute_session_restart_impact`]'s BFS, kept as a separate,
+    /// smaller helper since that function's result shape
+    /// (`RestartImpactSession`, carrying task name/session id for display)
+    /// doesn't fit this call site's need for bare index pairs.
+    fn forward_reachable_session_indices(
+        &self,
+        run_id: &str,
+        roots: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>> {
+        let sessions = self.sessions_of(run_id)?;
+        let tasks = self.tasks_of(run_id)?;
+        let plan = crate::plan::plan(&sessions, &tasks).map_err(StoreError::InvalidTransition)?;
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+        for (j, prereqs) in plan.deps.iter().enumerate() {
+            for &p in prereqs {
+                children[p].push(j);
+            }
+        }
+        let mut affected: HashSet<usize> = HashSet::new();
+        let mut frontier = Vec::new();
+        for (pos, s) in sessions.iter().enumerate() {
+            if roots.contains(&(s.task_idx, s.idx)) && affected.insert(pos) {
+                frontier.push(pos);
+            }
+        }
+        while let Some(cur) = frontier.pop() {
+            for &c in &children[cur] {
+                if affected.insert(c) {
+                    frontier.push(c);
+                }
+            }
+        }
+        Ok(affected
+            .into_iter()
+            .map(|pos| (sessions[pos].task_idx, sessions[pos].idx))
+            .collect())
+    }
+
+    /// Write a human-authored restart note (RAL-174) onto the ghost(s) of the
+    /// session(s) a restart request targets. Unlike agent-authored ghost
+    /// content, this note *replaces* rather than merges with whatever was
+    /// previously stored for that owner (Q5 of the ticket's interview: no
+    /// accumulation across restarts) -- see [`Store::set_ghost_user_note`].
+    /// `roots` are the session(s) the restart directly targets; when
+    /// `include_downstream` is set (the "Apply To All Children" checkbox),
+    /// the note is also written to every session downstream of a root within
+    /// the run's dependency graph -- the same "children" a restart's
+    /// downstream-impact cascade already resets to Pending.
+    pub fn apply_restart_user_note(
+        &self,
+        run_id: &str,
+        roots: &[(i64, i64)],
+        include_downstream: bool,
+        note: &str,
+    ) -> Result<()> {
+        let targets = if include_downstream {
+            self.forward_reachable_session_indices(run_id, roots)?
+        } else {
+            roots.to_vec()
+        };
+        for (task_idx, idx) in targets {
+            let uri = crate::ghost::session_uri(run_id, task_idx, idx);
+            self.set_ghost_user_note(&uri, crate::ghost::KIND_SESSION, Some(run_id), None, note)?;
+        }
+        Ok(())
     }
 
     /// Read-only BFS over cross-run dependencies: every run transitively
@@ -3812,6 +4278,48 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Record that fresh pane output was just observed for the tmux-wrapped
+    /// session named `session_name` (RAL-170) — the liveness signal behind
+    /// the Live View's "last activity" timestamp. Called from
+    /// `SubprocessRunner::run_via_tmux_attempt`'s poll loop every time a
+    /// pane capture shows more lines than the previous poll, i.e. it
+    /// piggybacks on work the daemon already does continuously for every
+    /// running tmux-wrapped session (task session, verify step, or Guardian
+    /// resolver/manual-check alike — all share the same deterministic
+    /// `crate::tmux::session_name` key), rather than being computed only
+    /// when a Live View happens to be open.
+    ///
+    /// Deliberately **in-memory only, never a DB column**: at the existing
+    /// 500ms tmux-poll cadence, a SQLite `UPDATE` per session per tick would
+    /// scale with concurrently-running sessions (fine at "hundreds", a real
+    /// contention/write-amplification risk at "thousands" sharing the one
+    /// `Store` mutex) for a value nobody needs once the process exits. A
+    /// plain in-process `HashMap` entry costs a pointer-sized insert instead
+    /// of a WAL write, and [`Self::clear_live_activity`] removes it as soon
+    /// as the owning `run_via_tmux` call returns, so memory stays bounded by
+    /// *currently running* sessions rather than growing across the daemon's
+    /// lifetime.
+    pub fn note_live_activity(&mut self, session_name: &str, at_ms: i64) {
+        self.live_activity.insert(session_name.to_string(), at_ms);
+    }
+
+    /// The last time [`Self::note_live_activity`] was called for
+    /// `session_name`, in Unix epoch milliseconds — `None` if the session
+    /// has never produced pane growth (fresh session, no output yet) or has
+    /// already ended (see [`Self::clear_live_activity`]).
+    pub fn live_activity_ms(&self, session_name: &str) -> Option<i64> {
+        self.live_activity.get(session_name).copied()
+    }
+
+    /// Drop the liveness entry for `session_name` once its owning
+    /// `run_via_tmux` call has returned for good (not on an intermediate
+    /// reattach kill — see the call site's doc comment). Best-effort: a
+    /// missing entry (session never produced output, or was already
+    /// cleared) is not an error.
+    pub fn clear_live_activity(&mut self, session_name: &str) {
+        self.live_activity.remove(session_name);
     }
 
     /// Fetch a task's first (lowest-`idx`) session's cwd — the cwd a
@@ -4793,7 +5301,11 @@ command = "cargo test"
         )
         .expect("insert legacy guardian_branches row");
 
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+        };
         store
             .init_schema()
             .expect("migration must succeed against a legacy schema");
@@ -4860,6 +5372,46 @@ command = "cargo test"
     }
 
     #[test]
+    fn migration_adds_nullable_task_agent_and_model_columns() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                run_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                project TEXT,
+                state TEXT NOT NULL,
+                depends_on TEXT NOT NULL DEFAULT '[]',
+                queue_rank REAL,
+                PRIMARY KEY (run_id, idx)
+             );
+             INSERT INTO tasks (run_id, idx, name, project, state, depends_on, queue_rank)
+             VALUES ('r1', 0, 'build', NULL, 'pending', '[]', NULL);",
+        )
+        .expect("create legacy tasks table");
+
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+        };
+        store
+            .init_schema()
+            .expect("migration must add raw task agent/model columns");
+
+        let (agent, model): (Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT agent, model FROM tasks WHERE run_id='r1' AND idx=0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("task row must survive migration with new nullable columns");
+        assert!(agent.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
     fn insert_and_fetch_run() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
@@ -4875,19 +5427,68 @@ command = "cargo test"
         assert_eq!(task.name, "build");
         // No `project` set in TOML -> falls back to the cwd basename (RAL-141).
         assert_eq!(task.project, "repo");
+        assert!(task.agent.is_none());
+        assert!(task.model.is_none());
         assert_eq!(task.sessions.len(), 1);
         assert_eq!(task.sessions[0].id, "worker");
         assert_eq!(task.sessions[0].agent, "claude");
         assert_eq!(task.sessions[0].state, "pending");
+        assert!(
+            task.sessions[0]
+                .system_prompt
+                .as_deref()
+                .is_some_and(|sp| sp.contains("non-interactive session")),
+            "prompt sessions should expose their effective system prompt"
+        );
         // session-level verify is exposed per session in the board view
         assert_eq!(task.sessions[0].verify.len(), 1);
         assert_eq!(task.sessions[0].verify[0].id.as_deref(), Some("fmt"));
         assert_eq!(task.sessions[0].verify[0].kind, "command");
         assert_eq!(task.sessions[0].verify[0].spec, "cargo fmt --check");
         assert!(task.sessions[0].verify[0].model.is_none());
+        assert!(task.sessions[0].verify[0].system_prompt.is_none());
         assert_eq!(task.verify.len(), 1); // task-level verify
         assert_eq!(task.verify[0].kind, "command");
         assert_eq!(task.verify[0].spec, "cargo test");
+        assert!(task.verify[0].system_prompt.is_none());
+    }
+
+    #[test]
+    fn prompt_verifies_expose_effective_system_prompt() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.session]]
+id = "worker"
+cwd = "/repo"
+prompt = "make it build"
+[[task.session.verify]]
+id = "session-check"
+prompt = "confirm formatting"
+[[task.verify]]
+id = "task-check"
+prompt = "confirm tests"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_run(&parse(src), Some("prompt verify"), false)
+            .unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        let session_verify = &run.tasks[0].sessions[0].verify[0];
+        let task_verify = &run.tasks[0].verify[0];
+        assert!(
+            session_verify
+                .system_prompt
+                .as_deref()
+                .is_some_and(|sp| sp.contains("VERIFICATION step"))
+        );
+        assert!(
+            task_verify
+                .system_prompt
+                .as_deref()
+                .is_some_and(|sp| sp.contains("VERIFICATION step"))
+        );
     }
 
     #[test]
@@ -4904,6 +5505,28 @@ prompt = "go"
         let id = store.insert_run(&parse(src), None, false).unwrap();
         let run = store.get_run(&id).unwrap();
         assert_eq!(run.tasks[0].project, "myrepo");
+    }
+
+    #[test]
+    fn task_view_preserves_raw_task_agent_and_model() {
+        let src = r#"
+[[task]]
+name = "build"
+agent = "codex"
+model = "gpt-5-codex"
+[[task.session]]
+id = "worker"
+cwd = "/repo"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(src), None, false).unwrap();
+        let run = store.get_run(&id).unwrap();
+        let task = &run.tasks[0];
+        assert_eq!(task.agent.as_deref(), Some("codex"));
+        assert_eq!(task.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(task.sessions[0].agent, "codex");
+        assert_eq!(task.sessions[0].model.as_deref(), Some("gpt-5-codex"));
     }
 
     #[test]
@@ -5516,6 +6139,80 @@ command = "y"
     }
 
     #[test]
+    fn apply_restart_user_note_narrow_targets_only_the_root_session() {
+        // s1 -> s2 -> s3; a narrow (checkbox-off) restart note on s2 must not
+        // reach s1 (upstream) or s3 (downstream).
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+
+        store
+            .apply_restart_user_note(&run, &[(0, 1)], false, "picking up mid-fix")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_ghost(&crate::ghost::session_uri(&run, 0, 1))
+                .unwrap()
+                .unwrap()
+                .user_note
+                .as_deref(),
+            Some("picking up mid-fix")
+        );
+        assert!(
+            store
+                .get_ghost(&crate::ghost::session_uri(&run, 0, 0))
+                .unwrap()
+                .is_none(),
+            "upstream session must not receive the note"
+        );
+        assert!(
+            store
+                .get_ghost(&crate::ghost::session_uri(&run, 0, 2))
+                .unwrap()
+                .is_none(),
+            "downstream session must not receive the note when include_downstream is false"
+        );
+    }
+
+    #[test]
+    fn apply_restart_user_note_include_downstream_reaches_children_not_upstream() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+
+        store
+            .apply_restart_user_note(&run, &[(0, 1)], true, "apply to all children")
+            .unwrap();
+
+        for idx in [1, 2] {
+            assert_eq!(
+                store
+                    .get_ghost(&crate::ghost::session_uri(&run, 0, idx))
+                    .unwrap()
+                    .unwrap()
+                    .user_note
+                    .as_deref(),
+                Some("apply to all children"),
+                "session {idx} should have the note"
+            );
+        }
+        assert!(
+            store
+                .get_ghost(&crate::ghost::session_uri(&run, 0, 0))
+                .unwrap()
+                .is_none(),
+            "upstream session must still be untouched"
+        );
+    }
+
+    #[test]
     fn restart_task_resets_all_of_its_sessions_and_downstream_but_not_upstream() {
         // t0/s1 -> t0/s2, t1/s3 depends on t0/s2 (cross-task). Restarting t0
         // must dirty every t0 session plus t1's downstream session, but leave
@@ -5677,6 +6374,47 @@ command = "y"
                 .verify_env_overrides
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn toml_environment_seeds_task_and_session_env_overrides() {
+        // RAL-172: a task/session's own `environment` table in the submitted
+        // TOML seeds the same store columns `set_task_env_overrides`/
+        // `set_session_env_overrides` write to, so it merges into the
+        // existing `run < task < session` layering (RAL-150) with zero
+        // extra resolution logic.
+        let src = "[[task]]\nname=\"t0\"\nenvironment={SHARED=\"from-task\", TASK_ONLY=\"1\"}\n\
+                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={SHARED=\"from-session\", SESSION_ONLY=\"2\"}\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let run = store.insert_run(&parse(src), Some("r"), false).unwrap();
+
+        let task_env = store.get_task_env_overrides(&run, 0).unwrap();
+        assert_eq!(
+            task_env.get("SHARED").map(String::as_str),
+            Some("from-task")
+        );
+        assert_eq!(task_env.get("TASK_ONLY").map(String::as_str), Some("1"));
+
+        let session_env = store.get_session_env_overrides(&run, 0, 0).unwrap();
+        assert_eq!(
+            session_env.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+        assert_eq!(
+            session_env.get("SESSION_ONLY").map(String::as_str),
+            Some("2")
+        );
+
+        // The session's declared value wins over the task's for the shared
+        // key once resolved, same precedence as a run-time override.
+        let resolved = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
+        assert_eq!(
+            resolved.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+        assert_eq!(resolved.get("TASK_ONLY").map(String::as_str), Some("1"));
+        assert_eq!(resolved.get("SESSION_ONLY").map(String::as_str), Some("2"));
     }
 
     #[test]
@@ -6147,6 +6885,66 @@ command = "y"
         assert_eq!(failed, HashSet::from([(0, 0)]));
     }
 
+    /// RAL-185: the seed the scheduler needs so a run-level cancel's leftovers
+    /// stay terminal. Mirrors `failed_sessions_returns_only_sessions_in_failed_state`.
+    #[test]
+    fn cancelled_sessions_and_tasks_return_only_rows_in_cancelled_state() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"c\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        // Task 0 finished for real before the cancel; task 1 was still in
+        // flight and got flipped; task 2 never started and got flipped too.
+        store
+            .set_session_state(&run, 0, 0, NodeState::Done)
+            .unwrap();
+        store.set_task_state(&run, 0, NodeState::Done).unwrap();
+        store
+            .set_session_state(&run, 1, 0, NodeState::Running)
+            .unwrap();
+        store.set_task_state(&run, 1, NodeState::Running).unwrap();
+
+        store.cancel(&run).unwrap();
+
+        assert_eq!(
+            store.cancelled_sessions(&run).unwrap(),
+            HashSet::from([(1, 0), (2, 0)]),
+            "the already-Done session must be left alone by a run-level cancel"
+        );
+        assert_eq!(
+            store.cancelled_tasks(&run).unwrap(),
+            HashSet::from([1, 2]),
+            "cancel_nonterminal_nodes flips tasks alongside sessions"
+        );
+    }
+
+    /// RAL-185 AC: a whole-run restart must still revive cancelled sessions.
+    /// `reset_run_to_pending` rewrites *every* row, so by the time the
+    /// scheduler reads its seeds there is nothing left in `cancelled` state and
+    /// the new `cancelled_sessions`/`cancelled_tasks` seeds are inert.
+    #[test]
+    fn restart_run_clears_cancelled_state_so_the_scheduler_seeds_are_empty() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_session_state(&run, 0, 0, NodeState::Running)
+            .unwrap();
+        store.cancel(&run).unwrap();
+        assert!(!store.cancelled_sessions(&run).unwrap().is_empty());
+
+        store.restart_run(&run).unwrap();
+
+        assert!(
+            store.cancelled_sessions(&run).unwrap().is_empty(),
+            "restart_run must leave no session cancelled, or the scheduler \
+             would refuse to dispatch it"
+        );
+        assert!(store.cancelled_tasks(&run).unwrap().is_empty());
+    }
+
     #[test]
     fn restart_run_on_missing_run_is_not_found() {
         let store = Store::open_in_memory().unwrap();
@@ -6280,6 +7078,50 @@ command = "y"
         assert_eq!(
             run.tasks[0].sessions[0].verify[0].state, "pending",
             "session verify must be pending"
+        );
+    }
+
+    #[test]
+    fn run_view_shows_running_when_a_deferred_restart_leaves_pending_but_a_sibling_task_is_live() {
+        // Reproduces the run-000000000148/ral-169+ral-170 case: restarting
+        // ral-169's terminal `test` verify resets the *run* row to "pending"
+        // (see `restart_session_verify`) purely as a "reclaim me later"
+        // signal — `scheduler::claim_ready` deliberately leaves ral-170's
+        // still-live worker alone rather than cancelling it. From the
+        // outside the run plainly has a live child (ral-170's session is
+        // genuinely `running`), so the board must not show "pending".
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"a\"\n\
+            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"test\"\ncommand=\"true\"\n\
+            [[task]]\nname=\"b\"\n\
+            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let id = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+
+        // Task a: completed once, its `test` verify failed, run finished Failed.
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store
+            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Failed)
+            .unwrap();
+        store.set_task_state(&id, 0, NodeState::Failed).unwrap();
+        store.set_run_state(&id, RunState::Failed).unwrap();
+
+        // Task b: its worker is still actively driving this session (the
+        // sibling task the deferred-claim mechanism refuses to interrupt).
+        store
+            .set_session_state(&id, 1, 0, NodeState::Running)
+            .unwrap();
+
+        // Restart task a's `test` verify. Per `restart_session_verify`, this
+        // writes the run row back to "pending" even though task b's session
+        // is still genuinely running.
+        store.restart_session_verify(&id, 0, 0, 0).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        assert_eq!(
+            run.state, "running",
+            "a run with a genuinely live sibling session must not display as pending, \
+             even though the scheduler's own runs.state column reads pending while it \
+             waits to reclaim the restarted task"
         );
     }
 

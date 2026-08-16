@@ -35,6 +35,159 @@ pub const TMUX_CMD_ENV: &str = "RALPHUS_TMUX_CMD";
 #[cfg(test)]
 pub(crate) static LIVE_TMUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Unique per-invocation tag for a live-tmux test's session/run identifiers
+/// (RAL-177): embeds the OS PID and a monotonic in-process counter, so two
+/// `cargo test` processes running the identical test suite — e.g. sibling
+/// git worktrees, each exercising these tests against the same shared,
+/// machine-wide psmux server — can never construct the same real tmux
+/// session name, and two tests within the same process never race each
+/// other on a name either. Shared home for every live-tmux test across the
+/// crate (`runner.rs`, `server.rs`, and this module's own tests), rather
+/// than duplicated per file, since all of them already reach into
+/// `crate::tmux::` for `LIVE_TMUX_TEST_LOCK`/`Tmux::resolve()`/
+/// `session_name()` anyway. Same `{label}-{pid}-{n}` idiom already used by
+/// `worktrees.rs`/`guardian_merge.rs`/`reviews.rs`/`scheduler.rs`'s test
+/// helpers for the identical class of problem (temp-dir collisions across
+/// concurrent test processes) — reused here instead of adding a `rand`
+/// dependency the workspace doesn't otherwise have.
+/// The PID is embedded as a `pid<N>` token (rather than a bare number) so
+/// [`extract_test_pid`] can find and parse it back out of a full session
+/// name unambiguously, for the orphan sweep in [`sweep_dead_test_sessions`].
+#[cfg(test)]
+pub(crate) fn unique_test_tag(label: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{label}-pid{}-{n}", std::process::id())
+}
+
+/// Best-effort extraction of the PID [`unique_test_tag`] embedded in a live-
+/// tmux test's session name (RAL-177) — looks for the last `pid<digits>`
+/// token in `name`, since a test session name may embed the tag in its
+/// run_id segment, its task segment, or both. `None` for a name that was
+/// never built from [`unique_test_tag`] at all (e.g. a real production
+/// session, or a stray unrelated tmux session on the same machine) — the
+/// sweep in [`sweep_dead_test_sessions`] only ever touches a name this
+/// successfully parses, so it can't accidentally reach a session it can't
+/// positively identify as one of its own test fixtures.
+#[cfg(test)]
+fn extract_test_pid(name: &str) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    let mut rest = name;
+    while let Some(idx) = rest.find("pid") {
+        let digits: String = rest[idx + 3..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(pid) = digits.parse() {
+            best = Some(pid);
+        }
+        rest = &rest[idx + 3..];
+    }
+    best
+}
+
+/// Whether OS process `pid` is still alive — best-effort, and fails *open*
+/// (treats a lookup failure as "alive") so [`sweep_dead_test_sessions`] never
+/// mistakenly kills a session whose owning process it simply couldn't check.
+#[cfg(test)]
+fn test_pid_is_alive(pid: u32) -> bool {
+    if cfg!(target_os = "windows") {
+        let script = format!(
+            "(Get-Process -Id {pid} -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Id)"
+        );
+        match Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+            }
+            _ => true,
+        }
+    } else {
+        // `kill -0` checks liveness without sending a real signal.
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+/// Force-kill every currently-registered `"ralphus_"`-prefixed live-tmux
+/// TEST session (identified via [`extract_test_pid`]) whose owning test
+/// process is confirmed dead (RAL-177 AC #3) — left behind by a `cargo test`
+/// run that was killed, crashed, or hit a hard external timeout before its
+/// own [`KillSessionOnDrop`] guard ever ran (Drop does not run on a hard
+/// process kill). Unlike [`reap_orphaned_sessions_at_startup`] (which is
+/// only ever safe to call before anything has been dispatched), this checks
+/// each candidate session's own embedded PID for liveness directly instead
+/// of relying on a "nothing should be running yet" invariant, so it's safe
+/// to call opportunistically from *within* a live test run, not just at
+/// startup — a session still backed by a live sibling test process is never
+/// touched. Returns the number of sessions killed, for the caller to log.
+#[cfg(test)]
+pub(crate) fn sweep_dead_test_sessions() -> usize {
+    let Ok(tmux) = Tmux::resolve() else {
+        return 0;
+    };
+    let names = tmux
+        .list_sessions_with_prefix("ralphus_")
+        .unwrap_or_default();
+    let mut killed = 0;
+    for name in names {
+        let Some(pid) = extract_test_pid(&name) else {
+            continue;
+        };
+        if !test_pid_is_alive(pid) {
+            let _ = tmux.kill_session(&name);
+            killed += 1;
+        }
+    }
+    killed
+}
+
+/// Runs [`sweep_dead_test_sessions`] exactly once per test binary invocation
+/// (RAL-177) — cheap to call from every live-tmux test's own availability
+/// check (`tmux_and_python_available()` in `runner.rs`, `tmux_available()`
+/// in `server.rs`, and this module's own live tests) without repeating the
+/// sweep's `list-sessions` + per-candidate liveness round trip on every
+/// single test.
+#[cfg(test)]
+pub(crate) fn sweep_dead_test_sessions_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let killed = sweep_dead_test_sessions();
+        if killed > 0 {
+            crate::rlog!(
+                WARNING,
+                "ralphus [tmux] swept {killed} orphaned live-tmux TEST session(s) left behind by a killed/timed-out prior test run (RAL-177)"
+            );
+        }
+    });
+}
+
+/// Kills a real tmux session on drop (covers both normal test-fn return and
+/// a panic/unwind mid-test) — the primary half of RAL-177 AC #3, alongside
+/// the PID-liveness sweep above for the "process was hard-killed, Drop never
+/// ran at all" case. Idempotent: killing an already-gone session is already
+/// a no-op success (see [`Tmux::kill_session`]'s doc comment), so it's
+/// always safe to hold one of these even when the test itself already killed
+/// the session on its own successful path.
+#[cfg(test)]
+pub(crate) struct KillSessionOnDrop(pub(crate) String);
+
+#[cfg(test)]
+impl Drop for KillSessionOnDrop {
+    fn drop(&mut self) {
+        if let Ok(tmux) = Tmux::resolve() {
+            let _ = tmux.kill_session(&self.0);
+        }
+    }
+}
+
 /// A tmux invocation failed, or the binary could not be resolved/spawned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxError(pub String);
@@ -696,23 +849,7 @@ pub fn find_server_pid(name: &str) -> Option<u32> {
     if !cfg!(target_os = "windows") {
         return None;
     }
-    // `name` is always `tmux::session_name`'s output, already sanitized to
-    // `[a-zA-Z0-9_-]` -- safe to interpolate into the PowerShell literal
-    // below with no injection risk.
-    let script = format!(
-        "(Get-CimInstance Win32_Process -Filter \"Name='tmux.exe'\" -ErrorAction SilentlyContinue | \
-         Where-Object {{ $_.CommandLine -like '*{name}*' -and $_.CommandLine -like '*server*' }} | \
-         Select-Object -First 1 -ExpandProperty ProcessId)"
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let pid: Option<u32> = String::from_utf8_lossy(&output.stdout).trim().parse().ok();
+    let pid = find_server_pid_windows(name);
     // Logged unconditionally (not just on the eventual failure path) so a
     // real occurrence always leaves a record of which PID was tracked --
     // useful for cross-referencing manually (e.g. a live process-watch
@@ -729,6 +866,81 @@ pub fn find_server_pid(name: &str) -> Option<u32> {
         ),
     }
     pid
+}
+
+/// The actual Windows process-table scan behind [`find_server_pid`], split
+/// out so it can be compiled away entirely on non-Windows (where `sysinfo`
+/// isn't even a dependency -- see `[target."cfg(windows)".dependencies]` in
+/// `Cargo.toml`).
+///
+/// This used to shell out to `powershell -Command "Get-CimInstance
+/// Win32_Process ..."` per lookup. That was measurably the single slowest
+/// piece of this whole subsystem: PowerShell's own .NET startup cost is
+/// substantial even alone, and degrades sharply under the heavy concurrent
+/// subprocess-spawning a full `cargo test` run produces -- two individual
+/// tests (`registers_pid_while_the_subprocess_is_alive_and_clears_it_after`,
+/// `live_tmux_registers_and_clears_pid_for_a_command_kind_spec`) were
+/// measured at 31s and 28s respectively, dominated by this call. `sysinfo`
+/// reads the Windows process table directly (via `ntapi`/`winapi`, no
+/// subprocess), which is the same fix for production latency as it is for
+/// test time -- `find_server_pid` sits on the hot path of every tmux-wrapped
+/// session spawn (RAL-151), not just these tests.
+///
+/// `name` is always `tmux::session_name`'s output -- no injection risk here
+/// since there's no shell/query language to escape into, just a plain
+/// substring check against each process's own command line.
+///
+/// Retries a handful of times with a short sleep between attempts: the
+/// caller invokes this immediately after the `tmux new-session` *client*
+/// subprocess returns, but that only guarantees the client asked the tmux
+/// *server* to start -- on a first session (no server running yet) there can
+/// be a brief window where the server process hasn't finished forking/
+/// exec'ing and so doesn't yet show up in a process-table snapshot. The old
+/// PowerShell-based lookup's own multi-hundred-ms .NET startup cost
+/// accidentally absorbed that race; a direct process-table read is fast
+/// enough that it needs an explicit bounded retry instead. Capped well
+/// below the old single-call cost (`RETRIES * RETRY_DELAY` = 500ms vs. the
+/// ~1-2s+ a single PowerShell invocation used to take), so this is still a
+/// large net win even in the worst case.
+#[cfg(target_os = "windows")]
+fn find_server_pid_windows(name: &str) -> Option<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    const RETRIES: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    // `cmd()` is empty by default under `sysinfo` -- fetching a process's
+    // command line is comparatively expensive, so it's opt-in via this
+    // refresh-kind flag. Without it every process silently reports `cmd:
+    // []`, and the substring match below would never find anything.
+    let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+
+    let mut sys = System::new();
+    for attempt in 0..RETRIES {
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+        let found = sys.processes().values().find_map(|proc| {
+            if !proc.name().eq_ignore_ascii_case("tmux.exe") {
+                return None;
+            }
+            let cmd = proc
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (cmd.contains(name) && cmd.contains("server")).then(|| proc.pid().as_u32())
+        });
+        if found.is_some() {
+            return found;
+        }
+        if attempt + 1 < RETRIES {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_server_pid_windows(_name: &str) -> Option<u32> {
+    None
 }
 
 /// Spawns a background thread that blocks until OS process `pid` exits, then
@@ -1057,7 +1269,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmux = Tmux::resolve().unwrap();
-        let name = session_name("test-run", "build", "roundtrip");
+        let name = session_name(&unique_test_tag("test-run"), "build", "roundtrip");
         let _ = tmux.kill_session(&name);
 
         let cwd = std::env::temp_dir();

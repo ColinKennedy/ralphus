@@ -14,7 +14,10 @@ endpoints. See `CLI_PARITY_PLAN.local.md` for the design history.
   review derivation, so a busy daemon can take longer than a health check to
   respond. No CLI flag yet — env var only.
 - `--json` — emit the raw daemon JSON instead of human-readable text. Works on
-  every subcommand that reads or mutates daemon state.
+  every subcommand that reads or mutates daemon state. Like every flag in this
+  section, it's declared on the root parser, not on any subcommand's own
+  parser — it must come **before** the subcommand name, not after:
+  `ralphus --json status`, not `ralphus status --json`.
 - `--version` — print the CLI version and exit.
 
 ## Exit codes
@@ -30,7 +33,59 @@ endpoints. See `CLI_PARITY_PLAN.local.md` for the design history.
 ## Selectors
 
 Most `show`/action commands take a **selector** instead of raw ids/indices
-(`cli/src/ralphus/selector.py`):
+(`cli/src/ralphus/selector.py`). Anywhere this reference writes `<selector>`,
+`<run_id>`, or a queue item path, the **ralphus URI** form below is accepted
+too — including the bare `run_id` positionals of the `run *` family, `status`,
+`graph`, and `queue set-status`/`reorder`/`set-position`.
+
+### The ralphus URI scheme (RAL-188)
+
+The self-describing form ralphus itself **produces** — every `show` command
+prints the exact URI addressing what it just displayed, as its first `uri`
+field:
+
+```
+ralphus:/RUN[<label>]                                                        ?id=<run_id>
+ralphus:/RUN[<label>]/TASK[<name>]                                           ?id=<run_id>
+ralphus:/RUN[<label>]/TASK[<name>]/VERIFY[<name-or-~index>]                  ?id=<run_id>
+ralphus:/RUN[<label>]/TASK[<name>]/SESSION[<name>]                           ?id=<run_id>
+ralphus:/RUN[<label>]/TASK[<name>]/SESSION[<name>]/VERIFY[<name-or-~index>]  ?id=<run_id>
+ralphus:/REVIEW[<name>]                                                      ?id=<guardian_id>
+ralphus:/REVIEW[<name>]?id=<guardian_id>&combined
+ralphus:/REVIEW[<name>]?id=<guardian_id>&worktree=<branch-id-or-name-or-~index>
+```
+
+Rules:
+
+- **A segment's contents are the entity's label**, falling back to its id when
+  no label is set. Labels are neither unique nor stable.
+- **`?id=` is the disambiguator.** Formally optional, always emitted by
+  anything ralphus produces, and authoritative when present — it wins over a
+  stale or renamed label. An ambiguous label with **no** `?id=` exits 2 with
+  the list of candidates; it is never silently resolved to the most recent.
+- **A positional index carries a `~` sigil** — `VERIFY[~0]`, `?worktree=~2`.
+  A bare `VERIFY[0]` addresses the step literally *named* `0`. This is how an
+  anonymous verify step (one with no author-supplied `id`) is addressed. `~` is
+  an RFC 3986 **unreserved** character, deliberately: the sigil was originally
+  `#`, which is the fragment delimiter, so a URI carrying one was truncated
+  anywhere it met a real URL parser (a browser address bar, the board's own
+  `location.hash`).
+- **`?worktree=` names one stacked branch** by its label (the feature branch
+  name the Reviews UI lists it under, e.g. `?worktree=RAL-188-uri-scheme`), by
+  its stable `branch-000000000278` id, or by `~<position>`. A label containing
+  a `/` is percent-encoded like any other (`?worktree=feature%2Fa`). Use
+  `&combined` instead for the review's combined worktree.
+- **`[`, `]` and `/` are percent-encoded inside a label**, so a review named
+  `RAL-174/175 batch` is written `REVIEW[RAL-174%2F175 batch]`. Spaces stay
+  raw. A hand-written literal `/` inside brackets also parses, because
+  balanced `[...]` groups are extracted before the path is split.
+- The `ralphus:` prefix is a **string format**, not an OS-registered protocol
+  handler. The bare `RUN[...]` shorthand is accepted too.
+
+Names resolve against the daemon; `GET /api/resolve?uri=...` does the same
+translation for non-CLI consumers (see `docs/daemon-api.md`).
+
+### Legacy selector form (still accepted)
 
 | Selector | Addresses |
 |---|---|
@@ -40,7 +95,16 @@ Most `show`/action commands take a **selector** instead of raw ids/indices
 | `<run_id>/<task>/verify/<i>` | a task-level verify step |
 | `<run_id>/<task>/<session>/verify/<i>` | a session-level verify step |
 | `<guardian_id>` or `@<name>` | a review |
-| `<guardian_id>#<pos-or-branch>` or `@<name>#<pos-or-branch>` | a review branch |
+| `<guardian_id>~<pos-or-branch>` or `@<name>~<pos-or-branch>` | a review branch |
+| `<guardian_id>#<pos-or-branch>` or `@<name>#<pos-or-branch>` | a review branch (older spelling; still parsed) |
+
+This form is an accepted alias only — nothing produces it any more. The two
+differ in exactly one resolution rule: here a **bare integer is a position**,
+whereas in the URI form a position always carries the `~` sigil and a bare
+token is always a name. The branch separator was originally `#` for the same
+reason the URI sigil was; both spellings still parse, and splitting happens at
+whichever appears **first**, so a branch name containing the other one still
+splits where you meant it to.
 
 A name segment that matches more than one candidate, or none, exits 2 with the
 list of candidates.
@@ -206,37 +270,144 @@ input name(s) instead of printing a command with a bare, unsubstituted
 
 ## quick-start
 
+Two independent command families (RAL-166), each with a `claude-code` and a
+`codex` entrypoint:
+
 | Command | What |
 |---|---|
-| `quick-start claude-code [--command] [-- ARGS...]` | Launch Claude Code primed with the full CLI help-map as a system prompt, so it can orchestrate `ralphus` unsupervised. See [quick-start claude-code](#quick-start-claude-code) below |
+| `quick-start manager claude-code [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed with the full CLI help-map as a system prompt, so it can orchestrate `ralphus` unsupervised. See [quick-start manager](#quick-start-manager) below |
+| `quick-start manager codex [--command] [--shell] [-- ARGS...]` | Launch Codex primed with the same help-map system prompt, so it can orchestrate `ralphus` unsupervised. See [quick-start manager](#quick-start-manager) below |
+| `quick-start reviewer claude-code [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
+| `quick-start reviewer codex [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Codex primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
 
-### quick-start claude-code
+There is no compatibility alias for the old `quick-start claude-code` shape —
+it is fully replaced by `quick-start manager claude-code`.
 
-Writes the help-map (same tree `show help-map` prints) to a throwaway temp
-file and launches `claude --dangerously-skip-permissions
---append-system-prompt-file <tempfile> ...`, so the file's contents become
-Claude Code's system prompt via the dedicated file-based flag (the path is
-its own argument value, not embedded in a text value, so it can't be
-truncated by a space in the path).
+### quick-start manager
 
-- Args after a literal `--` are forwarded verbatim to the underlying `claude`
-  invocation, e.g. `ralphus quick-start claude-code -- --mode auto`.
-- If the forwarded args include their own `--append-system-prompt-file`, its
-  contents are read and folded into ralphus's own temp file instead —
-  ralphus's context first, then a disclaimer, then the user's — rather than
-  forwarding a second, separate occurrence of the flag.
-- The `claude` launch command resolves, in order: `--command` (this
-  invocation only), then `$RALPHUS_CLAUDE_COMMAND`, then the bare `claude` on
-  PATH. The value may be a single bare path, or a compound shell command with
-  embedded spaces/syntax (e.g. `cd foo bar ; ./claude`) — see the heuristic in
-  [`check health`](#core) above. **A bare path containing a space (e.g. a
-  Windows install under `C:\Program Files\...`) must be wrapped in quotes**
-  (`"C:\Program Files\claude\claude.exe"`) or it is misdetected as a compound
-  command (RAL-110 Q5: any space without fully-wrapping quotes means
-  "compound").
-- `$RALPHUS_CLAUDE_COMMAND` is the same env var the `claude-code` agent
-  backend uses (`ralphus.runner.claude_code_backend`) — one name, everywhere
-  a `claude` executable is resolved.
+Both `manager` entrypoints inject the same "orchestrate ralphus itself"
+system prompt — the full help-map (same tree `show help-map` prints) plus the
+`SUBAGENT_NOTE`/`PROJECT_LOOKUP_NOTE`/`SUBMIT_VALIDATE_NOTE`/
+`SUBMIT_REVIEW_NOTE` guidance — only the delivery mechanism differs:
+
+- **`quick-start manager claude-code`** writes the prompt to a throwaway temp
+  file and launches `claude --dangerously-skip-permissions
+  --append-system-prompt-file <tempfile> ...`, so the file's contents become
+  Claude Code's system prompt via the dedicated file-based flag (the path is
+  its own argument value, not embedded in a text value, so it can't be
+  truncated by a space in the path). If the forwarded `--` args include their
+  own `--append-system-prompt-file`, its contents are read and folded into
+  ralphus's own temp file instead — ralphus's context first, then a
+  disclaimer, then the user's — rather than forwarding a second, separate
+  occurrence of the flag. The `claude` launch command resolves, in order:
+  `--command` (this invocation only), then `$RALPHUS_CLAUDE_COMMAND`, then
+  the bare `claude` on PATH.
+- **`quick-start manager codex`** launches an interactive `codex` session
+  with the prompt injected via `-c developer_instructions=...` — Codex has no
+  file-based system-prompt flag; this `-c` override is the closest analog
+  (see `ralphus.runner.codex_backend`'s module docstring) and must precede
+  any subcommand to be recognized, which is why this quick-start launches
+  the bare interactive TUI rather than `codex exec`. The `codex` launch
+  command resolves, in order: `--command` (this invocation only), then
+  `$RALPHUS_CODEX_CMD`, then the bare `codex` on PATH.
+
+Common to both:
+
+- Args after a literal `--` are forwarded verbatim to the underlying
+  harness, e.g. `ralphus quick-start manager claude-code -- --mode auto` or
+  `ralphus quick-start manager codex -- --model gpt-5-codex`.
+- `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_CMD` are the same env vars the
+  `claude-code`/`codex` agent backends use
+  (`ralphus.runner.claude_code_backend`/`ralphus.runner.codex_backend`) —
+  one name per harness, everywhere that harness's executable is resolved.
+
+#### What `--command` accepts (RAL-189)
+
+The launch command value takes three shapes, all of which behave the way the
+same text would typed straight into a terminal (`ralphus.shellcmd`):
+
+| Shape | Example | How it runs |
+|---|---|---|
+| A bare executable or path | `claude`, `"C:\Program Files\claude\claude.exe"` | Exec'd directly — ralphus's own arguments are appended as real argv entries, so no shell and no quoting can go wrong |
+| A single-name script | `my-claude.ps1`, `launch-claude.sh` | Resolved to a full path, then run through the target shell — the OS can't `exec` a `.ps1`/non-`+x` script itself |
+| A raw shell command line | `cd /foo/bar ; claude`, `python some_script.py -- super-claude` | Passed to the target shell verbatim, with ralphus's arguments quoted for that shell and appended |
+
+Which shape applies is decided by the RAL-110 heuristic in
+[`check health`](#core) above: no spaces (or fully wrapped in quotes) means a
+bare name/path, anything else is a raw command line. **A bare path containing
+a space (e.g. a Windows install under `C:\Program Files\...`) must be wrapped
+in quotes** (`"C:\Program Files\claude\claude.exe"`) or it is misdetected as a
+raw command line (RAL-110 Q5).
+
+Single-name lookup mirrors the target shell's own: on Windows, the current
+directory then `PATH`, trying each `%PATHEXT%` suffix (so a bare `my-claude`
+finds `my-claude.cmd`); on POSIX, `PATH` only — a script in the working
+directory must be spelled `./my-claude.sh` there, exactly as at a prompt. A
+name that resolves to nothing is still handed to the OS directly, so a genuine
+typo surfaces as one clean `could not launch ...` error.
+
+#### `--shell` — which shell interprets a `--command`
+
+`--shell` picks the shell used for the two shapes that need one (a script, or
+a raw command line); it is ignored for a directly-executable program. Accepted
+values: `auto` (default), `powershell`, `pwsh`, `cmd`, `bash`, `sh`, `zsh`,
+`fish`.
+
+`auto` means **the shell that launched `ralphus`**, detected by walking the
+real process ancestry (Toolhelp32 on Windows, `/proc` on Linux) and falling
+back to environment heuristics (`$SHELL`, `%COMSPEC%`,
+`$POWERSHELL_DISTRIBUTION_CHANNEL`, `%PSModulePath%`) and then the platform
+default. So a `;` typed at a PowerShell prompt keeps meaning what PowerShell
+says it means, rather than being reinterpreted by a hardcoded `cmd /C`.
+
+Name a shell explicitly to author a command *for a different shell* than the
+one you're sitting in:
+
+```bash
+# From a PowerShell prompt, but the command is written for bash:
+ralphus quick-start manager claude-code --shell bash --command 'cd /foo/bar ; claude'
+
+# A PowerShell script, resolved off PATH and run by PowerShell:
+ralphus quick-start manager claude-code --command my-claude.ps1
+
+# A raw command line with its own arguments:
+ralphus quick-start reviewer codex @myreview --command 'python some_script.py -- super-claude'
+```
+
+`$RALPHUS_SHELL` overrides what `auto` detects (useful in a wrapper script or
+a CI job where ancestry detection has nothing meaningful to find); an explicit
+`--shell` overrides `$RALPHUS_SHELL` in turn. An unrecognized `$RALPHUS_SHELL`
+value is ignored rather than fatal — an unrecognized `--shell` value is
+rejected by argparse.
+
+### quick-start reviewer
+
+Both `reviewer` entrypoints inject a review-focused system prompt (not a copy
+of the manager prompt): it frames the harness as operating on an *existing*
+review through the `ralphus review ...` CLI surface — branch feedback,
+combined/global review feedback, merge/rebase start or restart, branch
+enable/disable, base-branch changes, manual checks, and action hints — rather
+than orchestrating new ralphus tasks. The full help-map is still appended for
+reference. Delivery mechanism mirrors the matching `manager` entrypoint
+(temp-file for `claude-code`, `-c developer_instructions=...` for `codex`).
+
+- An optional `TARGET` positional seeds the initial review context: a
+  guardian id, `@name`, or a review-resolving URL (the `#/reviews/<id>` shape
+  `board.html` puts in the address bar, e.g.
+  `http://127.0.0.1:7474/#/reviews/guardian-000000000042`). A URL with no
+  recognizable `.../reviews/<id>` segment falls back to being treated as a
+  literal selector, best-effort. TARGET is optional — omit it to start with
+  no fixed review in mind.
+- The agent can switch to a different review at any point in the
+  conversation (`review list`, then `review show <selector>`) without being
+  relaunched — TARGET only seeds where the session starts.
+- Remote-state caution is built into the prompt: the harness must not assume
+  the review's code lives on the machine it's running on (the daemon, not
+  this host, is the source of truth), and any read-only inspection of review
+  code should go through the CLI's own `--json` views and printed
+  check/action commands rather than an assumed local checkout. All
+  write-oriented review actions must go through an explicit `ralphus review
+  ...` subcommand, never ad-hoc shell mutation in an inspected worktree.
 
 ## Machine-readable help-map (RAL-110)
 
@@ -252,8 +423,9 @@ its subcommands.
 (`ralphus.helpmap._HIDDEN_COMMANDS`): `author` starts its own agentic
 authoring loop, and an AI agent already driving `ralphus` via this help-map
 should write and `submit` TOML directly rather than invoking a second
-authoring agent through it; `quick-start claude-code` launches an entire
-separate `claude` process, which the driving agent should never re-launch on
+authoring agent through it; every `quick-start manager|reviewer
+claude-code|codex` entrypoint (RAL-166) launches an entire separate
+`claude`/`codex` process, which the driving agent should never re-launch on
 itself.
 
 A hand-picked subset of commands (`ralphus.helpmap._SUBAGENT_PATHS`) carries
@@ -262,11 +434,13 @@ today — each is slow/blocking, destructive, or does multi-step
 subprocess/filesystem work whose result isn't needed synchronously. Cheap,
 frequently-polled reads (`status`, `get`, ...) and tight edit-loop commands
 (`validate`) are deliberately left untagged. Wherever this tree is shown to
-an AI agent — `show help-map`, `quick-start claude-code`'s injected system
-prompt, `ralphus-help-map`'s own stdout — it's preceded by
-`ralphus.helpmap.SUBAGENT_NOTE`, which explains what the tag means: invoke
-that command from inside a subagent (e.g. Claude Code's Task tool) rather
-than directly in the driving agent's main context.
+an AI agent — `show help-map`, every `quick-start manager|reviewer
+...`'s injected system prompt, `ralphus-help-map`'s own stdout — it's preceded by
+`ralphus.helpmap`'s note block, including `SUBAGENT_NOTE` (what the tag
+means), `PROJECT_LOOKUP_NOTE`, `SUBMIT_VALIDATE_NOTE`, `SUBMIT_REVIEW_NOTE`,
+and `JSON_NOTE`. `SUBAGENT_NOTE` specifically explains the tag: invoke that
+command from inside a subagent (e.g. Claude Code's Task tool) rather than
+directly in the driving agent's main context.
 
 <!-- BEGIN GENERATED HELP-MAP (RAL-110) -->
 ```
@@ -285,6 +459,11 @@ than directly in the driving agent's main context.
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
     - listen selector [str] --timeout [float] --until [str]  {Block until a run/task/session/verify/review/review-worktree reaches a status (RAL-140).}
+    - machine  {Register and inspect machine providers remote work runs on (RAL-185).}
+        - get scheme [str]  {Show one registered machine provider by exact scheme.}
+        - list  {List every registered machine provider, plus built-in schemes.}
+        - register --arg [str, repeatable] --channel --description [str] --program [str] --scheme [str]  {Register a provider program a task's 'machine' field can reference.}
+        - remove scheme [str]  {Remove a registered machine provider.}
     - project  {Register and inspect projects known to the daemon (RAL-100).}
         - get name [str]  {Show one registered project's details by exact name.}
         - git --description [str] --name [str] --path [path]  {Register a git repository as a project the daemon can resolve placeholder session cwds against.}

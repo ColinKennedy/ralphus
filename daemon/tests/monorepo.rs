@@ -352,8 +352,9 @@ fn pydantic_ai_available(runner_cmd: &str) -> bool {
 /// are all reachable locally.
 ///
 /// Run with:
-///   cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --nocapture
+///   cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture
 #[test]
+#[ignore = "calls a live local Ollama model; run explicitly with `cargo test -- --ignored`"]
 fn full_monorepo_flow_with_subproject_sessions() {
     let Some(runner_cmd) = find_runner() else {
         eprintln!("SKIP full_monorepo_flow: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");

@@ -20,7 +20,17 @@ id is available from the very first event, the model's own text/tool activity
 can be streamed to the live tmux pane (RAL-102) as it happens, and per-turn
 token usage is captured. There is no dollar-cost field anywhere in Codex's
 output, unlike Claude Code's ``total_cost_usd`` -- ``cost_usd`` is always
-``0.0`` for this backend.
+``0.0`` for this backend, and the board renders a reported-cost of zero as
+``N/A`` rather than ``$0.0000`` so it never reads as "this cost nothing"
+(RAL-187). No estimated/invented figure is substituted.
+
+Token counts are **accumulated** across every ``turn.completed`` event rather
+than overwritten by the last one, and each accumulated total is forwarded
+live over the ``RALPHUS_EVENT:`` stderr channel (RAL-187) so the board shows
+a rising count while the session is still running instead of ``0`` until it
+finishes. Codex only reports usage at ``turn.completed``, so the readout
+stays at ``0`` until the first turn finishes -- accepted granularity, and
+still far better than "zero for the whole run".
 
 Codex has no direct equivalent of ``--append-system-prompt``; the closest
 analog is ``-c developer_instructions="..."``, a generic config override that
@@ -258,9 +268,35 @@ class CodexBackend:
                     elif item_type == "error":
                         print(f"[error] {item.get('message', '')}", file=sys.stderr)
                 elif ev_type == "turn.completed":
+                    # RAL-187: accumulate, don't overwrite. Each turn.completed
+                    # reports *that turn's* usage (summed over every model
+                    # request the turn made internally), so assigning here made
+                    # a multi-turn `codex exec` report only its final turn --
+                    # and left both counts at 0 whenever the run ended via
+                    # turn.failed/error or the stream was truncated before any
+                    # turn completed.
                     usage = ev.get("usage") or {}
-                    tokens_in = int(usage.get("input_tokens") or 0)
-                    tokens_out = int(usage.get("output_tokens") or 0)
+                    tokens_in += int(usage.get("input_tokens") or 0)
+                    tokens_out += int(usage.get("output_tokens") or 0)
+                    # RAL-187: forward the running total over the same
+                    # RALPHUS_EVENT marker claude_code_backend.py uses for its
+                    # live usage, so `runner.rs`'s existing event forwarder
+                    # persists it to the session row mid-run (no daemon-side
+                    # change needed) and the board stops reading 0 tokens for
+                    # the whole of a long Codex session. `cost_usd` is reported
+                    # as the same 0.0 the final result carries -- Codex has no
+                    # cost field, and the board renders 0 as N/A rather than
+                    # inventing an estimate.
+                    cartographer.emit(
+                        "llm-invoke",
+                        "codex live usage",
+                        level="debug",
+                        payload={
+                            "tokens_in": tokens_in,
+                            "tokens_out": tokens_out,
+                            "cost_usd": 0.0,
+                        },
+                    )
                 elif ev_type == "turn.failed":
                     err = ev.get("error") or {}
                     turn_error = str(err.get("message") or "codex turn failed")
@@ -297,6 +333,8 @@ class CodexBackend:
             summary=agent_message[-2000:],
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            # Codex reports no cost anywhere; see the module docstring. The
+            # board shows this as "N/A", not "$0.0000" (RAL-187).
             cost_usd=0.0,
             agent_session_id=thread_id,
         )

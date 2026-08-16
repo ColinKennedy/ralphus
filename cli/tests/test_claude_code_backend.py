@@ -102,6 +102,29 @@ def test_builds_headless_subscription_command(
     assert captured["cwd"] == ws.root
 
 
+def test_result_summary_keeps_trailing_marker_when_over_2000_chars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A result longer than the 2000-char cap is tail-truncated so a trailing
+    RALPHUS_VERIFY marker survives (regression test: this used to be head-truncated,
+    which silently dropped the marker on any long verify response and made a real
+    PASS get recorded as FAIL). Mirrors codex_backend.py's agent_message[-2000:]."""
+    ws = Workspace.create(str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda _program: None)
+
+    marker_line = "RALPHUS_VERIFY: PASS"
+    full_result = f"{'x' * 5000}\n{marker_line}"
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> _FakePopen:
+        return _FakePopen(0, stdout_lines=[_result_event(full_result)])
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    outcome = ClaudeCodeBackend().run("run tests", ws, model=None)
+
+    assert len(outcome.summary) <= 2000
+    assert outcome.summary.endswith(marker_line)
+
+
 def test_prompt_file_is_removed_after_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ws = Workspace.create(str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda _program: None)

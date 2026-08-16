@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,6 +17,7 @@ from ralphus.health import (
     run_checks,
     unquote_path,
 )
+from ralphus.hostos import is_windows
 
 # Every test here calls run_checks()/cli.main(), which always probes a real
 # (refused) daemon socket and a real Ollama endpoint with their own network
@@ -303,7 +303,7 @@ def test_claude_command_existing_file_passes(
     assert result.status == "pass"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX execute bit isn't meaningful on Windows")
+@pytest.mark.skipif(is_windows(), reason="POSIX execute bit isn't meaningful on Windows")
 def test_claude_command_non_executable_file_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -352,7 +352,7 @@ def test_codex_command_existing_file_passes(
     assert result.status == "pass"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX execute bit isn't meaningful on Windows")
+@pytest.mark.skipif(is_windows(), reason="POSIX execute bit isn't meaningful on Windows")
 def test_codex_command_non_executable_file_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

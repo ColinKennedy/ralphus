@@ -61,6 +61,12 @@ pub struct GhostView {
     pub guardian_id: Option<String>,
     /// The handoff note itself.
     pub content: String,
+    /// Free-form text a human typed into the restart popup (RAL-174), kept
+    /// separate from `content` so it can be overwritten on every restart
+    /// rather than folded/accumulated like the agent-authored notes above
+    /// (see [`Store::set_ghost_user_note`]). `None` when no one has ever
+    /// attached a restart note to this owner.
+    pub user_note: Option<String>,
     /// Opaque, VCS-agnostic revision marker captured when this ghost was last
     /// written (e.g. a git commit sha), for best-effort staleness reasoning.
     /// `None` when no VCS-derived identifier was available.
@@ -75,6 +81,7 @@ struct GhostRow {
     run_id: Option<String>,
     guardian_id: Option<String>,
     content: String,
+    user_note: Option<String>,
     revision: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
@@ -88,6 +95,7 @@ impl From<GhostRow> for GhostView {
             run_id: r.run_id,
             guardian_id: r.guardian_id,
             content: r.content,
+            user_note: r.user_note,
             revision: r.revision,
             created_at_ms: r.created_at_ms,
             updated_at_ms: r.updated_at_ms,
@@ -95,8 +103,7 @@ impl From<GhostRow> for GhostView {
     }
 }
 
-const GHOST_COLUMNS: &str =
-    "owner_uri, kind, run_id, guardian_id, content, revision, created_at_ms, updated_at_ms";
+const GHOST_COLUMNS: &str = "owner_uri, kind, run_id, guardian_id, content, user_note, revision, created_at_ms, updated_at_ms";
 
 fn map_ghost_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GhostRow> {
     Ok(GhostRow {
@@ -105,9 +112,10 @@ fn map_ghost_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GhostRow> {
         run_id: r.get(2)?,
         guardian_id: r.get(3)?,
         content: r.get(4)?,
-        revision: r.get(5)?,
-        created_at_ms: r.get(6)?,
-        updated_at_ms: r.get(7)?,
+        user_note: r.get(5)?,
+        revision: r.get(6)?,
+        created_at_ms: r.get(7)?,
+        updated_at_ms: r.get(8)?,
     })
 }
 
@@ -240,25 +248,42 @@ pub fn verify_outcome_note(passed: usize, total: usize) -> String {
 /// `"<task>/<session>"`. Returns `None` when there is nothing to inject, so
 /// callers can leave the prompt untouched rather than prepending an empty
 /// (but visually noisy) block.
+///
+/// When the target session's own ghost carries a human-authored restart note
+/// (RAL-174), it is appended as its own distinct line at the very bottom of
+/// the block -- after every agent-authored note, never interleaved with it
+/// (Q1/Q2 of the ticket's interview).
 #[must_use]
 pub fn format_context_block(
     own: Option<&GhostView>,
     parents: &[(String, GhostView)],
 ) -> Option<String> {
-    if own.is_none() && parents.is_empty() {
+    let own_note = own
+        .and_then(|g| g.user_note.as_deref())
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let own_content_present = own.is_some_and(|g| !g.content.trim().is_empty());
+    if !own_content_present && own_note.is_none() && parents.is_empty() {
         return None;
     }
     let mut out = String::from(
         "--- Prior context (best-effort notes from earlier work; not verified against the current files) ---\n",
     );
-    if let Some(g) = own {
+    if own_content_present {
         out.push_str("Your own notes from a previous attempt at this session:\n");
-        out.push_str(&g.content);
+        out.push_str(&own.expect("checked above").content);
         out.push('\n');
     }
     for (label, g) in parents {
         out.push_str(&format!("Notes from dependency session '{label}':\n"));
         out.push_str(&g.content);
+        out.push('\n');
+    }
+    if let Some(note) = own_note {
+        out.push_str(
+            "A human wrote the following note when triggering this restart (not agent-authored, does not accumulate across restarts):\n",
+        );
+        out.push_str(note);
         out.push('\n');
     }
     out.push_str("--- End prior context ---\n\n");
@@ -297,6 +322,32 @@ impl Store {
                 revision=excluded.revision,
                 updated_at_ms=excluded.updated_at_ms",
             params![owner_uri, kind, run_id, guardian_id, merged, revision, now, now],
+        )?;
+        self.get_ghost(owner_uri).map(|g| g.expect("just written"))
+    }
+
+    /// Attach (or replace) a human-authored restart note (RAL-174) on the
+    /// ghost for `owner_uri`, creating an (empty-content) ghost row first if
+    /// one doesn't already exist. Unlike [`Store::upsert_ghost`]'s `content`,
+    /// this *overwrites* rather than merges/accumulates -- each restart's
+    /// note is one-time (Q5 of the ticket's interview); only the normal
+    /// agent-authored `content` rolls up across restarts.
+    pub fn set_ghost_user_note(
+        &self,
+        owner_uri: &str,
+        kind: &str,
+        run_id: Option<&str>,
+        guardian_id: Option<&str>,
+        note: &str,
+    ) -> Result<GhostView> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO ghosts(owner_uri, kind, run_id, guardian_id, content, user_note, created_at_ms, updated_at_ms)
+             VALUES (?,?,?,?,'',?,?,?)
+             ON CONFLICT(owner_uri) DO UPDATE SET
+                user_note=excluded.user_note,
+                updated_at_ms=excluded.updated_at_ms",
+            params![owner_uri, kind, run_id, guardian_id, note, now, now],
         )?;
         self.get_ghost(owner_uri).map(|g| g.expect("just written"))
     }
@@ -576,6 +627,7 @@ mod tests {
             run_id: Some("run-1".to_string()),
             guardian_id: None,
             content: content.to_string(),
+            user_note: None,
             revision: None,
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -629,5 +681,119 @@ mod tests {
         let block = format_context_block(Some(&own), &[]).unwrap();
         assert!(block.contains("own note"));
         assert!(!block.contains("dependency session"));
+    }
+
+    #[test]
+    fn set_ghost_user_note_creates_a_row_with_empty_content() {
+        let s = store();
+        seed_run(&s, "run-1");
+        let uri = session_uri("run-1", 0, 0);
+        let g = s
+            .set_ghost_user_note(
+                &uri,
+                KIND_SESSION,
+                Some("run-1"),
+                None,
+                "pick up where you left off",
+            )
+            .unwrap();
+        assert_eq!(g.content, "");
+        assert_eq!(g.user_note.as_deref(), Some("pick up where you left off"));
+    }
+
+    #[test]
+    fn set_ghost_user_note_replaces_rather_than_accumulates() {
+        let s = store();
+        seed_run(&s, "run-1");
+        let uri = session_uri("run-1", 0, 0);
+        s.set_ghost_user_note(
+            &uri,
+            KIND_SESSION,
+            Some("run-1"),
+            None,
+            "first restart note",
+        )
+        .unwrap();
+        let g = s
+            .set_ghost_user_note(
+                &uri,
+                KIND_SESSION,
+                Some("run-1"),
+                None,
+                "second restart note",
+            )
+            .unwrap();
+        assert_eq!(g.user_note.as_deref(), Some("second restart note"));
+        assert!(!g.user_note.unwrap().contains("first restart note"));
+    }
+
+    #[test]
+    fn set_ghost_user_note_does_not_disturb_existing_agent_content() {
+        let s = store();
+        seed_run(&s, "run-1");
+        let uri = session_uri("run-1", 0, 0);
+        s.upsert_ghost(&uri, KIND_SESSION, Some("run-1"), None, "agent note", None)
+            .unwrap();
+        let g = s
+            .set_ghost_user_note(
+                &uri,
+                KIND_SESSION,
+                Some("run-1"),
+                None,
+                "human restart note",
+            )
+            .unwrap();
+        assert_eq!(g.content, "agent note");
+        assert_eq!(g.user_note.as_deref(), Some("human restart note"));
+
+        // A subsequent agent-authored write still merges/accumulates content
+        // as before, leaving the (separately-overwritten) user note alone.
+        let g2 = s
+            .upsert_ghost(
+                &uri,
+                KIND_SESSION,
+                Some("run-1"),
+                None,
+                "second agent note",
+                None,
+            )
+            .unwrap();
+        assert_eq!(g2.content, "agent note\n---\nsecond agent note");
+        assert_eq!(g2.user_note.as_deref(), Some("human restart note"));
+    }
+
+    #[test]
+    fn format_context_block_appends_user_note_after_agent_notes() {
+        let mut own = ghost_view("agent note from last attempt");
+        own.user_note = Some("you were stopped midway through the migration".to_string());
+        let parents = vec![("build/compile".to_string(), ghost_view("left a TODO"))];
+        let block = format_context_block(Some(&own), &parents).unwrap();
+        let agent_pos = block.find("agent note from last attempt").unwrap();
+        let parent_pos = block.find("left a TODO").unwrap();
+        let note_pos = block
+            .find("you were stopped midway through the migration")
+            .unwrap();
+        assert!(agent_pos < parent_pos);
+        assert!(
+            parent_pos < note_pos,
+            "user note must come after parent notes"
+        );
+    }
+
+    #[test]
+    fn format_context_block_user_note_alone_does_not_render_empty_own_section() {
+        let mut own = ghost_view("");
+        own.user_note = Some("restart note with no prior agent content".to_string());
+        let block = format_context_block(Some(&own), &[]).unwrap();
+        assert!(!block.contains("Your own notes from a previous attempt"));
+        assert!(block.contains("restart note with no prior agent content"));
+    }
+
+    #[test]
+    fn format_context_block_blank_user_note_is_ignored() {
+        let mut own = ghost_view("agent note");
+        own.user_note = Some("   ".to_string());
+        let block = format_context_block(Some(&own), &[]).unwrap();
+        assert!(!block.contains("A human wrote the following note"));
     }
 }

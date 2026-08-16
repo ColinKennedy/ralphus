@@ -43,6 +43,7 @@ chrono = { workspace = true }
 ureq = { workspace = true }
 
 [target."cfg(windows)".dependencies]
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 win32job = "2.0.3"
 
 [build-dependencies]
