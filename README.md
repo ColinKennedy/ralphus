@@ -9,10 +9,10 @@ workflow is to build and submit from
 [claude-code](https://claude.com/product/claude-code) once all of your branches are ready.
 
 ## Task View
-<img width="2539" height="1038" alt="Image" src="https://github.com/user-attachments/assets/5526c785-e05a-40c2-8ad8-0f564063b841" />
+<img width="2539" height="1038" alt="Image" src="https://github.com/user-attachments/assets/90fbd411-713f-436b-bf29-ec215edc66e1" />
 
 ## Reviews View
-<img width="2521" height="1310" alt="Image" src="https://github.com/user-attachments/assets/673e2cde-ff79-4071-a015-c0696029382b" />
+<img width="2521" height="1310" alt="Image" src="https://github.com/user-attachments/assets/11893a96-b12e-41b1-9d7c-0a2fce6cbcbc" />
 
 
 ## Related Projects
