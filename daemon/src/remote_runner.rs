@@ -1,4 +1,4 @@
-//! Remote session execution via a registered machine provider (RAL-185
+//! Remote cell execution via a registered machine provider (RAL-185
 //! Phase 2).
 //!
 //! The seam this hangs off already existed: [`crate::runner::Runner`] is the
@@ -17,7 +17,7 @@
 //!   anything else is resolved against the registry and handed to a
 //!   `ProviderRunner`.
 //!
-//! The router is what the scheduler holds, so session dispatch stays a single
+//! The router is what the scheduler holds, so cell dispatch stays a single
 //! `&dyn Runner` call and nothing above it needs to know a machine exists.
 
 use std::io::{BufRead, BufReader, Write};
@@ -32,11 +32,11 @@ use crate::machines::{PROTOCOL_VERSION, ResolvedMachine};
 use crate::runner::{EVENT_MARKER, LiveUsage, Runner, RunnerResult, RunnerSpec};
 use crate::store::Store;
 
-/// The `exec` verb: run one session/verify in a provisioned workspace.
+/// The `exec` verb: run one cell/proof in a provisioned workspace.
 pub const VERB_EXEC: &str = "exec";
 
 /// The `provision` verb: ensure a workspace exists on the machine, and report
-/// the path to use as the session's `cwd`.
+/// the path to use as the cell's `cwd`.
 pub const VERB_PROVISION: &str = "provision";
 
 /// The `run` verb: execute one VCS command in a workspace and return its
@@ -44,8 +44,8 @@ pub const VERB_PROVISION: &str = "provision";
 /// one-shot SSH invocation, a multiplexed connection, or a persistent worker
 /// channel — which is why the contract says nothing about it (RAL-185 D7).
 ///
-/// "Channel" rather than "session" deliberately: a *session* is already a
-/// first-class ralphus concept (task → session → verify), and reusing the word
+/// "Channel" rather than "cell" deliberately: a *cell* is already a
+/// first-class ralphus concept (task → cell → proof), and reusing the word
 /// for connection reuse would make both harder to read.
 pub const VERB_RUN: &str = "run";
 
@@ -147,10 +147,10 @@ pub struct ProvisionRequest {
     pub project: String,
     /// Where the workspace's contents come from.
     pub source: WorkspaceSource,
-    /// Owning run, for a provider that wants to namespace its workspaces.
-    pub run_id: String,
-    /// Owning session id, same purpose.
-    pub session_id: String,
+    /// Owning squad, for a provider that wants to namespace its workspaces.
+    pub squad_id: String,
+    /// Owning cell id, same purpose.
+    pub cell_id: String,
 }
 
 /// One provider's JSON response envelope (`docs/machine-providers.md`).
@@ -158,7 +158,7 @@ pub struct ProvisionRequest {
 /// `result` is only present for `exec`. It is deliberately a nested object
 /// rather than flattened into the envelope so a provider can report
 /// `ok: false` (the *invocation* failed) distinctly from
-/// `ok: true, result.status = "failed"` (the session ran and failed) — the
+/// `ok: true, result.status = "failed"` (the cell ran and failed) — the
 /// former is an infrastructure problem, the latter is a normal task outcome,
 /// and collapsing them would make a broken provider look like failing work.
 #[derive(Debug, Deserialize)]
@@ -171,7 +171,7 @@ struct ProviderResponse {
     #[serde(default)]
     result: Option<RunnerResult>,
     /// `provision` only: the absolute path, **on the provider's machine**, that
-    /// the session should use as its `cwd`.
+    /// the cell should use as its `cwd`.
     #[serde(default)]
     workspace: Option<String>,
     /// `exec` only: an opaque handle naming the started work, when the provider
@@ -204,7 +204,7 @@ struct ProviderResponse {
     exit_code: Option<i64>,
 }
 
-/// Runs sessions on one machine by invoking a registered provider program.
+/// Runs cells on one machine by invoking a registered provider program.
 pub struct ProviderRunner {
     /// Provider program path.
     program: String,
@@ -220,7 +220,7 @@ pub struct ProviderRunner {
     supports_channel: bool,
     /// When set, `RALPHUS_EVENT:` marker lines on the provider's stderr are
     /// forwarded into Cartographer, exactly as `SubprocessRunner` does for a
-    /// local run — without this a remote session is invisible to Cartographer
+    /// local run — without this a remote cell is invisible to Cartographer
     /// and, worse, its live cost cap silently stops being enforced.
     cartographer: Option<Arc<Mutex<Store>>>,
     /// The most recent `llm-invoke` usage snapshot seen on any invocation's
@@ -304,11 +304,11 @@ impl ProviderRunner {
         })?;
         crate::rlog!(
             INFO,
-            "ralphus [remote] provider {} verb={verb} uri={} run={} session={}",
+            "ralphus [remote] provider {} verb={verb} uri={} squad={} cell={}",
             self.scheme,
             self.uri,
-            spec.run_id,
-            spec.session_id
+            spec.squad_id,
+            spec.cell_id
         );
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -323,8 +323,8 @@ impl ProviderRunner {
         // reach Cartographer live rather than only at exit.
         let stderr_handle = child.stderr.take().map(|stderr| {
             let cartographer = self.cartographer.clone();
-            let run_id = spec.run_id.clone();
-            let session_id = spec.session_id.clone();
+            let squad_id = spec.squad_id.clone();
+            let cell_id = spec.cell_id.clone();
             let task = spec.task.clone();
             let live_usage = Arc::clone(&self.live_usage);
             std::thread::spawn(move || {
@@ -333,15 +333,15 @@ impl ProviderRunner {
                     if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
                         let fwd = crate::runner::forward_runner_event(
                             cartographer.as_ref(),
-                            &run_id,
-                            &session_id,
+                            &squad_id,
+                            &cell_id,
                             &task,
                             json,
                         );
                         // RAL-161/RAL-201: keep the latest snapshot so a
                         // caller polling this handle can enforce
-                        // `maximum_budget_usd` the same way a local session
-                        // does -- without this a remote session's live cost
+                        // `maximum_budget_usd` the same way a local cell
+                        // does -- without this a remote cell's live cost
                         // cap is silently unenforced (usage still lands in
                         // the DB via `forward_runner_event`, but nothing acts
                         // on it mid-run).
@@ -432,9 +432,9 @@ impl ProviderRunner {
         };
         crate::cartographer::Note::new("remote")
             .level(level)
-            .scope("session")
-            .run(&spec.run_id)
-            .session(&spec.session_id)
+            .scope("cell")
+            .squad(&spec.squad_id)
+            .cell(&spec.cell_id)
             .task(&spec.task)
             .emit(&guard, message, payload);
     }
@@ -507,14 +507,14 @@ impl ProviderRunner {
     }
 
     /// Drive an async `exec` handle to completion: poll `status`, pump `stream`
-    /// into the session's Live View snapshot, and `cancel` if the token trips.
+    /// into the cell's Live View snapshot, and `cancel` if the token trips.
     fn poll_to_completion(
         &self,
         handle: &str,
         spec: &RunnerSpec,
         cancel: Option<&CancelToken>,
     ) -> RunnerResult {
-        let session_name = crate::tmux::session_name(&spec.run_id, &spec.task, &spec.session_id);
+        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let started = Instant::now();
         let budget = spec.timeout_sec.map(Duration::from_secs);
         let mut transcript = String::new();
@@ -522,7 +522,7 @@ impl ProviderRunner {
         loop {
             if cancel.is_some_and(CancelToken::is_cancelled) {
                 // Best-effort: a provider that can't cancel still leaves us
-                // reporting the session cancelled, which matches how a local
+                // reporting the cell cancelled, which matches how a local
                 // kill that races the process exit behaves.
                 if let Err(e) = self.invoke_handle(VERB_CANCEL, handle, None, spec) {
                     crate::rlog!(
@@ -535,7 +535,7 @@ impl ProviderRunner {
                 self.note(
                     spec,
                     crate::logging::LogLevel::INFO,
-                    "remote session cancelled",
+                    "remote cell cancelled",
                     serde_json::json!({"handle": handle, "scheme": self.scheme}),
                 );
                 return RunnerResult::failure("cancelled");
@@ -547,7 +547,7 @@ impl ProviderRunner {
                     self.note(
                         spec,
                         crate::logging::LogLevel::WARNING,
-                        "remote session timed out",
+                        "remote cell timed out",
                         serde_json::json!({
                             "handle": handle,
                             "scheme": self.scheme,
@@ -564,7 +564,7 @@ impl ProviderRunner {
             // RAL-161/RAL-201: mirror `SubprocessRunner`'s live cost-cap kill.
             // `live_usage` is populated by the stderr-reading thread of every
             // `invoke_with` call this handle has made so far (see
-            // `Self::invoke_with`) -- without this check a remote session's
+            // `Self::invoke_with`) -- without this check a remote cell's
             // `maximum_budget_usd` is silently unenforced, even though the
             // usage itself is still persisted to the DB.
             if let Some(cap) = spec.maximum_budget_usd {
@@ -591,7 +591,7 @@ impl ProviderRunner {
                     self.note(
                         spec,
                         crate::logging::LogLevel::WARNING,
-                        "remote session cost cap exceeded",
+                        "remote cell cost cap exceeded",
                         serde_json::json!({
                             "handle": handle,
                             "scheme": self.scheme,
@@ -607,7 +607,7 @@ impl ProviderRunner {
                     );
                 }
             }
-            // Pump output first so a session that finishes between polls still
+            // Pump output first so a cell that finishes between polls still
             // gets its final chunk recorded.
             match self.invoke_handle(VERB_STREAM, handle, cursor, spec) {
                 Ok(resp) => {
@@ -621,7 +621,7 @@ impl ProviderRunner {
                 }
                 Err(e) => {
                     // Streaming is a convenience, not the result -- a provider
-                    // that doesn't implement it must not fail the session.
+                    // that doesn't implement it must not fail the cell.
                     crate::rlog!(
                         DEBUG,
                         "ralphus [remote] provider {} stream unavailable for {handle}: {e}",
@@ -660,7 +660,7 @@ impl ProviderRunner {
         let payload = match serde_json::to_string(spec) {
             Ok(p) => p,
             Err(e) => {
-                return RunnerResult::failure(format!("could not serialize session spec: {e}"));
+                return RunnerResult::failure(format!("could not serialize cell spec: {e}"));
             }
         };
         let resp = match self.invoke(VERB_EXEC, &payload, spec) {
@@ -687,8 +687,8 @@ impl ProviderRunner {
                 if let Some(store) = &self.cartographer {
                     if let Ok(guard) = store.lock() {
                         let _ = guard.save_remote_exec_handle(
-                            &spec.run_id,
-                            &spec.session_id,
+                            &spec.squad_id,
+                            &spec.cell_id,
                             &self.scheme,
                             &self.uri,
                             &handle,
@@ -698,7 +698,7 @@ impl ProviderRunner {
                 let result = self.poll_to_completion(&handle, spec, cancel);
                 if let Some(store) = &self.cartographer {
                     if let Ok(guard) = store.lock() {
-                        let _ = guard.clear_remote_exec_handle(&spec.run_id, &spec.session_id);
+                        let _ = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id);
                     }
                 }
                 result
@@ -733,7 +733,7 @@ impl ProviderRunner {
     /// Tear a provisioned workspace down (RAL-201).
     ///
     /// **Never called automatically.** Local worktrees (`worktrees.rs`,
-    /// `ensure_worktree`) are never auto-deleted either — a session's
+    /// `ensure_worktree`) are never auto-deleted either — a cell's
     /// workspace stays on disk after it finishes so a human can inspect it,
     /// and remote workspaces keep that same property rather than being
     /// reclaimed the moment a run ends. `cleanup` exists so an operator can
@@ -744,7 +744,7 @@ impl ProviderRunner {
     /// **Retention policy on failure: nothing is discarded.** This call does
     /// not touch any daemon-side record of the workspace — there is none to
     /// touch (`provision` is idempotent and re-derives the same workspace
-    /// from `run_id`/`session_id`/the placeholder branch every time, see
+    /// from `squad_id`/`cell_id`/the placeholder branch every time, see
     /// [`Self::provision`]) — so a failed cleanup simply leaves the remote
     /// workspace exactly as it was, and the error is returned to the caller
     /// verbatim rather than swallowed. A human can inspect why cleanup
@@ -897,7 +897,7 @@ impl Runner for ProviderRunner {
 ///
 /// # Errors
 /// Returns a description when the machine cannot be resolved, names an
-/// unregistered provider, or names a built-in that cannot run sessions.
+/// unregistered provider, or names a built-in that cannot run cells.
 pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<ProviderRunner>, String> {
     let resolved = store
         .resolve_machine(Some(machine))
@@ -923,21 +923,21 @@ pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<Provid
 
 /// Reconcile persisted remote `exec` handles against a fresh daemon start
 /// (RAL-201). Call once at `serve()` startup, immediately alongside
-/// [`Store::recover_orphaned_runs`] — both rest on the same invariant
+/// [`Store::recover_orphaned_squads`] — both rest on the same invariant
 /// ("nothing is executing yet, so any `running` row/persisted handle is
 /// orphaned"), so they belong together, not one without the other.
 ///
-/// A session that was mid-poll when the daemon died has no in-process record
+/// A cell that was mid-poll when the daemon died has no in-process record
 /// surviving the crash — only the row `ProviderRunner::exec` wrote before
-/// entering its poll loop. `recover_orphaned_runs` has already reset that
-/// session to `Pending`, so the scheduler will re-provision and re-`exec` it
+/// entering its poll loop. `recover_orphaned_squads` has already reset that
+/// cell to `Pending`, so the scheduler will re-provision and re-`exec` it
 /// as a brand new attempt; this function's job is to stop the *old* attempt
 /// on the provider first, so a restart never leaves two copies of the same
 /// work running remotely at once.
 ///
 /// Best-effort throughout: a provider that cannot be reached, no longer
 /// exists, or refuses the cancel is logged and the row is cleared anyway —
-/// there is nothing else productive to do with a handle whose owning session
+/// there is nothing else productive to do with a handle whose owning cell
 /// no longer considers itself running, and leaving a stale row behind would
 /// just make the next restart re-cancel the same (by then meaningless)
 /// handle forever.
@@ -956,9 +956,9 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
         let machine = format!("{}:{}", h.scheme, h.uri);
         let outcome = match provider_from_store(store, &machine) {
             Ok(Some(provider)) => {
-                let spec = crate::runner::RunnerSpec::for_command_verify(
-                    &h.run_id,
-                    &h.session_id,
+                let spec = crate::runner::RunnerSpec::for_command_proof(
+                    &h.squad_id,
+                    &h.cell_id,
                     &machine,
                     ".",
                     "",
@@ -973,11 +973,11 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
         if let Err(e) = &outcome {
             crate::rlog!(
                 WARNING,
-                "ralphus [recovery] could not cancel stale remote handle {} for run={} \
-                 session={} on machine {machine:?}: {e}",
+                "ralphus [recovery] could not cancel stale remote handle {} for squad={} \
+                 cell={} on machine {machine:?}: {e}",
                 h.handle,
-                h.run_id,
-                h.session_id
+                h.squad_id,
+                h.cell_id
             );
         }
         crate::cartographer::Note::new("recovery")
@@ -986,9 +986,9 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
             } else {
                 crate::logging::LogLevel::ERROR
             })
-            .scope("session")
-            .run(&h.run_id)
-            .session(&h.session_id)
+            .scope("cell")
+            .squad(&h.squad_id)
+            .cell(&h.cell_id)
             .emit(
                 store,
                 "stale remote exec handle reconciled on startup",
@@ -999,7 +999,7 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
                     "error": outcome.err(),
                 }),
             );
-        let _ = store.clear_remote_exec_handle(&h.run_id, &h.session_id);
+        let _ = store.clear_remote_exec_handle(&h.squad_id, &h.cell_id);
     }
 }
 
@@ -1032,7 +1032,7 @@ impl MachineRouter {
         Ok(built.map(|p| p.with_cartographer(Arc::clone(&self.store))))
     }
 
-    /// Provision a workspace for a remote session, returning its path on that
+    /// Provision a workspace for a remote cell, returning its path on that
     /// machine. `Ok(None)` when `machine` resolves local — the caller keeps
     /// its existing local behavior ([`crate::worktrees::ensure_worktree`]).
     ///
@@ -1094,7 +1094,7 @@ mod tests {
 
     impl Runner for RecordingLocal {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
-            self.seen.lock().unwrap().push(spec.session_id.clone());
+            self.seen.lock().unwrap().push(spec.cell_id.clone());
             RunnerResult {
                 status: "done".to_string(),
                 tokens_in: 7,
@@ -1102,7 +1102,7 @@ mod tests {
                 cost_usd: 0.25,
                 summary: "local".to_string(),
                 error: None,
-                verified: None,
+                proofed: None,
                 agent_session_id: None,
                 ghost: None,
             }
@@ -1111,20 +1111,21 @@ mod tests {
 
     fn spec(machine: Option<&str>) -> RunnerSpec {
         RunnerSpec {
-            run_id: "run-1".to_string(),
+            squad_id: "squad-1".to_string(),
             task: "t".to_string(),
-            session_id: "s0".to_string(),
+            cell_id: "s0".to_string(),
             cwd: ".".to_string(),
             prompt: Some("do work".to_string()),
             command: None,
             agent: "claude".to_string(),
+            executable: None,
             model: None,
             system_prompt: None,
             system_prompt_position: None,
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
-            verify: false,
+            proof: false,
             trace_context: None,
             resume_agent_session_id: None,
             env_overrides: BTreeMap::new(),
@@ -1162,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unregistered_machine_fails_the_session_without_running_it_locally() {
+    fn an_unregistered_machine_fails_the_cell_without_running_it_locally() {
         // The dangerous failure mode this guards: silently falling back to the
         // local runner would run the work on the wrong host while the user
         // believes it went to the build farm.
@@ -1260,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn a_real_provider_script_executes_a_session_and_its_result_is_returned() {
+    fn a_real_provider_script_executes_a_cell_and_its_result_is_returned() {
         let script = fake_provider(
             "exec-ok",
             r#"{"ok":true,"protocol_version":1,"result":{"status":"done","tokens_in":3,"tokens_out":4,"cost_usd":0.5,"summary":"remote ok"}}"#,
@@ -1287,7 +1288,7 @@ mod tests {
         assert!((r.cost_usd - 0.5).abs() < f64::EPSILON);
         assert!(
             local.seen.lock().unwrap().is_empty(),
-            "the session must have run remotely, not locally"
+            "the cell must have run remotely, not locally"
         );
     }
 
@@ -1380,7 +1381,7 @@ mod tests {
 
     #[test]
     fn provider_stderr_ralphus_events_reach_cartographer() {
-        // Without this a remote session is invisible in Cartographer AND its
+        // Without this a remote cell is invisible in Cartographer AND its
         // live cost cap silently stops being enforced -- both fail quietly.
         let event = r#"{"source":"llm-invoke","message":"done","payload":{}}"#;
         let line = format!("{EVENT_MARKER}{event}");
@@ -1408,7 +1409,7 @@ mod tests {
             .lock()
             .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter {
-                run_id: Some("run-1".to_string()),
+                squad_id: Some("squad-1".to_string()),
                 ..crate::cartographer::CartographerFilter::recent(50)
             })
             .unwrap();
@@ -1493,9 +1494,9 @@ mod tests {
     }
 
     #[test]
-    fn an_async_handle_is_cleared_from_the_store_once_the_session_finishes() {
+    fn an_async_handle_is_cleared_from_the_store_once_the_cell_finishes() {
         // RAL-201: the persisted handle exists so a daemon restart mid-poll
-        // can reconcile it -- once the session actually finishes normally
+        // can reconcile it -- once the cell actually finishes normally
         // there is nothing left to reconcile, so the row must not linger.
         let script = fake_async_provider(
             "async-clear",
@@ -1518,7 +1519,7 @@ mod tests {
                 .all_remote_exec_handles()
                 .unwrap()
                 .is_empty(),
-            "the handle row must be cleared once the session finishes"
+            "the handle row must be cleared once the cell finishes"
         );
     }
 
@@ -1538,7 +1539,7 @@ mod tests {
         register(&s, "ib", &script);
         s.lock()
             .unwrap()
-            .save_remote_exec_handle("run-1", "s0", "ib", "A", "stale-handle")
+            .save_remote_exec_handle("squad-1", "s0", "ib", "A", "stale-handle")
             .unwrap();
 
         reconcile_remote_exec_handles(&s.lock().unwrap());
@@ -1555,7 +1556,7 @@ mod tests {
             .lock()
             .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter {
-                run_id: Some("run-1".to_string()),
+                squad_id: Some("squad-1".to_string()),
                 ..crate::cartographer::CartographerFilter::recent(50)
             })
             .unwrap();
@@ -1576,7 +1577,7 @@ mod tests {
         let s = store();
         s.lock()
             .unwrap()
-            .save_remote_exec_handle("run-1", "s0", "ghostscheme", "A", "h1")
+            .save_remote_exec_handle("squad-1", "s0", "ghostscheme", "A", "h1")
             .unwrap();
         reconcile_remote_exec_handles(&s.lock().unwrap());
         assert!(
@@ -1589,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn a_streamed_remote_session_is_readable_through_the_existing_live_view_snapshot() {
+    fn a_streamed_remote_cell_is_readable_through_the_existing_live_view_snapshot() {
         // Reusing the pane-snapshot file the board already reads means remote
         // Live View needs no UI change at all.
         let script = fake_async_provider(
@@ -1612,7 +1613,7 @@ mod tests {
         let sp = spec(Some("ib:A"));
         let r = router.run(&sp);
         assert_eq!(r.status, "done", "{r:?}");
-        let name = crate::tmux::session_name(&sp.run_id, &sp.task, &sp.session_id);
+        let name = crate::tmux::session_name(&sp.squad_id, &sp.task, &sp.cell_id);
         let snapshot = crate::tmux::read_pane_snapshot(&name).unwrap_or_default();
         assert!(
             snapshot.contains("hello from the farm"),
@@ -1622,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_that_does_not_implement_stream_still_completes_the_session() {
+    fn a_provider_that_does_not_implement_stream_still_completes_the_cell() {
         // Streaming is a convenience. A provider that omits it loses Live View,
         // not the ability to run work.
         let script = fake_async_provider(
@@ -1645,7 +1646,7 @@ mod tests {
 
     #[test]
     fn cancelling_mid_run_stops_polling_and_reports_cancelled() {
-        // Before the handle refactor a cancelled remote session kept running on
+        // Before the handle refactor a cancelled remote cell kept running on
         // the remote machine with no way to stop it -- budget burning with no
         // off switch. `status` here never leaves "running", so the only way
         // this test terminates is via the cancel path.
@@ -1675,10 +1676,10 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_session_over_its_cost_cap_is_cancelled_mid_poll() {
+    fn a_remote_cell_over_its_cost_cap_is_cancelled_mid_poll() {
         // RAL-201: mirrors `SubprocessRunner`'s live cost-cap kill (RAL-161).
         // Without tracking `llm-invoke` usage across `status`/`stream` polls,
-        // a remote session's `maximum_budget_usd` was silently unenforced
+        // a remote cell's `maximum_budget_usd` was silently unenforced
         // even though the usage itself still reached the DB via
         // `forward_runner_event` -- this asserts the in-flight kill itself,
         // not just that the usage was recorded.

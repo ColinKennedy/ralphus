@@ -10,10 +10,18 @@ use std::process::ExitCode;
 use ralphus_librarian::{Command, DEFAULT_DAEMON_URL, parse_args, server, usage};
 
 fn main() -> ExitCode {
+    // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
+    // builds don't strip it as dead code ahead of the `ralphus license`
+    // subcommand landing.
+    std::hint::black_box(ralphus_core::license::embedded_license());
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Command::Version => {
             println!("ralphus-librarian {}", ralphus_core::version());
+            ExitCode::SUCCESS
+        }
+        Command::License => {
+            print!("{}", ralphus_core::license::embedded_license());
             ExitCode::SUCCESS
         }
         Command::Help => {
@@ -27,8 +35,13 @@ fn main() -> ExitCode {
             }
             let daemon_url = std::env::var("RALPHUS_DAEMON_URL")
                 .unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string());
+            let bind_host = ralphus_librarian::resolve_bind_host(
+                std::env::var(ralphus_librarian::BIND_ADDR_ENV)
+                    .ok()
+                    .as_deref(),
+            );
             eprintln!(
-                "ralphus-librarian serving on http://127.0.0.1:{port} (daemon: {daemon_url})"
+                "ralphus-librarian serving on http://{bind_host}:{port} (daemon: {daemon_url})"
             );
             let otel_provider = ralphus_librarian::otel::init("ralphus-librarian");
             let result = server::serve(port, &daemon_url);

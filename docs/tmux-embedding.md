@@ -1,7 +1,7 @@
 # Embedding tmux (RAL-102)
 
-ralphus routes every agent invocation (task sessions, `prompt`-kind verify
-steps, Guardian merge/resolver sessions) through a detached tmux session
+ralphus routes every agent invocation (task cells, `prompt`-kind proof
+steps, Guardian merge/resolver cells) through a detached tmux session
 instead of a raw child process, so the board can show a live, pollable view
 of what the agent is doing. See `daemon/src/tmux.rs` for the wrapper and
 `daemon/src/runner.rs`'s `SubprocessRunner::run_via_tmux` for how a session
@@ -58,7 +58,7 @@ the asset.
 2. Rebuild with `cargo build --release --features ralphus-daemon/embedded-tmux`
    (or add the feature to `scripts/build-release.cmd`'s daemon build step).
 3. Verify: unset `RALPHUS_TMUX_CMD`, temporarily remove `tmux` from `PATH`,
-   and confirm the daemon still starts task sessions successfully via the
+   and confirm the daemon still starts task cells successfully via the
    embedded fallback.
 
 macOS and Linux embedding follow the same pattern

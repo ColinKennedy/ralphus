@@ -1,0 +1,39 @@
+# RAL-241 manual-verification repro: a task engineered to stall/hang.
+#
+# Every cell -- command or prompt/agent alike -- runs tmux-wrapped
+# (daemon/src/runner.rs::SubprocessRunner::run_cancellable, RAL-151), so a
+# plain `command` cell is enough to exercise the stall-detection path: the
+# cell below sleeps for 10 minutes without printing anything, so
+# `Store::live_activity_ms` never advances past this attempt's start time.
+# Once that silence exceeds the configured stall threshold, the daemon
+# broadcasts one `high`-priority mailbox message for the stall onset (not
+# repeated on every poll -- see `SubprocessRunner::check_stall_escalation`).
+#
+# The real default threshold is 5 minutes (`RALPHUS_MAILBOX_STALL_SECS`,
+# daemon/src/runner.rs::mailbox_stall_threshold), which is impractical to
+# sit and watch by hand. For manual verification, start the daemon with a
+# much shorter override, e.g.:
+#
+#   RALPHUS_MAILBOX_STALL_SECS=20 ralphus-daemon serve
+#   # (or set it before scripts/build-debug.sh, which execs the daemon in
+#   # the same shell)
+#
+# `timeout_minutes` below is a safety net so the cell (and this repro)
+# eventually ends on its own even if nobody's watching -- it's set well above
+# the shortened stall threshold so there's time to observe the escalation
+# first.
+#
+# Usage:
+#   RALPHUS_MAILBOX_STALL_SECS=20 <start the daemon>
+#   ralphus submit examples/mailbox/repro-stall.toml
+#   ralphus mailbox check   # after ~20s of the cell running, once it stalls
+#   # (or, from a `ralphus quick-start watcher claude-code`/`codex` session,
+#   # just wait for its next turn-boundary `ralphus mailbox check` to surface it)
+
+[[task]]
+name = "mailbox-repro-stall"
+
+[[task.cell]]
+cwd = "."
+command = 'powershell -NoProfile -Command "Start-Sleep -Seconds 600"'
+timeout_minutes = 3

@@ -122,6 +122,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
+def daemon_token_path() -> Path:
+    home = os.environ.get("USERPROFILE") or os.environ.get("HOME") or "."
+    return Path(home) / ".ralphus" / "daemon.token"
+
+
+def read_daemon_token() -> str | None:
+    token = os.environ.get("RALPHUS_DAEMON_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        return daemon_token_path().read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def read_version(path: Path) -> str:
     completed = run_checked([str(path), "-V"], cwd=path.parent)
     text = (completed.stdout + completed.stderr).strip()
@@ -159,14 +174,14 @@ def bundle_readme(
            Or, from Git Bash, ./start-ralphus.sh
         2. Open http://127.0.0.1:7474
         3. Validate the example task:
-           bin\\ralphus\\ralphus.exe validate examples\\hello.toml
+           bin\\ralphus.exe validate examples\\hello.toml
         4. Submit it:
-           bin\\ralphus\\ralphus.exe submit examples\\hello.toml --wait
+           bin\\ralphus.exe submit examples\\hello.toml --wait
 
         Bundle layout
         -------------
         - bin/
-          ralphus-daemon.exe, ralphus-librarian.exe, the bundled CLI, and the bundled runner.
+          ralphus-daemon.exe, ralphus-librarian.exe, ralphus.exe, and ralphus-runner.exe.
         - tmux/
           psmux 3.3.7 plus its LICENSE and upstream README.
         - docs/
@@ -187,11 +202,12 @@ def bundle_readme(
         - Defaults: daemon on 127.0.0.1:7890, librarian on 127.0.0.1:7474.
         - Pass --daemon-port, --librarian-port, and optionally --db-path to run a second isolated stack.
         - Non-default daemon ports auto-derive a DB at %USERPROFILE%\\.ralphus\\tasks-<port>.db unless --db-path is supplied explicitly.
+        - Startup logs go to logs\\daemon.log and logs\\librarian.log inside the extracted bundle directory.
 
         Troubleshooting
         ---------------
-        - If the launcher reports a missing file, keep the extracted folder layout intact; the Python bundles must stay beside their _internal directories.
-        - If the daemon does not come up, check bin\\ralphus-daemon.exe serve --port 7890 manually from this folder.
+        - If the launcher reports a missing file, keep the extracted folder layout intact; the executables and tmux binary are resolved relative to this folder.
+        - If the daemon does not come up, check logs\\daemon.log first, then try bin\\ralphus-daemon.exe serve --port 7890 manually from this folder.
         - If tmux behavior looks wrong, run tmux\\tmux.exe -V and confirm it reports psmux 3.3.7.
         """
     )
@@ -203,13 +219,22 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_http(url: str, *, timeout_sec: float) -> None:
+def wait_http(url: str, *, timeout_sec: float, require_daemon_auth: bool = False) -> None:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=2) as response:
+            request = urllib.request.Request(url)
+            if require_daemon_auth:
+                token = read_daemon_token()
+                if token:
+                    request.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(request, timeout=2) as response:
                 if response.status == 200:
                     return
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+            time.sleep(0.25)
         except urllib.error.URLError:
             time.sleep(0.25)
     raise RuntimeError(f"timed out waiting for {url}")
@@ -242,8 +267,8 @@ def assemble_bundle(
     dist_dir = root / "dist"
     copy_file(dist_dir / "ralphus-daemon.exe", bundle_root / "bin" / "ralphus-daemon.exe")
     copy_file(dist_dir / "ralphus-librarian.exe", bundle_root / "bin" / "ralphus-librarian.exe")
-    copy_tree(dist_dir / "ralphus", bundle_root / "bin" / "ralphus")
-    copy_tree(dist_dir / "ralphus-runner", bundle_root / "bin" / "ralphus-runner")
+    copy_file(dist_dir / "ralphus.exe", bundle_root / "bin" / "ralphus.exe")
+    copy_file(dist_dir / "ralphus-runner.exe", bundle_root / "bin" / "ralphus-runner.exe")
 
     for rel_path in manifest["bundle"]["docs"]:
         src = root / rel_path
@@ -358,14 +383,18 @@ def smoke_test(zip_path: Path) -> None:
             stderr=subprocess.DEVNULL,
         )
         try:
-            wait_http(f"http://127.0.0.1:{daemon_port}/api/daemon", timeout_sec=30.0)
+            wait_http(
+                f"http://127.0.0.1:{daemon_port}/api/daemon",
+                timeout_sec=30.0,
+                require_daemon_auth=True,
+            )
             wait_http(f"http://127.0.0.1:{librarian_port}/", timeout_sec=30.0)
 
             tmux_version = read_version(bundle_root / "tmux" / "tmux.exe")
             if "psmux 3.3.7" not in tmux_version:
                 raise RuntimeError(f"unexpected bundled tmux version: {tmux_version}")
 
-            cli = bundle_root / "bin" / "ralphus" / "ralphus.exe"
+            cli = bundle_root / "bin" / "ralphus.exe"
             daemon_url = f"http://127.0.0.1:{daemon_port}"
             run_checked(
                 [str(cli), "--daemon-url", daemon_url, "validate", "examples/hello.toml"],
@@ -376,12 +405,12 @@ def smoke_test(zip_path: Path) -> None:
                 cwd=bundle_root,
             )
             result = json.loads(submit.stdout)
-            run_id = str(result["run_id"])
+            squad_id = str(result["squad_id"])
             deadline = time.time() + 60.0
             final_state = ""
             while time.time() < deadline:
                 show = run_checked(
-                    [str(cli), "--daemon-url", daemon_url, "--json", "run", "show", run_id],
+                    [str(cli), "--daemon-url", daemon_url, "--json", "squad", "show", squad_id],
                     cwd=bundle_root,
                 )
                 run_view = json.loads(show.stdout)
@@ -390,7 +419,9 @@ def smoke_test(zip_path: Path) -> None:
                     break
                 time.sleep(1.0)
             if final_state != "done":
-                raise RuntimeError(f"bundle smoke run {run_id} ended in state {final_state!r}")
+                raise RuntimeError(
+                    f"bundle smoke squad {squad_id} ended in state {final_state!r}"
+                )
             hello_file = bundle_root / "hello-from-ralphus.txt"
             if hello_file.read_text(encoding="utf-8").strip() != "hello from ralphus":
                 raise RuntimeError("bundle smoke run did not write the expected output file")

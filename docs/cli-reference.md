@@ -42,8 +42,8 @@ exception — see below.
 
 Most `show`/action commands take a **selector** instead of raw ids/indices
 (`cli/src/ralphus/selector.py`). Anywhere this reference writes `<selector>`,
-`<run_id>`, or a queue item path, the **ralphus URI** form below is accepted
-too — including the bare `run_id` positionals of the `run *` family, `status`,
+`<squad_id>`, or a queue item path, the **ralphus URI** form below is accepted
+too — including the bare `squad_id` positionals of the `squad *` family, `status`,
 `graph`, and `queue set-status`/`reorder`/`set-position`.
 
 ### The ralphus URI scheme (RAL-188)
@@ -53,11 +53,11 @@ prints the exact URI addressing what it just displayed, as its first `uri`
 field:
 
 ```
-ralphus:/RUN[<label>]                                                        ?id=<run_id>
-ralphus:/RUN[<label>]/TASK[<name>]                                           ?id=<run_id>
-ralphus:/RUN[<label>]/TASK[<name>]/VERIFY[<name-or-~index>]                  ?id=<run_id>
-ralphus:/RUN[<label>]/TASK[<name>]/SESSION[<name>]                           ?id=<run_id>
-ralphus:/RUN[<label>]/TASK[<name>]/SESSION[<name>]/VERIFY[<name-or-~index>]  ?id=<run_id>
+ralphus:/SQUAD[<label>]                                                      ?id=<squad_id>
+ralphus:/SQUAD[<label>]/TASK[<name>]                                         ?id=<squad_id>
+ralphus:/SQUAD[<label>]/TASK[<name>]/PROOF[<name-or-~index>]                 ?id=<squad_id>
+ralphus:/SQUAD[<label>]/TASK[<name>]/CELL[<name>]                            ?id=<squad_id>
+ralphus:/SQUAD[<label>]/TASK[<name>]/CELL[<name>]/PROOF[<name-or-~index>]    ?id=<squad_id>
 ralphus:/REVIEW[<name>]                                                      ?id=<guardian_id>
 ralphus:/REVIEW[<name>]?id=<guardian_id>&combined
 ralphus:/REVIEW[<name>]?id=<guardian_id>&worktree=<branch-id-or-name-or-~index>
@@ -71,9 +71,9 @@ Rules:
   anything ralphus produces, and authoritative when present — it wins over a
   stale or renamed label. An ambiguous label with **no** `?id=` exits 2 with
   the list of candidates; it is never silently resolved to the most recent.
-- **A positional index carries a `~` sigil** — `VERIFY[~0]`, `?worktree=~2`.
-  A bare `VERIFY[0]` addresses the step literally *named* `0`. This is how an
-  anonymous verify step (one with no author-supplied `id`) is addressed. `~` is
+- **A positional index carries a `~` sigil** — `PROOF[~0]`, `?worktree=~2`.
+  A bare `PROOF[0]` addresses the step literally *named* `0`. This is how an
+  anonymous proof step (one with no author-supplied `id`) is addressed. `~` is
   an RFC 3986 **unreserved** character, deliberately: the sigil was originally
   `#`, which is the fragment delimiter, so a URI carrying one was truncated
   anywhere it met a real URL parser (a browser address bar, the board's own
@@ -88,7 +88,7 @@ Rules:
   raw. A hand-written literal `/` inside brackets also parses, because
   balanced `[...]` groups are extracted before the path is split.
 - The `ralphus:` prefix is a **string format**, not an OS-registered protocol
-  handler. The bare `RUN[...]` shorthand is accepted too.
+  handler. The bare `SQUAD[...]` shorthand is accepted too.
 
 Names resolve against the daemon; `GET /api/resolve?uri=...` does the same
 translation for non-CLI consumers (see `docs/daemon-api.md`).
@@ -97,11 +97,11 @@ translation for non-CLI consumers (see `docs/daemon-api.md`).
 
 | Selector | Addresses |
 |---|---|
-| `<run_id>` | a run |
-| `<run_id>/<task>` | a task node (`task` = index or name) |
-| `<run_id>/<task>/<session>` | a session (`session` = index or name) |
-| `<run_id>/<task>/verify/<i>` | a task-level verify step |
-| `<run_id>/<task>/<session>/verify/<i>` | a session-level verify step |
+| `<squad_id>` | a squad |
+| `<squad_id>/<task>` | a task node (`task` = index or name) |
+| `<squad_id>/<task>/<cell>` | a cell (`cell` = index or name) |
+| `<squad_id>/<task>/proof/<i>` | a task-level proof step |
+| `<squad_id>/<task>/<cell>/proof/<i>` | a cell-level proof step |
 | `<guardian_id>` or `@<name>` | a review |
 | `<guardian_id>~<pos-or-branch>` or `@<name>~<pos-or-branch>` | a review branch |
 | `<guardian_id>#<pos-or-branch>` or `@<name>#<pos-or-branch>` | a review branch (older spelling; still parsed) |
@@ -124,16 +124,16 @@ list of candidates.
 | `validate <file>` | Validate a task TOML file offline (no daemon needed if `ralphus-daemon` is on PATH) |
 | `submit <file...\|dir\|glob\|-> [--label] [--hold] [--activate] [--wait] [--no-validate]` | Submit task TOML. See [Submit](#submit) below |
 | `author [--goal\|--prompt-file] [--verify] [--review] [--hold] [--dry-run] ...` | Generate, validate, and submit a TOML from a plain-language goal |
-| `status [run_id] [--concurrency]` | Show one run, or list all runs; `--concurrency` shows scheduler load instead |
-| `resources` | Per-task CPU/RAM/GPU for running sessions |
-| `graph [run_id] [--global] [--all] [--format ascii\|dot]` | Render the task-order dependency graph |
+| `status [squad_id] [--concurrency]` | Show one squad, or list all squads; `--concurrency` shows scheduler load instead |
+| `resources` | Per-task CPU/RAM/GPU for running cells |
+| `graph [squad_id] [--global] [--all] [--format ascii\|dot]` | Render the task-order dependency graph |
 | `get <selector> [field.path]` | jq-lite field query over any entity's JSON view |
 | `clear [--all\|--status STATES] [--keep-temporary] [--yes]` | Bulk-delete tasks and reviews |
 | `check health [--enable-developer-checks]` | System/environment health check |
 | `completion bash` | Print a bash tab-completion script |
 | `configuration show [--no-local]` | Show sourced `.ralphus.toml` files and resolved values |
 | `task show-tutor` | Print the Task TOML schema reference |
-| `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the run queue by priority |
+| `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the squad queue by priority |
 | `initialize git [--path]` | Enable git rerere in a repository |
 
 ### Submit
@@ -141,18 +141,18 @@ list of candidates.
 `submit` accepts one or more sources, each of which may be a `.toml` file
 path, a directory (expands to every `*.toml` file in it, non-recursive), a
 glob pattern (shell-quote it so `ralphus` expands it, not your shell), or `-`
-for stdin. Explicit file paths combine into **one** run (so a shared
+for stdin. Explicit file paths combine into **one** squad (so a shared
 `ralphus:new-review/<key>` folds into a single review); a directory or glob
-submits **each matching file as its own separate run** instead (one failure
+submits **each matching file as its own separate squad** instead (one failure
 aborts the remaining batch).
 
 - `--hold` stages as `queued` instead of `pending`.
 - `--activate` forces `--hold` internally, submits, then immediately calls
-  `run activate` — "submit held then promote" in one step.
-- `--wait` polls each submitted run and prints its state until terminal;
-  exits 0 only if the run reached `done` (1 for `failed`/`cancelled`).
+  `squad activate` — "submit held then promote" in one step.
+- `--wait` polls each submitted squad and prints its state until terminal;
+  exits 0 only if the squad reached `done` (1 for `failed`/`cancelled`).
 - `submit` **validates before submitting by default** (a client-side
-  `POST /api/runs/validate` call) and prints the full per-line
+  `POST /api/squads/validate` call) and prints the full per-line
   `error [line N]: message` report instead of submitting if it fails. In a
   batch (directory/glob), each file is validated right before its own
   submit, so one invalid file blocks the rest of the batch. `--no-validate`
@@ -161,21 +161,21 @@ aborts the remaining batch).
   trades the fuller pre-submit report for the daemon's single summary error
   message. To validate without submitting at all, use `ralphus validate`.
 
-## run
+## squad
 
 | Command | Endpoint |
 |---|---|
-| `run list [--status] [--name] [--sort]` | `GET /api/tasks` (server-side filtered/sorted) |
-| `run show <run_id>` | `GET /api/runs/{id}` |
-| `run logs <run_id>` | `GET /api/runs/{id}/logs` |
-| `run set-status <run_id> <state>` | `POST /api/runs/{id}/set-status` |
-| `run restart <run_id>` | `POST /api/runs/{id}/restart` |
-| `run retry <run_id>` | `POST /api/runs/{id}/retry` |
-| `run activate <run_id>` | `POST /api/runs/{id}/activate` |
-| `run cancel <run_id>` | `POST /api/runs/{id}/cancel` |
-| `run delete <run_id> [--yes]` | `DELETE /api/runs/{id}` |
-| `run rename <run_id> <label>` | `POST /api/runs/{id}/edit` |
-| `run edit <run_id> [--label]` | `POST /api/runs/{id}/edit` |
+| `squad list [--status] [--name] [--sort]` | `GET /api/tasks` (server-side filtered/sorted) |
+| `squad show <squad_id>` | `GET /api/squads/{id}` |
+| `squad logs <squad_id>` | `GET /api/squads/{id}/logs` |
+| `squad set-status <squad_id> <state>` | `POST /api/squads/{id}/set-status` |
+| `squad restart <squad_id>` | `POST /api/squads/{id}/restart` |
+| `squad retry <squad_id>` | `POST /api/squads/{id}/retry` |
+| `squad activate <squad_id>` | `POST /api/squads/{id}/activate` |
+| `squad cancel <squad_id>` | `POST /api/squads/{id}/cancel` |
+| `squad delete <squad_id> [--yes]` | `DELETE /api/squads/{id}` |
+| `squad rename <squad_id> <label>` | `POST /api/squads/{id}/edit` |
+| `squad edit <squad_id> [--label]` | `POST /api/squads/{id}/edit` |
 
 ## task
 
@@ -183,29 +183,29 @@ aborts the remaining batch).
 |---|---|
 | `task show <selector>` | Task node detail |
 | `task set-status <selector> <state>` | Override a task's status |
-| `task restart-verify <selector> --from <i>` | Restart task-level verify steps from index `i` |
+| `task restart-proof <selector> --from <i>` | Restart task-level proof steps from index `i` |
 | `task edit <selector> [--name] [--project]` | Edit a task node's name/project |
 
-## session
+## cell
 
 | Command | What |
 |---|---|
-| `session show <selector>` | Session detail (incl. tokens, cost, agent, model, cwd) |
-| `session worktree <selector>` | The worktree/project a session is using |
-| `session reviews <selector>` | Reviews this session's branch participates in |
-| `session set-status <selector> <state>` | Override a session's status |
-| `session restart <selector>` | Restart a session and its downstream |
-| `session restart-verify <selector> --from <i>` | Restart session-level verify steps from index `i` |
-| `session edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command]` | Edit a session's fields |
-| `session terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
+| `cell show <selector>` | Cell detail (incl. tokens, cost, agent, model, cwd) |
+| `cell worktree <selector>` | The worktree/project a cell is using |
+| `cell reviews <selector>` | Reviews this cell's branch participates in |
+| `cell set-status <selector> <state>` | Override a cell's status |
+| `cell restart <selector>` | Restart a cell and its downstream |
+| `cell restart-proof <selector> --from <i>` | Restart cell-level proof steps from index `i` |
+| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command]` | Edit a cell's fields |
+| `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
 
-## verify
+## proof
 
 | Command | What |
 |---|---|
-| `verify show <selector>` | Verify step detail (kind, state, spec, output) |
-| `verify set-status <selector> <state>` | Override a verify step's status |
-| `verify restart <selector>` | Restart a verify step (dispatches to the task- or session-scoped restart endpoint) |
+| `proof show <selector>` | Proof step detail (kind, state, spec, output) |
+| `proof set-status <selector> <state>` | Override a proof step's status |
+| `proof restart <selector>` | Restart a proof step (dispatches to the task- or cell-scoped restart endpoint) |
 
 ## review
 
@@ -215,7 +215,7 @@ aborts the remaining batch).
 | `review show <selector>` | Review detail, incl. `ready`/`merge_progress`/`summary_state` |
 | `review logs <selector>` | State-transition audit log |
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
-| `review worktrees <selector>` | Worktrees/branches this review consumes, with source session |
+| `review worktrees <selector>` | Worktrees/branches this review consumes, with source cell |
 | `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
@@ -250,7 +250,7 @@ aborts the remaining batch).
 
 ### Why some commands print instead of act
 
-`session terminal`, `review checks run`, and `review action run` deliberately
+`cell terminal`, `review checks run`, and `review action run` deliberately
 print a resolved shell command + working directory instead of calling the
 daemon's `open-terminal` / `run-manual-commands` / `run-action-hint`
 endpoints. Those endpoints spawn a GUI terminal window **on whatever machine
@@ -287,6 +287,8 @@ Two independent command families (RAL-166), each with a `claude-code` and a
 | `quick-start manager codex [--command] [--shell] [-- ARGS...]` | Launch Codex primed with the same help-map system prompt, so it can orchestrate `ralphus` unsupervised. See [quick-start manager](#quick-start-manager) below |
 | `quick-start reviewer claude-code [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
 | `quick-start reviewer codex [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Codex primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
+| `quick-start watcher claude-code [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
+| `quick-start watcher codex [--command] [--shell] [-- ARGS...]` | Launch Codex primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
 
 There is no compatibility alias for the old `quick-start claude-code` shape —
 it is fully replaced by `quick-start manager claude-code`.
@@ -328,6 +330,34 @@ Common to both:
   `claude-code`/`codex` agent backends use
   (`ralphus.runner.claude_code_backend`/`ralphus.runner.codex_backend`) —
   one name per harness, everywhere that harness's executable is resolved.
+
+#### Agent Profiles (RAL-243)
+
+Custom backend routing belongs in `.ralphus.toml`, not in task TOML:
+
+```toml
+[agent.profiles.openrouter-deepseek]
+backend = "codex"
+executable = "codex-openrouter"
+
+[agent.profiles.openrouter-deepseek.env]
+OPENROUTER_API_KEY = { from_env = "OPENROUTER_API_KEY" }
+```
+
+Then a task or cell selects it through the existing field:
+
+```toml
+agent = "openrouter-deepseek"
+```
+
+Rules:
+
+- Profile names must not collide with reserved built-in backends (`claude`, `anthropic`, `ollama`, `claude-code`, `codex`, `raw`, plus the CLI aliases).
+- `backend = "raw"` is the explicit generic external-executable backend and requires `executable`.
+- `executable` is only valid with `claude-code`, `codex`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
+- Profile env values may be literal strings or `{ from_env = "VAR" }`; indirection is resolved in the daemon's own OS environment, so secrets never appear in task TOML or HTTP request/response bodies.
+- If a cell resolves to a custom agent profile, do not also set `model`. Current v1 rule: `if you're using a custom agent profile, you can't also set model`.
+- The old implicit fallback from an unknown `agent` name to a generic harness executable is gone. Use a named profile instead.
 
 #### What `--command` accepts (RAL-189)
 
@@ -417,6 +447,36 @@ reference. Delivery mechanism mirrors the matching `manager` entrypoint
   write-oriented review actions must go through an explicit `ralphus review
   ...` subcommand, never ad-hoc shell mutation in an inspected worktree.
 
+### quick-start watcher
+
+RAL-241, poll-only scope: a mailbox-polling supervisor session. Both
+entrypoints register (or reuse a locally persisted) mailbox `client_id` with
+the daemon (`POST /api/mailbox/register`) before launch, then inject a system
+prompt instructing the agent to run `ralphus mailbox check` after every user
+turn and show its output verbatim — `urgent` messages must be read and acted
+on before continuing, `high` before the agent would otherwise go idle,
+`normal` is informational. Delivery mechanism mirrors the matching `manager`/
+`reviewer` entrypoints (temp-file for `claude-code`, `-c
+developer_instructions=...` for `codex`); the full help-map is still appended
+for reference, since the watcher may need to inspect/act on whatever the
+escalation is about.
+
+Direct-push delivery into a live tmux-tracked session (rather than this
+turn-boundary poll) is out of scope here — see the ticket's Q&A.
+
+## mailbox
+
+RAL-241, poll-only scope: the escalation mailbox client.
+
+| Command | What |
+|---|---|
+| `mailbox check [--priority urgent\|high\|normal]` | List this client's unread messages, print them, then drain (mark read) exactly the ones printed |
+
+`mailbox check` mints (or reuses) a `client_id` the same way `quick-start
+watcher` does, so a stray manual run before ever launching a watcher session
+still works. Not on the `--read-only` safety list — it mutates drain state as
+a side effect even though it takes no other flags.
+
 ## Machine-readable help-map (RAL-110)
 
 The tree below is generated by walking every subcommand with `--verbose
@@ -460,18 +520,27 @@ use; see `READ_ONLY_NOTE`.
 - ralphus --daemon-url [url] --json  {Submit and manage autonomous agent tasks against the ralphus daemon.}
     - agent  {Inspect agent backends ralphus can run.}
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
-    - cartographer --ascending --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --run [str] --scope [str] --session [str] --source [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
+    - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
+    - cell  {Inspect and act on cells.}
+        - edit selector [str] --agent [name] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a cell's fields.}
+        - restart selector [str]  {Restart a cell (and its downstream), dirtying dependent squads.}
+        - restart-proof selector [str] --from [index]  {Restart a cell's proof steps from an index onwards.}
+        - (read-only-safe) reviews selector [str]  {The reviews this cell's branch participates in.}
+        - set-status selector [str] state [str]  {Manually override a cell's status.}
+        - (read-only-safe) show selector [str]  {Show a single cell's detail.}
+        - (read-only-safe) terminal selector [str] --mode [open|readonly]  {Print the command to resume a cell's conversation locally.}
+        - (read-only-safe) worktree selector [str]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
         - (read-only-safe) health --enable-developer-checks (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama).}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
     - (read-only-safe) get selector [str] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
-    - (read-only-safe) graph run_id [str, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
-    - (read-only-safe) history selector [str]  {Show a session/verify step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
+    - (read-only-safe) graph squad_id [str, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
+    - (read-only-safe) history selector [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
-    - (read-only-safe) listen selector [str] --timeout [seconds] --until [status]  {Block until a run/task/session/verify/review/review-worktree reaches a status.}
+    - (read-only-safe) listen selector [str] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
         - cleanup machine [str]  {Tear down one provisioned workspace on a machine provider (RAL-201).}
         - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
@@ -480,15 +549,19 @@ use; see `READ_ONLY_NOTE`.
         - remove scheme [str]  {Remove a registered machine provider.}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
-        - git --description [text] --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder session cwds against.}
+        - git --description [text] --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
-    - queue  {Inspect and reorder the run queue by priority.}
+    - proof  {Inspect and act on proof steps.}
+        - restart selector [str]  {Restart this proof step (and any later ones in its scope).}
+        - set-status selector [str] state [str]  {Manually override a proof step's status.}
+        - (read-only-safe) show selector [str]  {Show a single proof step's detail.}
+    - queue  {Inspect and reorder the squad queue by priority.}
         - (read-only-safe) list --all  {List queued work items (ready-to-run by default).}
         - reorder paths [str...]  {Set the queue order to the given item paths (dependency-repaired).}
         - set-position paths [str...] --relative --to [integer]  {Move item(s) to an absolute index or a relative offset.}
-        - set-status path [str] state [str]  {Set a run/task/session/verify status (e.g. ignored) by item path or run id.}
+        - set-status path [str] state [str]  {Set a squad/task/cell/proof status (e.g. ignored) by item path or squad id.}
     - (read-only-safe) resources  {Show per-task resource usage (CPU/RAM/GPU).}
-    - retry run_id [str]  {Re-run a run from scratch (reset to pending). (Rust port: run-level only; Python's per-selector --environment/--env-file overrides are not yet ported.)}
+    - retry squad_id [str]  {Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; Python's per-selector --environment/--env-file overrides are not yet ported.)}
     - review (subagent)  {Inspect and act on reviews (guardians).}
         - action  {User-declared [[review.action]] test/action hints.}
             - (read-only-safe) list selector [str]  {List the action hints.}
@@ -538,42 +611,29 @@ use; see `READ_ONLY_NOTE`.
         - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
         - (read-only-safe) worktrees selector [str]  {The worktrees/branches this review consumes.}
-    - run  {Inspect and act on runs.}
-        - activate run_id [str]  {Promote a held (queued) run to pending.}
-        - cancel run_id [str]  {Cancel a run.}
-        - delete run_id [str] --yes  {Permanently delete a run.}
-        - edit run_id [str] --label [text]  {Edit a run's fields.}
-        - (read-only-safe) list --name [substring] --sort [date|name] --status [states]  {List runs.}
-        - (read-only-safe) logs run_id [str]  {Show a run's state-transition audit log.}
-        - rename run_id [str] label [str]  {Rename a run's label.}
-        - restart run_id [str]  {Restart a whole run, dirtying every run that depends on it.}
-        - retry run_id [str]  {Re-run with the same parameters (reset to pending).}
-        - set-status run_id [str] state [str]  {Manually override a run's status.}
-        - (read-only-safe) show run_id [str]  {Show a single run's detail.}
-        - timeline run_id [str] --write [path]  {Generate the merged, chronological uber-log-viewer timeline for a run (RAL-155).}
-    - session  {Inspect and act on sessions.}
-        - edit selector [str] --agent [name] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a session's fields.}
-        - restart selector [str]  {Restart a session (and its downstream), dirtying dependent runs.}
-        - restart-verify selector [str] --from [index]  {Restart a session's verify steps from an index onwards.}
-        - (read-only-safe) reviews selector [str]  {The reviews this session's branch participates in.}
-        - set-status selector [str] state [str]  {Manually override a session's status.}
-        - (read-only-safe) show selector [str]  {Show a single session's detail.}
-        - (read-only-safe) terminal selector [str] --mode [open|readonly]  {Print the command to resume a session's conversation locally.}
-        - (read-only-safe) worktree selector [str]  {Show the worktree/project a session is using.}
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}
-    - (read-only-safe) status run_id [str, optional] --concurrency  {Show run status from the daemon.}
+    - squad  {Inspect and act on squads.}
+        - activate squad_id [str]  {Promote a held (queued) squad to pending.}
+        - cancel squad_id [str]  {Cancel a squad.}
+        - delete squad_id [str] --yes  {Permanently delete a squad.}
+        - edit squad_id [str] --label [text]  {Edit a squad's fields.}
+        - (read-only-safe) list --name [substring] --sort [date|name] --status [states]  {List squads.}
+        - (read-only-safe) logs squad_id [str]  {Show a squad's state-transition audit log.}
+        - rename squad_id [str] label [str]  {Rename a squad's label.}
+        - restart squad_id [str]  {Restart a whole squad, dirtying every squad that depends on it.}
+        - retry squad_id [str]  {Re-run with the same parameters (reset to pending).}
+        - set-status squad_id [str] state [str]  {Manually override a squad's status.}
+        - (read-only-safe) show squad_id [str]  {Show a single squad's detail.}
+        - timeline squad_id [str] --write [path]  {Generate the merged, chronological uber-log-viewer timeline for a squad (RAL-155).}
+    - (read-only-safe) status squad_id [str, optional] --concurrency  {Show squad status from the daemon.}
     - submit file [str...] --activate --hold --label [text] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
         - edit selector [str] --name [name] --project [name]  {Edit a task node's name/project.}
-        - restart-verify selector [str] --from [index]  {Restart a task's verify steps from an index onwards.}
+        - restart-proof selector [str] --from [index]  {Restart a task's proof steps from an index onwards.}
         - set-status selector [str] state [str]  {Manually override a task's status.}
         - (read-only-safe) show selector [str]  {Show a single task node's detail.}
     - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
     - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
-    - verify  {Inspect and act on verify steps.}
-        - restart selector [str]  {Restart this verify step (and any later ones in its scope).}
-        - set-status selector [str] state [str]  {Manually override a verify step's status.}
-        - (read-only-safe) show selector [str]  {Show a single verify step's detail.}
 ```
 <!-- END GENERATED HELP-MAP (RAL-110) -->

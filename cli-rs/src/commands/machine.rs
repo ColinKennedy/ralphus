@@ -105,7 +105,10 @@ pub fn dispatch(cmd: MachineCommand, opts: &GlobalOpts) -> i32 {
     let client = opts.client();
     match cmd {
         MachineCommand::Help => {
-            println!("ralphus machine <register|list|get|remove|cleanup>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["machine"]).expect("machine help exists")
+            );
             0
         }
         MachineCommand::UsageError(m) => {

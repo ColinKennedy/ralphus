@@ -350,6 +350,124 @@ fn check_config(cwd: &Path) -> CheckResult {
     )
 }
 
+/// Validates `.ralphus.toml`'s `[forge] pull_request_branch_convention`
+/// (RAL-244) for `cwd`, reusing the daemon's own layered resolution
+/// (`ralphus_daemon::config::resolve_forge` -- global config under the
+/// nearest per-project `.ralphus.toml`) rather than re-parsing the file
+/// client-side, so this can never disagree with what `pr.rs` actually uses
+/// at submission time. Pure filesystem parsing with no daemon-process-
+/// specific state (unlike `check_agent_profiles`'s `from_env`/`executable`
+/// resolution), so -- like `check_config` -- this never needs the daemon to
+/// be reachable. An explicitly-set-but-invalid convention is a hard `fail`
+/// (RAL-244 interview decision), unlike every other `.ralphus.toml` string
+/// field, which silently falls back to its default.
+fn check_pull_request_branch_convention(cwd: &Path) -> CheckResult {
+    check_pull_request_branch_convention_for(&ralphus_daemon::config::resolve_forge(cwd))
+}
+
+/// Pure core of [`check_pull_request_branch_convention`], taking an
+/// already-resolved [`ralphus_daemon::config::ForgeConfig`] -- split out so
+/// tests can exercise it without mutating the real `RALPHUS_CONFIG_HOME`/
+/// `USERPROFILE` environment (this workspace forbids `unsafe`, which
+/// `std::env::set_var` requires), same rationale as `config.rs`'s
+/// `configuration_path_env` threading.
+fn check_pull_request_branch_convention_for(
+    forge_cfg: &ralphus_daemon::config::ForgeConfig,
+) -> CheckResult {
+    let Some(convention) = forge_cfg.pull_request_branch_convention.clone() else {
+        return CheckResult::new(
+            "pull-request-branch-convention",
+            PASS,
+            format!(
+                "not set (defaults to '{}')",
+                ralphus_daemon::config::DEFAULT_PR_BRANCH_CONVENTION
+            ),
+        );
+    };
+    match ralphus_daemon::config::validate_pull_request_branch_convention(&convention) {
+        Ok(()) => CheckResult::new("pull-request-branch-convention", PASS, convention),
+        Err(e) => CheckResult::new("pull-request-branch-convention", FAIL, e),
+    }
+}
+
+/// Delegates to `GET /api/health/agent-profiles`, which runs entirely
+/// inside the daemon process -- `from_env`/`executable` resolution has to
+/// happen there, since the daemon may have been started with a different
+/// environment/PATH than whatever shell is running this CLI (a background
+/// service, a stale terminal, ...). Checking client-side would silently
+/// verify the wrong process.
+fn check_agent_profiles(daemon_url: &str, cwd: &Path) -> Vec<CheckResult> {
+    let client = DaemonClient::new(daemon_url);
+    let response = match client.health_agent_profiles(cwd) {
+        Ok(response) => response,
+        Err(e) => {
+            return vec![CheckResult::new(
+                "agent-profiles",
+                FAIL,
+                format!("could not reach daemon to check agent profiles: {e}"),
+            )];
+        }
+    };
+    response["profiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let status = if p["status"].as_str() == Some(PASS) {
+                PASS
+            } else {
+                FAIL
+            };
+            CheckResult::new(
+                p["name"].as_str().unwrap_or("agent-profile"),
+                status,
+                p["detail"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Validates that `.ralphus.toml`'s `[review].default_resolver_agent`
+/// (RAL-?, `ralphus_daemon::config::ReviewConfig::default_resolver_agent`)
+/// names a real, currently-selectable agent -- a built-in backend or a
+/// configured `[agent.profiles.*]` entry -- for `cwd`. Delegates to
+/// `GET /api/agents`, the same daemon-side resolution the board's
+/// review-resolver dropdown uses, so this can never disagree with what a
+/// review actually falls back to (mirrors `check_agent_profiles`'s
+/// rationale for staying daemon-side rather than re-parsing `.ralphus.toml`
+/// client-side).
+fn check_default_resolver_agent(daemon_url: &str, cwd: &Path) -> CheckResult {
+    let client = DaemonClient::new(daemon_url);
+    let response = match client.list_agents(cwd) {
+        Ok(response) => response,
+        Err(e) => {
+            return CheckResult::new(
+                "default-resolver-agent",
+                FAIL,
+                format!("could not reach daemon to check the default resolver agent: {e}"),
+            );
+        }
+    };
+    let default_agent = response["default_agent"].as_str().unwrap_or("ollama");
+    let known = response["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|a| a["id"].as_str() == Some(default_agent));
+    if known {
+        CheckResult::new("default-resolver-agent", PASS, default_agent)
+    } else {
+        CheckResult::new(
+            "default-resolver-agent",
+            FAIL,
+            format!(
+                "[review].default_resolver_agent = \"{default_agent}\" does not match any \
+                 built-in backend or configured [agent.profiles.*] entry for this project"
+            ),
+        )
+    }
+}
+
 fn check_cargo() -> CheckResult {
     match which("cargo") {
         None => CheckResult::developer(
@@ -371,6 +489,9 @@ pub fn run_checks(daemon_url: &str, cwd: &Path, enable_developer_checks: bool) -
     results.push(check_ollama());
     results.push(check_nvidia_smi());
     results.push(check_config(cwd));
+    results.push(check_pull_request_branch_convention(cwd));
+    results.extend(check_agent_profiles(daemon_url, cwd));
+    results.push(check_default_resolver_agent(daemon_url, cwd));
     results.push(check_agent_command(
         "claude-command",
         "RALPHUS_CLAUDE_COMMAND",
@@ -427,5 +548,36 @@ mod tests {
         // `git` is a hard requirement elsewhere in this suite's own dev
         // environment expectations (health check itself requires it).
         assert!(which("git").is_some() || std::env::var("PATH").is_err());
+    }
+
+    #[test]
+    fn check_pull_request_branch_convention_passes_when_unset() {
+        let result = check_pull_request_branch_convention_for(
+            &ralphus_daemon::config::ForgeConfig::default(),
+        );
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("{name}-review"));
+    }
+
+    #[test]
+    fn check_pull_request_branch_convention_passes_when_valid() {
+        let cfg = ralphus_daemon::config::ForgeConfig {
+            pull_request_branch_convention: Some("review-{name}".to_string()),
+            ..ralphus_daemon::config::ForgeConfig::default()
+        };
+        let result = check_pull_request_branch_convention_for(&cfg);
+        assert_eq!(result.status, PASS);
+        assert_eq!(result.detail, "review-{name}");
+    }
+
+    #[test]
+    fn check_pull_request_branch_convention_fails_when_missing_placeholder() {
+        let cfg = ralphus_daemon::config::ForgeConfig {
+            pull_request_branch_convention: Some("static-branch".to_string()),
+            ..ralphus_daemon::config::ForgeConfig::default()
+        };
+        let result = check_pull_request_branch_convention_for(&cfg);
+        assert_eq!(result.status, FAIL);
+        assert!(result.detail.contains("{name}"));
     }
 }

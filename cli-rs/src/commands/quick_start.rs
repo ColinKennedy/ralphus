@@ -1,5 +1,10 @@
-//! `ralphus quick-start <manager|reviewer> <claude-code|codex>`, ported from
-//! `cli/src/ralphus/__main__.py`'s quick-start group.
+//! `ralphus quick-start <manager|reviewer|watcher> <claude-code|codex>`.
+//! `manager`/`reviewer` are ported from `cli/src/ralphus/__main__.py`'s
+//! quick-start group; `watcher` is new (RAL-241) -- a mailbox-polling
+//! supervisor session that registers a `client_id` with the daemon on
+//! startup (see `crate::commands::mailbox::ensure_client_id`) and launches
+//! with a system prompt instructing the agent to run `ralphus mailbox check`
+//! after every user turn.
 //!
 //! Despite the "interactive" framing, this does **not** touch tmux/psmux at
 //! all -- that mechanism is for tracking a *scheduled task's* session, a
@@ -14,6 +19,7 @@
 
 use std::process::Command;
 
+use crate::args::GlobalOpts;
 use crate::flags::Scanner;
 
 const CLAUDE_READ_ONLY_MECHANISM: &str = "--permission-mode plan";
@@ -42,6 +48,13 @@ pub enum QuickStartCommand {
         target: Option<String>,
         args: LaunchArgs,
     },
+    /// RAL-241: a mailbox-polling supervisor session (see
+    /// `crate::commands::mailbox`) -- registers a `client_id` with the
+    /// daemon on startup, then launches with a system prompt instructing the
+    /// agent to run `ralphus mailbox check` after every user turn.
+    WatcherHelp,
+    WatcherClaudeCode(LaunchArgs),
+    WatcherCodex(LaunchArgs),
     UsageError(String),
 }
 
@@ -112,6 +125,20 @@ pub fn parse(args: &[String]) -> QuickStartCommand {
                 "unknown quick-start reviewer subcommand: {other}"
             )),
         },
+        Some("watcher") => match head.get(1).map(String::as_str) {
+            None => QuickStartCommand::WatcherHelp,
+            Some("claude-code") => {
+                let (launch, _) = parse_launch_args(&head[2..], passthrough);
+                QuickStartCommand::WatcherClaudeCode(launch)
+            }
+            Some("codex") => {
+                let (launch, _) = parse_launch_args(&head[2..], passthrough);
+                QuickStartCommand::WatcherCodex(launch)
+            }
+            Some(other) => QuickStartCommand::UsageError(format!(
+                "unknown quick-start watcher subcommand: {other}"
+            )),
+        },
         Some(other) => {
             QuickStartCommand::UsageError(format!("unknown quick-start subcommand: {other}"))
         }
@@ -120,11 +147,11 @@ pub fn parse(args: &[String]) -> QuickStartCommand {
 
 #[must_use]
 #[allow(clippy::print_stdout)]
-pub fn dispatch(cmd: QuickStartCommand) -> i32 {
+pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
     match cmd {
         QuickStartCommand::Help => {
             println!(
-                "ralphus quick-start <manager|reviewer> <claude-code|codex> [--command CMD] [--shell SHELL] [--read-only] [-- ARGS...]"
+                "ralphus quick-start <manager|reviewer|watcher> <claude-code|codex> [--command CMD] [--shell SHELL] [--read-only] [-- ARGS...]"
             );
             0
         }
@@ -134,6 +161,10 @@ pub fn dispatch(cmd: QuickStartCommand) -> i32 {
         }
         QuickStartCommand::ReviewerHelp => {
             println!("ralphus quick-start reviewer <claude-code|codex> [target]");
+            0
+        }
+        QuickStartCommand::WatcherHelp => {
+            println!("ralphus quick-start watcher <claude-code|codex>");
             0
         }
         QuickStartCommand::UsageError(m) => {
@@ -168,6 +199,47 @@ pub fn dispatch(cmd: QuickStartCommand) -> i32 {
             ),
             &args,
         ),
+        QuickStartCommand::WatcherClaudeCode(launch) => {
+            if ensure_watcher_registered(opts).is_none() {
+                return 2;
+            }
+            launch_claude(
+                "quick-start-watcher-claude-code",
+                watcher_system_prompt_content(launch.read_only, CLAUDE_READ_ONLY_MECHANISM),
+                &launch,
+            )
+        }
+        QuickStartCommand::WatcherCodex(launch) => {
+            if ensure_watcher_registered(opts).is_none() {
+                return 2;
+            }
+            launch_codex(
+                "quick-start-watcher-codex",
+                watcher_system_prompt_content(launch.read_only, CODEX_READ_ONLY_MECHANISM),
+                &launch,
+            )
+        }
+    }
+}
+
+/// RAL-241: register (or reuse a previously persisted) mailbox `client_id`
+/// before launching a watcher session, so `ralphus mailbox check` -- which
+/// the watcher's system prompt instructs the agent to run after every user
+/// turn -- has an id to poll with from its very first invocation, with no
+/// manual setup step. `None` (having already printed an error) if
+/// registration fails; the caller aborts the launch in that case, since a
+/// watcher session that can never drain the mailbox defeats the point of
+/// this command.
+fn ensure_watcher_registered(opts: &GlobalOpts) -> Option<()> {
+    match crate::commands::mailbox::ensure_client_id(&opts.client()) {
+        Ok(client_id) => {
+            eprintln!("ralphus [runner] quick-start-watcher mailbox client_id={client_id}");
+            Some(())
+        }
+        Err(e) => {
+            e.print(opts.json, None);
+            None
+        }
     }
 }
 
@@ -248,6 +320,30 @@ fn reviewer_system_prompt_content(
         "You are Ralphus. The complete `ralphus` CLI command surface -- every subcommand, flag, \
          and expected value type -- is documented below for reference. Use `ralphus <command> \
          --help` for details on any specific command.\n\n{REVIEWER_ROLE_NOTE}{target_note}\n\n{}{read_only_block}\n\n{}",
+        crate::help_map::READ_ONLY_NOTE,
+        crate::help_map::generate(),
+    )
+}
+
+/// RAL-241: framing for the watcher quick-start harness -- a mailbox-polling
+/// supervisor rather than a fresh orchestration session or a review
+/// operator. The one hard requirement (drain after every user turn) is
+/// stated up front and repeated as "MANDATORY" since it's the entire reason
+/// this quick-start variant exists; everything else is the same full
+/// command surface `manager` gets, since a watcher may still need to
+/// inspect/act on the squad/task/review the escalation is about.
+const WATCHER_ROLE_NOTE: &str = "You are Ralphus operating in WATCHER mode (RAL-241). Your job is to supervise autonomous ralphus work by draining its escalation mailbox -- a queue of `urgent`/`high`/`normal` priority messages the daemon writes when something needs attention (a task/cell failed, or a session appears to have stalled with no activity for several minutes).\n\nMANDATORY: after every user turn -- i.e. as the first thing you do once you finish responding to what the user just asked, before going idle waiting for their next message -- run `ralphus mailbox check` and show its output to the user verbatim, even if it reports no unread messages. Do not silently swallow or summarize away a message.\n\nHow to react once you've shown a message:\n  - `urgent` -- stop and read it now. Treat it as more important than whatever else you were about to say; investigate it (e.g. `ralphus get <selector>`, `ralphus cell show <selector>`, `ralphus cartographer --squad-id <id>`) before continuing.\n  - `high` -- process it before you would otherwise go idle; it does not need to interrupt an in-progress response, but must not be left unaddressed.\n  - `normal` -- informational; mention it, no action required.\n\n`ralphus mailbox check` also marks whatever it returns as read (drained), so only genuinely new escalations appear on each subsequent check -- you do not need to deduplicate against earlier turns yourself.";
+
+fn watcher_system_prompt_content(read_only: bool, harness_mechanism: &str) -> String {
+    let read_only_block = if read_only {
+        format!("\n\n{}", read_only_session_note(harness_mechanism))
+    } else {
+        String::new()
+    };
+    format!(
+        "You are Ralphus. The complete `ralphus` CLI command surface -- every subcommand, flag, \
+         and expected value type -- is documented below for reference. Use `ralphus <command> \
+         --help` for details on any specific command.\n\n{WATCHER_ROLE_NOTE}\n\n{}{read_only_block}\n\n{}",
         crate::help_map::READ_ONLY_NOTE,
         crate::help_map::generate(),
     )
@@ -614,6 +710,46 @@ mod tests {
     }
 
     #[test]
+    fn bare_watcher_is_watcher_help() {
+        matches!(parse(&v(&["watcher"])), QuickStartCommand::WatcherHelp);
+    }
+
+    #[test]
+    fn parses_watcher_claude_code_with_flags() {
+        match parse(&v(&[
+            "watcher",
+            "claude-code",
+            "--command",
+            "my-claude",
+            "--read-only",
+        ])) {
+            QuickStartCommand::WatcherClaudeCode(launch) => {
+                assert_eq!(launch.command.as_deref(), Some("my-claude"));
+                assert!(launch.read_only);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_watcher_codex_with_passthrough() {
+        match parse(&v(&["watcher", "codex", "--", "--model", "gpt-5-codex"])) {
+            QuickStartCommand::WatcherCodex(launch) => {
+                assert_eq!(launch.passthrough, v(&["--model", "gpt-5-codex"]));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_watcher_subcommand_is_usage_error() {
+        matches!(
+            parse(&v(&["watcher", "bogus"])),
+            QuickStartCommand::UsageError(_)
+        );
+    }
+
+    #[test]
     fn parse_review_target_extracts_id_from_url() {
         assert_eq!(
             parse_review_target("http://127.0.0.1:7474/#/reviews/guardian-3?tab=chat"),
@@ -783,6 +919,25 @@ mod tests {
     fn reviewer_system_prompt_omits_target_note_when_absent() {
         let content = reviewer_system_prompt_content(None, false, CODEX_READ_ONLY_MECHANISM);
         assert!(!content.contains("Initial review target"));
+    }
+
+    #[test]
+    fn watcher_system_prompt_instructs_mailbox_check_after_every_turn() {
+        let content = watcher_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
+        assert!(content.contains("WATCHER mode"));
+        assert!(content.contains("MANDATORY"));
+        assert!(content.contains("ralphus mailbox check"));
+        assert!(content.contains("after every user turn"));
+        assert!(!content.contains("READ-ONLY MODE"));
+        // Still carries the full help-map for reference, like manager/reviewer.
+        assert!(content.contains("- ralphus "));
+    }
+
+    #[test]
+    fn watcher_system_prompt_adds_read_only_note_when_requested() {
+        let content = watcher_system_prompt_content(true, CODEX_READ_ONLY_MECHANISM);
+        assert!(content.contains("READ-ONLY MODE"));
+        assert!(content.contains(CODEX_READ_ONLY_MECHANISM));
     }
 
     // ---- launch command precedence -----------------------------------

@@ -1,11 +1,11 @@
-//! Dependency planning: order a run's sessions so each runs after the sessions
+//! Dependency planning: order a squad's cells so each runs after the cells
 //! it depends on.
 //!
-//! Edges come from two places (both resolved to session positions here):
-//! - a session's own `depends_on` — a within-task session id (`"a"`) or a
-//!   cross-task `"task/session"` reference;
-//! - its task's `depends_on` — a task name (all that task's sessions) or a
-//!   cross-task `"task/session"` reference — applied to every session in the task.
+//! Edges come from two places (both resolved to cell positions here):
+//! - a cell's own `depends_on` — a within-task cell id (`"a"`) or a
+//!   cross-task `"task/cell"` reference;
+//! - its task's `depends_on` — a task name (all that task's cells) or a
+//!   cross-task `"task/cell"` reference — applied to every cell in the task.
 //!
 //! Unresolvable references produce no edge (best-effort; the validator is the
 //! place that rejects bad refs). A cycle is a hard error.
@@ -14,29 +14,29 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::store::{SessionRow, TaskRow};
+use crate::store::{CellRow, TaskRow};
 
-/// A concrete execution plan for a run's sessions.
+/// A concrete execution plan for a squad's cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionPlan {
-    /// Session positions (indices into the `sessions` slice) in execution order.
+    /// Cell positions (indices into the `cells` slice) in execution order.
     pub order: Vec<usize>,
-    /// `deps[i]` is the set of prerequisite session positions for session `i`.
+    /// `deps[i]` is the set of prerequisite cell positions for cell `i`.
     pub deps: Vec<Vec<usize>>,
-    /// `task_deps[i]` is the set of prerequisite *task* indices for session
-    /// `i`, from a bare task-name entry in that session's owning task's own
+    /// `task_deps[i]` is the set of prerequisite *task* indices for cell
+    /// `i`, from a bare task-name entry in that cell's owning task's own
     /// `depends_on` (the "wait for this whole other task" form — see the
     /// module doc comment's second bullet). Unlike `deps` (satisfied once
-    /// the referenced sessions reach `SessState::Done`), a task index here is
+    /// the referenced cells reach `CellState::Done`), a task index here is
     /// only satisfied once that *task* itself finalizes (its own task-level
-    /// verify has run) — plain session completion isn't enough. Explicit
-    /// `"task/session"` cross-task references and same-task session-level
+    /// proof has run) — plain cell completion isn't enough. Explicit
+    /// `"task/cell"` cross-task references and same-task cell-level
     /// `depends_on` entries only ever populate `deps`, never this — they're
     /// deliberately fine-grained, not "wait for the whole task". Before this
     /// field existed, a task-name dependent (e.g. RAL-142 depending on
     /// RAL-141-project-identifier by name) dispatched the instant the
-    /// upstream task's sessions reached Done, racing ahead of that task's
-    /// own fmt/clippy/test task-level verify — caught live on 2026-08-11.
+    /// upstream task's cells reached Done, racing ahead of that task's
+    /// own fmt/clippy/test task-level proof — caught live on 2026-08-11.
     pub task_deps: Vec<Vec<i64>>,
 }
 
@@ -45,8 +45,8 @@ pub struct ExecutionPlan {
 ///
 /// # Errors
 /// Returns `Err` with a human-readable message when a dependency cycle exists.
-pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan, String> {
-    let n = sessions.len();
+pub fn plan(cells: &[CellRow], tasks: &[TaskRow]) -> Result<ExecutionPlan, String> {
+    let n = cells.len();
     let task_name_to_idx: HashMap<&str, i64> =
         tasks.iter().map(|t| (t.name.as_str(), t.idx)).collect();
     let task_deps: HashMap<i64, &[String]> = tasks
@@ -54,52 +54,52 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
         .map(|t| (t.idx, t.depends_on.as_slice()))
         .collect();
 
-    let mut sid_to_pos: HashMap<(i64, &str), usize> = HashMap::new();
-    let mut task_sessions: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (i, s) in sessions.iter().enumerate() {
-        sid_to_pos.insert((s.task_idx, s.session_id.as_str()), i);
-        task_sessions.entry(s.task_idx).or_default().push(i);
+    let mut cid_to_pos: HashMap<(i64, &str), usize> = HashMap::new();
+    let mut task_cells: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, c) in cells.iter().enumerate() {
+        cid_to_pos.insert((c.task_idx, c.cell_id.as_str()), i);
+        task_cells.entry(c.task_idx).or_default().push(i);
     }
 
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut task_level_deps: Vec<Vec<i64>> = vec![Vec::new(); n];
-    for (i, s) in sessions.iter().enumerate() {
+    for (i, c) in cells.iter().enumerate() {
         let mut prereqs: Vec<usize> = Vec::new();
         let mut task_prereqs: Vec<i64> = Vec::new();
 
-        // Session-level references.
-        for dep in &s.depends_on {
-            if let Some((tname, sid)) = dep.split_once('/') {
+        // Cell-level references.
+        for dep in &c.depends_on {
+            if let Some((tname, cid)) = dep.split_once('/') {
                 if let Some(&pos) = task_name_to_idx
                     .get(tname)
-                    .and_then(|t| sid_to_pos.get(&(*t, sid)))
+                    .and_then(|t| cid_to_pos.get(&(*t, cid)))
                 {
                     prereqs.push(pos);
                 }
-            } else if let Some(&pos) = sid_to_pos.get(&(s.task_idx, dep.as_str())) {
+            } else if let Some(&pos) = cid_to_pos.get(&(c.task_idx, dep.as_str())) {
                 prereqs.push(pos);
             }
         }
 
-        // Task-level references apply to every session in the task. A bare
+        // Task-level references apply to every cell in the task. A bare
         // task-name entry additionally means "wait for that whole task",
-        // not just its sessions — recorded in `task_prereqs` so the
+        // not just its cells — recorded in `task_prereqs` so the
         // scheduler can gate on the target task's own finalizer, not only
-        // `SessState::Done` on its sessions (see `task_deps`'s doc comment).
-        if let Some(tdeps) = task_deps.get(&s.task_idx) {
+        // `CellState::Done` on its cells (see `task_deps`'s doc comment).
+        if let Some(tdeps) = task_deps.get(&c.task_idx) {
             for dep in *tdeps {
-                if let Some((tname, sid)) = dep.split_once('/') {
+                if let Some((tname, cid)) = dep.split_once('/') {
                     if let Some(&pos) = task_name_to_idx
                         .get(tname)
-                        .and_then(|t| sid_to_pos.get(&(*t, sid)))
+                        .and_then(|t| cid_to_pos.get(&(*t, cid)))
                     {
                         prereqs.push(pos);
                     }
                 } else if let Some(&tidx) = task_name_to_idx.get(dep.as_str()) {
-                    if let Some(positions) = task_sessions.get(&tidx) {
+                    if let Some(positions) = task_cells.get(&tidx) {
                         prereqs.extend(positions.iter().copied());
                     }
-                    if tidx != s.task_idx {
+                    if tidx != c.task_idx {
                         task_prereqs.push(tidx);
                     }
                 }
@@ -125,71 +125,71 @@ pub fn plan(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<ExecutionPlan,
 }
 
 /// A node in a rendered dependency graph (CLI_PARITY_PLAN.local.md Phase 6):
-/// one session, identified as `t<task_idx>s<session_idx>`.
+/// one cell, identified as `t<task_idx>s<cell_idx>`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphNode {
-    /// `t<task_idx>s<session_idx>` -- stable, unique within the run.
+    /// `t<task_idx>s<cell_idx>` -- stable, unique within the squad.
     pub id: String,
-    /// Task index within the run.
+    /// Task index within the squad.
     pub task_idx: i64,
-    /// Session index within the task.
-    pub session_idx: i64,
+    /// Cell index within the task.
+    pub cell_idx: i64,
     /// Owning task's name.
     pub task_name: String,
-    /// The session's own id (`[[task.session]] id`, or a generated `session-N`).
-    pub session_id: String,
+    /// The cell's own id (`[[task.cell]] id`, or a generated `cell-N`).
+    pub cell_id: String,
 }
 
 /// A directed edge: `from` must complete before `to` may start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GraphEdge {
-    /// The prerequisite node/run id.
+    /// The prerequisite node/squad id.
     pub from: String,
-    /// The dependent node/run id.
+    /// The dependent node/squad id.
     pub to: String,
 }
 
-/// A run's internal session dependency graph, for `ralphus graph <run_id>`
-/// (CLI_PARITY_PLAN.local.md Phase 6). Nodes are sessions (the schedulable
-/// unit); edges come from the same session-level/task-level `depends_on`
+/// A squad's internal cell dependency graph, for `ralphus graph <squad_id>`
+/// (CLI_PARITY_PLAN.local.md Phase 6). Nodes are cells (the schedulable
+/// unit); edges come from the same cell-level/task-level `depends_on`
 /// references [`plan`] resolves (including the ones `{handoff:...}` prompt
 /// substitution rides on -- there is no separate "handoff edge" kind).
 #[derive(Debug, Clone, Serialize)]
-pub struct RunGraph {
-    /// One entry per session.
+pub struct SquadGraph {
+    /// One entry per cell.
     pub nodes: Vec<GraphNode>,
     /// `from` must complete before `to`.
     pub edges: Vec<GraphEdge>,
 }
 
-/// Build the rendered dependency graph for a run's sessions.
+/// Build the rendered dependency graph for a squad's cells.
 ///
 /// # Errors
 /// Returns `Err` with a human-readable message when a dependency cycle exists
 /// (same condition [`plan`] rejects).
-pub fn graph(sessions: &[SessionRow], tasks: &[TaskRow]) -> Result<RunGraph, String> {
-    let ExecutionPlan { deps, .. } = plan(sessions, tasks)?;
-    let node_id = |s: &SessionRow| format!("t{}s{}", s.task_idx, s.idx);
-    let nodes = sessions
+pub fn graph(cells: &[CellRow], tasks: &[TaskRow]) -> Result<SquadGraph, String> {
+    let ExecutionPlan { deps, .. } = plan(cells, tasks)?;
+    let node_id = |c: &CellRow| format!("t{}s{}", c.task_idx, c.idx);
+    let nodes = cells
         .iter()
-        .map(|s| GraphNode {
-            id: node_id(s),
-            task_idx: s.task_idx,
-            session_idx: s.idx,
-            task_name: s.task_name.clone(),
-            session_id: s.session_id.clone(),
+        .map(|c| GraphNode {
+            id: node_id(c),
+            task_idx: c.task_idx,
+            cell_idx: c.idx,
+            task_name: c.task_name.clone(),
+            cell_id: c.cell_id.clone(),
         })
         .collect();
     let mut edges = Vec::new();
     for (i, prereqs) in deps.iter().enumerate() {
         for &j in prereqs {
             edges.push(GraphEdge {
-                from: node_id(&sessions[j]),
-                to: node_id(&sessions[i]),
+                from: node_id(&cells[j]),
+                to: node_id(&cells[i]),
             });
         }
     }
-    Ok(RunGraph { nodes, edges })
+    Ok(SquadGraph { nodes, edges })
 }
 
 /// Deterministic topological sort (lowest index first). `deps[i]` lists the
@@ -206,7 +206,7 @@ fn topo_order(deps: &[Vec<usize>]) -> Result<Vec<usize>, String> {
                 done[i] = true;
                 order.push(i);
             }
-            None => return Err("dependency cycle among sessions".to_string()),
+            None => return Err("dependency cycle among cells".to_string()),
         }
     }
     Ok(order)
@@ -216,12 +216,12 @@ fn topo_order(deps: &[Vec<usize>]) -> Result<Vec<usize>, String> {
 mod tests {
     use super::*;
 
-    fn session(task_idx: i64, idx: i64, id: &str, deps: &[&str]) -> SessionRow {
-        SessionRow {
+    fn cell(task_idx: i64, idx: i64, id: &str, deps: &[&str]) -> CellRow {
+        CellRow {
             task_idx,
             idx,
             task_name: format!("task{task_idx}"),
-            session_id: id.to_string(),
+            cell_id: id.to_string(),
             cwd: Some(".".to_string()),
             subprojects: vec![],
             prompt: None,
@@ -250,19 +250,19 @@ mod tests {
     }
 
     #[test]
-    fn independent_sessions_keep_order() {
-        let sessions = vec![session(0, 0, "a", &[]), session(0, 1, "b", &[])];
+    fn independent_cells_keep_order() {
+        let cells = vec![cell(0, 0, "a", &[]), cell(0, 1, "b", &[])];
         let tasks = vec![task(0, &[])];
-        let p = plan(&sessions, &tasks).unwrap();
+        let p = plan(&cells, &tasks).unwrap();
         assert_eq!(p.order, vec![0, 1]);
     }
 
     #[test]
     fn within_task_dependency_orders_after() {
         // b depends on a, but is listed first -> a must still run before b.
-        let sessions = vec![session(0, 0, "b", &["a"]), session(0, 1, "a", &[])];
+        let cells = vec![cell(0, 0, "b", &["a"]), cell(0, 1, "a", &[])];
         let tasks = vec![task(0, &[])];
-        let p = plan(&sessions, &tasks).unwrap();
+        let p = plan(&cells, &tasks).unwrap();
         assert_eq!(p.order, vec![1, 0]);
         assert_eq!(p.deps[0], vec![1]);
     }
@@ -270,35 +270,35 @@ mod tests {
     #[test]
     fn cross_task_dependency() {
         // task1/w depends on task0/x via "task0/x".
-        let sessions = vec![session(0, 0, "x", &[]), session(1, 0, "w", &["task0/x"])];
+        let cells = vec![cell(0, 0, "x", &[]), cell(1, 0, "w", &["task0/x"])];
         let tasks = vec![task(0, &[]), task(1, &[])];
-        let p = plan(&sessions, &tasks).unwrap();
+        let p = plan(&cells, &tasks).unwrap();
         assert_eq!(p.order, vec![0, 1]);
         assert_eq!(p.deps[1], vec![0]);
     }
 
     #[test]
-    fn task_level_dependency_applies_to_all_sessions() {
-        // task1 depends on task0 -> every task1 session waits for every task0 session.
-        let sessions = vec![session(0, 0, "x", &[]), session(1, 0, "w", &[])];
+    fn task_level_dependency_applies_to_all_cells() {
+        // task1 depends on task0 -> every task1 cell waits for every task0 cell.
+        let cells = vec![cell(0, 0, "x", &[]), cell(1, 0, "w", &[])];
         let tasks = vec![task(0, &[]), task(1, &["task0"])];
-        let p = plan(&sessions, &tasks).unwrap();
+        let p = plan(&cells, &tasks).unwrap();
         assert_eq!(p.order, vec![0, 1]);
         assert_eq!(p.deps[1], vec![0]);
     }
 
     #[test]
     fn cycle_is_an_error() {
-        let sessions = vec![session(0, 0, "a", &["b"]), session(0, 1, "b", &["a"])];
+        let cells = vec![cell(0, 0, "a", &["b"]), cell(0, 1, "b", &["a"])];
         let tasks = vec![task(0, &[])];
-        assert!(plan(&sessions, &tasks).is_err());
+        assert!(plan(&cells, &tasks).is_err());
     }
 
     #[test]
     fn unresolvable_ref_is_ignored() {
-        let sessions = vec![session(0, 0, "a", &["ghost"])];
+        let cells = vec![cell(0, 0, "a", &["ghost"])];
         let tasks = vec![task(0, &[])];
-        let p = plan(&sessions, &tasks).unwrap();
+        let p = plan(&cells, &tasks).unwrap();
         assert_eq!(p.order, vec![0]);
         assert!(p.deps[0].is_empty());
     }
@@ -306,23 +306,23 @@ mod tests {
     // ── CLI_PARITY_PLAN.local.md Phase 6: `graph()` ─────────────────────────────
 
     #[test]
-    fn graph_has_one_node_per_session_with_stable_ids() {
-        let sessions = vec![session(0, 0, "a", &[]), session(1, 0, "w", &[])];
+    fn graph_has_one_node_per_cell_with_stable_ids() {
+        let cells = vec![cell(0, 0, "a", &[]), cell(1, 0, "w", &[])];
         let tasks = vec![task(0, &[]), task(1, &[])];
-        let g = graph(&sessions, &tasks).unwrap();
+        let g = graph(&cells, &tasks).unwrap();
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.nodes[0].id, "t0s0");
         assert_eq!(g.nodes[1].id, "t1s0");
         assert_eq!(g.nodes[0].task_name, "task0");
-        assert_eq!(g.nodes[0].session_id, "a");
+        assert_eq!(g.nodes[0].cell_id, "a");
     }
 
     #[test]
     fn graph_edge_points_from_prerequisite_to_dependent() {
         // b depends on a: edge must be a -> b, not b -> a.
-        let sessions = vec![session(0, 0, "b", &["a"]), session(0, 1, "a", &[])];
+        let cells = vec![cell(0, 0, "b", &["a"]), cell(0, 1, "a", &[])];
         let tasks = vec![task(0, &[])];
-        let g = graph(&sessions, &tasks).unwrap();
+        let g = graph(&cells, &tasks).unwrap();
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].from, "t0s1"); // "a"
         assert_eq!(g.edges[0].to, "t0s0"); // "b"
@@ -330,9 +330,9 @@ mod tests {
 
     #[test]
     fn graph_cross_task_dependency_produces_an_edge() {
-        let sessions = vec![session(0, 0, "x", &[]), session(1, 0, "w", &["task0/x"])];
+        let cells = vec![cell(0, 0, "x", &[]), cell(1, 0, "w", &["task0/x"])];
         let tasks = vec![task(0, &[]), task(1, &[])];
-        let g = graph(&sessions, &tasks).unwrap();
+        let g = graph(&cells, &tasks).unwrap();
         assert_eq!(
             g.edges,
             vec![GraphEdge {
@@ -343,17 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn graph_independent_sessions_have_no_edges() {
-        let sessions = vec![session(0, 0, "a", &[]), session(0, 1, "b", &[])];
+    fn graph_independent_cells_have_no_edges() {
+        let cells = vec![cell(0, 0, "a", &[]), cell(0, 1, "b", &[])];
         let tasks = vec![task(0, &[])];
-        let g = graph(&sessions, &tasks).unwrap();
+        let g = graph(&cells, &tasks).unwrap();
         assert!(g.edges.is_empty());
     }
 
     #[test]
     fn graph_propagates_the_cycle_error() {
-        let sessions = vec![session(0, 0, "a", &["b"]), session(0, 1, "b", &["a"])];
+        let cells = vec![cell(0, 0, "a", &["b"]), cell(0, 1, "b", &["a"])];
         let tasks = vec![task(0, &[])];
-        assert!(graph(&sessions, &tasks).is_err());
+        assert!(graph(&cells, &tasks).is_err());
     }
 }

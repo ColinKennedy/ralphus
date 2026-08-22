@@ -1,48 +1,48 @@
 # Tasks
 
-The Tasks tab is the default view and the one you'll live in most: every run
-you've submitted, its tasks and sessions, and the full detail of whichever
-one you've selected.
+The Tasks tab is the default view and the one you'll live in most: every
+squad you've submitted, its tasks and cells, and the full detail of
+whichever one you've selected.
 
 ## The board at a glance
 
-![Tasks tab showing four runs in different states, with the running run's task/session tree expanded](../screenshots/tasks-overview.png)
+![Tasks tab showing four squads in different states, with the running squad's task/cell tree expanded](../screenshots/tasks-overview.png)
 
-The **left sidebar** lists every run, newest first, filterable by status and
-searchable by id/label:
+The **left sidebar** lists every squad, newest first, filterable by status
+and searchable by id/label:
 
-- The colored dot + label is the run's **state** — `running`, `done`,
+- The colored dot + label is the squad's **state** — `running`, `done`,
   `failed`, or `queued` (held back with `hold=true`, waiting to be
-  activated). A `queued` run shows a `▶ Run` button right there in the
+  activated). A `queued` squad shows a `▶ Run` button right there in the
   sidebar.
 - Below the label, the small meta line repeats the state as text and (for
   anything past `pending`/`queued`) offers a logs shortcut.
-- Right-click any run for rename / retry / restart / cancel / delete, or to
+- Right-click any squad for rename / retry / restart / cancel / delete, or to
   manually override its status.
 
-The **main pane** shows the selected run's task tree: each task's name,
-state, and declared task-level verify steps, with its sessions nested below.
-In the screenshot above, `add-dark-mode-toggle` is `running` — one session
-(`wire-theme-toggle`) already finished and its `fmt` verify step passed;
-the second session (`persist-theme-choice`) is still in flight and depends
+The **main pane** shows the selected squad's task tree: each task's name,
+state, and declared task-level proof steps, with its cells nested below.
+In the screenshot above, `add-dark-mode-toggle` is `running` — one cell
+(`wire-theme-toggle`) already finished and its `fmt` proof step passed;
+the second cell (`persist-theme-choice`) is still in flight and depends
 on the first.
 
-## Selecting a session
+## Selecting a cell
 
-![The same board with a specific session selected, showing its details pane](../screenshots/tasks-session-detail.png)
+![The same board with a specific cell selected, showing its details pane](../screenshots/tasks-session-detail.png)
 
-Click any session to open its **details pane**: the resolved agent and
+Click any cell to open its **details pane**: the resolved agent and
 model, token/cost counters, the prompt or command it ran, its own dependency
 (`persist-theme-choice` waits on `wire-theme-toggle`, shown above), and any
-session-level verify steps. This is where you'd go to read exactly what an
+cell-level proof steps. This is where you'd go to read exactly what an
 agent was asked to do and what it reported back — the same pane a
-`command`-kind session shows its captured output in.
+`command`-kind cell shows its captured output in.
 
 ## Where task state comes from
 
-A task's state rolls up from its sessions and verify steps — it only counts
-as `done` once every session has finished and every verify step has passed.
-A `failed` session (like `extract-token-parser` in the `refactor-auth-
-middleware` run) fails its owning task, and any task-level verify step
+A task's state rolls up from its cells and proof steps — it only counts
+as `done` once every cell has finished and every proof step has passed.
+A `failed` cell (like `extract-token-parser` in the `refactor-auth-
+middleware` squad) fails its owning task, and any task-level proof step
 attached to it is shown alongside the failure so you can see exactly which
 check caught it.

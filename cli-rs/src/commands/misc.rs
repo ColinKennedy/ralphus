@@ -16,7 +16,7 @@ use crate::entity_uri::from_resolved_selector;
 use crate::flags::Scanner;
 use crate::selector::{self, ResolvedSelector, SelectorError};
 
-const RUN_STATES: [&str; 6] = [
+const SQUAD_STATES: [&str; 6] = [
     "queued",
     "pending",
     "running",
@@ -30,6 +30,44 @@ const STDIN_SOURCE: &str = "-";
 
 pub fn cmd_validate(opts: &GlobalOpts, files: &[String]) -> i32 {
     let client = opts.client();
+    // More than one file: validate them as ONE combined submission, the same
+    // way `ralphus submit a.toml b.toml ...` joins multiple files' raw text
+    // client-side (`texts.join("\n\n")`) before either validating or
+    // submitting. Without this, a cross-file `upstream = "<<task:...>>"`
+    // reference would validate clean under `submit` (which joins first) but
+    // falsely report as unknown under `validate` (which used to check each
+    // file in isolation) -- the two commands must agree on what "this
+    // submission" contains.
+    if files.len() > 1 {
+        let mut texts = Vec::new();
+        for path in files {
+            match std::fs::read_to_string(path) {
+                Ok(t) => texts.push(t),
+                Err(e) => {
+                    println!("error: could not read {path}: {e}");
+                    return 1;
+                }
+            }
+        }
+        let combined = texts.join("\n\n");
+        return match client.validate(&combined) {
+            Ok(outcome) => {
+                let valid = outcome["valid"].as_bool().unwrap_or(false);
+                emit(opts, &outcome, |o| {
+                    if o["valid"].as_bool().unwrap_or(false) {
+                        println!("{}: valid", files.join(" "));
+                    } else {
+                        print_validation_errors(o["errors"].as_array());
+                    }
+                });
+                i32::from(!valid)
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(opts.json, None);
+                1
+            }
+        };
+    }
     let mut had_error = false;
     for path in files {
         let text = match std::fs::read_to_string(path) {
@@ -105,7 +143,7 @@ pub fn parse_submit(scanner: &mut Scanner) -> super::Command {
 
 /// Expands each `submit` file argument into concrete sources. `is_batch` is
 /// true when any argument was a directory or glob -- each resolved file then
-/// becomes its own separate run, rather than combining into one (the
+/// becomes its own separate squad, rather than combining into one (the
 /// existing behavior for explicit file paths).
 fn resolve_submit_sources(raw_args: &[String]) -> Result<(Vec<String>, bool), String> {
     let mut sources = Vec::new();
@@ -221,17 +259,17 @@ fn read_submit_source(source: &str) -> Result<String, String> {
     std::fs::read_to_string(source).map_err(|e| format!("could not read {source}: {e}"))
 }
 
-fn wait_for_terminal(client: &DaemonClient, run_id: &str) -> Result<Value, DaemonError> {
+fn wait_for_terminal(client: &DaemonClient, squad_id: &str) -> Result<Value, DaemonError> {
     let mut last_state: Option<String> = None;
     loop {
-        let run = client.run(run_id)?;
-        let state = run["state"].as_str().map(str::to_string);
+        let squad = client.squad(squad_id)?;
+        let state = squad["state"].as_str().map(str::to_string);
         if state != last_state {
-            println!("{run_id}: {}", state.as_deref().unwrap_or("?"));
+            println!("{squad_id}: {}", state.as_deref().unwrap_or("?"));
             last_state = state.clone();
         }
         if matches!(state.as_deref(), Some("done" | "failed" | "cancelled")) {
-            return Ok(run);
+            return Ok(squad);
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -243,10 +281,10 @@ fn finish_submission(
     result: &Value,
     args: &SubmitArgs,
 ) -> i32 {
-    let run_id = result["run_id"].as_str().map(str::to_string);
+    let squad_id = result["squad_id"].as_str().map(str::to_string);
     if args.activate {
-        if let Some(id) = &run_id {
-            if let Err(e) = client.activate_run(id) {
+        if let Some(id) = &squad_id {
+            if let Err(e) = client.activate_squad(id) {
                 let code = crate::output::exit_code_for(&e);
                 CommandError::Daemon(e).print(opts.json, None);
                 return code;
@@ -254,9 +292,9 @@ fn finish_submission(
         }
     }
     if args.wait {
-        if let Some(id) = &run_id {
+        if let Some(id) = &squad_id {
             return match wait_for_terminal(client, id) {
-                Ok(run) => i32::from(run["state"].as_str() != Some("done")),
+                Ok(squad) => i32::from(squad["state"].as_str() != Some("done")),
                 Err(e) => {
                     CommandError::Daemon(e).print(opts.json, None);
                     1
@@ -320,7 +358,7 @@ pub fn cmd_submit(opts: &GlobalOpts, args: SubmitArgs) -> i32 {
             match client.submit(&text, hold, args.label.as_deref()) {
                 Ok(result) => {
                     emit(opts, &result, |r| {
-                        println!("{} ({})", r["run_id"], r["state"])
+                        println!("{} ({})", r["squad_id"], r["state"])
                     });
                     exit_code = exit_code.max(finish_submission(opts, &client, &result, &args));
                 }
@@ -351,7 +389,7 @@ pub fn cmd_submit(opts: &GlobalOpts, args: SubmitArgs) -> i32 {
     match client.submit(&text, hold, args.label.as_deref()) {
         Ok(result) => {
             emit(opts, &result, |r| {
-                println!("{} ({})", r["run_id"], r["state"])
+                println!("{} ({})", r["squad_id"], r["state"])
             });
             finish_submission(opts, &client, &result, &args)
         }
@@ -365,18 +403,18 @@ pub fn cmd_submit(opts: &GlobalOpts, args: SubmitArgs) -> i32 {
 
 // ---- status / resources / graph -----------------------------------------
 
-pub fn cmd_status(opts: &GlobalOpts, run_id: Option<String>, concurrency: bool) -> i32 {
+pub fn cmd_status(opts: &GlobalOpts, squad_id: Option<String>, concurrency: bool) -> i32 {
     let client = opts.client();
     run_and_report(opts, None, || {
         if concurrency {
             let board = client.tasks(None, None, None)?;
             emit(opts, &board, render_concurrency);
-        } else if let Some(id) = &run_id {
-            let run = client.run(id)?;
-            emit(opts, &run, print_run);
+        } else if let Some(id) = &squad_id {
+            let squad = client.squad(id)?;
+            emit(opts, &squad, print_squad);
         } else {
             let board = client.tasks(None, None, None)?;
-            emit(opts, &board, render_run_list);
+            emit(opts, &board, render_squad_list);
         }
         Ok(())
     })
@@ -398,28 +436,28 @@ fn render_concurrency(board: &Value) {
     }
 }
 
-pub fn render_run_list(board: &Value) {
-    let runs = board["runs"].as_array().cloned().unwrap_or_default();
-    if runs.is_empty() {
-        println!("no runs");
+pub fn render_squad_list(board: &Value) {
+    let squads = board["squads"].as_array().cloned().unwrap_or_default();
+    if squads.is_empty() {
+        println!("no squads");
         return;
     }
-    let rows: Vec<Vec<String>> = runs
+    let rows: Vec<Vec<String>> = squads
         .iter()
-        .map(|r| {
+        .map(|s| {
             vec![
-                r["id"].as_str().unwrap_or_default().to_string(),
-                r["state"].as_str().unwrap_or_default().to_string(),
-                r["label"].as_str().unwrap_or_default().to_string(),
+                s["id"].as_str().unwrap_or_default().to_string(),
+                s["state"].as_str().unwrap_or_default().to_string(),
+                s["label"].as_str().unwrap_or_default().to_string(),
             ]
         })
         .collect();
     crate::output::print_table(&["ID", "STATE", "LABEL"], &rows);
 }
 
-fn print_run(run: &Value) {
-    println!("{}  {}", run["id"], run["state"]);
-    if let Some(tasks) = run["tasks"].as_array() {
+fn print_squad(squad: &Value) {
+    println!("{}  {}", squad["id"], squad["state"]);
+    if let Some(tasks) = squad["tasks"].as_array() {
         for task in tasks {
             println!("  task {}: {}", task["name"], task["state"]);
         }
@@ -433,7 +471,7 @@ pub fn cmd_resources(opts: &GlobalOpts) -> i32 {
         emit(opts, &result, |res| {
             let rows = res["resources"].as_array().cloned().unwrap_or_default();
             if rows.is_empty() {
-                println!("no running sessions");
+                println!("no running cells");
                 return;
             }
             let table_rows: Vec<Vec<String>> = rows
@@ -448,9 +486,9 @@ pub fn cmd_resources(opts: &GlobalOpts) -> i32 {
                         .map(|c| format!("{c:.1}"))
                         .unwrap_or_else(|| "-".to_string());
                     vec![
-                        row["run_id"].as_str().unwrap_or_default().to_string(),
+                        row["squad_id"].as_str().unwrap_or_default().to_string(),
                         row["task_name"].as_str().unwrap_or_default().to_string(),
-                        row["session_id"].as_str().unwrap_or_default().to_string(),
+                        row["cell_id"].as_str().unwrap_or_default().to_string(),
                         row["pid"].to_string(),
                         cpu,
                         mb,
@@ -458,7 +496,7 @@ pub fn cmd_resources(opts: &GlobalOpts) -> i32 {
                 })
                 .collect();
             crate::output::print_table(
-                &["RUN", "TASK", "SESSION", "PID", "CPU%", "MEM_MB"],
+                &["SQUAD", "TASK", "CELL", "PID", "CPU%", "MEM_MB"],
                 &table_rows,
             );
         });
@@ -466,9 +504,9 @@ pub fn cmd_resources(opts: &GlobalOpts) -> i32 {
     })
 }
 
-pub fn cmd_graph(opts: &GlobalOpts, run_id: Option<String>, dot: bool, global: bool) -> i32 {
-    if !global && run_id.is_none() {
-        println!("error: a run id is required unless --global is given");
+pub fn cmd_graph(opts: &GlobalOpts, squad_id: Option<String>, dot: bool, global: bool) -> i32 {
+    if !global && squad_id.is_none() {
+        println!("error: a squad id is required unless --global is given");
         return 2;
     }
     let client = opts.client();
@@ -476,7 +514,7 @@ pub fn cmd_graph(opts: &GlobalOpts, run_id: Option<String>, dot: bool, global: b
         let data = if global {
             client.global_graph(false)?
         } else {
-            client.run_graph(run_id.as_deref().unwrap_or_default())?
+            client.squad_graph(squad_id.as_deref().unwrap_or_default())?
         };
         let nodes = data["nodes"].as_array().cloned().unwrap_or_default();
         let edges = data["edges"].as_array().cloned().unwrap_or_default();
@@ -492,7 +530,7 @@ pub fn cmd_graph(opts: &GlobalOpts, run_id: Option<String>, dot: bool, global: b
                         n["state"]
                     )
                 } else {
-                    format!("{}/{}", n["task_name"], n["session_id"])
+                    format!("{}/{}", n["task_name"], n["cell_id"])
                 };
                 n["label"] = Value::String(label);
                 n
@@ -524,12 +562,12 @@ fn looks_like_guardian_selector(selector: &str) -> bool {
         || selector.starts_with("guardian")
 }
 
-fn verify_step_for<'a>(run: &'a Value, resolved: &ResolvedSelector) -> &'a Value {
-    let task = &run["tasks"][resolved.task_idx as usize];
-    if resolved.verify_scope == "session" {
-        &task["sessions"][resolved.session_idx as usize]["verify"][resolved.verify_idx as usize]
+fn proof_step_for<'a>(squad: &'a Value, resolved: &ResolvedSelector) -> &'a Value {
+    let task = &squad["tasks"][resolved.task_idx as usize];
+    if resolved.proof_scope == "cell" {
+        &task["cells"][resolved.cell_idx as usize]["proof"][resolved.proof_idx as usize]
     } else {
-        &task["verify"][resolved.verify_idx as usize]
+        &task["proof"][resolved.proof_idx as usize]
     }
 }
 
@@ -555,15 +593,15 @@ pub fn cmd_get(opts: &GlobalOpts, selector: &str, field: Option<&str>) -> i32 {
                 guardian
             }
         } else {
-            let resolved = selector::resolve_run_selector(&client, selector)?;
-            let run = client.run(&resolved.run_id)?;
+            let resolved = selector::resolve_squad_selector(&client, selector)?;
+            let squad = client.squad(&resolved.squad_id)?;
             match resolved.kind.as_str() {
-                "run" => run,
-                "task" => run["tasks"][resolved.task_idx as usize].clone(),
-                "session" => run["tasks"][resolved.task_idx as usize]["sessions"]
-                    [resolved.session_idx as usize]
+                "squad" => squad,
+                "task" => squad["tasks"][resolved.task_idx as usize].clone(),
+                "cell" => squad["tasks"][resolved.task_idx as usize]["cells"]
+                    [resolved.cell_idx as usize]
                     .clone(),
-                _ => verify_step_for(&run, &resolved).clone(),
+                _ => proof_step_for(&squad, &resolved).clone(),
             }
         };
         let data = match field {
@@ -618,9 +656,9 @@ fn walk_field(data: &Value, field: &str) -> Result<Value, SelectorError> {
 pub struct CartographerArgs {
     pub entity: Option<String>,
     pub for_selector: Option<String>,
-    pub run_id: Option<String>,
+    pub squad_id: Option<String>,
     pub task: Option<String>,
-    pub session_id: Option<String>,
+    pub cell_id: Option<String>,
     pub guardian_id: Option<String>,
     pub source: Option<String>,
     pub scope: Option<String>,
@@ -634,9 +672,9 @@ pub struct CartographerArgs {
 pub fn parse_cartographer(scanner: &mut Scanner) -> super::Command {
     let entity = scanner.take_value("--entity").ok().flatten();
     let for_selector = scanner.take_value("--for").ok().flatten();
-    let run_id = scanner.take_value("--run").ok().flatten();
+    let squad_id = scanner.take_value("--squad").ok().flatten();
     let task = scanner.take_value("--task").ok().flatten();
-    let session_id = scanner.take_value("--session").ok().flatten();
+    let cell_id = scanner.take_value("--cell").ok().flatten();
     let guardian_id = scanner.take_value("--guardian").ok().flatten();
     let source = scanner.take_value("--source").ok().flatten();
     let scope = scanner.take_value("--scope").ok().flatten();
@@ -656,9 +694,9 @@ pub fn parse_cartographer(scanner: &mut Scanner) -> super::Command {
     super::Command::Cartographer(CartographerArgs {
         entity,
         for_selector,
-        run_id,
+        squad_id,
         task,
-        session_id,
+        cell_id,
         guardian_id,
         source,
         scope,
@@ -675,16 +713,16 @@ pub fn cmd_cartographer(opts: &GlobalOpts, args: CartographerArgs) -> i32 {
     run_and_report(opts, None, || {
         let mut entity = args.entity.clone();
         if let Some(sel) = &args.for_selector {
-            let resolved = selector::resolve_run_selector(&client, sel)?;
+            let resolved = selector::resolve_squad_selector(&client, sel)?;
             entity = Some(from_resolved_selector(&resolved).to_string());
         }
         let filters = CartographerFilters {
             source: args.source.as_deref(),
             scope: args.scope.as_deref(),
             level: args.level.as_deref(),
-            run_id: args.run_id.as_deref(),
+            squad_id: args.squad_id.as_deref(),
             guardian_id: args.guardian_id.as_deref(),
-            session_id: args.session_id.as_deref(),
+            cell_id: args.cell_id.as_deref(),
             task: args.task.as_deref(),
             entity: entity.as_deref(),
             q: args.q.as_deref(),
@@ -719,8 +757,8 @@ fn render_cartographer_page(page: &Value) {
         if let Some(t) = row["task"].as_str() {
             bits.push(format!("task={t}"));
         }
-        if let Some(s) = row["session_id"].as_str() {
-            bits.push(format!("session={s}"));
+        if let Some(s) = row["cell_id"].as_str() {
+            bits.push(format!("cell={s}"));
         }
         println!(
             "{}: {}",
@@ -739,10 +777,10 @@ fn render_cartographer_page(page: &Value) {
 pub fn cmd_history(opts: &GlobalOpts, selector: &str) -> i32 {
     let client = opts.client();
     run_and_report(opts, None, || {
-        let resolved = selector::resolve_run_selector(&client, selector)?;
-        if resolved.kind != "session" && resolved.kind != "verify" {
+        let resolved = selector::resolve_squad_selector(&client, selector)?;
+        if resolved.kind != "cell" && resolved.kind != "proof" {
             return Err(SelectorError(format!(
-                "'{selector}' is a {} selector -- history targets a session or verify step",
+                "'{selector}' is a {} selector -- history targets a cell or proof step",
                 resolved.kind
             ))
             .into());
@@ -772,20 +810,20 @@ fn print_history_content(content: &str) {
 }
 
 fn history_pane(client: &DaemonClient, resolved: &ResolvedSelector) -> Result<Value, DaemonError> {
-    if resolved.kind == "session" {
-        client.session_pane(
-            &resolved.run_id,
+    if resolved.kind == "cell" {
+        client.cell_pane(
+            &resolved.squad_id,
             resolved.task_idx,
-            resolved.session_idx,
+            resolved.cell_idx,
             20000,
         )
     } else {
-        client.verify_pane(
-            &resolved.run_id,
+        client.proof_pane(
+            &resolved.squad_id,
             resolved.task_idx,
-            &resolved.verify_scope,
-            resolved.session_idx,
-            resolved.verify_idx,
+            &resolved.proof_scope,
+            resolved.cell_idx,
+            resolved.proof_idx,
             20000,
         )
     }
@@ -795,10 +833,10 @@ fn history_ghost_or_output(
     client: &DaemonClient,
     resolved: &ResolvedSelector,
 ) -> Result<(String, bool), DaemonError> {
-    if resolved.kind == "session" {
+    if resolved.kind == "cell" {
         let uri = format!(
-            "session:{}:{}:{}",
-            resolved.run_id, resolved.task_idx, resolved.session_idx
+            "cell:{}:{}:{}",
+            resolved.squad_id, resolved.task_idx, resolved.cell_idx
         );
         match client.ghost_get(&uri) {
             Ok(ghost) => Ok((
@@ -809,8 +847,8 @@ fn history_ghost_or_output(
             Err(e) => Err(e),
         }
     } else {
-        let run = client.run(&resolved.run_id)?;
-        let output = verify_step_for(&run, resolved)["output"]
+        let squad = client.squad(&resolved.squad_id)?;
+        let output = proof_step_for(&squad, resolved)["output"]
             .as_str()
             .unwrap_or_default()
             .to_string();
@@ -905,29 +943,34 @@ fn listen_status(client: &DaemonClient, selector: &str) -> Result<(String, Strin
             guardian["status"].as_str().unwrap_or_default().to_string(),
         ));
     }
-    let resolved = selector::resolve_run_selector(client, selector)?;
-    let run = client.run(&resolved.run_id)?;
+    let resolved = selector::resolve_squad_selector(client, selector)?;
+    let squad = client.squad(&resolved.squad_id)?;
     let (kind, status) =
         match resolved.kind.as_str() {
-            "run" => ("run", run["state"].as_str().unwrap_or_default().to_string()),
+            "squad" => (
+                "squad",
+                squad["state"].as_str().unwrap_or_default().to_string(),
+            ),
             "task" => (
                 "task",
-                run["tasks"][resolved.task_idx as usize]["state"]
+                squad["tasks"][resolved.task_idx as usize]["state"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
             ),
-            "session" => (
-                "session",
-                run["tasks"][resolved.task_idx as usize]["sessions"][resolved.session_idx as usize]
-                    ["state"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
+            "cell" => {
+                (
+                    "cell",
+                    squad["tasks"][resolved.task_idx as usize]["cells"][resolved.cell_idx as usize]
+                        ["state"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            }
             _ => (
-                "verify",
-                verify_step_for(&run, &resolved)["state"]
+                "proof",
+                proof_step_for(&squad, &resolved)["state"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
@@ -938,11 +981,11 @@ fn listen_status(client: &DaemonClient, selector: &str) -> Result<(String, Strin
 
 // ---- retry ------------------------------------------------------------------
 
-pub fn cmd_retry(opts: &GlobalOpts, run_id: &str) -> i32 {
+pub fn cmd_retry(opts: &GlobalOpts, squad_id: &str) -> i32 {
     let client = opts.client();
     run_and_report(opts, None, || {
-        let result = client.retry_run(run_id)?;
-        emit(opts, &result, |r| println!("{run_id} -> {}", r["state"]));
+        let result = client.retry_squad(squad_id)?;
+        emit(opts, &result, |r| println!("{squad_id} -> {}", r["state"]));
         Ok(())
     })
 }
@@ -980,7 +1023,7 @@ pub fn cmd_clear(opts: &GlobalOpts, args: ClearArgs) -> i32 {
             .collect();
         let invalid: Vec<&String> = states
             .iter()
-            .filter(|s| !RUN_STATES.contains(&s.as_str()))
+            .filter(|s| !SQUAD_STATES.contains(&s.as_str()))
             .collect();
         if !invalid.is_empty() {
             println!(
@@ -990,20 +1033,20 @@ pub fn cmd_clear(opts: &GlobalOpts, args: ClearArgs) -> i32 {
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
-                RUN_STATES.join(", ")
+                SQUAD_STATES.join(", ")
             );
             return 2;
         }
     }
     if !args.all && states.is_empty() {
-        println!("error: pass --all to clear everything, or --status to filter by run state");
+        println!("error: pass --all to clear everything, or --status to filter by squad state");
         return 2;
     }
     if !args.yes {
         let what = if states.is_empty() {
             "ALL tasks and reviews".to_string()
         } else {
-            format!("runs in states [{}]", states.join(", "))
+            format!("squads in states [{}]", states.join(", "))
         };
         print!("Delete {what}? This cannot be undone. [y/N] ");
         use std::io::Write as _;
@@ -1025,8 +1068,8 @@ pub fn cmd_clear(opts: &GlobalOpts, args: ClearArgs) -> i32 {
         let result = client.clear(states_opt, args.keep_temporary)?;
         emit(opts, &result, |r| {
             println!(
-                "cleared {} run(s), {} review(s); {} worktree(s) purged",
-                r["runs_deleted"].as_i64().unwrap_or(0),
+                "cleared {} squad(s), {} review(s); {} worktree(s) purged",
+                r["squads_deleted"].as_i64().unwrap_or(0),
                 r["guardians_deleted"].as_i64().unwrap_or(0),
                 r["worktrees_purged"].as_i64().unwrap_or(0)
             );
@@ -1170,9 +1213,9 @@ pub fn cmd_configuration(_opts: &GlobalOpts) -> i32 {
 pub fn cmd_initialize_git(path: Option<String>) -> i32 {
     let target = path.map_or_else(
         || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        std::path::PathBuf::from,
+        |p| ralphus_core::expand_home(&p),
     );
-    let target = target.canonicalize().unwrap_or(target);
+    let target = ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
 
     let probe = std::process::Command::new("git")
         .args([
@@ -1235,7 +1278,7 @@ mod tests {
     fn looks_like_guardian_selector_detects_legacy_forms() {
         assert!(looks_like_guardian_selector("@my-review"));
         assert!(looks_like_guardian_selector("guardian-1~2"));
-        assert!(!looks_like_guardian_selector("run-1/task/0"));
+        assert!(!looks_like_guardian_selector("squad-1/task/0"));
     }
 
     #[test]

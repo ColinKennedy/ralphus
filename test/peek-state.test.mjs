@@ -1,7 +1,7 @@
 // RAL-186: automated coverage for board.html's live-view (peek) state machine.
 //
-// The bug this file exists for: opening "Show Live View" on a verify step,
-// restarting that verify, and coming back found the box still showing the
+// The bug this file exists for: opening "Show Live View" on a proof step,
+// restarting that proof step, and coming back found the box still showing the
 // stale "Historical record (read-only) — session ended" log. Only navigating
 // to another node and back fixed it.
 //
@@ -79,7 +79,7 @@ test("reaching the strike limit confirms the session ended and asks for a re-ren
   const ticks = poll(started, Array(PEEK_MISSING_STRIKE_LIMIT).fill(gone("final output\n")));
   const last = ticks[ticks.length - 1];
   assert.equal(last.state.ended, true);
-  assert.equal(last.state.lastActivityMs, null, "a finished session's last output is history, not liveness");
+  assert.equal(last.state.lastActivityMs, null, "a finished cell's last output is history, not liveness");
   assert.match(last.state.text, /^final output\n/);
   assert.match(last.state.text, /\[Read-only historical record — this terminal session has ended\.\]$/);
   assert.equal(last.headerChanged, true, "live -> ended must force the banner/dot to re-render");
@@ -105,7 +105,7 @@ test("staying ended does not keep asking for re-renders", () => {
 
 test("RAL-186: a restarted step's live view revives on the first active poll", () => {
   // Watch a step run, watch it finish (the restart tears the old pane down),
-  // sit on the historical record for a couple of ticks while the run is
+  // sit on the historical record for a couple of ticks while the squad is
   // re-queued, then the new tmux pane comes up under the same key.
   const ended = poll(FRESH, [live("attempt one\n"), gone("attempt one\n"), gone("attempt one\n"), gone("attempt one\n")]).pop().state;
   assert.equal(ended.ended, true, "precondition: the box is showing the historical record");
@@ -148,24 +148,24 @@ test("RAL-186: a full restart cycle can repeat without the box latching", () => 
   assert.equal(final.headerChanged, true);
 });
 
-// ---- Key/URL derivation: the restarted *session* case shares this machinery ----
+// ---- Key/URL derivation: the restarted *cell* case shares this machinery ----
 
-test("session and verify peek keys resolve to their own pane endpoints", () => {
-  // Acceptance criterion: a restarted session's live view goes through exactly
-  // the same state machine as a restarted verify's. The keys differ only in how
+test("cell and proof peek keys resolve to their own pane endpoints", () => {
+  // Acceptance criterion: a restarted cell's live view goes through exactly
+  // the same state machine as a restarted proof step's. The keys differ only in how
   // they address the daemon; both are index-derived and so survive a restart
   // unchanged, which is why the same fix covers both.
   assert.equal(
-    peekUrlFor("session|run-abc|0|1"),
-    "/api/runs/run-abc/sessions/0/1/pane?lines=500",
+    peekUrlFor("cell|squad-abc|0|1"),
+    "/api/squads/squad-abc/cells/0/1/pane?lines=500",
   );
   assert.equal(
-    peekUrlFor("verify|run-abc|0|task|-1|2"),
-    "/api/runs/run-abc/verifies/0/task/-1/2/pane?lines=500",
+    peekUrlFor("proof|squad-abc|0|task|-1|2"),
+    "/api/squads/squad-abc/proofs/0/task/-1/2/pane?lines=500",
   );
   assert.equal(
-    peekUrlFor("verify|run-abc|0|session|1|2"),
-    "/api/runs/run-abc/verifies/0/session/1/2/pane?lines=500",
+    peekUrlFor("proof|squad-abc|0|cell|1|2"),
+    "/api/squads/squad-abc/proofs/0/cell/1/2/pane?lines=500",
   );
   assert.equal(
     peekUrlFor("guardian|g1|b2"),
@@ -180,9 +180,9 @@ test("session and verify peek keys resolve to their own pane endpoints", () => {
 
 test("every peek kind revives identically — the state machine is key-agnostic", () => {
   const keys = [
-    "session|run-abc|0|1",
-    "verify|run-abc|0|task|-1|2",
-    "verify|run-abc|0|session|1|2",
+    "cell|squad-abc|0|1",
+    "proof|squad-abc|0|task|-1|2",
+    "proof|squad-abc|0|cell|1|2",
     "guardian|g1|b2",
     "guardian-manual|g1",
   ];
@@ -196,13 +196,13 @@ test("every peek kind revives identically — the state machine is key-agnostic"
 });
 
 test("peek keys sanitize into stable, collision-free DOM ids", () => {
-  assert.equal(peekCssKey("verify|run-abc|0|task|-1|2"), "verify_run-abc_0_task_-1_2");
-  assert.equal(peekCssKey("session|run-abc|0|1"), "session_run-abc_0_1");
+  assert.equal(peekCssKey("proof|squad-abc|0|task|-1|2"), "proof_squad-abc_0_task_-1_2");
+  assert.equal(peekCssKey("cell|squad-abc|0|1"), "cell_squad-abc_0_1");
   // Restarting does not change any index, so the id a box is patched through
   // is the same before and after — the box the user is already looking at is
   // the one that gets revived.
-  assert.equal(peekCssKey("verify|r|0|task|-1|0"), peekCssKey("verify|r|0|task|-1|0"));
-  assert.notEqual(peekCssKey("verify|r|0|task|-1|0"), peekCssKey("verify|r|0|task|-1|1"));
+  assert.equal(peekCssKey("proof|r|0|task|-1|0"), peekCssKey("proof|r|0|task|-1|0"));
+  assert.notEqual(peekCssKey("proof|r|0|task|-1|0"), peekCssKey("proof|r|0|task|-1|1"));
 });
 
 test("the strike limit is a real tolerance, not a no-op", () => {

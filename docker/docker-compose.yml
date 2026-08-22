@@ -1,0 +1,65 @@
+# ralphus container execution mode (RAL-225).
+#
+# Runs the daemon + librarian (and therefore every locally-executed agent
+# subprocess the runner spawns) inside one hardened container, with the
+# filesystem confined to a single bind-mounted workspace root -- the coarser
+# "container-per-workspace" boundary this ticket's resolved decision adopted
+# (see docs/container-mode.md for the full rationale and exactly what this
+# does and does not confine).
+#
+# This is an OPT-IN mode, selected by running this compose file instead of
+# scripts/build-debug.sh / scripts/start-ralphus.sh. Bare-subprocess
+# execution remains the default and fully supported.
+#
+# Usage:
+#   RALPHUS_WORKSPACE_ROOT=/path/to/your/checkouts docker compose -f docker/docker-compose.yml up --build
+# or, from the repo root:
+#   RALPHUS_WORKSPACE_ROOT=/path/to/your/checkouts bash scripts/run-container.sh
+#
+# `RALPHUS_WORKSPACE_ROOT` is the ONLY host directory made visible inside the
+# container -- point it at a parent directory of whatever project checkouts
+# your task files' `cwd`s live under, and use container-side paths (e.g.
+# `/workspaces/my-project`) in those task files when submitting against this
+# instance.
+
+services:
+  ralphus:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ralphus-container-mode:latest
+    init: true
+    # Hardening posture: no capability this daemon/runner/agent stack needs
+    # requires anything beyond a normal unprivileged process, so there is
+    # nothing to selectively re-add.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      # Scratch space for the two binaries and any subprocess they spawn;
+      # never persisted, never reachable from another container.
+      - /tmp
+    # The daemon/librarian always listen on 7890/7474 *inside* the
+    # container's own network namespace -- only the HOST side of the
+    # mapping below is configurable, via RALPHUS_DAEMON_PORT/
+    # RALPHUS_LIBRARIAN_PORT (set by scripts/run-container.sh's
+    # --daemon-port/--librarian-port flags). That keeps the container
+    # itself identical run to run; only which host port reaches it moves.
+    ports:
+      - "${RALPHUS_DAEMON_PORT:-7890}:7890"
+      - "${RALPHUS_LIBRARIAN_PORT:-7474}:7474"
+    volumes:
+      # The ONE confinement boundary: everything an agent session's `cwd`
+      # can reach lives under here and nowhere else on the host.
+      - type: bind
+        source: ${RALPHUS_WORKSPACE_ROOT:?set RALPHUS_WORKSPACE_ROOT to the host directory agent sessions may read/write}
+        target: /workspaces
+      # Daemon bookkeeping (SQLite DB, terminal logs, Cartographer) --
+      # persisted across container restarts, but never exposed to an agent
+      # session's `cwd` the way /workspaces is.
+      - ralphus-state:/home/ralphus/.ralphus
+
+volumes:
+  ralphus-state:

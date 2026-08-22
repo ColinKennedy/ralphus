@@ -39,9 +39,9 @@ role in the table below, then use it.
 | `--teal` | `#39c5cf` | *(shared)* | semantic (dependency / linked movement) |
 | `--warn` | `#d29922` | *(shared)* | semantic (Cartographer `warning`-level log severity, RAL-98) |
 | `--unverified` | `#e3b341` | *(shared)* | semantic (review reached done with no build/test verification, RAL-101) |
-| `--waiting` | `#f778ba` | *(shared)* | status (a `pending` run held back by a scheduler down-time window, RAL-122) |
+| `--waiting` | `#f778ba` | *(shared)* | status (a `pending` squad held back by a scheduler down-time window, RAL-122) |
 | `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
-| `--stale` | `#db6d28` | *(shared)* | semantic (Live View: no fresh pane output for a while from a still-running session, RAL-170) |
+| `--stale` | `#db6d28` | *(shared)* | semantic (Live View: no fresh pane output for a while from a still-running cell, RAL-170) |
 | `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that contributes no changes — fails the review, RAL-190) |
 | `--drift` | `#f0883e` | *(shared)* | semantic (a submitted PR's remote branch and its review worktree have diverged, RAL-190) |
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
@@ -50,7 +50,7 @@ role in the table below, then use it.
 
 ## Semantic roles — pick by intent
 
-### Entity status (runs, tasks, sessions, verifies)
+### Entity status (squads, tasks, cells, proofs)
 Use the matching status variable for the status dot, badge, and any state-colored
 border. The stable state string maps 1:1 to a variable of the same name:
 
@@ -65,8 +65,8 @@ border. The stable state string maps 1:1 to a variable of the same name:
 | `ignored` | `--ignored` (amber) |
 
 ### Selection — `--accent` (pale blue)
-Anything the **user explicitly selected** (a selected queue row, task, run, or
-session). Style: `background: rgba(74,163,255,.16); border-color: var(--accent)`
+Anything the **user explicitly selected** (a selected queue row, task, squad, or
+cell). Style: `background: rgba(74,163,255,.16); border-color: var(--accent)`
 with a **solid** border. This is the primary "you picked this" affordance and must
 stay visually calm and unambiguous. Do not reuse it for anything the user did not
 directly select.
@@ -106,7 +106,7 @@ The branch's status is therefore `failed`, but it deliberately does **not** use
 `--failed` red. A generic red "failed" says only that something went wrong; the
 salmon `--empty` says *which* thing, distinguishing "this branch is empty" from
 a conflict, a check-gate failure, or a rebase error at a glance — the one
-failure whose fix is "go look at the task's session", not "go look at the
+failure whose fix is "go look at the task's cell", not "go look at the
 diff". Deliberately *not* `--ignored` amber either, which is reserved for the
 real `ignored` status.
 
@@ -125,7 +125,7 @@ failure requiring investigation, so it deliberately does not reuse
 `--failed`/`--danger` red either.
 
 ### Log severity — Cartographer only (RAL-98)
-Cartographer's event table (the global log, a run's Logs "events" tab, and a
+Cartographer's event table (the global log, a squad's Logs "events" tab, and a
 review's Logs button) colors rows by `level`, a concept distinct from entity
 status: `error` reuses `--failed` (red), `warning` uses the dedicated `--warn`
 (a separate hue from `--ignored` — log severity is not the same concept as the
@@ -144,11 +144,11 @@ status and from Cartographer's `--warn` log severity — reuse neither for it;
 (see "Adding a new UI element" below).
 
 ### Down-time waiting — `--waiting` only (RAL-122)
-A run that is `pending` purely because a configured scheduler down-time
+A squad that is `pending` purely because a configured scheduler down-time
 window (`[daemon]` in `.ralphus.toml`) is currently active is shown with the
 label "waiting" instead of "pending", colored with `--waiting`. This is a
 **display-only** relabeling of the `pending` state (driven by the board's
-`GET /api/tasks` `daemon.downtime_active` flag) — the run's real stored state
+`GET /api/tasks` `daemon.downtime_active` flag) — the squad's real stored state
 is still `pending`, so status filters, menus, and the API are unaffected.
 Distinct from `--pending` (grey, "the scheduler hasn't gotten to this yet")
 and from the caution-reserved `--ignored` (this is expected, configured
@@ -165,10 +165,10 @@ running, or done), so it can't reuse a status color; it also isn't a user
 concept (see "Adding a new UI element" below).
 
 ### Possibly-incomplete data — `--incomplete` only (RAL-155)
-The uber-log-viewer (a run's "Timeline" button/modal) flags two best-effort
+The uber-log-viewer (a squad's "Timeline" button/modal) flags two best-effort
 conditions with `--incomplete`: `gaps_possible` (Cartographer's retention
-pruning has already removed some of this run's earliest history) and
-`truncated` (the run generated more events than the conservative
+pruning has already removed some of this squad's earliest history) and
+`truncated` (the squad generated more events than the conservative
 per-generation cap). Both are "this data may not be the full picture," not a
 caution about an action the user is about to take (`--ignored`), a log
 severity (`--warn`, Cartographer-display-only), or an unverified-review state
@@ -177,7 +177,7 @@ this new concept (see "Adding a new UI element" below).
 
 ### Read-only field indicator — `--muted` (no new color)
 A detail-pane field that is purely derived/computed and can never be edited
-(e.g. a session's git `upstream`, resolved live from git state rather than
+(e.g. a cell's git `upstream`, resolved live from git state rather than
 stored config) marks its key label with a small `🔒` badge (`.ro-badge`),
 colored `--muted` — the same "secondary/disabled text" role already used for
 `--muted` elsewhere, not a new hue. Pair it with a tooltip explaining why the
@@ -188,9 +188,9 @@ to write back to.
 
 ### Stale liveness — `--stale` only (RAL-170)
 The Live View peek box shows the timestamp of the last fresh pane output
-received for a running session; once that gap passes a threshold
+received for a running cell; once that gap passes a threshold
 (`PEEK_STALE_WARNING_MS` in `board.html`) the timestamp switches from
-`--muted` to `--stale`, a caution that a still-`running` session may have
+`--muted` to `--stale`, a caution that a still-`running` cell may have
 silently hung rather than a normal quiet stretch. Distinct from the
 caution-reserved `--ignored` (that amber is for the genuine `ignored`
 status, not generic "pay attention") and from `--warn` (reserved for
@@ -199,8 +199,8 @@ fit this new concept (see "Adding a new UI element" below).
 
 ### Inherited resolved value — italic text only (no new color)
 A detail-pane field whose displayed value is a resolved fallback from a parent
-scope (for example, a session `agent` inherited from its task, or a verify
-step `model` inherited from its parent session) should render its **value**
+scope (for example, a cell `agent` inherited from its task, or a proof
+step `model` inherited from its parent cell) should render its **value**
 text in italics (`font-style: italic`) with the normal primary text color
 (`--text`) — no new hue. Pair it with a tooltip naming the source scope (per
 the UI Tooltip Rule in `CLAUDE.md`). Do **not** recolor inherited values to

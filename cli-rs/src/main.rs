@@ -9,6 +9,10 @@ use ralphus_cli::args::extract_global_opts;
 use ralphus_cli::commands::{dispatch, parse_args};
 
 fn main() -> std::process::ExitCode {
+    // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
+    // builds don't strip it as dead code ahead of the `ralphus license`
+    // subcommand landing.
+    std::hint::black_box(ralphus_core::license::embedded_license());
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let (opts, args) = extract_global_opts(&raw_args);
     let cmd = parse_args(&args);

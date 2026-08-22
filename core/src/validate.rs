@@ -6,10 +6,10 @@
 //! unknown keys, wrong types, and precise 1-based line numbers that a plain
 //! serde error would not surface.
 //!
-//! Scope note: cross-run / cross-blob reference resolution (which needs the
+//! Scope note: cross-squad / cross-blob reference resolution (which needs the
 //! daemon's database) is deferred to a later phase. This module validates a
 //! single submission's structure, types, required fields, mutually-exclusive
-//! keys, `restart_on` grammar, and within-task session dependency cycles.
+//! keys, `restart_on` grammar, and within-task cell dependency cycles.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,12 +33,15 @@ pub enum ErrorKind {
     ConflictingKeys,
     /// A within-task dependency references something that does not exist.
     IntraTaskRefNotFound,
+    /// An `upstream = "<<task:...>>"` sentinel references a task (or
+    /// task/cell) that does not exist anywhere in this submission.
+    UnknownTaskRef,
 }
 
 /// A single validation finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationError {
-    /// Dotted path to the offending element, e.g. `task[0].session[1].cwd`.
+    /// Dotted path to the offending element, e.g. `task[0].cell[1].cwd`.
     pub path: String,
     /// The category of finding.
     pub kind: ErrorKind,
@@ -172,10 +175,10 @@ const TASK_KEYS: &[&str] = &[
     "depends_on",
     "environment",
     "no_commit_required",
-    "session",
-    "verify",
+    "cell",
+    "proof",
 ];
-const SESSION_KEYS: &[&str] = &[
+const CELL_KEYS: &[&str] = &[
     "id",
     "name",
     "role",
@@ -195,7 +198,7 @@ const SESSION_KEYS: &[&str] = &[
     "timeout_minutes",
     "priority",
     "environment",
-    "verify",
+    "proof",
     "review",
     "upstream",
 ];
@@ -211,7 +214,7 @@ const REVIEW_KEYS: &[&str] = &[
 ];
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
-const VERIFY_KEYS: &[&str] = &[
+const PROOF_KEYS: &[&str] = &[
     "id",
     "command",
     "brain",
@@ -395,6 +398,14 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         return;
     }
 
+    // Submission-wide index (every [[task]] in `arr`, not just the one being
+    // walked) so an `upstream = "<<task:...>>"` sentinel can be checked
+    // against a task anywhere in this submission -- including a task that
+    // appears later in the array, or in a different file that `ralphus
+    // submit a.toml b.toml` already joined into this same `arr` before
+    // `validate_toml` ever saw it (see `build_task_cell_index`'s doc comment).
+    let task_cell_index = build_task_cell_index(arr);
+
     let mut task_names: HashSet<String> = HashSet::new();
     for (t, item) in arr.iter().enumerate() {
         let path = format!("task[{t}]");
@@ -457,36 +468,39 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
 
         let task_agent = table.get("agent").and_then(toml::Value::as_str);
         let task_project = table.get("project").and_then(toml::Value::as_str);
-        validate_sessions(
-            table.get("session"),
+        validate_cells(
+            table.get("cell"),
             t,
             &path,
             task_agent,
             task_project,
             header,
+            &task_cell_index,
             ctx,
         );
-        validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
+        validate_proof_array(table.get("proof"), &format!("{path}.proof"), ctx);
     }
 }
 
-// ── [[task.session]] ─────────────────────────────────────────────────────────
+// ── [[task.cell]] ─────────────────────────────────────────────────────────
 
-fn validate_sessions(
+#[allow(clippy::too_many_arguments)]
+fn validate_cells(
     value: Option<&toml::Value>,
     task_idx: usize,
     task_path: &str,
     task_agent: Option<&str>,
     task_project: Option<&str>,
     task_header: Option<u32>,
+    task_cell_index: &HashMap<String, HashSet<String>>,
     ctx: &mut Ctx,
 ) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
-            &format!("{task_path}.session"),
+            &format!("{task_path}.cell"),
             ErrorKind::WrongType,
-            "session must be an array of tables",
+            "cell must be an array of tables",
             None,
         );
         return;
@@ -497,24 +511,33 @@ fn validate_sessions(
     let mut has_placeholder = false;
 
     for (s, item) in arr.iter().enumerate() {
-        let path = format!("{task_path}.session[{s}]");
+        let path = format!("{task_path}.cell[{s}]");
         let Some(table) = item.as_table() else {
             ctx.error(
                 &path,
                 ErrorKind::WrongType,
-                "each session must be a table",
+                "each cell must be a table",
                 None,
             );
             continue;
         };
-        let header = ctx.idx.session_line(task_idx, s);
-        unknown_keys(ctx, table, SESSION_KEYS, &path, header);
+        let header = ctx.idx.cell_line(task_idx, s);
+        unknown_keys(ctx, table, CELL_KEYS, &path, header);
 
+        // RAL-224: `cwd` is deliberately syntax-only (present/non-empty/string),
+        // unlike `check_subprojects` below which also rejects a leading '/' or
+        // '\' and any '..' segment. A traversal check / sensitive-path denylist
+        // for `cwd` was considered and explicitly rejected -- the stakeholder
+        // decision was to rely on RAL-219's submission-time authentication (only
+        // authenticated callers can submit a task at all) as the real gate,
+        // rather than layering path-content rules on top. Revisit if RAL-219
+        // ever introduces a lower-trust authenticated tier that shouldn't be
+        // able to point `cwd` anywhere on disk.
         match table.get("cwd") {
             None => ctx.error(
                 &path,
                 ErrorKind::MissingRequired,
-                "'cwd' is required for every session (absolute path to the worktree)",
+                "'cwd' is required for every cell (absolute path to the worktree)",
                 header,
             ),
             Some(toml::Value::String(c)) if c.trim().is_empty() => {
@@ -530,11 +553,22 @@ fn validate_sessions(
             Some(v) => {
                 // A non-empty string (the two guarded arms above handled empty /
                 // non-string cases): check whether it's a worktree placeholder.
-                if v.as_str()
-                    .and_then(crate::schema::parse_worktree_placeholder)
-                    .is_some()
-                {
-                    has_placeholder = true;
+                if let Some(s) = v.as_str() {
+                    if crate::schema::parse_worktree_placeholder(s).is_some() {
+                        has_placeholder = true;
+                        if crate::schema::parse_worktree_placeholder_upstream(s).is_none() {
+                            let line = ctx.key_line(header, "cwd");
+                            ctx.error(
+                                &format!("{path}.cwd"),
+                                ErrorKind::MissingRequired,
+                                "a \"ralphus:new-worktree/<branch>\" placeholder cwd requires \
+                                 an explicit \"?upstream=<upstream>\" suffix, e.g. \
+                                 \"ralphus:new-worktree/<branch>?upstream=main\", so ralphus \
+                                 knows what the branch tracks instead of guessing from HEAD",
+                                line,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -548,13 +582,13 @@ fn validate_sessions(
             (true, true) => ctx.error(
                 &path,
                 ErrorKind::ConflictingKeys,
-                "session cannot set both 'prompt' (AI-driven) and 'command' (deterministic); use one",
+                "cell cannot set both 'prompt' (AI-driven) and 'command' (deterministic); use one",
                 header,
             ),
             (false, false) => ctx.error(
                 &path,
                 ErrorKind::MissingRequired,
-                "session requires either 'prompt' (AI-driven) or 'command' (shell command)",
+                "cell requires either 'prompt' (AI-driven) or 'command' (shell command)",
                 header,
             ),
             _ => {
@@ -570,7 +604,7 @@ fn validate_sessions(
                     ctx.error(
                         &format!("{path}.id"),
                         ErrorKind::InvalidValue,
-                        format!("session id \"{id}\" must not contain '/'"),
+                        format!("cell id \"{id}\" must not contain '/'"),
                         line,
                     );
                 } else {
@@ -605,23 +639,24 @@ fn validate_sessions(
 
         check_type(ctx, table, "upstream", Ty::Str, &path, header);
         check_upstream(ctx, table, &path, header);
+        check_upstream_task_ref_exists(ctx, table, &path, header, task_cell_index);
 
         check_type(ctx, table, "review", Ty::Str, &path, header);
 
-        validate_verify_array(table.get("verify"), &format!("{path}.verify"), ctx);
+        validate_proof_array(table.get("proof"), &format!("{path}.proof"), ctx);
     }
 
     if has_placeholder && task_project.is_none() {
         ctx.error(
             task_path,
             ErrorKind::MissingRequired,
-            "task 'project' is required when any session uses a placeholder cwd \
+            "task 'project' is required when any cell uses a placeholder cwd \
              (\"ralphus:new-worktree/<branch>\")",
             task_header,
         );
     }
 
-    check_session_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
+    check_cell_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
 }
 
 /// Validate the `subprojects` array (RAL-23): each element must be a
@@ -724,13 +759,6 @@ fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
     }
 }
 
-/// Enforce the appended-system-prompt rules (RAL-5). `system_prompt` and
-/// `system_prompt_position` are only accepted for backends with a real
-/// delivery mechanism — see
-/// [`agent_supports_system_prompt`](crate::schema::agent_supports_system_prompt)
-/// — and the position, when set, must be the `"append"` sentinel. The
-/// effective agent is the session's own `agent`, falling back to the
-/// task-level `agent`, then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
 /// Validate a `machine` value's *syntax* (RAL-185).
 ///
 /// Type-checks it as a string, then requires it to be either the literal
@@ -772,6 +800,21 @@ fn check_machine(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<
     );
 }
 
+/// Enforce the appended-system-prompt rules (RAL-5). `system_prompt` and
+/// `system_prompt_position` are only accepted for backends with a real
+/// delivery mechanism — see
+/// [`agent_supports_system_prompt`](crate::schema::agent_supports_system_prompt)
+/// — and the position, when set, must be the `"append"` sentinel. The
+/// effective agent is the cell's own `agent`, falling back to the
+/// task-level `agent`, then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
+///
+/// This only rejects agent names `core` can classify itself --
+/// [`RESERVED_AGENT_NAMES`](crate::schema::RESERVED_AGENT_NAMES), the
+/// built-in backends and their aliases. A name outside that set may be a
+/// custom `[agent.profiles.*]` entry whose backend `core` cannot see (same
+/// split as [`check_machine`]'s provider-registry check); that case is
+/// deferred to `daemon::agent_profiles::validate_task_file_profiles` at
+/// submit time, once the daemon has resolved the profile's real backend.
 fn check_system_prompt(
     ctx: &mut Ctx,
     table: &toml::Table,
@@ -790,7 +833,9 @@ fn check_system_prompt(
         .and_then(toml::Value::as_str)
         .or(task_agent)
         .unwrap_or(crate::schema::DEFAULT_AGENT);
-    if !crate::schema::agent_supports_system_prompt(agent) {
+    if crate::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !crate::schema::agent_supports_system_prompt(agent)
+    {
         let key = if has_prompt {
             "system_prompt"
         } else {
@@ -828,7 +873,7 @@ fn check_system_prompt(
 }
 
 /// Validate top-level `[[review]]` blocks. Only the TOML shape is checked here;
-/// whether a session's `review` id actually matches a declared review is a
+/// whether a cell's `review` id actually matches a declared review is a
 /// daemon-level preflight.
 fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
     let Some(value) = value else { return };
@@ -1017,7 +1062,7 @@ fn validate_review_action_input_array(value: Option<&toml::Value>, path: &str, c
     }
 }
 
-/// Validate the `upstream` field of a session. When it uses the
+/// Validate the `upstream` field of a cell. When it uses the
 /// `<<task:...>>` sentinel the inner reference must be non-empty.
 fn check_upstream(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
     let Some(val) = table.get("upstream").and_then(toml::Value::as_str) else {
@@ -1049,17 +1094,124 @@ fn check_upstream(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option
     }
 }
 
-/// Resolve within-task session dependencies and detect cycles. Cross-task refs
+/// Build a submission-wide index of task name -> its cells' `id`s, from
+/// every `[[task]]` in `arr` (not just one). This is what lets
+/// [`check_upstream_task_ref_exists`] resolve an `upstream = "<<task:...>>"`
+/// sentinel against a task anywhere in the submission, regardless of which
+/// `[[task]]` block it physically appears before or after -- and, since
+/// `ralphus submit a.toml b.toml` joins multiple files' raw TOML text into
+/// one string before this module ever sees it (`texts.join("\n\n")` in
+/// `cli-rs`'s `cmd_submit`), a cross-*file* reference within one submission
+/// resolves here too, for free: by the time `validate_toml` runs, `arr` is
+/// already every `[[task]]` from every joined file, indistinguishable from
+/// one file with the same content.
+///
+/// Malformed entries (a non-table task, a missing/empty name, a cell id
+/// containing `/`) are skipped rather than erroring here -- those are each
+/// already reported by their own dedicated check elsewhere in this module;
+/// this index only needs to know what a valid `upstream` reference COULD
+/// legitimately resolve to.
+fn build_task_cell_index(arr: &[toml::Value]) -> HashMap<String, HashSet<String>> {
+    let mut index: HashMap<String, HashSet<String>> = HashMap::new();
+    for item in arr {
+        let Some(table) = item.as_table() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if name.trim().is_empty() {
+            continue;
+        }
+        let cells = index.entry(name.to_string()).or_default();
+        let Some(cell_arr) = table.get("cell").and_then(toml::Value::as_array) else {
+            continue;
+        };
+        for cell_item in cell_arr {
+            let Some(cell_table) = cell_item.as_table() else {
+                continue;
+            };
+            if let Some(id) = cell_table.get("id").and_then(toml::Value::as_str) {
+                if !id.is_empty() && !id.contains('/') {
+                    cells.insert(id.to_string());
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Check that an `upstream = "<<task:task-name>>"` (or
+/// `"<<task:task-name/cell-id>>"`) sentinel references a task -- and cell,
+/// when given -- that actually exists in `task_cell_index`. Previously this
+/// went unchecked entirely: a typo'd or nonexistent task name validated
+/// clean and only surfaced at run time as a silent no-op (the rebase this
+/// sentinel is supposed to trigger just never fires --
+/// `daemon/src/scheduler.rs`'s `try_upstream_rebase` returns `None` via `?`
+/// the same way it does for "no upstream set at all", so nothing in the
+/// squad's own output distinguishes "intentionally no upstream" from "typo'd
+/// upstream").
+///
+/// A non-sentinel `upstream` value (empty, or not `<<task:...>>`-shaped) is
+/// out of scope here -- `check_upstream` already reports an empty value, and
+/// a plain literal branch name is syntactically valid (even though nothing
+/// currently acts on it; see the `upstream` field's doc comment).
+fn check_upstream_task_ref_exists(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    path: &str,
+    header: Option<u32>,
+    task_cell_index: &HashMap<String, HashSet<String>>,
+) {
+    let Some(val) = table.get("upstream").and_then(toml::Value::as_str) else {
+        return;
+    };
+    let Some(inner) = crate::schema::parse_upstream_task_ref(val) else {
+        return;
+    };
+    if inner.trim().is_empty() {
+        return; // already reported by check_upstream
+    }
+    let (task_name, cell_id) = inner
+        .split_once('/')
+        .map_or((inner, None), |(t, c)| (t, Some(c)));
+    let line = ctx.key_line(header, "upstream");
+    match task_cell_index.get(task_name) {
+        None => ctx.error(
+            &format!("{path}.upstream"),
+            ErrorKind::UnknownTaskRef,
+            format!("'upstream' <<task:...>> references unknown task \"{task_name}\""),
+            line,
+        ),
+        Some(cells) => {
+            if let Some(cid) = cell_id {
+                if !cells.contains(cid) {
+                    ctx.error(
+                        &format!("{path}.upstream"),
+                        ErrorKind::UnknownTaskRef,
+                        format!(
+                            "'upstream' <<task:...>> references unknown cell \"{cid}\" \
+                             in task \"{task_name}\""
+                        ),
+                        line,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resolve within-task cell dependencies and detect cycles. Cross-task refs
 /// (those containing `/`) are left for a later phase to resolve against the DB.
-fn check_session_deps(
+fn check_cell_deps(
     ids: &HashMap<String, usize>,
     edges: &[(usize, String)],
-    session_count: usize,
+    cell_count: usize,
     task_path: &str,
     task_idx: usize,
     ctx: &mut Ctx,
 ) {
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); session_count];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); cell_count];
     for (from, dep) in edges {
         if dep.contains('/') {
             continue; // cross-task ref, deferred.
@@ -1067,11 +1219,11 @@ fn check_session_deps(
         match ids.get(dep) {
             Some(&to) => adj[*from].push(to),
             None => {
-                let line = ctx.idx.session_line(task_idx, *from);
+                let line = ctx.idx.cell_line(task_idx, *from);
                 ctx.error(
-                    &format!("{task_path}.session[{from}].depends_on"),
+                    &format!("{task_path}.cell[{from}].depends_on"),
                     ErrorKind::IntraTaskRefNotFound,
-                    format!("depends_on references unknown session id \"{dep}\""),
+                    format!("depends_on references unknown cell id \"{dep}\""),
                     line,
                 );
             }
@@ -1081,9 +1233,9 @@ fn check_session_deps(
     if has_cycle(&adj) {
         let line = ctx.idx.task_line(task_idx);
         ctx.error(
-            &format!("{task_path}.session"),
+            &format!("{task_path}.cell"),
             ErrorKind::InvalidValue,
-            "circular dependency detected among sessions",
+            "circular dependency detected among cells",
             line,
         );
     }
@@ -1112,15 +1264,15 @@ fn has_cycle(adj: &[Vec<usize>]) -> bool {
     (0..adj.len()).any(|n| marks[n] == Mark::White && dfs(n, adj, &mut marks))
 }
 
-// ── verify steps ─────────────────────────────────────────────────────────────
+// ── proof steps ─────────────────────────────────────────────────────────────
 
-fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+fn validate_proof_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
             path,
             ErrorKind::WrongType,
-            "verify must be an array of tables",
+            "proof must be an array of tables",
             None,
         );
         return;
@@ -1131,15 +1283,15 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
             ctx.error(
                 &vpath,
                 ErrorKind::WrongType,
-                "each verify step must be a table",
+                "each proof step must be a table",
                 None,
             );
             continue;
         };
-        unknown_keys(ctx, table, VERIFY_KEYS, &vpath, None);
+        unknown_keys(ctx, table, PROOF_KEYS, &vpath, None);
         check_machine(ctx, table, &vpath, None);
-        // RAL-191: a verify step carries its own `environment`, validated with
-        // exactly the same key/value rules as a task's or session's.
+        // RAL-191: a proof step carries its own `environment`, validated with
+        // exactly the same key/value rules as a task's or cell's.
         check_environment(ctx, table, &vpath, None);
 
         let kinds = ["command", "brain", "prompt"];
@@ -1152,7 +1304,7 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
             0 => ctx.error(
                 &vpath,
                 ErrorKind::MissingRequired,
-                "verify step requires exactly one of: command, brain, prompt",
+                "proof step requires exactly one of: command, brain, prompt",
                 None,
             ),
             1 => {}
@@ -1160,7 +1312,7 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
                 &vpath,
                 ErrorKind::ConflictingKeys,
                 format!(
-                    "verify step sets multiple kinds ({}); use exactly one",
+                    "proof step sets multiple kinds ({}); use exactly one",
                     set.join(", ")
                 ),
                 None,
@@ -1189,7 +1341,7 @@ fn validate_verify_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx)
 }
 
 /// Validate a single `restart_on` reference against the grammar
-/// `task/session/verify[?on=pass|fail|both]` with `task/*` and `task/session/*`
+/// `task/cell/proof[?on=pass|fail|both]` with `task/*` and `task/cell/*`
 /// wildcards allowed.
 fn check_restart_grammar(spec: &str) -> Result<(), String> {
     let (path, filter) = match spec.split_once("?on=") {
@@ -1209,9 +1361,9 @@ fn check_restart_grammar(spec: &str) -> Result<(), String> {
     }
     match segs.as_slice() {
         [_task, last] if *last == "*" => Ok(()),
-        [_task, _session, _verify] => Ok(()),
+        [_task, _cell, _proof] => Ok(()),
         _ => Err(format!(
-            "restart_on \"{spec}\" must be task/session/verify or a task/* / task/session/* wildcard"
+            "restart_on \"{spec}\" must be task/cell/proof or a task/* / task/cell/* wildcard"
         )),
     }
 }
@@ -1225,8 +1377,8 @@ struct HeaderIndex {
     default_lines: Vec<u32>,
     task_lines: Vec<u32>,
     review_lines: Vec<u32>,
-    /// (task_idx, session_idx) -> line
-    session_lines: HashMap<(usize, usize), u32>,
+    /// (task_idx, cell_idx) -> line
+    cell_lines: HashMap<(usize, usize), u32>,
 }
 
 impl HeaderIndex {
@@ -1234,9 +1386,9 @@ impl HeaderIndex {
         let mut default_lines = Vec::new();
         let mut task_lines = Vec::new();
         let mut review_lines = Vec::new();
-        let mut session_lines = HashMap::new();
+        let mut cell_lines = HashMap::new();
         let mut cur_task: isize = -1;
-        let mut cur_session: isize = -1;
+        let mut cur_cell: isize = -1;
 
         for (i, line) in raw.lines().enumerate() {
             let ln = u32::try_from(i + 1).unwrap_or(u32::MAX);
@@ -1244,15 +1396,13 @@ impl HeaderIndex {
                 Some("[[default]]") => default_lines.push(ln),
                 Some("[[task]]") => {
                     cur_task += 1;
-                    cur_session = -1;
+                    cur_cell = -1;
                     task_lines.push(ln);
                 }
-                Some("[[task.session]]") => {
-                    cur_session += 1;
-                    if let (Ok(t), Ok(s)) =
-                        (usize::try_from(cur_task), usize::try_from(cur_session))
-                    {
-                        session_lines.insert((t, s), ln);
+                Some("[[task.cell]]") => {
+                    cur_cell += 1;
+                    if let (Ok(t), Ok(s)) = (usize::try_from(cur_task), usize::try_from(cur_cell)) {
+                        cell_lines.insert((t, s), ln);
                     }
                 }
                 Some("[[review]]") => review_lines.push(ln),
@@ -1263,7 +1413,7 @@ impl HeaderIndex {
             default_lines,
             task_lines,
             review_lines,
-            session_lines,
+            cell_lines,
         }
     }
 
@@ -1279,8 +1429,8 @@ impl HeaderIndex {
         self.review_lines.get(r).copied()
     }
 
-    fn session_line(&self, t: usize, s: usize) -> Option<u32> {
-        self.session_lines.get(&(t, s)).copied()
+    fn cell_line(&self, t: usize, s: usize) -> Option<u32> {
+        self.cell_lines.get(&(t, s)).copied()
     }
 
     /// Find the line of `key = ...` in the scalar body starting just after
@@ -1324,7 +1474,7 @@ fn key_assignment_matches(line: &str, key: &str) -> bool {
 }
 
 /// Normalize a potential array-of-table header line by removing inner
-/// whitespace, e.g. `[[ task . session ]]` -> `[[task.session]]`. Returns `None`
+/// whitespace, e.g. `[[ task . cell ]]` -> `[[task.cell]]`. Returns `None`
 /// if the line is not an `[[...]]` header.
 fn normalize_header(line: &str) -> Option<String> {
     let t = line.trim();
@@ -1352,10 +1502,10 @@ mod tests {
     const GOOD: &str = r#"
 [[task]]
 name = "build"
-[[task.session]]
+[[task.cell]]
 cwd = "/repo"
 prompt = "make it build"
-[[task.session.verify]]
+[[task.cell.proof]]
 command = "cargo build"
 "#;
 
@@ -1375,7 +1525,7 @@ command = "cargo build"
     #[test]
     fn unknown_task_key_reports_line() {
         let src =
-            "[[task]]\nname = \"t\"\nbudgt_usd = 1.0\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+            "[[task]]\nname = \"t\"\nbudgt_usd = 1.0\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         let e = r
             .errors
@@ -1388,7 +1538,7 @@ command = "cargo build"
 
     #[test]
     fn missing_name() {
-        let src = "[[task]]\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1398,8 +1548,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn session_needs_cwd() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\nprompt=\"p\"\n";
+    fn cell_needs_cwd() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1410,8 +1560,7 @@ command = "cargo build"
 
     #[test]
     fn prompt_and_command_conflict() {
-        let src =
-            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\ncommand=\"c\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\ncommand=\"c\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1421,8 +1570,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn session_needs_prompt_or_command() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\n";
+    fn cell_needs_prompt_or_command() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1432,21 +1581,21 @@ command = "cargo build"
     }
 
     #[test]
-    fn command_only_session_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\ncommand=\"cargo build\"\n";
+    fn command_only_cell_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\n";
         assert!(validate_toml(src).is_ok());
     }
 
     #[test]
     fn no_commit_required_accepted_as_bool() {
-        let src = "[[task]]\nname=\"t\"\nno_commit_required=true\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn no_commit_required_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\nno_commit_required=\"yes\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nno_commit_required=\"yes\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(
@@ -1458,8 +1607,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn priority_accepted_on_task_and_session() {
-        let src = "[[task]]\nname=\"t\"\npriority=2\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\npriority=0\n";
+    fn priority_accepted_on_task_and_cell() {
+        let src = "[[task]]\nname=\"t\"\npriority=2\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\npriority=0\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -1467,7 +1616,7 @@ command = "cargo build"
     #[test]
     fn priority_wrong_type_reported() {
         let src =
-            "[[task]]\nname=\"t\"\npriority=\"high\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+            "[[task]]\nname=\"t\"\npriority=\"high\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1480,7 +1629,7 @@ command = "cargo build"
 
     #[test]
     fn wrong_type_for_budget() {
-        let src = "[[task]]\nname=\"t\"\nbudget_tokens=\"lots\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nbudget_tokens=\"lots\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1490,22 +1639,23 @@ command = "cargo build"
     }
 
     #[test]
-    fn maximum_budget_usd_accepted_on_task_and_session() {
-        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=5.0\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=1.5\n";
+    fn maximum_budget_usd_accepted_on_task_and_cell() {
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=5.0\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=1.5\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn maximum_budget_usd_accepts_bare_integer() {
-        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=5\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src =
+            "[[task]]\nname=\"t\"\nmaximum_budget_usd=5\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn maximum_budget_usd_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=\"lots\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=\"lots\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
@@ -1517,7 +1667,7 @@ command = "cargo build"
 
     #[test]
     fn maximum_budget_usd_zero_rejected() {
-        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=0.0\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nmaximum_budget_usd=0.0\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1531,7 +1681,7 @@ command = "cargo build"
 
     #[test]
     fn maximum_budget_usd_negative_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=-1.0\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=-1.0\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1547,14 +1697,14 @@ command = "cargo build"
 
     #[test]
     fn review_maximum_budget_usd_accepted() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=10.0\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=10.0\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn review_maximum_budget_usd_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=\"lots\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=\"lots\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
@@ -1566,7 +1716,7 @@ command = "cargo build"
 
     #[test]
     fn review_maximum_budget_usd_zero_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=0.0\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=0.0\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1579,8 +1729,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn verify_needs_exactly_one_kind() {
-        let none = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"v\"\n";
+    fn proof_needs_exactly_one_kind() {
+        let none = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"v\"\n";
         assert!(
             validate_toml(none)
                 .errors
@@ -1588,7 +1738,7 @@ command = "cargo build"
                 .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("exactly one"))
         );
 
-        let many = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\ncommand=\"c\"\nbrain=\"b\"\n";
+        let many = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nbrain=\"b\"\n";
         assert!(
             validate_toml(many)
                 .errors
@@ -1599,7 +1749,7 @@ command = "cargo build"
 
     #[test]
     fn duplicate_task_names() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1610,7 +1760,7 @@ command = "cargo build"
 
     #[test]
     fn intra_task_dep_not_found() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"ghost\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"ghost\"]\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1621,7 +1771,7 @@ command = "cargo build"
 
     #[test]
     fn cross_task_dep_is_not_flagged_here() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"other/b\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"other/b\"]\n";
         let r = validate_toml(src);
         assert!(
             !r.errors
@@ -1630,9 +1780,126 @@ command = "cargo build"
         );
     }
 
+    // ── upstream <<task:...>> existence checks ─────────────────────────────
+
+    #[test]
+    fn upstream_task_ref_resolves_within_same_file() {
+        let src = "[[task]]\nname=\"a\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:a>>\"\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_task_cell_ref_resolves_within_same_file() {
+        let src = "[[task]]\nname=\"a\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:a/work>>\"\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_task_ref_unknown_task_is_flagged() {
+        let src = "[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:ghost>>\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef
+                && e.message.contains("unknown task \"ghost\"")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_task_ref_unknown_cell_is_flagged() {
+        let src = "[[task]]\nname=\"a\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:a/ghost>>\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef
+                && e.message.contains("unknown cell \"ghost\" in task \"a\"")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_task_ref_forward_reference_within_same_file_is_fine() {
+        // "a" references "b", which is declared LATER in the same array --
+        // the index is built from the whole array up front, so declaration
+        // order must not matter.
+        let src = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:b>>\"\n\
+                    [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_task_ref_resolves_across_joined_files() {
+        // Mirrors what `ralphus submit a.toml b.toml` does client-side:
+        // read each file's TOML text independently and join with a blank
+        // line into ONE combined submission before validating -- so a task
+        // declared in "file one" must be a valid `upstream` target for a
+        // cell declared in "file two", once joined.
+        let file_a = "[[task]]\nname=\"upstream-task\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let file_b = "[[task]]\nname=\"downstream-task\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:upstream-task>>\"\n";
+        let combined = format!("{file_a}\n\n{file_b}");
+        let r = validate_toml(&combined);
+        assert!(
+            !r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_task_ref_unknown_across_joined_files_is_still_flagged() {
+        // Same join as above, but the referenced task exists in neither
+        // joined file -- joining two files must not accidentally make an
+        // otherwise-invalid reference look resolvable.
+        let file_a = "[[task]]\nname=\"unrelated-task\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let file_b = "[[task]]\nname=\"downstream-task\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:ghost>>\"\n";
+        let combined = format!("{file_a}\n\n{file_b}");
+        let r = validate_toml(&combined);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef
+                && e.message.contains("unknown task \"ghost\"")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn upstream_plain_branch_name_is_not_checked_against_the_task_index() {
+        // A literal (non-sentinel) `upstream` value is syntactically valid
+        // today (see the field's own doc comment -- nothing currently acts
+        // on it, but `check_upstream` doesn't reject it either), so it must
+        // never be flagged as an unknown task ref just because it isn't a
+        // task name.
+        let src = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"origin/some-branch\"\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors.iter().any(|e| e.kind == ErrorKind::UnknownTaskRef),
+            "{:?}",
+            r.errors
+        );
+    }
+
     #[test]
     fn dependency_cycle_detected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"b\"]\n[[task.session]]\nid=\"b\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"a\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"b\"]\n[[task.cell]]\nid=\"b\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"a\"]\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.message.contains("circular")));
     }
@@ -1650,7 +1917,7 @@ command = "cargo build"
 
     #[test]
     fn restart_on_bad_grammar_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\ncommand=\"c\"\nrestart_on=[\"nope\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nrestart_on=[\"nope\"]\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1660,25 +1927,25 @@ command = "cargo build"
     }
 
     #[test]
-    fn environment_accepted_on_task_and_session() {
-        let src = "[[task]]\nname=\"t\"\nenvironment={A=\"1\"}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={B=\"2\"}\n";
+    fn environment_accepted_on_task_and_cell() {
+        let src = "[[task]]\nname=\"t\"\nenvironment={A=\"1\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={B=\"2\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn environment_accepted_on_verify_steps() {
-        // RAL-191: `environment` on `[[task.verify]]` / `[[task.session.verify]]`.
-        let src = "[[task]]\nname=\"t\"\n[[task.verify]]\ncommand=\"c\"\nenvironment={A=\"1\"}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\ncommand=\"d\"\nenvironment={B=\"2\"}\n";
+    fn environment_accepted_on_proof_steps() {
+        // RAL-191: `environment` on `[[task.proof]]` / `[[task.cell.proof]]`.
+        let src = "[[task]]\nname=\"t\"\n[[task.proof]]\ncommand=\"c\"\nenvironment={A=\"1\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"d\"\nenvironment={B=\"2\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn environment_invalid_key_on_a_verify_step_reported() {
-        // The same key/value rules apply at the verify layer -- an invalid
+    fn environment_invalid_key_on_a_proof_step_reported() {
+        // The same key/value rules apply at the proof layer -- an invalid
         // identifier here would otherwise reach `build_command_line_with_env`.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\ncommand=\"c\"\nenvironment={\"BAD-KEY\"=\"x\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nenvironment={\"BAD-KEY\"=\"x\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1690,8 +1957,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn environment_non_string_value_on_a_verify_step_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.verify]]\ncommand=\"c\"\nenvironment={A=1}\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    fn environment_non_string_value_on_a_proof_step_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.proof]]\ncommand=\"c\"\nenvironment={A=1}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1704,7 +1971,8 @@ command = "cargo build"
 
     #[test]
     fn environment_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\nenvironment=\"nope\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src =
+            "[[task]]\nname=\"t\"\nenvironment=\"nope\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1718,7 +1986,7 @@ command = "cargo build"
     #[test]
     fn environment_non_string_value_reported() {
         let src =
-            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=1}\n";
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=1}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1731,7 +1999,7 @@ command = "cargo build"
 
     #[test]
     fn environment_invalid_key_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={\"1BAD\"=\"x\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={\"1BAD\"=\"x\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1744,7 +2012,7 @@ command = "cargo build"
 
     #[test]
     fn system_prompt_valid_for_claude_code() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -1754,22 +2022,22 @@ command = "cargo build"
         // Codex has no dedicated system-prompt flag but delivers `system_prompt`
         // via `-c developer_instructions=...` (see `CodexBackend`), so it's
         // accepted the same as claude-code.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn system_prompt_valid_for_codex_cli_alias() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex-cli\"\nsystem_prompt=\"be terse\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex-cli\"\nsystem_prompt=\"be terse\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn system_prompt_inherits_task_agent() {
-        // agent set at the task level (claude-code); the session omits it.
-        let src = "[[task]]\nname=\"t\"\nagent=\"claude-code\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n";
+        // agent set at the task level (claude-code); the cell omits it.
+        let src = "[[task]]\nname=\"t\"\nagent=\"claude-code\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -1777,7 +2045,7 @@ command = "cargo build"
     #[test]
     fn system_prompt_rejected_for_default_agent() {
         // No agent set anywhere → resolves to the default "claude", not claude-code.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
@@ -1789,7 +2057,7 @@ command = "cargo build"
 
     #[test]
     fn system_prompt_rejected_for_ollama() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\nsystem_prompt=\"be terse\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\nsystem_prompt=\"be terse\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1801,8 +2069,20 @@ command = "cargo build"
     }
 
     #[test]
+    fn system_prompt_deferred_to_daemon_for_custom_agent_profile() {
+        // "openrouter-deepseek" isn't a RESERVED_AGENT_NAMES entry, so `core`
+        // can't tell whether it's a custom `[agent.profiles.*]` resolving to a
+        // system_prompt-capable backend (e.g. claude-code) -- it must not
+        // reject offline. The daemon checks the resolved backend instead, see
+        // `daemon::agent_profiles::validate_task_file_profiles`.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"openrouter-deepseek\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
     fn system_prompt_position_rejects_unknown_value() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"x\"\nsystem_prompt_position=\"prepend\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=\"x\"\nsystem_prompt_position=\"prepend\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
@@ -1814,14 +2094,14 @@ command = "cargo build"
 
     #[test]
     fn system_prompt_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=123\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=123\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
     }
 
     #[test]
     fn toplevel_review_block_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"be\"\n[[review]]\nid=\"be\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"be\"\n[[review]]\nid=\"be\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1834,9 +2114,9 @@ command = "cargo build"
     #[test]
     fn machine_is_valid_at_every_level() {
         let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
-                   [[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmachine=\"incredibuild:A\"\nreview=\"r\"\n\
-                   [[task.session.verify]]\ncommand=\"cargo test\"\nmachine=\"incredibuild:A\"\n\
-                   [[task.verify]]\ncommand=\"cargo fmt\"\nmachine=\"local\"\n\
+                   [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmachine=\"incredibuild:A\"\nreview=\"r\"\n\
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmachine=\"incredibuild:A\"\n\
+                   [[task.proof]]\ncommand=\"cargo fmt\"\nmachine=\"local\"\n\
                    [[review]]\nid=\"r\"\nmachine=\"incredibuild:C\"\n";
         assert!(
             validate_toml(src).is_ok(),
@@ -1847,7 +2127,7 @@ command = "cargo build"
 
     #[test]
     fn machine_without_a_scheme_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         let e = r
             .errors
@@ -1861,7 +2141,7 @@ command = "cargo build"
 
     #[test]
     fn machine_with_empty_uri_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1877,7 +2157,7 @@ command = "cargo build"
         // Without the minimum-scheme-length rule this parses as provider "C",
         // and the user's first clue would be an unrelated "provider C is not
         // registered" at submit time.
-        let src = "[[task]]\nname=\"t\"\nmachine=\"C:\\\\build\\\\wt\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nmachine=\"C:\\\\build\\\\wt\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         let e = r
             .errors
@@ -1889,7 +2169,7 @@ command = "cargo build"
 
     #[test]
     fn machine_wrong_type_is_reported() {
-        let src = "[[task]]\nname=\"t\"\nmachine=42\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nmachine=42\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1904,7 +2184,7 @@ command = "cargo build"
     fn a_task_file_that_never_mentions_machine_still_validates() {
         // Regression guard: `machine` is optional everywhere and defaults to
         // local, so every pre-RAL-185 task file must keep validating untouched.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1914,7 +2194,7 @@ command = "cargo build"
 
     #[test]
     fn review_with_action_command_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run tests\"\ncommand=\"cargo test\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run tests\"\ncommand=\"cargo test\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1924,7 +2204,7 @@ command = "cargo build"
 
     #[test]
     fn review_with_action_prompt_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check UI\"\nprompt=\"Open localhost:3000 and verify the wizard\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check UI\"\nprompt=\"Open localhost:3000 and verify the wizard\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1934,7 +2214,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_both_prompt_and_command_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\nprompt=\"do x\"\ncommand=\"do y\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\nprompt=\"do x\"\ncommand=\"do y\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1947,7 +2227,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_missing_both_prompt_and_command_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1960,7 +2240,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_missing_label_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\ncommand=\"cargo test\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\ncommand=\"cargo test\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1973,7 +2253,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_unknown_key_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nfoo=\"bar\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nfoo=\"bar\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -1986,7 +2266,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_cleanup_command_alone_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\ncleanup_command=\"ralphus-daemon stop --port {port}\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\ncleanup_command=\"ralphus-daemon stop --port {port}\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -1996,7 +2276,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port for the daemon\"\ndefault=\"7890\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port for the daemon\"\ndefault=\"7890\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2006,7 +2286,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_missing_name_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nmessage=\"Port for the daemon\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nmessage=\"Port for the daemon\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2019,7 +2299,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_missing_message_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2032,7 +2312,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_unknown_key_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port\"\nfoo=\"bar\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port\"\nfoo=\"bar\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2045,7 +2325,7 @@ command = "cargo build"
 
     #[test]
     fn review_link_placeholder_id_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"ralphus:new-review/ral-batch\"\n[[review]]\nid=\"ralphus:new-review/ral-batch\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"ralphus:new-review/ral-batch\"\n[[review]]\nid=\"ralphus:new-review/ral-batch\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2056,7 +2336,7 @@ command = "cargo build"
     #[test]
     fn malformed_review_link_id_reported() {
         // Right scheme, but empty key after the slash.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=\"ralphus:new-review/\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=\"ralphus:new-review/\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2070,7 +2350,7 @@ command = "cargo build"
     #[test]
     fn wrong_scheme_review_link_id_reported() {
         // `ralphus:` scheme but not the `new-review/` form.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=\"ralphus:review/xyz\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=\"ralphus:review/xyz\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2083,7 +2363,7 @@ command = "cargo build"
 
     #[test]
     fn review_unknown_key_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nbranch=\"x\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nbranch=\"x\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2094,21 +2374,22 @@ command = "cargo build"
 
     #[test]
     fn review_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=123\n";
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nid=123\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
     }
 
     #[test]
-    fn session_review_must_be_string_not_table() {
-        // A session's `review` field opts into a top-level [[review]] block by id
+    fn cell_review_must_be_string_not_table() {
+        // A cell's `review` field opts into a top-level [[review]] block by id
         // and must be a string; a table value is rejected.
         let src =
-            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview={id=\"x\"}\n";
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview={id=\"x\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
-            "a table-valued session 'review' must be rejected: {:?}",
+            "a table-valued cell 'review' must be rejected: {:?}",
             r.errors
         );
     }
@@ -2116,7 +2397,7 @@ command = "cargo build"
     #[test]
     fn review_without_action_block_works_identically() {
         // A [[review]] with no [[review.action]] sub-blocks must still validate.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nagent=\"claude\"\nmodel=\"claude-opus-4-8\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nagent=\"claude\"\nmodel=\"claude-opus-4-8\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2126,7 +2407,7 @@ command = "cargo build"
 
     #[test]
     fn subprojects_single_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\"]\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2136,7 +2417,7 @@ command = "cargo build"
 
     #[test]
     fn subprojects_multiple_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\",\"packages/bar\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\",\"packages/bar\"]\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2146,7 +2427,7 @@ command = "cargo build"
 
     #[test]
     fn subprojects_nested_path_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"a/b/c\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"a/b/c\"]\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2156,7 +2437,8 @@ command = "cargo build"
 
     #[test]
     fn subprojects_empty_entry_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"\"]\n";
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"\"]\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2169,7 +2451,7 @@ command = "cargo build"
 
     #[test]
     fn subprojects_absolute_path_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"/packages/foo\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"/packages/foo\"]\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2182,7 +2464,7 @@ command = "cargo build"
 
     #[test]
     fn subprojects_dotdot_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/../etc\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/../etc\"]\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2196,7 +2478,7 @@ command = "cargo build"
     #[test]
     fn subprojects_wrong_type_rejected() {
         let src =
-            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=123\n";
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=123\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
@@ -2208,7 +2490,7 @@ command = "cargo build"
     #[test]
     fn subprojects_string_not_array_rejected() {
         // Passing a plain string instead of an array should be caught as WrongType
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=\"packages/foo\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=\"packages/foo\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
@@ -2236,21 +2518,23 @@ command = "cargo build"
 
     #[test]
     fn upstream_task_sentinel_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:task-a>>\"\n";
+        let src = "[[task]]\nname=\"task-a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:task-a>>\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn upstream_task_session_sentinel_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:task-a/session-1>>\"\n";
+    fn upstream_task_cell_sentinel_is_valid() {
+        let src = "[[task]]\nname=\"task-a\"\n[[task.cell]]\nid=\"cell-1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:task-a/cell-1>>\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn upstream_empty_sentinel_ref_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:>>\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:>>\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2263,8 +2547,7 @@ command = "cargo build"
 
     #[test]
     fn upstream_empty_string_is_rejected() {
-        let src =
-            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2277,8 +2560,7 @@ command = "cargo build"
 
     #[test]
     fn upstream_wrong_type_rejected() {
-        let src =
-            "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=123\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=123\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
     }
@@ -2287,14 +2569,14 @@ command = "cargo build"
 
     #[test]
     fn placeholder_cwd_with_project_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn placeholder_cwd_without_project_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
@@ -2306,19 +2588,53 @@ command = "cargo build"
     }
 
     #[test]
+    fn placeholder_cwd_without_upstream_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("upstream")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn placeholder_cwd_with_empty_upstream_value_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("upstream")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn placeholder_cwd_with_remote_qualified_upstream_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/origin/feature/x?upstream=origin/blah\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
     fn old_style_project_prefixed_cwd_is_treated_as_a_plain_path() {
         // The pre-RAL-100-redesign `<project>:worktree/<branch>` scheme no
         // longer parses as a placeholder, so it doesn't require 'project' to
         // be set -- it's just an (unusual, but not our concern here) literal
         // cwd string.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"my-project:worktree/feat\"\nprompt=\"p\"\n";
+        let src =
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"my-project:worktree/feat\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn plain_path_cwd_does_not_require_project() {
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2328,9 +2644,9 @@ command = "cargo build"
 
     #[test]
     fn upstream_unknown_key_would_have_been_caught() {
-        // Regression guard: "upstream" must be in SESSION_KEYS so it is NOT
+        // Regression guard: "upstream" must be in CELL_KEYS so it is NOT
         // reported as an unknown key.
-        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:dep>>\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nupstream=\"<<task:dep>>\"\n";
         let r = validate_toml(src);
         assert!(
             !r.errors

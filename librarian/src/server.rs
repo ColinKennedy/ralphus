@@ -60,7 +60,14 @@ pub fn handle(daemon_url: &str, method: &str, path: &str, body: &str) -> Reply {
     let path_only = path.split('?').next().unwrap_or(path);
     match (method, path_only) {
         ("GET", "/" | "/index.html") => Reply::html(INDEX_HTML),
-        (_, p) if p.starts_with("/api/") => proxy(daemon_url, method, path, body, None),
+        (_, p) if p.starts_with("/api/") => proxy(
+            daemon_url,
+            method,
+            path,
+            body,
+            None,
+            daemon_token().as_deref(),
+        ),
         _ => Reply::not_found(),
     }
 }
@@ -87,7 +94,14 @@ pub fn handle_with_trace(
 
     let reply = match (method, path_only) {
         ("GET", "/" | "/index.html") => Reply::html(INDEX_HTML),
-        (_, p) if p.starts_with("/api/") => proxy(daemon_url, method, path, body, Some(&span.cx)),
+        (_, p) if p.starts_with("/api/") => proxy(
+            daemon_url,
+            method,
+            path,
+            body,
+            Some(&span.cx),
+            daemon_token().as_deref(),
+        ),
         _ => Reply::not_found(),
     };
 
@@ -100,23 +114,47 @@ pub fn handle_with_trace(
     reply
 }
 
+/// Read the daemon's bearer token from `state_dir()/daemon.token` (RAL-219),
+/// the same file the daemon itself generates/persists at startup. The
+/// librarian holds no other state, so this is read fresh on every proxied
+/// request rather than cached — a cheap local file read, and it means a
+/// token that didn't exist yet at librarian startup (daemon started later)
+/// or was regenerated is always picked up on the very next request.
+fn daemon_token() -> Option<String> {
+    std::fs::read_to_string(ralphus_core::daemon_token_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Forward a request to the daemon and relay its status and body. A daemon that
 /// is down becomes a 502 with an error envelope the page knows how to show.
 /// When `parent` carries a valid span, its `traceparent` is forwarded to the
 /// daemon as a request header (RAL-96) so the daemon's own span continues the
-/// same trace instead of starting a disconnected one.
+/// same trace instead of starting a disconnected one. `token` (RAL-219, read
+/// by the caller via [`daemon_token`] — kept as a plain parameter here, like
+/// `parent`, so tests can exercise the forwarding without touching the real
+/// token file) is attached the same way, so the board UI keeps working
+/// without the operator configuring anything extra for local use.
 fn proxy(
     daemon_url: &str,
     method: &str,
     path: &str,
     body: &str,
     parent: Option<&Context>,
+    token: Option<&str>,
 ) -> Reply {
     let url = format!("{}{}", daemon_url.trim_end_matches('/'), path);
     let traceparent = parent.and_then(crate::otel::traceparent_from_context);
-    let with_trace = |req: ureq::Request| match &traceparent {
-        Some(tp) => req.set("traceparent", tp),
-        None => req,
+    let with_trace = |req: ureq::Request| {
+        let req = match &traceparent {
+            Some(tp) => req.set("traceparent", tp),
+            None => req,
+        };
+        match token {
+            Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+            None => req,
+        }
     };
     let result = match method {
         "GET" => with_trace(ureq::get(&url)).call(),
@@ -152,49 +190,168 @@ fn proxy(
 /// the buffered `proxy()` path above.
 const EVENTS_PATH: &str = "/api/events";
 
-/// Serve the librarian on `127.0.0.1:port`, proxying the API to `daemon_url`.
+/// Case-insensitive header lookup (`tiny_http::Header::field` compares
+/// case-insensitively via `.equiv`).
+fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+fn cors_header(name: &'static [u8], value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(name, value.as_bytes()).expect("valid header")
+}
+
+/// `Access-Control-Allow-Origin` (echoing the exact allowed origin, never a
+/// wildcard, per RAL-220) plus `Vary: Origin`.
+fn cors_response_headers(origin: &str) -> Vec<tiny_http::Header> {
+    vec![
+        cors_header(b"Access-Control-Allow-Origin", origin),
+        cors_header(b"Vary", "Origin"),
+    ]
+}
+
+/// The additional headers a preflight `OPTIONS` response needs beyond
+/// [`cors_response_headers`].
+fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
+    let mut headers = cors_response_headers(origin);
+    headers.push(cors_header(
+        b"Access-Control-Allow-Methods",
+        "GET, POST, DELETE, OPTIONS",
+    ));
+    headers.push(cors_header(
+        b"Access-Control-Allow-Headers",
+        "Content-Type, traceparent",
+    ));
+    headers
+}
+
+/// Resolve the CORS decision for one incoming request against the effective
+/// (global + per-project `.ralphus.toml`) `[cors]` allow-list. Applied at the
+/// librarian's own HTTP boundary, independent of the daemon's own gate --
+/// see this module's `config` sibling for why (the daemon never sees a
+/// browser's `Origin` header when it arrives via the librarian's proxy).
+fn resolve_cors(request: &tiny_http::Request) -> ralphus_core::cors::CorsDecision {
+    let origin = header_value(request, "Origin");
+    let host = header_value(request, "Host");
+    let allowed = crate::config::load_cors_config().allowed_origins;
+    ralphus_core::cors::decide(origin.as_deref(), host.as_deref(), &allowed)
+}
+
+/// Serve the librarian on `port`, proxying the API to `daemon_url`. Binds
+/// `127.0.0.1` by default, overridable via `RALPHUS_BIND_ADDR` (see
+/// `crate::resolve_bind_host`) -- the container execution mode (RAL-225)
+/// sets it to `0.0.0.0` so the published port is reachable from the host.
 ///
 /// # Errors
 /// Returns an error if the listener cannot bind.
 pub fn serve(port: u16, daemon_url: &str) -> std::io::Result<()> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
+    let bind_host = crate::resolve_bind_host(std::env::var(crate::BIND_ADDR_ENV).ok().as_deref());
+    let server = tiny_http::Server::http((bind_host.as_str(), port))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    for mut request in server.incoming_requests() {
-        let method = request.method().as_str().to_string();
-        let url = request.url().to_string();
+    serve_with(server, daemon_url);
+    Ok(())
+}
 
-        if method == "GET" && url.split('?').next().unwrap_or(&url) == EVENTS_PATH {
-            // Like the daemon's own accept loop, this one is otherwise
-            // synchronous/single-request -- a long-lived SSE connection held
-            // here would starve every other client (RAL-167).
-            let daemon_url = daemon_url.to_string();
-            std::thread::spawn(move || proxy_events_stream(&daemon_url, request));
-            continue;
-        }
+/// Serve requests from an already-bound server, proxying the API to
+/// `daemon_url`. Split out from [`serve`] (mirroring
+/// `ralphus_daemon::server::serve`/`serve_with`) so tests can bind an
+/// ephemeral port and drive the CORS-gated HTTP loop directly, rather than
+/// only the pure, header-free [`handle`]/[`handle_with_trace`] functions.
+///
+/// RAL-239 follow-up: each accepted request is dispatched onto its own
+/// thread via [`handle_request`], the same pattern this file already used
+/// for the SSE branch alone. Previously every request -- including plain
+/// proxied `GET`s -- ran inline in this loop, one at a time; a browser tab
+/// left open on the board keeps several connections alive concurrently
+/// (polling, live-view peek panes, PR-sync checks), and any one of those
+/// taking a while to answer serialized every other request behind it,
+/// including an unrelated page load or tab switch. Handing each request its
+/// own thread immediately makes the accept loop free to take the next one
+/// right away.
+pub fn serve_with(server: tiny_http::Server, daemon_url: &str) {
+    for request in server.incoming_requests() {
+        let daemon_url = daemon_url.to_string();
+        std::thread::spawn(move || handle_request(request, &daemon_url));
+    }
+}
 
-        let traceparent = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("traceparent"))
-            .map(|h| h.value.as_str().to_string());
+/// Handle one accepted request end to end: CORS gating, `OPTIONS` preflight,
+/// the SSE stream, or an ordinary proxied call -- exactly the branches
+/// [`serve_with`] used to run inline, now run on that request's own thread.
+fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
+    let method = request.method().as_str().to_string();
+    let url = request.url().to_string();
 
-        let mut body = String::new();
-        let _ = request.as_reader().read_to_string(&mut body);
-
-        let reply = handle_with_trace(daemon_url, &method, &url, &body, traceparent.as_deref());
-        let header =
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], reply.content_type.as_bytes())
-                .expect("valid header");
+    // RAL-220: reject a disallowed cross-origin browser request outright
+    // before it is proxied anywhere -- see `ralphus_core::cors`'s doc
+    // comment for why omitting `Access-Control-*` headers alone isn't
+    // enough. A request with no `Origin` header (same-origin browser
+    // traffic, or any non-browser caller) is unaffected.
+    let cors = resolve_cors(&request);
+    if cors == ralphus_core::cors::CorsDecision::Denied {
         let response = tiny_http::Response::new(
-            tiny_http::StatusCode(reply.status),
-            vec![header],
-            Cursor::new(reply.body.into_bytes()),
+            tiny_http::StatusCode(403),
+            vec![cors_header(b"Content-Type", "application/json")],
+            Cursor::new(
+                br#"{"error":{"code":"origin_not_allowed","message":"cross-origin request denied"}}"#
+                    .to_vec(),
+            ),
             None,
             None,
         );
         let _ = request.respond(response);
+        return;
     }
-    Ok(())
+
+    if method == "OPTIONS" {
+        let headers = match &cors {
+            ralphus_core::cors::CorsDecision::Allowed(origin) => cors_preflight_headers(origin),
+            _ => vec![],
+        };
+        let response = tiny_http::Response::new(
+            tiny_http::StatusCode(204),
+            headers,
+            Cursor::new(Vec::new()),
+            None,
+            None,
+        );
+        let _ = request.respond(response);
+        return;
+    }
+
+    if method == "GET" && url.split('?').next().unwrap_or(&url) == EVENTS_PATH {
+        let allow_origin = match cors {
+            ralphus_core::cors::CorsDecision::Allowed(origin) => Some(origin),
+            _ => None,
+        };
+        proxy_events_stream(daemon_url, &url, request, allow_origin.as_deref());
+        return;
+    }
+
+    let traceparent = header_value(&request, "traceparent");
+
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+
+    let reply = handle_with_trace(daemon_url, &method, &url, &body, traceparent.as_deref());
+    let mut headers = vec![
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], reply.content_type.as_bytes())
+            .expect("valid header"),
+    ];
+    if let ralphus_core::cors::CorsDecision::Allowed(origin) = &cors {
+        headers.extend(cors_response_headers(origin));
+    }
+    let response = tiny_http::Response::new(
+        tiny_http::StatusCode(reply.status),
+        headers,
+        Cursor::new(reply.body.into_bytes()),
+        None,
+        None,
+    );
+    let _ = request.respond(response);
 }
 
 /// Stream-proxy the daemon's `/api/events` SSE endpoint straight through to
@@ -203,8 +360,21 @@ pub fn serve(port: u16, daemon_url: &str) -> std::io::Result<()> {
 /// the daemon's response headers arrive (the body is a live, unbounded
 /// stream), and every chunk read from it is written straight to the browser
 /// connection and flushed immediately.
-fn proxy_events_stream(daemon_url: &str, request: tiny_http::Request) {
-    let url = format!("{}{EVENTS_PATH}", daemon_url.trim_end_matches('/'));
+///
+/// `incoming_url` is the browser's full request URL, `?ticket=...` and all
+/// (RAL-222) — board.html mints that ticket itself via `POST
+/// /api/events/ticket` (forwarded to the daemon like any other `/api/*` call,
+/// see `proxy`) and supplies it here because `EventSource` cannot set custom
+/// headers, so the ticket has to travel as a query param instead. This
+/// function's only job on the auth front is to relay it through verbatim —
+/// the daemon is the one that validates and consumes it.
+fn proxy_events_stream(
+    daemon_url: &str,
+    incoming_url: &str,
+    request: tiny_http::Request,
+    allow_origin: Option<&str>,
+) {
+    let url = format!("{}{incoming_url}", daemon_url.trim_end_matches('/'));
     let mut writer = request.into_writer();
     let resp = match ureq::get(&url).call() {
         Ok(r) => r,
@@ -215,13 +385,21 @@ fn proxy_events_stream(daemon_url: &str, request: tiny_http::Request) {
             return;
         }
     };
-    let preamble = b"HTTP/1.1 200 OK\r\n\
+    // RAL-220: echo the resolved-allowed origin (if any) the same way the
+    // buffered response path does -- see `resolve_cors` in `serve()`.
+    let cors_lines = match allow_origin {
+        Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"),
+        None => String::new(),
+    };
+    let preamble = format!(
+        "HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\
 Cache-Control: no-cache\r\n\
 Connection: keep-alive\r\n\
 X-Accel-Buffering: no\r\n\
-\r\n";
-    if writer.write_all(preamble).is_err() || writer.flush().is_err() {
+{cors_lines}\r\n"
+    );
+    if writer.write_all(preamble.as_bytes()).is_err() || writer.flush().is_err() {
         return;
     }
     let mut reader = resp.into_reader();
@@ -261,7 +439,7 @@ mod tests {
     fn api_post_is_proxied_not_rejected() {
         // POST is now forwarded; with the daemon down (port 9) it degrades to 502,
         // NOT a 405 read-only rejection.
-        let reply = handle("http://127.0.0.1:9", "POST", "/api/runs", "{}");
+        let reply = handle("http://127.0.0.1:9", "POST", "/api/squads", "{}");
         assert_eq!(reply.status, 502);
     }
 
@@ -311,6 +489,74 @@ mod tests {
         assert_eq!(forwarded.split('-').nth(1), incoming.split('-').nth(1));
     }
 
+    // ── RAL-219: bearer-token forwarding ────────────────────────────────────
+
+    /// The proxy must attach `Authorization: Bearer <token>` when one is
+    /// available, so the board UI keeps working against a daemon that now
+    /// requires it, with no extra operator configuration. Calls `proxy()`
+    /// directly with an explicit token (rather than through `handle`, which
+    /// reads the real `state_dir()/daemon.token`) so this test never touches
+    /// the developer machine's actual token file.
+    #[test]
+    fn proxy_forwards_the_bearer_token_when_present() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral port");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let received_clone = std::sync::Arc::clone(&received);
+        let handle_thread = std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.as_str().to_string());
+                *received_clone.lock().unwrap() = auth;
+                let _ = req.respond(tiny_http::Response::from_string("{}"));
+            }
+        });
+        let daemon_url = format!("http://127.0.0.1:{port}");
+        let reply = proxy(
+            &daemon_url,
+            "GET",
+            "/api/tasks",
+            "",
+            None,
+            Some("secret-token-value"),
+        );
+        handle_thread.join().unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(
+            received.lock().unwrap().clone(),
+            Some("Bearer secret-token-value".to_string())
+        );
+    }
+
+    /// No token available (e.g. the daemon hasn't written one yet) must not
+    /// crash or send a bogus header — just proxy without `Authorization`.
+    #[test]
+    fn proxy_sends_no_authorization_header_when_no_token_is_available() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral port");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let received_clone = std::sync::Arc::clone(&received);
+        let handle_thread = std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.as_str().to_string());
+                *received_clone.lock().unwrap() = auth;
+                let _ = req.respond(tiny_http::Response::from_string("{}"));
+            }
+        });
+        let daemon_url = format!("http://127.0.0.1:{port}");
+        let reply = proxy(&daemon_url, "GET", "/api/tasks", "", None, None);
+        handle_thread.join().unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(received.lock().unwrap().clone(), None);
+    }
+
     /// RAL-98 regression: the proxy must forward `?query` strings to the
     /// daemon verbatim (e.g. `/api/cartographer?run_id=...&limit=...`) rather
     /// than stripping them, or every filtered/paginated endpoint silently
@@ -331,14 +577,14 @@ mod tests {
         let reply = handle(
             &daemon_url,
             "GET",
-            "/api/cartographer?run_id=run-1&limit=5&sort=asc",
+            "/api/cartographer?squad_id=squad-1&limit=5&sort=asc",
             "",
         );
         handle_thread.join().unwrap();
         assert_eq!(reply.status, 200);
         assert_eq!(
             *received.lock().unwrap(),
-            "/api/cartographer?run_id=run-1&limit=5&sort=asc"
+            "/api/cartographer?squad_id=squad-1&limit=5&sort=asc"
         );
     }
 
@@ -350,5 +596,79 @@ mod tests {
         let reply = handle("http://127.0.0.1:9", "GET", "/?foo=bar", "");
         assert_eq!(reply.status, 200);
         assert!(reply.body.contains("ralphus"));
+    }
+
+    // ── RAL-239: per-request threading, not a shared serial queue ──────────
+
+    /// `serve_with` used to process every request -- including plain proxied
+    /// `GET`s -- one at a time on its single accept-loop thread. In practice
+    /// a browser tab left open on the board keeps several connections alive
+    /// concurrently, and any one request that's slow to answer (a forge
+    /// PR-sync check, a tmux pane capture, ...) serialized every other
+    /// request behind it, including an unrelated page's own load. Spins up a
+    /// real `serve_with` loop against a fake daemon that deliberately sleeps
+    /// on one path, fires a slow and a fast request concurrently, and asserts
+    /// the fast one finishes well within the slow one's sleep window rather
+    /// than queuing behind it.
+    #[test]
+    fn serve_with_does_not_serialize_requests_behind_a_slow_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        // The fake daemon hands each accepted connection its own thread too
+        // (so it never becomes the bottleneck under test here), sleeping
+        // only for the `/api/slow` path.
+        let daemon_server = tiny_http::Server::http("127.0.0.1:0").expect("bind daemon");
+        let daemon_port = daemon_server.server_addr().to_ip().expect("ip addr").port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_clone = Arc::clone(&served);
+        std::thread::spawn(move || {
+            for req in daemon_server.incoming_requests() {
+                served_clone.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    if req.url().starts_with("/api/slow") {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    let _ = req.respond(tiny_http::Response::from_string("{}"));
+                });
+            }
+        });
+        let daemon_url = format!("http://127.0.0.1:{daemon_port}");
+
+        let lib_server = tiny_http::Server::http("127.0.0.1:0").expect("bind librarian");
+        let lib_port = lib_server.server_addr().to_ip().expect("ip addr").port();
+        std::thread::spawn(move || serve_with(lib_server, &daemon_url));
+        // Give both accept loops a moment to actually be listening before
+        // any client connects.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let lib_url = format!("http://127.0.0.1:{lib_port}");
+        let slow_url = format!("{lib_url}/api/slow");
+        std::thread::spawn(move || {
+            let _ = ureq::get(&slow_url).call();
+        });
+        // Give the slow request a head start so it's already in flight
+        // through the librarian when the fast one arrives.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let fast_url = format!("{lib_url}/api/fast");
+        let t0 = Instant::now();
+        let resp = ureq::get(&fast_url)
+            .call()
+            .expect("fast request should succeed");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(resp.status(), 200);
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "fast request took {elapsed:?}, expected it to complete well under the slow \
+             request's 500ms sleep -- it must not be serialized behind it"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "both requests should have reached the fake daemon"
+        );
     }
 }

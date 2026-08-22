@@ -75,9 +75,13 @@ fn truncate(sanitized: &str) -> String {
 ///
 /// Deterministic and collision-*unaware* — the same input always produces the
 /// same output, but two different branch names can produce the same short
-/// name. Disambiguating that (only needed within one guardian's worktree
-/// directory) is [`dedupe_short_names`]'s job, layered on top rather than
-/// folded in here, so this stays a pure function of one branch name.
+/// name. Disambiguating that is layered on top rather than folded in here, so
+/// this stays a pure function of one branch name: [`dedupe_short_names`] does
+/// it for a guardian's fixed branch list (`g/g<n>/wt-<short>`), and
+/// `worktrees::resolve_task_worktree_dir` does it for task worktrees
+/// (`w/<short>`) by querying live `git worktree list` state instead, since
+/// those branches are discovered one at a time across squads rather than
+/// known up front.
 #[must_use]
 pub(crate) fn short_name(raw: &str) -> String {
     let truncated = truncate(&sanitize(raw));

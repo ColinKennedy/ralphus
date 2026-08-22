@@ -40,3 +40,6 @@ ralphus.lic
 # Editors / OS
 .DS_Store
 *.local.md.bak
+
+# Build artifacts
+bundle-dist/

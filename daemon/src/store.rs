@@ -11,19 +11,19 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ralphus_core::schema::{ResolvedAgent, TaskFile};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::Serialize;
 
-use crate::runner::{effective_session_system_prompt, effective_verify_system_prompt};
+use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
 
 /// Errors the store can produce.
 #[derive(Debug)]
 pub enum StoreError {
     /// An underlying rusqlite error.
     Sqlite(rusqlite::Error),
-    /// The requested run does not exist.
+    /// The requested squad does not exist.
     NotFound,
-    /// The operation is not valid for the run's current state.
+    /// The operation is not valid for the squad's current state.
     InvalidTransition(String),
 }
 
@@ -31,7 +31,7 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Sqlite(e) => write!(f, "database error: {e}"),
-            Self::NotFound => write!(f, "run not found"),
+            Self::NotFound => write!(f, "squad not found"),
             Self::InvalidTransition(m) => write!(f, "invalid transition: {m}"),
         }
     }
@@ -48,10 +48,14 @@ impl From<rusqlite::Error> for StoreError {
 /// Convenient result alias.
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Lifecycle state of a whole run (submission). See `docs/daemon-api.md`.
+/// A `(squad_id, task_idx, cell_idx)` triple identifying one cell, used to
+/// key batched per-cell lookups such as [`Store::resolve_cell_env_overrides_batch`].
+pub type CellRef = (String, i64, i64);
+
+/// Lifecycle state of a whole squad (submission). See `docs/daemon-api.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RunState {
+pub enum SquadState {
     /// Staged but not scheduled (explicit hold).
     Queued,
     /// Schedulable; waiting for the scheduler / dependencies.
@@ -66,11 +70,11 @@ pub enum RunState {
     Cancelled,
     /// Manually skipped by a user (RAL Queue). Not scheduled, but — unlike
     /// `cancelled` — it satisfies downstream dependencies exactly like `done`.
-    /// Reversible: a user can set an ignored run back to `pending`.
+    /// Reversible: a user can set an ignored squad back to `pending`.
     Ignored,
 }
 
-impl RunState {
+impl SquadState {
     /// The stable lowercase string stored in the database.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -115,7 +119,7 @@ impl RunState {
     }
 }
 
-/// Execution state of a session or a task node.
+/// Execution state of a cell or a task node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
@@ -169,7 +173,7 @@ impl NodeState {
 
     /// Whether this is a terminal state (no further transitions expected).
     /// `ignored` is deliberately NOT terminal — it is reversible back to
-    /// `pending`, mirroring [`RunState::is_terminal`].
+    /// `pending`, mirroring [`SquadState::is_terminal`].
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
@@ -178,9 +182,9 @@ impl NodeState {
 
 // ── Read views (serialized straight to the API) ──────────────────────────────
 
-/// One row from [`Store::verify_specs`]:
+/// One row from [`Store::proof_specs`]:
 /// `(idx, kind, spec, model, timeout_sec, budget_tokens)`.
-pub type VerifySpecRow = (
+pub type ProofSpecRow = (
     i64,
     String,
     String,
@@ -189,16 +193,16 @@ pub type VerifySpecRow = (
     Option<i64>,
 );
 
-/// A verify step as shown in the board.
+/// A proof step as shown in the board.
 #[derive(Debug, Clone, Serialize)]
-pub struct VerifyView {
+pub struct ProofView {
     /// Optional step id.
     pub id: Option<String>,
     /// One of `command` / `brain` / `prompt` / `approval`.
     pub kind: String,
     /// Current state string.
     pub state: String,
-    /// Captured command output, once the verifier has run (CCTL-99).
+    /// Captured command output, once the proof step has run (CCTL-99).
     pub output: Option<String>,
     /// The step definition: command text, prompt text, or empty for brain/approval.
     pub spec: String,
@@ -209,9 +213,9 @@ pub struct VerifyView {
     pub system_prompt: Option<String>,
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<String>,
-    /// Resolved agent program (inherited from the owning session or task defaults).
+    /// Resolved agent program (inherited from the owning cell or task defaults).
     pub agent: String,
-    /// Resumable CLI-agent session/thread id captured when the step ran via a
+    /// Resumable CLI-agent cell/thread id captured when the step ran via a
     /// CLI backend with a resume mechanism (claude-code, codex). `None` for
     /// other agents or steps that have not yet run.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,17 +228,17 @@ pub struct VerifyView {
     pub cost_usd: f64,
     /// RAL-191: environment-variable overrides set on **this individual step**,
     /// the narrowest layer — merged on top of the owning scope's
-    /// `verify_env_overrides` (and its ancestors) when the step runs. Empty for
+    /// `proof_env_overrides` (and its ancestors) when the step runs. Empty for
     /// the vast majority of steps; omitted from the JSON when empty so the
     /// common board payload is unchanged.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
 }
 
-/// A session as shown in the board.
+/// A cell as shown in the board.
 #[derive(Debug, Clone, Serialize)]
-pub struct SessionView {
-    /// Session id (or a generated `session-N`).
+pub struct CellView {
+    /// Cell id (or a generated `cell-N`).
     pub id: String,
     /// Human-readable display name (from `name` in the TOML). `None` when not set;
     /// the board falls back to `id` for display.
@@ -245,12 +249,12 @@ pub struct SessionView {
     pub agent: String,
     /// Resolved model, if any.
     pub model: Option<String>,
-    /// AI prompt, if a prompt session.
+    /// AI prompt, if a prompt cell.
     pub prompt: Option<String>,
-    /// Shell command, if a command session.
+    /// Shell command, if a command cell.
     pub command: Option<String>,
     /// Read-only effective system prompt actually appended to this agent
-    /// invocation. Omitted for command sessions and for rows created before
+    /// invocation. Omitted for command cells and for rows created before
     /// RAL-180 first populated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -262,42 +266,42 @@ pub struct SessionView {
     pub tokens_out: i64,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
-    /// Resolved USD spend cap (session overrides task), or `None` for no cap.
-    /// Once `cost_usd` exceeds this the daemon kills the session mid-run
+    /// Resolved USD spend cap (cell overrides task), or `None` for no cap.
+    /// Once `cost_usd` exceeds this the daemon kills the cell mid-run
     /// (RAL-161).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_budget_usd: Option<f64>,
-    /// Failure detail, when the session failed.
+    /// Failure detail, when the cell failed.
     pub error: Option<String>,
-    /// Dependency references (within-task session ids or `task/session`).
+    /// Dependency references (within-task cell ids or `task/cell`).
     pub depends_on: Vec<String>,
-    /// Session-level verify steps (`[[task.session.verify]]`), in order.
-    pub verify: Vec<VerifyView>,
-    /// Reviews (guardians) this session participates in — those whose stack
-    /// includes the session's review branch (RAL-17). Empty for most sessions.
-    pub reviews: Vec<RunReviewRef>,
-    /// Resumable CLI-agent session/thread id (for `claude --resume`/`codex exec
+    /// Cell-level proof steps (`[[task.cell.proof]]`), in order.
+    pub proof: Vec<ProofView>,
+    /// Reviews (guardians) this cell participates in — those whose stack
+    /// includes the cell's review branch (RAL-17). Empty for most cells.
+    pub reviews: Vec<SquadReviewRef>,
+    /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex exec
     /// resume`), captured from the owning backend's output. `None` for other
-    /// agents or sessions that have not yet completed.
+    /// agents or cells that have not yet completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
-    /// Persistent environment-variable overrides set directly on this session
+    /// Persistent environment-variable overrides set directly on this cell
     /// (hierarchical env overrides, extending RAL-150): merged on top of the
-    /// owning task's/run's when the session's own subprocess is spawned. See
-    /// [`Store::resolve_session_env_overrides`]. Empty for the vast majority
-    /// of sessions.
+    /// owning task's/squad's when the cell's own subprocess is spawned. See
+    /// [`Store::resolve_cell_env_overrides`]. Empty for the vast majority
+    /// of cells.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
-    /// Persistent environment-variable overrides set on this session's own
-    /// verify steps only, merged on top of `env_overrides` (and its
-    /// ancestors) when a session-scoped verify step runs. See
-    /// [`Store::resolve_session_verify_env_overrides`].
+    /// Persistent environment-variable overrides set on this cell's own
+    /// proof steps only, merged on top of `env_overrides` (and its
+    /// ancestors) when a cell-scoped proof step runs. See
+    /// [`Store::resolve_cell_proof_env_overrides`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub verify_env_overrides: BTreeMap<String, String>,
-    /// When this session first entered `running` (Unix epoch milliseconds).
+    pub proof_env_overrides: BTreeMap<String, String>,
+    /// When this cell first entered `running` (Unix epoch milliseconds).
     /// `None` until it starts. Details-pane "started at" / "time running".
     pub started_at_ms: Option<i64>,
-    /// When this session last reached a terminal state (Unix epoch
+    /// When this cell last reached a terminal state (Unix epoch
     /// milliseconds). `None` while pending/running.
     pub finished_at_ms: Option<i64>,
 }
@@ -309,12 +313,12 @@ pub struct TaskView {
     pub name: String,
     /// Project identifier: the registered project name when the task's TOML
     /// set `project`, otherwise a fallback derived from the task's first
-    /// session `cwd` (RAL-141, see [`fallback_project_identifier`]). Always
+    /// cell `cwd` (RAL-141, see [`fallback_project_identifier`]). Always
     /// present -- never `null` in the API response -- so a project filter
     /// facet has real data for every task.
     pub project: String,
     /// Raw task-level agent value from the submitted TOML, if any. `None`
-    /// means the task left `agent` unset and sessions inherit further or fall
+    /// means the task left `agent` unset and cells inherit further or fall
     /// back to the built-in default.
     pub agent: Option<String>,
     /// Raw task-level model value from the submitted TOML, if any. `None`
@@ -322,28 +326,28 @@ pub struct TaskView {
     pub model: Option<String>,
     /// Current state string.
     pub state: String,
-    /// Sessions in the task.
-    pub sessions: Vec<SessionView>,
-    /// Task-level verify steps.
-    pub verify: Vec<VerifyView>,
+    /// Cells in the task.
+    pub cells: Vec<CellView>,
+    /// Task-level proof steps.
+    pub proof: Vec<ProofView>,
     /// Task-level dependency references (other task names).
     pub depends_on: Vec<String>,
     /// Persistent environment-variable overrides set directly on this task
     /// (hierarchical env overrides, extending RAL-150): merged on top of the
-    /// run's, and merged onto every session under this task. See
-    /// [`Store::resolve_session_env_overrides`]. Empty for the vast majority
+    /// squad's, and merged onto every cell under this task. See
+    /// [`Store::resolve_cell_env_overrides`]. Empty for the vast majority
     /// of tasks.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
     /// Persistent environment-variable overrides set on this task's own
-    /// (task-scoped) verify steps only, merged on top of `env_overrides` (and
-    /// the run's) when a task-scoped verify step runs. See
-    /// [`Store::resolve_task_verify_env_overrides`].
+    /// (task-scoped) proof steps only, merged on top of `env_overrides` (and
+    /// the squad's) when a task-scoped proof step runs. See
+    /// [`Store::resolve_task_proof_env_overrides`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub verify_env_overrides: BTreeMap<String, String>,
+    pub proof_env_overrides: BTreeMap<String, String>,
     /// Whether this task is "soloed" (RAL-157) — while `true` on any task in
-    /// the run, the scheduler only dispatches soloed tasks' sessions; every
-    /// other task's sessions stay paused (Pending) until un-soloed.
+    /// the squad, the scheduler only dispatches soloed tasks' cells; every
+    /// other task's cells stay paused (Pending) until un-soloed.
     pub soloed: bool,
     /// When this task first entered `running` (Unix epoch milliseconds).
     /// `None` until it starts. Details-pane "started at" / "time running".
@@ -353,17 +357,17 @@ pub struct TaskView {
     pub finished_at_ms: Option<i64>,
 }
 
-/// A lightweight reference to a review (guardian) derived from a run.
+/// A lightweight reference to a review (guardian) derived from a squad.
 #[derive(Debug, Clone, Serialize)]
-pub struct RunReviewRef {
+pub struct SquadReviewRef {
     /// Guardian id.
     pub id: String,
     /// Display name.
     pub name: String,
     /// Guardian status string.
     pub status: String,
-    /// The specific branch in the review stack this session contributes to.
-    /// `None` for run-level review refs (not tied to a branch).
+    /// The specific branch in the review stack this cell contributes to.
+    /// `None` for squad-level review refs (not tied to a branch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }
@@ -371,9 +375,9 @@ pub struct RunReviewRef {
 /// One entry in the execution/transition log (CCTL-99).
 #[derive(Debug, Clone, Serialize)]
 pub struct EventView {
-    /// Entity scope: `run` / `task` / `session` / `verify` / `guardian` / `branch`.
+    /// Entity scope: `squad` / `task` / `cell` / `proof` / `guardian` / `branch`.
     pub scope: String,
-    /// A reference within the scope (e.g. `session s1`, `b003`), if any.
+    /// A reference within the scope (e.g. `cell s1`, `b003`), if any.
     #[serde(rename = "ref")]
     pub reference: Option<String>,
     /// Human-readable transition/note.
@@ -382,62 +386,62 @@ pub struct EventView {
     pub at_ms: i64,
 }
 
-/// A run (submission) as shown in the board.
+/// A squad (submission) as shown in the board.
 #[derive(Debug, Clone, Serialize)]
-pub struct RunView {
-    /// Run id, e.g. `run-000000000001`.
+pub struct SquadView {
+    /// Squad id, e.g. `squad-000000000001`.
     pub id: String,
     /// Optional human label.
     pub label: Option<String>,
-    /// Current run state string. Not a raw passthrough of the `runs.state`
-    /// column — see [`effective_run_state`] — so this reflects whether the
-    /// run's children are actually doing something right now, even in the
-    /// window where a targeted verify/session restart has reset the column
-    /// to `pending` but the run's worker is still busy with unrelated
-    /// sibling sessions.
+    /// Current squad state string. Not a raw passthrough of the `squads.state`
+    /// column — see [`effective_squad_state`] — so this reflects whether the
+    /// squad's children are actually doing something right now, even in the
+    /// window where a targeted proof/cell restart has reset the column
+    /// to `pending` but the squad's worker is still busy with unrelated
+    /// sibling cells.
     pub state: String,
-    /// Creation time (Unix epoch milliseconds) — when the run was submitted/
+    /// Creation time (Unix epoch milliseconds) — when the squad was submitted/
     /// queued, which can differ from when it actually started executing.
     pub created_at_ms: i64,
-    /// When this run first entered `running` (Unix epoch milliseconds).
+    /// When this squad first entered `running` (Unix epoch milliseconds).
     /// `None` until it starts. Details-pane "started at" / "time running".
     pub started_at_ms: Option<i64>,
-    /// When this run last reached a terminal state (Unix epoch
+    /// When this squad last reached a terminal state (Unix epoch
     /// milliseconds). `None` while queued/pending/running.
     pub finished_at_ms: Option<i64>,
-    /// The tasks in the run.
+    /// The tasks in the squad.
     pub tasks: Vec<TaskView>,
-    /// Reviews (guardians) derived from this run.
-    pub reviews: Vec<RunReviewRef>,
+    /// Reviews (guardians) derived from this squad.
+    pub reviews: Vec<SquadReviewRef>,
     /// Persistent environment-variable overrides applied to every subprocess
-    /// spawned for this run (RAL-150). Values here are the raw, unredacted
-    /// overrides — safe to show in the board's run detail view per the
+    /// spawned for this squad (RAL-150). Values here are the raw, unredacted
+    /// overrides — safe to show in the board's squad detail view per the
     /// ticket's binding decision (only Cartographer/audit-log payloads mask
     /// non-allowlisted values, see `daemon::config::EnvOverridesConfig`).
-    /// Empty for the vast majority of runs (no overrides ever set).
+    /// Empty for the vast majority of squads (no overrides ever set).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
 }
 
-/// A node in the cross-run `[[default]] depends_on` gating graph
+/// A node in the cross-squad `[[default]] depends_on` gating graph
 /// (CLI_PARITY_PLAN.local.md Phase 6, `ralphus graph --global`).
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalGraphNode {
-    /// Run id.
+    /// Squad id.
     pub id: String,
     /// Optional human label.
     pub label: Option<String>,
-    /// Current run state string.
+    /// Current squad state string.
     pub state: String,
 }
 
-/// The cross-run gating graph: nodes are runs, edges are `[[default]]
+/// The cross-squad gating graph: nodes are squads, edges are `[[default]]
 /// depends_on` references (see [`Store::global_graph`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalGraph {
-    /// One entry per included run.
+    /// One entry per included squad.
     pub nodes: Vec<GlobalGraphNode>,
-    /// `from` (the dependency run) must complete before `to` (the dependent run).
+    /// `from` (the dependency squad) must complete before `to` (the dependent squad).
     pub edges: Vec<crate::plan::GraphEdge>,
 }
 
@@ -459,18 +463,18 @@ pub struct ProjectView {
 
 /// Outcome of a bulk [`Store::clear_all`].
 pub struct ClearOutcome {
-    /// Number of runs deleted (with their sessions/tasks/verifies/events).
-    pub runs_deleted: usize,
+    /// Number of squads deleted (with their cells/tasks/proofs/events).
+    pub squads_deleted: usize,
     /// Number of guardians (reviews) deleted, with their branches.
     pub guardians_deleted: usize,
     /// `(guardian_id, project_root)` pairs for each deleted guardian — one entry
     /// per project root — so the caller can purge all on-disk review worktrees.
     /// Multi-project guardians produce multiple entries with the same guardian_id.
     pub guardian_roots: Vec<(String, String)>,
-    /// Ids of every run actually deleted (RAL-154) — so the caller can purge
-    /// each one's durable, on-disk terminal logs, mirroring the single-run
-    /// `delete_run` endpoint's cleanup.
-    pub run_ids: Vec<String>,
+    /// Ids of every squad actually deleted (RAL-154) — so the caller can purge
+    /// each one's durable, on-disk terminal logs, mirroring the single-squad
+    /// `delete_squad` endpoint's cleanup.
+    pub squad_ids: Vec<String>,
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -483,7 +487,7 @@ pub struct Store {
     event_bus: crate::events::EventBus,
     /// Liveness signal (RAL-170): last time fresh pane output was observed
     /// for a running tmux-wrapped session, keyed by `crate::tmux::session_name`
-    /// (the same deterministic key used for task sessions, verify steps, and
+    /// (the same deterministic key used for task cells, proof steps, and
     /// Guardian resolver/manual-check sessions alike — see
     /// [`Self::note_live_activity`]'s doc comment for why this is in-memory
     /// only, not a DB column). Entries are removed once the owning
@@ -497,6 +501,14 @@ pub struct Store {
     /// than strictly necessary, not a correctness issue. See
     /// `guardian_merge::queue_final_summary_regen`/`sweep_pending_summaries`.
     guardian_summary_debounce: HashMap<String, GuardianSummaryDebounce>,
+    /// RAL-241: which `crate::tmux::session_name` keys have already had a
+    /// stall escalation enqueued for their *current* stall onset, and when
+    /// that onset's last-known-good activity timestamp was — so a still-
+    /// ongoing stall doesn't re-enqueue a mailbox message on every poll.
+    /// In-memory only, like `live_activity` above: cleared alongside it (see
+    /// `Store::clear_live_activity`) once the owning `run_via_tmux` call has
+    /// a terminal result, so a *new* attempt/cell can be escalated again.
+    stall_escalated: HashMap<String, i64>,
 }
 
 /// RAL-208: see [`Store::guardian_summary_debounce`].
@@ -531,7 +543,7 @@ pub(crate) fn from_json(s: &str) -> Vec<String> {
 }
 
 /// Serialize a string-to-string map to the JSON stored in the DB (RAL-150:
-/// `runs.env_overrides`). `BTreeMap` gives deterministic key order, which
+/// `squads.env_overrides`). `BTreeMap` gives deterministic key order, which
 /// keeps Cartographer payloads and API responses stable across calls.
 pub(crate) fn to_json_map(v: &BTreeMap<String, String>) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
@@ -540,6 +552,29 @@ pub(crate) fn to_json_map(v: &BTreeMap<String, String>) -> String {
 /// Parse a string-to-string map from stored JSON, defaulting to empty on error.
 pub(crate) fn from_json_map(s: &str) -> BTreeMap<String, String> {
     serde_json::from_str(s).unwrap_or_default()
+}
+
+/// RAL-230: restrict the DB file (and, if already present, its WAL/SHM
+/// siblings) to owner-only `0o600` on every open -- re-tightening a
+/// pre-existing, looser-permissioned file the same way [`crate::state_dir`]
+/// re-tightens the containing directory, rather than leaving an old file's
+/// permissions untouched. The WAL/SHM files may not exist yet at this point
+/// (SQLite creates them lazily) -- each is skipped if absent, and later
+/// `Store::open` calls against the same path (e.g. daemon restarts) will
+/// pick them up once they exist.
+#[cfg(unix)]
+fn tighten_unix_db_permissions(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut shm = db_path.as_os_str().to_owned();
+    shm.push("-shm");
+    let paths: [std::path::PathBuf; 3] = [db_path.to_path_buf(), wal.into(), shm.into()];
+    for p in paths {
+        if p.exists() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 impl Store {
@@ -553,8 +588,11 @@ impl Store {
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
         };
         store.init_schema()?;
+        #[cfg(unix)]
+        tighten_unix_db_permissions(path);
         Ok(store)
     }
 
@@ -566,6 +604,7 @@ impl Store {
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
         };
         store.init_schema()?;
         Ok(store)
@@ -585,7 +624,7 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS runs (
+            CREATE TABLE IF NOT EXISTS squads (
                 id            TEXT PRIMARY KEY,
                 label         TEXT,
                 state         TEXT NOT NULL,
@@ -598,7 +637,7 @@ impl Store {
                 finished_at_ms INTEGER
             );
             CREATE TABLE IF NOT EXISTS tasks (
-                run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                squad_id     TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
                 idx        INTEGER NOT NULL,
                 name       TEXT NOT NULL,
                 project    TEXT,
@@ -611,10 +650,10 @@ impl Store {
                 finished_at_ms INTEGER,
                 no_commit_required INTEGER NOT NULL DEFAULT 0,
                 baseline_commit_sha TEXT,
-                PRIMARY KEY (run_id, idx)
+                PRIMARY KEY (squad_id, idx)
             );
-            CREATE TABLE IF NOT EXISTS sessions (
-                run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            CREATE TABLE IF NOT EXISTS cells (
+                squad_id     TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
                 task_idx   INTEGER NOT NULL,
                 idx        INTEGER NOT NULL,
                 sid        TEXT NOT NULL,
@@ -643,13 +682,13 @@ impl Store {
                 machine       TEXT,
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
-                PRIMARY KEY (run_id, task_idx, idx)
+                PRIMARY KEY (squad_id, task_idx, idx)
             );
-            CREATE TABLE IF NOT EXISTS verifies (
-                run_id      TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            CREATE TABLE IF NOT EXISTS proofs (
+                squad_id      TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
                 task_idx    INTEGER NOT NULL,
                 scope       TEXT NOT NULL,
-                session_idx INTEGER NOT NULL,
+                cell_idx INTEGER NOT NULL,
                 idx         INTEGER NOT NULL,
                 vid         TEXT,
                 kind        TEXT NOT NULL,
@@ -664,7 +703,7 @@ impl Store {
                 budget_tokens INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY (run_id, task_idx, scope, session_idx, idx)
+                PRIMARY KEY (squad_id, task_idx, scope, cell_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS guardians (
                 id                TEXT PRIMARY KEY,
@@ -676,7 +715,7 @@ impl Store {
                 status            TEXT NOT NULL,
                 detail            TEXT,
                 checks            TEXT NOT NULL DEFAULT '[]',
-                run_id            TEXT,
+                squad_id            TEXT,
                 combined_worktree TEXT,
                 conflicts_total     INTEGER,
                 conflicts_remaining INTEGER,
@@ -691,8 +730,8 @@ impl Store {
                 review_key        TEXT,
                 resolver_agent    TEXT,
                 resolver_model    TEXT,
-                verify_scope      TEXT,
-                verify_skip_auto_clean INTEGER,
+                proof_scope      TEXT,
+                proof_skip_auto_clean INTEGER,
                 created_at_ms     INTEGER NOT NULL,
                 updated_at_ms     INTEGER NOT NULL
             );
@@ -714,7 +753,7 @@ impl Store {
                 PRIMARY KEY (guardian_id, position)
             );
             -- RAL-193: per-call cost line items for a guardian's own
-            -- conflict-resolution and verifier LLM calls (guardian_merge.rs),
+            -- conflict-resolution and proof-step LLM calls (guardian_merge.rs),
             -- which previously were logged at best and otherwise discarded.
             -- `attempt` mirrors `guardians.merge_attempt` at call time, so a
             -- single merge attempt's total and the cumulative total across
@@ -722,7 +761,7 @@ impl Store {
             -- filtering/summing this table. `branch_id` is the stable
             -- per-branch id (`guardian_branches.id`) for a call scoped to one
             -- stacked branch, NULL for a review-wide call (chat, combined
-            -- final verify).
+            -- final proof).
             CREATE TABLE IF NOT EXISTS guardian_costs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
@@ -737,14 +776,14 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_guardian_costs_guardian ON guardian_costs(guardian_id);
             CREATE TABLE IF NOT EXISTS events (
                 seq         INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id      TEXT,
+                squad_id      TEXT,
                 guardian_id TEXT,
                 scope       TEXT NOT NULL,
                 ref         TEXT,
                 message     TEXT NOT NULL,
                 at_ms       INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_events_squad ON events(squad_id, seq);
             CREATE INDEX IF NOT EXISTS idx_events_guardian ON events(guardian_id, seq);
             CREATE TABLE IF NOT EXISTS guardian_messages (
                 seq         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -761,23 +800,32 @@ impl Store {
                 source      TEXT NOT NULL,
                 message     TEXT NOT NULL,
                 scope       TEXT,
-                run_id      TEXT,
+                squad_id      TEXT,
                 guardian_id TEXT,
-                session_id  TEXT,
+                cell_id  TEXT,
                 task        TEXT,
                 log_path    TEXT,
                 payload     TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_carto_at ON cartographer_events(at_ms);
-            CREATE INDEX IF NOT EXISTS idx_carto_run ON cartographer_events(run_id);
+            CREATE INDEX IF NOT EXISTS idx_carto_squad ON cartographer_events(squad_id);
             CREATE INDEX IF NOT EXISTS idx_carto_guardian ON cartographer_events(guardian_id);
-            CREATE INDEX IF NOT EXISTS idx_carto_session ON cartographer_events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_carto_cell ON cartographer_events(cell_id);
             CREATE INDEX IF NOT EXISTS idx_carto_source ON cartographer_events(source);
             CREATE TABLE IF NOT EXISTS projects (
                 name          TEXT PRIMARY KEY,
                 description   TEXT NOT NULL DEFAULT '',
                 path          TEXT NOT NULL,
                 vcs           TEXT NOT NULL DEFAULT 'git',
+                created_at_ms INTEGER NOT NULL
+            );
+            -- Minimal user registry (RAL-?): a placeholder identity a request
+            -- can name itself as, for `AgentAccess` (`agent_access.rs`) to key
+            -- off. TODO: Replace with user auth once RAL-252 is done -- there
+            -- is no login, no password, no session here, just a name a caller
+            -- can claim.
+            CREATE TABLE IF NOT EXISTS users (
+                name          TEXT PRIMARY KEY,
                 created_at_ms INTEGER NOT NULL
             );
             -- RAL-185: the machine provider registry. A machine value of the form
@@ -816,13 +864,13 @@ impl Store {
             -- record that remote work is in flight lived in a Rust
             -- `Instant`/loop on a thread that a restart just killed.
             CREATE TABLE IF NOT EXISTS remote_exec_handles (
-                run_id        TEXT NOT NULL,
-                session_id    TEXT NOT NULL,
+                squad_id        TEXT NOT NULL,
+                cell_id    TEXT NOT NULL,
                 scheme        TEXT NOT NULL,
                 uri           TEXT NOT NULL,
                 handle        TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (run_id, session_id)
+                PRIMARY KEY (squad_id, cell_id)
             );
             -- RAL-117: a durable, mutable mapping from a guardian's worktree(s) to
             -- the pull request(s) submitted for it. `branch_id` is NULL for a
@@ -879,18 +927,18 @@ impl Store {
                 PRIMARY KEY (guardian_id, input_name)
             );
             -- RAL-136: ephemeral, queryable handoff notes ('ghosts') a task
-            -- session or review worktree publishes for downstream work.  One
+            -- cell or review worktree publishes for downstream work.  One
             -- row per owner (`owner_uri`) -- a rewrite merges onto the
             -- existing row rather than inserting a second one (see
-            -- `ghost::merge_content`). `run_id`/`guardian_id` are mutually
-            -- exclusive depending on `kind` and exist so a run/guardian
+            -- `ghost::merge_content`). `squad_id`/`guardian_id` are mutually
+            -- exclusive depending on `kind` and exist so a squad/guardian
             -- deletion can cascade-clean its ghosts (done explicitly in
-            -- `delete_run`/`delete_guardian`/`clear_all`, like every other
-            -- child table -- see the comment on `delete_run`).
+            -- `delete_squad`/`delete_guardian`/`clear_all`, like every other
+            -- child table -- see the comment on `delete_squad`).
             CREATE TABLE IF NOT EXISTS ghosts (
                 owner_uri     TEXT PRIMARY KEY,
                 kind          TEXT NOT NULL,
-                run_id        TEXT REFERENCES runs(id) ON DELETE CASCADE,
+                squad_id        TEXT REFERENCES squads(id) ON DELETE CASCADE,
                 guardian_id   TEXT REFERENCES guardians(id) ON DELETE CASCADE,
                 content       TEXT NOT NULL,
                 user_note     TEXT,
@@ -898,14 +946,44 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_ghosts_run ON ghosts(run_id);
+            CREATE INDEX IF NOT EXISTS idx_ghosts_squad ON ghosts(squad_id);
             CREATE INDEX IF NOT EXISTS idx_ghosts_guardian ON ghosts(guardian_id);
+            -- RAL-241: the escalation mailbox. `mailbox_clients` is who can
+            -- drain (registered via `POST /api/mailbox/register`);
+            -- `mailbox_messages` is what got enqueued (a failed cell, a
+            -- stalled session, ...); `mailbox_drains` is per-client-per-
+            -- message read state -- one escalation can broadcast to many
+            -- clients, and each drains independently. See
+            -- `crate::mailbox`'s module doc comment.
+            CREATE TABLE IF NOT EXISTS mailbox_clients (
+                id               TEXT PRIMARY KEY,
+                registered_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mailbox_messages (
+                id            TEXT PRIMARY KEY,
+                priority      TEXT NOT NULL,
+                message       TEXT NOT NULL,
+                squad_id      TEXT REFERENCES squads(id) ON DELETE CASCADE,
+                task          TEXT,
+                cell_id       TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mailbox_messages_created ON mailbox_messages(created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_messages_priority ON mailbox_messages(priority);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_messages_squad ON mailbox_messages(squad_id);
+            CREATE TABLE IF NOT EXISTS mailbox_drains (
+                message_id    TEXT NOT NULL REFERENCES mailbox_messages(id) ON DELETE CASCADE,
+                client_id     TEXT NOT NULL REFERENCES mailbox_clients(id) ON DELETE CASCADE,
+                drained_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (message_id, client_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mailbox_drains_client ON mailbox_drains(client_id);
             ",
         )?;
         // Best-effort migrations for databases created before these columns
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
-            "ALTER TABLE guardians ADD COLUMN run_id TEXT",
+            "ALTER TABLE guardians ADD COLUMN squad_id TEXT",
             "ALTER TABLE guardians ADD COLUMN combined_worktree TEXT",
             "ALTER TABLE guardians ADD COLUMN conflicts_total INTEGER",
             "ALTER TABLE guardians ADD COLUMN conflicts_remaining INTEGER",
@@ -942,24 +1020,24 @@ impl Store {
             // Which git project (repository root) this branch lives in (RAL-29).
             // NULL means the guardian's own git_root (backward compatible).
             "ALTER TABLE guardian_branches ADD COLUMN project TEXT",
-            "ALTER TABLE verifies ADD COLUMN model TEXT",
-            "ALTER TABLE verifies ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
+            "ALTER TABLE proofs ADD COLUMN model TEXT",
+            "ALTER TABLE proofs ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
             // Raw task-level agent/model values used by the board to show
             // whether child resolved values were inherited from the task
             // rather than set explicitly at the child level (RAL-82).
             "ALTER TABLE tasks ADD COLUMN agent TEXT",
             "ALTER TABLE tasks ADD COLUMN model TEXT",
-            "ALTER TABLE sessions ADD COLUMN review_branch TEXT",
-            "ALTER TABLE sessions ADD COLUMN timeout_sec INTEGER",
-            "ALTER TABLE sessions ADD COLUMN budget_tokens INTEGER",
-            "ALTER TABLE sessions ADD COLUMN system_prompt TEXT",
-            "ALTER TABLE sessions ADD COLUMN system_prompt_position TEXT",
-            "ALTER TABLE sessions ADD COLUMN subprojects TEXT",
-            "ALTER TABLE sessions ADD COLUMN name TEXT",
-            "ALTER TABLE verifies ADD COLUMN timeout_sec INTEGER",
-            "ALTER TABLE verifies ADD COLUMN budget_tokens INTEGER",
+            "ALTER TABLE cells ADD COLUMN review_branch TEXT",
+            "ALTER TABLE cells ADD COLUMN timeout_sec INTEGER",
+            "ALTER TABLE cells ADD COLUMN budget_tokens INTEGER",
+            "ALTER TABLE cells ADD COLUMN system_prompt TEXT",
+            "ALTER TABLE cells ADD COLUMN system_prompt_position TEXT",
+            "ALTER TABLE cells ADD COLUMN subprojects TEXT",
+            "ALTER TABLE cells ADD COLUMN name TEXT",
+            "ALTER TABLE proofs ADD COLUMN timeout_sec INTEGER",
+            "ALTER TABLE proofs ADD COLUMN budget_tokens INTEGER",
             // RAL-50: branch-chaining upstream sentinel.
-            "ALTER TABLE sessions ADD COLUMN upstream TEXT",
+            "ALTER TABLE cells ADD COLUMN upstream TEXT",
             // RAL-69: tracks whether the user dismissed the "can re-enable" icon
             // on a force-started disabled branch. Once dismissed it never reappears.
             "ALTER TABLE guardian_branches ADD COLUMN dismissed_reenable INTEGER NOT NULL DEFAULT 0",
@@ -992,13 +1070,13 @@ impl Store {
             // NULL = unranked (sorts after ranked items). Seeded from the TOML
             // `priority` key at submit; mutated by the Queue reorder/set-position.
             "ALTER TABLE tasks ADD COLUMN queue_rank REAL",
-            "ALTER TABLE sessions ADD COLUMN queue_rank REAL",
-            "ALTER TABLE verifies ADD COLUMN queue_rank REAL",
-            // RAL-96: the W3C `traceparent` of the request that created this run
+            "ALTER TABLE cells ADD COLUMN queue_rank REAL",
+            "ALTER TABLE proofs ADD COLUMN queue_rank REAL",
+            // RAL-96: the W3C `traceparent` of the request that created this squad
             // (browser click or CLI submit), persisted so the scheduler's later,
-            // asynchronous work (run-claim, session execution, verify execution)
+            // asynchronous work (squad-claim, cell execution, proof execution)
             // continues the same OpenTelemetry trace instead of starting a new one.
-            "ALTER TABLE runs ADD COLUMN trace_context TEXT",
+            "ALTER TABLE squads ADD COLUMN trace_context TEXT",
             // RAL-110: split the old single `skip_checks` flag into two independent
             // opt-outs -- see the backfill-and-drop block below, which carries
             // forward any existing `skip_checks` value into both.
@@ -1028,50 +1106,50 @@ impl Store {
             // JSON map of {input_name: value}; a value here becomes the new
             // default the next time that check is viewed.
             "ALTER TABLE guardians ADD COLUMN input_values TEXT NOT NULL DEFAULT '{}'",
-            // RAL-168: per-review override of the "Verify" scope -- one of
+            // RAL-168: per-review override of the "Proof" scope -- one of
             // "each_branch"/"final_branch"/"nothing". NULL means "inherit the
-            // project-level .ralphus.toml [review] verify_scope default"
+            // project-level .ralphus.toml [review] proof_scope default"
             // (same nullable-override pattern as resolver_agent/resolver_model
-            // above), resolved at hydration time into `effective_verify_scope`.
-            "ALTER TABLE guardians ADD COLUMN verify_scope TEXT",
+            // above), resolved at hydration time into `effective_proof_scope`.
+            "ALTER TABLE guardians ADD COLUMN proof_scope TEXT",
             // RAL-168: per-review override of the "each_branch" auto-clean-skip
             // sub-option. NULL means "inherit the project-level default".
-            "ALTER TABLE guardians ADD COLUMN verify_skip_auto_clean INTEGER",
+            "ALTER TABLE guardians ADD COLUMN proof_skip_auto_clean INTEGER",
             // RAL-185: the machine this review's worktrees and merge run on.
             // NULL means the daemon's own host, which is every pre-RAL-185 row.
             "ALTER TABLE guardians ADD COLUMN machine TEXT",
-            // Verify steps never recorded their own token/cost usage -- only
-            // sessions did -- so a `prompt`/`command`-kind verify step's LLM
+            // Proof steps never recorded their own token/cost usage -- only
+            // cells did -- so a `prompt`/`command`-kind proof step's LLM
             // spend was silently discarded instead of being shown in the
             // board or folded into a lifetime cost total.
-            "ALTER TABLE verifies ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE verifies ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE verifies ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
             // RAL-180: persist the effective read-only system prompt the board
-            // shows in the details pane, separate from a session's authored
+            // shows in the details pane, separate from a cell's authored
             // `system_prompt` config so re-runs don't accidentally re-synthesise
             // from already-expanded text.
-            "ALTER TABLE sessions ADD COLUMN effective_system_prompt TEXT",
-            "ALTER TABLE verifies ADD COLUMN effective_system_prompt TEXT",
-            // RAL-185: the resolved machine a session/verify runs on. NULL means
+            "ALTER TABLE cells ADD COLUMN effective_system_prompt TEXT",
+            "ALTER TABLE proofs ADD COLUMN effective_system_prompt TEXT",
+            // RAL-185: the resolved machine a cell/proof runs on. NULL means
             // the daemon's own host, which is what every pre-RAL-185 row is.
             // RAL-190: a branch that contributes no diff over the stack tip
             // below it. Almost always means its task never committed, so the
             // review would otherwise look healthy while containing nothing.
             "ALTER TABLE guardian_branches ADD COLUMN is_empty INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE sessions ADD COLUMN machine TEXT",
-            "ALTER TABLE verifies ADD COLUMN machine TEXT",
+            "ALTER TABLE cells ADD COLUMN machine TEXT",
+            "ALTER TABLE proofs ADD COLUMN machine TEXT",
             // RAL-174: free-form text a human attaches to a restart via the
             // board's restart popup. Kept separate from `content` so it can be
             // overwritten on every restart instead of merged/accumulated --
             // see `ghost::Store::set_ghost_user_note`.
             "ALTER TABLE ghosts ADD COLUMN user_note TEXT",
-            // RAL-210: when a session last transitioned to `running`, so the
-            // board can show session start time. Overwritten on every restart
-            // (see `set_session_state`) rather than kept as a first-start-only
+            // RAL-210: when a cell last transitioned to `running`, so the
+            // board can show cell start time. Overwritten on every restart
+            // (see `set_cell_state`) rather than kept as a first-start-only
             // value, per the ticket's decision that only the most recent
             // running-transition matters.
-            "ALTER TABLE sessions ADD COLUMN started_at_ms INTEGER",
+            "ALTER TABLE cells ADD COLUMN started_at_ms INTEGER",
             // RAL-190: the commit sha last pushed to `branch_alias` on the
             // remote, so a later sync check can tell "remote moved since we
             // last touched it" (a reviewer pushed to the PR branch) apart from
@@ -1082,16 +1160,22 @@ impl Store {
             "ALTER TABLE guardian_pull_requests ADD COLUMN last_pushed_sha TEXT",
             // RAL-156: opt-out from the automatic no-new-commits-since-baseline
             // guard the finalizer runs for git-backed tasks, and the baseline
-            // commit sha captured at task start (first session to reach
-            // Running) that guard compares each session's cwd HEAD against.
+            // commit sha captured at task start (first cell to reach
+            // Running) that guard compares each cell's cwd HEAD against.
             "ALTER TABLE tasks ADD COLUMN no_commit_required INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN baseline_commit_sha TEXT",
+            // The GitHub-native PR stack number registered for this guardian's
+            // chain of stacked PRs (`pr::submit_stack_for_guardian`), once 2+
+            // branches have been submitted. NULL for GitLab reviews (no
+            // equivalent concept) and for a GitHub review that hasn't
+            // registered a stack yet.
+            "ALTER TABLE guardians ADD COLUMN forge_stack_number INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
         // Codex support: `*claude_session_id` columns were named after the only
         // CLI harness that existed at the time, but they hold the resumable
-        // session/thread id of *whichever* CLI agent produced it (claude-code or
+        // cell/thread id of *whichever* CLI agent produced it (claude-code or
         // codex) -- renamed here to `*agent_session_id` for accuracy. A best-effort
         // rename against a database that still has the old column name; harmless
         // no-op (old column already renamed, or never existed) otherwise. The
@@ -1099,65 +1183,65 @@ impl Store {
         // a database old enough to have neither -- mirrors the "fails harmlessly"
         // idiom of the ADD-COLUMN loop above, just with RENAME COLUMN first.
         for stmt in [
-            "ALTER TABLE sessions RENAME COLUMN claude_session_id TO agent_session_id",
-            "ALTER TABLE verifies RENAME COLUMN claude_session_id TO agent_session_id",
+            "ALTER TABLE cells RENAME COLUMN claude_session_id TO agent_session_id",
+            "ALTER TABLE proofs RENAME COLUMN claude_session_id TO agent_session_id",
             "ALTER TABLE guardian_branches RENAME COLUMN resolver_claude_session_id TO resolver_agent_session_id",
             "ALTER TABLE guardians RENAME COLUMN manual_commands_claude_session_id TO manual_commands_agent_session_id",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
         for stmt in [
-            "ALTER TABLE sessions ADD COLUMN agent_session_id TEXT",
-            "ALTER TABLE verifies ADD COLUMN agent_session_id TEXT",
+            "ALTER TABLE cells ADD COLUMN agent_session_id TEXT",
+            "ALTER TABLE proofs ADD COLUMN agent_session_id TEXT",
             "ALTER TABLE guardian_branches ADD COLUMN resolver_agent_session_id TEXT",
             "ALTER TABLE guardians ADD COLUMN manual_commands_agent_session_id TEXT",
             // RAL-149: opts the per-branch conflict-resolution fix pass into also
             // running the quality-bar instructions (formatters/linters/tests),
-            // in addition to always running them in the dedicated final-verify
+            // in addition to always running them in the dedicated final-proof
             // call that follows a fix pass. Default off -- quality checks may
-            // incur real cost, so they run once (in the final-verify call) by
+            // incur real cost, so they run once (in the final-proof call) by
             // default rather than twice per conflict-resolution cycle.
-            "ALTER TABLE guardians ADD COLUMN verify_mid_resolution INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE guardians ADD COLUMN proof_mid_resolution INTEGER NOT NULL DEFAULT 0",
             // RAL-150: persistent, user-set environment-variable overrides applied
-            // to every subprocess spawned for this run (agent + command sessions,
-            // and verify steps). JSON map of {key: value}; set/unset via
-            // `POST /api/runs/{id}/env`, survives across retries until unset.
-            "ALTER TABLE runs ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
-            // Hierarchical env overrides (RAL-150 extension): task/session-level
-            // layers, plus separate layers for a task's/session's own verify
+            // to every subprocess spawned for this squad (agent + command cells,
+            // and proof steps). JSON map of {key: value}; set/unset via
+            // `POST /api/squads/{id}/env`, survives across retries until unset.
+            "ALTER TABLE squads ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // Hierarchical env overrides (RAL-150 extension): task/cell-level
+            // layers, plus separate layers for a task's/cell's own proof
             // steps, each overriding its parent's values on a per-key basis --
-            // run < task < session, and run < task < task.verify /
-            // run < task < session < session.verify. See
-            // `Store::resolve_session_env_overrides` and siblings.
+            // squad < task < cell, and squad < task < task.proof /
+            // squad < task < cell < cell.proof. See
+            // `Store::resolve_cell_env_overrides` and siblings.
             "ALTER TABLE tasks ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
-            "ALTER TABLE tasks ADD COLUMN verify_env_overrides TEXT NOT NULL DEFAULT '{}'",
-            "ALTER TABLE sessions ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
-            "ALTER TABLE sessions ADD COLUMN verify_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE tasks ADD COLUMN proof_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE cells ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE cells ADD COLUMN proof_env_overrides TEXT NOT NULL DEFAULT '{}'",
             // RAL-157: a task can be "soloed" to pause its non-soloed siblings
-            // within the same run -- see `Store::solo_task`/`unsolo_task` and the
+            // within the same squad -- see `Store::solo_task`/`unsolo_task` and the
             // scheduler dispatcher's live solo gate. Multiple tasks in the same
-            // run can be soloed at once; default 0 (not soloed) preserves today's
-            // behavior for every existing run.
+            // squad can be soloed at once; default 0 (not soloed) preserves today's
+            // behavior for every existing squad.
             "ALTER TABLE tasks ADD COLUMN soloed INTEGER NOT NULL DEFAULT 0",
-            // RAL-161: resolved per-session USD spend cap (session overrides
-            // task). Exceeding the live `cost_usd` kills the session mid-run.
-            "ALTER TABLE sessions ADD COLUMN maximum_budget_usd REAL",
-            // RAL-191: the narrowest env-override layer -- one individual verify
+            // RAL-161: resolved per-cell USD spend cap (cell overrides
+            // task). Exceeding the live `cost_usd` kills the cell mid-run.
+            "ALTER TABLE cells ADD COLUMN maximum_budget_usd REAL",
+            // RAL-191: the narrowest env-override layer -- one individual proof
             // step's own variables, merged on top of its owning scope's
-            // `verify_env_overrides`. Per-step rather than per-scope because
-            // `verify` is an array: two `[[task.verify]]` blocks setting the
+            // `proof_env_overrides`. Per-step rather than per-scope because
+            // `proof` is an array: two `[[task.proof]]` blocks setting the
             // same key to different values must not collide. See
-            // `Store::resolve_task_verify_step_env_overrides` and its sibling.
-            "ALTER TABLE verifies ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // `Store::resolve_task_proof_step_env_overrides` and its sibling.
+            "ALTER TABLE proofs ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
             // RAL-191: a review branch's own env overrides, layered on top of
-            // whatever its *source session* resolves to, so a review worktree
+            // whatever its *source cell* resolves to, so a review worktree
             // inherits the environment the work was produced under. Unlike
             // every other layer this one is a JSON map of {key: value|null},
             // where `null` is a tombstone meaning "remove this inherited key
             // entirely" -- see `Store::resolve_guardian_branch_env`.
             "ALTER TABLE guardian_branches ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
             // RAL-203: the combined review worktree has no upstream task
-            // session of its own to inherit an environment from, so the
+            // cell of its own to inherit an environment from, so the
             // finalize-time build/check-gate step against it instead borrows
             // the last enabled branch's own resolved environment
             // (`guardian::combined_env_from_branches`) -- this column layers
@@ -1171,28 +1255,28 @@ impl Store {
             "ALTER TABLE guardians ADD COLUMN manual_checks_env_overrides TEXT NOT NULL DEFAULT '{}'",
             // RAL-193: this review's own USD spend cap (from `[[review]]`'s
             // `maximum_budget_usd`), enforced against the cumulative sum of
-            // `guardian_costs` the same way a task/session cap is enforced
+            // `guardian_costs` the same way a task/cell cap is enforced
             // against a live `cost_usd` (RAL-161).
             "ALTER TABLE guardians ADD COLUMN maximum_budget_usd REAL",
             // RAL-193: incrementing counter bumped once per merge/rebase
             // attempt, so cost line items in `guardian_costs` can be
             // attributed to the attempt that produced them.
             "ALTER TABLE guardians ADD COLUMN merge_attempt INTEGER NOT NULL DEFAULT 0",
-            // Details-pane "time running" / "started at" (UTC): when a run/task/
-            // session first entered `running` and when it last reached a terminal
+            // Details-pane "time running" / "started at" (UTC): when a squad/task/
+            // cell first entered `running` and when it last reached a terminal
             // state. NULL until reached. Distinct from `created_at_ms`
             // (submission/queue time), which can differ from actual execution
-            // start. See `Store::set_run_state`/`set_task_state`/
-            // `set_session_state`/`record_session_result` for where these are
+            // start. See `Store::set_squad_state`/`set_task_state`/
+            // `set_cell_state`/`record_cell_result` for where these are
             // stamped, and the restart/reset paths that clear them for entities
-            // being genuinely re-executed. `sessions.started_at_ms` is already
+            // being genuinely re-executed. `cells.started_at_ms` is already
             // added by the RAL-210 migration above, so only `finished_at_ms`
-            // is needed for `sessions` here.
-            "ALTER TABLE runs ADD COLUMN started_at_ms INTEGER",
-            "ALTER TABLE runs ADD COLUMN finished_at_ms INTEGER",
+            // is needed for `cells` here.
+            "ALTER TABLE squads ADD COLUMN started_at_ms INTEGER",
+            "ALTER TABLE squads ADD COLUMN finished_at_ms INTEGER",
             "ALTER TABLE tasks ADD COLUMN started_at_ms INTEGER",
             "ALTER TABLE tasks ADD COLUMN finished_at_ms INTEGER",
-            "ALTER TABLE sessions ADD COLUMN finished_at_ms INTEGER",
+            "ALTER TABLE cells ADD COLUMN finished_at_ms INTEGER",
             // RAL-155: path to an on-disk log file a Cartographer row
             // references (e.g. a RAL-154 durable terminal-log attempt file),
             // carried by path rather than embedding the file's content — see
@@ -1204,22 +1288,22 @@ impl Store {
         // RAL-155: task-scoped Cartographer filtering (`?task=`, and the
         // `entity=task:...` addressing scheme) needs this to not degrade into
         // a full-table scan as `cartographer_events` grows. Created after the
-        // ALTER-TABLE migrations above, same reasoning as `idx_sessions_review_branch`.
+        // ALTER-TABLE migrations above, same reasoning as `idx_cells_review_branch`.
         let _ = self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_carto_task ON cartographer_events(task)",
             [],
         );
-        // RAL-121: `hydrate_guardian` looks up each branch's most recent session
+        // RAL-121: `hydrate_guardian` looks up each branch's most recent cell
         // by `review_branch` (set once, at submit time, by
-        // `reviews::derive_reviews` -> `set_session_review_branch`; RAL-118's
+        // `reviews::derive_reviews` -> `set_cell_review_branch`; RAL-118's
         // `move_guardian_branch` reassigns a branch's *guardian*, never its
-        // `sessions.review_branch` value, so this stays correct across moves).
-        // Without an index every guardian-list load did a full `sessions` table
-        // scan per branch; `sessions` only grows over a project's life. Created
+        // `cells.review_branch` value, so this stays correct across moves).
+        // Without an index every guardian-list load did a full `cells` table
+        // scan per branch; `cells` only grows over a project's life. Created
         // after the ALTER-TABLE migrations above so it's safe against a database
         // created before the `review_branch` column existed.
         let _ = self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_review_branch ON sessions(review_branch)",
+            "CREATE INDEX IF NOT EXISTS idx_cells_review_branch ON cells(review_branch)",
             [],
         );
         // RAL-122: enforce branch-id uniqueness at the DB layer (not just via
@@ -1255,14 +1339,14 @@ impl Store {
                 .execute("ALTER TABLE guardians DROP COLUMN skip_checks", []);
         }
         // RAL-168: `verify_mid_resolution` is retired -- replaced outright by
-        // `verify_scope`/`verify_skip_auto_clean` above, not mapped forward
+        // `proof_scope`/`proof_skip_auto_clean` above, not mapped forward
         // (its old meaning -- also run quality-bar checks during the fix pass
         // -- no longer exists now that the fix pass never runs them; see
         // `resolve_conflicts_with_agent` in `guardian_merge.rs`). No backfill
         // needed: every existing review simply gets the new columns' default
         // "inherit the project default" (NULL), which resolves to
         // "each_branch" -- the documented AC that existing reviews preserve
-        // today's default verify behavior. Same guard-on-column-existing
+        // today's default proof behavior. Same guard-on-column-existing
         // idiom as the `skip_checks` block above, so the DROP runs exactly once.
         let has_old_verify_mid_resolution = self
             .conn
@@ -1341,70 +1425,70 @@ impl Store {
         Ok(format!("{prefix}-{seq:012}"))
     }
 
-    fn next_run_id(&self) -> Result<String> {
-        self.next_id("run_seq", "run")
+    fn next_squad_id(&self) -> Result<String> {
+        self.next_id("squad_seq", "squad")
     }
 
-    /// Ingest a validated task file, returning the new run id. `hold` submits to
-    /// `Queued` (staged); otherwise the run goes straight to `Pending`.
-    pub fn insert_run(
+    /// Ingest a validated task file, returning the new squad id. `hold` submits to
+    /// `Queued` (staged); otherwise the squad goes straight to `Pending`.
+    pub fn insert_squad(
         &mut self,
         file: &TaskFile,
         label: Option<&str>,
         hold: bool,
     ) -> Result<String> {
-        let run_id = self.next_run_id()?;
-        self.insert_run_with_id(&run_id, file, label, hold)?;
-        Ok(run_id)
+        let squad_id = self.next_squad_id()?;
+        self.insert_squad_with_id(&squad_id, file, label, hold)?;
+        Ok(squad_id)
     }
 
-    /// Shared implementation behind [`Self::insert_run`], taking `run_id` as
+    /// Shared implementation behind [`Self::insert_squad`], taking `squad_id` as
     /// a parameter instead of always minting a fresh one — lets a test
     /// supply its own caller-chosen id (RAL-177) instead of the store's
     /// deterministic sequential one. A fresh in-memory `Store` always
-    /// assigns the same first id (`run-000000000001`), which is identical
+    /// assigns the same first id (`squad-000000000001`), which is identical
     /// across every worktree's identical test — fine for a DB-only
     /// assertion, but a collision risk for a live-tmux test whose fixture
-    /// run_id also seeds a *real*, machine-wide tmux session name
-    /// (`ralphus_{run_id}_...`) or feeds a prefix-scoped kill
+    /// squad_id also seeds a *real*, machine-wide tmux session name
+    /// (`ralphus_{squad_id}_...`) or feeds a prefix-scoped kill
     /// (`kill_run_tmux_sessions`/`kill_guardian_tmux_sessions` in
     /// `server.rs`) against the same shared psmux server. Letting such a
     /// test supply its own per-process-unique id (see
     /// `crate::tmux::unique_test_tag`) closes that gap without touching the
-    /// production id-assignment path or any of `insert_run`'s existing
+    /// production id-assignment path or any of `insert_squad`'s existing
     /// callers. `pub(crate)`, not `pub`, since only this crate's own tests
     /// need direct access to the id.
-    pub(crate) fn insert_run_with_id(
+    pub(crate) fn insert_squad_with_id(
         &mut self,
-        run_id: &str,
+        squad_id: &str,
         file: &TaskFile,
         label: Option<&str>,
         hold: bool,
     ) -> Result<()> {
         let now = now_ms();
         let state = if hold {
-            RunState::Queued
+            SquadState::Queued
         } else {
-            RunState::Pending
+            SquadState::Pending
         };
 
-        let run_deps = file
+        let squad_deps = file
             .defaults
             .first()
             .map(|d| d.depends_on.as_slice())
             .unwrap_or(&[]);
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO runs(id, label, state, depends_on, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?)",
-            params![run_id, label, state.as_str(), to_json(run_deps), now, now],
+            "INSERT INTO squads(id, label, state, depends_on, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?)",
+            params![squad_id, label, state.as_str(), to_json(squad_deps), now, now],
         )?;
 
         for (t_idx, task) in file.task.iter().enumerate() {
             let t_idx_i = i64::try_from(t_idx).unwrap_or(0);
             tx.execute(
-                "INSERT INTO tasks(run_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![
-                    run_id,
+                    squad_id,
                     t_idx_i,
                     task.name,
                     task.project,
@@ -1415,7 +1499,7 @@ impl Store {
                     task.priority.map(f64::from),
                     // RAL-172: TOML-declared `environment` seeds this task's
                     // row in the same hierarchical env-override store a
-                    // later `POST /api/runs/{id}/tasks/{ti}/env` call would
+                    // later `POST /api/squads/{id}/tasks/{ti}/env` call would
                     // write to (RAL-150) -- from here on the two are
                     // indistinguishable.
                     to_json_map(&task.environment),
@@ -1423,70 +1507,63 @@ impl Store {
                 ],
             )?;
 
-            for (s_idx, session) in task.session.iter().enumerate() {
-                let resolved = ResolvedAgent::resolve(task, session);
-                let sid = session
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("session-{s_idx}"));
-                // A session inherits the task's timeout/budget unless it sets its
+            for (s_idx, cell) in task.cell.iter().enumerate() {
+                let resolved = ResolvedAgent::resolve(task, cell);
+                let sid = cell.id.clone().unwrap_or_else(|| format!("cell-{s_idx}"));
+                // A cell inherits the task's timeout/budget unless it sets its
                 // own. Timeout is stored in seconds; budget in total tokens.
-                let timeout_sec =
-                    resolve_timeout_sec(session.timeout_minutes, task.timeout_minutes);
-                let budget_tokens = resolve_budget(session.budget_tokens, task.budget_tokens);
+                let timeout_sec = resolve_timeout_sec(cell.timeout_minutes, task.timeout_minutes);
+                let budget_tokens = resolve_budget(cell.budget_tokens, task.budget_tokens);
                 let maximum_budget_usd =
-                    resolve_maximum_budget_usd(session.maximum_budget_usd, task.maximum_budget_usd);
-                let effective_system_prompt = session.prompt.as_ref().map(|_| {
-                    effective_session_system_prompt(
-                        session.system_prompt.as_deref(),
-                        &session.subprojects,
-                    )
+                    resolve_maximum_budget_usd(cell.maximum_budget_usd, task.maximum_budget_usd);
+                let effective_system_prompt = cell.prompt.as_ref().map(|_| {
+                    effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-                    "INSERT INTO sessions(run_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, upstream, queue_rank, env_overrides, machine)
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, upstream, queue_rank, env_overrides, machine)
                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
-                        run_id,
+                        squad_id,
                         t_idx_i,
                         i64::try_from(s_idx).unwrap_or(0),
                         sid,
-                        session.name,
-                        session.cwd,
-                        to_json(&session.subprojects),
-                        session.prompt,
-                        session.command,
+                        cell.name,
+                        cell.cwd,
+                        to_json(&cell.subprojects),
+                        cell.prompt,
+                        cell.command,
                         resolved.program,
                         resolved.model,
-                        session.system_prompt,
-                        session.system_prompt_position,
+                        cell.system_prompt,
+                        cell.system_prompt_position,
                         effective_system_prompt,
                         NodeState::Pending.as_str(),
-                        to_json(&session.depends_on),
+                        to_json(&cell.depends_on),
                         timeout_sec,
                         budget_tokens,
                         maximum_budget_usd,
-                        session.upstream,
-                        // Seed the queue rank from the session's own priority, or
+                        cell.upstream,
+                        // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
-                        // `priority` nudges all its sessions' starting position.
-                        session.priority.or(task.priority).map(f64::from),
+                        // `priority` nudges all its cells' starting position.
+                        cell.priority.or(task.priority).map(f64::from),
                         // RAL-172: same seeding as the task's own `env_overrides`
-                        // above, scoped to this session -- merges on top of the
-                        // task's/run's via `Store::resolve_session_env_overrides`.
-                        to_json_map(&session.environment),
+                        // above, scoped to this cell -- merges on top of the
+                        // task's/squad's via `Store::resolve_cell_env_overrides`.
+                        to_json_map(&cell.environment),
                         // RAL-185: resolved once at submit so the scheduler never
                         // has to re-derive inheritance, and so a later edit to the
-                        // task file can't silently move an in-flight run's machine.
-                        ralphus_core::schema::resolve_session_machine(task, session),
+                        // task file can't silently move an in-flight squad's machine.
+                        ralphus_core::schema::resolve_cell_machine(task, cell),
                     ],
                 )?;
 
-                for (v_idx, v) in session.verify.iter().enumerate() {
-                    insert_verify(
+                for (v_idx, v) in cell.proof.iter().enumerate() {
+                    insert_proof(
                         &tx,
-                        run_id,
+                        squad_id,
                         t_idx_i,
-                        "session",
+                        "cell",
                         i64::try_from(s_idx).unwrap_or(0),
                         v_idx,
                         v,
@@ -1496,26 +1573,26 @@ impl Store {
                 }
             }
 
-            // Task-level verifies inherit the first session's resolved agent to
+            // Task-level proofs inherit the first cell's resolved agent to
             // match the scheduler's runtime behaviour (scheduler takes
-            // `task_session.map(|s| s.agent)`). Fall back to the task-level
-            // agent field when there are no sessions.
-            let task_verify_agent = task
-                .session
+            // `task_cell.map(|s| s.agent)`). Fall back to the task-level
+            // agent field when there are no cells.
+            let task_proof_agent = task
+                .cell
                 .first()
                 .map(|s| ResolvedAgent::resolve(task, s).program)
                 .unwrap_or_else(|| ResolvedAgent::from_task(task).program);
-            for (v_idx, v) in task.verify.iter().enumerate() {
-                insert_verify(
+            for (v_idx, v) in task.proof.iter().enumerate() {
+                insert_proof(
                     &tx,
-                    run_id,
+                    squad_id,
                     t_idx_i,
                     "task",
                     -1,
                     v_idx,
                     v,
                     task,
-                    &task_verify_agent,
+                    &task_proof_agent,
                 )?;
             }
         }
@@ -1523,18 +1600,18 @@ impl Store {
         tx.commit()?;
         crate::rlog!(
             INFO,
-            "ralphus [submit] run {run_id} inserted state={} tasks={}",
+            "ralphus [submit] squad {squad_id} inserted state={} tasks={}",
             state.as_str(),
             file.task.len()
         );
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "submit",
-            message: "run inserted",
-            scope: Some("run"),
-            run_id: Some(run_id),
+            message: "squad inserted",
+            scope: Some("squad"),
+            squad_id: Some(squad_id),
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
             payload: serde_json::json!({"state": state.as_str(), "tasks": file.task.len()}),
@@ -1547,22 +1624,22 @@ impl Store {
     /// transition), so this returns the raw rusqlite result only for tests.
     pub fn log_event(
         &self,
-        run_id: Option<&str>,
+        squad_id: Option<&str>,
         guardian_id: Option<&str>,
         scope: &str,
         reference: Option<&str>,
         message: &str,
     ) -> Result<()> {
-        self.log_event_with_task(run_id, guardian_id, scope, reference, message, None)
+        self.log_event_with_task(squad_id, guardian_id, scope, reference, message, None)
     }
 
     /// [`Store::log_event`], plus a task name for callers that already know
     /// it (RAL-155 Q2: task-scoped Cartographer filtering needs the `task`
-    /// column populated on task/session state transitions, not just on the
-    /// scheduler/runner's own session-execution events).
+    /// column populated on task/cell state transitions, not just on the
+    /// scheduler/runner's own cell-execution events).
     pub fn log_event_with_task(
         &self,
-        run_id: Option<&str>,
+        squad_id: Option<&str>,
         guardian_id: Option<&str>,
         scope: &str,
         reference: Option<&str>,
@@ -1570,11 +1647,11 @@ impl Store {
         task: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO events(run_id, guardian_id, scope, ref, message, at_ms)
+            "INSERT INTO events(squad_id, guardian_id, scope, ref, message, at_ms)
              VALUES(?,?,?,?,?,?)",
-            params![run_id, guardian_id, scope, reference, message, now_ms()],
+            params![squad_id, guardian_id, scope, reference, message, now_ms()],
         )?;
-        // Cartographer subsumes this per-run/per-guardian audit trail (RAL-98):
+        // Cartographer subsumes this per-squad/per-guardian audit trail (RAL-98):
         // every `log_event` call also lands in the global structured log, so
         // the two never drift apart.
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
@@ -1582,9 +1659,9 @@ impl Store {
             source: "store",
             message,
             scope: Some(scope),
-            run_id,
+            squad_id,
             guardian_id,
-            session_id: None,
+            cell_id: None,
             task,
             log_path: None,
             payload: reference.map_or(serde_json::json!({}), |r| serde_json::json!({"ref": r})),
@@ -1592,9 +1669,9 @@ impl Store {
         Ok(())
     }
 
-    /// The audit log for a run, oldest first, capped at `limit` most-recent rows.
-    pub fn events_for_run(&self, run_id: &str, limit: i64) -> Result<Vec<EventView>> {
-        self.events_where("run_id", run_id, limit)
+    /// The audit log for a squad, oldest first, capped at `limit` most-recent rows.
+    pub fn events_for_squad(&self, squad_id: &str, limit: i64) -> Result<Vec<EventView>> {
+        self.events_where("squad_id", squad_id, limit)
     }
 
     /// The audit log for a guardian (review cycle), oldest first, capped.
@@ -1603,7 +1680,7 @@ impl Store {
     }
 
     fn events_where(&self, column: &str, value: &str, limit: i64) -> Result<Vec<EventView>> {
-        // `column` is a fixed internal literal ("run_id"/"guardian_id"), never
+        // `column` is a fixed internal literal ("squad_id"/"guardian_id"), never
         // user input, so interpolating it into the SQL is safe here.
         let sql = format!(
             "SELECT scope, ref, message, at_ms FROM events
@@ -1624,30 +1701,33 @@ impl Store {
         Ok(rows)
     }
 
-    /// The current state of a run.
-    pub fn run_state(&self, id: &str) -> Result<RunState> {
+    /// The current state of a squad.
+    pub fn squad_state(&self, id: &str) -> Result<SquadState> {
         let s: Option<String> = self
             .conn
-            .query_row("SELECT state FROM runs WHERE id=?", params![id], |r| {
+            .query_row("SELECT state FROM squads WHERE id=?", params![id], |r| {
                 r.get(0)
             })
             .optional()?;
         let s = s.ok_or(StoreError::NotFound)?;
-        RunState::parse(&s).ok_or(StoreError::NotFound)
+        SquadState::parse(&s).ok_or(StoreError::NotFound)
     }
 
-    /// Set a run's state. Also stamps `started_at_ms` (once, the first time the
-    /// run enters `running`) and `finished_at_ms` (every time it enters a
-    /// terminal state, so a re-finish after a verify-only restart reflects the
+    /// Set a squad's state. Also stamps `started_at_ms` (once, the first time the
+    /// squad enters `running`) and `finished_at_ms` (every time it enters a
+    /// terminal state, so a re-finish after a proof-only restart reflects the
     /// latest completion) — see the "Details-pane" migration comment in
     /// `init_schema` for the field semantics.
-    pub fn set_run_state(&self, id: &str, state: RunState) -> Result<()> {
-        let old = self.run_state(id).map(|s| s.as_str()).unwrap_or("unknown");
+    pub fn set_squad_state(&self, id: &str, state: SquadState) -> Result<()> {
+        let old = self
+            .squad_state(id)
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
         let now = now_ms();
-        let entering_running = i64::from(state == RunState::Running);
+        let entering_running = i64::from(state == SquadState::Running);
         let entering_terminal = i64::from(state.is_terminal());
         let n = self.conn.execute(
-            "UPDATE runs SET state=?, updated_at_ms=?,
+            "UPDATE squads SET state=?, updated_at_ms=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE id=?",
@@ -1664,25 +1744,29 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
-            crate::rlog!(INFO, "ralphus [state] run {id} {old} → {}", state.as_str());
+            crate::rlog!(
+                INFO,
+                "ralphus [state] squad {id} {old} → {}",
+                state.as_str()
+            );
             let _ = self.log_event(
                 Some(id),
                 None,
-                "run",
+                "squad",
                 None,
-                &format!("run → {}", state.as_str()),
+                &format!("squad → {}", state.as_str()),
             );
             Ok(())
         }
     }
 
-    /// The W3C `traceparent` recorded against a run at submit time (RAL-96),
-    /// if the submitting request carried one. `Ok(None)` for a run submitted
+    /// The W3C `traceparent` recorded against a squad at submit time (RAL-96),
+    /// if the submitting request carried one. `Ok(None)` for a squad submitted
     /// with no trace context (or one predating this column).
-    pub fn run_trace_context(&self, id: &str) -> Result<Option<String>> {
+    pub fn squad_trace_context(&self, id: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT trace_context FROM runs WHERE id=?",
+                "SELECT trace_context FROM squads WHERE id=?",
                 params![id],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -1691,12 +1775,12 @@ impl Store {
     }
 
     /// Record the `traceparent` of the request that created `id` (RAL-96), so
-    /// the scheduler's later asynchronous work (run-claim, session execution,
-    /// verify execution) can rebuild a [`crate::otel::Context`] that continues
+    /// the scheduler's later asynchronous work (squad-claim, cell execution,
+    /// proof execution) can rebuild a [`crate::otel::Context`] that continues
     /// the same trace instead of starting a disconnected one.
-    pub fn set_run_trace_context(&self, id: &str, trace_context: &str) -> Result<()> {
+    pub fn set_squad_trace_context(&self, id: &str, trace_context: &str) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE runs SET trace_context=? WHERE id=?",
+            "UPDATE squads SET trace_context=? WHERE id=?",
             params![trace_context, id],
         )?;
         if n == 0 {
@@ -1706,63 +1790,63 @@ impl Store {
         }
     }
 
-    /// Activate a held (`Queued`) run, moving it to `Pending`.
-    pub fn activate(&self, id: &str) -> Result<RunState> {
-        match self.run_state(id)? {
-            RunState::Queued => {
-                self.set_run_state(id, RunState::Pending)?;
-                Ok(RunState::Pending)
+    /// Activate a held (`Queued`) squad, moving it to `Pending`.
+    pub fn activate(&self, id: &str) -> Result<SquadState> {
+        match self.squad_state(id)? {
+            SquadState::Queued => {
+                self.set_squad_state(id, SquadState::Pending)?;
+                Ok(SquadState::Pending)
             }
             other => Err(StoreError::InvalidTransition(format!(
-                "can only activate a queued run, run is {}",
+                "can only activate a queued squad, squad is {}",
                 other.as_str()
             ))),
         }
     }
 
-    /// Cancel a run, regardless of its current state (RAL-116). Always
-    /// available and idempotent — even a run that already reached a terminal
+    /// Cancel a squad, regardless of its current state (RAL-116). Always
+    /// available and idempotent — even a squad that already reached a terminal
     /// state (`done`/`failed`/already `cancelled`) is (re-)flipped to
     /// `cancelled`, so it can never be picked up again by another trigger
-    /// (a restart, cross-run gating, etc). In-flight nodes are flipped too;
+    /// (a restart, cross-squad gating, etc). In-flight nodes are flipped too;
     /// the worker thread stops on its own via the cancel token, so it will
     /// not re-run any node this flips.
-    pub fn cancel(&self, id: &str) -> Result<RunState> {
-        self.run_state(id)?;
-        self.set_run_state(id, RunState::Cancelled)?;
+    pub fn cancel(&self, id: &str) -> Result<SquadState> {
+        self.squad_state(id)?;
+        self.set_squad_state(id, SquadState::Cancelled)?;
         self.cancel_nonterminal_nodes(id)?;
-        Ok(RunState::Cancelled)
+        Ok(SquadState::Cancelled)
     }
 
-    /// Flip every task/session/verify still in a non-terminal state
+    /// Flip every task/cell/proof still in a non-terminal state
     /// (`pending`/`running`) to `cancelled`, so the board reflects a cancelled
-    /// run immediately. Terminal nodes (`done`/`failed`/already `cancelled`) are
-    /// left untouched — a session that already finished keeps its real outcome.
+    /// squad immediately. Terminal nodes (`done`/`failed`/already `cancelled`) are
+    /// left untouched — a cell that already finished keeps its real outcome.
     /// The worker thread stops on its own via the cancel token, so it will not
     /// re-run any node this flips.
-    fn cancel_nonterminal_nodes(&self, run_id: &str) -> Result<()> {
+    fn cancel_nonterminal_nodes(&self, squad_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET state='cancelled' WHERE run_id=? AND state IN ('pending','running')",
-            params![run_id],
+            "UPDATE cells SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
+            params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE tasks SET state='cancelled' WHERE run_id=? AND state IN ('pending','running')",
-            params![run_id],
+            "UPDATE tasks SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
+            params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE verifies SET state='cancelled' WHERE run_id=? AND state IN ('pending','running')",
-            params![run_id],
+            "UPDATE proofs SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
+            params![squad_id],
         )?;
         Ok(())
     }
 
-    /// Run ids that are ready to schedule: Pending, and with every cross-run
-    /// dependency (from the run's `[[default]]` `depends_on`) already Done.
-    /// A dependency reference `run-id` or `run-id/task/session` is satisfied when
-    /// that whole run is Done (path-precise gating is a later refinement).
+    /// Squad ids that are ready to schedule: Pending, and with every cross-squad
+    /// dependency (from the squad's `[[default]]` `depends_on`) already Done.
+    /// A dependency reference `squad-id` or `squad-id/task/cell` is satisfied when
+    /// that whole squad is Done (path-precise gating is a later refinement).
     pub fn list_ready(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, depends_on FROM runs WHERE state='pending' ORDER BY created_at_ms ASC",
+            "SELECT id, depends_on FROM squads WHERE state='pending' ORDER BY created_at_ms ASC",
         )?;
         let pending = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -1778,17 +1862,19 @@ impl Store {
         Ok(ready)
     }
 
-    /// Whether every cross-run dependency reference points at a Done run.
+    /// Whether every cross-squad dependency reference points at a Done squad.
     fn deps_satisfied(&self, deps: &[String]) -> Result<bool> {
         for dep in deps {
-            let dep_run = dep.split('/').next().unwrap_or(dep);
+            let dep_squad = dep.split('/').next().unwrap_or(dep);
             let state: Option<String> = self
                 .conn
-                .query_row("SELECT state FROM runs WHERE id=?", params![dep_run], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT state FROM squads WHERE id=?",
+                    params![dep_squad],
+                    |r| r.get(0),
+                )
                 .optional()?;
-            match state.as_deref().and_then(RunState::parse) {
+            match state.as_deref().and_then(SquadState::parse) {
                 Some(s) if s.satisfies_dependents() => {}
                 _ => return Ok(false),
             }
@@ -1796,21 +1882,21 @@ impl Store {
         Ok(true)
     }
 
-    /// Count of currently running runs.
+    /// Count of currently running squads.
     pub fn running_count(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM runs WHERE state='running'", [], |r| {
-                r.get(0)
-            })?)
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM squads WHERE state='running'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
-    /// Count of sessions currently executing — the real in-flight work, bounded
+    /// Count of cells currently executing — the real in-flight work, bounded
     /// by the scheduler's task-level concurrency limit. Unlike `running_count`
-    /// (which counts runs), this reflects how many agent sessions run at once.
-    pub fn running_session_count(&self) -> Result<i64> {
+    /// (which counts squads), this reflects how many agent cells run at once.
+    pub fn running_cell_count(&self) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE state='running'",
+            "SELECT COUNT(*) FROM cells WHERE state='running'",
             [],
             |r| r.get(0),
         )?)
@@ -1826,14 +1912,14 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Set a session's state. Also stamps `started_at_ms` (once, the first
-    /// time the session enters `running`) and `finished_at_ms` (every time it
-    /// enters a terminal state, so a re-finish after a verify-only restart
-    /// reflects the latest completion) — see [`Store::set_run_state`]'s doc
+    /// Set a cell's state. Also stamps `started_at_ms` (once, the first
+    /// time the cell enters `running`) and `finished_at_ms` (every time it
+    /// enters a terminal state, so a re-finish after a proof-only restart
+    /// reflects the latest completion) — see [`Store::set_squad_state`]'s doc
     /// comment for the shared semantics.
-    pub fn set_session_state(
+    pub fn set_cell_state(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
         state: NodeState,
@@ -1841,8 +1927,8 @@ impl Store {
         let old = self
             .conn
             .query_row(
-                "SELECT state FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, idx],
+                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()
@@ -1853,51 +1939,51 @@ impl Store {
         let entering_running = i64::from(state == NodeState::Running);
         let entering_terminal = i64::from(state.is_terminal());
         self.conn.execute(
-            "UPDATE sessions SET state=?,
+            "UPDATE cells SET state=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
-             WHERE run_id=? AND task_idx=? AND idx=?",
+             WHERE squad_id=? AND task_idx=? AND idx=?",
             params![
                 state.as_str(),
                 entering_running,
                 now,
                 entering_terminal,
                 now,
-                run_id,
+                squad_id,
                 task_idx,
                 idx
             ],
         )?;
         crate::rlog!(
             DEBUG,
-            "ralphus [state] session {run_id}/t{task_idx}/s{idx} {old} → {}",
+            "ralphus [state] cell {squad_id}/t{task_idx}/s{idx} {old} → {}",
             state.as_str()
         );
-        // RAL-155 Q2: populate Cartographer's `task` column on session
+        // RAL-155 Q2: populate Cartographer's `task` column on cell
         // transitions too, not just `log_event`'s legacy free-text `ref`, so
         // task-scoped filtering (and the uber-log-viewer) surfaces these.
-        // Best-effort: a session whose owning task was deleted mid-flight
+        // Best-effort: a cell whose owning task was deleted mid-flight
         // (shouldn't happen — cascade-deleted together) just logs with no task.
-        let task_name = self.task_name_at(run_id, task_idx).ok().flatten();
+        let task_name = self.task_name_at(squad_id, task_idx).ok().flatten();
         let _ = self.log_event_with_task(
-            Some(run_id),
+            Some(squad_id),
             None,
-            "session",
+            "cell",
             Some(&format!("t{task_idx}/s{idx}")),
-            &format!("session → {}", state.as_str()),
+            &format!("cell → {}", state.as_str()),
             task_name.as_deref(),
         );
         Ok(())
     }
 
     /// Set a task node's state. Also stamps `started_at_ms`/`finished_at_ms` —
-    /// see [`Store::set_run_state`]'s doc comment for the shared semantics.
-    pub fn set_task_state(&self, run_id: &str, task_idx: i64, state: NodeState) -> Result<()> {
+    /// see [`Store::set_squad_state`]'s doc comment for the shared semantics.
+    pub fn set_task_state(&self, squad_id: &str, task_idx: i64, state: NodeState) -> Result<()> {
         let row = self
             .conn
             .query_row(
-                "SELECT state, name FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT state, name FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()
@@ -1914,24 +2000,24 @@ impl Store {
             "UPDATE tasks SET state=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
-             WHERE run_id=? AND idx=?",
+             WHERE squad_id=? AND idx=?",
             params![
                 state.as_str(),
                 entering_running,
                 now,
                 entering_terminal,
                 now,
-                run_id,
+                squad_id,
                 task_idx
             ],
         )?;
         crate::rlog!(
             INFO,
-            "ralphus [state] task {run_id}/t{task_idx} {old} → {}",
+            "ralphus [state] task {squad_id}/t{task_idx} {old} → {}",
             state.as_str()
         );
         let _ = self.log_event_with_task(
-            Some(run_id),
+            Some(squad_id),
             None,
             "task",
             Some(&format!("t{task_idx}")),
@@ -1941,48 +2027,48 @@ impl Store {
         Ok(())
     }
 
-    /// Solo a task within a run (RAL-157): while any task in the run is
-    /// soloed, the scheduler's dispatcher only starts sessions belonging to a
-    /// soloed task — every other task's not-yet-started sessions stay
+    /// Solo a task within a squad (RAL-157): while any task in the squad is
+    /// soloed, the scheduler's dispatcher only starts cells belonging to a
+    /// soloed task — every other task's not-yet-started cells stay
     /// paused (Pending) until un-soloed, even once the soloed task itself
     /// finishes (a dependent must not start racing ahead just because its
-    /// soloed upstream completed). Sessions already `running` when a sibling
-    /// gets soloed are left to finish on their own — there is no per-session
-    /// interrupt in this codebase today (cancellation is run-wide only, see
+    /// soloed upstream completed). Cells already `running` when a sibling
+    /// gets soloed are left to finish on their own — there is no per-cell
+    /// interrupt in this codebase today (cancellation is squad-wide only, see
     /// `Cancellations`), so "pause" for in-flight work means "don't dispatch
-    /// its task's *next* session," not a mid-session kill. Multiple tasks may
+    /// its task's *next* cell," not a mid-cell kill. Multiple tasks may
     /// be soloed simultaneously; soloing one does not un-solo another.
     /// Idempotent. Errors with [`StoreError::NotFound`] if the task doesn't
     /// exist.
-    pub fn solo_task(&self, run_id: &str, task_idx: i64) -> Result<()> {
-        self.set_task_soloed(run_id, task_idx, true)
+    pub fn solo_task(&self, squad_id: &str, task_idx: i64) -> Result<()> {
+        self.set_task_soloed(squad_id, task_idx, true)
     }
 
     /// Un-solo a task (RAL-157) — the reverse of [`Store::solo_task`]. Solo
-    /// state never auto-clears (not on run restart, not on the soloed task's
+    /// state never auto-clears (not on squad restart, not on the soloed task's
     /// own completion); this is the only way to resume paused siblings.
     /// Idempotent. Errors with [`StoreError::NotFound`] if the task doesn't
     /// exist.
-    pub fn unsolo_task(&self, run_id: &str, task_idx: i64) -> Result<()> {
-        self.set_task_soloed(run_id, task_idx, false)
+    pub fn unsolo_task(&self, squad_id: &str, task_idx: i64) -> Result<()> {
+        self.set_task_soloed(squad_id, task_idx, false)
     }
 
-    fn set_task_soloed(&self, run_id: &str, task_idx: i64, soloed: bool) -> Result<()> {
+    fn set_task_soloed(&self, squad_id: &str, task_idx: i64, soloed: bool) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE tasks SET soloed=?1 WHERE run_id=?2 AND idx=?3",
-            params![soloed, run_id, task_idx],
+            "UPDATE tasks SET soloed=?1 WHERE squad_id=?2 AND idx=?3",
+            params![soloed, squad_id, task_idx],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);
         }
         crate::rlog!(
             INFO,
-            "ralphus [state] task {run_id}/t{task_idx} soloed={soloed}"
+            "ralphus [state] task {squad_id}/t{task_idx} soloed={soloed}"
         );
         // `log_event` also writes this into Cartographer (RAL-98), so a single
-        // call keeps the per-run audit trail and the structured log in sync.
+        // call keeps the per-squad audit trail and the structured log in sync.
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
             "task",
             Some(&format!("t{task_idx}")),
@@ -1995,35 +2081,30 @@ impl Store {
         Ok(())
     }
 
-    /// Indices of every currently-soloed task in a run (RAL-157), read live so
+    /// Indices of every currently-soloed task in a squad (RAL-157), read live so
     /// the scheduler's dispatcher observes a mid-run solo/unsolo toggle on its
-    /// very next pass rather than only at the run's next (re)start.
-    pub fn soloed_task_indices(&self, run_id: &str) -> Result<HashSet<i64>> {
+    /// very next pass rather than only at the squad's next (re)start.
+    pub fn soloed_task_indices(&self, squad_id: &str) -> Result<HashSet<i64>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT idx FROM tasks WHERE run_id=? AND soloed=1")?;
+            .prepare("SELECT idx FROM tasks WHERE squad_id=? AND soloed=1")?;
         let rows = stmt
-            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Current state of one session, or `None` if it doesn't exist. Used by
-    /// the restart handlers (`server::restart_session`/`restart_session_verify`)
-    /// to decide whether cancelling the *whole run's* worker is actually
+    /// Current state of one cell, or `None` if it doesn't exist. Used by
+    /// the restart handlers (`server::restart_cell`/`restart_cell_proof`)
+    /// to decide whether cancelling the *whole squad's* worker is actually
     /// necessary — see those functions' doc comments (RAL-1xx: restart
     /// collateral damage).
-    pub fn session_state(
-        &self,
-        run_id: &str,
-        task_idx: i64,
-        idx: i64,
-    ) -> Result<Option<NodeState>> {
+    pub fn cell_state(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<Option<NodeState>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT state FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, idx],
+                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
                 |r| r.get(0),
             )
             .optional()?;
@@ -2031,98 +2112,98 @@ impl Store {
     }
 
     /// Current state of one task, or `None` if it doesn't exist. Same purpose
-    /// as [`Store::session_state`], for `server::restart_task_verify`.
-    pub fn task_state(&self, run_id: &str, task_idx: i64) -> Result<Option<NodeState>> {
+    /// as [`Store::cell_state`], for `server::restart_task_proof`.
+    pub fn task_state(&self, squad_id: &str, task_idx: i64) -> Result<Option<NodeState>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT state FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT state FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(raw.and_then(|s| NodeState::parse(&s)))
     }
 
-    /// The task name at `(run_id, task_idx)`, or `None` if no such task
+    /// The task name at `(squad_id, task_idx)`, or `None` if no such task
     /// exists. Used to translate an [`crate::entity_uri::EntityUri::Task`]
     /// (addressed by index, like every other entity URI) into Cartographer's
     /// `task` column, which stores the task's *name* (RAL-155 Q2).
-    pub fn task_name_at(&self, run_id: &str, task_idx: i64) -> Result<Option<String>> {
+    pub fn task_name_at(&self, squad_id: &str, task_idx: i64) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT name FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT name FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| r.get(0),
             )
             .optional()?)
     }
 
-    /// The session id (`sid`) at `(run_id, task_idx, session_idx)`, or `None`
-    /// if no such session exists. Used the same way as [`Store::task_name_at`]
-    /// to translate an index-addressed [`crate::entity_uri::EntityUri::Session`]
-    /// into Cartographer's `session_id` column.
-    pub fn session_sid_at(
+    /// The cell id (`sid`) at `(squad_id, task_idx, cell_idx)`, or `None`
+    /// if no such cell exists. Used the same way as [`Store::task_name_at`]
+    /// to translate an index-addressed [`crate::entity_uri::EntityUri::Cell`]
+    /// into Cartographer's `cell_id` column.
+    pub fn cell_sid_at(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT sid FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, session_idx],
+                "SELECT sid FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
                 |r| r.get(0),
             )
             .optional()?)
     }
 
-    /// Whether any session-scope verify step for `(task_idx, session_idx)` at
-    /// index >= `from_idx` is currently `Running`. Verify steps within one
+    /// Whether any cell-scope proof step for `(task_idx, cell_idx)` at
+    /// index >= `from_idx` is currently `Running`. Proof steps within one
     /// scope run sequentially, so at most one can be, but this checks
-    /// defensively. Mirrors [`Store::restart_session_verify`]'s own WHERE
-    /// clause; used by `server::restart_session_verify` (RAL-1xx).
-    pub fn session_verify_running_from(
+    /// defensively. Mirrors [`Store::restart_cell_proof`]'s own WHERE
+    /// clause; used by `server::restart_cell_proof` (RAL-1xx).
+    pub fn cell_proof_running_from(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         from_idx: i64,
     ) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM verifies WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=? AND idx>=? AND state='running'",
-            params![run_id, task_idx, session_idx, from_idx],
+            "SELECT COUNT(*) FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=? AND idx>=? AND state='running'",
+            params![squad_id, task_idx, cell_idx, from_idx],
             |r| r.get(0),
         )?;
         Ok(count > 0)
     }
 
-    /// Whether any task-scope verify step for `task_idx` at index >=
+    /// Whether any task-scope proof step for `task_idx` at index >=
     /// `from_idx` is currently `Running`. Mirrors
-    /// [`Store::restart_task_verify`]'s own WHERE clause; used by
-    /// `server::restart_task_verify` (RAL-1xx).
-    pub fn task_verify_running_from(
+    /// [`Store::restart_task_proof`]'s own WHERE clause; used by
+    /// `server::restart_task_proof` (RAL-1xx).
+    pub fn task_proof_running_from(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         from_idx: i64,
     ) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM verifies WHERE run_id=? AND task_idx=? AND scope='task' AND idx>=? AND state='running'",
-            params![run_id, task_idx, from_idx],
+            "SELECT COUNT(*) FROM proofs WHERE squad_id=? AND task_idx=? AND scope='task' AND idx>=? AND state='running'",
+            params![squad_id, task_idx, from_idx],
             |r| r.get(0),
         )?;
         Ok(count > 0)
     }
 
-    /// Fetch a single run's full board view.
-    pub fn get_run(&self, id: &str) -> Result<RunView> {
+    /// Fetch a single squad's full board view.
+    pub fn get_squad(&self, id: &str) -> Result<SquadView> {
         let row = self
             .conn
             .query_row(
-                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM runs WHERE id=?",
+                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM squads WHERE id=?",
                 params![id],
                 |r| {
                     Ok((
@@ -2138,7 +2219,7 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        self.build_run_view(
+        self.build_squad_view(
             row.0,
             row.1,
             row.2,
@@ -2149,13 +2230,13 @@ impl Store {
         )
     }
 
-    /// Fetch all runs, newest first.
-    pub fn list_runs(&self) -> Result<Vec<RunView>> {
-        // Tie-break on id so runs created within the same millisecond still order
-        // deterministically. Run ids are monotonic, zero-padded, fixed-width, so
+    /// Fetch all squads, newest first.
+    pub fn list_squads(&self) -> Result<Vec<SquadView>> {
+        // Tie-break on id so squads created within the same millisecond still order
+        // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM runs ORDER BY created_at_ms DESC, id DESC",
+            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM squads ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -2172,23 +2253,23 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(|(id, label, state, ts, started, finished, env)| {
-                self.build_run_view(id, label, state, ts, started, finished, from_json_map(&env))
+                self.build_squad_view(id, label, state, ts, started, finished, from_json_map(&env))
             })
             .collect()
     }
 
-    /// The cross-run `[[default]] depends_on` gating graph across every
-    /// submitted run (CLI_PARITY_PLAN.local.md Phase 6, `ralphus graph
-    /// --global`). `include_terminal` selects between "active runs only"
-    /// (queued/pending/running -- the default per plan Q5) and "every run
+    /// The cross-squad `[[default]] depends_on` gating graph across every
+    /// submitted squad (CLI_PARITY_PLAN.local.md Phase 6, `ralphus graph
+    /// --global`). `include_terminal` selects between "active squads only"
+    /// (queued/pending/running -- the default per plan Q5) and "every squad
     /// including done/failed/cancelled" (`--all`).
     ///
-    /// A dependency reference to a run outside the included set (filtered out,
+    /// A dependency reference to a squad outside the included set (filtered out,
     /// or simply unresolvable) produces no edge -- same best-effort philosophy
-    /// as [`crate::plan::plan`] for within-run refs.
+    /// as [`crate::plan::plan`] for within-squad refs.
     pub fn global_graph(&self, include_terminal: bool) -> Result<GlobalGraph> {
-        let all_runs = self.list_runs()?;
-        let included: Vec<&RunView> = all_runs
+        let all_squads = self.list_squads()?;
+        let included: Vec<&SquadView> = all_squads
             .iter()
             .filter(|r| {
                 include_terminal || matches!(r.state.as_str(), "queued" | "pending" | "running")
@@ -2207,11 +2288,11 @@ impl Store {
 
         let mut edges = Vec::new();
         for r in &included {
-            for dep in self.run_depends_on(&r.id)? {
-                let dep_run = dep.split('/').next().unwrap_or(&dep);
-                if included_ids.contains(dep_run) {
+            for dep in self.squad_depends_on(&r.id)? {
+                let dep_squad = dep.split('/').next().unwrap_or(&dep);
+                if included_ids.contains(dep_squad) {
                     edges.push(crate::plan::GraphEdge {
-                        from: dep_run.to_string(),
+                        from: dep_squad.to_string(),
                         to: r.id.clone(),
                     });
                 }
@@ -2221,7 +2302,7 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_run_view(
+    fn build_squad_view(
         &self,
         id: String,
         label: Option<String>,
@@ -2230,10 +2311,10 @@ impl Store {
         started_at_ms: Option<i64>,
         finished_at_ms: Option<i64>,
         env_overrides: BTreeMap<String, String>,
-    ) -> Result<RunView> {
+    ) -> Result<SquadView> {
         let mut tstmt = self.conn.prepare(
-            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, verify_env_overrides, soloed, started_at_ms, finished_at_ms
-             FROM tasks WHERE run_id=? ORDER BY idx",
+            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms
+             FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
         let task_rows = tstmt
             .query_map(params![id], |r| {
@@ -2254,18 +2335,17 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Map each guardian branch of this run back to its review, so a session
+        // Map each guardian branch of this squad back to its review, so a cell
         // whose review branch is in a guardian's stack lists that review (RAL-17).
         let review_by_branch = self.reviews_by_branch(&id)?;
-        // Fetch every verify step and session belonging to this run in one
+        // Fetch every proof step and cell belonging to this squad in one
         // statement each (grouped in memory below), rather than one query per
-        // task/session as before -- a run with hundreds of tasks turned that
+        // task/cell as before -- a squad with hundreds of tasks turned that
         // into thousands of individual SQL statements, all serialized under
         // the daemon's single store lock, which is what made `GET /api/tasks`
         // slow enough to stall restart/status-flip requests queued behind it.
-        let verifies_by_scope = self.verifies_by_scope(&id)?;
-        let mut sessions_by_task =
-            self.sessions_by_task(&id, &review_by_branch, &verifies_by_scope)?;
+        let proofs_by_scope = self.proofs_by_scope(&id)?;
+        let mut cells_by_task = self.cells_by_task(&id, &review_by_branch, &proofs_by_scope)?;
         let mut tasks = Vec::with_capacity(task_rows.len());
         for (
             t_idx,
@@ -2276,17 +2356,17 @@ impl Store {
             tstate,
             deps,
             task_env,
-            task_verify_env,
+            task_proof_env,
             soloed,
             t_started,
             t_finished,
         ) in task_rows
         {
-            let sessions = sessions_by_task.remove(&t_idx).unwrap_or_default();
+            let cells = cells_by_task.remove(&t_idx).unwrap_or_default();
             let project = project.unwrap_or_else(|| {
-                fallback_project_identifier(sessions.first().and_then(|s| s.cwd.as_deref()))
+                fallback_project_identifier(cells.first().and_then(|s| s.cwd.as_deref()))
             });
-            let verify = verifies_by_scope
+            let proof = proofs_by_scope
                 .get(&(t_idx, "task".to_string(), -1))
                 .cloned()
                 .unwrap_or_default();
@@ -2296,20 +2376,20 @@ impl Store {
                 agent,
                 model,
                 state: tstate,
-                sessions,
-                verify,
+                cells,
+                proof,
                 depends_on: from_json(&deps),
                 env_overrides: from_json_map(&task_env),
-                verify_env_overrides: from_json_map(&task_verify_env),
+                proof_env_overrides: from_json_map(&task_proof_env),
                 soloed,
                 started_at_ms: t_started,
                 finished_at_ms: t_finished,
             });
         }
 
-        let reviews = self.reviews_for_run(&id)?;
-        let state = effective_run_state(&self.conn, state, &id)?;
-        Ok(RunView {
+        let reviews = self.reviews_for_squad(&id)?;
+        let state = effective_squad_state(&self.conn, state, &id)?;
+        Ok(SquadView {
             id,
             label,
             state,
@@ -2322,14 +2402,14 @@ impl Store {
         })
     }
 
-    /// The reviews (guardians) derived from a run, oldest first.
-    fn reviews_for_run(&self, run_id: &str) -> Result<Vec<RunReviewRef>> {
+    /// The reviews (guardians) derived from a squad, oldest first.
+    fn reviews_for_squad(&self, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, status FROM guardians WHERE run_id=? ORDER BY created_at_ms, id",
+            "SELECT id, name, status FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
-                Ok(RunReviewRef {
+            .query_map(params![squad_id], |r| {
+                Ok(SquadReviewRef {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     status: r.get(2)?,
@@ -2340,23 +2420,23 @@ impl Store {
         Ok(rows)
     }
 
-    /// All sessions belonging to `run_id`, fetched in one statement and
-    /// grouped by `task_idx` — the bulk counterpart to a per-task session
-    /// query. `verifies_by_scope` must already hold this run's verify steps
-    /// (see [`Self::verifies_by_scope`]) so each session's own verify list
-    /// can be attached without a further per-session query.
-    fn sessions_by_task(
+    /// All cells belonging to `squad_id`, fetched in one statement and
+    /// grouped by `task_idx` — the bulk counterpart to a per-task cell
+    /// query. `proofs_by_scope` must already hold this squad's proof steps
+    /// (see [`Self::proofs_by_scope`]) so each cell's own proof list
+    /// can be attached without a further per-cell query.
+    fn cells_by_task(
         &self,
-        run_id: &str,
-        review_by_branch: &HashMap<String, Vec<RunReviewRef>>,
-        verifies_by_scope: &HashMap<(i64, String, i64), Vec<VerifyView>>,
-    ) -> Result<HashMap<i64, Vec<SessionView>>> {
+        squad_id: &str,
+        review_by_branch: &HashMap<String, Vec<SquadReviewRef>>,
+        proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
+    ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, verify_env_overrides, started_at_ms, finished_at_ms
-             FROM sessions WHERE run_id=? ORDER BY task_idx, idx",
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms
+             FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 let task_idx: i64 = r.get(0)?;
                 let idx: i64 = r.get(1)?;
                 let review_branch: Option<String> = r.get(16)?;
@@ -2366,7 +2446,7 @@ impl Store {
                 Ok((
                     task_idx,
                     idx,
-                    SessionView {
+                    CellView {
                         id: r.get::<_, String>(2)?,
                         name: r.get::<_, Option<String>>(3)?,
                         cwd: r.get::<_, Option<String>>(4)?,
@@ -2381,54 +2461,54 @@ impl Store {
                         command: r.get::<_, Option<String>>(13)?,
                         system_prompt: r.get::<_, Option<String>>(14)?,
                         depends_on: from_json(&r.get::<_, String>(15)?),
-                        verify: Vec::new(),
+                        proof: Vec::new(),
                         reviews,
                         agent_session_id: r.get::<_, Option<String>>(17)?,
                         maximum_budget_usd: r.get::<_, Option<f64>>(18)?,
                         env_overrides: from_json_map(&r.get::<_, String>(19)?),
-                        verify_env_overrides: from_json_map(&r.get::<_, String>(20)?),
+                        proof_env_overrides: from_json_map(&r.get::<_, String>(20)?),
                         started_at_ms: r.get::<_, Option<i64>>(21)?,
                         finished_at_ms: r.get::<_, Option<i64>>(22)?,
                     },
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut map: HashMap<i64, Vec<SessionView>> = HashMap::new();
-        for (task_idx, idx, mut session) in rows {
-            session.verify = verifies_by_scope
-                .get(&(task_idx, "session".to_string(), idx))
+        let mut map: HashMap<i64, Vec<CellView>> = HashMap::new();
+        for (task_idx, idx, mut cell) in rows {
+            cell.proof = proofs_by_scope
+                .get(&(task_idx, "cell".to_string(), idx))
                 .cloned()
                 .unwrap_or_default();
-            session.state = effective_session_state(&session.state, &session.verify);
-            map.entry(task_idx).or_default().push(session);
+            cell.state = effective_cell_state(&cell.state, &cell.proof);
+            map.entry(task_idx).or_default().push(cell);
         }
         Ok(map)
     }
 
-    /// Map each of this run's session branches back to the reviews containing
-    /// it, so a session can list the reviews its branch participates in
-    /// (RAL-17). Joins on `sessions.review_branch = guardian_branches.branch`
-    /// rather than filtering guardians by `guardians.run_id`, because a
+    /// Map each of this squad's cell branches back to the reviews containing
+    /// it, so a cell can list the reviews its branch participates in
+    /// (RAL-17). Joins on `cells.review_branch = guardian_branches.branch`
+    /// rather than filtering guardians by `guardians.squad_id`, because a
     /// guardian can be *found* (not created) by a later submission that shares
     /// a `ralphus:new-review/<key>` link or was attached to manually — its
-    /// `run_id` then still points at whichever run created it, even though a
-    /// different run's session branch was appended to it (see
-    /// `collecting_guardians_for_sessions`, which needs the same join).
-    fn reviews_by_branch(&self, run_id: &str) -> Result<HashMap<String, Vec<RunReviewRef>>> {
+    /// `squad_id` then still points at whichever squad created it, even though a
+    /// different squad's cell branch was appended to it (see
+    /// `collecting_guardians_for_cells`, which needs the same join).
+    fn reviews_by_branch(&self, squad_id: &str) -> Result<HashMap<String, Vec<SquadReviewRef>>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT gb.branch, g.id, g.name, g.status
              FROM guardian_branches gb
              JOIN guardians g ON g.id = gb.guardian_id
-             JOIN sessions s ON s.review_branch = gb.branch
-             WHERE s.run_id = ?
+             JOIN cells s ON s.review_branch = gb.branch
+             WHERE s.squad_id = ?
              ORDER BY g.created_at_ms, g.id",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 let branch: String = r.get(0)?;
                 Ok((
                     branch.clone(),
-                    RunReviewRef {
+                    SquadReviewRef {
                         id: r.get(1)?,
                         name: r.get(2)?,
                         status: r.get(3)?,
@@ -2437,34 +2517,34 @@ impl Store {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut map: HashMap<String, Vec<RunReviewRef>> = HashMap::new();
+        let mut map: HashMap<String, Vec<SquadReviewRef>> = HashMap::new();
         for (branch, rref) in rows {
             map.entry(branch).or_default().push(rref);
         }
         Ok(map)
     }
 
-    /// All verify steps belonging to `run_id`, fetched in one statement and
-    /// grouped by `(task_idx, scope, session_idx)` — the same key
-    /// [`Self::verifies_for`] filters on, but for the whole run at once.
-    /// Used by `build_run_view` so listing a run's board view costs a
-    /// constant number of queries regardless of how many tasks/sessions it
-    /// has, instead of one query per task/session.
-    fn verifies_by_scope(
+    /// All proof steps belonging to `squad_id`, fetched in one statement and
+    /// grouped by `(task_idx, scope, cell_idx)` — the same key
+    /// [`Self::proofs_for`] filters on, but for the whole squad at once.
+    /// Used by `build_squad_view` so listing a squad's board view costs a
+    /// constant number of queries regardless of how many tasks/cells it
+    /// has, instead of one query per task/cell.
+    fn proofs_by_scope(
         &self,
-        run_id: &str,
-    ) -> Result<HashMap<(i64, String, i64), Vec<VerifyView>>> {
+        squad_id: &str,
+    ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, session_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM verifies
-             WHERE run_id=? ORDER BY task_idx, scope, session_idx, idx",
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM proofs
+             WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
-                    VerifyView {
+                    ProofView {
                         id: r.get::<_, Option<String>>(3)?,
                         kind: r.get::<_, String>(4)?,
                         state: r.get::<_, String>(5)?,
@@ -2482,29 +2562,27 @@ impl Store {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut map: HashMap<(i64, String, i64), Vec<VerifyView>> = HashMap::new();
-        for (task_idx, scope, session_idx, v) in rows {
-            map.entry((task_idx, scope, session_idx))
-                .or_default()
-                .push(v);
+        let mut map: HashMap<(i64, String, i64), Vec<ProofView>> = HashMap::new();
+        for (task_idx, scope, cell_idx, v) in rows {
+            map.entry((task_idx, scope, cell_idx)).or_default().push(v);
         }
         Ok(map)
     }
 
-    pub(crate) fn verifies_for(
+    pub(crate) fn proofs_for(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
-    ) -> Result<Vec<VerifyView>> {
+        cell_idx: i64,
+    ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM verifies
-             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? ORDER BY idx",
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM proofs
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
-            .query_map(params![run_id, task_idx, scope, session_idx], |r| {
-                Ok(VerifyView {
+            .query_map(params![squad_id, task_idx, scope, cell_idx], |r| {
+                Ok(ProofView {
                     id: r.get::<_, Option<String>>(0)?,
                     kind: r.get::<_, String>(1)?,
                     state: r.get::<_, String>(2)?,
@@ -2548,9 +2626,9 @@ impl Store {
             source: "store",
             message: "project registered",
             scope: Some("project"),
-            run_id: None,
+            squad_id: None,
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
             payload: serde_json::json!({"name": name, "path": path, "vcs": vcs}),
@@ -2642,47 +2720,47 @@ impl Store {
         }
     }
 
-    /// Rewrite a session's `cwd` — used to resolve a worktree placeholder
+    /// Rewrite a cell's `cwd` — used to resolve a worktree placeholder
     /// (`ralphus:new-worktree/<branch>`) to its real materialized path
-    /// (RAL-100) before the session runs.
-    pub fn set_session_cwd(&self, run_id: &str, task_idx: i64, idx: i64, cwd: &str) -> Result<()> {
+    /// (RAL-100) before the cell runs.
+    pub fn set_cell_cwd(&self, squad_id: &str, task_idx: i64, idx: i64, cwd: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET cwd=? WHERE run_id=? AND task_idx=? AND idx=?",
-            params![cwd, run_id, task_idx, idx],
+            "UPDATE cells SET cwd=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![cwd, squad_id, task_idx, idx],
         )?;
         Ok(())
     }
 
-    /// Persist the effective read-only system prompt shown for a session in
+    /// Persist the effective read-only system prompt shown for a cell in
     /// the board details pane.
-    pub fn set_session_effective_system_prompt(
+    pub fn set_cell_effective_system_prompt(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
         system_prompt: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET effective_system_prompt=? WHERE run_id=? AND task_idx=? AND idx=?",
-            params![system_prompt, run_id, task_idx, idx],
+            "UPDATE cells SET effective_system_prompt=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![system_prompt, squad_id, task_idx, idx],
         )?;
         Ok(())
     }
 
-    /// Persist the effective read-only system prompt shown for a verify step in
+    /// Persist the effective read-only system prompt shown for a proof step in
     /// the board details pane.
-    pub fn set_verify_effective_system_prompt(
+    pub fn set_proof_effective_system_prompt(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
         system_prompt: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE verifies SET effective_system_prompt=? WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-            params![system_prompt, run_id, task_idx, scope, session_idx, idx],
+            "UPDATE proofs SET effective_system_prompt=? WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![system_prompt, squad_id, task_idx, scope, cell_idx, idx],
         )?;
         Ok(())
     }
@@ -2707,25 +2785,25 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// The state shown for a session in the board API/UI.
+/// The state shown for a cell in the board API/UI.
 ///
-/// The persisted `sessions.state` column is set to `done` as soon as the
-/// session's own agent body finishes, *before* its session-level verify
+/// The persisted `cells.state` column is set to `done` as soon as the
+/// cell's own agent body finishes, *before* its cell-level proof
 /// steps run — deliberately, so crash recovery can tell "body finished,
-/// verify pending" apart from a fresh session and only re-run the verify
+/// proof pending" apart from a fresh cell and only re-run the proof
 /// tail rather than redoing the (expensive) agent work (RAL-64; see
-/// `Store::done_sessions`). Left as-is, that reads to a viewer as the
-/// session being finished while its verify checklist is still running or
-/// has failed. This folds verify progress back in for display only, without
+/// `Store::done_cells`). Left as-is, that reads to a viewer as the
+/// cell being finished while its proof checklist is still running or
+/// has failed. This folds proof progress back in for display only, without
 /// touching the persisted column the scheduler relies on.
-fn effective_session_state(raw: &str, verify: &[VerifyView]) -> String {
+fn effective_cell_state(raw: &str, proof: &[ProofView]) -> String {
     if raw != "done" {
         return raw.to_string();
     }
-    if verify.iter().any(|v| v.state == "failed") {
+    if proof.iter().any(|v| v.state == "failed") {
         return "failed".to_string();
     }
-    if verify.iter().any(|v| {
+    if proof.iter().any(|v| {
         !matches!(
             v.state.as_str(),
             "done" | "failed" | "cancelled" | "ignored"
@@ -2736,58 +2814,58 @@ fn effective_session_state(raw: &str, verify: &[VerifyView]) -> String {
     raw.to_string()
 }
 
-/// The state shown for a run in the board API/UI (see [`STATUS_ISSUE.local.md`]
+/// The state shown for a squad in the board API/UI (see [`STATUS_ISSUE.local.md`]
 /// for the full writeup of the bug this fixes).
 ///
-/// `runs.state == "pending"` is overloaded. For a fresh submission it means
+/// `squads.state == "pending"` is overloaded. For a fresh submission it means
 /// exactly what it says: nothing has been claimed yet. But
-/// `Store::restart_session_verify`/`restart_task_verify`/`restart_session`
-/// also write the run back to `pending` purely as a "reclaim me on the next
-/// tick" signal to `scheduler::claim_ready` — and, when the run's worker
-/// thread is still alive driving *other*, unrelated sessions (deliberately
+/// `Store::restart_cell_proof`/`restart_task_proof`/`restart_cell`
+/// also write the squad back to `pending` purely as a "reclaim me on the next
+/// tick" signal to `scheduler::claim_ready` — and, when the squad's worker
+/// thread is still alive driving *other*, unrelated cells (deliberately
 /// left alone rather than cancelled, precisely so an unrelated sibling isn't
 /// interrupted — see `claim_ready`'s doc comment), that worker won't discover
 /// the restarted target until it finishes everything else and a fresh worker
-/// re-claims the run. During that whole window the persisted column reads
-/// `pending` even though the run plainly has live children.
+/// re-claims the squad. During that whole window the persisted column reads
+/// `pending` even though the squad plainly has live children.
 ///
-/// This mirrors [`effective_session_state`] one level up: fold the run's
+/// This mirrors [`effective_cell_state`] one level up: fold the squad's
 /// children's real state back in for display, without touching the
-/// `runs.state` column the scheduler itself reads via `list_ready`/
+/// `squads.state` column the scheduler itself reads via `list_ready`/
 /// `claim_ready`. Unlike the board's client-side `isDowntimeWaiting`
-/// relabeling (a purely cosmetic pill swap — that run truly has no live
+/// relabeling (a purely cosmetic pill swap — that squad truly has no live
 /// children, so filters/menus deliberately keep using the raw `pending`),
-/// this run *does* have something genuinely in flight, so the correction
+/// this squad *does* have something genuinely in flight, so the correction
 /// is real, not cosmetic, and is applied here so every consumer (CLI, board
-/// filters/menus, `/api/runs`) sees the same corrected value.
+/// filters/menus, `/api/squads`) sees the same corrected value.
 ///
-/// Deliberately queries the raw `sessions`/`verifies` columns rather than
-/// scanning the already-built [`TaskView`]s: [`effective_session_state`]
-/// folds a "done, verify still pending" session's *displayed* state to
+/// Deliberately queries the raw `cells`/`proofs` columns rather than
+/// scanning the already-built [`TaskView`]s: [`effective_cell_state`]
+/// folds a "done, proof still pending" cell's *displayed* state to
 /// `"running"` too (meaning "not fully resolved", not "currently
 /// executing") — reusing that folded value here would fire for the ordinary,
 /// no-live-worker restart case as well (nothing is actually executing, a
-/// verify is merely queued), which is exactly [`Self::restart_session_verify`]'s
+/// proof is merely queued), which is exactly [`Self::restart_cell_proof`]'s
 /// own steady-state right after a restart. Only a literal raw `running` row
 /// means an agent process is genuinely executing right now.
-fn effective_run_state(conn: &Connection, raw: String, run_id: &str) -> Result<String> {
+fn effective_squad_state(conn: &Connection, raw: String, squad_id: &str) -> Result<String> {
     if raw != "pending" {
         return Ok(raw);
     }
-    let running_sessions: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sessions WHERE run_id=? AND state='running'",
-        params![run_id],
+    let running_cells: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cells WHERE squad_id=? AND state='running'",
+        params![squad_id],
         |r| r.get(0),
     )?;
-    if running_sessions > 0 {
+    if running_cells > 0 {
         return Ok("running".to_string());
     }
-    let running_verifies: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM verifies WHERE run_id=? AND state='running'",
-        params![run_id],
+    let running_proofs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM proofs WHERE squad_id=? AND state='running'",
+        params![squad_id],
         |r| r.get(0),
     )?;
-    Ok(if running_verifies > 0 {
+    Ok(if running_proofs > 0 {
         "running".to_string()
     } else {
         raw
@@ -2795,10 +2873,10 @@ fn effective_run_state(conn: &Connection, raw: String, run_id: &str) -> Result<S
 }
 
 /// Fallback project identifier for a task whose TOML left `project` unset
-/// (RAL-141): the basename of its first session's `cwd`, so a task that only
+/// (RAL-141): the basename of its first cell's `cwd`, so a task that only
 /// sets a literal filesystem path still gets a usable, stable identifier for
 /// a board project filter facet to group by. Falls back further to
-/// `"unassigned"` when there's no session, no `cwd`, or the `cwd` has no
+/// `"unassigned"` when there's no cell, no `cwd`, or the `cwd` has no
 /// filename component (e.g. `"/"`). Never applied to a task using the
 /// `ralphus:new-worktree/<branch>` placeholder cwd -- `project` is already
 /// structurally required for those (see `core::validate`), so this path is
@@ -2822,21 +2900,21 @@ fn resolve_budget(step: Option<u64>, task: Option<u64>) -> Option<i64> {
     step.or(task).map(|b| i64::try_from(b).unwrap_or(i64::MAX))
 }
 
-/// Resolve an effective USD spend cap from a session-level and a task-level
-/// value (session wins; task is the default). `None` means no cap.
-fn resolve_maximum_budget_usd(session: Option<f64>, task: Option<f64>) -> Option<f64> {
-    session.or(task)
+/// Resolve an effective USD spend cap from a cell-level and a task-level
+/// value (cell wins; task is the default). `None` means no cap.
+fn resolve_maximum_budget_usd(cell: Option<f64>, task: Option<f64>) -> Option<f64> {
+    cell.or(task)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_verify(
+fn insert_proof(
     tx: &rusqlite::Transaction<'_>,
-    run_id: &str,
+    squad_id: &str,
     task_idx: i64,
     scope: &str,
-    session_idx: i64,
+    cell_idx: i64,
     v_idx: usize,
-    v: &ralphus_core::schema::VerifyStep,
+    v: &ralphus_core::schema::ProofStep,
     task: &ralphus_core::schema::TaskDef,
     agent: &str,
 ) -> Result<()> {
@@ -2854,18 +2932,18 @@ fn insert_verify(
     let timeout_sec = resolve_timeout_sec(v.timeout_minutes, task.timeout_minutes);
     let budget_tokens = resolve_budget(v.budget_tokens, task.budget_tokens);
     let effective_system_prompt = if kind == "prompt" {
-        Some(effective_verify_system_prompt(None))
+        Some(effective_proof_system_prompt(None))
     } else {
         None
     };
     tx.execute(
-        "INSERT INTO verifies(run_id, task_idx, scope, session_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, env_overrides)
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, env_overrides)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
-            run_id,
+            squad_id,
             task_idx,
             scope,
-            session_idx,
+            cell_idx,
             i64::try_from(v_idx).unwrap_or(0),
             v.id,
             kind,
@@ -2877,7 +2955,7 @@ fn insert_verify(
             timeout_sec,
             budget_tokens,
             // RAL-191: the step's TOML-declared `environment` seeds the same
-            // column `POST .../verify/{vi}/env` writes to, so a declared value
+            // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
             to_json_map(&v.environment),
         ],
@@ -2885,22 +2963,22 @@ fn insert_verify(
     Ok(())
 }
 
-/// The executable fields of a session, as the scheduler needs them to build a
+/// The executable fields of a cell, as the scheduler needs them to build a
 /// runner spec.
 #[derive(Debug, Clone)]
-pub struct SessionRow {
-    /// Index of the owning task within the run.
+pub struct CellRow {
+    /// Index of the owning task within the squad.
     pub task_idx: i64,
-    /// Index of the session within the task.
+    /// Index of the cell within the task.
     pub idx: i64,
     /// Owning task name.
     pub task_name: String,
-    /// Session id.
-    pub session_id: String,
+    /// Cell id.
+    pub cell_id: String,
     /// Working directory.
     pub cwd: Option<String>,
     /// Subproject paths within the repository root (e.g. `["packages/foo"]`).
-    /// Empty when the session targets the whole repository (RAL-23).
+    /// Empty when the cell targets the whole repository (RAL-23).
     pub subprojects: Vec<String>,
     /// AI prompt (mutually exclusive with `command`).
     pub prompt: Option<String>,
@@ -2915,55 +2993,62 @@ pub struct SessionRow {
     pub system_prompt: Option<String>,
     /// Placement of `system_prompt` (only `"append"` today). `None` when unset.
     pub system_prompt_position: Option<String>,
-    /// This session's dependency references (within-task session ids or
-    /// cross-task `task/session`).
+    /// This cell's dependency references (within-task cell ids or
+    /// cross-task `task/cell`).
     pub depends_on: Vec<String>,
-    /// Effective wall-clock timeout in seconds (resolved from session/task), or
+    /// Effective wall-clock timeout in seconds (resolved from cell/task), or
     /// `None` for no limit. The daemon kills the runner subprocess past this.
     pub timeout_sec: Option<i64>,
-    /// Effective total-token budget (resolved from session/task), or `None` for
-    /// no cap. The runner fails the session if usage exceeds it.
+    /// Effective total-token budget (resolved from cell/task), or `None` for
+    /// no cap. The runner fails the cell if usage exceeds it.
     pub budget_tokens: Option<i64>,
-    /// Effective USD spend cap (resolved from session/task), or `None` for no
-    /// cap. The runner kills the session mid-run and fails it once the live
+    /// Effective USD spend cap (resolved from cell/task), or `None` for no
+    /// cap. The runner kills the cell mid-run and fails it once the live
     /// `cost_usd` exceeds this (RAL-161).
     pub maximum_budget_usd: Option<f64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
-    /// scheduler rebases this session's branch onto the named dependency's
+    /// scheduler rebases this cell's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
     pub upstream: Option<String>,
-    /// The resolved machine this session runs on (RAL-185), as authored --
+    /// The resolved machine this cell runs on (RAL-185), as authored --
     /// e.g. `"incredibuild:A"`. `None` means the daemon's own host, which is
-    /// every pre-RAL-185 row and every session that never declared one.
+    /// every pre-RAL-185 row and every cell that never declared one.
     /// Resolved at submit so a later edit to the task file cannot move an
-    /// in-flight run's machine.
+    /// in-flight squad's machine.
     pub machine: Option<String>,
 }
 
-/// Editable session definition fields (from the details pane).
+/// Editable cell definition fields (from the details pane).
+///
+/// `cwd`/`model`/`prompt`/`command` are nested `Option`s so a caller can say
+/// three different things per field: `None` -- the caller didn't mention
+/// this field, leave the column as it already is; `Some(None)` -- the caller
+/// gave an empty value, clear the column to NULL; `Some(Some(v))` -- set the
+/// column to `v`. `agent` can't be NULL (`cells.agent` is `NOT NULL`), so it
+/// only has the "untouched" (`None`) and "set" (`Some(v)`) states.
 #[derive(Debug, Clone)]
-pub struct SessionEdit<'a> {
+pub struct CellEdit<'a> {
     /// Working directory.
-    pub cwd: Option<&'a str>,
+    pub cwd: Option<Option<&'a str>>,
     /// Agent program.
-    pub agent: &'a str,
+    pub agent: Option<&'a str>,
     /// Model.
-    pub model: Option<&'a str>,
+    pub model: Option<Option<&'a str>>,
     /// AI prompt (mutually exclusive with command).
-    pub prompt: Option<&'a str>,
+    pub prompt: Option<Option<&'a str>>,
     /// Shell command.
-    pub command: Option<&'a str>,
+    pub command: Option<Option<&'a str>>,
 }
 
 /// A task's identity and dependencies, for scheduling.
 #[derive(Debug, Clone)]
 pub struct TaskRow {
-    /// Task index within the run.
+    /// Task index within the squad.
     pub idx: i64,
     /// Task name.
     pub name: String,
     /// Registered project name (RAL-100). Required whenever any of this
-    /// task's sessions uses a `ralphus:new-worktree/<branch>` placeholder
+    /// task's cells uses a `ralphus:new-worktree/<branch>` placeholder
     /// `cwd` -- that's the project the daemon materializes the worktree
     /// under.
     pub project: Option<String>,
@@ -2985,85 +3070,85 @@ pub struct TaskCommitGuardInfo {
     /// Opts the task out of the guard entirely (RAL-156 Q4).
     pub no_commit_required: bool,
     /// The task-scoped baseline commit sha captured at task start, or `None`
-    /// if no session has captured one yet (e.g. no session has started, or
+    /// if no cell has captured one yet (e.g. no cell has started, or
     /// none could resolve a `HEAD`).
     pub baseline_commit_sha: Option<String>,
 }
 
-/// The full set of entities a restart would dirty (RAL-104): sessions/tasks
-/// reset to Pending within the target run, and other runs — transitively
+/// The full set of entities a restart would dirty (RAL-104): cells/tasks
+/// reset to Pending within the target squad, and other squads — transitively
 /// dependent on it — that get dirtied too. Computed once by
-/// [`Store::compute_run_restart_impact`] / [`Store::compute_session_restart_impact`]
+/// [`Store::compute_squad_restart_impact`] / [`Store::compute_cell_restart_impact`]
 /// and shared by both the non-mutating dry-run preview and the real restart,
 /// so the two can never drift out of sync.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RestartImpact {
-    /// Sessions within the target run that will be reset to Pending.
-    pub sessions: Vec<RestartImpactSession>,
-    /// Tasks within the target run that will be reset to Pending.
+    /// Cells within the target squad that will be reset to Pending.
+    pub cells: Vec<RestartImpactCell>,
+    /// Tasks within the target squad that will be reset to Pending.
     pub tasks: Vec<RestartImpactTask>,
-    /// Other runs, transitively dependent on the target run, that will be
+    /// Other squads, transitively dependent on the target squad, that will be
     /// dirtied (reset to Pending).
-    pub dirtied_runs: Vec<RestartImpactRun>,
+    pub dirtied_squads: Vec<RestartImpactSquad>,
 }
 
-/// One session affected by a restart, for display in the dry-run preview.
+/// One cell affected by a restart, for display in the dry-run preview.
 #[derive(Debug, Clone, Serialize)]
-pub struct RestartImpactSession {
-    /// Index of the owning task within the run.
+pub struct RestartImpactCell {
+    /// Index of the owning task within the squad.
     pub task_idx: i64,
-    /// Index of the session within the task.
+    /// Index of the cell within the task.
     pub idx: i64,
     /// Owning task name.
     pub task_name: String,
-    /// Session id.
-    pub session_id: String,
+    /// Cell id.
+    pub cell_id: String,
 }
 
 /// One task affected by a restart, for display in the dry-run preview.
 #[derive(Debug, Clone, Serialize)]
 pub struct RestartImpactTask {
-    /// Task index within the run.
+    /// Task index within the squad.
     pub idx: i64,
     /// Task name.
     pub name: String,
 }
 
-/// One dependent run that would be dirtied by a restart, for display in the
+/// One dependent squad that would be dirtied by a restart, for display in the
 /// dry-run preview.
 #[derive(Debug, Clone, Serialize)]
-pub struct RestartImpactRun {
-    /// Run id.
+pub struct RestartImpactSquad {
+    /// Squad id.
     pub id: String,
     /// Optional human label.
     pub label: Option<String>,
 }
 
-/// Everything cancelling a run affects, computed by [`Store::cancel_run`] and
+/// Everything cancelling a squad affects, computed by [`Store::cancel_squad`] and
 /// shared by the non-mutating dry-run preview and the real cascading cancel
 /// (RAL-116), so the two can never drift out of sync.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CancelImpact {
-    /// The target run plus every run transitively dependent on it — all of
-    /// which will be (or were) cancelled. The target run is always first.
-    pub runs: Vec<RestartImpactRun>,
+    /// The target squad plus every squad transitively dependent on it — all of
+    /// which will be (or were) cancelled. The target squad is always first.
+    pub squads: Vec<RestartImpactSquad>,
 }
 
 impl Store {
-    /// All sessions of a run, in insertion order.
-    pub fn sessions_of(&self, run_id: &str) -> Result<Vec<SessionRow>> {
+    /// All cells of a squad, in insertion order.
+    pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine
-             FROM sessions s JOIN tasks t ON t.run_id = s.run_id AND t.idx = s.task_idx
-             WHERE s.run_id = ? ORDER BY s.task_idx, s.idx",
+             FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
+             WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
-                Ok(SessionRow {
+            .query_map(params![squad_id], |r| {
+                Ok(CellRow {
                     task_idx: r.get(0)?,
                     idx: r.get(1)?,
                     task_name: r.get(2)?,
-                    session_id: r.get(3)?,
+                    cell_id: r.get(3)?,
                     cwd: r.get(4)?,
                     subprojects: r
                         .get::<_, Option<String>>(5)?
@@ -3087,13 +3172,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// All tasks of a run with their dependencies, in order.
-    pub fn tasks_of(&self, run_id: &str) -> Result<Vec<TaskRow>> {
+    /// All tasks of a squad with their dependencies, in order.
+    pub fn tasks_of(&self, squad_id: &str) -> Result<Vec<TaskRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, name, project, depends_on, soloed FROM tasks WHERE run_id=? ORDER BY idx",
+            "SELECT idx, name, project, depends_on, soloed FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok(TaskRow {
                     idx: r.get(0)?,
                     name: r.get(1)?,
@@ -3107,16 +3192,16 @@ impl Store {
     }
 
     /// Fetch what the RAL-156 no-new-commits guard needs for one task.
-    /// `Ok(None)` when the `(run_id, task_idx)` pair doesn't exist.
+    /// `Ok(None)` when the `(squad_id, task_idx)` pair doesn't exist.
     pub fn task_commit_guard_info(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
     ) -> Result<Option<TaskCommitGuardInfo>> {
         self.conn
             .query_row(
-                "SELECT project, no_commit_required, baseline_commit_sha FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT project, no_commit_required, baseline_commit_sha FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| {
                     Ok(TaskCommitGuardInfo {
                         project: r.get(0)?,
@@ -3131,76 +3216,76 @@ impl Store {
 
     /// Capture a task's RAL-156 baseline commit sha, the first time only:
     /// a no-op if this task already has one (`baseline_commit_sha IS NULL` in
-    /// the WHERE clause), so whichever of the task's sessions reaches
-    /// `Running` first wins and later sessions never clobber it.
-    pub fn set_task_baseline_commit(&self, run_id: &str, task_idx: i64, sha: &str) -> Result<()> {
+    /// the WHERE clause), so whichever of the task's cells reaches
+    /// `Running` first wins and later cells never clobber it.
+    pub fn set_task_baseline_commit(&self, squad_id: &str, task_idx: i64, sha: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET baseline_commit_sha=?1 WHERE run_id=?2 AND idx=?3 AND baseline_commit_sha IS NULL",
-            params![sha, run_id, task_idx],
+            "UPDATE tasks SET baseline_commit_sha=?1 WHERE squad_id=?2 AND idx=?3 AND baseline_commit_sha IS NULL",
+            params![sha, squad_id, task_idx],
         )?;
         Ok(())
     }
 
-    /// The cross-run dependency references declared in the run's `[[default]]`.
-    pub fn run_depends_on(&self, run_id: &str) -> Result<Vec<String>> {
+    /// The cross-squad dependency references declared in the squad's `[[default]]`.
+    pub fn squad_depends_on(&self, squad_id: &str) -> Result<Vec<String>> {
         let s: Option<String> = self
             .conn
             .query_row(
-                "SELECT depends_on FROM runs WHERE id=?",
-                params![run_id],
+                "SELECT depends_on FROM squads WHERE id=?",
+                params![squad_id],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(from_json(&s.ok_or(StoreError::NotFound)?))
     }
 
-    /// Add a cross-run dependency (RAL-105): appends `target_id` to `run_id`'s
-    /// `[[default]] depends_on`, reusing the existing whole-run gating in
+    /// Add a cross-squad dependency (RAL-105): appends `target_id` to `squad_id`'s
+    /// `[[default]] depends_on`, reusing the existing whole-squad gating in
     /// [`Store::list_ready`]/[`Store::deps_satisfied`] — no new scheduling
-    /// path. A `run_id`/`target_id` that doesn't exist is `NotFound`; a
+    /// path. A `squad_id`/`target_id` that doesn't exist is `NotFound`; a
     /// self-reference or a reference that would create a cycle in the
-    /// cross-run dependency graph is rejected as `InvalidTransition`. Adding
-    /// a dependency that is already present is a no-op. Returns the run's
+    /// cross-squad dependency graph is rejected as `InvalidTransition`. Adding
+    /// a dependency that is already present is a no-op. Returns the squad's
     /// updated `depends_on` list.
-    pub fn add_run_dependency(&self, run_id: &str, target_id: &str) -> Result<Vec<String>> {
-        if run_id == target_id {
+    pub fn add_squad_dependency(&self, squad_id: &str, target_id: &str) -> Result<Vec<String>> {
+        if squad_id == target_id {
             return Err(StoreError::InvalidTransition(
-                "a run cannot depend on itself".to_string(),
+                "a squad cannot depend on itself".to_string(),
             ));
         }
-        let mut deps = self.run_depends_on(run_id)?;
-        self.run_depends_on(target_id)?; // existence check
+        let mut deps = self.squad_depends_on(squad_id)?;
+        self.squad_depends_on(target_id)?; // existence check
         if deps
             .iter()
             .any(|d| d.split('/').next().unwrap_or(d) == target_id)
         {
             return Ok(deps);
         }
-        if self.run_transitively_depends_on(target_id, run_id)? {
+        if self.squad_transitively_depends_on(target_id, squad_id)? {
             return Err(StoreError::InvalidTransition(format!(
                 "adding a dependency on {target_id} would create a cycle"
             )));
         }
         deps.push(target_id.to_string());
         self.conn.execute(
-            "UPDATE runs SET depends_on=?, updated_at_ms=? WHERE id=?",
-            params![to_json(&deps), now_ms(), run_id],
+            "UPDATE squads SET depends_on=?, updated_at_ms=? WHERE id=?",
+            params![to_json(&deps), now_ms(), squad_id],
         )?;
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
-            "run",
+            "squad",
             None,
             &format!("dependency added: now depends on {target_id}"),
         );
         Ok(deps)
     }
 
-    /// Whether `from` transitively depends on `to` via cross-run `depends_on`
+    /// Whether `from` transitively depends on `to` via cross-squad `depends_on`
     /// edges (BFS). Dangling references (a dep id that no longer resolves to
-    /// a run) are skipped — same best-effort philosophy as
+    /// a squad) are skipped — same best-effort philosophy as
     /// [`Store::global_graph`].
-    fn run_transitively_depends_on(&self, from: &str, to: &str) -> Result<bool> {
+    fn squad_transitively_depends_on(&self, from: &str, to: &str) -> Result<bool> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut frontier = vec![from.to_string()];
         while let Some(cur) = frontier.pop() {
@@ -3210,57 +3295,57 @@ impl Store {
             if !seen.insert(cur.clone()) {
                 continue;
             }
-            for dep in self.run_depends_on(&cur).unwrap_or_default() {
-                let dep_run = dep.split('/').next().unwrap_or(&dep).to_string();
-                frontier.push(dep_run);
+            for dep in self.squad_depends_on(&cur).unwrap_or_default() {
+                let dep_squad = dep.split('/').next().unwrap_or(&dep).to_string();
+                frontier.push(dep_squad);
             }
         }
         Ok(false)
     }
 
-    /// The distinct task indices of a run, ascending.
-    pub fn task_indices(&self, run_id: &str) -> Result<Vec<i64>> {
+    /// The distinct task indices of a squad, ascending.
+    pub fn task_indices(&self, squad_id: &str) -> Result<Vec<i64>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT idx FROM tasks WHERE run_id=? ORDER BY idx")?;
+            .prepare("SELECT idx FROM tasks WHERE squad_id=? ORDER BY idx")?;
         let ids = stmt
-            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(ids)
     }
 
     /// Returns `true` when every task in `task_indices` has state `done` for the
-    /// given run. An empty set is vacuously true. Used by the per-task review
+    /// given squad. An empty set is vacuously true. Used by the per-task review
     /// gate to decide whether a guardian's blocking tasks have all finished.
-    pub fn all_tasks_done(&self, run_id: &str, task_indices: &HashSet<i64>) -> Result<bool> {
+    pub fn all_tasks_done(&self, squad_id: &str, task_indices: &HashSet<i64>) -> Result<bool> {
         if task_indices.is_empty() {
             return Ok(true);
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT idx FROM tasks WHERE run_id=? AND state != 'done'")?;
+            .prepare("SELECT idx FROM tasks WHERE squad_id=? AND state != 'done'")?;
         let non_done: Vec<i64> = stmt
-            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(non_done.iter().all(|idx| !task_indices.contains(idx)))
     }
 
-    /// The verify steps of a scope (`"task"` with `session_idx = -1`, or
-    /// `"session"` with the session's index), in order:
+    /// The proof steps of a scope (`"task"` with `cell_idx = -1`, or
+    /// `"cell"` with the cell's index), in order:
     /// `(idx, kind, spec, model)` — `model` is only meaningful for `agent`.
-    pub fn verify_specs(
+    pub fn proof_specs(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
-    ) -> Result<Vec<VerifySpecRow>> {
+        cell_idx: i64,
+    ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens FROM verifies
-             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? ORDER BY idx",
+            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens FROM proofs
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
-            .query_map(params![run_id, task_idx, scope, session_idx], |r| {
+            .query_map(params![squad_id, task_idx, scope, cell_idx], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -3274,43 +3359,43 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fresh current state of one verify step (not a snapshot from
-    /// [`Store::verify_specs`]) — lets the scheduler notice a user manually
+    /// Fresh current state of one proof step (not a snapshot from
+    /// [`Store::proof_specs`]) — lets the scheduler notice a user manually
     /// setting a not-yet-executed step to `ignored` mid-run and honor it
     /// instead of racing ahead with a stale snapshot.
-    pub fn verify_state(
+    pub fn proof_state(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
     ) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT state FROM verifies WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-                params![run_id, task_idx, scope, session_idx, idx],
+                "SELECT state FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()?)
     }
 
-    /// Set a verify step's state.
-    pub fn set_verify_state(
+    /// Set a proof step's state.
+    pub fn set_proof_state(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
         state: NodeState,
     ) -> Result<()> {
         let old = self
             .conn
             .query_row(
-                "SELECT state FROM verifies WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-                params![run_id, task_idx, scope, session_idx, idx],
+                "SELECT state FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()
@@ -3318,31 +3403,31 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| "unknown".to_string());
         self.conn.execute(
-            "UPDATE verifies SET state=?
-             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-            params![state.as_str(), run_id, task_idx, scope, session_idx, idx],
+            "UPDATE proofs SET state=?
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![state.as_str(), squad_id, task_idx, scope, cell_idx, idx],
         )?;
         crate::rlog!(
             DEBUG,
-            "ralphus [state] verify {run_id}/t{task_idx}/{scope}/#{idx} {old} → {}",
+            "ralphus [state] proof {squad_id}/t{task_idx}/{scope}/#{idx} {old} → {}",
             state.as_str()
         );
-        // RAL-155 Q2: same reasoning as `set_task_state`/`set_session_state`.
-        let task_name = self.task_name_at(run_id, task_idx).ok().flatten();
+        // RAL-155 Q2: same reasoning as `set_task_state`/`set_cell_state`.
+        let task_name = self.task_name_at(squad_id, task_idx).ok().flatten();
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::DEBUG,
             source: "store",
-            message: "verify state transition",
-            scope: Some("verify"),
-            run_id: Some(run_id),
+            message: "proof state transition",
+            scope: Some("proof"),
+            squad_id: Some(squad_id),
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: task_name.as_deref(),
             log_path: None,
             payload: serde_json::json!({
                 "task_idx": task_idx,
-                "verify_scope": scope,
-                "session_idx": session_idx,
+                "proof_scope": scope,
+                "cell_idx": cell_idx,
                 "idx": idx,
                 "old": old,
                 "new": state.as_str(),
@@ -3351,19 +3436,19 @@ impl Store {
         Ok(())
     }
 
-    /// Record a verifier's terminal state and captured output, logging it (CCTL-99).
+    /// Record a proof step's terminal state and captured output, logging it (CCTL-99).
     ///
     /// RAL-163: guarded by `state IN (...)` the same way and for the same
-    /// reason as [`Self::record_session_result`] — a manual `set-status`
-    /// override on this verify step while it's still mid-flight must not be
+    /// reason as [`Self::record_cell_result`] — a manual `set-status`
+    /// override on this proof step while it's still mid-flight must not be
     /// clobbered once the scheduler's own runner call for it unblocks.
     #[allow(clippy::too_many_arguments)]
-    pub fn set_verify_result(
+    pub fn set_proof_result(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
         state: NodeState,
         output: &str,
@@ -3377,8 +3462,8 @@ impl Store {
         let (old, vid): (String, Option<String>) = self
             .conn
             .query_row(
-                "SELECT state, vid FROM verifies WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-                params![run_id, task_idx, scope, session_idx, idx],
+                "SELECT state, vid FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -3386,8 +3471,8 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE verifies SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cost_usd=?
-             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cost_usd=?
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
                 output,
@@ -3395,10 +3480,10 @@ impl Store {
                 tokens_in,
                 tokens_out,
                 cost_usd,
-                run_id,
+                squad_id,
                 task_idx,
                 scope,
-                session_idx,
+                cell_idx,
                 idx,
                 state.as_str(),
             ],
@@ -3409,25 +3494,25 @@ impl Store {
         };
         crate::rlog!(
             INFO,
-            "ralphus [state] verify {run_id}/t{task_idx}/{scope}/#{idx} {old} → {} output_len={}",
+            "ralphus [state] proof {squad_id}/t{task_idx}/{scope}/#{idx} {old} → {} output_len={}",
             state.as_str(),
             output.len()
         );
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
-            "verify",
+            "proof",
             Some(&reference),
-            &format!("verify → {}", state.as_str()),
+            &format!("proof → {}", state.as_str()),
         );
         Ok(())
     }
 
-    /// Edit a run's label.
-    pub fn edit_run_label(&self, run_id: &str, label: Option<&str>) -> Result<()> {
+    /// Edit a squad's label.
+    pub fn edit_squad_label(&self, squad_id: &str, label: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE runs SET label=?, updated_at_ms=? WHERE id=?",
-            params![label, now_ms(), run_id],
+            "UPDATE squads SET label=?, updated_at_ms=? WHERE id=?",
+            params![label, now_ms(), squad_id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -3439,14 +3524,14 @@ impl Store {
     /// Edit a task's name and project.
     pub fn edit_task_fields(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         name: &str,
         project: Option<&str>,
     ) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE tasks SET name=?, project=? WHERE run_id=? AND idx=?",
-            params![name, project, run_id, task_idx],
+            "UPDATE tasks SET name=?, project=? WHERE squad_id=? AND idx=?",
+            params![name, project, squad_id, task_idx],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -3455,20 +3540,24 @@ impl Store {
         }
     }
 
-    /// Edit a session's editable definition fields. Exactly one of `prompt` /
-    /// `command` should be non-empty (the other is cleared).
-    pub fn edit_session_fields(
+    /// Edit a cell's editable definition fields. A field the caller didn't
+    /// mention (`None` in `edit`) leaves the corresponding column
+    /// untouched -- see [`CellEdit`]'s doc comment. Exactly one of
+    /// `prompt` / `command` should be non-empty when both are touched (the
+    /// other is cleared); the caller (`edit_squad`'s `"cell"` arm) resolves
+    /// that XOR before building `edit`.
+    pub fn edit_cell_fields(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
-        edit: &SessionEdit<'_>,
+        edit: &CellEdit<'_>,
     ) -> Result<()> {
         let (subprojects, authored_system_prompt): (Vec<String>, Option<String>) = self
             .conn
             .query_row(
-                "SELECT subprojects, system_prompt FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, idx],
+                "SELECT subprojects, system_prompt FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?
@@ -3480,23 +3569,44 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        let effective_system_prompt = edit.prompt.as_ref().map(|_| {
-            effective_session_system_prompt(authored_system_prompt.as_deref(), &subprojects)
-        });
+
+        let cwd_touched = edit.cwd.is_some();
+        let cwd_value = edit.cwd.flatten();
+        let agent_touched = edit.agent.is_some();
+        let model_touched = edit.model.is_some();
+        let model_value = edit.model.flatten();
+        let prompt_touched = edit.prompt.is_some();
+        let prompt_value = edit.prompt.flatten();
+        let command_touched = edit.command.is_some();
+        let command_value = edit.command.flatten();
+        let effective_system_prompt = prompt_value
+            .map(|_| effective_cell_system_prompt(authored_system_prompt.as_deref(), &subprojects));
+
         let n = self.conn.execute(
-            "UPDATE sessions SET cwd=?, agent=?, model=?, prompt=?, command=?, effective_system_prompt=?
-             WHERE run_id=? AND task_idx=? AND idx=?",
-            params![
-                edit.cwd,
-                edit.agent,
-                edit.model,
-                edit.prompt,
-                edit.command,
-                effective_system_prompt,
-                run_id,
-                task_idx,
-                idx
-            ],
+            "UPDATE cells SET
+                cwd = CASE WHEN :cwd_touched THEN :cwd ELSE cwd END,
+                agent = CASE WHEN :agent_touched THEN :agent ELSE agent END,
+                model = CASE WHEN :model_touched THEN :model ELSE model END,
+                prompt = CASE WHEN :prompt_touched THEN :prompt ELSE prompt END,
+                command = CASE WHEN :command_touched THEN :command ELSE command END,
+                effective_system_prompt = CASE WHEN :prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END
+             WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
+            named_params! {
+                ":cwd_touched": cwd_touched,
+                ":cwd": cwd_value,
+                ":agent_touched": agent_touched,
+                ":agent": edit.agent,
+                ":model_touched": model_touched,
+                ":model": model_value,
+                ":prompt_touched": prompt_touched,
+                ":prompt": prompt_value,
+                ":command_touched": command_touched,
+                ":command": command_value,
+                ":effective_system_prompt": effective_system_prompt,
+                ":squad_id": squad_id,
+                ":task_idx": task_idx,
+                ":idx": idx,
+            },
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -3505,34 +3615,34 @@ impl Store {
         }
     }
 
-    /// The persistent environment-variable overrides currently set on a run
+    /// The persistent environment-variable overrides currently set on a squad
     /// (RAL-150). Empty when none have ever been set.
-    pub fn get_run_env_overrides(&self, run_id: &str) -> Result<BTreeMap<String, String>> {
+    pub fn get_squad_env_overrides(&self, squad_id: &str) -> Result<BTreeMap<String, String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT env_overrides FROM runs WHERE id=?",
-                params![run_id],
+                "SELECT env_overrides FROM squads WHERE id=?",
+                params![squad_id],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
     }
 
-    /// Add/replace (`set`) and remove (`unset`) entries in a run's persistent
+    /// Add/replace (`set`) and remove (`unset`) entries in a squad's persistent
     /// environment-variable overrides (RAL-150), returning the resulting map.
     /// Overrides are persistent by design (Q4 of the ticket): once set, a key
     /// stays set across any number of retries until explicitly unset — this
     /// merges into whatever is already stored rather than replacing it
     /// wholesale. `set` entries win when a key appears in both `set` and
     /// `unset`.
-    pub fn set_run_env_overrides(
+    pub fn set_squad_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         set: &BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<BTreeMap<String, String>> {
-        let mut current = self.get_run_env_overrides(run_id)?;
+        let mut current = self.get_squad_env_overrides(squad_id)?;
         for key in unset {
             current.remove(key);
         }
@@ -3540,34 +3650,34 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE runs SET env_overrides=?, updated_at_ms=? WHERE id=?",
-            params![to_json_map(&current), now_ms(), run_id],
+            "UPDATE squads SET env_overrides=?, updated_at_ms=? WHERE id=?",
+            params![to_json_map(&current), now_ms(), squad_id],
         )?;
         Ok(current)
     }
 
     // ── Hierarchical env overrides (RAL-150 extension) ─────────────────────
     //
-    // Task/session-level layers, plus a separate layer for a task's/session's
-    // own verify steps, mirroring `get_run_env_overrides`/
-    // `set_run_env_overrides` exactly (same set-wins-over-unset-for-same-key
+    // Task/cell-level layers, plus a separate layer for a task's/cell's
+    // own proof steps, mirroring `get_squad_env_overrides`/
+    // `set_squad_env_overrides` exactly (same set-wins-over-unset-for-same-key
     // merge, same persist-until-unset semantics). The three `resolve_*`
     // methods below fold each layer on top of its parents in one place, so
     // scheduler call sites stay a single call and precedence stays
     // unit-testable independent of dispatch.
 
     /// The persistent environment-variable overrides set directly on a task
-    /// (not merged with the run's). Empty when none have ever been set.
+    /// (not merged with the squad's). Empty when none have ever been set.
     pub fn get_task_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT env_overrides FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT env_overrides FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| r.get(0),
             )
             .optional()?;
@@ -3578,12 +3688,12 @@ impl Store {
     /// environment-variable overrides, returning the resulting map.
     pub fn set_task_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         set: &BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<BTreeMap<String, String>> {
-        let mut current = self.get_task_env_overrides(run_id, task_idx)?;
+        let mut current = self.get_task_env_overrides(squad_id, task_idx)?;
         for key in unset {
             current.remove(key);
         }
@@ -3591,24 +3701,24 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE tasks SET env_overrides=? WHERE run_id=? AND idx=?",
-            params![to_json_map(&current), run_id, task_idx],
+            "UPDATE tasks SET env_overrides=? WHERE squad_id=? AND idx=?",
+            params![to_json_map(&current), squad_id, task_idx],
         )?;
         Ok(current)
     }
 
     /// The persistent environment-variable overrides set on a task's own
-    /// (task-scoped) verify steps, not merged with the task's/run's.
-    pub fn get_task_verify_env_overrides(
+    /// (task-scoped) proof steps, not merged with the task's/squad's.
+    pub fn get_task_proof_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT verify_env_overrides FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT proof_env_overrides FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| r.get(0),
             )
             .optional()?;
@@ -3616,16 +3726,16 @@ impl Store {
     }
 
     /// Add/replace (`set`) and remove (`unset`) entries in a task's
-    /// verify-scoped environment-variable overrides, returning the resulting
+    /// proof-scoped environment-variable overrides, returning the resulting
     /// map.
-    pub fn set_task_verify_env_overrides(
+    pub fn set_task_proof_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         set: &BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<BTreeMap<String, String>> {
-        let mut current = self.get_task_verify_env_overrides(run_id, task_idx)?;
+        let mut current = self.get_task_proof_env_overrides(squad_id, task_idx)?;
         for key in unset {
             current.remove(key);
         }
@@ -3633,43 +3743,43 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE tasks SET verify_env_overrides=? WHERE run_id=? AND idx=?",
-            params![to_json_map(&current), run_id, task_idx],
+            "UPDATE tasks SET proof_env_overrides=? WHERE squad_id=? AND idx=?",
+            params![to_json_map(&current), squad_id, task_idx],
         )?;
         Ok(current)
     }
 
     /// The persistent environment-variable overrides set directly on a
-    /// session (not merged with its task's/run's). Empty when none have ever
+    /// cell (not merged with its task's/squad's). Empty when none have ever
     /// been set.
-    pub fn get_session_env_overrides(
+    pub fn get_cell_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT env_overrides FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, session_idx],
+                "SELECT env_overrides FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
     }
 
-    /// Add/replace (`set`) and remove (`unset`) entries in a session's own
+    /// Add/replace (`set`) and remove (`unset`) entries in a cell's own
     /// environment-variable overrides, returning the resulting map.
-    pub fn set_session_env_overrides(
+    pub fn set_cell_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         set: &BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<BTreeMap<String, String>> {
-        let mut current = self.get_session_env_overrides(run_id, task_idx, session_idx)?;
+        let mut current = self.get_cell_env_overrides(squad_id, task_idx, cell_idx)?;
         for key in unset {
             current.remove(key);
         }
@@ -3677,43 +3787,43 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE sessions SET env_overrides=? WHERE run_id=? AND task_idx=? AND idx=?",
-            params![to_json_map(&current), run_id, task_idx, session_idx],
+            "UPDATE cells SET env_overrides=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![to_json_map(&current), squad_id, task_idx, cell_idx],
         )?;
         Ok(current)
     }
 
-    /// The persistent environment-variable overrides set on a session's own
-    /// verify steps, not merged with the session's/task's/run's.
-    pub fn get_session_verify_env_overrides(
+    /// The persistent environment-variable overrides set on a cell's own
+    /// proof steps, not merged with the cell's/task's/squad's.
+    pub fn get_cell_proof_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT verify_env_overrides FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, session_idx],
+                "SELECT proof_env_overrides FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
     }
 
-    /// Add/replace (`set`) and remove (`unset`) entries in a session's
-    /// verify-scoped environment-variable overrides, returning the resulting
+    /// Add/replace (`set`) and remove (`unset`) entries in a cell's
+    /// proof-scoped environment-variable overrides, returning the resulting
     /// map.
-    pub fn set_session_verify_env_overrides(
+    pub fn set_cell_proof_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         set: &BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<BTreeMap<String, String>> {
-        let mut current = self.get_session_verify_env_overrides(run_id, task_idx, session_idx)?;
+        let mut current = self.get_cell_proof_env_overrides(squad_id, task_idx, cell_idx)?;
         for key in unset {
             current.remove(key);
         }
@@ -3721,97 +3831,190 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE sessions SET verify_env_overrides=? WHERE run_id=? AND task_idx=? AND idx=?",
-            params![to_json_map(&current), run_id, task_idx, session_idx],
+            "UPDATE cells SET proof_env_overrides=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![to_json_map(&current), squad_id, task_idx, cell_idx],
         )?;
         Ok(current)
     }
 
-    /// Effective environment-variable overrides for a session's own
-    /// subprocess: `run < task < session`, each layer's keys winning over its
+    /// Effective environment-variable overrides for a cell's own
+    /// subprocess: `squad < task < cell`, each layer's keys winning over its
     /// parent's.
-    pub fn resolve_session_env_overrides(
+    pub fn resolve_cell_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
-        let mut merged = self.get_run_env_overrides(run_id)?;
-        merged.extend(self.get_task_env_overrides(run_id, task_idx)?);
-        merged.extend(self.get_session_env_overrides(run_id, task_idx, session_idx)?);
+        let mut merged = self.get_squad_env_overrides(squad_id)?;
+        merged.extend(self.get_task_env_overrides(squad_id, task_idx)?);
+        merged.extend(self.get_cell_env_overrides(squad_id, task_idx, cell_idx)?);
         Ok(merged)
     }
 
-    /// Effective environment-variable overrides for a task-scoped verify
-    /// step: `run < task < task.verify`.
-    pub fn resolve_task_verify_env_overrides(
+    /// Batched form of [`Self::resolve_cell_env_overrides`] for a whole set of
+    /// cells at once (RAL-121 follow-up: guardian hydration was doing three
+    /// queries per branch here, re-scanning `squads`/`tasks`/`cells` once for
+    /// every branch of every review on every board poll). Fetches each of the
+    /// three tables once per distinct squad rather than once per cell, then
+    /// folds the three layers together in memory the same way the per-cell
+    /// version does. Missing rows (a squad/task/cell that no longer exists)
+    /// resolve to an empty map for that layer, matching the per-cell
+    /// version's `NotFound` short-circuit -- a deleted ancestor contributes
+    /// nothing rather than failing the whole batch.
+    pub fn resolve_cell_env_overrides_batch(
         &self,
-        run_id: &str,
+        refs: &[CellRef],
+    ) -> Result<HashMap<CellRef, BTreeMap<String, String>>> {
+        if refs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let squad_ids: Vec<&str> = refs
+            .iter()
+            .map(|(s, _, _)| s.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let placeholders = vec!["?"; squad_ids.len()].join(",");
+
+        let mut squad_env: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id, env_overrides FROM squads WHERE id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, raw) = row?;
+                squad_env.insert(id, from_json_map(&raw.unwrap_or_default()));
+            }
+        }
+
+        let mut task_env: HashMap<(String, i64), BTreeMap<String, String>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT squad_id, idx, env_overrides FROM tasks WHERE squad_id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (squad_id, idx, raw) = row?;
+                task_env.insert((squad_id, idx), from_json_map(&raw.unwrap_or_default()));
+            }
+        }
+
+        let mut cell_env: HashMap<(String, i64, i64), BTreeMap<String, String>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT squad_id, task_idx, idx, env_overrides FROM cells WHERE squad_id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (squad_id, task_idx, idx, raw) = row?;
+                cell_env.insert(
+                    (squad_id, task_idx, idx),
+                    from_json_map(&raw.unwrap_or_default()),
+                );
+            }
+        }
+
+        let mut out = HashMap::with_capacity(refs.len());
+        for (squad_id, task_idx, cell_idx) in refs {
+            let mut merged = squad_env.get(squad_id).cloned().unwrap_or_default();
+            if let Some(t) = task_env.get(&(squad_id.clone(), *task_idx)) {
+                merged.extend(t.clone());
+            }
+            if let Some(c) = cell_env.get(&(squad_id.clone(), *task_idx, *cell_idx)) {
+                merged.extend(c.clone());
+            }
+            out.insert((squad_id.clone(), *task_idx, *cell_idx), merged);
+        }
+        Ok(out)
+    }
+
+    /// Effective environment-variable overrides for a task-scoped proof
+    /// step: `squad < task < task.proof`.
+    pub fn resolve_task_proof_env_overrides(
+        &self,
+        squad_id: &str,
         task_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
-        let mut merged = self.get_run_env_overrides(run_id)?;
-        merged.extend(self.get_task_env_overrides(run_id, task_idx)?);
-        merged.extend(self.get_task_verify_env_overrides(run_id, task_idx)?);
+        let mut merged = self.get_squad_env_overrides(squad_id)?;
+        merged.extend(self.get_task_env_overrides(squad_id, task_idx)?);
+        merged.extend(self.get_task_proof_env_overrides(squad_id, task_idx)?);
         Ok(merged)
     }
 
-    /// Effective environment-variable overrides for a session-scoped verify
-    /// step: `run < task < session < session.verify`.
-    pub fn resolve_session_verify_env_overrides(
+    /// Effective environment-variable overrides for a cell-scoped proof
+    /// step: `squad < task < cell < cell.proof`.
+    pub fn resolve_cell_proof_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<BTreeMap<String, String>> {
-        let mut merged = self.resolve_session_env_overrides(run_id, task_idx, session_idx)?;
-        merged.extend(self.get_session_verify_env_overrides(run_id, task_idx, session_idx)?);
+        let mut merged = self.resolve_cell_env_overrides(squad_id, task_idx, cell_idx)?;
+        merged.extend(self.get_cell_proof_env_overrides(squad_id, task_idx, cell_idx)?);
         Ok(merged)
     }
 
-    /// The environment-variable overrides set on one individual verify step
+    /// The environment-variable overrides set on one individual proof step
     /// (RAL-191), not merged with any ancestor scope. `scope` is `"task"` or
-    /// `"session"`; `session_idx` is the owning session's index for a
-    /// session-scoped step and ignored (stored as the same value the row was
+    /// `"cell"`; `cell_idx` is the owning cell's index for a
+    /// cell-scoped step and ignored (stored as the same value the row was
     /// inserted with) for a task-scoped one.
-    pub fn get_verify_step_env_overrides(
+    pub fn get_proof_step_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
     ) -> Result<BTreeMap<String, String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT env_overrides FROM verifies
-                 WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-                params![run_id, task_idx, scope, session_idx, idx],
+                "SELECT env_overrides FROM proofs
+                 WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(from_json_map(&raw.ok_or(StoreError::NotFound)?))
     }
 
-    /// Add/replace (`set`) and remove (`unset`) entries in one verify step's
+    /// Add/replace (`set`) and remove (`unset`) entries in one proof step's
     /// own environment-variable overrides, returning the resulting map.
     ///
-    /// Eight arguments because a verify step's primary key genuinely is
-    /// five-part (`run, task, scope, session, idx`) — the same key every other
-    /// `verifies` accessor here takes — plus the set/unset pair.
+    /// Eight arguments because a proof step's primary key genuinely is
+    /// five-part (`squad, task, scope, cell, idx`) — the same key every other
+    /// `proofs` accessor here takes — plus the set/unset pair.
     #[allow(clippy::too_many_arguments)]
-    pub fn set_verify_step_env_overrides(
+    pub fn set_proof_step_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
         set: &BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<BTreeMap<String, String>> {
         let mut current =
-            self.get_verify_step_env_overrides(run_id, task_idx, scope, session_idx, idx)?;
+            self.get_proof_step_env_overrides(squad_id, task_idx, scope, cell_idx, idx)?;
         for key in unset {
             current.remove(key);
         }
@@ -3819,253 +4022,247 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE verifies SET env_overrides=?
-             WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
+            "UPDATE proofs SET env_overrides=?
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
             params![
                 to_json_map(&current),
-                run_id,
+                squad_id,
                 task_idx,
                 scope,
-                session_idx,
+                cell_idx,
                 idx
             ],
         )?;
         Ok(current)
     }
 
-    /// Effective overrides for one *task-scoped* verify step (RAL-191):
-    /// `run < task < task.verify < this step`.
-    pub fn resolve_task_verify_step_env_overrides(
+    /// Effective overrides for one *task-scoped* proof step (RAL-191):
+    /// `squad < task < task.proof < this step`.
+    pub fn resolve_task_proof_step_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
     ) -> Result<BTreeMap<String, String>> {
-        let mut merged = self.resolve_task_verify_env_overrides(run_id, task_idx)?;
-        merged.extend(self.get_verify_step_env_overrides(run_id, task_idx, "task", -1, idx)?);
+        let mut merged = self.resolve_task_proof_env_overrides(squad_id, task_idx)?;
+        merged.extend(self.get_proof_step_env_overrides(squad_id, task_idx, "task", -1, idx)?);
         Ok(merged)
     }
 
-    /// Effective overrides for one *session-scoped* verify step (RAL-191):
-    /// `run < task < session < session.verify < this step`.
-    pub fn resolve_session_verify_step_env_overrides(
+    /// Effective overrides for one *cell-scoped* proof step (RAL-191):
+    /// `squad < task < cell < cell.proof < this step`.
+    pub fn resolve_cell_proof_step_env_overrides(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
     ) -> Result<BTreeMap<String, String>> {
-        let mut merged =
-            self.resolve_session_verify_env_overrides(run_id, task_idx, session_idx)?;
-        merged.extend(self.get_verify_step_env_overrides(
-            run_id,
-            task_idx,
-            "session",
-            session_idx,
-            idx,
-        )?);
+        let mut merged = self.resolve_cell_proof_env_overrides(squad_id, task_idx, cell_idx)?;
+        merged
+            .extend(self.get_proof_step_env_overrides(squad_id, task_idx, "cell", cell_idx, idx)?);
         Ok(merged)
     }
 
-    /// Reset a run and all its nodes back to `Pending` — the dirty→pending gate
-    /// applied after an edit, so the run re-executes with the new values. A
+    /// Reset a squad and all its nodes back to `Pending` — the dirty→pending gate
+    /// applied after an edit, so the squad re-executes with the new values. A
     /// currently-running worker's final state write is skipped (see the
     /// scheduler), so this effectively stops in-flight work.
     ///
-    /// Also clears `started_at_ms`/`finished_at_ms` on the run and its tasks
-    /// and sessions: this is a genuine fresh re-execution, so the old start
+    /// Also clears `started_at_ms`/`finished_at_ms` on the squad and its tasks
+    /// and cells: this is a genuine fresh re-execution, so the old start
     /// time must not linger (it would otherwise survive the `COALESCE` in
-    /// [`Store::set_run_state`]/[`Store::set_task_state`]/
-    /// [`Store::set_session_state`] and make the Details Pane show an
+    /// [`Store::set_squad_state`]/[`Store::set_task_state`]/
+    /// [`Store::set_cell_state`] and make the Details Pane show an
     /// inflated elapsed duration once it starts running again).
-    pub fn reset_run_to_pending(&self, run_id: &str) -> Result<()> {
+    pub fn reset_squad_to_pending(&self, squad_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=?, started_at_ms=NULL, finished_at_ms=NULL WHERE id=?",
-            params![now_ms(), run_id],
+            "UPDATE squads SET state='pending', updated_at_ms=?, started_at_ms=NULL, finished_at_ms=NULL WHERE id=?",
+            params![now_ms(), squad_id],
         )?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=?",
-            params![run_id],
+            "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=?",
+            params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE sessions SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=?",
-            params![run_id],
+            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=?",
+            params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE verifies SET state='pending' WHERE run_id=?",
-            params![run_id],
+            "UPDATE proofs SET state='pending' WHERE squad_id=?",
+            params![squad_id],
         )?;
         Ok(())
     }
 
-    /// Crash recovery: runs left `Running` after an unclean shutdown have no
-    /// worker to finish them. Reset each such run — and only its still-in-flight
-    /// (`running`) tasks/sessions/verifies — back to `Pending`, so the scheduler
-    /// re-claims and resumes it. `Done` sessions are deliberately left `Done` so
+    /// Crash recovery: squads left `Running` after an unclean shutdown have no
+    /// worker to finish them. Reset each such squad — and only its still-in-flight
+    /// (`running`) tasks/cells/proofs — back to `Pending`, so the scheduler
+    /// re-claims and resumes it. `Done` cells are deliberately left `Done` so
     /// re-execution skips finished work and only the unfinished tail re-runs
     /// (RAL-19). Runs a single pass at startup, before the scheduler begins;
-    /// returns the recovered run ids. Safe because nothing is executing yet, so
+    /// returns the recovered squad ids. Safe because nothing is executing yet, so
     /// any `running` row is by definition orphaned.
-    pub fn recover_orphaned_runs(&self) -> Result<Vec<String>> {
+    pub fn recover_orphaned_squads(&self) -> Result<Vec<String>> {
         let ids: Vec<String> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM runs WHERE state='running'")?;
+                .prepare("SELECT id FROM squads WHERE state='running'")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         for id in &ids {
             crate::rlog!(
                 WARNING,
-                "ralphus [recovery] run {id}: running → pending (orphaned on startup)"
+                "ralphus [recovery] squad {id}: running → pending (orphaned on startup)"
             );
             let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::WARNING,
                 source: "recovery",
-                message: "run recovered: running → pending (orphaned on startup)",
-                scope: Some("run"),
-                run_id: Some(id),
+                message: "squad recovered: running → pending (orphaned on startup)",
+                scope: Some("squad"),
+                squad_id: Some(id),
                 guardian_id: None,
-                session_id: None,
+                cell_id: None,
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
             });
             self.conn.execute(
-                "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND state='running'",
+                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND state='running'",
                 params![id],
             )?;
             self.conn.execute(
-                "UPDATE verifies SET state='pending' WHERE run_id=? AND state='running'",
+                "UPDATE proofs SET state='pending' WHERE squad_id=? AND state='running'",
                 params![id],
             )?;
             self.conn.execute(
-                "UPDATE tasks SET state='pending' WHERE run_id=? AND state='running'",
+                "UPDATE tasks SET state='pending' WHERE squad_id=? AND state='running'",
                 params![id],
             )?;
             self.conn.execute(
-                "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
+                "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
                 params![now_ms(), id],
             )?;
         }
         Ok(ids)
     }
 
-    /// Task indices that have at least one session in [`done_sessions`] whose
-    /// session-level verify previously **failed**. Used by the scheduler to seed
-    /// `progress.failed` on a partial restart: those sessions are skipped (they
+    /// Task indices that have at least one cell in [`done_cells`] whose
+    /// cell-level proof previously **failed**. Used by the scheduler to seed
+    /// `progress.failed` on a partial restart: those cells are skipped (they
     /// are already Done), but their prior failure must still condemn the task so
     /// that the task finalizer does not incorrectly set the task to Done.
-    pub fn done_sessions_with_failed_verify(&self, run_id: &str) -> Result<HashSet<i64>> {
+    pub fn done_cells_with_failed_proof(&self, squad_id: &str) -> Result<HashSet<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT s.task_idx
-             FROM sessions s
-             WHERE s.run_id=? AND s.state='done'
+             FROM cells s
+             WHERE s.squad_id=? AND s.state='done'
              AND NOT EXISTS (
-                 SELECT 1 FROM verifies v
-                 WHERE v.run_id=s.run_id AND v.task_idx=s.task_idx
-                 AND v.scope='session' AND v.session_idx=s.idx
+                 SELECT 1 FROM proofs v
+                 WHERE v.squad_id=s.squad_id AND v.task_idx=s.task_idx
+                 AND v.scope='cell' AND v.cell_idx=s.idx
                  AND v.state NOT IN ('done','failed','cancelled')
              )
              AND EXISTS (
-                 SELECT 1 FROM verifies v2
-                 WHERE v2.run_id=s.run_id AND v2.task_idx=s.task_idx
-                 AND v2.scope='session' AND v2.session_idx=s.idx
+                 SELECT 1 FROM proofs v2
+                 WHERE v2.squad_id=s.squad_id AND v2.task_idx=s.task_idx
+                 AND v2.scope='cell' AND v2.cell_idx=s.idx
                  AND v2.state='failed'
              )",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok(rows)
     }
 
-    /// The `(task_idx, idx)` of every session in a run that is already `Done`
-    /// *and* whose session-level verify steps are all in a terminal state.
-    /// The scheduler skips these so a restarted run only re-runs its dirty
+    /// The `(task_idx, idx)` of every cell in a squad that is already `Done`
+    /// *and* whose cell-level proof steps are all in a terminal state.
+    /// The scheduler skips these so a restarted squad only re-runs its dirty
     /// (reset-to-pending) subset instead of redoing finished work (RAL-19).
     ///
-    /// A session whose verifies are still pending (e.g. the daemon was stopped
-    /// between `record_session_result` and `run_verifies`) is excluded so the
-    /// session worker re-runs and the verifies are executed (RAL-64).
-    pub fn done_sessions(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+    /// A cell whose proofs are still pending (e.g. the daemon was stopped
+    /// between `record_cell_result` and `run_proofs`) is excluded so the
+    /// cell worker re-runs and the proofs are executed (RAL-64).
+    pub fn done_cells(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.task_idx, s.idx
-             FROM sessions s
-             WHERE s.run_id=? AND s.state='done'
+             FROM cells s
+             WHERE s.squad_id=? AND s.state='done'
              AND NOT EXISTS (
-                 SELECT 1 FROM verifies v
-                 WHERE v.run_id=s.run_id
+                 SELECT 1 FROM proofs v
+                 WHERE v.squad_id=s.squad_id
                  AND v.task_idx=s.task_idx
-                 AND v.scope='session'
-                 AND v.session_idx=s.idx
+                 AND v.scope='cell'
+                 AND v.cell_idx=s.idx
                  AND v.state NOT IN ('done','failed','cancelled')
              )",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok(rows)
     }
 
-    /// The `(task_idx, idx)` of every session already `Failed`. The scheduler
+    /// The `(task_idx, idx)` of every cell already `Failed`. The scheduler
     /// seeds these as terminally Failed (never re-dispatched) rather than
-    /// falling through to Pending -- otherwise a *scoped* session/verify
+    /// falling through to Pending -- otherwise a *scoped* cell/proof
     /// restart, which only resets its own target + downstream to Pending but
-    /// still flips the whole run back to Pending so the scheduler reactivates
-    /// it, would silently redispatch every other still-`failed` session in
-    /// the run too (a session/task genuinely reset by the restart is already
+    /// still flips the whole squad back to Pending so the scheduler reactivates
+    /// it, would silently redispatch every other still-`failed` cell in
+    /// the squad too (a cell/task genuinely reset by the restart is already
     /// `pending` in the DB by the time this runs, so it's excluded here).
-    pub fn failed_sessions(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+    pub fn failed_cells(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT task_idx, idx FROM sessions WHERE run_id=? AND state='failed'")?;
+            .prepare("SELECT task_idx, idx FROM cells WHERE squad_id=? AND state='failed'")?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok(rows)
     }
 
-    /// The `(task_idx, idx)` of every session manually set to `ignored`. The
-    /// scheduler seeds these as satisfied so their downstream sessions run,
+    /// The `(task_idx, idx)` of every cell manually set to `ignored`. The
+    /// scheduler seeds these as satisfied so their downstream cells run,
     /// exactly as a `done` upstream would (they are themselves never executed).
-    pub fn ignored_sessions(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+    pub fn ignored_cells(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT task_idx, idx FROM sessions WHERE run_id=? AND state='ignored'")?;
+            .prepare("SELECT task_idx, idx FROM cells WHERE squad_id=? AND state='ignored'")?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok(rows)
     }
 
-    /// The `(task_idx, idx)` of every session left `cancelled` — e.g. by a
-    /// run-level [`Store::cancel`], which flips every non-terminal session to
+    /// The `(task_idx, idx)` of every cell left `cancelled` — e.g. by a
+    /// squad-level [`Store::cancel`], which flips every non-terminal cell to
     /// `cancelled` via `cancel_nonterminal_nodes`. The scheduler seeds these as
     /// terminally Cancelled (never re-dispatched), for exactly the same reason
-    /// [`Store::failed_sessions`] exists: a *scoped* `restart_session` resets
+    /// [`Store::failed_cells`] exists: a *scoped* `restart_cell` resets
     /// only its own target + downstream to `pending`, yet still flips the whole
-    /// run back to `pending` so the scheduler reactivates it — without this
-    /// seed, every unrelated `cancelled` sibling in the run silently fell
+    /// squad back to `pending` so the scheduler reactivates it — without this
+    /// seed, every unrelated `cancelled` sibling in the squad silently fell
     /// through to `Pending` and was redispatched (RAL-185).
     ///
-    /// A session genuinely revived by a restart (directly, or as downstream of
+    /// A cell genuinely revived by a restart (directly, or as downstream of
     /// a restarted upstream) is already `pending` in the DB by the time this
-    /// runs, so it is excluded here and runs normally. A whole-run
-    /// [`Store::restart_run`] resets *every* session via
-    /// [`Store::reset_run_to_pending`], so this returns nothing for that path.
-    pub fn cancelled_sessions(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+    /// runs, so it is excluded here and runs normally. A whole-squad
+    /// [`Store::restart_squad`] resets *every* cell via
+    /// [`Store::reset_squad_to_pending`], so this returns nothing for that path.
+    pub fn cancelled_cells(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT task_idx, idx FROM sessions WHERE run_id=? AND state='cancelled'")?;
+            .prepare("SELECT task_idx, idx FROM cells WHERE squad_id=? AND state='cancelled'")?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
@@ -4073,131 +4270,131 @@ impl Store {
     }
 
     /// The `idx` of every task left `cancelled` (companion to
-    /// [`Store::cancelled_sessions`] — `cancel_nonterminal_nodes` cancels
-    /// tasks, sessions *and* verifies together). The scheduler pre-marks these
+    /// [`Store::cancelled_cells`] — `cancel_nonterminal_nodes` cancels
+    /// tasks, cells *and* proofs together). The scheduler pre-marks these
     /// as finalized so no task finalizer launches for them: without it, seeding
-    /// a cancelled task's sessions as terminal would make the dispatcher's
-    /// "all sessions terminal" check fire, run that task's verify steps, and
+    /// a cancelled task's cells as terminal would make the dispatcher's
+    /// "all cells terminal" check fire, run that task's proof steps, and
     /// flip a task you explicitly cancelled to Done (RAL-185).
-    pub fn cancelled_tasks(&self, run_id: &str) -> Result<HashSet<i64>> {
+    pub fn cancelled_tasks(&self, squad_id: &str) -> Result<HashSet<i64>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT idx FROM tasks WHERE run_id=? AND state='cancelled'")?;
+            .prepare("SELECT idx FROM tasks WHERE squad_id=? AND state='cancelled'")?;
         let rows = stmt
-            .query_map(params![run_id], |r| r.get::<_, i64>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Compute everything [`Store::restart_run`] would dirty, without mutating
-    /// anything: every session/task in the run (a whole-run restart resets all
-    /// of them) plus every run transitively dependent on it. Shared by the
+    /// Compute everything [`Store::restart_squad`] would dirty, without mutating
+    /// anything: every cell/task in the squad (a whole-squad restart resets all
+    /// of them) plus every squad transitively dependent on it. Shared by the
     /// non-mutating dry-run preview and the real restart (RAL-104) so the two
     /// can never drift out of sync.
-    pub fn compute_run_restart_impact(&self, run_id: &str) -> Result<RestartImpact> {
+    pub fn compute_squad_restart_impact(&self, squad_id: &str) -> Result<RestartImpact> {
         let exists: Option<String> = self
             .conn
-            .query_row("SELECT id FROM runs WHERE id=?", params![run_id], |r| {
+            .query_row("SELECT id FROM squads WHERE id=?", params![squad_id], |r| {
                 r.get(0)
             })
             .optional()?;
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        let sessions = self
-            .sessions_of(run_id)?
+        let cells = self
+            .cells_of(squad_id)?
             .into_iter()
-            .map(|s| RestartImpactSession {
+            .map(|s| RestartImpactCell {
                 task_idx: s.task_idx,
                 idx: s.idx,
                 task_name: s.task_name,
-                session_id: s.session_id,
+                cell_id: s.cell_id,
             })
             .collect();
         let tasks = self
-            .tasks_of(run_id)?
+            .tasks_of(squad_id)?
             .into_iter()
             .map(|t| RestartImpactTask {
                 idx: t.idx,
                 name: t.name,
             })
             .collect();
-        let dirtied_runs = self.compute_dirty_dependents(run_id)?;
+        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
         Ok(RestartImpact {
-            sessions,
+            cells,
             tasks,
-            dirtied_runs,
+            dirtied_squads,
         })
     }
 
     /// Compute (and, unless `dry_run`, perform) a cascading cancel of
-    /// `run_id`: the run itself plus every run transitively dependent on it
+    /// `squad_id`: the squad itself plus every squad transitively dependent on it
     /// (RAL-116). One function drives both the non-mutating dry-run preview
     /// and the real cancel, so they can never drift apart — mirrors
-    /// [`Store::compute_run_restart_impact`] (RAL-104). Every listed run is
+    /// [`Store::compute_squad_restart_impact`] (RAL-104). Every listed squad is
     /// cancelled regardless of its current state, including already-terminal
     /// ones, matching [`Store::cancel`]'s always-available semantics.
-    pub fn cancel_run(&self, run_id: &str, dry_run: bool) -> Result<CancelImpact> {
+    pub fn cancel_squad(&self, squad_id: &str, dry_run: bool) -> Result<CancelImpact> {
         let row: Option<(String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT id, label FROM runs WHERE id=?",
-                params![run_id],
+                "SELECT id, label FROM squads WHERE id=?",
+                params![squad_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         let Some((id, label)) = row else {
             return Err(StoreError::NotFound);
         };
-        let mut runs = vec![RestartImpactRun { id, label }];
-        runs.extend(self.compute_dirty_dependents(run_id)?);
+        let mut squads = vec![RestartImpactSquad { id, label }];
+        squads.extend(self.compute_dirty_dependents(squad_id)?);
 
         if !dry_run {
-            for r in &runs {
-                self.set_run_state(&r.id, RunState::Cancelled)?;
+            for r in &squads {
+                self.set_squad_state(&r.id, SquadState::Cancelled)?;
                 self.cancel_nonterminal_nodes(&r.id)?;
-                let _ = self.log_event(Some(&r.id), None, "run", None, "cancelled");
+                let _ = self.log_event(Some(&r.id), None, "squad", None, "cancelled");
             }
         }
 
-        Ok(CancelImpact { runs })
+        Ok(CancelImpact { squads })
     }
 
-    /// Restart a whole run: reset it (and all its nodes) to Pending and dirty
-    /// every run that transitively depends on it, so the dependents re-run once
-    /// this run finishes again (RAL-19). Returns the dirtied dependent run ids.
-    pub fn restart_run(&self, run_id: &str) -> Result<Vec<String>> {
-        let impact = self.compute_run_restart_impact(run_id)?;
-        self.reset_run_to_pending(run_id)?;
-        let _ = self.log_event(Some(run_id), None, "run", None, "restarted");
-        self.apply_dirty_dependents(&impact.dirtied_runs)?;
-        Ok(impact.dirtied_runs.into_iter().map(|r| r.id).collect())
+    /// Restart a whole squad: reset it (and all its nodes) to Pending and dirty
+    /// every squad that transitively depends on it, so the dependents re-run once
+    /// this squad finishes again (RAL-19). Returns the dirtied dependent squad ids.
+    pub fn restart_squad(&self, squad_id: &str) -> Result<Vec<String>> {
+        let impact = self.compute_squad_restart_impact(squad_id)?;
+        self.reset_squad_to_pending(squad_id)?;
+        let _ = self.log_event(Some(squad_id), None, "squad", None, "restarted");
+        self.apply_dirty_dependents(&impact.dirtied_squads)?;
+        Ok(impact.dirtied_squads.into_iter().map(|r| r.id).collect())
     }
 
-    /// Compute everything [`Store::restart_session`] would dirty, without
-    /// mutating anything: the target session plus every session downstream of
-    /// it within the run (forward reachability over the plan graph), the tasks
-    /// that own any of those sessions, and every run transitively dependent on
+    /// Compute everything [`Store::restart_cell`] would dirty, without
+    /// mutating anything: the target cell plus every cell downstream of
+    /// it within the squad (forward reachability over the plan graph), the tasks
+    /// that own any of those cells, and every squad transitively dependent on
     /// this one. Shared by the non-mutating dry-run preview and the real
     /// restart (RAL-104) so the two can never drift out of sync.
-    pub fn compute_session_restart_impact(
+    pub fn compute_cell_restart_impact(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
     ) -> Result<RestartImpact> {
-        let sessions = self.sessions_of(run_id)?;
-        let tasks = self.tasks_of(run_id)?;
-        let target = sessions
+        let cells = self.cells_of(squad_id)?;
+        let tasks = self.tasks_of(squad_id)?;
+        let target = cells
             .iter()
             .position(|s| s.task_idx == task_idx && s.idx == idx)
             .ok_or(StoreError::NotFound)?;
-        let plan = crate::plan::plan(&sessions, &tasks).map_err(StoreError::InvalidTransition)?;
+        let plan = crate::plan::plan(&cells, &tasks).map_err(StoreError::InvalidTransition)?;
 
-        // Forward reachability: session `j` is downstream of `target` when
+        // Forward reachability: cell `j` is downstream of `target` when
         // `target` is one of its transitive prerequisites. Invert deps into
         // child edges, then BFS out from `target`.
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); cells.len()];
         for (j, prereqs) in plan.deps.iter().enumerate() {
             for &p in prereqs {
                 children[p].push(j);
@@ -4215,20 +4412,20 @@ impl Store {
         }
 
         let mut affected_task_idxs: HashSet<i64> = HashSet::new();
-        let mut affected_sessions: Vec<RestartImpactSession> = affected
+        let mut affected_cells: Vec<RestartImpactCell> = affected
             .iter()
             .map(|&pos| {
-                let s = &sessions[pos];
+                let s = &cells[pos];
                 affected_task_idxs.insert(s.task_idx);
-                RestartImpactSession {
+                RestartImpactCell {
                     task_idx: s.task_idx,
                     idx: s.idx,
                     task_name: s.task_name.clone(),
-                    session_id: s.session_id.clone(),
+                    cell_id: s.cell_id.clone(),
                 }
             })
             .collect();
-        affected_sessions.sort_by_key(|s| (s.task_idx, s.idx));
+        affected_cells.sort_by_key(|s| (s.task_idx, s.idx));
 
         let mut affected_tasks: Vec<RestartImpactTask> = tasks
             .iter()
@@ -4240,90 +4437,90 @@ impl Store {
             .collect();
         affected_tasks.sort_by_key(|t| t.idx);
 
-        let dirtied_runs = self.compute_dirty_dependents(run_id)?;
+        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
 
         Ok(RestartImpact {
-            sessions: affected_sessions,
+            cells: affected_cells,
             tasks: affected_tasks,
-            dirtied_runs,
+            dirtied_squads,
         })
     }
 
-    /// Restart a single session: reset it and every session downstream of it
-    /// within the run to Pending, put the run (and each affected task) back to
-    /// Pending, and dirty every run that depends on this one (RAL-19). Upstream
-    /// sessions stay Done and are skipped on re-run. Returns the dirtied
-    /// dependent run ids.
+    /// Restart a single cell: reset it and every cell downstream of it
+    /// within the squad to Pending, put the squad (and each affected task) back to
+    /// Pending, and dirty every squad that depends on this one (RAL-19). Upstream
+    /// cells stay Done and are skipped on re-run. Returns the dirtied
+    /// dependent squad ids.
     ///
-    /// Clears `started_at_ms`/`finished_at_ms` on the restarted sessions and
+    /// Clears `started_at_ms`/`finished_at_ms` on the restarted cells and
     /// their owning tasks (genuinely re-executing — see
-    /// [`Store::reset_run_to_pending`]'s doc comment), but deliberately leaves
-    /// the run's own `started_at_ms` alone: the run as a whole already started
-    /// earlier and other, unaffected sessions may still be `Done`.
-    pub fn restart_session(&self, run_id: &str, task_idx: i64, idx: i64) -> Result<Vec<String>> {
-        let impact = self.compute_session_restart_impact(run_id, task_idx, idx)?;
+    /// [`Store::reset_squad_to_pending`]'s doc comment), but deliberately leaves
+    /// the squad's own `started_at_ms` alone: the squad as a whole already started
+    /// earlier and other, unaffected cells may still be `Done`.
+    pub fn restart_cell(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<Vec<String>> {
+        let impact = self.compute_cell_restart_impact(squad_id, task_idx, idx)?;
 
-        for s in &impact.sessions {
+        for s in &impact.cells {
             self.conn.execute(
-                "UPDATE sessions SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, s.task_idx, s.idx],
+                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=?",
-                params![run_id, s.task_idx, s.idx],
+                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                params![squad_id, s.task_idx, s.idx],
             )?;
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=? AND idx=?",
-                params![run_id, t.idx],
+                "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=? AND idx=?",
+                params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='task'",
-                params![run_id, t.idx],
+                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='task'",
+                params![squad_id, t.idx],
             )?;
         }
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=?, finished_at_ms=NULL WHERE id=?",
-            params![now_ms(), run_id],
+            "UPDATE squads SET state='pending', updated_at_ms=?, finished_at_ms=NULL WHERE id=?",
+            params![now_ms(), squad_id],
         )?;
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
-            "session",
+            "cell",
             Some(&format!("{task_idx}/{idx}")),
             "restarted (with downstream)",
         );
-        self.apply_dirty_dependents(&impact.dirtied_runs)?;
-        Ok(impact.dirtied_runs.into_iter().map(|r| r.id).collect())
+        self.apply_dirty_dependents(&impact.dirtied_squads)?;
+        Ok(impact.dirtied_squads.into_iter().map(|r| r.id).collect())
     }
 
     /// Compute everything [`Store::restart_task`] would dirty, without
-    /// mutating anything: every session belonging to `task_idx` plus every
-    /// session downstream of any of them within the run (forward reachability
+    /// mutating anything: every cell belonging to `task_idx` plus every
+    /// cell downstream of any of them within the squad (forward reachability
     /// over the plan graph, seeded from the whole task rather than a single
-    /// session — same BFS as [`Store::compute_session_restart_impact`]), the
-    /// tasks that own any of those sessions, and every run transitively
+    /// cell — same BFS as [`Store::compute_cell_restart_impact`]), the
+    /// tasks that own any of those cells, and every squad transitively
     /// dependent on this one (RAL-150).
     pub fn compute_task_restart_impact(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
     ) -> Result<RestartImpact> {
-        let sessions = self.sessions_of(run_id)?;
-        let tasks = self.tasks_of(run_id)?;
+        let cells = self.cells_of(squad_id)?;
+        let tasks = self.tasks_of(squad_id)?;
         if !tasks.iter().any(|t| t.idx == task_idx) {
             return Err(StoreError::NotFound);
         }
-        let plan = crate::plan::plan(&sessions, &tasks).map_err(StoreError::InvalidTransition)?;
+        let plan = crate::plan::plan(&cells, &tasks).map_err(StoreError::InvalidTransition)?;
 
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); cells.len()];
         for (j, prereqs) in plan.deps.iter().enumerate() {
             for &p in prereqs {
                 children[p].push(j);
             }
         }
-        let targets: Vec<usize> = sessions
+        let targets: Vec<usize> = cells
             .iter()
             .enumerate()
             .filter(|(_, s)| s.task_idx == task_idx)
@@ -4346,20 +4543,20 @@ impl Store {
 
         let mut affected_task_idxs: HashSet<i64> = HashSet::new();
         affected_task_idxs.insert(task_idx);
-        let mut affected_sessions: Vec<RestartImpactSession> = affected
+        let mut affected_cells: Vec<RestartImpactCell> = affected
             .iter()
             .map(|&pos| {
-                let s = &sessions[pos];
+                let s = &cells[pos];
                 affected_task_idxs.insert(s.task_idx);
-                RestartImpactSession {
+                RestartImpactCell {
                     task_idx: s.task_idx,
                     idx: s.idx,
                     task_name: s.task_name.clone(),
-                    session_id: s.session_id.clone(),
+                    cell_id: s.cell_id.clone(),
                 }
             })
             .collect();
-        affected_sessions.sort_by_key(|s| (s.task_idx, s.idx));
+        affected_cells.sort_by_key(|s| (s.task_idx, s.idx));
 
         let mut affected_tasks: Vec<RestartImpactTask> = tasks
             .iter()
@@ -4371,76 +4568,76 @@ impl Store {
             .collect();
         affected_tasks.sort_by_key(|t| t.idx);
 
-        let dirtied_runs = self.compute_dirty_dependents(run_id)?;
+        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
 
         Ok(RestartImpact {
-            sessions: affected_sessions,
+            cells: affected_cells,
             tasks: affected_tasks,
-            dirtied_runs,
+            dirtied_squads,
         })
     }
 
-    /// Restart a whole task: reset every session it owns (and every session
-    /// downstream of them within the run) to Pending, put the run and each
-    /// affected task back to Pending, and dirty every run that depends on this
-    /// one (RAL-150, mirrors [`Store::restart_session`] at task granularity —
+    /// Restart a whole task: reset every cell it owns (and every cell
+    /// downstream of them within the squad) to Pending, put the squad and each
+    /// affected task back to Pending, and dirty every squad that depends on this
+    /// one (RAL-150, mirrors [`Store::restart_cell`] at task granularity —
     /// there is deliberately no separate `edit`/`preview` pair for this yet,
     /// matching the ticket's "don't scale up scope" note). Returns the
-    /// dirtied dependent run ids.
-    pub fn restart_task(&self, run_id: &str, task_idx: i64) -> Result<Vec<String>> {
-        let impact = self.compute_task_restart_impact(run_id, task_idx)?;
+    /// dirtied dependent squad ids.
+    pub fn restart_task(&self, squad_id: &str, task_idx: i64) -> Result<Vec<String>> {
+        let impact = self.compute_task_restart_impact(squad_id, task_idx)?;
 
-        for s in &impact.sessions {
+        for s in &impact.cells {
             self.conn.execute(
-                "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, s.task_idx, s.idx],
+                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=?",
-                params![run_id, s.task_idx, s.idx],
+                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                params![squad_id, s.task_idx, s.idx],
             )?;
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
-                params![run_id, t.idx],
+                "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+                params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='task'",
-                params![run_id, t.idx],
+                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='task'",
+                params![squad_id, t.idx],
             )?;
         }
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
-            params![now_ms(), run_id],
+            "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
+            params![now_ms(), squad_id],
         )?;
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
             "task",
             Some(&format!("t{task_idx}")),
             "restarted (with downstream)",
         );
-        self.apply_dirty_dependents(&impact.dirtied_runs)?;
-        Ok(impact.dirtied_runs.into_iter().map(|r| r.id).collect())
+        self.apply_dirty_dependents(&impact.dirtied_squads)?;
+        Ok(impact.dirtied_squads.into_iter().map(|r| r.id).collect())
     }
 
-    /// Session `(task_idx, idx)` pairs forward-reachable from `roots` within
-    /// `run_id`'s dependency plan (RAL-174: the "Apply To All Children"
+    /// Cell `(task_idx, idx)` pairs forward-reachable from `roots` within
+    /// `squad_id`'s dependency plan (RAL-174: the "Apply To All Children"
     /// restart-note checkbox) -- the same reachability rule as
-    /// [`Store::compute_session_restart_impact`]'s BFS, kept as a separate,
+    /// [`Store::compute_cell_restart_impact`]'s BFS, kept as a separate,
     /// smaller helper since that function's result shape
-    /// (`RestartImpactSession`, carrying task name/session id for display)
+    /// (`RestartImpactCell`, carrying task name/cell id for display)
     /// doesn't fit this call site's need for bare index pairs.
-    fn forward_reachable_session_indices(
+    fn forward_reachable_cell_indices(
         &self,
-        run_id: &str,
+        squad_id: &str,
         roots: &[(i64, i64)],
     ) -> Result<Vec<(i64, i64)>> {
-        let sessions = self.sessions_of(run_id)?;
-        let tasks = self.tasks_of(run_id)?;
-        let plan = crate::plan::plan(&sessions, &tasks).map_err(StoreError::InvalidTransition)?;
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+        let cells = self.cells_of(squad_id)?;
+        let tasks = self.tasks_of(squad_id)?;
+        let plan = crate::plan::plan(&cells, &tasks).map_err(StoreError::InvalidTransition)?;
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); cells.len()];
         for (j, prereqs) in plan.deps.iter().enumerate() {
             for &p in prereqs {
                 children[p].push(j);
@@ -4448,7 +4645,7 @@ impl Store {
         }
         let mut affected: HashSet<usize> = HashSet::new();
         let mut frontier = Vec::new();
-        for (pos, s) in sessions.iter().enumerate() {
+        for (pos, s) in cells.iter().enumerate() {
             if roots.contains(&(s.task_idx, s.idx)) && affected.insert(pos) {
                 frontier.push(pos);
             }
@@ -4462,46 +4659,46 @@ impl Store {
         }
         Ok(affected
             .into_iter()
-            .map(|pos| (sessions[pos].task_idx, sessions[pos].idx))
+            .map(|pos| (cells[pos].task_idx, cells[pos].idx))
             .collect())
     }
 
     /// Write a human-authored restart note (RAL-174) onto the ghost(s) of the
-    /// session(s) a restart request targets. Unlike agent-authored ghost
+    /// cell(s) a restart request targets. Unlike agent-authored ghost
     /// content, this note *replaces* rather than merges with whatever was
     /// previously stored for that owner (Q5 of the ticket's interview: no
     /// accumulation across restarts) -- see [`Store::set_ghost_user_note`].
-    /// `roots` are the session(s) the restart directly targets; when
+    /// `roots` are the cell(s) the restart directly targets; when
     /// `include_downstream` is set (the "Apply To All Children" checkbox),
-    /// the note is also written to every session downstream of a root within
-    /// the run's dependency graph -- the same "children" a restart's
+    /// the note is also written to every cell downstream of a root within
+    /// the squad's dependency graph -- the same "children" a restart's
     /// downstream-impact cascade already resets to Pending.
     pub fn apply_restart_user_note(
         &self,
-        run_id: &str,
+        squad_id: &str,
         roots: &[(i64, i64)],
         include_downstream: bool,
         note: &str,
     ) -> Result<()> {
         let targets = if include_downstream {
-            self.forward_reachable_session_indices(run_id, roots)?
+            self.forward_reachable_cell_indices(squad_id, roots)?
         } else {
             roots.to_vec()
         };
         for (task_idx, idx) in targets {
-            let uri = crate::ghost::session_uri(run_id, task_idx, idx);
-            self.set_ghost_user_note(&uri, crate::ghost::KIND_SESSION, Some(run_id), None, note)?;
+            let uri = crate::ghost::cell_uri(squad_id, task_idx, idx);
+            self.set_ghost_user_note(&uri, crate::ghost::KIND_CELL, Some(squad_id), None, note)?;
         }
         Ok(())
     }
 
-    /// Read-only BFS over cross-run dependencies: every run transitively
-    /// dependent on `run_id`, in discovery order. Does not mutate anything —
+    /// Read-only BFS over cross-squad dependencies: every squad transitively
+    /// dependent on `squad_id`, in discovery order. Does not mutate anything —
     /// shared by the dry-run preview and [`Store::dirty_dependents`] (RAL-104).
-    pub fn compute_dirty_dependents(&self, run_id: &str) -> Result<Vec<RestartImpactRun>> {
+    pub fn compute_dirty_dependents(&self, squad_id: &str) -> Result<Vec<RestartImpactSquad>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, label, depends_on FROM runs")?;
+            .prepare("SELECT id, label, depends_on FROM squads")?;
         let all: Vec<(String, Option<String>, Vec<String>)> = stmt
             .query_map([], |r| {
                 Ok((
@@ -4513,20 +4710,20 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(run_id.to_string());
-        let mut frontier = vec![run_id.to_string()];
+        seen.insert(squad_id.to_string());
+        let mut frontier = vec![squad_id.to_string()];
         let mut dirtied = Vec::new();
         while let Some(cur) = frontier.pop() {
             for (id, label, deps) in &all {
                 if seen.contains(id) {
                     continue;
                 }
-                // A dep reference is `run-id` or `run-id/task/session`; the run
+                // A dep reference is `squad-id` or `squad-id/task/cell`; the squad
                 // is the first path segment.
                 let depends = deps.iter().any(|d| d.split('/').next().unwrap_or(d) == cur);
                 if depends {
                     seen.insert(id.clone());
-                    dirtied.push(RestartImpactRun {
+                    dirtied.push(RestartImpactSquad {
                         id: id.clone(),
                         label: label.clone(),
                     });
@@ -4538,14 +4735,14 @@ impl Store {
     }
 
     /// Apply the mutations for [`Store::compute_dirty_dependents`]'s result:
-    /// reset each listed run to Pending and log the dirtying event.
-    pub fn apply_dirty_dependents(&self, runs: &[RestartImpactRun]) -> Result<()> {
-        for r in runs {
-            self.reset_run_to_pending(&r.id)?;
+    /// reset each listed squad to Pending and log the dirtying event.
+    pub fn apply_dirty_dependents(&self, squads: &[RestartImpactSquad]) -> Result<()> {
+        for r in squads {
+            self.reset_squad_to_pending(&r.id)?;
             let _ = self.log_event(
                 Some(&r.id),
                 None,
-                "run",
+                "squad",
                 None,
                 "dirtied by upstream restart",
             );
@@ -4553,27 +4750,31 @@ impl Store {
         Ok(())
     }
 
-    /// Reset every run that transitively depends on `run_id` back to Pending, so
-    /// it re-runs once the upstream completes again (RAL-19). Cross-run gating
+    /// Reset every squad that transitively depends on `squad_id` back to Pending, so
+    /// it re-runs once the upstream completes again (RAL-19). Cross-squad gating
     /// (`list_ready`) then holds each dependent until its upstreams are Done.
-    /// Returns the dirtied run ids.
-    pub fn dirty_dependents(&self, run_id: &str) -> Result<Vec<String>> {
-        let impacted = self.compute_dirty_dependents(run_id)?;
+    /// Returns the dirtied squad ids.
+    pub fn dirty_dependents(&self, squad_id: &str) -> Result<Vec<String>> {
+        let impacted = self.compute_dirty_dependents(squad_id)?;
         self.apply_dirty_dependents(&impacted)?;
         Ok(impacted.into_iter().map(|r| r.id).collect())
     }
 
-    /// Delete a run and all of its child rows. Children are removed explicitly
+    /// Delete a squad and all of its child rows. Children are removed explicitly
     /// (rather than relying on `ON DELETE CASCADE`, which is off for in-memory
     /// test databases) inside one transaction.
-    pub fn delete_run(&mut self, run_id: &str) -> Result<()> {
+    pub fn delete_squad(&mut self, squad_id: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM events WHERE run_id=?", params![run_id])?;
-        tx.execute("DELETE FROM verifies WHERE run_id=?", params![run_id])?;
-        tx.execute("DELETE FROM sessions WHERE run_id=?", params![run_id])?;
-        tx.execute("DELETE FROM tasks WHERE run_id=?", params![run_id])?;
-        tx.execute("DELETE FROM ghosts WHERE run_id=?", params![run_id])?;
-        let n = tx.execute("DELETE FROM runs WHERE id=?", params![run_id])?;
+        tx.execute("DELETE FROM events WHERE squad_id=?", params![squad_id])?;
+        tx.execute("DELETE FROM proofs WHERE squad_id=?", params![squad_id])?;
+        tx.execute("DELETE FROM cells WHERE squad_id=?", params![squad_id])?;
+        tx.execute("DELETE FROM tasks WHERE squad_id=?", params![squad_id])?;
+        tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![squad_id])?;
+        tx.execute(
+            "DELETE FROM mailbox_messages WHERE squad_id=?",
+            params![squad_id],
+        )?;
+        let n = tx.execute("DELETE FROM squads WHERE id=?", params![squad_id])?;
         tx.commit()?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -4583,14 +4784,14 @@ impl Store {
     }
 
     /// Bulk-clear state (RAL-13). With an empty `states` filter this wipes
-    /// everything — all runs (and their sessions/tasks/verifies/events), all
+    /// everything — all squads (and their cells/tasks/proofs/events), all
     /// guardians (and their branches), and the id sequences reset so the next
-    /// run/guardian id restarts at 1. When `states` is non-empty, only runs
+    /// squad/guardian id restarts at 1. When `states` is non-empty, only squads
     /// whose state is in the set are deleted (with their children); guardians
     /// and the id sequences are left untouched, since the filter is expressed
-    /// in run states. The returned git roots let the caller purge on-disk
+    /// in squad states. The returned git roots let the caller purge on-disk
     /// review worktrees for any deleted guardian.
-    pub fn clear_all(&mut self, states: &[RunState]) -> Result<ClearOutcome> {
+    pub fn clear_all(&mut self, states: &[SquadState]) -> Result<ClearOutcome> {
         if states.is_empty() {
             // Emit one (guardian_id, project_root) pair per project root, so the
             // caller can purge worktrees for every project in multi-project guardians.
@@ -4602,40 +4803,41 @@ impl Store {
                     g.projects.into_iter().map(move |p| (id.clone(), p))
                 })
                 .collect();
-            let run_ids: Vec<String> = {
-                let mut stmt = self.conn.prepare("SELECT id FROM runs")?;
+            let squad_ids: Vec<String> = {
+                let mut stmt = self.conn.prepare("SELECT id FROM squads")?;
                 stmt.query_map([], |r| r.get::<_, String>(0))?
                     .collect::<std::result::Result<Vec<_>, _>>()?
             };
             let tx = self.conn.transaction()?;
             tx.execute("DELETE FROM events", [])?;
-            tx.execute("DELETE FROM verifies", [])?;
-            tx.execute("DELETE FROM sessions", [])?;
+            tx.execute("DELETE FROM proofs", [])?;
+            tx.execute("DELETE FROM cells", [])?;
             tx.execute("DELETE FROM tasks", [])?;
             tx.execute("DELETE FROM ghosts", [])?;
-            let runs_deleted = tx.execute("DELETE FROM runs", [])?;
+            tx.execute("DELETE FROM mailbox_messages", [])?;
+            let squads_deleted = tx.execute("DELETE FROM squads", [])?;
             tx.execute("DELETE FROM guardian_branches", [])?;
             tx.execute("DELETE FROM guardian_messages", [])?;
             tx.execute("DELETE FROM guardian_input_resolutions", [])?;
             tx.execute("DELETE FROM guardian_costs", [])?;
             let guardians_deleted = tx.execute("DELETE FROM guardians", [])?;
-            // Reset id sequences so the next run/guardian id restarts at 1.
+            // Reset id sequences so the next squad/guardian id restarts at 1.
             tx.execute(
-                "DELETE FROM meta WHERE key IN ('run_seq', 'guardian_seq')",
+                "DELETE FROM meta WHERE key IN ('squad_seq', 'guardian_seq')",
                 [],
             )?;
             tx.commit()?;
             return Ok(ClearOutcome {
-                runs_deleted,
+                squads_deleted,
                 guardians_deleted,
                 guardian_roots,
-                run_ids,
+                squad_ids,
             });
         }
-        // Filtered: delete only runs whose state matches, plus their children.
+        // Filtered: delete only squads whose state matches, plus their children.
         let wanted: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
         let ids: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT id, state FROM runs")?;
+            let mut stmt = self.conn.prepare("SELECT id, state FROM squads")?;
             let rows = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4646,79 +4848,80 @@ impl Store {
         };
         let tx = self.conn.transaction()?;
         for id in &ids {
-            tx.execute("DELETE FROM events WHERE run_id=?", params![id])?;
-            tx.execute("DELETE FROM verifies WHERE run_id=?", params![id])?;
-            tx.execute("DELETE FROM sessions WHERE run_id=?", params![id])?;
-            tx.execute("DELETE FROM tasks WHERE run_id=?", params![id])?;
-            tx.execute("DELETE FROM ghosts WHERE run_id=?", params![id])?;
-            tx.execute("DELETE FROM runs WHERE id=?", params![id])?;
+            tx.execute("DELETE FROM events WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM proofs WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM cells WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM tasks WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM mailbox_messages WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM squads WHERE id=?", params![id])?;
         }
         tx.commit()?;
         Ok(ClearOutcome {
-            runs_deleted: ids.len(),
+            squads_deleted: ids.len(),
             guardians_deleted: 0,
             guardian_roots: Vec::new(),
-            run_ids: ids,
+            squad_ids: ids,
         })
     }
 
-    /// Record the git branch a review session contributes to a guardian stack,
-    /// so the board can link the session to its review(s) (RAL-17).
-    pub fn set_session_review_branch(
+    /// Record the git branch a review cell contributes to a guardian stack,
+    /// so the board can link the cell to its review(s) (RAL-17).
+    pub fn set_cell_review_branch(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
         branch: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET review_branch=? WHERE run_id=? AND task_idx=? AND idx=?",
-            params![branch, run_id, task_idx, idx],
+            "UPDATE cells SET review_branch=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![branch, squad_id, task_idx, idx],
         )?;
         Ok(())
     }
 
-    /// Record a session's final outcome (state, usage, error, and session UUID).
+    /// Record a cell's final outcome (state, usage, error, and cell UUID).
     ///
     /// `agent_session_id` uses `COALESCE(?, agent_session_id)` rather than a
     /// plain overwrite: a live mid-run scrape
-    /// ([`Self::set_session_agent_session_id_live`]) may already have
-    /// recorded a real session/thread id, but a failed outcome always carries
+    /// ([`Self::set_cell_agent_session_id_live`]) may already have
+    /// recorded a real cell/thread id, but a failed outcome always carries
     /// `agent_session_id: None` (`RunnerResult::failure`) — a plain
     /// overwrite would clobber that good value back to `NULL` on every
-    /// failure, permanently disabling "Open Agent" for a session that really
+    /// failure, permanently disabling "Open Agent" for a cell that really
     /// did start one.
     ///
     /// RAL-163: a manual `set-status` override (via
-    /// `server::capture_and_stop_node`) may finalize this session to a state
+    /// `server::capture_and_stop_node`) may finalize this cell to a state
     /// other than `pending`/`running` while its agent is still mid-flight —
     /// that path captures the agent's in-progress pane into a ghost and kills
     /// it, but the scheduler's own runner call can still unblock and reach
     /// this write afterward. The `state IN (...)` guard makes that write a
     /// no-op in that case so the manual override sticks, while still
     /// allowing the two legitimate callers: the ordinary case (row is
-    /// `running`), a session that never started (`pending` — e.g. blocked by
+    /// `running`), a cell that never started (`pending` — e.g. blocked by
     /// a failed dependency), and a same-state re-write (the blocked-by-
-    /// failed-dependency path calls [`Self::set_session_state`] directly
+    /// failed-dependency path calls [`Self::set_cell_state`] directly
     /// before also calling this for the other outcome fields).
     ///
     /// Also stamps `finished_at_ms` when `outcome.state` is terminal — this is
-    /// the primary path by which a session's real completion is recorded (see
-    /// [`Store::set_run_state`]'s doc comment for the shared timestamp
-    /// semantics); `started_at_ms` is not touched here since a session only
+    /// the primary path by which a cell's real completion is recorded (see
+    /// [`Store::set_squad_state`]'s doc comment for the shared timestamp
+    /// semantics); `started_at_ms` is not touched here since a cell only
     /// ever reaches this function after already having been marked `running`.
-    pub fn record_session_result(
+    pub fn record_cell_result(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         idx: i64,
-        outcome: &SessionOutcome,
+        outcome: &CellOutcome,
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE sessions SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
-             WHERE run_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
+             WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 outcome.state.as_str(),
                 outcome.tokens_in,
@@ -4728,7 +4931,7 @@ impl Store {
                 outcome.agent_session_id.as_deref(),
                 entering_terminal,
                 now_ms(),
-                run_id,
+                squad_id,
                 task_idx,
                 idx,
                 outcome.state.as_str(),
@@ -4737,40 +4940,40 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a session's declared id (`sid`, e.g. `"s0"`) for the tmux
+    /// Fetch a cell's declared id (`sid`, e.g. `"s0"`) for the tmux
     /// capture-pane/attach endpoints (RAL-102). The daemon derives the tmux
-    /// session name from `(run_id, task, session_id)` the same way the
+    /// session name from `(squad_id, task, cell_id)` the same way the
     /// scheduler does when building a `RunnerSpec` (see
     /// `crate::tmux::session_name`), so this — paired with
     /// [`Store::get_task_name`] — lets those HTTP handlers recompute the same
     /// name without any new bookkeeping.
     ///
-    /// Returns `Err(StoreError::NotFound)` when the run or session row does
+    /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
     /// not exist.
-    pub fn get_session_id(&self, run_id: &str, task_idx: i64, session_idx: i64) -> Result<String> {
+    pub fn get_cell_id(&self, squad_id: &str, task_idx: i64, cell_idx: i64) -> Result<String> {
         self.conn
             .query_row(
-                "SELECT sid FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, session_idx],
+                "SELECT sid FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
             .ok_or(StoreError::NotFound)
     }
 
-    /// Fetch every session's `(idx, sid)` pair for a task, ordered by idx.
+    /// Fetch every cell's `(idx, sid)` pair for a task, ordered by idx.
     /// Used by manual status-set stop-and-capture (RAL-163) to find every
     /// tmux pane that might be running under a task-scope status change,
-    /// since a task can have more than one session — unlike
-    /// [`Store::get_session_id`], which addresses exactly one.
+    /// since a task can have more than one cell — unlike
+    /// [`Store::get_cell_id`], which addresses exactly one.
     ///
-    /// Returns an empty vec (not an error) when the run/task has no sessions.
-    pub fn get_task_session_ids(&self, run_id: &str, task_idx: i64) -> Result<Vec<(i64, String)>> {
+    /// Returns an empty vec (not an error) when the squad/task has no cells.
+    pub fn get_task_cell_ids(&self, squad_id: &str, task_idx: i64) -> Result<Vec<(i64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT idx, sid FROM sessions WHERE run_id=? AND task_idx=? ORDER BY idx")?;
+            .prepare("SELECT idx, sid FROM cells WHERE squad_id=? AND task_idx=? ORDER BY idx")?;
         let rows = stmt
-            .query_map(params![run_id, task_idx], |r| {
+            .query_map(params![squad_id, task_idx], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4778,44 +4981,44 @@ impl Store {
     }
 
     /// Fetch a task's declared name for the tmux capture-pane/attach
-    /// endpoints (RAL-102) — see [`Store::get_session_id`]'s doc comment for
-    /// why the caller needs this alongside the session id.
+    /// endpoints (RAL-102) — see [`Store::get_cell_id`]'s doc comment for
+    /// why the caller needs this alongside the cell id.
     ///
-    /// Returns `Err(StoreError::NotFound)` when the run or task row does not
+    /// Returns `Err(StoreError::NotFound)` when the squad or task row does not
     /// exist.
-    pub fn get_task_name(&self, run_id: &str, task_idx: i64) -> Result<String> {
+    pub fn get_task_name(&self, squad_id: &str, task_idx: i64) -> Result<String> {
         self.conn
             .query_row(
-                "SELECT name FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT name FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
             .ok_or(StoreError::NotFound)
     }
 
-    /// Fetch a session's cwd, agent, and (if any) recorded CLI-agent session
+    /// Fetch a cell's cwd, agent, and (if any) recorded CLI-agent session
     /// id, for the "Open Agent" terminal action — resuming the real CLI
     /// (`claude --resume <id>` or `codex exec resume <id>`, depending on
-    /// which agent the session actually ran under) rather than re-attaching
+    /// which agent the cell actually ran under) rather than re-attaching
     /// to the runner's tmux wrapper, which only shows its log/event stream
     /// (see `crate::server::open_agent_terminal`). The `agent` column is
     /// what lets `open_agent_terminal` pick the right resume command.
     ///
-    /// Returns `Err(StoreError::NotFound)` when the run or session row does
-    /// not exist; `agent_session_id` is `None` when the session hasn't
+    /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
+    /// not exist; `agent_session_id` is `None` when the cell hasn't
     /// started (or ran under an agent with no resume mechanism) rather than
     /// an error.
-    pub fn get_session_agent_resume(
+    pub fn get_cell_agent_resume(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<(String, String, Option<String>)> {
         self.conn
             .query_row(
-                "SELECT cwd, agent, agent_session_id FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, session_idx],
+                "SELECT cwd, agent, agent_session_id FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?.unwrap_or_default(),
@@ -4828,62 +5031,62 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Persist a session's CLI-agent session/thread id as soon as it's known —
-    /// before the session finishes — so "Open Agent" activates immediately
-    /// rather than only once the whole session completes. Called from
+    /// Persist a cell's CLI-agent session/thread id as soon as it's known —
+    /// before the cell finishes — so "Open Agent" activates immediately
+    /// rather than only once the whole cell completes. Called from
     /// `runner::forward_runner_event` when the runner subprocess emits an
     /// `llm-invoke` event carrying `agent_session_id` in its payload (RAL-102
     /// follow-up; mirrors `guardian::set_branch_resolver_session_id`'s "Watch
-    /// Live" idea, applied to plain task sessions instead of a side-channel
+    /// Live" idea, applied to plain task cells instead of a side-channel
     /// file + watcher thread).
     ///
-    /// Best-effort and silently a no-op when `(run_id, task_name, session_sid)`
-    /// doesn't match a session row — e.g. a verify step or a Guardian
+    /// Best-effort and silently a no-op when `(squad_id, task_name, cell_sid)`
+    /// doesn't match a cell row — e.g. a proof step or a Guardian
     /// resolver invocation, which route through the very same event-forwarding
     /// code path but aren't rows in this table at all.
-    pub fn set_session_agent_session_id_live(
+    pub fn set_cell_agent_session_id_live(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_name: &str,
-        session_sid: &str,
+        cell_sid: &str,
         agent_session_id: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET agent_session_id=?
-             WHERE run_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE run_id=? AND name=?)",
-            params![agent_session_id, run_id, session_sid, run_id, task_name],
+            "UPDATE cells SET agent_session_id=?
+             WHERE squad_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE squad_id=? AND name=?)",
+            params![agent_session_id, squad_id, cell_sid, squad_id, task_name],
         )?;
         Ok(())
     }
 
-    /// Persist a session's running token/cost usage as soon as fresh numbers
-    /// are known -- before the session finishes -- so the board shows live
-    /// cost/tokens for a `running` session instead of `$0.0000` / `0/0` until
+    /// Persist a cell's running token/cost usage as soon as fresh numbers
+    /// are known -- before the cell finishes -- so the board shows live
+    /// cost/tokens for a `running` cell instead of `$0.0000` / `0/0` until
     /// completion (RAL-161). Called from `runner::forward_runner_event`
-    /// alongside [`Self::set_session_claude_session_id_live`], which it
+    /// alongside [`Self::set_cell_claude_session_id_live`], which it
     /// mirrors: same best-effort, same silent no-op when
-    /// `(run_id, task_name, session_sid)` doesn't match a session row (a
-    /// verify step or Guardian resolver invocation shares the same
+    /// `(squad_id, task_name, cell_sid)` doesn't match a cell row (a
+    /// proof step or Guardian resolver invocation shares the same
     /// event-forwarding code path but isn't a row in this table).
     ///
-    /// Unlike [`Self::record_session_result`]'s final write, this is a plain
+    /// Unlike [`Self::record_cell_result`]'s final write, this is a plain
     /// overwrite with no `COALESCE` -- a live scrape always carries real
     /// numbers (never `None`), and the final write always happens after any
     /// live writes, so it naturally wins as the authoritative last word.
-    pub fn set_session_live_usage(
+    pub fn set_cell_live_usage(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_name: &str,
-        session_sid: &str,
+        cell_sid: &str,
         tokens_in: i64,
         tokens_out: i64,
         cost_usd: f64,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET tokens_in=?, tokens_out=?, cost_usd=?
-             WHERE run_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE run_id=? AND name=?)",
+            "UPDATE cells SET tokens_in=?, tokens_out=?, cost_usd=?
+             WHERE squad_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE squad_id=? AND name=?)",
             params![
-                tokens_in, tokens_out, cost_usd, run_id, session_sid, run_id, task_name
+                tokens_in, tokens_out, cost_usd, squad_id, cell_sid, squad_id, task_name
             ],
         )?;
         Ok(())
@@ -4895,28 +5098,28 @@ impl Store {
     /// `SubprocessRunner::run_via_tmux_attempt`'s poll loop every time a
     /// pane capture shows more lines than the previous poll, i.e. it
     /// piggybacks on work the daemon already does continuously for every
-    /// running tmux-wrapped session (task session, verify step, or Guardian
+    /// running tmux-wrapped session (task cell, proof step, or Guardian
     /// resolver/manual-check alike — all share the same deterministic
     /// `crate::tmux::session_name` key), rather than being computed only
     /// when a Live View happens to be open.
     ///
     /// Deliberately **in-memory only, never a DB column**: at the existing
-    /// 500ms tmux-poll cadence, a SQLite `UPDATE` per session per tick would
-    /// scale with concurrently-running sessions (fine at "hundreds", a real
+    /// 500ms tmux-poll cadence, a SQLite `UPDATE` per cell per tick would
+    /// scale with concurrently-running cells (fine at "hundreds", a real
     /// contention/write-amplification risk at "thousands" sharing the one
     /// `Store` mutex) for a value nobody needs once the process exits. A
     /// plain in-process `HashMap` entry costs a pointer-sized insert instead
     /// of a WAL write, and [`Self::clear_live_activity`] removes it as soon
     /// as the owning `run_via_tmux` call returns, so memory stays bounded by
-    /// *currently running* sessions rather than growing across the daemon's
+    /// *currently running* cells rather than growing across the daemon's
     /// lifetime.
     pub fn note_live_activity(&mut self, session_name: &str, at_ms: i64) {
         self.live_activity.insert(session_name.to_string(), at_ms);
     }
 
     /// The last time [`Self::note_live_activity`] was called for
-    /// `session_name`, in Unix epoch milliseconds — `None` if the session
-    /// has never produced pane growth (fresh session, no output yet) or has
+    /// `session_name`, in Unix epoch milliseconds — `None` if the cell
+    /// has never produced pane growth (fresh cell, no output yet) or has
     /// already ended (see [`Self::clear_live_activity`]).
     pub fn live_activity_ms(&self, session_name: &str) -> Option<i64> {
         self.live_activity.get(session_name).copied()
@@ -4925,10 +5128,38 @@ impl Store {
     /// Drop the liveness entry for `session_name` once its owning
     /// `run_via_tmux` call has returned for good (not on an intermediate
     /// reattach kill — see the call site's doc comment). Best-effort: a
-    /// missing entry (session never produced output, or was already
+    /// missing entry (cell never produced output, or was already
     /// cleared) is not an error.
     pub fn clear_live_activity(&mut self, session_name: &str) {
         self.live_activity.remove(session_name);
+    }
+
+    /// RAL-241: has a stall escalation already been enqueued for
+    /// `session_name`'s *current* stall onset — i.e. has this exact
+    /// `last_activity_ms` value (the moment activity stopped) already fired
+    /// a mailbox message? Comparing the stored value against the caller's
+    /// current `last_activity_ms` (rather than just checking presence) means
+    /// a fresh burst of activity followed by a *new* stall is escalated
+    /// again, without needing an explicit "clear" between the two stalls.
+    #[must_use]
+    pub fn is_stall_escalated(&self, session_name: &str, last_activity_ms: i64) -> bool {
+        self.stall_escalated.get(session_name) == Some(&last_activity_ms)
+    }
+
+    /// Record that a stall escalation was just enqueued for `session_name`'s
+    /// current stall onset (`last_activity_ms`), so
+    /// [`Self::is_stall_escalated`] suppresses a repeat enqueue for the same
+    /// ongoing stall.
+    pub fn note_stall_escalated(&mut self, session_name: &str, last_activity_ms: i64) {
+        self.stall_escalated
+            .insert(session_name.to_string(), last_activity_ms);
+    }
+
+    /// Drop the RAL-241 stall-escalation bookkeeping for `session_name`,
+    /// mirroring [`Self::clear_live_activity`] — called from the same site,
+    /// once the owning `run_via_tmux` call has a terminal result for good.
+    pub fn clear_stall_escalated(&mut self, session_name: &str) {
+        self.stall_escalated.remove(session_name);
     }
 
     /// RAL-208: request that guardian `id`'s LLM-authored final change
@@ -4989,17 +5220,17 @@ impl Store {
         d.generated_signature = Some(signature.to_string());
     }
 
-    /// Fetch a task's first (lowest-`idx`) session's cwd — the cwd a
-    /// task-scope verify step's "Open Agent" action resumes into, mirroring
-    /// how `scheduler.rs::run_verifies` itself picks a cwd for a task-scope
-    /// step (`sessions.iter().find(|s| s.task_idx == task_idx)`).
+    /// Fetch a task's first (lowest-`idx`) cell's cwd — the cwd a
+    /// task-scope proof step's "Open Agent" action resumes into, mirroring
+    /// how `scheduler.rs::run_proofs` itself picks a cwd for a task-scope
+    /// step (`cells.iter().find(|s| s.task_idx == task_idx)`).
     ///
-    /// Returns `Err(StoreError::NotFound)` when the run/task has no sessions.
-    pub fn get_task_first_session_cwd(&self, run_id: &str, task_idx: i64) -> Result<String> {
+    /// Returns `Err(StoreError::NotFound)` when the squad/task has no cells.
+    pub fn get_task_first_cell_cwd(&self, squad_id: &str, task_idx: i64) -> Result<String> {
         self.conn
             .query_row(
-                "SELECT cwd FROM sessions WHERE run_id=? AND task_idx=? ORDER BY idx LIMIT 1",
-                params![run_id, task_idx],
+                "SELECT cwd FROM cells WHERE squad_id=? AND task_idx=? ORDER BY idx LIMIT 1",
+                params![squad_id, task_idx],
                 |r| r.get::<_, Option<String>>(0),
             )
             .optional()?
@@ -5007,28 +5238,28 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Fetch a `prompt`-kind verify step's agent and recorded CLI-agent
-    /// session id, for its "Open Agent" terminal action — see
-    /// [`Store::get_session_agent_resume`]'s doc comment for the same idea
+    /// Fetch a `prompt`-kind proof step's agent and recorded CLI-agent
+    /// cell id, for its "Open Agent" terminal action — see
+    /// [`Store::get_cell_agent_resume`]'s doc comment for the same idea
     /// (including why `agent` is needed alongside the id) applied to a plain
-    /// session.
+    /// cell.
     ///
-    /// Returns `Err(StoreError::NotFound)` when the verify row does not
+    /// Returns `Err(StoreError::NotFound)` when the proof row does not
     /// exist; the id itself is `None` when the step hasn't run yet (or ran
     /// under an agent with no resume mechanism) rather than an error.
-    pub fn get_verify_agent_session_id(
+    pub fn get_proof_agent_session_id(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
+        cell_idx: i64,
         idx: i64,
     ) -> Result<(String, Option<String>)> {
         self.conn
             .query_row(
-                "SELECT agent, agent_session_id FROM verifies
-                 WHERE run_id=? AND task_idx=? AND scope=? AND session_idx=? AND idx=?",
-                params![run_id, task_idx, scope, session_idx, idx],
+                "SELECT agent, agent_session_id FROM proofs
+                 WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?.unwrap_or_default(),
@@ -5040,21 +5271,21 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Reset every session downstream of any of `roots` (but not the roots
-    /// themselves) within `run_id` that is currently `Failed` back to
-    /// Pending — clearing its error, resetting its own session-level
-    /// verifies, and resetting its owning task. Used by
-    /// [`Store::restart_session_verify`] and [`Store::restart_task_verify`]
-    /// (RAL-165): retrying a verify can change its outcome, and there's no
-    /// case where a downstream session shouldn't get a fresh chance once
+    /// Reset every cell downstream of any of `roots` (but not the roots
+    /// themselves) within `squad_id` that is currently `Failed` back to
+    /// Pending — clearing its error, resetting its own cell-level
+    /// proofs, and resetting its owning task. Used by
+    /// [`Store::restart_cell_proof`] and [`Store::restart_task_proof`]
+    /// (RAL-165): retrying a proof can change its outcome, and there's no
+    /// case where a downstream cell shouldn't get a fresh chance once
     /// that new outcome is known — whether it was left Failed by a direct
     /// cascade from this failure or for its own, independent reason.
-    /// Sessions that are `Done`, `Pending`, or `Running` are left untouched.
-    fn revive_failed_downstream_sessions(&self, run_id: &str, roots: &[(i64, i64)]) -> Result<()> {
+    /// Cells that are `Done`, `Pending`, or `Running` are left untouched.
+    fn revive_failed_downstream_cells(&self, squad_id: &str, roots: &[(i64, i64)]) -> Result<()> {
         let mut downstream: HashSet<(i64, i64)> = HashSet::new();
         for &(task_idx, idx) in roots {
-            let impact = self.compute_session_restart_impact(run_id, task_idx, idx)?;
-            downstream.extend(impact.sessions.iter().map(|s| (s.task_idx, s.idx)));
+            let impact = self.compute_cell_restart_impact(squad_id, task_idx, idx)?;
+            downstream.extend(impact.cells.iter().map(|s| (s.task_idx, s.idx)));
         }
         for r in roots {
             downstream.remove(r);
@@ -5063,8 +5294,8 @@ impl Store {
             let state: Option<String> = self
                 .conn
                 .query_row(
-                    "SELECT state FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                    params![run_id, task_idx, idx],
+                    "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                    params![squad_id, task_idx, idx],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -5072,151 +5303,151 @@ impl Store {
                 continue;
             }
             self.conn.execute(
-                "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, idx],
+                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
-                "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=?",
-                params![run_id, task_idx, idx],
+                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
-                "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
             )?;
         }
         Ok(())
     }
 
-    /// Restart a single session's verify steps from `verify_from` onwards:
-    /// reset only the session-level verifies at index >= `verify_from` to
-    /// Pending while leaving the session itself Done. The owning task and run
+    /// Restart a single cell's proof steps from `proof_from` onwards:
+    /// reset only the cell-level proofs at index >= `proof_from` to
+    /// Pending while leaving the cell itself Done. The owning task and squad
     /// are put back to Pending so the scheduler re-enters them. The scheduler
-    /// detects that the session is Done with pending verifies via
-    /// [`Store::sessions_needing_verify_only`] and skips re-running the
-    /// session body, executing only the verify steps. Any downstream session
+    /// detects that the cell is Done with pending proofs via
+    /// [`Store::cells_needing_proof_only`] and skips re-running the
+    /// cell body, executing only the proof steps. Any downstream cell
     /// left `Failed` by an earlier pass is revived back to Pending too
-    /// (RAL-165) — see [`Store::revive_failed_downstream_sessions`]. Returns
-    /// dirtied dependent run ids.
-    pub fn restart_session_verify(
+    /// (RAL-165) — see [`Store::revive_failed_downstream_cells`]. Returns
+    /// dirtied dependent squad ids.
+    pub fn restart_cell_proof(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
-        verify_from: i64,
+        cell_idx: i64,
+        proof_from: i64,
     ) -> Result<Vec<String>> {
         let exists: Option<i64> = self
             .conn
             .query_row(
-                "SELECT idx FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
-                params![run_id, task_idx, session_idx],
+                "SELECT idx FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
                 |r| r.get(0),
             )
             .optional()?;
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        // Reset only verifies at idx >= verify_from — the session body stays
-        // Done so the scheduler's verify-only path re-runs verifies without
-        // re-running the session.
+        // Reset only proofs at idx >= proof_from — the cell body stays
+        // Done so the scheduler's proof-only path re-runs proofs without
+        // re-running the cell.
         self.conn.execute(
-            "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=? AND idx>=?",
-            params![run_id, task_idx, session_idx, verify_from],
+            "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=? AND idx>=?",
+            params![squad_id, task_idx, cell_idx, proof_from],
         )?;
-        self.revive_failed_downstream_sessions(run_id, &[(task_idx, session_idx)])?;
+        self.revive_failed_downstream_cells(squad_id, &[(task_idx, cell_idx)])?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
-            params![run_id, task_idx],
+            "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+            params![squad_id, task_idx],
         )?;
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
-            params![now_ms(), run_id],
+            "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
+            params![now_ms(), squad_id],
         )?;
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
-            "verify",
-            Some(&format!("session t{task_idx}/s{session_idx}")),
+            "proof",
+            Some(&format!("cell t{task_idx}/s{cell_idx}")),
             "restarted",
         );
-        self.dirty_dependents(run_id)
+        self.dirty_dependents(squad_id)
     }
 
-    /// Restart a task's task-level verify steps from `verify_from` onwards:
-    /// reset only the task-scope verifies at index >= `verify_from` to Pending
-    /// while leaving all sessions and their session-level verifies intact. The
-    /// task and run are put back to Pending so the scheduler's task finalizer
-    /// fires and re-runs the task-level verifies. Any session downstream of
+    /// Restart a task's task-level proof steps from `proof_from` onwards:
+    /// reset only the task-scope proofs at index >= `proof_from` to Pending
+    /// while leaving all cells and their cell-level proofs intact. The
+    /// task and squad are put back to Pending so the scheduler's task finalizer
+    /// fires and re-runs the task-level proofs. Any cell downstream of
     /// this task that was left `Failed` by an earlier pass is revived back to
-    /// Pending too (RAL-165) — see [`Store::revive_failed_downstream_sessions`].
-    /// Returns dirtied dependent run ids.
-    pub fn restart_task_verify(
+    /// Pending too (RAL-165) — see [`Store::revive_failed_downstream_cells`].
+    /// Returns dirtied dependent squad ids.
+    pub fn restart_task_proof(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        verify_from: i64,
+        proof_from: i64,
     ) -> Result<Vec<String>> {
         let exists: Option<i64> = self
             .conn
             .query_row(
-                "SELECT idx FROM tasks WHERE run_id=? AND idx=?",
-                params![run_id, task_idx],
+                "SELECT idx FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
                 |r| r.get(0),
             )
             .optional()?;
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        // Reset only task-scope verifies at idx >= verify_from. Session states
-        // and session-level verifies are intentionally left untouched: all
-        // sessions remain Done so the scheduler's task finalizer fires
-        // immediately and re-runs only the affected task-level verifies,
-        // without re-running any session body.
+        // Reset only task-scope proofs at idx >= proof_from. Cell states
+        // and cell-level proofs are intentionally left untouched: all
+        // cells remain Done so the scheduler's task finalizer fires
+        // immediately and re-runs only the affected task-level proofs,
+        // without re-running any cell body.
         self.conn.execute(
-            "UPDATE verifies SET state='pending' WHERE run_id=? AND task_idx=? AND scope='task' AND idx>=?",
-            params![run_id, task_idx, verify_from],
+            "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='task' AND idx>=?",
+            params![squad_id, task_idx, proof_from],
         )?;
         let roots: Vec<(i64, i64)> = self
-            .sessions_of(run_id)?
+            .cells_of(squad_id)?
             .into_iter()
             .filter(|s| s.task_idx == task_idx)
             .map(|s| (s.task_idx, s.idx))
             .collect();
-        self.revive_failed_downstream_sessions(run_id, &roots)?;
+        self.revive_failed_downstream_cells(squad_id, &roots)?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
-            params![run_id, task_idx],
+            "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+            params![squad_id, task_idx],
         )?;
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
-            params![now_ms(), run_id],
+            "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
+            params![now_ms(), squad_id],
         )?;
         let _ = self.log_event(
-            Some(run_id),
+            Some(squad_id),
             None,
-            "verify",
+            "proof",
             Some(&format!("task t{task_idx}")),
             "restarted",
         );
-        self.dirty_dependents(run_id)
+        self.dirty_dependents(squad_id)
     }
 
-    /// Sessions that are `done` in the DB but have at least one session-level
-    /// verify in a non-terminal state. The scheduler uses this to identify
-    /// "verify-only restart" cases: these sessions skip the runner and execute
-    /// only their verify steps.
-    pub fn sessions_needing_verify_only(&self, run_id: &str) -> Result<HashSet<(i64, i64)>> {
+    /// Cells that are `done` in the DB but have at least one cell-level
+    /// proof in a non-terminal state. The scheduler uses this to identify
+    /// "proof-only restart" cases: these cells skip the runner and execute
+    /// only their proof steps.
+    pub fn cells_needing_proof_only(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT s.task_idx, s.idx FROM sessions s
-             WHERE s.run_id=? AND s.state='done'
+            "SELECT DISTINCT s.task_idx, s.idx FROM cells s
+             WHERE s.squad_id=? AND s.state='done'
              AND EXISTS (
-                 SELECT 1 FROM verifies v
-                 WHERE v.run_id=s.run_id AND v.task_idx=s.task_idx
-                 AND v.scope='session' AND v.session_idx=s.idx
+                 SELECT 1 FROM proofs v
+                 WHERE v.squad_id=s.squad_id AND v.task_idx=s.task_idx
+                 AND v.scope='cell' AND v.cell_idx=s.idx
                  AND v.state NOT IN ('done','failed','cancelled')
              )",
         )?;
         let rows = stmt
-            .query_map(params![run_id], |r| {
+            .query_map(params![squad_id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
@@ -5225,15 +5456,15 @@ impl Store {
 
     // ── Queue view + reorder (RAL Queue) ─────────────────────────────────────
 
-    /// The flat list of runnable work items across every schedulable run
+    /// The flat list of runnable work items across every schedulable squad
     /// (`pending`/`running`/`queued`), classified for the Queue view. Each item
-    /// is a session, a session-level verify, or a task-level verify still in a
+    /// is a cell, a cell-level proof, or a task-level proof still in a
     /// `pending`/`running` state. Ordered canonically by
-    /// `(queue_rank NULLS LAST, run created_at, task_idx, sessions-before-verifies, idx)`.
+    /// `(queue_rank NULLS LAST, squad created_at, task_idx, cells-before-proofs, idx)`.
     pub fn queue(&self) -> Result<Vec<QueueItem>> {
-        let runs: Vec<(String, Option<String>, String, i64)> = {
+        let squads: Vec<(String, Option<String>, String, i64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, label, state, created_at_ms FROM runs
+                "SELECT id, label, state, created_at_ms FROM squads
                  WHERE state IN ('pending','running','queued') ORDER BY created_at_ms, id",
             )?;
             stmt.query_map([], |r| {
@@ -5248,12 +5479,12 @@ impl Store {
         };
 
         let mut out: Vec<QueueItem> = Vec::new();
-        for (run_id, run_label, run_state, run_created) in runs {
-            self.queue_items_for_run(
-                &run_id,
-                run_label.as_deref(),
-                &run_state,
-                run_created,
+        for (squad_id, squad_label, squad_state, squad_created) in squads {
+            self.queue_items_for_squad(
+                &squad_id,
+                squad_label.as_deref(),
+                &squad_state,
+                squad_created,
                 &mut out,
             )?;
         }
@@ -5267,21 +5498,21 @@ impl Store {
         Ok(out)
     }
 
-    fn queue_items_for_run(
+    fn queue_items_for_squad(
         &self,
-        run_id: &str,
-        run_label: Option<&str>,
-        run_state: &str,
-        run_created: i64,
+        squad_id: &str,
+        squad_label: Option<&str>,
+        squad_state: &str,
+        squad_created: i64,
         out: &mut Vec<QueueItem>,
     ) -> Result<()> {
-        let sessions = self.sessions_of(run_id)?;
-        let tasks = self.tasks_of(run_id)?;
-        let plan = match crate::plan::plan(&sessions, &tasks) {
+        let cells = self.cells_of(squad_id)?;
+        let tasks = self.tasks_of(squad_id)?;
+        let plan = match crate::plan::plan(&cells, &tasks) {
             Ok(p) => p,
-            Err(_) => return Ok(()), // a cyclic run cannot be queued
+            Err(_) => return Ok(()), // a cyclic squad cannot be queued
         };
-        let run_deps_ok = self.deps_satisfied(&self.run_depends_on(run_id)?)?;
+        let squad_deps_ok = self.deps_satisfied(&self.squad_depends_on(squad_id)?)?;
 
         // Each task's declared `depends_on` (task names), for the header display.
         let task_deps: HashMap<i64, Vec<String>> = tasks
@@ -5289,13 +5520,13 @@ impl Store {
             .map(|t| (t.idx, t.depends_on.clone()))
             .collect();
 
-        // Position of each (task_idx, idx) within `sessions` (== plan indexing).
+        // Position of each (task_idx, idx) within `cells` (== plan indexing).
         let mut pos_of: HashMap<(i64, i64), usize> = HashMap::new();
-        for (i, s) in sessions.iter().enumerate() {
+        for (i, s) in cells.iter().enumerate() {
             pos_of.insert((s.task_idx, s.idx), i);
         }
 
-        // Session metadata: state, display name, queue_rank.
+        // Cell metadata: state, display name, queue_rank.
         struct SMeta {
             state: String,
             name: String,
@@ -5303,9 +5534,9 @@ impl Store {
         }
         let smeta: HashMap<(i64, i64), SMeta> = {
             let mut stmt = self.conn.prepare(
-                "SELECT task_idx, idx, sid, name, state, queue_rank FROM sessions WHERE run_id=?",
+                "SELECT task_idx, idx, sid, name, state, queue_rank FROM cells WHERE squad_id=?",
             )?;
-            stmt.query_map(params![run_id], |r| {
+            stmt.query_map(params![squad_id], |r| {
                 let ti: i64 = r.get(0)?;
                 let si: i64 = r.get(1)?;
                 let sid: String = r.get(2)?;
@@ -5333,8 +5564,8 @@ impl Store {
                 .unwrap_or_else(|| "pending".to_string())
         };
 
-        // ── sessions ──
-        for s in &sessions {
+        // ── cells ──
+        for s in &cells {
             let meta = match smeta.get(&(s.task_idx, s.idx)) {
                 Some(m) => m,
                 None => continue,
@@ -5345,18 +5576,18 @@ impl Store {
             let pos = pos_of[&(s.task_idx, s.idx)];
             let mut blocked_by: Vec<String> = Vec::new();
             let mut excluded = false;
-            if !run_deps_ok {
-                blocked_by.push("upstream run".to_string());
+            if !squad_deps_ok {
+                blocked_by.push("upstream squad".to_string());
             }
             let mut deps_paths: Vec<String> = Vec::new();
             for &d in &plan.deps[pos] {
-                let (dti, dsi) = (sessions[d].task_idx, sessions[d].idx);
-                deps_paths.push(session_path(run_id, dti, dsi));
+                let (dti, dsi) = (cells[d].task_idx, cells[d].idx);
+                deps_paths.push(cell_path(squad_id, dti, dsi));
                 let dep_state = state_of(dti, dsi);
                 let dep_label = smeta
                     .get(&(dti, dsi))
-                    .map(|m| format!("session {}", m.name))
-                    .unwrap_or_else(|| format!("session t{dti}/s{dsi}"));
+                    .map(|m| format!("cell {}", m.name))
+                    .unwrap_or_else(|| format!("cell t{dti}/s{dsi}"));
                 match dep_state.as_str() {
                     "done" | "ignored" => {}
                     "failed" | "cancelled" => {
@@ -5369,21 +5600,21 @@ impl Store {
             let readiness = classify(
                 meta.state.as_str(),
                 excluded,
-                blocked_by.is_empty() && run_deps_ok,
+                blocked_by.is_empty() && squad_deps_ok,
             );
             out.push(QueueItem {
-                run_id: run_id.to_string(),
-                run_label: run_label.map(str::to_string),
-                run_state: run_state.to_string(),
-                run_created_at_ms: run_created,
-                kind: "session".to_string(),
-                path: session_path(run_id, s.task_idx, s.idx),
+                squad_id: squad_id.to_string(),
+                squad_label: squad_label.map(str::to_string),
+                squad_state: squad_state.to_string(),
+                squad_created_at_ms: squad_created,
+                kind: "cell".to_string(),
+                path: cell_path(squad_id, s.task_idx, s.idx),
                 indent: 2,
                 task_idx: s.task_idx,
                 task_name: s.task_name.clone(),
-                session_idx: s.idx,
-                verify_idx: -1,
-                verify_scope: String::new(),
+                cell_idx: s.idx,
+                proof_idx: -1,
+                proof_scope: String::new(),
                 name: meta.name.clone(),
                 state: meta.state.clone(),
                 readiness,
@@ -5395,13 +5626,13 @@ impl Store {
             });
         }
 
-        // ── verifies (session-scope and task-scope) ──
-        let verify_rows: Vec<VerifyQueueRow> = {
+        // ── proofs (cell-scope and task-scope) ──
+        let proof_rows: Vec<ProofQueueRow> = {
             let mut stmt = self.conn.prepare(
-                "SELECT task_idx, scope, session_idx, idx, vid, kind, state, queue_rank
-                 FROM verifies WHERE run_id=? ORDER BY task_idx, scope, session_idx, idx",
+                "SELECT task_idx, scope, cell_idx, idx, vid, kind, state, queue_rank
+                 FROM proofs WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
             )?;
-            stmt.query_map(params![run_id], |r| {
+            stmt.query_map(params![squad_id], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -5415,45 +5646,45 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for (ti, scope, sidx, vi, vid, kind, vstate, rank) in verify_rows {
+        for (ti, scope, sidx, vi, vid, kind, vstate, rank) in proof_rows {
             if !matches!(vstate.as_str(), "pending" | "running") {
                 continue;
             }
             let mut blocked_by: Vec<String> = Vec::new();
             let mut excluded = false;
             let mut deps_paths: Vec<String> = Vec::new();
-            if !run_deps_ok {
-                blocked_by.push("upstream run".to_string());
+            if !squad_deps_ok {
+                blocked_by.push("upstream squad".to_string());
             }
             let (name, path, indent, kind_str);
-            if scope == "session" {
+            if scope == "cell" {
                 name = vid.unwrap_or_else(|| kind.clone());
-                path = sverify_path(run_id, ti, sidx, vi);
+                path = sproof_path(squad_id, ti, sidx, vi);
                 indent = 3;
-                kind_str = "session_verify".to_string();
-                // Depends on the owning session, then prior session-verify.
-                deps_paths.push(session_path(run_id, ti, sidx));
+                kind_str = "cell_proof".to_string();
+                // Depends on the owning cell, then prior cell-proof.
+                deps_paths.push(cell_path(squad_id, ti, sidx));
                 let ss = state_of(ti, sidx);
                 match ss.as_str() {
                     "done" | "ignored" => {}
                     "failed" | "cancelled" => {
                         excluded = true;
-                        blocked_by.push("owning session".to_string());
+                        blocked_by.push("owning cell".to_string());
                     }
-                    _ => blocked_by.push("owning session".to_string()),
+                    _ => blocked_by.push("owning cell".to_string()),
                 }
                 if vi > 0 {
-                    deps_paths.push(sverify_path(run_id, ti, sidx, vi - 1));
-                    blocked_by.push("prior verify step".to_string());
+                    deps_paths.push(sproof_path(squad_id, ti, sidx, vi - 1));
+                    blocked_by.push("prior proof step".to_string());
                 }
             } else {
                 name = vid.unwrap_or_else(|| kind.clone());
-                path = tverify_path(run_id, ti, vi);
+                path = tproof_path(squad_id, ti, vi);
                 indent = 2;
-                kind_str = "task_verify".to_string();
-                // Depends on every session in the task, then prior task-verify.
-                for s in sessions.iter().filter(|s| s.task_idx == ti) {
-                    deps_paths.push(session_path(run_id, ti, s.idx));
+                kind_str = "task_proof".to_string();
+                // Depends on every cell in the task, then prior task-proof.
+                for s in cells.iter().filter(|s| s.task_idx == ti) {
+                    deps_paths.push(cell_path(squad_id, ti, s.idx));
                     let ss = state_of(ti, s.idx);
                     match ss.as_str() {
                         "done" | "ignored" => {}
@@ -5465,36 +5696,36 @@ impl Store {
                     .get(&ti)
                     .cloned()
                     .unwrap_or_else(|| format!("t{ti}"));
-                if sessions.iter().filter(|s| s.task_idx == ti).any(|s| {
+                if cells.iter().filter(|s| s.task_idx == ti).any(|s| {
                     !NodeState::parse(&state_of(ti, s.idx))
                         .is_some_and(|n| n.satisfies_dependents())
                 }) {
-                    blocked_by.push(format!("task {tname} sessions"));
+                    blocked_by.push(format!("task {tname} cells"));
                 }
                 if vi > 0 {
-                    deps_paths.push(tverify_path(run_id, ti, vi - 1));
-                    blocked_by.push("prior verify step".to_string());
+                    deps_paths.push(tproof_path(squad_id, ti, vi - 1));
+                    blocked_by.push("prior proof step".to_string());
                 }
             }
             let readiness = classify(
                 vstate.as_str(),
                 excluded,
-                blocked_by.is_empty() && run_deps_ok,
+                blocked_by.is_empty() && squad_deps_ok,
             );
             let tname = task_names.get(&ti).cloned().unwrap_or_default();
             out.push(QueueItem {
-                run_id: run_id.to_string(),
-                run_label: run_label.map(str::to_string),
-                run_state: run_state.to_string(),
-                run_created_at_ms: run_created,
+                squad_id: squad_id.to_string(),
+                squad_label: squad_label.map(str::to_string),
+                squad_state: squad_state.to_string(),
+                squad_created_at_ms: squad_created,
                 kind: kind_str,
                 path,
                 indent,
                 task_idx: ti,
                 task_name: tname,
-                session_idx: if scope == "session" { sidx } else { -1 },
-                verify_idx: vi,
-                verify_scope: scope,
+                cell_idx: if scope == "cell" { sidx } else { -1 },
+                proof_idx: vi,
+                proof_scope: scope,
                 name,
                 state: vstate,
                 readiness,
@@ -5512,17 +5743,17 @@ impl Store {
     pub fn set_queue_rank(&self, path: &str, rank: f64) -> Result<()> {
         let p = parse_queue_path(path).ok_or(StoreError::NotFound)?;
         match p.kind {
-            QueuePathKind::Session => self.conn.execute(
-                "UPDATE sessions SET queue_rank=? WHERE run_id=? AND task_idx=? AND idx=?",
-                params![rank, p.run_id, p.task_idx, p.session_idx],
+            QueuePathKind::Cell => self.conn.execute(
+                "UPDATE cells SET queue_rank=? WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![rank, p.squad_id, p.task_idx, p.cell_idx],
             )?,
-            QueuePathKind::SessionVerify => self.conn.execute(
-                "UPDATE verifies SET queue_rank=? WHERE run_id=? AND task_idx=? AND scope='session' AND session_idx=? AND idx=?",
-                params![rank, p.run_id, p.task_idx, p.session_idx, p.verify_idx],
+            QueuePathKind::CellProof => self.conn.execute(
+                "UPDATE proofs SET queue_rank=? WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=? AND idx=?",
+                params![rank, p.squad_id, p.task_idx, p.cell_idx, p.proof_idx],
             )?,
-            QueuePathKind::TaskVerify => self.conn.execute(
-                "UPDATE verifies SET queue_rank=? WHERE run_id=? AND task_idx=? AND scope='task' AND session_idx=-1 AND idx=?",
-                params![rank, p.run_id, p.task_idx, p.verify_idx],
+            QueuePathKind::TaskProof => self.conn.execute(
+                "UPDATE proofs SET queue_rank=? WHERE squad_id=? AND task_idx=? AND scope='task' AND cell_idx=-1 AND idx=?",
+                params![rank, p.squad_id, p.task_idx, p.proof_idx],
             )?,
         };
         Ok(())
@@ -5553,9 +5784,9 @@ impl Store {
             source: "store",
             message: "queue reordered",
             scope: Some("queue"),
-            run_id: None,
+            squad_id: None,
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
             payload: serde_json::json!({"items": ordered.len()}),
@@ -5587,9 +5818,9 @@ impl Store {
             source: "store",
             message: "queue set-position",
             scope: Some("queue"),
-            run_id: None,
+            squad_id: None,
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
             payload: serde_json::json!({
@@ -5602,10 +5833,10 @@ impl Store {
     }
 }
 
-/// The recorded outcome of running a session.
+/// The recorded outcome of running a cell.
 #[derive(Debug, Clone)]
-pub struct SessionOutcome {
-    /// Final session state.
+pub struct CellOutcome {
+    /// Final cell state.
     pub state: NodeState,
     /// Input tokens used.
     pub tokens_in: i64,
@@ -5615,7 +5846,7 @@ pub struct SessionOutcome {
     pub cost_usd: f64,
     /// Error detail, if failed.
     pub error: Option<String>,
-    /// Resumable CLI-agent session/thread id (for `claude --resume`/`codex exec
+    /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex exec
     /// resume`), if captured.
     pub agent_session_id: Option<String>,
 }
@@ -5625,30 +5856,30 @@ pub struct SessionOutcome {
 /// A single reorderable unit of runnable work in the Queue view.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueItem {
-    /// Owning run id.
-    pub run_id: String,
-    /// Owning run label, if any.
-    pub run_label: Option<String>,
-    /// Owning run state.
-    pub run_state: String,
-    /// Owning run creation time (stable grouping / tie-break).
-    pub run_created_at_ms: i64,
-    /// `session` | `session_verify` | `task_verify`.
+    /// Owning squad id.
+    pub squad_id: String,
+    /// Owning squad label, if any.
+    pub squad_label: Option<String>,
+    /// Owning squad state.
+    pub squad_state: String,
+    /// Owning squad creation time (stable grouping / tie-break).
+    pub squad_created_at_ms: i64,
+    /// `cell` | `cell_proof` | `task_proof`.
     pub kind: String,
     /// Selector path addressing this item (see [`parse_queue_path`]).
     pub path: String,
-    /// Tree depth: run=0, task=1, session/task_verify=2, session_verify=3.
+    /// Tree depth: squad=0, task=1, cell/task_proof=2, cell_proof=3.
     pub indent: u8,
     /// Owning task index.
     pub task_idx: i64,
     /// Owning task display name.
     pub task_name: String,
-    /// Session index (-1 for task-scope verifies).
-    pub session_idx: i64,
-    /// Verify index (-1 for sessions).
-    pub verify_idx: i64,
-    /// `""` | `session` | `task`.
-    pub verify_scope: String,
+    /// Cell index (-1 for task-scope proofs).
+    pub cell_idx: i64,
+    /// Proof index (-1 for cells).
+    pub proof_idx: i64,
+    /// `""` | `cell` | `task`.
+    pub proof_scope: String,
     /// Display name.
     pub name: String,
     /// Current node state.
@@ -5660,8 +5891,8 @@ pub struct QueueItem {
     /// The owning task's declared `depends_on` (task names), for display — the
     /// Queue shows this on the task header, mirroring the Tasks view.
     pub task_depends_on: Vec<String>,
-    /// This item's own declared dependency references (session `depends_on`;
-    /// empty for verifies). Shown on the row so the link is visible.
+    /// This item's own declared dependency references (cell `depends_on`;
+    /// empty for proofs). Shown on the row so the link is visible.
     pub depends_on: Vec<String>,
     /// Paths of the queue items this one depends on (for drag-along + reorder).
     pub deps_paths: Vec<String>,
@@ -5669,9 +5900,9 @@ pub struct QueueItem {
     pub queue_rank: Option<f64>,
 }
 
-/// One row of `queue_items_for_run`'s verify query:
-/// `(task_idx, scope, session_idx, idx, vid, kind, state, queue_rank)`.
-type VerifyQueueRow = (
+/// One row of `queue_items_for_squad`'s proof query:
+/// `(task_idx, scope, cell_idx, idx, vid, kind, state, queue_rank)`.
+type ProofQueueRow = (
     i64,
     String,
     i64,
@@ -5684,68 +5915,68 @@ type VerifyQueueRow = (
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuePathKind {
-    Session,
-    SessionVerify,
-    TaskVerify,
+    Cell,
+    CellProof,
+    TaskProof,
 }
 
 struct ParsedQueuePath {
-    run_id: String,
+    squad_id: String,
     kind: QueuePathKind,
     task_idx: i64,
-    session_idx: i64,
-    verify_idx: i64,
+    cell_idx: i64,
+    proof_idx: i64,
 }
 
-fn session_path(run_id: &str, ti: i64, si: i64) -> String {
-    format!("{run_id}/t{ti}/s{si}")
+fn cell_path(squad_id: &str, ti: i64, si: i64) -> String {
+    format!("{squad_id}/t{ti}/s{si}")
 }
-fn sverify_path(run_id: &str, ti: i64, si: i64, vi: i64) -> String {
-    format!("{run_id}/t{ti}/s{si}/v{vi}")
+fn sproof_path(squad_id: &str, ti: i64, si: i64, vi: i64) -> String {
+    format!("{squad_id}/t{ti}/s{si}/v{vi}")
 }
-fn tverify_path(run_id: &str, ti: i64, vi: i64) -> String {
-    format!("{run_id}/t{ti}/tv{vi}")
+fn tproof_path(squad_id: &str, ti: i64, vi: i64) -> String {
+    format!("{squad_id}/t{ti}/tv{vi}")
 }
 
-/// Parse a queue item path. Grammar (the run id itself never contains `/`):
-///  - `<run>/t<ti>/s<si>`       → a session
-///  - `<run>/t<ti>/s<si>/v<vi>` → a session-scope verify
-///  - `<run>/t<ti>/tv<vi>`      → a task-scope verify
+/// Parse a queue item path. Grammar (the squad id itself never contains `/`):
+///  - `<squad>/t<ti>/s<si>`       → a cell
+///  - `<squad>/t<ti>/s<si>/v<vi>` → a cell-scope proof
+///  - `<squad>/t<ti>/tv<vi>`      → a task-scope proof
 fn parse_queue_path(path: &str) -> Option<ParsedQueuePath> {
     let segs: Vec<&str> = path.split('/').collect();
     match segs.as_slice() {
-        [run, t, s] => {
+        [squad, t, s] => {
             let ti = t.strip_prefix('t')?.parse().ok()?;
             if let Some(si) = s.strip_prefix('s').and_then(|v| v.parse().ok()) {
                 Some(ParsedQueuePath {
-                    run_id: (*run).to_string(),
-                    kind: QueuePathKind::Session,
+                    squad_id: (*squad).to_string(),
+                    kind: QueuePathKind::Cell,
                     task_idx: ti,
-                    session_idx: si,
-                    verify_idx: -1,
+                    cell_idx: si,
+                    proof_idx: -1,
                 })
             } else {
                 s.strip_prefix("tv")
                     .and_then(|v| v.parse().ok())
                     .map(|vi| ParsedQueuePath {
-                        run_id: (*run).to_string(),
-                        kind: QueuePathKind::TaskVerify,
+                        squad_id: (*squad).to_string(),
+                        kind: QueuePathKind::TaskProof,
                         task_idx: ti,
-                        session_idx: -1,
-                        verify_idx: vi,
+                        cell_idx: -1,
+                        proof_idx: vi,
                     })
             }
         }
-        [run, t, s, v] => {
+        [squad, t, s, v] => {
             let ti = t.strip_prefix('t')?.parse().ok()?;
             let si = s.strip_prefix('s')?.parse().ok()?;
             let vi = v.strip_prefix('v')?.parse().ok()?;
             Some(ParsedQueuePath {
-                run_id: (*run).to_string(),
-                kind: QueuePathKind::SessionVerify,
+                squad_id: (*squad).to_string(),
+                kind: QueuePathKind::CellProof,
                 task_idx: ti,
-                session_idx: si,
-                verify_idx: vi,
+                cell_idx: si,
+                proof_idx: vi,
             })
         }
         _ => None,
@@ -5765,17 +5996,17 @@ fn classify(state: &str, excluded: bool, ready: bool) -> String {
     }
 }
 
-/// Canonical sort key: ranked items first (ascending), then unranked by run
-/// creation, task, sessions-before-verifies, and index.
+/// Canonical sort key: ranked items first (ascending), then unranked by squad
+/// creation, task, cells-before-proofs, and index.
 fn queue_sort_key(i: &QueueItem) -> (f64, i64, i64, i64, i64, i64) {
     let (a, b, c) = match i.kind.as_str() {
-        "session" => (i.session_idx, 0, 0),
-        "session_verify" => (i.session_idx, 1, i.verify_idx),
-        _ => (i64::MAX, 0, i.verify_idx), // task_verify sorts after its sessions
+        "cell" => (i.cell_idx, 0, 0),
+        "cell_proof" => (i.cell_idx, 1, i.proof_idx),
+        _ => (i64::MAX, 0, i.proof_idx), // task_proof sorts after its cells
     };
     (
         i.queue_rank.unwrap_or(f64::INFINITY),
-        i.run_created_at_ms,
+        i.squad_created_at_ms,
         i.task_idx,
         a,
         b,
@@ -5891,14 +6122,14 @@ mod tests {
     const SAMPLE: &str = r#"
 [[task]]
 name = "build"
-[[task.session]]
+[[task.cell]]
 id = "worker"
 cwd = "/repo"
 prompt = "make it build"
-[[task.session.verify]]
+[[task.cell.proof]]
 id = "fmt"
 command = "cargo fmt --check"
-[[task.verify]]
+[[task.proof]]
 command = "cargo test"
 "#;
 
@@ -5913,26 +6144,26 @@ command = "cargo test"
     /// affected tables, with the old column names and real data in them --
     /// and runs the real `init_schema()` migration path
     /// (`Store::open`/`open_in_memory` both just call this) against it, to
-    /// prove an upgrading user's existing session/resolver ids actually
+    /// prove an upgrading user's existing cell/resolver ids actually
     /// survive the rename rather than silently becoming `NULL`.
     #[test]
     fn migration_renames_legacy_claude_session_id_columns() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
-            "CREATE TABLE sessions (
-                run_id TEXT NOT NULL, task_idx INTEGER NOT NULL, idx INTEGER NOT NULL,
+            "CREATE TABLE cells (
+                squad_id TEXT NOT NULL, task_idx INTEGER NOT NULL, idx INTEGER NOT NULL,
                 sid TEXT, agent TEXT NOT NULL DEFAULT 'claude', state TEXT NOT NULL,
                 depends_on TEXT NOT NULL DEFAULT '[]', tokens_in INTEGER NOT NULL DEFAULT 0,
                 tokens_out INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
                 claude_session_id TEXT,
-                PRIMARY KEY (run_id, task_idx, idx)
+                PRIMARY KEY (squad_id, task_idx, idx)
              );
-             CREATE TABLE verifies (
-                run_id TEXT NOT NULL, task_idx INTEGER NOT NULL, scope TEXT NOT NULL,
-                session_idx INTEGER NOT NULL, idx INTEGER NOT NULL, vid TEXT,
+             CREATE TABLE proofs (
+                squad_id TEXT NOT NULL, task_idx INTEGER NOT NULL, scope TEXT NOT NULL,
+                cell_idx INTEGER NOT NULL, idx INTEGER NOT NULL, vid TEXT,
                 kind TEXT NOT NULL, spec TEXT NOT NULL, state TEXT NOT NULL,
                 agent TEXT NOT NULL DEFAULT 'claude', claude_session_id TEXT,
-                PRIMARY KEY (run_id, task_idx, scope, session_idx, idx)
+                PRIMARY KEY (squad_id, task_idx, scope, cell_idx, idx)
              );
              CREATE TABLE guardians (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, base_branch TEXT NOT NULL,
@@ -5946,17 +6177,17 @@ command = "cargo test"
         )
         .expect("create legacy (pre-rename) schema");
         conn.execute(
-            "INSERT INTO sessions (run_id, task_idx, idx, sid, state, claude_session_id)
-             VALUES ('r1', 0, 0, 's0', 'done', 'legacy-session-id')",
+            "INSERT INTO cells (squad_id, task_idx, idx, sid, state, claude_session_id)
+             VALUES ('r1', 0, 0, 's0', 'done', 'legacy-cell-id')",
             [],
         )
-        .expect("insert legacy session row");
+        .expect("insert legacy cell row");
         conn.execute(
-            "INSERT INTO verifies (run_id, task_idx, scope, session_idx, idx, kind, spec, state, claude_session_id)
-             VALUES ('r1', 0, 'session', 0, 0, 'command', 'true', 'done', 'legacy-verify-sid')",
+            "INSERT INTO proofs (squad_id, task_idx, scope, cell_idx, idx, kind, spec, state, claude_session_id)
+             VALUES ('r1', 0, 'cell', 0, 0, 'command', 'true', 'done', 'legacy-proof-sid')",
             [],
         )
-        .expect("insert legacy verify row");
+        .expect("insert legacy proof row");
         conn.execute(
             "INSERT INTO guardians (id, name, base_branch, manual_commands_claude_session_id)
              VALUES ('g1', 'g', 'main', 'legacy-manual-sid')",
@@ -5975,30 +6206,31 @@ command = "cargo test"
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
         };
         store
             .init_schema()
             .expect("migration must succeed against a legacy schema");
 
-        let session_sid: String = store
+        let cell_sid: String = store
             .conn
             .query_row(
-                "SELECT agent_session_id FROM sessions WHERE run_id='r1'",
+                "SELECT agent_session_id FROM cells WHERE squad_id='r1'",
                 [],
                 |r| r.get(0),
             )
             .expect("agent_session_id column must exist and hold the migrated value");
-        assert_eq!(session_sid, "legacy-session-id");
+        assert_eq!(cell_sid, "legacy-cell-id");
 
-        let verify_sid: String = store
+        let proof_sid: String = store
             .conn
             .query_row(
-                "SELECT agent_session_id FROM verifies WHERE run_id='r1'",
+                "SELECT agent_session_id FROM proofs WHERE squad_id='r1'",
                 [],
                 |r| r.get(0),
             )
             .expect("agent_session_id column must exist and hold the migrated value");
-        assert_eq!(verify_sid, "legacy-verify-sid");
+        assert_eq!(proof_sid, "legacy-proof-sid");
 
         let manual_sid: String = store
             .conn
@@ -6028,7 +6260,7 @@ command = "cargo test"
         let old_column_still_exists: bool = store
             .conn
             .query_row(
-                "SELECT 1 FROM pragma_table_info('sessions') WHERE name='claude_session_id'",
+                "SELECT 1 FROM pragma_table_info('cells') WHERE name='claude_session_id'",
                 [],
                 |_| Ok(()),
             )
@@ -6046,16 +6278,16 @@ command = "cargo test"
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
             "CREATE TABLE tasks (
-                run_id TEXT NOT NULL,
+                squad_id TEXT NOT NULL,
                 idx INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 project TEXT,
                 state TEXT NOT NULL,
                 depends_on TEXT NOT NULL DEFAULT '[]',
                 queue_rank REAL,
-                PRIMARY KEY (run_id, idx)
+                PRIMARY KEY (squad_id, idx)
              );
-             INSERT INTO tasks (run_id, idx, name, project, state, depends_on, queue_rank)
+             INSERT INTO tasks (squad_id, idx, name, project, state, depends_on, queue_rank)
              VALUES ('r1', 0, 'build', NULL, 'pending', '[]', NULL);",
         )
         .expect("create legacy tasks table");
@@ -6065,6 +6297,7 @@ command = "cargo test"
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
         };
         store
             .init_schema()
@@ -6073,7 +6306,7 @@ command = "cargo test"
         let (agent, model): (Option<String>, Option<String>) = store
             .conn
             .query_row(
-                "SELECT agent, model FROM tasks WHERE run_id='r1' AND idx=0",
+                "SELECT agent, model FROM tasks WHERE squad_id='r1' AND idx=0",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -6083,91 +6316,91 @@ command = "cargo test"
     }
 
     #[test]
-    fn insert_and_fetch_run() {
+    fn insert_and_fetch_squad() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(SAMPLE), Some("my run"), false)
+            .insert_squad(&parse(SAMPLE), Some("my squad"), false)
             .unwrap();
-        assert_eq!(id, "run-000000000001");
+        assert_eq!(id, "squad-000000000001");
 
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.label.as_deref(), Some("my run"));
-        assert_eq!(run.state, "pending");
-        assert_eq!(run.tasks.len(), 1);
-        let task = &run.tasks[0];
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.label.as_deref(), Some("my squad"));
+        assert_eq!(squad.state, "pending");
+        assert_eq!(squad.tasks.len(), 1);
+        let task = &squad.tasks[0];
         assert_eq!(task.name, "build");
         // No `project` set in TOML -> falls back to the cwd basename (RAL-141).
         assert_eq!(task.project, "repo");
         assert!(task.agent.is_none());
         assert!(task.model.is_none());
-        assert_eq!(task.sessions.len(), 1);
-        assert_eq!(task.sessions[0].id, "worker");
-        assert_eq!(task.sessions[0].agent, "claude");
-        assert_eq!(task.sessions[0].state, "pending");
+        assert_eq!(task.cells.len(), 1);
+        assert_eq!(task.cells[0].id, "worker");
+        assert_eq!(task.cells[0].agent, "claude");
+        assert_eq!(task.cells[0].state, "pending");
         assert!(
-            task.sessions[0]
+            task.cells[0]
                 .system_prompt
                 .as_deref()
-                .is_some_and(|sp| sp.contains("non-interactive session")),
-            "prompt sessions should expose their effective system prompt"
+                .is_some_and(|sp| sp.contains("non-interactive cell")),
+            "prompt cells should expose their effective system prompt"
         );
-        // session-level verify is exposed per session in the board view
-        assert_eq!(task.sessions[0].verify.len(), 1);
-        assert_eq!(task.sessions[0].verify[0].id.as_deref(), Some("fmt"));
-        assert_eq!(task.sessions[0].verify[0].kind, "command");
-        assert_eq!(task.sessions[0].verify[0].spec, "cargo fmt --check");
-        assert!(task.sessions[0].verify[0].model.is_none());
-        assert!(task.sessions[0].verify[0].system_prompt.is_none());
-        assert_eq!(task.verify.len(), 1); // task-level verify
-        assert_eq!(task.verify[0].kind, "command");
-        assert_eq!(task.verify[0].spec, "cargo test");
-        assert!(task.verify[0].system_prompt.is_none());
+        // cell-level proof is exposed per cell in the board view
+        assert_eq!(task.cells[0].proof.len(), 1);
+        assert_eq!(task.cells[0].proof[0].id.as_deref(), Some("fmt"));
+        assert_eq!(task.cells[0].proof[0].kind, "command");
+        assert_eq!(task.cells[0].proof[0].spec, "cargo fmt --check");
+        assert!(task.cells[0].proof[0].model.is_none());
+        assert!(task.cells[0].proof[0].system_prompt.is_none());
+        assert_eq!(task.proof.len(), 1); // task-level proof
+        assert_eq!(task.proof[0].kind, "command");
+        assert_eq!(task.proof[0].spec, "cargo test");
+        assert!(task.proof[0].system_prompt.is_none());
     }
 
     #[test]
-    fn prompt_verifies_expose_effective_system_prompt() {
+    fn prompt_proofs_expose_effective_system_prompt() {
         let src = r#"
 [[task]]
 name = "build"
-[[task.session]]
+[[task.cell]]
 id = "worker"
 cwd = "/repo"
 prompt = "make it build"
-[[task.session.verify]]
-id = "session-check"
+[[task.cell.proof]]
+id = "cell-check"
 prompt = "confirm formatting"
-[[task.verify]]
+[[task.proof]]
 id = "task-check"
 prompt = "confirm tests"
 "#;
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(src), Some("prompt verify"), false)
+            .insert_squad(&parse(src), Some("prompt proof"), false)
             .unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        let session_verify = &run.tasks[0].sessions[0].verify[0];
-        let task_verify = &run.tasks[0].verify[0];
+        let squad = store.get_squad(&id).unwrap();
+        let cell_proof = &squad.tasks[0].cells[0].proof[0];
+        let task_proof = &squad.tasks[0].proof[0];
         assert!(
-            session_verify
+            cell_proof
                 .system_prompt
                 .as_deref()
-                .is_some_and(|sp| sp.contains("VERIFICATION step"))
+                .is_some_and(|sp| sp.contains("PROOF step"))
         );
         assert!(
-            task_verify
+            task_proof
                 .system_prompt
                 .as_deref()
-                .is_some_and(|sp| sp.contains("VERIFICATION step"))
+                .is_some_and(|sp| sp.contains("PROOF step"))
         );
     }
 
     #[test]
-    fn session_view_keeps_authored_system_prompt_text() {
+    fn cell_view_keeps_authored_system_prompt_text() {
         let src = r#"
 [[task]]
 name = "build"
-[[task.session]]
+[[task.cell]]
 id = "worker"
 cwd = "/repo"
 prompt = "make it build"
@@ -6176,18 +6409,18 @@ system_prompt_position = "append"
 "#;
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(src), Some("system prompt"), false)
+            .insert_squad(&parse(src), Some("system prompt"), false)
             .unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        let session = &run.tasks[0].sessions[0];
-        let effective = session.system_prompt.as_deref().unwrap_or("");
+        let squad = store.get_squad(&id).unwrap();
+        let cell = &squad.tasks[0].cells[0];
+        let effective = cell.system_prompt.as_deref().unwrap_or("");
         assert!(
             effective.contains("Do NOT commit and do NOT push under any circumstances."),
-            "details pane payload should keep the authored session system prompt text"
+            "details pane payload should keep the authored cell system prompt text"
         );
         assert!(
-            effective.contains("non-interactive session"),
+            effective.contains("non-interactive cell"),
             "details pane payload should still include ralphus-added unattended instructions"
         );
     }
@@ -6198,14 +6431,14 @@ system_prompt_position = "append"
 [[task]]
 name = "build"
 project = "myrepo"
-[[task.session]]
+[[task.cell]]
 cwd = "/some/other/path"
 prompt = "go"
 "#;
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(src), None, false).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.tasks[0].project, "myrepo");
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].project, "myrepo");
     }
 
     #[test]
@@ -6215,31 +6448,31 @@ prompt = "go"
 name = "build"
 agent = "codex"
 model = "gpt-5-codex"
-[[task.session]]
+[[task.cell]]
 id = "worker"
 cwd = "/repo"
 prompt = "go"
 "#;
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(src), None, false).unwrap();
-        let run = store.get_run(&id).unwrap();
-        let task = &run.tasks[0];
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        let task = &squad.tasks[0];
         assert_eq!(task.agent.as_deref(), Some("codex"));
         assert_eq!(task.model.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(task.sessions[0].agent, "codex");
-        assert_eq!(task.sessions[0].model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(task.cells[0].agent, "codex");
+        assert_eq!(task.cells[0].model.as_deref(), Some("gpt-5-codex"));
     }
 
     #[test]
-    fn task_with_no_sessions_falls_back_to_unassigned() {
+    fn task_with_no_cells_falls_back_to_unassigned() {
         let src = r#"
 [[task]]
 name = "empty"
 "#;
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(src), None, false).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.tasks[0].project, "unassigned");
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].project, "unassigned");
     }
 
     #[test]
@@ -6256,7 +6489,7 @@ name = "empty"
     #[test]
     fn task_name_at_resolves_index_to_name() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         assert_eq!(
             store.task_name_at(&id, 0).unwrap().as_deref(),
             Some("build")
@@ -6266,138 +6499,141 @@ name = "empty"
     }
 
     #[test]
-    fn session_sid_at_resolves_index_to_sid() {
+    fn cell_sid_at_resolves_index_to_sid() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         assert_eq!(
-            store.session_sid_at(&id, 0, 0).unwrap().as_deref(),
+            store.cell_sid_at(&id, 0, 0).unwrap().as_deref(),
             Some("worker")
         );
-        assert_eq!(store.session_sid_at(&id, 0, 99).unwrap(), None);
+        assert_eq!(store.cell_sid_at(&id, 0, 99).unwrap(), None);
     }
 
     #[test]
-    fn run_ids_increment() {
+    fn squad_ids_increment() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        let b = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        assert_eq!(a, "run-000000000001");
-        assert_eq!(b, "run-000000000002");
+        let a = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let b = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(a, "squad-000000000001");
+        assert_eq!(b, "squad-000000000002");
     }
 
     #[test]
     fn hold_submits_as_queued_then_activates() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, true).unwrap();
-        assert_eq!(store.run_state(&id).unwrap(), RunState::Queued);
+        let id = store.insert_squad(&parse(SAMPLE), None, true).unwrap();
+        assert_eq!(store.squad_state(&id).unwrap(), SquadState::Queued);
         assert!(store.list_ready().unwrap().is_empty());
 
-        assert_eq!(store.activate(&id).unwrap(), RunState::Pending);
+        assert_eq!(store.activate(&id).unwrap(), SquadState::Pending);
         assert_eq!(store.list_ready().unwrap(), vec![id]);
     }
 
     #[test]
     fn default_submit_is_pending_and_ready() {
-        // The old-project fix: submitting makes a run schedulable, not stuck.
+        // The old-project fix: submitting makes a squad schedulable, not stuck.
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        assert_eq!(store.run_state(&id).unwrap(), RunState::Pending);
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(store.squad_state(&id).unwrap(), SquadState::Pending);
         assert_eq!(store.list_ready().unwrap(), vec![id]);
     }
 
     #[test]
-    fn cannot_activate_a_pending_run() {
+    fn cannot_activate_a_pending_squad() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         assert!(store.activate(&id).is_err());
     }
 
     #[test]
     fn cancel_sets_cancelled() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        assert_eq!(store.cancel(&id).unwrap(), RunState::Cancelled);
-        // Idempotent — cancelling an already-terminal run still succeeds
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(store.cancel(&id).unwrap(), SquadState::Cancelled);
+        // Idempotent — cancelling an already-terminal squad still succeeds
         // (RAL-116), so it stays locked out of ever being picked up again.
-        assert_eq!(store.cancel(&id).unwrap(), RunState::Cancelled);
+        assert_eq!(store.cancel(&id).unwrap(), SquadState::Cancelled);
     }
 
     #[test]
     fn cancel_is_available_from_a_terminal_done_state() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
-        assert_eq!(store.cancel(&id).unwrap(), RunState::Cancelled);
-        assert_eq!(store.run_state(&id).unwrap(), RunState::Cancelled);
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
+        assert_eq!(store.cancel(&id).unwrap(), SquadState::Cancelled);
+        assert_eq!(store.squad_state(&id).unwrap(), SquadState::Cancelled);
     }
 
     #[test]
     fn cancel_flips_nonterminal_nodes_but_preserves_finished_ones() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
-        // One session already finished; the task is still running.
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        // One cell already finished; the task is still running.
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
 
         store.cancel(&id).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.state, "cancelled");
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.state, "cancelled");
         // The still-running task flips to cancelled…
-        assert_eq!(run.tasks[0].state, "cancelled");
-        // …but the session that already completed keeps its real outcome.
-        assert_eq!(run.tasks[0].sessions[0].state, "done");
+        assert_eq!(squad.tasks[0].state, "cancelled");
+        // …but the cell that already completed keeps its real outcome.
+        assert_eq!(squad.tasks[0].cells[0].state, "done");
     }
 
     // RAL-157: two independent tasks, for solo/unsolo tests.
     const TWO_TASKS: &str = r#"
 [[task]]
 name = "a"
-[[task.session]]
+[[task.cell]]
 cwd = "."
 command = "build a"
 [[task]]
 name = "b"
-[[task.session]]
+[[task.cell]]
 cwd = "."
 command = "build b"
 "#;
 
     #[test]
-    fn solo_task_round_trips_and_is_visible_on_the_run_view() {
+    fn solo_task_round_trips_and_is_visible_on_the_squad_view() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+        let id = store.insert_squad(&parse(TWO_TASKS), None, false).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        assert!(!run.tasks[0].soloed, "not soloed by default");
-        assert!(!run.tasks[1].soloed);
+        let squad = store.get_squad(&id).unwrap();
+        assert!(!squad.tasks[0].soloed, "not soloed by default");
+        assert!(!squad.tasks[1].soloed);
 
         store.solo_task(&id, 0).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(run.tasks[0].soloed);
-        assert!(!run.tasks[1].soloed, "soloing one task doesn't solo others");
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.tasks[0].soloed);
+        assert!(
+            !squad.tasks[1].soloed,
+            "soloing one task doesn't solo others"
+        );
 
         store.unsolo_task(&id, 0).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(!run.tasks[0].soloed);
+        let squad = store.get_squad(&id).unwrap();
+        assert!(!squad.tasks[0].soloed);
     }
 
     #[test]
     fn solo_task_is_idempotent() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+        let id = store.insert_squad(&parse(TWO_TASKS), None, false).unwrap();
         store.solo_task(&id, 0).unwrap();
         store.solo_task(&id, 0).unwrap();
-        assert!(store.get_run(&id).unwrap().tasks[0].soloed);
+        assert!(store.get_squad(&id).unwrap().tasks[0].soloed);
         store.unsolo_task(&id, 0).unwrap();
         store.unsolo_task(&id, 0).unwrap();
-        assert!(!store.get_run(&id).unwrap().tasks[0].soloed);
+        assert!(!store.get_squad(&id).unwrap().tasks[0].soloed);
     }
 
     #[test]
     fn solo_task_unknown_task_index_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+        let id = store.insert_squad(&parse(TWO_TASKS), None, false).unwrap();
         assert!(matches!(
             store.solo_task(&id, 99),
             Err(StoreError::NotFound)
@@ -6407,7 +6643,7 @@ command = "build b"
     #[test]
     fn multiple_tasks_can_be_soloed_at_once_with_no_auto_exclusivity() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(TWO_TASKS), None, false).unwrap();
+        let id = store.insert_squad(&parse(TWO_TASKS), None, false).unwrap();
 
         store.solo_task(&id, 0).unwrap();
         assert_eq!(store.soloed_task_indices(&id).unwrap(), [0].into());
@@ -6421,202 +6657,202 @@ command = "build b"
     }
 
     #[test]
-    fn cancel_run_dry_run_reports_impact_without_mutating() {
+    fn cancel_squad_dry_run_reports_impact_without_mutating() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, b, c) = dependent_chain(&mut store); // a <- b <- c
 
-        let impact = store.cancel_run(&a, true).unwrap();
-        let ids: Vec<&str> = impact.runs.iter().map(|r| r.id.as_str()).collect();
+        let impact = store.cancel_squad(&a, true).unwrap();
+        let ids: Vec<&str> = impact.squads.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec![a.as_str(), b.as_str(), c.as_str()]);
 
         // Nothing was actually mutated.
-        assert_eq!(store.run_state(&a).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&c).unwrap(), RunState::Pending);
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&c).unwrap(), SquadState::Pending);
     }
 
     #[test]
-    fn cancel_run_cascades_to_downstream_dependents() {
+    fn cancel_squad_cascades_to_downstream_dependents() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, b, c) = dependent_chain(&mut store); // a <- b <- c
 
-        let impact = store.cancel_run(&a, false).unwrap();
-        let ids: Vec<&str> = impact.runs.iter().map(|r| r.id.as_str()).collect();
+        let impact = store.cancel_squad(&a, false).unwrap();
+        let ids: Vec<&str> = impact.squads.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec![a.as_str(), b.as_str(), c.as_str()]);
 
-        assert_eq!(store.run_state(&a).unwrap(), RunState::Cancelled);
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Cancelled);
-        assert_eq!(store.run_state(&c).unwrap(), RunState::Cancelled);
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Cancelled);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Cancelled);
+        assert_eq!(store.squad_state(&c).unwrap(), SquadState::Cancelled);
     }
 
     #[test]
-    fn cancel_run_cascades_even_to_already_terminal_dependents() {
+    fn cancel_squad_cascades_even_to_already_terminal_dependents() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, b, _c) = dependent_chain(&mut store); // a <- b <- c
-        store.set_run_state(&b, RunState::Done).unwrap();
+        store.set_squad_state(&b, SquadState::Done).unwrap();
 
-        store.cancel_run(&a, false).unwrap();
-        // Terminal or not, a run that depends (even transitively) on a
-        // cancelled run is locked out of ever being picked up again.
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Cancelled);
+        store.cancel_squad(&a, false).unwrap();
+        // Terminal or not, a squad that depends (even transitively) on a
+        // cancelled squad is locked out of ever being picked up again.
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Cancelled);
     }
 
     #[test]
-    fn cancel_run_missing_is_not_found() {
+    fn cancel_squad_missing_is_not_found() {
         let store = Store::open_in_memory().unwrap();
         assert!(matches!(
-            store.cancel_run("nope", true),
+            store.cancel_squad("nope", true),
             Err(StoreError::NotFound)
         ));
         assert!(matches!(
-            store.cancel_run("nope", false),
+            store.cancel_squad("nope", false),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn session_shows_running_while_its_own_verify_is_still_in_flight() {
-        // Regression: the board must not show a session as "done" while one of
-        // its own session-level verify steps is still pending/running — even
-        // though the persisted `sessions.state` column is (by design, RAL-64)
+    fn cell_shows_running_while_its_own_proof_is_still_in_flight() {
+        // Regression: the board must not show a cell as "done" while one of
+        // its own cell-level proof steps is still pending/running — even
+        // though the persisted `cells.state` column is (by design, RAL-64)
         // already "done" at that point.
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(THREE_SESSION_VERIFIES), None, false)
+            .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
             .unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 1, NodeState::Running)
+            .set_proof_state(&id, 0, "cell", 0, 1, NodeState::Running)
             .unwrap();
         // Index 2 stays "pending".
 
-        let run = store.get_run(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
         assert_eq!(
-            run.tasks[0].sessions[0].state, "running",
-            "session must read as running while a verify step is still in flight"
+            squad.tasks[0].cells[0].state, "running",
+            "cell must read as running while a proof step is still in flight"
         );
 
-        // Once the failing/last verify fails, the session should read as failed.
+        // Once the failing/last proof fails, the cell should read as failed.
         store
-            .set_verify_state(&id, 0, "session", 0, 1, NodeState::Failed)
+            .set_proof_state(&id, 0, "cell", 0, 1, NodeState::Failed)
             .unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 2, NodeState::Cancelled)
+            .set_proof_state(&id, 0, "cell", 0, 2, NodeState::Cancelled)
             .unwrap();
-        let run = store.get_run(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
         assert_eq!(
-            run.tasks[0].sessions[0].state, "failed",
-            "session must read as failed when one of its verifies failed"
+            squad.tasks[0].cells[0].state, "failed",
+            "cell must read as failed when one of its proofs failed"
         );
     }
 
     #[test]
-    fn session_reads_done_when_a_verify_step_is_ignored_not_stuck_running() {
-        // Regression: an `ignored` verify step (a user-set skip/pass-through,
+    fn cell_reads_done_when_a_proof_step_is_ignored_not_stuck_running() {
+        // Regression: an `ignored` proof step (a user-set skip/pass-through,
         // per the scheduler's `continue`-on-ignored handling) must count as a
-        // terminal state for the session rollup, same as done/failed/cancelled
-        // — otherwise a session with an ignored verify step reads "running"
-        // forever even after the run has actually finished.
+        // terminal state for the cell rollup, same as done/failed/cancelled
+        // — otherwise a cell with an ignored proof step reads "running"
+        // forever even after the squad has actually finished.
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(THREE_SESSION_VERIFIES), None, false)
+            .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
             .unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
-            .unwrap();
-        store
-            .set_verify_state(&id, 0, "session", 0, 1, NodeState::Ignored)
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 2, NodeState::Done)
+            .set_proof_state(&id, 0, "cell", 0, 1, NodeState::Ignored)
+            .unwrap();
+        store
+            .set_proof_state(&id, 0, "cell", 0, 2, NodeState::Done)
             .unwrap();
 
-        let run = store.get_run(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
         assert_eq!(
-            run.tasks[0].sessions[0].state, "done",
-            "an ignored verify step must not keep the session stuck at 'running'"
+            squad.tasks[0].cells[0].state, "done",
+            "an ignored proof step must not keep the cell stuck at 'running'"
         );
     }
 
     #[test]
-    fn session_and_task_state_transitions() {
+    fn cell_and_task_state_transitions() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
-        // SAMPLE's session has its own "fmt" verify — mark it done too so the
-        // displayed session state (which folds verify progress back in) reads
-        // as fully done, not "running" on a still-pending verify.
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+        // SAMPLE's cell has its own "fmt" proof — mark it done too so the
+        // displayed cell state (which folds proof progress back in) reads
+        // as fully done, not "running" on a still-pending proof.
         store
-            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
         assert_eq!(store.running_count().unwrap(), 1);
 
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.state, "running");
-        assert_eq!(run.tasks[0].state, "done");
-        assert_eq!(run.tasks[0].sessions[0].state, "done");
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.state, "running");
+        assert_eq!(squad.tasks[0].state, "done");
+        assert_eq!(squad.tasks[0].cells[0].state, "done");
     }
 
     #[test]
-    fn missing_run_is_not_found() {
+    fn missing_squad_is_not_found() {
         let store = Store::open_in_memory().unwrap();
-        assert!(matches!(store.get_run("nope"), Err(StoreError::NotFound)));
+        assert!(matches!(store.get_squad("nope"), Err(StoreError::NotFound)));
     }
 
     #[test]
-    fn recover_orphaned_runs_resets_running_but_keeps_done() {
+    fn recover_orphaned_squads_resets_running_but_keeps_done() {
         let two = r#"
 [[task]]
 name = "t"
-[[task.session]]
+[[task.cell]]
 id = "a"
 cwd = "/repo"
 command = "x"
-[[task.session]]
+[[task.cell]]
 id = "b"
 cwd = "/repo"
 command = "y"
 "#;
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(two), None, false).unwrap();
-        // Simulate an unclean shutdown mid-run: one session finished, one was
+        let id = store.insert_squad(&parse(two), None, false).unwrap();
+        // Simulate an unclean shutdown mid-run: one cell finished, one was
         // still executing when the process died.
-        store.set_run_state(&id, RunState::Running).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
-        store
-            .set_session_state(&id, 0, 1, NodeState::Running)
-            .unwrap();
-        assert_eq!(store.running_session_count().unwrap(), 1);
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 1, NodeState::Running).unwrap();
+        assert_eq!(store.running_cell_count().unwrap(), 1);
 
-        let recovered = store.recover_orphaned_runs().unwrap();
+        let recovered = store.recover_orphaned_squads().unwrap();
         assert_eq!(recovered, vec![id.clone()]);
 
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.state, "pending"); // re-claimable by the scheduler
-        assert_eq!(run.tasks[0].state, "pending");
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.state, "pending"); // re-claimable by the scheduler
+        assert_eq!(squad.tasks[0].state, "pending");
         // Finished work is preserved (skipped on resume); orphaned work resets.
-        assert_eq!(run.tasks[0].sessions[0].state, "done");
-        assert_eq!(run.tasks[0].sessions[1].state, "pending");
-        assert_eq!(store.running_session_count().unwrap(), 0);
+        assert_eq!(squad.tasks[0].cells[0].state, "done");
+        assert_eq!(squad.tasks[0].cells[1].state, "pending");
+        assert_eq!(store.running_cell_count().unwrap(), 0);
     }
 
     #[test]
-    fn cross_run_dependency_gates_readiness() {
+    fn cross_squad_dependency_gates_readiness() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
-        // Run b depends on run a via a [[default]] depends_on.
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        // Squad b depends on squad a via a [[default]] depends_on.
         let dep_toml = format!(
-            "[[default]]\ndepends_on = [\"{a}\"]\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            "[[default]]\ndepends_on = [\"{a}\"]\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
         );
         let b = store
-            .insert_run(&parse(&dep_toml), Some("b"), false)
+            .insert_squad(&parse(&dep_toml), Some("b"), false)
             .unwrap();
 
         // Only `a` is ready while `a` is still pending.
@@ -6625,202 +6861,220 @@ command = "y"
         assert!(!ready.contains(&b));
 
         // Once `a` is Done, `b` becomes ready.
-        store.set_run_state(&a, RunState::Done).unwrap();
+        store.set_squad_state(&a, SquadState::Done).unwrap();
         let ready = store.list_ready().unwrap();
         assert!(ready.contains(&b));
     }
 
     #[test]
-    fn add_run_dependency_appends_and_gates_readiness() {
+    fn add_squad_dependency_appends_and_gates_readiness() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
-        let b = store.insert_run(&parse(SAMPLE), Some("b"), false).unwrap();
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        let b = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
 
         assert!(store.list_ready().unwrap().contains(&b));
-        let deps = store.add_run_dependency(&b, &a).unwrap();
+        let deps = store.add_squad_dependency(&b, &a).unwrap();
         assert_eq!(deps, vec![a.clone()]);
         assert!(!store.list_ready().unwrap().contains(&b));
 
-        store.set_run_state(&a, RunState::Done).unwrap();
+        store.set_squad_state(&a, SquadState::Done).unwrap();
         assert!(store.list_ready().unwrap().contains(&b));
     }
 
     #[test]
-    fn add_run_dependency_is_idempotent() {
+    fn add_squad_dependency_is_idempotent() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
-        let b = store.insert_run(&parse(SAMPLE), Some("b"), false).unwrap();
-        store.add_run_dependency(&b, &a).unwrap();
-        let deps = store.add_run_dependency(&b, &a).unwrap();
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        let b = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
+        store.add_squad_dependency(&b, &a).unwrap();
+        let deps = store.add_squad_dependency(&b, &a).unwrap();
         assert_eq!(deps, vec![a]);
     }
 
     #[test]
-    fn add_run_dependency_rejects_self_reference() {
+    fn add_squad_dependency_rejects_self_reference() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
         assert!(matches!(
-            store.add_run_dependency(&a, &a),
+            store.add_squad_dependency(&a, &a),
             Err(StoreError::InvalidTransition(_))
         ));
     }
 
     #[test]
-    fn add_run_dependency_rejects_direct_cycle() {
+    fn add_squad_dependency_rejects_direct_cycle() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
-        let b = store.insert_run(&parse(SAMPLE), Some("b"), false).unwrap();
-        store.add_run_dependency(&b, &a).unwrap(); // b depends on a
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        let b = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
+        store.add_squad_dependency(&b, &a).unwrap(); // b depends on a
         assert!(matches!(
-            store.add_run_dependency(&a, &b), // a depends on b -> cycle
+            store.add_squad_dependency(&a, &b), // a depends on b -> cycle
             Err(StoreError::InvalidTransition(_))
         ));
     }
 
     #[test]
-    fn add_run_dependency_rejects_transitive_cycle() {
+    fn add_squad_dependency_rejects_transitive_cycle() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, _b, c) = dependent_chain(&mut store); // a <- b <- c
         // c already (transitively) depends on a; making a depend on c is a cycle.
         assert!(matches!(
-            store.add_run_dependency(&a, &c),
+            store.add_squad_dependency(&a, &c),
             Err(StoreError::InvalidTransition(_))
         ));
     }
 
     #[test]
-    fn add_run_dependency_missing_run_or_target_is_not_found() {
+    fn add_squad_dependency_missing_squad_or_target_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
         assert!(matches!(
-            store.add_run_dependency("nope", &a),
+            store.add_squad_dependency("nope", &a),
             Err(StoreError::NotFound)
         ));
         assert!(matches!(
-            store.add_run_dependency(&a, "nope"),
+            store.add_squad_dependency(&a, "nope"),
             Err(StoreError::NotFound)
         ));
     }
 
-    // RAL-19: helper to build a chain of runs a <- b <- c (each depends on the
+    // RAL-19: helper to build a chain of squads a <- b <- c (each depends on the
     // prior via a [[default]] depends_on) and return their ids.
     fn dependent_chain(store: &mut Store) -> (String, String, String) {
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
         let dep_b = format!(
-            "[[default]]\ndepends_on = [\"{a}\"]\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            "[[default]]\ndepends_on = [\"{a}\"]\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
         );
-        let b = store.insert_run(&parse(&dep_b), Some("b"), false).unwrap();
+        let b = store
+            .insert_squad(&parse(&dep_b), Some("b"), false)
+            .unwrap();
         let dep_c = format!(
-            "[[default]]\ndepends_on = [\"{b}\"]\n[[task]]\nname=\"c\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            "[[default]]\ndepends_on = [\"{b}\"]\n[[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
         );
-        let c = store.insert_run(&parse(&dep_c), Some("c"), false).unwrap();
+        let c = store
+            .insert_squad(&parse(&dep_c), Some("c"), false)
+            .unwrap();
         (a, b, c)
     }
 
     #[test]
-    fn restarting_a_run_dirties_all_downstream_runs() {
+    fn restarting_a_squad_dirties_all_downstream_squads() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, b, c) = dependent_chain(&mut store);
         // Drive the whole chain to Done.
         for id in [&a, &b, &c] {
-            store.set_run_state(id, RunState::Done).unwrap();
+            store.set_squad_state(id, SquadState::Done).unwrap();
         }
-        // Restart A: it and both downstream runs must be dirty (Pending) again.
-        let dirtied = store.restart_run(&a).unwrap();
+        // Restart A: it and both downstream squads must be dirty (Pending) again.
+        let dirtied = store.restart_squad(&a).unwrap();
         assert!(
             dirtied.contains(&b) && dirtied.contains(&c),
             "cascade to b and c"
         );
-        assert_eq!(store.run_state(&a).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&c).unwrap(), RunState::Pending);
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&c).unwrap(), SquadState::Pending);
     }
 
     #[test]
-    fn restarting_a_session_dirties_downstream_runs_too() {
+    fn restarting_a_cell_dirties_downstream_squads_too() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, b, _c) = dependent_chain(&mut store);
         for id in [&a, &b] {
-            store.set_run_state(id, RunState::Done).unwrap();
+            store.set_squad_state(id, SquadState::Done).unwrap();
         }
-        // Restart A's single session (task 0, session 0): A goes Pending and the
-        // downstream run B is dirtied.
-        let dirtied = store.restart_session(&a, 0, 0).unwrap();
+        // Restart A's single cell (task 0, cell 0): A goes Pending and the
+        // downstream squad B is dirtied.
+        let dirtied = store.restart_cell(&a, 0, 0).unwrap();
         assert!(dirtied.contains(&b));
-        assert_eq!(store.run_state(&a).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Pending);
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Pending);
     }
 
     #[test]
-    fn run_restart_preview_matches_the_real_restart_without_mutating() {
+    fn squad_restart_preview_matches_the_real_restart_without_mutating() {
         // RAL-104: the dry-run preview must report exactly what the real
         // restart would dirty, and must not touch any state itself.
         let mut store = Store::open_in_memory().unwrap();
         let (a, b, c) = dependent_chain(&mut store);
         for id in [&a, &b, &c] {
-            store.set_run_state(id, RunState::Done).unwrap();
+            store.set_squad_state(id, SquadState::Done).unwrap();
         }
 
-        let preview = store.compute_run_restart_impact(&a).unwrap();
-        let dirtied_ids: Vec<&str> = preview.dirtied_runs.iter().map(|r| r.id.as_str()).collect();
+        let preview = store.compute_squad_restart_impact(&a).unwrap();
+        let dirtied_ids: Vec<&str> = preview
+            .dirtied_squads
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
         assert!(dirtied_ids.contains(&b.as_str()) && dirtied_ids.contains(&c.as_str()));
-        assert_eq!(preview.sessions.len(), 1, "a has one session");
+        assert_eq!(preview.cells.len(), 1, "a has one cell");
         assert_eq!(preview.tasks.len(), 1, "a has one task");
 
         // Nothing was mutated by computing the preview.
-        assert_eq!(store.run_state(&a).unwrap(), RunState::Done);
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Done);
-        assert_eq!(store.run_state(&c).unwrap(), RunState::Done);
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Done);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Done);
+        assert_eq!(store.squad_state(&c).unwrap(), SquadState::Done);
 
         // The real restart dirties exactly the same set the preview reported.
-        let dirtied = store.restart_run(&a).unwrap();
-        assert_eq!(dirtied.len(), preview.dirtied_runs.len());
+        let dirtied = store.restart_squad(&a).unwrap();
+        assert_eq!(dirtied.len(), preview.dirtied_squads.len());
         for id in &dirtied {
             assert!(dirtied_ids.contains(&id.as_str()));
         }
-        assert_eq!(store.run_state(&a).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&b).unwrap(), RunState::Pending);
-        assert_eq!(store.run_state(&c).unwrap(), RunState::Pending);
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&c).unwrap(), SquadState::Pending);
     }
 
     #[test]
-    fn session_restart_preview_matches_the_real_restart_without_mutating() {
-        // RAL-104: same guarantee as the run-level preview, for a single
-        // session restart with an in-run downstream chain plus a dependent run.
+    fn cell_restart_preview_matches_the_real_restart_without_mutating() {
+        // RAL-104: same guarantee as the squad-level preview, for a single
+        // cell restart with an in-squad downstream chain plus a dependent squad.
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
-            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         let dep_toml = format!(
-            "[[default]]\ndepends_on = [\"{run}\"]\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            "[[default]]\ndepends_on = [\"{squad}\"]\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
         );
         let dependent = store
-            .insert_run(&parse(&dep_toml), Some("dependent"), false)
+            .insert_squad(&parse(&dep_toml), Some("dependent"), false)
             .unwrap();
-        store.set_run_state(&dependent, RunState::Done).unwrap();
+        store.set_squad_state(&dependent, SquadState::Done).unwrap();
         for idx in 0..3 {
             store
-                .set_session_state(&run, 0, idx, NodeState::Done)
+                .set_cell_state(&squad, 0, idx, NodeState::Done)
                 .unwrap();
         }
 
-        let preview = store.compute_session_restart_impact(&run, 0, 1).unwrap();
-        let session_ids: Vec<(i64, i64)> = preview
-            .sessions
-            .iter()
-            .map(|s| (s.task_idx, s.idx))
-            .collect();
-        assert_eq!(
-            session_ids,
-            vec![(0, 1), (0, 2)],
-            "s2 and downstream s3 only"
-        );
+        let preview = store.compute_cell_restart_impact(&squad, 0, 1).unwrap();
+        let cell_ids: Vec<(i64, i64)> = preview.cells.iter().map(|s| (s.task_idx, s.idx)).collect();
+        assert_eq!(cell_ids, vec![(0, 1), (0, 2)], "s2 and downstream s3 only");
         assert_eq!(preview.tasks.len(), 1);
         assert_eq!(
             preview
-                .dirtied_runs
+                .dirtied_squads
                 .iter()
                 .map(|r| r.id.clone())
                 .collect::<Vec<_>>(),
@@ -6828,58 +7082,58 @@ command = "y"
         );
 
         // Nothing was mutated by computing the preview.
-        let done = store.done_sessions(&run).unwrap();
+        let done = store.done_cells(&squad).unwrap();
         assert!(done.contains(&(0, 0)) && done.contains(&(0, 1)) && done.contains(&(0, 2)));
-        assert_eq!(store.run_state(&dependent).unwrap(), RunState::Done);
+        assert_eq!(store.squad_state(&dependent).unwrap(), SquadState::Done);
 
         // The real restart applies exactly what the preview reported.
-        store.restart_session(&run, 0, 1).unwrap();
-        let done = store.done_sessions(&run).unwrap();
+        store.restart_cell(&squad, 0, 1).unwrap();
+        let done = store.done_cells(&squad).unwrap();
         assert!(done.contains(&(0, 0)), "s1 stays done");
         assert!(!done.contains(&(0, 1)) && !done.contains(&(0, 2)));
-        assert_eq!(store.run_state(&dependent).unwrap(), RunState::Pending);
+        assert_eq!(store.squad_state(&dependent).unwrap(), SquadState::Pending);
     }
 
     #[test]
-    fn restart_session_resets_downstream_sessions_in_run_but_not_upstream() {
+    fn restart_cell_resets_downstream_cells_in_squad_but_not_upstream() {
         // s1 -> s2 -> s3 within one task; restarting s2 dirties s2 and s3 while
         // s1 stays Done (and is later skipped on re-run).
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
-            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         for idx in 0..3 {
             store
-                .set_session_state(&run, 0, idx, NodeState::Done)
+                .set_cell_state(&squad, 0, idx, NodeState::Done)
                 .unwrap();
         }
-        store.restart_session(&run, 0, 1).unwrap(); // restart s2
-        let done = store.done_sessions(&run).unwrap();
+        store.restart_cell(&squad, 0, 1).unwrap(); // restart s2
+        let done = store.done_cells(&squad).unwrap();
         assert!(done.contains(&(0, 0)), "s1 stays done");
         assert!(!done.contains(&(0, 1)), "s2 dirtied");
         assert!(!done.contains(&(0, 2)), "s3 dirtied (downstream of s2)");
     }
 
     #[test]
-    fn apply_restart_user_note_narrow_targets_only_the_root_session() {
+    fn apply_restart_user_note_narrow_targets_only_the_root_cell() {
         // s1 -> s2 -> s3; a narrow (checkbox-off) restart note on s2 must not
         // reach s1 (upstream) or s3 (downstream).
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
-            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
 
         store
-            .apply_restart_user_note(&run, &[(0, 1)], false, "picking up mid-fix")
+            .apply_restart_user_note(&squad, &[(0, 1)], false, "picking up mid-fix")
             .unwrap();
 
         assert_eq!(
             store
-                .get_ghost(&crate::ghost::session_uri(&run, 0, 1))
+                .get_ghost(&crate::ghost::cell_uri(&squad, 0, 1))
                 .unwrap()
                 .unwrap()
                 .user_note
@@ -6888,17 +7142,17 @@ command = "y"
         );
         assert!(
             store
-                .get_ghost(&crate::ghost::session_uri(&run, 0, 0))
+                .get_ghost(&crate::ghost::cell_uri(&squad, 0, 0))
                 .unwrap()
                 .is_none(),
-            "upstream session must not receive the note"
+            "upstream cell must not receive the note"
         );
         assert!(
             store
-                .get_ghost(&crate::ghost::session_uri(&run, 0, 2))
+                .get_ghost(&crate::ghost::cell_uri(&squad, 0, 2))
                 .unwrap()
                 .is_none(),
-            "downstream session must not receive the note when include_downstream is false"
+            "downstream cell must not receive the note when include_downstream is false"
         );
     }
 
@@ -6906,60 +7160,54 @@ command = "y"
     fn apply_restart_user_note_include_downstream_reaches_children_not_upstream() {
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
-            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s2\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
 
         store
-            .apply_restart_user_note(&run, &[(0, 1)], true, "apply to all children")
+            .apply_restart_user_note(&squad, &[(0, 1)], true, "apply to all children")
             .unwrap();
 
         for idx in [1, 2] {
             assert_eq!(
                 store
-                    .get_ghost(&crate::ghost::session_uri(&run, 0, idx))
+                    .get_ghost(&crate::ghost::cell_uri(&squad, 0, idx))
                     .unwrap()
                     .unwrap()
                     .user_note
                     .as_deref(),
                 Some("apply to all children"),
-                "session {idx} should have the note"
+                "cell {idx} should have the note"
             );
         }
         assert!(
             store
-                .get_ghost(&crate::ghost::session_uri(&run, 0, 0))
+                .get_ghost(&crate::ghost::cell_uri(&squad, 0, 0))
                 .unwrap()
                 .is_none(),
-            "upstream session must still be untouched"
+            "upstream cell must still be untouched"
         );
     }
 
     #[test]
-    fn restart_task_resets_all_of_its_sessions_and_downstream_but_not_upstream() {
+    fn restart_task_resets_all_of_its_cells_and_downstream_but_not_upstream() {
         // t0/s1 -> t0/s2, t1/s3 depends on t0/s2 (cross-task). Restarting t0
-        // must dirty every t0 session plus t1's downstream session, but leave
-        // an unrelated upstream-only session alone.
+        // must dirty every t0 cell plus t1's downstream cell, but leave
+        // an unrelated upstream-only cell alone.
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t0\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
             [[task]]\nname=\"t1\"\n\
-            [[task.session]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"t0/s2\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
-        store
-            .set_session_state(&run, 0, 0, NodeState::Done)
-            .unwrap();
-        store
-            .set_session_state(&run, 0, 1, NodeState::Done)
-            .unwrap();
-        store
-            .set_session_state(&run, 1, 0, NodeState::Done)
-            .unwrap();
+            [[task.cell]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"t0/s2\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&squad, 0, 1, NodeState::Done).unwrap();
+        store.set_cell_state(&squad, 1, 0, NodeState::Done).unwrap();
 
-        store.restart_task(&run, 0).unwrap();
-        let done = store.done_sessions(&run).unwrap();
+        store.restart_task(&squad, 0).unwrap();
+        let done = store.done_cells(&squad).unwrap();
         assert!(!done.contains(&(0, 0)), "t0/s1 dirtied");
         assert!(!done.contains(&(0, 1)), "t0/s2 dirtied");
         assert!(
@@ -6971,10 +7219,10 @@ command = "y"
     #[test]
     fn restart_task_on_missing_task_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         assert!(matches!(
-            store.restart_task(&run, 5),
+            store.restart_task(&squad, 5),
             Err(StoreError::NotFound)
         ));
     }
@@ -6982,24 +7230,24 @@ command = "y"
     // ── env overrides (RAL-150) ───────────────────────────────────────────
 
     #[test]
-    fn run_env_overrides_default_to_empty() {
+    fn squad_env_overrides_default_to_empty() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
-        assert!(store.get_run_env_overrides(&run).unwrap().is_empty());
-        assert!(store.get_run(&run).unwrap().env_overrides.is_empty());
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        assert!(store.get_squad_env_overrides(&squad).unwrap().is_empty());
+        assert!(store.get_squad(&squad).unwrap().env_overrides.is_empty());
     }
 
     #[test]
-    fn set_run_env_overrides_persists_and_merges() {
+    fn set_squad_env_overrides_persists_and_merges() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
 
         let mut set = BTreeMap::new();
         set.insert("A".to_string(), "1".to_string());
         set.insert("B".to_string(), "2".to_string());
-        let result = store.set_run_env_overrides(&run, &set, &[]).unwrap();
+        let result = store.set_squad_env_overrides(&squad, &set, &[]).unwrap();
         assert_eq!(result.get("A").map(String::as_str), Some("1"));
         assert_eq!(result.get("B").map(String::as_str), Some("2"));
 
@@ -7007,7 +7255,7 @@ command = "y"
         let mut set2 = BTreeMap::new();
         set2.insert("C".to_string(), "3".to_string());
         let result2 = store
-            .set_run_env_overrides(&run, &set2, &["A".to_string()])
+            .set_squad_env_overrides(&squad, &set2, &["A".to_string()])
             .unwrap();
         assert!(!result2.contains_key("A"), "A was unset");
         assert_eq!(
@@ -7017,30 +7265,30 @@ command = "y"
         );
         assert_eq!(result2.get("C").map(String::as_str), Some("3"));
 
-        // Persisted across a fresh fetch, and reflected in the RunView.
-        assert_eq!(store.get_run_env_overrides(&run).unwrap(), result2);
-        assert_eq!(store.get_run(&run).unwrap().env_overrides, result2);
+        // Persisted across a fresh fetch, and reflected in the SquadView.
+        assert_eq!(store.get_squad_env_overrides(&squad).unwrap(), result2);
+        assert_eq!(store.get_squad(&squad).unwrap().env_overrides, result2);
     }
 
     #[test]
-    fn set_run_env_overrides_missing_run_is_not_found() {
+    fn set_squad_env_overrides_missing_squad_is_not_found() {
         let store = Store::open_in_memory().unwrap();
         let set = BTreeMap::new();
         assert!(matches!(
-            store.set_run_env_overrides("nope", &set, &[]),
+            store.set_squad_env_overrides("nope", &set, &[]),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn set_run_env_overrides_set_wins_over_unset_for_same_key() {
+    fn set_squad_env_overrides_set_wins_over_unset_for_same_key() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         let mut set = BTreeMap::new();
         set.insert("A".to_string(), "1".to_string());
         let result = store
-            .set_run_env_overrides(&run, &set, &["A".to_string()])
+            .set_squad_env_overrides(&squad, &set, &["A".to_string()])
             .unwrap();
         assert_eq!(result.get("A").map(String::as_str), Some("1"));
     }
@@ -7049,16 +7297,16 @@ command = "y"
     fn env_overrides_survive_retry_to_pending() {
         // Persistence (Q4): overrides must not be cleared by a plain retry.
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         let mut set = BTreeMap::new();
         set.insert("RALPHUS_RESOLVER_MODEL".to_string(), "qwen3:8b".to_string());
-        store.set_run_env_overrides(&run, &set, &[]).unwrap();
+        store.set_squad_env_overrides(&squad, &set, &[]).unwrap();
 
-        store.reset_run_to_pending(&run).unwrap();
+        store.reset_squad_to_pending(&squad).unwrap();
         assert_eq!(
             store
-                .get_run_env_overrides(&run)
+                .get_squad_env_overrides(&squad)
                 .unwrap()
                 .get("RALPHUS_RESOLVER_MODEL"),
             Some(&"qwen3:8b".to_string())
@@ -7067,391 +7315,450 @@ command = "y"
 
     // ── hierarchical env overrides (RAL-150 extension) ─────────────────────
 
-    fn two_task_two_session_toml() -> &'static str {
+    fn two_task_two_cell_toml() -> &'static str {
         "[[task]]\nname=\"t0\"\n\
-         [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-         [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+         [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+         [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
          [[task]]\nname=\"t1\"\n\
-         [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n"
+         [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n"
     }
 
     #[test]
     fn task_env_overrides_default_to_empty() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
-        assert!(store.get_task_env_overrides(&run, 0).unwrap().is_empty());
+        assert!(store.get_task_env_overrides(&squad, 0).unwrap().is_empty());
         assert!(
             store
-                .get_task_verify_env_overrides(&run, 0)
+                .get_task_proof_env_overrides(&squad, 0)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            store.get_run(&run).unwrap().tasks[0]
+            store.get_squad(&squad).unwrap().tasks[0]
                 .env_overrides
                 .is_empty()
         );
         assert!(
-            store.get_run(&run).unwrap().tasks[0]
-                .verify_env_overrides
+            store.get_squad(&squad).unwrap().tasks[0]
+                .proof_env_overrides
                 .is_empty()
         );
     }
 
     #[test]
-    fn toml_environment_seeds_task_and_session_env_overrides() {
-        // RAL-172: a task/session's own `environment` table in the submitted
+    fn toml_environment_seeds_task_and_cell_env_overrides() {
+        // RAL-172: a task/cell's own `environment` table in the submitted
         // TOML seeds the same store columns `set_task_env_overrides`/
-        // `set_session_env_overrides` write to, so it merges into the
-        // existing `run < task < session` layering (RAL-150) with zero
+        // `set_cell_env_overrides` write to, so it merges into the
+        // existing `squad < task < cell` layering (RAL-150) with zero
         // extra resolution logic.
         let src = "[[task]]\nname=\"t0\"\nenvironment={SHARED=\"from-task\", TASK_ONLY=\"1\"}\n\
-                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   environment={SHARED=\"from-session\", SESSION_ONLY=\"2\"}\n";
+                   [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={SHARED=\"from-cell\", CELL_ONLY=\"2\"}\n";
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(src), Some("r"), false).unwrap();
+        let squad = store.insert_squad(&parse(src), Some("r"), false).unwrap();
 
-        let task_env = store.get_task_env_overrides(&run, 0).unwrap();
+        let task_env = store.get_task_env_overrides(&squad, 0).unwrap();
         assert_eq!(
             task_env.get("SHARED").map(String::as_str),
             Some("from-task")
         );
         assert_eq!(task_env.get("TASK_ONLY").map(String::as_str), Some("1"));
 
-        let session_env = store.get_session_env_overrides(&run, 0, 0).unwrap();
+        let cell_env = store.get_cell_env_overrides(&squad, 0, 0).unwrap();
         assert_eq!(
-            session_env.get("SHARED").map(String::as_str),
-            Some("from-session")
+            cell_env.get("SHARED").map(String::as_str),
+            Some("from-cell")
         );
-        assert_eq!(
-            session_env.get("SESSION_ONLY").map(String::as_str),
-            Some("2")
-        );
+        assert_eq!(cell_env.get("CELL_ONLY").map(String::as_str), Some("2"));
 
-        // The session's declared value wins over the task's for the shared
-        // key once resolved, same precedence as a run-time override.
-        let resolved = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
+        // The cell's declared value wins over the task's for the shared
+        // key once resolved, same precedence as a squad-time override.
+        let resolved = store.resolve_cell_env_overrides(&squad, 0, 0).unwrap();
         assert_eq!(
             resolved.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
         assert_eq!(resolved.get("TASK_ONLY").map(String::as_str), Some("1"));
-        assert_eq!(resolved.get("SESSION_ONLY").map(String::as_str), Some("2"));
+        assert_eq!(resolved.get("CELL_ONLY").map(String::as_str), Some("2"));
     }
 
     #[test]
-    fn toml_environment_seeds_each_verify_step_separately() {
-        // RAL-191: the whole point of the per-step layer -- two verify steps
+    fn toml_environment_seeds_each_proof_step_separately() {
+        // RAL-191: the whole point of the per-step layer -- two proof steps
         // under one task set the same key to different values, and neither
         // clobbers the other.
         let src = "[[task]]\nname=\"t0\"\n\
-                   [[task.verify]]\ncommand=\"cargo test\"\nenvironment={RUST_LOG=\"debug\"}\n\
-                   [[task.verify]]\ncommand=\"cargo clippy\"\nenvironment={RUST_LOG=\"warn\"}\n\
-                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   [[task.session.verify]]\ncommand=\"npm test\"\nenvironment={CI=\"1\"}\n";
+                   [[task.proof]]\ncommand=\"cargo test\"\nenvironment={RUST_LOG=\"debug\"}\n\
+                   [[task.proof]]\ncommand=\"cargo clippy\"\nenvironment={RUST_LOG=\"warn\"}\n\
+                   [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.cell.proof]]\ncommand=\"npm test\"\nenvironment={CI=\"1\"}\n";
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(src), Some("r"), false).unwrap();
+        let squad = store.insert_squad(&parse(src), Some("r"), false).unwrap();
 
         let step0 = store
-            .get_verify_step_env_overrides(&run, 0, "task", -1, 0)
+            .get_proof_step_env_overrides(&squad, 0, "task", -1, 0)
             .unwrap();
         let step1 = store
-            .get_verify_step_env_overrides(&run, 0, "task", -1, 1)
+            .get_proof_step_env_overrides(&squad, 0, "task", -1, 1)
             .unwrap();
         assert_eq!(step0.get("RUST_LOG").map(String::as_str), Some("debug"));
         assert_eq!(step1.get("RUST_LOG").map(String::as_str), Some("warn"));
 
         let sess_step = store
-            .get_verify_step_env_overrides(&run, 0, "session", 0, 0)
+            .get_proof_step_env_overrides(&squad, 0, "cell", 0, 0)
             .unwrap();
         assert_eq!(sess_step.get("CI").map(String::as_str), Some("1"));
     }
 
     #[test]
-    fn resolve_verify_step_env_precedence_step_wins_over_every_ancestor() {
-        // RAL-191: run < task < task.verify < step, and
-        // run < task < session < session.verify < step.
+    fn resolve_proof_step_env_precedence_step_wins_over_every_ancestor() {
+        // RAL-191: squad < task < task.proof < step, and
+        // squad < task < cell < cell.proof < step.
         let mut store = Store::open_in_memory().unwrap();
         let src = "[[task]]\nname=\"t0\"\n\
-                   [[task.verify]]\ncommand=\"c\"\n\
-                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   [[task.session.verify]]\ncommand=\"d\"\n";
-        let run = store.insert_run(&parse(src), Some("r"), false).unwrap();
+                   [[task.proof]]\ncommand=\"c\"\n\
+                   [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.cell.proof]]\ncommand=\"d\"\n";
+        let squad = store.insert_squad(&parse(src), Some("r"), false).unwrap();
 
         let mut m = BTreeMap::new();
-        m.insert("A".to_string(), "run".to_string());
-        store.set_run_env_overrides(&run, &m, &[]).unwrap();
-        // With nothing set below it, the step inherits the run's value.
+        m.insert("A".to_string(), "squad".to_string());
+        store.set_squad_env_overrides(&squad, &m, &[]).unwrap();
+        // With nothing set below it, the step inherits the squad's value.
         assert_eq!(
             store
-                .resolve_task_verify_step_env_overrides(&run, 0, 0)
+                .resolve_task_proof_step_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"run".to_string())
+            Some(&"squad".to_string())
         );
 
         let mut m = BTreeMap::new();
-        m.insert("A".to_string(), "task-verify".to_string());
+        m.insert("A".to_string(), "task-proof".to_string());
         store
-            .set_task_verify_env_overrides(&run, 0, &m, &[])
+            .set_task_proof_env_overrides(&squad, 0, &m, &[])
             .unwrap();
         assert_eq!(
             store
-                .resolve_task_verify_step_env_overrides(&run, 0, 0)
+                .resolve_task_proof_step_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"task-verify".to_string())
+            Some(&"task-proof".to_string())
         );
 
-        // The step's own value beats the scope-wide verify layer above it.
+        // The step's own value beats the scope-wide proof layer above it.
         let mut m = BTreeMap::new();
         m.insert("A".to_string(), "step".to_string());
         store
-            .set_verify_step_env_overrides(&run, 0, "task", -1, 0, &m, &[])
+            .set_proof_step_env_overrides(&squad, 0, "task", -1, 0, &m, &[])
             .unwrap();
         assert_eq!(
             store
-                .resolve_task_verify_step_env_overrides(&run, 0, 0)
+                .resolve_task_proof_step_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
             Some(&"step".to_string())
         );
-        // ...and does not leak into the session-scoped chain.
+        // ...and does not leak into the cell-scoped chain.
         assert_eq!(
             store
-                .resolve_session_verify_step_env_overrides(&run, 0, 0, 0)
+                .resolve_cell_proof_step_env_overrides(&squad, 0, 0, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"run".to_string())
+            Some(&"squad".to_string())
         );
     }
 
     #[test]
     fn set_task_env_overrides_persists_and_merges() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
 
         let mut set = BTreeMap::new();
         set.insert("A".to_string(), "1".to_string());
-        let result = store.set_task_env_overrides(&run, 0, &set, &[]).unwrap();
+        let result = store.set_task_env_overrides(&squad, 0, &set, &[]).unwrap();
         assert_eq!(result.get("A").map(String::as_str), Some("1"));
 
         let mut set2 = BTreeMap::new();
         set2.insert("B".to_string(), "2".to_string());
         let result2 = store
-            .set_task_env_overrides(&run, 0, &set2, &["A".to_string()])
+            .set_task_env_overrides(&squad, 0, &set2, &["A".to_string()])
             .unwrap();
         assert!(!result2.contains_key("A"));
         assert_eq!(result2.get("B").map(String::as_str), Some("2"));
 
-        assert_eq!(store.get_task_env_overrides(&run, 0).unwrap(), result2);
-        assert_eq!(store.get_run(&run).unwrap().tasks[0].env_overrides, result2);
+        assert_eq!(store.get_task_env_overrides(&squad, 0).unwrap(), result2);
+        assert_eq!(
+            store.get_squad(&squad).unwrap().tasks[0].env_overrides,
+            result2
+        );
         // Task 1 is untouched.
-        assert!(store.get_task_env_overrides(&run, 1).unwrap().is_empty());
+        assert!(store.get_task_env_overrides(&squad, 1).unwrap().is_empty());
     }
 
     #[test]
     fn set_task_env_overrides_missing_task_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         let set = BTreeMap::new();
         assert!(matches!(
-            store.set_task_env_overrides(&run, 9, &set, &[]),
+            store.set_task_env_overrides(&squad, 9, &set, &[]),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn set_task_verify_env_overrides_persists_independent_of_task_env() {
+    fn set_task_proof_env_overrides_persists_independent_of_task_env() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         let mut set = BTreeMap::new();
         set.insert("A".to_string(), "task".to_string());
-        store.set_task_env_overrides(&run, 0, &set, &[]).unwrap();
+        store.set_task_env_overrides(&squad, 0, &set, &[]).unwrap();
         let mut vset = BTreeMap::new();
-        vset.insert("A".to_string(), "task-verify".to_string());
+        vset.insert("A".to_string(), "task-proof".to_string());
         store
-            .set_task_verify_env_overrides(&run, 0, &vset, &[])
+            .set_task_proof_env_overrides(&squad, 0, &vset, &[])
             .unwrap();
 
         assert_eq!(
-            store.get_task_env_overrides(&run, 0).unwrap().get("A"),
+            store.get_task_env_overrides(&squad, 0).unwrap().get("A"),
             Some(&"task".to_string())
         );
         assert_eq!(
             store
-                .get_task_verify_env_overrides(&run, 0)
+                .get_task_proof_env_overrides(&squad, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"task-verify".to_string())
+            Some(&"task-proof".to_string())
         );
     }
 
     #[test]
-    fn session_env_overrides_default_to_empty() {
+    fn cell_env_overrides_default_to_empty() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         assert!(
             store
-                .get_session_env_overrides(&run, 0, 0)
+                .get_cell_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
-                .get_session_verify_env_overrides(&run, 0, 0)
+                .get_cell_proof_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
-    fn set_session_env_overrides_persists_and_is_scoped_to_that_session() {
+    fn set_cell_env_overrides_persists_and_is_scoped_to_that_cell() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         let mut set = BTreeMap::new();
         set.insert("A".to_string(), "1".to_string());
         store
-            .set_session_env_overrides(&run, 0, 0, &set, &[])
+            .set_cell_env_overrides(&squad, 0, 0, &set, &[])
             .unwrap();
 
         assert_eq!(
-            store
-                .get_session_env_overrides(&run, 0, 0)
-                .unwrap()
-                .get("A"),
+            store.get_cell_env_overrides(&squad, 0, 0).unwrap().get("A"),
             Some(&"1".to_string())
         );
-        // Sibling session (t0/s1) and the other task's session (t1/s0) are untouched.
+        // Sibling cell (t0/s1) and the other task's cell (t1/s0) are untouched.
         assert!(
             store
-                .get_session_env_overrides(&run, 0, 1)
+                .get_cell_env_overrides(&squad, 0, 1)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
-                .get_session_env_overrides(&run, 1, 0)
+                .get_cell_env_overrides(&squad, 1, 0)
                 .unwrap()
                 .is_empty()
         );
 
-        let view = store.get_run(&run).unwrap();
+        let view = store.get_squad(&squad).unwrap();
         assert_eq!(
-            view.tasks[0].sessions[0].env_overrides.get("A"),
+            view.tasks[0].cells[0].env_overrides.get("A"),
             Some(&"1".to_string())
         );
     }
 
     #[test]
-    fn set_session_env_overrides_missing_session_is_not_found() {
+    fn set_cell_env_overrides_missing_cell_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         let set = BTreeMap::new();
         assert!(matches!(
-            store.set_session_env_overrides(&run, 0, 9, &set, &[]),
+            store.set_cell_env_overrides(&squad, 0, 9, &set, &[]),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn resolve_session_env_overrides_precedence_run_lt_task_lt_session() {
+    fn resolve_cell_env_overrides_precedence_squad_lt_task_lt_cell() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
 
-        // Only a run-level value: flows straight through.
-        let mut run_set = BTreeMap::new();
-        run_set.insert("A".to_string(), "run".to_string());
-        run_set.insert("B".to_string(), "run".to_string());
-        run_set.insert("C".to_string(), "run".to_string());
-        store.set_run_env_overrides(&run, &run_set, &[]).unwrap();
-        let merged = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
-        assert_eq!(merged.get("A"), Some(&"run".to_string()));
+        // Only a squad-level value: flows straight through.
+        let mut squad_set = BTreeMap::new();
+        squad_set.insert("A".to_string(), "squad".to_string());
+        squad_set.insert("B".to_string(), "squad".to_string());
+        squad_set.insert("C".to_string(), "squad".to_string());
+        store
+            .set_squad_env_overrides(&squad, &squad_set, &[])
+            .unwrap();
+        let merged = store.resolve_cell_env_overrides(&squad, 0, 0).unwrap();
+        assert_eq!(merged.get("A"), Some(&"squad".to_string()));
 
-        // A task-level value for B wins over the run's, but only for sessions
+        // A task-level value for B wins over the squad's, but only for cells
         // under that task.
         let mut task_set = BTreeMap::new();
         task_set.insert("B".to_string(), "task".to_string());
         store
-            .set_task_env_overrides(&run, 0, &task_set, &[])
+            .set_task_env_overrides(&squad, 0, &task_set, &[])
             .unwrap();
-        let merged = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
-        assert_eq!(merged.get("A"), Some(&"run".to_string()));
+        let merged = store.resolve_cell_env_overrides(&squad, 0, 0).unwrap();
+        assert_eq!(merged.get("A"), Some(&"squad".to_string()));
         assert_eq!(merged.get("B"), Some(&"task".to_string()));
-        let other_task_merged = store.resolve_session_env_overrides(&run, 1, 0).unwrap();
-        assert_eq!(other_task_merged.get("B"), Some(&"run".to_string()));
+        let other_task_merged = store.resolve_cell_env_overrides(&squad, 1, 0).unwrap();
+        assert_eq!(other_task_merged.get("B"), Some(&"squad".to_string()));
 
-        // A session-level value for C wins over both the task's and the run's,
-        // but only for that one session.
-        let mut session_set = BTreeMap::new();
-        session_set.insert("C".to_string(), "session".to_string());
+        // A cell-level value for C wins over both the task's and the squad's,
+        // but only for that one cell.
+        let mut cell_set = BTreeMap::new();
+        cell_set.insert("C".to_string(), "cell".to_string());
         store
-            .set_session_env_overrides(&run, 0, 0, &session_set, &[])
+            .set_cell_env_overrides(&squad, 0, 0, &cell_set, &[])
             .unwrap();
-        let merged = store.resolve_session_env_overrides(&run, 0, 0).unwrap();
-        assert_eq!(merged.get("C"), Some(&"session".to_string()));
-        let sibling_merged = store.resolve_session_env_overrides(&run, 0, 1).unwrap();
-        assert_eq!(sibling_merged.get("C"), Some(&"run".to_string()));
+        let merged = store.resolve_cell_env_overrides(&squad, 0, 0).unwrap();
+        assert_eq!(merged.get("C"), Some(&"cell".to_string()));
+        let sibling_merged = store.resolve_cell_env_overrides(&squad, 0, 1).unwrap();
+        assert_eq!(sibling_merged.get("C"), Some(&"squad".to_string()));
     }
 
     #[test]
-    fn resolve_task_verify_env_overrides_precedence_run_lt_task_lt_task_verify() {
+    fn resolve_cell_env_overrides_batch_matches_the_single_cell_form() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
 
-        let mut run_set = BTreeMap::new();
-        run_set.insert("A".to_string(), "run".to_string());
-        store.set_run_env_overrides(&run, &run_set, &[]).unwrap();
+        let mut squad_set = BTreeMap::new();
+        squad_set.insert("A".to_string(), "squad".to_string());
+        store
+            .set_squad_env_overrides(&squad, &squad_set, &[])
+            .unwrap();
+        let mut task_set = BTreeMap::new();
+        task_set.insert("B".to_string(), "task".to_string());
+        store
+            .set_task_env_overrides(&squad, 0, &task_set, &[])
+            .unwrap();
+        let mut cell_set = BTreeMap::new();
+        cell_set.insert("C".to_string(), "cell".to_string());
+        store
+            .set_cell_env_overrides(&squad, 0, 0, &cell_set, &[])
+            .unwrap();
+
+        let refs = vec![
+            (squad.clone(), 0, 0),
+            (squad.clone(), 0, 1),
+            (squad.clone(), 1, 0),
+        ];
+        let batched = store.resolve_cell_env_overrides_batch(&refs).unwrap();
+        for r in &refs {
+            let single = store.resolve_cell_env_overrides(&r.0, r.1, r.2).unwrap();
+            assert_eq!(batched.get(r), Some(&single), "mismatch for {r:?}");
+        }
+        assert_eq!(
+            batched.get(&(squad.clone(), 0, 0)).unwrap().get("C"),
+            Some(&"cell".to_string())
+        );
+
+        // A squad/task/cell combo with no rows at all resolves to empty
+        // rather than erroring, mirroring the per-cell version's behavior
+        // for a deleted ancestor.
+        let missing = vec![("no-such-squad".to_string(), 0, 0)];
+        let batched_missing = store.resolve_cell_env_overrides_batch(&missing).unwrap();
+        assert!(
+            batched_missing
+                .get(&("no-such-squad".to_string(), 0, 0))
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            store
+                .resolve_cell_env_overrides_batch(&[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_task_proof_env_overrides_precedence_squad_lt_task_lt_task_proof() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
+            .unwrap();
+
+        let mut squad_set = BTreeMap::new();
+        squad_set.insert("A".to_string(), "squad".to_string());
+        store
+            .set_squad_env_overrides(&squad, &squad_set, &[])
+            .unwrap();
 
         let mut task_set = BTreeMap::new();
         task_set.insert("A".to_string(), "task".to_string());
         store
-            .set_task_env_overrides(&run, 0, &task_set, &[])
+            .set_task_env_overrides(&squad, 0, &task_set, &[])
             .unwrap();
-        // Task-verify has no value of its own yet -- inherits the task's.
+        // Task-proof has no value of its own yet -- inherits the task's.
         assert_eq!(
             store
-                .resolve_task_verify_env_overrides(&run, 0)
+                .resolve_task_proof_env_overrides(&squad, 0)
                 .unwrap()
                 .get("A"),
             Some(&"task".to_string())
         );
 
-        let mut verify_set = BTreeMap::new();
-        verify_set.insert("A".to_string(), "task-verify".to_string());
+        let mut proof_set = BTreeMap::new();
+        proof_set.insert("A".to_string(), "task-proof".to_string());
         store
-            .set_task_verify_env_overrides(&run, 0, &verify_set, &[])
+            .set_task_proof_env_overrides(&squad, 0, &proof_set, &[])
             .unwrap();
         assert_eq!(
             store
-                .resolve_task_verify_env_overrides(&run, 0)
+                .resolve_task_proof_env_overrides(&squad, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"task-verify".to_string())
+            Some(&"task-proof".to_string())
         );
-        // The plain (non-verify) task resolution is untouched by the
-        // task-verify-only override.
+        // The plain (non-proof) task resolution is untouched by the
+        // task-proof-only override.
         assert_eq!(
             store
-                .resolve_session_env_overrides(&run, 0, 0)
+                .resolve_cell_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
             Some(&"task".to_string())
@@ -7459,58 +7766,60 @@ command = "y"
     }
 
     #[test]
-    fn resolve_session_verify_env_overrides_precedence_full_chain() {
+    fn resolve_cell_proof_env_overrides_precedence_full_chain() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(two_task_two_session_toml()), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
 
-        let mut run_set = BTreeMap::new();
-        run_set.insert("A".to_string(), "run".to_string());
-        store.set_run_env_overrides(&run, &run_set, &[]).unwrap();
+        let mut squad_set = BTreeMap::new();
+        squad_set.insert("A".to_string(), "squad".to_string());
+        store
+            .set_squad_env_overrides(&squad, &squad_set, &[])
+            .unwrap();
         let mut task_set = BTreeMap::new();
         task_set.insert("A".to_string(), "task".to_string());
         store
-            .set_task_env_overrides(&run, 0, &task_set, &[])
+            .set_task_env_overrides(&squad, 0, &task_set, &[])
             .unwrap();
-        let mut session_set = BTreeMap::new();
-        session_set.insert("A".to_string(), "session".to_string());
+        let mut cell_set = BTreeMap::new();
+        cell_set.insert("A".to_string(), "cell".to_string());
         store
-            .set_session_env_overrides(&run, 0, 0, &session_set, &[])
+            .set_cell_env_overrides(&squad, 0, 0, &cell_set, &[])
             .unwrap();
-        // No session-verify value yet -- inherits the session's.
+        // No cell-proof value yet -- inherits the cell's.
         assert_eq!(
             store
-                .resolve_session_verify_env_overrides(&run, 0, 0)
+                .resolve_cell_proof_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"session".to_string())
+            Some(&"cell".to_string())
         );
 
-        let mut verify_set = BTreeMap::new();
-        verify_set.insert("A".to_string(), "session-verify".to_string());
+        let mut proof_set = BTreeMap::new();
+        proof_set.insert("A".to_string(), "cell-proof".to_string());
         store
-            .set_session_verify_env_overrides(&run, 0, 0, &verify_set, &[])
+            .set_cell_proof_env_overrides(&squad, 0, 0, &proof_set, &[])
             .unwrap();
         assert_eq!(
             store
-                .resolve_session_verify_env_overrides(&run, 0, 0)
+                .resolve_cell_proof_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"session-verify".to_string())
+            Some(&"cell-proof".to_string())
         );
-        // The plain session resolution is untouched by the session-verify-only
-        // override, and a sibling session's verify resolution never sees it.
+        // The plain cell resolution is untouched by the cell-proof-only
+        // override, and a sibling cell's proof resolution never sees it.
         assert_eq!(
             store
-                .resolve_session_env_overrides(&run, 0, 0)
+                .resolve_cell_env_overrides(&squad, 0, 0)
                 .unwrap()
                 .get("A"),
-            Some(&"session".to_string())
+            Some(&"cell".to_string())
         );
         assert_eq!(
             store
-                .resolve_session_verify_env_overrides(&run, 0, 1)
+                .resolve_cell_proof_env_overrides(&squad, 0, 1)
                 .unwrap()
                 .get("A"),
             Some(&"task".to_string())
@@ -7518,57 +7827,55 @@ command = "y"
     }
 
     #[test]
-    fn get_task_session_ids_returns_all_sessions_ordered() {
+    fn get_task_cell_ids_returns_all_cells_ordered() {
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task]]\nname=\"u\"\n[[task.session]]\nid=\"other\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"u\"\n[[task.cell]]\nid=\"other\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         assert_eq!(
-            store.get_task_session_ids(&run, 0).unwrap(),
+            store.get_task_cell_ids(&squad, 0).unwrap(),
             vec![(0, "s1".to_string()), (1, "s2".to_string())]
         );
         assert_eq!(
-            store.get_task_session_ids(&run, 1).unwrap(),
+            store.get_task_cell_ids(&squad, 1).unwrap(),
             vec![(0, "other".to_string())]
         );
     }
 
     #[test]
-    fn get_task_session_ids_empty_for_unknown_task() {
+    fn get_task_cell_ids_empty_for_unknown_task() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        assert_eq!(store.get_task_session_ids(&run, 99).unwrap(), Vec::new());
+        let squad = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(store.get_task_cell_ids(&squad, 99).unwrap(), Vec::new());
     }
 
     #[test]
-    fn record_session_result_does_not_clobber_a_manually_finalized_session() {
+    fn record_cell_result_does_not_clobber_a_manually_finalized_cell() {
         // RAL-163: a manual set-status override (server::capture_and_stop_node)
-        // can finalize a session's state while the scheduler's own runner call
+        // can finalize a cell's state while the scheduler's own runner call
         // for it is still in flight. When that call eventually unblocks and
-        // reaches `record_session_result`, it must not stomp the manual
+        // reaches `record_cell_result`, it must not stomp the manual
         // override back to whatever the runner actually returned.
-        // Deliberately no session-level verify step here (unlike SAMPLE) --
-        // `get_run`'s view folds a raw `done` state through
-        // `effective_session_state`, which would otherwise mask the very
+        // Deliberately no cell-level proof step here (unlike SAMPLE) --
+        // `get_squad`'s view folds a raw `done` state through
+        // `effective_cell_state`, which would otherwise mask the very
         // column this test is asserting on.
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Running)
+            .set_cell_state(&squad, 0, 0, NodeState::Running)
             .unwrap();
 
         // The user manually finalizes it to `done` while the agent (unknown to
         // the store) is still actually running.
-        store
-            .set_session_state(&run, 0, 0, NodeState::Done)
-            .unwrap();
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
 
         // The scheduler's in-flight runner call finally returns -- too late,
         // the node is no longer `running`/`pending`, so this must be a no-op.
-        let outcome = SessionOutcome {
+        let outcome = CellOutcome {
             state: NodeState::Failed,
             tokens_in: 7,
             tokens_out: 9,
@@ -7576,31 +7883,31 @@ command = "y"
             error: Some("late result".to_string()),
             agent_session_id: None,
         };
-        store.record_session_result(&run, 0, 0, &outcome).unwrap();
+        store.record_cell_result(&squad, 0, 0, &outcome).unwrap();
 
         assert_eq!(
-            store.session_state(&run, 0, 0).unwrap(),
+            store.cell_state(&squad, 0, 0).unwrap(),
             Some(NodeState::Done),
             "the manual override must stick, not be overwritten by the late runner result"
         );
-        let run_view = store.get_run(&run).unwrap();
-        let session = &run_view.tasks[0].sessions[0];
+        let squad_view = store.get_squad(&squad).unwrap();
+        let cell = &squad_view.tasks[0].cells[0];
         assert_eq!(
-            session.tokens_in, 0,
+            cell.tokens_in, 0,
             "late outcome fields must not land either"
         );
-        assert!(session.error.is_none());
+        assert!(cell.error.is_none());
     }
 
     #[test]
-    fn record_session_result_applies_normally_when_session_is_still_running() {
-        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    fn record_cell_result_applies_normally_when_cell_is_still_running() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Running)
+            .set_cell_state(&squad, 0, 0, NodeState::Running)
             .unwrap();
-        let outcome = SessionOutcome {
+        let outcome = CellOutcome {
             state: NodeState::Done,
             tokens_in: 3,
             tokens_out: 4,
@@ -7608,23 +7915,25 @@ command = "y"
             error: None,
             agent_session_id: None,
         };
-        store.record_session_result(&run, 0, 0, &outcome).unwrap();
+        store.record_cell_result(&squad, 0, 0, &outcome).unwrap();
         assert_eq!(
-            store.session_state(&run, 0, 0).unwrap(),
+            store.cell_state(&squad, 0, 0).unwrap(),
             Some(NodeState::Done)
         );
-        let run_view = store.get_run(&run).unwrap();
-        let session = &run_view.tasks[0].sessions[0];
-        assert_eq!(session.tokens_in, 3);
+        let squad_view = store.get_squad(&squad).unwrap();
+        let cell = &squad_view.tasks[0].cells[0];
+        assert_eq!(cell.tokens_in, 3);
     }
 
     #[test]
-    fn record_session_result_applies_to_a_never_started_pending_session() {
+    fn record_cell_result_applies_to_a_never_started_pending_cell() {
         // Mirrors the "blocked by a failed dependency" scheduler path: the
-        // session never left `pending` before its outcome is recorded.
+        // cell never left `pending` before its outcome is recorded.
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(SAMPLE), Some("r"), false).unwrap();
-        let outcome = SessionOutcome {
+        let squad = store
+            .insert_squad(&parse(SAMPLE), Some("r"), false)
+            .unwrap();
+        let outcome = CellOutcome {
             state: NodeState::Failed,
             tokens_in: 0,
             tokens_out: 0,
@@ -7632,268 +7941,274 @@ command = "y"
             error: Some("blocked by a failed dependency".to_string()),
             agent_session_id: None,
         };
-        store.record_session_result(&run, 0, 0, &outcome).unwrap();
-        let run_view = store.get_run(&run).unwrap();
-        let session = &run_view.tasks[0].sessions[0];
-        assert_eq!(session.state, "failed");
+        store.record_cell_result(&squad, 0, 0, &outcome).unwrap();
+        let squad_view = store.get_squad(&squad).unwrap();
+        let cell = &squad_view.tasks[0].cells[0];
+        assert_eq!(cell.state, "failed");
         assert_eq!(
-            session.error.as_deref(),
+            cell.error.as_deref(),
             Some("blocked by a failed dependency")
         );
     }
 
     #[test]
-    fn done_sessions_excludes_sessions_with_pending_session_verifies() {
-        // RAL-64: if the daemon stopped between record_session_result and
-        // run_verifies, the session is 'done' in the DB but its verifies are
-        // still 'pending'. done_sessions must NOT return such a session, so that
-        // the scheduler re-runs the worker and the verifies actually execute.
+    fn done_cells_excludes_cells_with_pending_cell_proofs() {
+        // RAL-64: if the daemon stopped between record_cell_result and
+        // run_proofs, the cell is 'done' in the DB but its proofs are
+        // still 'pending'. done_cells must NOT return such a cell, so that
+        // the scheduler re-runs the worker and the proofs actually execute.
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.session.verify]]\ncommand=\"exit 0\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell.proof]]\ncommand=\"exit 0\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
 
-        // Simulate the crash window: session is Done, verify is still Pending.
-        store
-            .set_session_state(&run, 0, 0, NodeState::Done)
-            .unwrap();
-        // Verify is inserted as 'pending' by insert_run — leave it as-is.
+        // Simulate the crash window: cell is Done, proof is still Pending.
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
+        // Proof is inserted as 'pending' by insert_squad — leave it as-is.
 
-        let done = store.done_sessions(&run).unwrap();
+        let done = store.done_cells(&squad).unwrap();
         assert!(
             !done.contains(&(0, 0)),
-            "session with pending verify must not be in done_sessions"
+            "cell with pending proof must not be in done_cells"
         );
 
-        // After completing the verify, the session is returned.
+        // After completing the proof, the cell is returned.
         store
-            .set_verify_state(&run, 0, "session", 0, 0, NodeState::Done)
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
-        let done = store.done_sessions(&run).unwrap();
+        let done = store.done_cells(&squad).unwrap();
         assert!(
             done.contains(&(0, 0)),
-            "session with completed verify must be in done_sessions"
+            "cell with completed proof must be in done_cells"
         );
     }
 
     #[test]
-    fn failed_sessions_returns_only_sessions_in_failed_state() {
+    fn failed_cells_returns_only_cells_in_failed_state() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task]]\nname=\"c\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Failed)
+            .set_cell_state(&squad, 0, 0, NodeState::Failed)
             .unwrap();
-        store
-            .set_session_state(&run, 1, 0, NodeState::Done)
-            .unwrap();
-        // task_idx 2 stays Pending (insert_run's default).
+        store.set_cell_state(&squad, 1, 0, NodeState::Done).unwrap();
+        // task_idx 2 stays Pending (insert_squad's default).
 
-        let failed = store.failed_sessions(&run).unwrap();
+        let failed = store.failed_cells(&squad).unwrap();
         assert_eq!(failed, HashSet::from([(0, 0)]));
     }
 
-    /// RAL-185: the seed the scheduler needs so a run-level cancel's leftovers
-    /// stay terminal. Mirrors `failed_sessions_returns_only_sessions_in_failed_state`.
+    /// RAL-185: the seed the scheduler needs so a squad-level cancel's leftovers
+    /// stay terminal. Mirrors `failed_cells_returns_only_cells_in_failed_state`.
     #[test]
-    fn cancelled_sessions_and_tasks_return_only_rows_in_cancelled_state() {
+    fn cancelled_cells_and_tasks_return_only_rows_in_cancelled_state() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task]]\nname=\"c\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         // Task 0 finished for real before the cancel; task 1 was still in
         // flight and got flipped; task 2 never started and got flipped too.
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
+        store.set_task_state(&squad, 0, NodeState::Done).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Done)
+            .set_cell_state(&squad, 1, 0, NodeState::Running)
             .unwrap();
-        store.set_task_state(&run, 0, NodeState::Done).unwrap();
-        store
-            .set_session_state(&run, 1, 0, NodeState::Running)
-            .unwrap();
-        store.set_task_state(&run, 1, NodeState::Running).unwrap();
+        store.set_task_state(&squad, 1, NodeState::Running).unwrap();
 
-        store.cancel(&run).unwrap();
+        store.cancel(&squad).unwrap();
 
         assert_eq!(
-            store.cancelled_sessions(&run).unwrap(),
+            store.cancelled_cells(&squad).unwrap(),
             HashSet::from([(1, 0), (2, 0)]),
-            "the already-Done session must be left alone by a run-level cancel"
+            "the already-Done cell must be left alone by a squad-level cancel"
         );
         assert_eq!(
-            store.cancelled_tasks(&run).unwrap(),
+            store.cancelled_tasks(&squad).unwrap(),
             HashSet::from([1, 2]),
-            "cancel_nonterminal_nodes flips tasks alongside sessions"
+            "cancel_nonterminal_nodes flips tasks alongside cells"
         );
     }
 
-    /// RAL-185 AC: a whole-run restart must still revive cancelled sessions.
-    /// `reset_run_to_pending` rewrites *every* row, so by the time the
+    /// RAL-185 AC: a whole-squad restart must still revive cancelled cells.
+    /// `reset_squad_to_pending` rewrites *every* row, so by the time the
     /// scheduler reads its seeds there is nothing left in `cancelled` state and
-    /// the new `cancelled_sessions`/`cancelled_tasks` seeds are inert.
+    /// the new `cancelled_cells`/`cancelled_tasks` seeds are inert.
     #[test]
-    fn restart_run_clears_cancelled_state_so_the_scheduler_seeds_are_empty() {
+    fn restart_squad_clears_cancelled_state_so_the_scheduler_seeds_are_empty() {
         let mut store = Store::open_in_memory().unwrap();
-        let toml = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Running)
+            .set_cell_state(&squad, 0, 0, NodeState::Running)
             .unwrap();
-        store.cancel(&run).unwrap();
-        assert!(!store.cancelled_sessions(&run).unwrap().is_empty());
+        store.cancel(&squad).unwrap();
+        assert!(!store.cancelled_cells(&squad).unwrap().is_empty());
 
-        store.restart_run(&run).unwrap();
+        store.restart_squad(&squad).unwrap();
 
         assert!(
-            store.cancelled_sessions(&run).unwrap().is_empty(),
-            "restart_run must leave no session cancelled, or the scheduler \
+            store.cancelled_cells(&squad).unwrap().is_empty(),
+            "restart_squad must leave no cell cancelled, or the scheduler \
              would refuse to dispatch it"
         );
-        assert!(store.cancelled_tasks(&run).unwrap().is_empty());
+        assert!(store.cancelled_tasks(&squad).unwrap().is_empty());
     }
 
     #[test]
-    fn restart_run_on_missing_run_is_not_found() {
+    fn restart_squad_on_missing_squad_is_not_found() {
         let store = Store::open_in_memory().unwrap();
         assert!(matches!(
-            store.restart_run("nope"),
+            store.restart_squad("nope"),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn delete_run_removes_it_and_children() {
+    fn delete_squad_removes_it_and_children() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(SAMPLE), Some("gone"), false)
+            .insert_squad(&parse(SAMPLE), Some("gone"), false)
             .unwrap();
-        store.delete_run(&id).unwrap();
-        assert!(matches!(store.get_run(&id), Err(StoreError::NotFound)));
-        // The child rows are gone too, so a re-fetch of sessions is empty.
-        assert!(store.sessions_of(&id).unwrap().is_empty());
+        store.delete_squad(&id).unwrap();
+        assert!(matches!(store.get_squad(&id), Err(StoreError::NotFound)));
+        // The child rows are gone too, so a re-fetch of cells is empty.
+        assert!(store.cells_of(&id).unwrap().is_empty());
         // Deleting again is a NotFound.
-        assert!(matches!(store.delete_run(&id), Err(StoreError::NotFound)));
+        assert!(matches!(store.delete_squad(&id), Err(StoreError::NotFound)));
     }
 
     #[test]
-    fn session_lists_the_reviews_its_branch_participates_in() {
-        // RAL-17: a session whose review branch is in a guardian's stack (both
-        // tied to the same run) lists that review in its board view.
+    fn cell_lists_the_reviews_its_branch_participates_in() {
+        // RAL-17: a cell whose review branch is in a guardian's stack (both
+        // tied to the same squad) lists that review in its board view.
         let mut store = Store::open_in_memory().unwrap();
-        let run = store.insert_run(&parse(SAMPLE), Some("r"), false).unwrap();
+        let squad = store
+            .insert_squad(&parse(SAMPLE), Some("r"), false)
+            .unwrap();
         let gid = store
-            .create_guardian_for_run("Backend review", "main", "/repo", Some(&run))
+            .create_guardian_for_squad("Backend review", "main", "/repo", Some(&squad))
             .unwrap();
         store.add_guardian_branch(&gid, "feature/a").unwrap();
-        // The single SAMPLE session is task 0, session 0.
+        // The single SAMPLE cell is task 0, cell 0.
         store
-            .set_session_review_branch(&run, 0, 0, "feature/a")
+            .set_cell_review_branch(&squad, 0, 0, "feature/a")
             .unwrap();
 
-        let view = store.get_run(&run).unwrap();
-        let session = &view.tasks[0].sessions[0];
-        assert_eq!(session.reviews.len(), 1);
-        assert_eq!(session.reviews[0].id, gid);
-        assert_eq!(session.reviews[0].name, "Backend review");
-        // A session with no review branch lists nothing.
-        let run2 = store.insert_run(&parse(SAMPLE), Some("r2"), false).unwrap();
-        let view2 = store.get_run(&run2).unwrap();
-        assert!(view2.tasks[0].sessions[0].reviews.is_empty());
+        let view = store.get_squad(&squad).unwrap();
+        let cell = &view.tasks[0].cells[0];
+        assert_eq!(cell.reviews.len(), 1);
+        assert_eq!(cell.reviews[0].id, gid);
+        assert_eq!(cell.reviews[0].name, "Backend review");
+        // A cell with no review branch lists nothing.
+        let squad2 = store
+            .insert_squad(&parse(SAMPLE), Some("r2"), false)
+            .unwrap();
+        let view2 = store.get_squad(&squad2).unwrap();
+        assert!(view2.tasks[0].cells[0].reviews.is_empty());
     }
 
     #[test]
-    fn session_lists_a_review_whose_guardian_was_created_by_a_different_run() {
-        // A guardian created by one run's submission (its `run_id` column) can
-        // later be *found* rather than created for a second run that shares a
+    fn cell_lists_a_review_whose_guardian_was_created_by_a_different_squad() {
+        // A guardian created by one squad's submission (its `squad_id` column) can
+        // later be *found* rather than created for a second squad that shares a
         // `ralphus:new-review/<key>` link (or was attached to manually) — its
-        // `run_id` still points at the first run, but the second run's session
+        // `squad_id` still points at the first squad, but the second squad's cell
         // branch is appended to it. The "in reviews" lookup must match by
-        // `sessions.review_branch = guardian_branches.branch`, not by
-        // `guardians.run_id`, or the second run's session sees no review at all.
+        // `cells.review_branch = guardian_branches.branch`, not by
+        // `guardians.squad_id`, or the second squad's cell sees no review at all.
         let mut store = Store::open_in_memory().unwrap();
-        let run_a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
+        let squad_a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
         let gid = store
-            .create_guardian_for_run("Shared review", "main", "/repo", Some(&run_a))
+            .create_guardian_for_squad("Shared review", "main", "/repo", Some(&squad_a))
             .unwrap();
         store.add_guardian_branch(&gid, "feature/b").unwrap();
 
-        let run_b = store.insert_run(&parse(SAMPLE), Some("b"), false).unwrap();
+        let squad_b = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
         store
-            .set_session_review_branch(&run_b, 0, 0, "feature/b")
+            .set_cell_review_branch(&squad_b, 0, 0, "feature/b")
             .unwrap();
 
-        let view_b = store.get_run(&run_b).unwrap();
-        let session = &view_b.tasks[0].sessions[0];
-        assert_eq!(session.reviews.len(), 1);
-        assert_eq!(session.reviews[0].id, gid);
-        assert_eq!(session.reviews[0].name, "Shared review");
+        let view_b = store.get_squad(&squad_b).unwrap();
+        let cell = &view_b.tasks[0].cells[0];
+        assert_eq!(cell.reviews.len(), 1);
+        assert_eq!(cell.reviews[0].id, gid);
+        assert_eq!(cell.reviews[0].name, "Shared review");
     }
 
     #[test]
-    fn list_runs_newest_first() {
+    fn list_squads_newest_first() {
         let mut store = Store::open_in_memory().unwrap();
-        let _a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
-        let b = store.insert_run(&parse(SAMPLE), Some("b"), false).unwrap();
-        let runs = store.list_runs().unwrap();
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].id, b); // newest first
+        let _a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        let b = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
+        let squads = store.list_squads().unwrap();
+        assert_eq!(squads.len(), 2);
+        assert_eq!(squads[0].id, b); // newest first
     }
 
     #[test]
     fn state_transitions_are_logged_and_cleaned_up() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
-        let events = store.events_for_run(&id, 100).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
+        let events = store.events_for_squad(&id, 100).unwrap();
         // Oldest-first, and the last transition is "done".
         assert!(
             events
                 .iter()
-                .any(|e| e.scope == "run" && e.message.contains("running"))
+                .any(|e| e.scope == "squad" && e.message.contains("running"))
         );
-        assert_eq!(events.last().unwrap().message, "run → done");
-        // Deleting the run removes its events.
-        store.delete_run(&id).unwrap();
-        assert!(store.events_for_run(&id, 100).unwrap().is_empty());
+        assert_eq!(events.last().unwrap().message, "squad → done");
+        // Deleting the squad removes its events.
+        store.delete_squad(&id).unwrap();
+        assert!(store.events_for_squad(&id, 100).unwrap().is_empty());
     }
 
     #[test]
-    fn run_state_stamps_started_and_finished_at() {
+    fn squad_state_stamps_started_and_finished_at() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(run.started_at_ms.is_none());
-        assert!(run.finished_at_ms.is_none());
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.started_at_ms.is_none());
+        assert!(squad.finished_at_ms.is_none());
 
-        store.set_run_state(&id, RunState::Running).unwrap();
-        let run = store.get_run(&id).unwrap();
-        let started = run.started_at_ms.expect("started_at_ms set on running");
-        assert!(run.finished_at_ms.is_none());
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        let started = squad.started_at_ms.expect("started_at_ms set on running");
+        assert!(squad.finished_at_ms.is_none());
 
-        store.set_run_state(&id, RunState::Done).unwrap();
-        let run = store.get_run(&id).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
+        let squad = store.get_squad(&id).unwrap();
         // started_at_ms is untouched by the terminal transition.
-        assert_eq!(run.started_at_ms, Some(started));
-        assert!(run.finished_at_ms.is_some());
+        assert_eq!(squad.started_at_ms, Some(started));
+        assert!(squad.finished_at_ms.is_some());
     }
 
     #[test]
-    fn run_state_started_at_is_not_overwritten_by_re_entering_running() {
+    fn squad_state_started_at_is_not_overwritten_by_re_entering_running() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
-        let first_started = store.get_run(&id).unwrap().started_at_ms.unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        let first_started = store.get_squad(&id).unwrap().started_at_ms.unwrap();
 
-        // A run doesn't normally re-enter `running` without a restart in
+        // A squad doesn't normally re-enter `running` without a restart in
         // between, but the setter must be idempotent regardless.
-        store.set_run_state(&id, RunState::Running).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
         assert_eq!(
-            store.get_run(&id).unwrap().started_at_ms,
+            store.get_squad(&id).unwrap().started_at_ms,
             Some(first_started)
         );
     }
@@ -7902,43 +8217,41 @@ command = "y"
     fn old_timestamps_do_not_make_running_work_look_unhealthy() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(SAMPLE), Some("slow"), false)
+            .insert_squad(&parse(SAMPLE), Some("slow"), false)
             .unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
-        store
-            .set_session_state(&id, 0, 0, NodeState::Running)
-            .unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
 
         // Simulate a legitimately long-running task entirely by rewriting the
         // persisted clocks, rather than by waiting in real time.
         store
             .conn
             .execute(
-                "UPDATE runs SET created_at_ms=0, updated_at_ms=0 WHERE id=?",
+                "UPDATE squads SET created_at_ms=0, updated_at_ms=0 WHERE id=?",
                 params![id],
             )
             .unwrap();
         store
             .conn
-            .execute("UPDATE events SET at_ms=0 WHERE run_id=?", params![id])
+            .execute("UPDATE events SET at_ms=0 WHERE squad_id=?", params![id])
             .unwrap();
         store
             .conn
             .execute(
-                "UPDATE cartographer_events SET at_ms=0 WHERE run_id=?",
+                "UPDATE cartographer_events SET at_ms=0 WHERE squad_id=?",
                 params![id],
             )
             .unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.created_at_ms, 0);
-        assert_eq!(run.state, "running");
-        assert_eq!(run.tasks[0].state, "running");
-        assert_eq!(run.tasks[0].sessions[0].state, "running");
-        assert!(run.tasks[0].sessions[0].error.is_none());
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.created_at_ms, 0);
+        assert_eq!(squad.state, "running");
+        assert_eq!(squad.tasks[0].state, "running");
+        assert_eq!(squad.tasks[0].cells[0].state, "running");
+        assert!(squad.tasks[0].cells[0].error.is_none());
 
-        let events = store.events_for_run(&id, 100).unwrap();
+        let events = store.events_for_squad(&id, 100).unwrap();
         assert!(
             !events.is_empty(),
             "running work should still have event history"
@@ -7947,7 +8260,7 @@ command = "y"
 
         let carto = store
             .cartographer_query(&crate::cartographer::CartographerFilter {
-                run_id: Some(id.clone()),
+                squad_id: Some(id.clone()),
                 limit: 100,
                 ..Default::default()
             })
@@ -7964,41 +8277,37 @@ command = "y"
     }
 
     #[test]
-    fn task_and_session_state_stamp_timestamps() {
+    fn task_and_cell_state_stamp_timestamps() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
 
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
-        store
-            .set_session_state(&id, 0, 0, NodeState::Running)
-            .unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(run.tasks[0].started_at_ms.is_some());
-        assert!(run.tasks[0].finished_at_ms.is_none());
-        assert!(run.tasks[0].sessions[0].started_at_ms.is_some());
-        assert!(run.tasks[0].sessions[0].finished_at_ms.is_none());
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.tasks[0].started_at_ms.is_some());
+        assert!(squad.tasks[0].finished_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].started_at_ms.is_some());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_none());
 
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(run.tasks[0].finished_at_ms.is_some());
-        assert!(run.tasks[0].sessions[0].finished_at_ms.is_some());
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.tasks[0].finished_at_ms.is_some());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_some());
     }
 
     #[test]
-    fn record_session_result_stamps_finished_at() {
+    fn record_cell_result_stamps_finished_at() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store
-            .set_session_state(&id, 0, 0, NodeState::Running)
-            .unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
 
         store
-            .record_session_result(
+            .record_cell_result(
                 &id,
                 0,
                 0,
-                &SessionOutcome {
+                &CellOutcome {
                     state: NodeState::Done,
                     tokens_in: 1,
                     tokens_out: 2,
@@ -8008,176 +8317,172 @@ command = "y"
                 },
             )
             .unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(run.tasks[0].sessions[0].started_at_ms.is_some());
-        assert!(run.tasks[0].sessions[0].finished_at_ms.is_some());
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.tasks[0].cells[0].started_at_ms.is_some());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_some());
     }
 
     #[test]
-    fn restart_run_clears_started_and_finished_at() {
+    fn restart_squad_clears_started_and_finished_at() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
-        store
-            .set_session_state(&id, 0, 0, NodeState::Running)
-            .unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        assert!(run.started_at_ms.is_some());
-        assert!(run.finished_at_ms.is_some());
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.started_at_ms.is_some());
+        assert!(squad.finished_at_ms.is_some());
 
-        store.restart_run(&id).unwrap();
-        let run = store.get_run(&id).unwrap();
-        assert!(run.started_at_ms.is_none());
-        assert!(run.finished_at_ms.is_none());
-        assert!(run.tasks[0].started_at_ms.is_none());
-        assert!(run.tasks[0].finished_at_ms.is_none());
-        assert!(run.tasks[0].sessions[0].started_at_ms.is_none());
-        assert!(run.tasks[0].sessions[0].finished_at_ms.is_none());
+        store.restart_squad(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.started_at_ms.is_none());
+        assert!(squad.finished_at_ms.is_none());
+        assert!(squad.tasks[0].started_at_ms.is_none());
+        assert!(squad.tasks[0].finished_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].started_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_none());
     }
 
     #[test]
-    fn restart_session_clears_its_own_timestamps_but_not_the_runs_started_at() {
+    fn restart_cell_clears_its_own_timestamps_but_not_the_squads_started_at() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        store.set_run_state(&id, RunState::Running).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
-        store
-            .set_session_state(&id, 0, 0, NodeState::Running)
-            .unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        let run_started = store.get_run(&id).unwrap().started_at_ms.unwrap();
+        let squad_started = store.get_squad(&id).unwrap().started_at_ms.unwrap();
 
-        store.restart_session(&id, 0, 0).unwrap();
-        let run = store.get_run(&id).unwrap();
-        // The overall run already started earlier and isn't restarting from
+        store.restart_cell(&id, 0, 0).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        // The overall squad already started earlier and isn't restarting from
         // scratch, so its own started_at_ms survives...
-        assert_eq!(run.started_at_ms, Some(run_started));
-        // ...but it's no longer finished, and the restarted session/task
+        assert_eq!(squad.started_at_ms, Some(squad_started));
+        // ...but it's no longer finished, and the restarted cell/task
         // genuinely are starting over.
-        assert!(run.finished_at_ms.is_none());
-        assert!(run.tasks[0].started_at_ms.is_none());
-        assert!(run.tasks[0].finished_at_ms.is_none());
-        assert!(run.tasks[0].sessions[0].started_at_ms.is_none());
-        assert!(run.tasks[0].sessions[0].finished_at_ms.is_none());
+        assert!(squad.finished_at_ms.is_none());
+        assert!(squad.tasks[0].started_at_ms.is_none());
+        assert!(squad.tasks[0].finished_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].started_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_none());
     }
 
     #[test]
-    fn restart_session_verify_keeps_session_done_but_resets_its_verifies() {
+    fn restart_cell_proof_keeps_cell_done_but_resets_its_proofs() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        // Simulate a completed session + verify.
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        // Simulate a completed cell + proof.
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        store.restart_session_verify(&id, 0, 0, 0).unwrap();
+        store.restart_cell_proof(&id, 0, 0, 0).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.state, "pending", "run must be pending after restart");
-        assert_eq!(run.tasks[0].state, "pending", "task must be pending");
-        // The persisted session body stays Done (only the verify row is reset —
-        // see `done_sessions`, which relies on this for crash-recovery), but the
-        // displayed state folds verify progress back in so the board doesn't
-        // show the session as finished while its verify re-runs.
+        let squad = store.get_squad(&id).unwrap();
         assert_eq!(
-            run.tasks[0].sessions[0].state, "running",
-            "displayed session state must reflect its pending verify"
+            squad.state, "pending",
+            "squad must be pending after restart"
+        );
+        assert_eq!(squad.tasks[0].state, "pending", "task must be pending");
+        // The persisted cell body stays Done (only the proof row is reset —
+        // see `done_cells`, which relies on this for crash-recovery), but the
+        // displayed state folds proof progress back in so the board doesn't
+        // show the cell as finished while its proof re-runs.
+        assert_eq!(
+            squad.tasks[0].cells[0].state, "running",
+            "displayed cell state must reflect its pending proof"
         );
         assert_eq!(
-            run.tasks[0].sessions[0].verify[0].state, "pending",
-            "session verify must be pending"
+            squad.tasks[0].cells[0].proof[0].state, "pending",
+            "cell proof must be pending"
         );
     }
 
     #[test]
-    fn run_view_shows_running_when_a_deferred_restart_leaves_pending_but_a_sibling_task_is_live() {
-        // Reproduces the run-000000000148/ral-169+ral-170 case: restarting
-        // ral-169's terminal `test` verify resets the *run* row to "pending"
-        // (see `restart_session_verify`) purely as a "reclaim me later"
+    fn squad_view_shows_running_when_a_deferred_restart_leaves_pending_but_a_sibling_task_is_live()
+    {
+        // Reproduces the squad-000000000148/ral-169+ral-170 case: restarting
+        // ral-169's terminal `test` proof resets the *squad* row to "pending"
+        // (see `restart_cell_proof`) purely as a "reclaim me later"
         // signal — `scheduler::claim_ready` deliberately leaves ral-170's
         // still-live worker alone rather than cancelling it. From the
-        // outside the run plainly has a live child (ral-170's session is
+        // outside the squad plainly has a live child (ral-170's cell is
         // genuinely `running`), so the board must not show "pending".
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"a\"\n\
-            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"test\"\ncommand=\"true\"\n\
+            [[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"test\"\ncommand=\"true\"\n\
             [[task]]\nname=\"b\"\n\
-            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let id = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let id = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
 
-        // Task a: completed once, its `test` verify failed, run finished Failed.
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        // Task a: completed once, its `test` proof failed, squad finished Failed.
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Failed)
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Failed)
             .unwrap();
         store.set_task_state(&id, 0, NodeState::Failed).unwrap();
-        store.set_run_state(&id, RunState::Failed).unwrap();
+        store.set_squad_state(&id, SquadState::Failed).unwrap();
 
-        // Task b: its worker is still actively driving this session (the
+        // Task b: its worker is still actively driving this cell (the
         // sibling task the deferred-claim mechanism refuses to interrupt).
-        store
-            .set_session_state(&id, 1, 0, NodeState::Running)
-            .unwrap();
+        store.set_cell_state(&id, 1, 0, NodeState::Running).unwrap();
 
-        // Restart task a's `test` verify. Per `restart_session_verify`, this
-        // writes the run row back to "pending" even though task b's session
+        // Restart task a's `test` proof. Per `restart_cell_proof`, this
+        // writes the squad row back to "pending" even though task b's cell
         // is still genuinely running.
-        store.restart_session_verify(&id, 0, 0, 0).unwrap();
+        store.restart_cell_proof(&id, 0, 0, 0).unwrap();
 
-        let run = store.get_run(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
         assert_eq!(
-            run.state, "running",
-            "a run with a genuinely live sibling session must not display as pending, \
-             even though the scheduler's own runs.state column reads pending while it \
+            squad.state, "running",
+            "a squad with a genuinely live sibling cell must not display as pending, \
+             even though the scheduler's own squads.state column reads pending while it \
              waits to reclaim the restarted task"
         );
     }
 
     #[test]
-    fn restart_session_verify_on_missing_session_is_not_found() {
+    fn restart_cell_proof_on_missing_cell_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         assert!(matches!(
-            store.restart_session_verify(&id, 0, 99, 0),
+            store.restart_cell_proof(&id, 0, 99, 0),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn restart_session_verify_revives_downstream_session_left_failed_by_cascade() {
-        // Mirrors RAL-159/run-000000000147: "work" -> "finalize" in one task.
-        // work's own checks verify failed, which cascaded finalize (its
+    fn restart_cell_proof_revives_downstream_cell_left_failed_by_cascade() {
+        // Mirrors RAL-159/squad-000000000147: "work" -> "finalize" in one task.
+        // work's own checks proof failed, which cascaded finalize (its
         // dependent) to Failed with "blocked by a failed dependency". Only
-        // work's verify then gets retried (not a full session restart) --
-        // finalize must come back to Pending too, or a now-passing verify
+        // work's proof then gets retried (not a full cell restart) --
+        // finalize must come back to Pending too, or a now-passing proof
         // can never actually unstick the task (RAL-165).
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"checks\"\ncommand=\"true\"\n\
-            [[task.session]]\nid=\"finalize\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"work\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"checks\"\ncommand=\"true\"\n\
+            [[task.cell]]\nid=\"finalize\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"work\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap(); // work's body succeeded
         store
-            .set_session_state(&run, 0, 0, NodeState::Done)
-            .unwrap(); // work's body succeeded
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Failed)
+            .unwrap(); // work's checks proof failed
         store
-            .set_verify_state(&run, 0, "session", 0, 0, NodeState::Failed)
-            .unwrap(); // work's checks verify failed
-        store
-            .record_session_result(
-                &run,
+            .record_cell_result(
+                &squad,
                 0,
                 1,
-                &SessionOutcome {
+                &CellOutcome {
                     state: NodeState::Failed,
                     tokens_in: 0,
                     tokens_out: 0,
@@ -8187,13 +8492,13 @@ command = "y"
                 },
             )
             .unwrap(); // finalize cascaded to Failed
-        store.set_task_state(&run, 0, NodeState::Failed).unwrap();
-        store.set_run_state(&run, RunState::Failed).unwrap();
+        store.set_task_state(&squad, 0, NodeState::Failed).unwrap();
+        store.set_squad_state(&squad, SquadState::Failed).unwrap();
 
-        store.restart_session_verify(&run, 0, 0, 0).unwrap();
+        store.restart_cell_proof(&squad, 0, 0, 0).unwrap();
 
-        let run_view = store.get_run(&run).unwrap();
-        let finalize = &run_view.tasks[0].sessions[1];
+        let squad_view = store.get_squad(&squad).unwrap();
+        let finalize = &squad_view.tasks[0].cells[1];
         assert_eq!(
             finalize.state, "pending",
             "finalize must be revived to pending, not left stuck failed"
@@ -8205,103 +8510,97 @@ command = "y"
     }
 
     #[test]
-    fn restart_session_verify_does_not_touch_a_done_downstream_session() {
-        // If the downstream session already succeeded, a verify retry on its
+    fn restart_cell_proof_does_not_touch_a_done_downstream_cell() {
+        // If the downstream cell already succeeded, a proof retry on its
         // upstream must not force it to redo work (e.g. re-commit).
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.session.verify]]\nid=\"checks\"\ncommand=\"true\"\n\
-            [[task.session]]\nid=\"finalize\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"work\"]\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"checks\"\ncommand=\"true\"\n\
+            [[task.cell]]\nid=\"finalize\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"work\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Done)
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
-        store
-            .set_verify_state(&run, 0, "session", 0, 0, NodeState::Done)
-            .unwrap();
-        store
-            .set_session_state(&run, 0, 1, NodeState::Done)
-            .unwrap();
-        store.set_task_state(&run, 0, NodeState::Done).unwrap();
-        store.set_run_state(&run, RunState::Done).unwrap();
+        store.set_cell_state(&squad, 0, 1, NodeState::Done).unwrap();
+        store.set_task_state(&squad, 0, NodeState::Done).unwrap();
+        store.set_squad_state(&squad, SquadState::Done).unwrap();
 
-        store.restart_session_verify(&run, 0, 0, 0).unwrap();
+        store.restart_cell_proof(&squad, 0, 0, 0).unwrap();
 
-        let run_view = store.get_run(&run).unwrap();
+        let squad_view = store.get_squad(&squad).unwrap();
         assert_eq!(
-            run_view.tasks[0].sessions[1].state, "done",
-            "an already-done downstream session must not be reset"
+            squad_view.tasks[0].cells[1].state, "done",
+            "an already-done downstream cell must not be reset"
         );
     }
 
     #[test]
-    fn restart_task_verify_resets_only_task_verifies_sessions_remain_done() {
+    fn restart_task_proof_resets_only_task_proofs_cells_remain_done() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
-        // Simulate a task where sessions passed but the task-level verify failed.
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        // Simulate a task where cells passed but the task-level proof failed.
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store
-            .set_verify_state(&id, 0, "session", 0, 0, NodeState::Done)
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
         store
-            .set_verify_state(&id, 0, "task", -1, 0, NodeState::Failed)
+            .set_proof_state(&id, 0, "task", -1, 0, NodeState::Failed)
             .unwrap();
         store.set_task_state(&id, 0, NodeState::Failed).unwrap();
-        store.set_run_state(&id, RunState::Failed).unwrap();
+        store.set_squad_state(&id, SquadState::Failed).unwrap();
 
-        store.restart_task_verify(&id, 0, 0).unwrap();
+        store.restart_task_proof(&id, 0, 0).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        assert_eq!(run.state, "pending");
-        assert_eq!(run.tasks[0].state, "pending");
-        // Sessions and session-level verifies are NOT reset — only task-level verifies are.
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.state, "pending");
+        assert_eq!(squad.tasks[0].state, "pending");
+        // Cells and cell-level proofs are NOT reset — only task-level proofs are.
         assert_eq!(
-            run.tasks[0].sessions[0].state, "done",
-            "session must remain done"
+            squad.tasks[0].cells[0].state, "done",
+            "cell must remain done"
         );
         assert_eq!(
-            run.tasks[0].sessions[0].verify[0].state, "done",
-            "session-level verify must remain done"
+            squad.tasks[0].cells[0].proof[0].state, "done",
+            "cell-level proof must remain done"
         );
-        assert_eq!(run.tasks[0].verify[0].state, "pending");
+        assert_eq!(squad.tasks[0].proof[0].state, "pending");
     }
 
     #[test]
-    fn restart_task_verify_on_missing_task_is_not_found() {
+    fn restart_task_proof_on_missing_task_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         assert!(matches!(
-            store.restart_task_verify(&id, 99, 0),
+            store.restart_task_proof(&id, 99, 0),
             Err(StoreError::NotFound)
         ));
     }
 
     #[test]
-    fn restart_task_verify_revives_downstream_session_left_failed_by_cascade() {
-        // Same RAL-165 gap as restart_session_verify, but for a task-level
-        // verify: task "t" -> session "downstream" in a separate task,
-        // dependent on t's own session. t's task-level verify failed,
-        // cascading "downstream" to Failed; retrying only t's task verify
+    fn restart_task_proof_revives_downstream_cell_left_failed_by_cascade() {
+        // Same RAL-165 gap as restart_cell_proof, but for a task-level
+        // proof: task "t" -> cell "downstream" in a separate task,
+        // dependent on t's own cell. t's task-level proof failed,
+        // cascading "downstream" to Failed; retrying only t's task proof
         // must revive "downstream" too.
         let mut store = Store::open_in_memory().unwrap();
         let toml = "[[task]]\nname=\"t\"\n\
-            [[task.session]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.verify]]\ncommand=\"true\"\n\
+            [[task.cell]]\nid=\"work\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.proof]]\ncommand=\"true\"\n\
             [[task]]\nname=\"u\"\ndepends_on=[\"t\"]\n\
-            [[task.session]]\nid=\"downstream\"\ncwd=\"/r\"\nprompt=\"p\"\n";
-        let run = store.insert_run(&parse(toml), Some("r"), false).unwrap();
+            [[task.cell]]\nid=\"downstream\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
         store
-            .set_session_state(&run, 0, 0, NodeState::Done)
+            .set_proof_state(&squad, 0, "task", -1, 0, NodeState::Failed)
             .unwrap();
+        store.set_task_state(&squad, 0, NodeState::Failed).unwrap();
         store
-            .set_verify_state(&run, 0, "task", -1, 0, NodeState::Failed)
-            .unwrap();
-        store.set_task_state(&run, 0, NodeState::Failed).unwrap();
-        store
-            .record_session_result(
-                &run,
+            .record_cell_result(
+                &squad,
                 1,
                 0,
-                &SessionOutcome {
+                &CellOutcome {
                     state: NodeState::Failed,
                     tokens_in: 0,
                     tokens_out: 0,
@@ -8311,189 +8610,191 @@ command = "y"
                 },
             )
             .unwrap();
-        store.set_task_state(&run, 1, NodeState::Failed).unwrap();
-        store.set_run_state(&run, RunState::Failed).unwrap();
+        store.set_task_state(&squad, 1, NodeState::Failed).unwrap();
+        store.set_squad_state(&squad, SquadState::Failed).unwrap();
 
-        store.restart_task_verify(&run, 0, 0).unwrap();
+        store.restart_task_proof(&squad, 0, 0).unwrap();
 
-        let run_view = store.get_run(&run).unwrap();
-        let downstream = &run_view.tasks[1].sessions[0];
+        let squad_view = store.get_squad(&squad).unwrap();
+        let downstream = &squad_view.tasks[1].cells[0];
         assert_eq!(
             downstream.state, "pending",
-            "downstream session must be revived to pending"
+            "downstream cell must be revived to pending"
         );
         assert_eq!(
             downstream.error, None,
-            "downstream session's stale cascade error must be cleared"
+            "downstream cell's stale cascade error must be cleared"
         );
     }
 
-    // Three session-level verify steps: restart from vi=1 leaves vi=0 Done,
+    // Three cell-level proof steps: restart from vi=1 leaves vi=0 Done,
     // resets vi=1 and vi=2 to Pending.
-    const THREE_SESSION_VERIFIES: &str = r#"
+    const THREE_CELL_PROOFS: &str = r#"
 [[task]]
 name = "t"
-[[task.session]]
+[[task.cell]]
 cwd = "."
 command = "build"
-[[task.session.verify]]
+[[task.cell.proof]]
 command = "check-a"
-[[task.session.verify]]
+[[task.cell.proof]]
 command = "check-b"
-[[task.session.verify]]
+[[task.cell.proof]]
 command = "check-c"
 "#;
 
-    // Three task-level verify steps (no session-level verifies).
-    const THREE_TASK_VERIFIES: &str = r#"
+    // Three task-level proof steps (no cell-level proofs).
+    const THREE_TASK_PROOFS: &str = r#"
 [[task]]
 name = "t"
-[[task.session]]
+[[task.cell]]
 cwd = "."
 command = "build"
-[[task.verify]]
+[[task.proof]]
 command = "check-a"
-[[task.verify]]
+[[task.proof]]
 command = "check-b"
-[[task.verify]]
+[[task.proof]]
 command = "check-c"
 "#;
 
     #[test]
-    fn restart_session_verify_from_middle_leaves_earlier_step_intact() {
+    fn restart_cell_proof_from_middle_leaves_earlier_step_intact() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(THREE_SESSION_VERIFIES), None, false)
+            .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
             .unwrap();
-        // Simulate: session done, all three verifies done.
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        // Simulate: cell done, all three proofs done.
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         for vi in 0..3i64 {
             store
-                .set_verify_state(&id, 0, "session", 0, vi, NodeState::Done)
+                .set_proof_state(&id, 0, "cell", 0, vi, NodeState::Done)
                 .unwrap();
         }
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
         // Restart from vi=1 — only steps 1 and 2 should reset.
-        store.restart_session_verify(&id, 0, 0, 1).unwrap();
+        store.restart_cell_proof(&id, 0, 0, 1).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        let vs = &run.tasks[0].sessions[0].verify;
+        let squad = store.get_squad(&id).unwrap();
+        let vs = &squad.tasks[0].cells[0].proof;
         assert_eq!(vs[0].state, "done", "vi=0 must stay done");
         assert_eq!(vs[1].state, "pending", "vi=1 must be reset to pending");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
-        assert_eq!(run.tasks[0].state, "pending");
-        assert_eq!(run.state, "pending");
+        assert_eq!(squad.tasks[0].state, "pending");
+        assert_eq!(squad.state, "pending");
     }
 
     #[test]
-    fn restart_session_verify_from_last_only_resets_that_step() {
+    fn restart_cell_proof_from_last_only_resets_that_step() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(THREE_SESSION_VERIFIES), None, false)
+            .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
             .unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         for vi in 0..3i64 {
             store
-                .set_verify_state(&id, 0, "session", 0, vi, NodeState::Done)
+                .set_proof_state(&id, 0, "cell", 0, vi, NodeState::Done)
                 .unwrap();
         }
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
         // Restart from vi=2 — only the last step resets.
-        store.restart_session_verify(&id, 0, 0, 2).unwrap();
+        store.restart_cell_proof(&id, 0, 0, 2).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        let vs = &run.tasks[0].sessions[0].verify;
+        let squad = store.get_squad(&id).unwrap();
+        let vs = &squad.tasks[0].cells[0].proof;
         assert_eq!(vs[0].state, "done", "vi=0 must stay done");
         assert_eq!(vs[1].state, "done", "vi=1 must stay done");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
     }
 
     #[test]
-    fn restart_task_verify_from_middle_leaves_earlier_step_intact() {
+    fn restart_task_proof_from_middle_leaves_earlier_step_intact() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(THREE_TASK_VERIFIES), None, false)
+            .insert_squad(&parse(THREE_TASK_PROOFS), None, false)
             .unwrap();
-        // Simulate: session done, all three task-level verifies done.
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        // Simulate: cell done, all three task-level proofs done.
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         for vi in 0..3i64 {
             store
-                .set_verify_state(&id, 0, "task", -1, vi, NodeState::Done)
+                .set_proof_state(&id, 0, "task", -1, vi, NodeState::Done)
                 .unwrap();
         }
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
         // Restart from vi=1 — only steps 1 and 2 should reset.
-        store.restart_task_verify(&id, 0, 1).unwrap();
+        store.restart_task_proof(&id, 0, 1).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        let vs = &run.tasks[0].verify;
+        let squad = store.get_squad(&id).unwrap();
+        let vs = &squad.tasks[0].proof;
         assert_eq!(vs[0].state, "done", "vi=0 must stay done");
         assert_eq!(vs[1].state, "pending", "vi=1 must be reset to pending");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
-        assert_eq!(run.tasks[0].state, "pending");
-        assert_eq!(run.state, "pending");
-        // Session must be untouched.
-        assert_eq!(run.tasks[0].sessions[0].state, "done");
+        assert_eq!(squad.tasks[0].state, "pending");
+        assert_eq!(squad.state, "pending");
+        // Cell must be untouched.
+        assert_eq!(squad.tasks[0].cells[0].state, "done");
     }
 
     // ── RAL Queue ────────────────────────────────────────────────────────────
 
-    const TWO_SESSION_CHAIN: &str = "[[task]]\nname=\"t\"\n\
-        [[task.session]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-        [[task.session]]\nid=\"b\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"a\"]\n";
+    const TWO_CELL_CHAIN: &str = "[[task]]\nname=\"t\"\n\
+        [[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+        [[task.cell]]\nid=\"b\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"a\"]\n";
 
     #[test]
     fn ignored_state_round_trips() {
         assert_eq!(NodeState::parse("ignored"), Some(NodeState::Ignored));
         assert_eq!(NodeState::Ignored.as_str(), "ignored");
-        assert_eq!(RunState::parse("ignored"), Some(RunState::Ignored));
-        assert_eq!(RunState::Ignored.as_str(), "ignored");
+        assert_eq!(SquadState::parse("ignored"), Some(SquadState::Ignored));
+        assert_eq!(SquadState::Ignored.as_str(), "ignored");
         assert!(NodeState::Ignored.satisfies_dependents());
-        assert!(RunState::Ignored.satisfies_dependents());
-        assert!(!RunState::Ignored.is_terminal(), "ignored is reversible");
+        assert!(SquadState::Ignored.satisfies_dependents());
+        assert!(!SquadState::Ignored.is_terminal(), "ignored is reversible");
     }
 
     #[test]
-    fn ignored_upstream_run_satisfies_dependents() {
+    fn ignored_upstream_squad_satisfies_dependents() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.insert_run(&parse(SAMPLE), Some("a"), false).unwrap();
+        let a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
         let dep = format!(
-            "[[default]]\ndepends_on = [\"{a}\"]\n[[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            "[[default]]\ndepends_on = [\"{a}\"]\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
         );
-        let b = store.insert_run(&parse(&dep), Some("b"), false).unwrap();
+        let b = store.insert_squad(&parse(&dep), Some("b"), false).unwrap();
         assert!(!store.list_ready().unwrap().contains(&b));
-        // Ignoring the upstream run unblocks the dependent, exactly like done.
-        store.set_run_state(&a, RunState::Ignored).unwrap();
+        // Ignoring the upstream squad unblocks the dependent, exactly like done.
+        store.set_squad_state(&a, SquadState::Ignored).unwrap();
         assert!(store.list_ready().unwrap().contains(&b));
     }
 
     #[test]
-    fn queue_lists_ready_and_blocked_sessions() {
+    fn queue_lists_ready_and_blocked_cells() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(TWO_SESSION_CHAIN), Some("r"), false)
+        let squad = store
+            .insert_squad(&parse(TWO_CELL_CHAIN), Some("r"), false)
             .unwrap();
         let q = store.queue().unwrap();
         let a = q.iter().find(|i| i.path.ends_with("/s0")).unwrap();
         let b = q.iter().find(|i| i.path.ends_with("/s1")).unwrap();
-        assert_eq!(a.readiness, "ready", "session a has no deps");
-        assert_eq!(b.readiness, "blocked", "session b waits on a");
-        assert_eq!(b.deps_paths, vec![session_path(&run, 0, 0)]);
+        assert_eq!(a.readiness, "ready", "cell a has no deps");
+        assert_eq!(b.readiness, "blocked", "cell b waits on a");
+        assert_eq!(b.deps_paths, vec![cell_path(&squad, 0, 0)]);
     }
 
     #[test]
     fn queue_ignored_upstream_makes_downstream_ready() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(TWO_SESSION_CHAIN), None, false)
+        let squad = store
+            .insert_squad(&parse(TWO_CELL_CHAIN), None, false)
             .unwrap();
-        // Ignore session a → session b becomes ready.
+        // Ignore cell a → cell b becomes ready.
         store
-            .set_session_state(&run, 0, 0, NodeState::Ignored)
+            .set_cell_state(&squad, 0, 0, NodeState::Ignored)
             .unwrap();
         let q = store.queue().unwrap();
         // a is ignored (terminal-like) so it drops out of the queue; b is ready.
@@ -8504,10 +8805,10 @@ command = "check-c"
 
     #[test]
     fn queue_exposes_task_depends_on() {
-        let toml = "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"/r\"\ncommand=\"x\"\n\
-                    [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n[[task.session]]\ncwd=\"/r\"\ncommand=\"y\"\n";
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"x\"\n\
+                    [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"y\"\n";
         let mut store = Store::open_in_memory().unwrap();
-        let _run = store.insert_run(&parse(toml), None, false).unwrap();
+        let _squad = store.insert_squad(&parse(toml), None, false).unwrap();
         let q = store.queue().unwrap();
         let b = q.iter().find(|i| i.task_name == "b").unwrap();
         assert_eq!(
@@ -8525,11 +8826,11 @@ command = "check-c"
     fn reorder_pulls_dependency_along() {
         // b depends on a. Asking for [b, a] must be repaired to [a, b].
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(TWO_SESSION_CHAIN), None, false)
+        let squad = store
+            .insert_squad(&parse(TWO_CELL_CHAIN), None, false)
             .unwrap();
-        let pa = session_path(&run, 0, 0);
-        let pb = session_path(&run, 0, 1);
+        let pa = cell_path(&squad, 0, 0);
+        let pb = cell_path(&squad, 0, 1);
         let order = store.reorder_queue(&[pb.clone(), pa.clone()]).unwrap();
         assert_eq!(order, vec![pa, pb], "dependency dragged along");
     }
@@ -8537,11 +8838,11 @@ command = "check-c"
     #[test]
     fn set_position_absolute_clamps_to_bottom() {
         let mut store = Store::open_in_memory().unwrap();
-        let run = store
-            .insert_run(&parse(TWO_SESSION_CHAIN), None, false)
+        let squad = store
+            .insert_squad(&parse(TWO_CELL_CHAIN), None, false)
             .unwrap();
-        let pa = session_path(&run, 0, 0);
-        let pb = session_path(&run, 0, 1);
+        let pa = cell_path(&squad, 0, 0);
+        let pb = cell_path(&squad, 0, 1);
         // Send a to an enormous absolute position → clamps to the bottom, but the
         // b→a dependency repair pulls a back above b, so the order stays [a, b].
         let order = store
@@ -8558,25 +8859,25 @@ command = "check-c"
     }
 
     #[test]
-    fn restart_task_verify_from_last_only_resets_that_step() {
+    fn restart_task_proof_from_last_only_resets_that_step() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
-            .insert_run(&parse(THREE_TASK_VERIFIES), None, false)
+            .insert_squad(&parse(THREE_TASK_PROOFS), None, false)
             .unwrap();
-        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         for vi in 0..3i64 {
             store
-                .set_verify_state(&id, 0, "task", -1, vi, NodeState::Done)
+                .set_proof_state(&id, 0, "task", -1, vi, NodeState::Done)
                 .unwrap();
         }
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
-        store.set_run_state(&id, RunState::Done).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
 
         // Restart from vi=2 — only the last step resets.
-        store.restart_task_verify(&id, 0, 2).unwrap();
+        store.restart_task_proof(&id, 0, 2).unwrap();
 
-        let run = store.get_run(&id).unwrap();
-        let vs = &run.tasks[0].verify;
+        let squad = store.get_squad(&id).unwrap();
+        let vs = &squad.tasks[0].proof;
         assert_eq!(vs[0].state, "done", "vi=0 must stay done");
         assert_eq!(vs[1].state, "done", "vi=1 must stay done");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
@@ -8730,15 +9031,15 @@ command = "check-c"
     }
 
     #[test]
-    fn set_session_cwd_rewrites_placeholder_to_real_path() {
+    fn set_cell_cwd_rewrites_placeholder_to_real_path() {
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         store
-            .set_session_cwd(&id, 0, 0, "C:/repos/ralphus/.git/.ralphus_worktrees/feat")
+            .set_cell_cwd(&id, 0, 0, "C:/repos/ralphus/.git/.ralphus_worktrees/feat")
             .unwrap();
-        let run = store.get_run(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
         assert_eq!(
-            run.tasks[0].sessions[0].cwd.as_deref(),
+            squad.tasks[0].cells[0].cwd.as_deref(),
             Some("C:/repos/ralphus/.git/.ralphus_worktrees/feat")
         );
     }
@@ -8822,5 +9123,45 @@ command = "check-c"
                 .take_due_final_summary_requests(10_000, 5_000)
                 .is_empty()
         );
+    }
+
+    /// RAL-230: the DB file (and its WAL/SHM siblings, when SQLite has
+    /// already created them) must be owner-only on Unix -- the DB holds
+    /// stored env-var overrides and task/cell prompts.
+    #[cfg(unix)]
+    #[test]
+    fn open_sets_owner_only_permissions_on_the_db_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ral230-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let db_path = dir.join("tasks.db");
+
+        let store = Store::open(&db_path).expect("open store");
+        drop(store);
+
+        let mode = std::fs::metadata(&db_path)
+            .expect("stat db")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600 on db file, got {mode:o}");
+
+        // SQLite creates the WAL/SHM siblings lazily -- only assert on ones
+        // that actually exist by the time `open` returns.
+        for suffix in ["-wal", "-shm"] {
+            let sibling = dir.join(format!("tasks.db{suffix}"));
+            if sibling.exists() {
+                let mode = std::fs::metadata(&sibling)
+                    .expect("stat sibling")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "expected 0o600 on {sibling:?}, got {mode:o}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

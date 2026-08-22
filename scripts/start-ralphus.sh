@@ -50,10 +50,14 @@ to_win_path() {
   fi
 }
 
-runner_path="$root/bin/ralphus-runner/ralphus-runner.exe"
+runner_path="$root/bin/ralphus-runner.exe"
 tmux_path="$root/tmux/tmux.exe"
 daemon_exe="$root/bin/ralphus-daemon.exe"
 librarian_exe="$root/bin/ralphus-librarian.exe"
+hello_template="$root/examples/hello.toml"
+log_dir="$root/logs"
+daemon_log="$log_dir/daemon.log"
+librarian_log="$log_dir/librarian.log"
 
 for required in "$daemon_exe" "$librarian_exe" "$runner_path" "$tmux_path"; do
   if [[ ! -f "$required" ]]; then
@@ -61,6 +65,15 @@ for required in "$daemon_exe" "$librarian_exe" "$runner_path" "$tmux_path"; do
     exit 1
   fi
 done
+if [[ -f "$hello_template" ]]; then
+  bundle_root_win="$(to_win_path "$root")"
+  bundle_root_win="${bundle_root_win//\\//}"
+  powershell.exe -NoProfile -Command \
+    "\$path = '$hello_template'; \$text = Get-Content \$path -Raw; \$text = \$text -replace '__RALPHUS_BUNDLE_ROOT__', '$bundle_root_win'; [System.IO.File]::WriteAllText(\$path, \$text, [System.Text.UTF8Encoding]::new(\$false))"
+fi
+mkdir -p "$log_dir"
+: > "$daemon_log"
+: > "$librarian_log"
 
 export RALPHUS_RUNNER_CMD="$(to_win_path "$runner_path")"
 export RALPHUS_TMUX_CMD="$(to_win_path "$tmux_path")"
@@ -78,12 +91,16 @@ fi
 if [[ "$daemon_only" -eq 0 ]]; then
   echo "   librarian -> http://127.0.0.1:${librarian_port}"
 fi
+echo "   daemon log -> $daemon_log"
+if [[ "$daemon_only" -eq 0 ]]; then
+  echo "   librarian log -> $librarian_log"
+fi
 
 daemon_args=(serve --port "$daemon_port")
 if [[ -n "$db_path" ]]; then
   daemon_args+=(--db "$(to_win_path "$db_path")")
 fi
-"$daemon_exe" "${daemon_args[@]}" &
+"$daemon_exe" "${daemon_args[@]}" >"$daemon_log" 2>&1 &
 daemon_pid=$!
 
 cleanup() {
@@ -91,9 +108,14 @@ cleanup() {
 }
 
 if ! powershell.exe -NoProfile -Command \
-  "\$deadline = (Get-Date).AddSeconds(30); while ((Get-Date) -lt \$deadline) { try { Invoke-RestMethod -Uri '$RALPHUS_DAEMON_URL/api/daemon' -TimeoutSec 2 | Out-Null; exit 0 } catch { Start-Sleep -Milliseconds 250 } }; exit 1"
+  "\$deadline = (Get-Date).AddSeconds(30); \$stateHome = \$env:USERPROFILE; if (-not \$stateHome) { \$stateHome = \$env:HOME }; if (-not \$stateHome) { \$stateHome = '.' }; \$tokenPath = Join-Path (Join-Path \$stateHome '.ralphus') 'daemon.token'; while ((Get-Date) -lt \$deadline) { try { \$token = if (\$env:RALPHUS_DAEMON_TOKEN) { \$env:RALPHUS_DAEMON_TOKEN.Trim() } elseif (Test-Path \$tokenPath) { (Get-Content \$tokenPath -Raw).Trim() } else { '' }; if (\$token) { Invoke-RestMethod -Uri '$RALPHUS_DAEMON_URL/api/daemon' -Headers @{ Authorization = ('Bearer ' + \$token) } -TimeoutSec 2 | Out-Null; exit 0 } } catch { }; Start-Sleep -Milliseconds 250 }; exit 1"
 then
   echo "daemon did not become ready within 30 seconds" >&2
+  echo "daemon log: $daemon_log" >&2
+  if [[ -f "$daemon_log" ]]; then
+    echo "--- daemon log tail ---" >&2
+    tail -n 40 "$daemon_log" >&2 || true
+  fi
   cleanup
   exit 1
 fi
@@ -104,4 +126,4 @@ if [[ "$daemon_only" -eq 1 ]]; then
 fi
 
 trap cleanup EXIT
-"$librarian_exe" serve --port "$librarian_port"
+"$librarian_exe" serve --port "$librarian_port" >>"$librarian_log" 2>&1

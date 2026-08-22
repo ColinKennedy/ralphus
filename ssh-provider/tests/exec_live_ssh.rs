@@ -38,7 +38,7 @@ use ralphus_ssh_provider::{exec, ping};
 /// A POSIX shell "remote runner" standing in for the real `ralphus-runner`:
 /// consumes the spec on stdin (ignored), emits one `RALPHUS_EVENT:` line
 /// (an `llm-invoke` usage event, the one the live cost-cap kill depends on)
-/// to stderr, then a minimal `SessionResult` JSON to stdout.
+/// to stderr, then a minimal `CellResult` JSON to stdout.
 const FAKE_RUNNER_SCRIPT: &str = r#"#!/bin/sh
 cat >/dev/null
 echo 'RALPHUS_EVENT: {"source":"llm-invoke","message":"live ssh test","payload":{"tokens_in":1,"tokens_out":2,"cost_usd":0.01}}' 1>&2
@@ -89,9 +89,9 @@ fn ralphus_event_and_llm_invoke_markers_survive_the_ssh_round_trip() {
     };
 
     let spec = serde_json::json!({
-        "run_id": "live-ssh-test-run",
+        "squad_id": "live-ssh-test-run",
         "task": "live-ssh-test-task",
-        "session_id": "s0",
+        "cell_id": "s0",
         "cwd": local_source_dir.to_string_lossy(),
         "prompt": "unused -- the fake runner ignores its stdin payload",
         "agent": "claude",
@@ -146,9 +146,9 @@ fn the_built_binary_forwards_ralphus_event_lines_onto_its_own_stderr() {
     std::fs::write(local_source_dir.join("hello.txt"), b"hi").expect("write source file");
 
     let spec = serde_json::json!({
-        "run_id": "live-ssh-bin-test-run",
+        "squad_id": "live-ssh-bin-test-run",
         "task": "live-ssh-bin-test-task",
-        "session_id": "s0",
+        "cell_id": "s0",
         "cwd": local_source_dir.to_string_lossy(),
         "prompt": "unused",
         "agent": "claude",

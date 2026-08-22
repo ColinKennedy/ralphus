@@ -1,16 +1,16 @@
-//! Verify-step execution.
+//! Proof-step execution.
 //!
-//! `command` verify steps (fmt/lint/test) run as shell commands — exit code
-//! is the verdict. `agent` verifiers need a model; `brain` and `approval`
-//! verifiers are deferred (left pending) until their respective backends
+//! `command` proof steps (fmt/lint/test) run as shell commands — exit code
+//! is the verdict. `agent` provers need a model; `brain` and `approval`
+//! provers are deferred (left pending) until their respective backends
 //! land.
 //!
 //! This module's direct, un-wrapped subprocess execution is used by Guardian
 //! review check gates (`daemon/src/guardian_merge.rs`), which have no live
-//! view of their own to preserve. A task/session `command`-kind verify step
+//! view of their own to preserve. A task/cell `command`-kind proof step
 //! instead runs through [`crate::runner::Runner`] (RAL-151), tmux-wrapped
-//! exactly like a `prompt`-kind verify step, so it can be watched live from
-//! the board — see `daemon/src/scheduler.rs::run_verifies`'s `"command"`
+//! exactly like a `prompt`-kind proof step, so it can be watched live from
+//! the board — see `daemon/src/scheduler.rs::run_proofs`'s `"command"`
 //! branch.
 
 use std::collections::BTreeMap;
@@ -19,34 +19,34 @@ use std::process::{Command, Stdio};
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
 
-/// Run a `command` verify step in `cwd`. Returns true when the command exits 0.
+/// Run a `command` proof step in `cwd`. Returns true when the command exits 0.
 ///
 /// Used by callers (e.g. Guardian review checks) that have no trace to
-/// continue and no run-scoped env overrides to apply; the span it creates
+/// continue and no squad-scoped env overrides to apply; the span it creates
 /// starts a fresh trace of its own.
 #[must_use]
-pub fn run_command_verify(cwd: &str, command: &str) -> bool {
-    run_command_verify_capture(cwd, command, &Context::new(), &BTreeMap::new()).0
+pub fn run_command_proof(cwd: &str, command: &str) -> bool {
+    run_command_proof_capture(cwd, command, &Context::new(), &BTreeMap::new()).0
 }
 
-/// Like [`run_command_verify`] but also captures the combined stdout+stderr
+/// Like [`run_command_proof`] but also captures the combined stdout+stderr
 /// (truncated) so it can be shown in the log viewer (CCTL-99). Wraps the
 /// subprocess in an OpenTelemetry span (RAL-96), as a child of `parent`, and
-/// applies `env` — the owning run's persistent environment-variable overrides
+/// applies `env` — the owning squad's persistent environment-variable overrides
 /// (RAL-150), if any — on top of the daemon's own inherited environment.
 #[must_use]
-pub fn run_command_verify_capture(
+pub fn run_command_proof_capture(
     cwd: &str,
     command: &str,
     parent: &Context,
     env: &BTreeMap<String, String>,
 ) -> (bool, String) {
-    let span = crate::otel::start_span("verify.command", parent, SpanKind::Internal);
-    span.set_attribute("verify.cwd", cwd.to_string());
-    span.set_attribute("verify.command", command.to_string());
+    let span = crate::otel::start_span("proof.command", parent, SpanKind::Internal);
+    span.set_attribute("proof.cwd", cwd.to_string());
+    span.set_attribute("proof.command", command.to_string());
     crate::rlog!(
         DEBUG,
-        "ralphus [verify] command starting cwd={cwd:?} command={command:?}"
+        "ralphus [proof] command starting cwd={cwd:?} command={command:?}"
     );
     let (shell, flag) = if cfg!(windows) {
         ("cmd", "/C")
@@ -75,11 +75,11 @@ pub fn run_command_verify_capture(
     span.set_status(if result.0 {
         Status::Ok
     } else {
-        Status::error("verify command failed")
+        Status::error("proof command failed")
     });
     crate::rlog!(
         DEBUG,
-        "ralphus [verify] command completed passed={} cwd={cwd:?}",
+        "ralphus [proof] command completed passed={} cwd={cwd:?}",
         result.0
     );
     result
@@ -88,7 +88,7 @@ pub fn run_command_verify_capture(
 /// Resolve the current `HEAD` commit sha of `cwd`, or `None` if `cwd` isn't a
 /// git working tree, has no commits yet, or `git` isn't available. Used by the
 /// finalizer's no-new-commits guard (RAL-156): to capture a git-backed task's
-/// baseline at session start, and to compare each session's `cwd` against it
+/// baseline at cell start, and to compare each cell's `cwd` against it
 /// at finalize time.
 #[must_use]
 pub fn git_head_sha(cwd: &str) -> Option<String> {
@@ -111,7 +111,7 @@ pub fn git_head_sha(cwd: &str) -> Option<String> {
 /// finalizer runs for git-backed tasks, in place of trusting the agent's own
 /// self-report. Fails closed per-`cwd` — one whose `HEAD` can't be resolved
 /// (bad path, not a git repo, no commits) counts as "no new commit" for that
-/// session, never as a pass.
+/// cell, never as a pass.
 #[must_use]
 pub fn any_cwd_has_new_commit(cwds: &[&str], baseline: &str) -> bool {
     cwds.iter()
@@ -137,25 +137,25 @@ mod tests {
 
     #[test]
     fn passing_command_is_true() {
-        assert!(run_command_verify(".", "exit 0"));
+        assert!(run_command_proof(".", "exit 0"));
     }
 
     #[test]
     fn failing_command_is_false() {
-        assert!(!run_command_verify(".", "exit 1"));
+        assert!(!run_command_proof(".", "exit 1"));
     }
 
     #[test]
     fn bad_cwd_is_false() {
-        assert!(!run_command_verify("/no/such/dir/ralphus-xyz", "exit 0"));
+        assert!(!run_command_proof("/no/such/dir/ralphus-xyz", "exit 0"));
     }
 
     #[test]
     fn capture_returns_output() {
         let (ok, out) =
-            run_command_verify_capture(".", "echo hello-verify", &Context::new(), &BTreeMap::new());
+            run_command_proof_capture(".", "echo hello-proof", &Context::new(), &BTreeMap::new());
         assert!(ok);
-        assert!(out.contains("hello-verify"), "captured: {out:?}");
+        assert!(out.contains("hello-proof"), "captured: {out:?}");
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         } else {
             "echo $RALPHUS_TEST_VAR"
         };
-        let (ok, out) = run_command_verify_capture(".", cmd, &Context::new(), &env);
+        let (ok, out) = run_command_proof_capture(".", cmd, &Context::new(), &env);
         assert!(ok);
         assert!(out.contains("hello-env-override"), "captured: {out:?}");
     }
@@ -194,7 +194,7 @@ mod tests {
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let n = TEST_N.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("ral156-verify-{tag}-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("ral156-proof-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir tmp_dir");
         dir
@@ -266,9 +266,9 @@ mod tests {
 
     #[test]
     fn any_cwd_has_new_commit_true_when_any_of_several_changed() {
-        // Two sessions of the same task: the first's cwd never moved past the
+        // Two cells of the same task: the first's cwd never moved past the
         // baseline; the second's got an extra commit on top -- standing in for
-        // "this session made progress since the task started." (Deliberately
+        // "this cell made progress since the task started." (Deliberately
         // *not* two independent single-commit repos: with identical tree,
         // message, and author/committer env, two repos created in the same
         // second can hash to the same commit sha, making the "changed" repo

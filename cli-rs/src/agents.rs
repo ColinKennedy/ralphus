@@ -43,9 +43,16 @@ pub const KNOWN_AGENTS: &[AgentInfo] = &[
         models: None,
         default_model: None,
     },
+    AgentInfo {
+        name: "raw",
+        aliases: &[],
+        description: "Generic external executable backend. Only valid when selected via an agent profile that also provides an executable.",
+        models: None,
+        default_model: None,
+    },
 ];
 
-pub const OTHER_AGENTS_NOTE: &str = "Any other agent name (e.g. \"aider\") runs as a generic external harness backend: <any model> is passed through via --model unchecked.";
+pub const OTHER_AGENTS_NOTE: &str = "Any other agent name must be defined as an agent profile in .ralphus.toml. The old implicit generic-harness fallback is gone.";
 
 #[cfg(test)]
 mod tests {

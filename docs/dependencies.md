@@ -7,7 +7,7 @@ var) at runtime, and any version constraints that matter.
 
 **Windows requires psmux 3.3.6 or later.** `daemon/src/tmux.rs` resolves a
 `tmux`-named binary on `PATH` (or `RALPHUS_TMUX_CMD` if set — see
-`docs/tmux-embedding.md`) for every agent-kind session/verify run (RAL-102).
+`docs/tmux-embedding.md`) for every agent-kind cell/proof run (RAL-102).
 On Windows this is [psmux](https://github.com/psmux/psmux), a native
 Windows tmux alternative — not real tmux, and not a drop-in (see
 `docs/tmux-embedding.md`'s "Why embedding isn't done yet" for the known

@@ -113,4 +113,4 @@ end to end, including runs driven by a local Ollama model.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Proprietary and exclusive — see [LICENSE](LICENSE).

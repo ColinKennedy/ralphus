@@ -8,14 +8,16 @@
 //! on scalar conflicts** while **list fields (e.g. `checks`) are unioned**.
 //!
 //! Today the consumed scalars are `skip_worktrees`, which lets large repos
-//! avoid a git worktree copy per branch, and `auto_build` (RAL-101), the
+//! avoid a git worktree copy per branch, `auto_build` (RAL-101), the
 //! project-level default build/test command run when a review declares no
-//! explicit `checks`.
+//! explicit `checks`, and `default_resolver_agent`, the project-level
+//! fallback conflict-resolver agent used when a review sets none of its own.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{NaiveTime, Utc};
+use ralphus_core::cors::CorsConfig;
 use serde::Deserialize;
 
 /// Resolved review configuration (after layering global under per-project).
@@ -62,6 +64,14 @@ pub struct ReviewConfig {
     /// over the global layer, same as `skip_worktrees`.
     #[serde(default)]
     pub verify_skip_auto_clean: Option<bool>,
+    /// The conflict-resolver agent used when a review doesn't set its own
+    /// `[[review]].agent` and `RALPHUS_RESOLVER_AGENT` isn't set -- a builtin
+    /// backend name (`"claude"`, `"claude-code"`, `"codex"`, `"ollama"`,
+    /// `"anthropic"`) or a configured `[agent.profiles.*]` name. `None` means
+    /// unset, which resolves to `"ollama"` (see [`Self::default_resolver_agent`]);
+    /// per-project scalars win over the global layer, same as `skip_worktrees`.
+    #[serde(default)]
+    pub default_resolver_agent: Option<String>,
 }
 
 impl ReviewConfig {
@@ -101,6 +111,15 @@ impl ReviewConfig {
         self.verify_skip_auto_clean.unwrap_or(false)
     }
 
+    /// The configured default conflict-resolver agent, unset resolves to
+    /// `"ollama"` -- the last link in `guardian_merge::resolver_agent`'s
+    /// fallback chain (per-review `agent` -> `RALPHUS_RESOLVER_AGENT` -> this
+    /// -> `"ollama"`).
+    #[must_use]
+    pub fn default_resolver_agent(&self) -> &str {
+        self.default_resolver_agent.as_deref().unwrap_or("ollama")
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -119,6 +138,7 @@ impl ReviewConfig {
             summary_format: over.summary_format.or(self.summary_format),
             verify_scope: over.verify_scope.or(self.verify_scope),
             verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
+            default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
         }
     }
 }
@@ -150,6 +170,17 @@ pub struct DaemonConfig {
     /// refuses to claim a `Pending` run.
     #[serde(default)]
     pub downtime: Vec<DowntimeWindow>,
+    /// The user identity (`crate::agent_access::UserContext`) a request is
+    /// attributed to when it names none explicitly. Must name a row already
+    /// registered via `Store::create_user`/`POST /api/users` -- an unknown
+    /// name resolves the same as unset (`None`) rather than erroring, since
+    /// this is advisory bookkeeping, not access control.
+    ///
+    /// TODO: Replace with user auth once RAL-252 is done -- this whole field
+    /// is a stopgap for "some caller-attributable identity" until requests
+    /// carry a real authenticated identity instead of a config default.
+    #[serde(default)]
+    pub default_user: Option<String>,
 }
 
 impl DaemonConfig {
@@ -349,6 +380,70 @@ pub fn load_terminal_log_config() -> TerminalLogConfig {
     }
 }
 
+/// Live View debug-line-visibility configuration (`[live_view]` table,
+/// RAL-232). Controls the default state of the board's per-pane "Show Debug
+/// Messages" checkbox -- ralphus interleaves its own diagnostic/telemetry
+/// lines (`ralphus [TYPE] ...`, `RALPHUS_EVENT:`, `RALPHUS_TMUX_DONE`) into
+/// the same tmux pane the agent's own output streams through, and the board
+/// strips those lines from its live rendering by default
+/// (`librarian/assets/board.html`'s `stripDebugLines`). This config only
+/// governs that *rendering* default; the daemon's own pane capture, the
+/// persisted last-pane-content snapshot, and Cartographer/terminal-log
+/// records are all unaffected and always keep both agent and debug lines --
+/// see `crate::server::capture_pane_reply`. `None` means unset (so a lower
+/// layer can supply it); resolved callers use
+/// [`show_debug_messages_default`](Self::show_debug_messages_default), which
+/// falls back to `false` (unchecked, agent-only).
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct LiveViewConfig {
+    #[serde(default)]
+    pub show_debug_messages_default: Option<bool>,
+}
+
+impl LiveViewConfig {
+    /// Whether a newly-opened Live View pane defaults to showing ralphus's
+    /// own diagnostic/telemetry lines. Defaults to `false` (agent-only) when
+    /// unset.
+    #[must_use]
+    pub fn show_debug_messages_default(&self) -> bool {
+        self.show_debug_messages_default.unwrap_or(false)
+    }
+}
+
+/// Parse a `LiveViewConfig` from the given TOML text; the default (unchecked)
+/// when the `[live_view]` table is absent.
+#[must_use]
+pub fn live_view_from_toml_str(s: &str) -> LiveViewConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .live_view
+        .unwrap_or_default()
+}
+
+/// Load the effective Live View config by layering the global config file
+/// under the nearest per-project `.ralphus.toml` (per-project scalars win),
+/// following the `[terminal_logs]`/`[cartographer]` pattern -- current-dir-based
+/// since the daemon's HTTP handlers have no per-request "review cwd".
+#[must_use]
+pub fn load_live_view_config() -> LiveViewConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| live_view_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| live_view_from_toml_str(&s))
+        .unwrap_or_default();
+    LiveViewConfig {
+        show_debug_messages_default: local
+            .show_debug_messages_default
+            .or(global.show_debug_messages_default),
+    }
+}
+
 /// Forge routing configuration (`[forge]` table, RAL-117). Lets a project pin
 /// which forge (GitHub/GitLab) and remote to submit PRs against, instead of
 /// relying purely on `git remote get-url` autodetection. `None` fields fall
@@ -369,6 +464,46 @@ pub struct ForgeConfig {
     /// falls back to `RALPHUS_GITHUB_TOKEN` / `RALPHUS_GITLAB_TOKEN`.
     #[serde(default)]
     pub token_env: Option<String>,
+    /// Template for the branch name a submitted PR/MR is pushed under
+    /// (RAL-244), e.g. `"{name}-review"` or `"review-{name}"` — `{name}` is
+    /// replaced with the source branch's own name (see
+    /// [`crate::pr::apply_pr_branch_convention`]). `None` falls back to
+    /// [`DEFAULT_PR_BRANCH_CONVENTION`]. Validated by
+    /// [`validate_pull_request_branch_convention`] -- unlike every other
+    /// string field on this struct, an explicitly-set-but-invalid value is a
+    /// hard `check health` failure rather than a silent fallback (RAL-244
+    /// interview decision: a silently-wrong branch convention is worse than
+    /// a loud one).
+    #[serde(default)]
+    pub pull_request_branch_convention: Option<String>,
+}
+
+/// Fallback [`ForgeConfig::pull_request_branch_convention`] when the project
+/// sets none.
+pub const DEFAULT_PR_BRANCH_CONVENTION: &str = "{name}-review";
+
+/// Validates a configured `pull_request_branch_convention` string (RAL-244):
+/// it must be non-empty and contain the `{name}` placeholder, or the
+/// generated branch name would be empty or identical for every submission.
+/// Only called on an explicitly-set value -- `None` silently uses
+/// [`DEFAULT_PR_BRANCH_CONVENTION`] instead.
+pub fn validate_pull_request_branch_convention(
+    convention: &str,
+) -> std::result::Result<(), String> {
+    if convention.is_empty() {
+        return Err(
+            "forge.pull_request_branch_convention is set but empty -- must be a non-empty \
+             string containing \"{name}\""
+                .to_string(),
+        );
+    }
+    if !convention.contains("{name}") {
+        return Err(format!(
+            "forge.pull_request_branch_convention \"{convention}\" does not contain \"{{name}}\" \
+             -- every submitted PR branch would get the same literal name"
+        ));
+    }
+    Ok(())
 }
 
 impl ForgeConfig {
@@ -381,7 +516,19 @@ impl ForgeConfig {
             remote: over.remote.or(self.remote),
             api_base: over.api_base.or(self.api_base),
             token_env: over.token_env.or(self.token_env),
+            pull_request_branch_convention: over
+                .pull_request_branch_convention
+                .or(self.pull_request_branch_convention),
         }
+    }
+
+    /// The effective PR branch convention: the configured value, or
+    /// [`DEFAULT_PR_BRANCH_CONVENTION`] when unset.
+    #[must_use]
+    pub fn resolved_pr_branch_convention(&self) -> &str {
+        self.pull_request_branch_convention
+            .as_deref()
+            .unwrap_or(DEFAULT_PR_BRANCH_CONVENTION)
     }
 }
 
@@ -440,6 +587,25 @@ pub fn is_valid_env_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Whether `value` is free of control characters (`\n`, `\r`, ESC, NUL, tabs,
+/// ...) -- required for a RAL-227 env override value. Enforced at the same
+/// API boundary as [`is_valid_env_key`] (`crate::server`'s env-override
+/// handlers) so key and value get consistent, co-located validation, rather
+/// than a second check living deep inside
+/// [`crate::tmux::build_command_line_with_env`] that could drift out of
+/// sync. On Windows, a session's launch command is delivered via `send-keys`
+/// typed keystroke-by-keystroke into an already-running interactive pane
+/// (not parsed once as a complete string like the POSIX `respawn-pane`
+/// path) -- an embedded literal `\n` would act like pressing Enter
+/// mid-command, submitting a truncated command early with the remainder
+/// typed in as a second, independently-interpreted command. Values legitimately
+/// carry arbitrary content (API keys, config values), so this rejects only
+/// control characters, not general content.
+#[must_use]
+pub fn is_valid_env_value(value: &str) -> bool {
+    !value.chars().any(|c| c.is_control())
+}
+
 /// The on-disk file shape: either a `[review]` or a `[defaults]` table.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
@@ -454,11 +620,15 @@ struct ConfigFile {
     #[serde(default)]
     terminal_logs: Option<TerminalLogConfig>,
     #[serde(default)]
+    live_view: Option<LiveViewConfig>,
+    #[serde(default)]
     forge: Option<ForgeConfig>,
     #[serde(default)]
     env_overrides: Option<EnvOverridesConfig>,
     #[serde(default)]
     budget: Option<BudgetConfig>,
+    #[serde(default)]
+    cors: Option<CorsConfig>,
 }
 
 /// Parse a config from TOML text, preferring `[review]` over `[defaults]`.
@@ -546,6 +716,7 @@ pub fn load_daemon_config() -> DaemonConfig {
         log_path: local.log_path.or(global.log_path),
         log_level: local.log_level.or(global.log_level),
         downtime: merge_downtime(global.downtime, local.downtime),
+        default_user: local.default_user.or(global.default_user),
     }
 }
 
@@ -686,6 +857,36 @@ pub fn load_env_overrides_config() -> EnvOverridesConfig {
     global.merge(local)
 }
 
+/// Parse a `CorsConfig` from the given TOML text (RAL-220's `[cors]` table).
+#[must_use]
+pub fn cors_from_toml_str(s: &str) -> CorsConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .cors
+        .unwrap_or_default()
+}
+
+/// Load the effective CORS allow-list using the daemon process's own current
+/// directory to locate the per-project `.ralphus.toml` -- the daemon's HTTP
+/// handlers have no per-request "review cwd" the way review config does, so
+/// this mirrors [`load_env_overrides_config`]/[`load_daemon_config`]
+/// (current-dir-based) rather than [`resolve`]/[`resolve_forge`].
+#[must_use]
+pub fn load_cors_config() -> CorsConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| cors_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| cors_from_toml_str(&s))
+        .unwrap_or_default();
+    global.merge(local)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +958,41 @@ mod tests {
         assert_eq!(
             global.merge(ReviewConfig::default()).auto_build,
             Some("global cmd".to_string())
+        );
+    }
+
+    // ── default_resolver_agent ──────────────────────────────────────────
+
+    #[test]
+    fn default_resolver_agent_unset_resolves_to_ollama() {
+        assert_eq!(ReviewConfig::default().default_resolver_agent(), "ollama");
+    }
+
+    #[test]
+    fn parse_default_resolver_agent() {
+        let c = from_toml_str("[review]\ndefault_resolver_agent = \"claude-code\"\n");
+        assert_eq!(c.default_resolver_agent, Some("claude-code".to_string()));
+        assert_eq!(c.default_resolver_agent(), "claude-code");
+    }
+
+    #[test]
+    fn merge_default_resolver_agent_project_wins() {
+        let global = ReviewConfig {
+            default_resolver_agent: Some("claude".to_string()),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            default_resolver_agent: Some("claude-code".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).default_resolver_agent,
+            Some("claude-code".to_string())
+        );
+        // Project unset falls back to the global value.
+        assert_eq!(
+            global.merge(ReviewConfig::default()).default_resolver_agent,
+            Some("claude".to_string())
         );
     }
 
@@ -1005,6 +1241,32 @@ mod tests {
         assert_eq!(c.max_lines_per_attempt(), 1);
     }
 
+    // ── LiveViewConfig (RAL-232) ──────────────────────────────────────────
+
+    #[test]
+    fn live_view_defaults_when_absent() {
+        let c = live_view_from_toml_str("");
+        assert!(!c.show_debug_messages_default());
+    }
+
+    #[test]
+    fn live_view_parses_explicit_true() {
+        let c = live_view_from_toml_str("[live_view]\nshow_debug_messages_default = true\n");
+        assert!(c.show_debug_messages_default());
+    }
+
+    #[test]
+    fn live_view_parses_explicit_false() {
+        let c = live_view_from_toml_str("[live_view]\nshow_debug_messages_default = false\n");
+        assert!(!c.show_debug_messages_default());
+    }
+
+    #[test]
+    fn live_view_malformed_toml_is_default() {
+        let c = live_view_from_toml_str("not = = valid");
+        assert!(!c.show_debug_messages_default());
+    }
+
     // ── Downtime windows (RAL-122) ────────────────────────────────────────
 
     fn t(hh: u32, mm: u32) -> NaiveTime {
@@ -1142,6 +1404,7 @@ mod tests {
             remote: Some("origin".to_string()),
             api_base: None,
             token_env: None,
+            pull_request_branch_convention: None,
         };
         let project = ForgeConfig {
             kind: Some("gitlab".to_string()),
@@ -1151,6 +1414,52 @@ mod tests {
         assert_eq!(merged.kind.as_deref(), Some("gitlab"));
         // Unset-in-project field falls back to the global value.
         assert_eq!(merged.remote.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn forge_pr_branch_convention_defaults_and_parses() {
+        let c = forge_from_toml_str("");
+        assert_eq!(c.pull_request_branch_convention, None);
+        assert_eq!(c.resolved_pr_branch_convention(), "{name}-review");
+
+        let c =
+            forge_from_toml_str("[forge]\npull_request_branch_convention = \"review-{name}\"\n");
+        assert_eq!(
+            c.pull_request_branch_convention.as_deref(),
+            Some("review-{name}")
+        );
+        assert_eq!(c.resolved_pr_branch_convention(), "review-{name}");
+    }
+
+    #[test]
+    fn forge_pr_branch_convention_merge_project_wins() {
+        let global = ForgeConfig {
+            pull_request_branch_convention: Some("{name}-review".to_string()),
+            ..ForgeConfig::default()
+        };
+        let project = ForgeConfig {
+            pull_request_branch_convention: Some("release/blah-{name}".to_string()),
+            ..ForgeConfig::default()
+        };
+        let merged = global.clone().merge(project);
+        assert_eq!(
+            merged.pull_request_branch_convention.as_deref(),
+            Some("release/blah-{name}")
+        );
+        // Per-project unset still falls back to the global value.
+        let merged = global.merge(ForgeConfig::default());
+        assert_eq!(
+            merged.pull_request_branch_convention.as_deref(),
+            Some("{name}-review")
+        );
+    }
+
+    #[test]
+    fn validate_pull_request_branch_convention_rejects_empty_and_missing_placeholder() {
+        assert!(validate_pull_request_branch_convention("").is_err());
+        assert!(validate_pull_request_branch_convention("static-branch-name").is_err());
+        assert!(validate_pull_request_branch_convention("{name}-review").is_ok());
+        assert!(validate_pull_request_branch_convention("release/blah-{name}").is_ok());
     }
 
     // ── EnvOverridesConfig (RAL-150) ──────────────────────────────────────
@@ -1193,6 +1502,29 @@ mod tests {
         );
     }
 
+    // ── CorsConfig (RAL-220) ──────────────────────────────────────────────
+
+    #[test]
+    fn cors_defaults_when_absent() {
+        let c = cors_from_toml_str("");
+        assert!(c.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn cors_parses_explicit_values() {
+        let c = cors_from_toml_str("[cors]\nallowed_origins = [\"https://board.example.com\"]\n");
+        assert_eq!(
+            c.allowed_origins,
+            vec!["https://board.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn cors_malformed_toml_is_default() {
+        let c = cors_from_toml_str("not = = valid");
+        assert!(c.allowed_origins.is_empty());
+    }
+
     #[test]
     fn is_valid_env_key_accepts_identifiers() {
         assert!(is_valid_env_key("RALPHUS_RESOLVER_MODEL"));
@@ -1208,5 +1540,24 @@ mod tests {
         assert!(!is_valid_env_key("HAS=EQUALS"));
         assert!(!is_valid_env_key("HAS;SEMI"));
         assert!(!is_valid_env_key("$(injected)"));
+    }
+
+    #[test]
+    fn is_valid_env_value_accepts_ordinary_content() {
+        assert!(is_valid_env_value(""));
+        assert!(is_valid_env_value("sk-abc123"));
+        assert!(is_valid_env_value(
+            "it's a value with spaces & punctuation!"
+        ));
+        assert!(is_valid_env_value("path/to/thing"));
+    }
+
+    #[test]
+    fn is_valid_env_value_rejects_control_characters() {
+        assert!(!is_valid_env_value("line1\nline2"));
+        assert!(!is_valid_env_value("carriage\rreturn"));
+        assert!(!is_valid_env_value("tab\ttab"));
+        assert!(!is_valid_env_value("esc\x1b[31m"));
+        assert!(!is_valid_env_value("nul\0byte"));
     }
 }

@@ -110,7 +110,7 @@ impl Runner for StageDoneRunner {
             cost_usd: 0.0,
             summary: "resolved\nRALPHUS_STAGE: DONE".into(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -152,7 +152,7 @@ impl Runner for MarkerStrippingRunner {
             cost_usd: 0.0,
             summary: "resolved".into(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -171,7 +171,28 @@ impl Runner for FeedbackRunner {
             cost_usd: 0.0,
             summary: "edited".into(),
             error: None,
-            verified: None,
+            proofed: None,
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+}
+
+/// RAL-241 follow-up: a fake reviewer agent that runs successfully but makes
+/// no edits at all -- exercises `run_feedback`'s silent-no-op path (the
+/// worktree stays clean, so nothing gets committed even though `no_commit`
+/// wasn't requested).
+struct SilentNoOpFeedbackRunner;
+impl Runner for SilentNoOpFeedbackRunner {
+    fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            summary: "nothing to change".into(),
+            error: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -190,7 +211,7 @@ impl Runner for NamedFeedbackRunner {
             cost_usd: 0.0,
             summary: "edited".into(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -583,6 +604,150 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
+    // RAL-241 follow-up regression: an agent run that completes successfully
+    // but edits nothing (and `no_commit` was never requested in the
+    // feedback text) previously landed no commit yet still reported the
+    // branch detail as "feedback applied" -- identical to a real fix. A
+    // reviewer polling `review status` had no way to tell the two apart
+    // without manually `git log`-ing the worktree.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let review_tip_before = {
+        let rb = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+            .review_branch
+            .clone()
+            .unwrap();
+        git(&root, &["rev-parse", &rb])
+    };
+
+    run_feedback(
+        &store,
+        &SilentNoOpFeedbackRunner,
+        &id,
+        &bid0,
+        "tighten up the error messages",
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let detail = view.branches[0].detail.clone();
+    assert_ne!(
+        detail.as_deref(),
+        Some("feedback applied"),
+        "a no-op run must not be reported the same as a real fix"
+    );
+    assert!(
+        detail.as_deref().is_some_and(|d| d.contains("no changes")),
+        "detail: {detail:?}"
+    );
+
+    // Nothing was actually committed onto the review branch.
+    let rb = view.branches[0].review_branch.clone().unwrap();
+    let review_tip_after = git(&root, &["rev-parse", &rb]);
+    assert_eq!(
+        review_tip_before, review_tip_after,
+        "no-op feedback run must not create a commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
+    // RAL-241 follow-up regression: an agent run that completes successfully
+    // but edits nothing (and `no_commit` was never requested in the
+    // feedback text) previously landed no commit yet still reported the
+    // branch detail as "feedback applied" -- identical to a real fix. A
+    // reviewer polling `review status` had no way to tell the two apart
+    // without manually `git log`-ing the worktree.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let review_tip_before = {
+        let rb = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+            .review_branch
+            .clone()
+            .unwrap();
+        git(&root, &["rev-parse", &rb])
+    };
+
+    run_feedback(
+        &store,
+        &SilentNoOpFeedbackRunner,
+        &id,
+        &bid0,
+        "tighten up the error messages",
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let detail = view.branches[0].detail.clone();
+    assert_ne!(
+        detail.as_deref(),
+        Some("feedback applied"),
+        "a no-op run must not be reported the same as a real fix"
+    );
+    assert!(
+        detail.as_deref().is_some_and(|d| d.contains("no changes")),
+        "detail: {detail:?}"
+    );
+
+    // Nothing was actually committed onto the review branch.
+    let rb = view.branches[0].review_branch.clone().unwrap();
+    let review_tip_after = git(&root, &["rev-parse", &rb]);
+    assert_eq!(
+        review_tip_before, review_tip_after,
+        "no-op feedback run must not create a commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn single_feature_repo() -> (PathBuf, Arc<Mutex<Store>>, String) {
     let root = temp_repo();
     init_repo(&root);
@@ -741,7 +906,7 @@ impl Runner for InferredBuildRunner {
                 summary: r#"{"manual_commands": ["echo verify"], "build_command": "echo built > built_marker.txt"}"#
                     .into(),
                 error: None,
-                verified: None,
+                proofed: None,
                 agent_session_id: None,
                 ghost: None,
             };
@@ -825,9 +990,9 @@ fn skip_worktree_checks_does_not_affect_auto_build() {
 }
 
 // Regression: `skip_worktree_checks` must suppress the dedicated
-// `run_final_verify` call itself, not just the quality-bar instructions
+// `run_final_proof` call itself, not just the quality-bar instructions
 // handed to it (RAL-110 vs RAL-168/RAL-149 were previously independent
-// axes). Exercises both `VerifyGate` call sites in one pass:
+// axes). Exercises both `ProofGate` call sites in one pass:
 // feature/x rebases cleanly onto main but contributes real changes
 // (`allows_for_clean_branch`), and feature/y then conflicts against it and is
 // resolved by the fake agent (`allows_after_conflict`).
@@ -896,7 +1061,7 @@ fn skip_worktree_checks_suppresses_final_verify() {
                 cost_usd: 0.0,
                 summary: "resolved".into(),
                 error: None,
-                verified: spec.verify.then_some(true),
+                proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
             }
@@ -922,21 +1087,21 @@ fn skip_worktree_checks_suppresses_final_verify() {
         .iter()
         .find(|b| b.branch == "feature/y")
         .expect("feature/y branch view");
-    // Neither branch's final status reflects a verify call having run.
+    // Neither branch's final status reflects a proof call having run.
     assert_eq!(
         x.merge_status, "done",
-        "feature/x (clean rebase, real changes) must skip final-verify entirely"
+        "feature/x (clean rebase, real changes) must skip final-proof entirely"
     );
     assert_eq!(
         y.merge_status, "conflict_resolved",
-        "feature/y (agent-resolved conflict) must skip final-verify entirely"
+        "feature/y (agent-resolved conflict) must skip final-proof entirely"
     );
 
     let specs = captured.lock().unwrap();
     assert!(
-        specs.iter().all(|s| s.task != "resolve-verify"),
-        "skip_worktree_checks must suppress the dedicated final-verify call, \
-         but a resolve-verify spec was issued: {specs:?}"
+        specs.iter().all(|s| s.task != "resolve-proof"),
+        "skip_worktree_checks must suppress the dedicated final-proof call, \
+         but a resolve-proof spec was issued: {specs:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1147,7 +1312,7 @@ fn base_branch_shift_triggers_rebuild() {
 // all blocking tasks IT knows about done, and leaves `collecting` (→
 // `in_review`) before the second run's task — and therefore its branch —
 // exists at all. Once the guardian is no longer `collecting`,
-// `try_start_ready_reviews_for_task`'s `collecting_guardians_for_sessions`
+// `try_start_ready_reviews_for_task`'s `collecting_guardians_for_cells`
 // query never finds it again, so the straggler branch never gets its
 // `worktree`/`review_branch` populated even though its session is `done`.
 // `reopen_straggler` (wired into the periodic `review_maintenance` sweep) must
@@ -1174,25 +1339,25 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
 
     let mut owned_store = Store::open_in_memory().unwrap();
     let sample: TaskFile =
-        toml::from_str("[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/repo\"\nprompt=\"p\"\n")
+        toml::from_str("[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n")
             .unwrap();
 
     // Guardian created for run A, carrying only feature/a (mirrors RAL-97's task
     // finishing first, in its own run).
-    let run_a = owned_store.insert_run(&sample, Some("a"), false).unwrap();
+    let run_a = owned_store.insert_squad(&sample, Some("a"), false).unwrap();
     let id = {
         let g = &owned_store;
         let id = g
-            .create_guardian_for_run("linked", "main", root.to_str().unwrap(), Some(&run_a))
+            .create_guardian_for_squad("linked", "main", root.to_str().unwrap(), Some(&run_a))
             .unwrap();
         g.add_guardian_branch(&id, "feature/a").unwrap();
         id
     };
     owned_store
-        .set_session_review_branch(&run_a, 0, 0, "feature/a")
+        .set_cell_review_branch(&run_a, 0, 0, "feature/a")
         .unwrap();
     owned_store
-        .set_session_state(&run_a, 0, 0, NodeState::Done)
+        .set_cell_state(&run_a, 0, 0, NodeState::Done)
         .unwrap();
 
     let store = Arc::new(Mutex::new(owned_store));
@@ -1209,14 +1374,13 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
     // branch to the SAME (already `in_review`) guardian by review-key linkage.
     let run_b = {
         let mut g = store.lock().unwrap();
-        g.insert_run(&sample, Some("b"), false).unwrap()
+        g.insert_squad(&sample, Some("b"), false).unwrap()
     };
     {
         let g = store.lock().unwrap();
         g.add_guardian_branch(&id, "feature/b").unwrap();
-        g.set_session_review_branch(&run_b, 0, 0, "feature/b")
-            .unwrap();
-        g.set_session_state(&run_b, 0, 0, NodeState::Done).unwrap();
+        g.set_cell_review_branch(&run_b, 0, 0, "feature/b").unwrap();
+        g.set_cell_state(&run_b, 0, 0, NodeState::Done).unwrap();
     }
 
     // Sanity check: this is the bug. The straggler branch is stuck `pending`
@@ -1710,14 +1874,14 @@ fn new_naming_convention_per_branch_and_combined() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Verify-synthesis integration: when a guardian is linked to a run whose session
-// has verify steps, `resolve_conflicts_with_agent` must:
-//   1. invoke a "verify-synthesis" LLM call whose prompt lists every step
+// Proof-synthesis integration: when a guardian is linked to a squad whose cell
+// has proof steps, `resolve_conflicts_with_agent` must:
+//   1. invoke a "proof-synthesis" LLM call whose prompt lists every step
 //      (command-kind, prompt-kind, and task-level) in the expected format; and
 //   2. inject the synthesised quality bar into the subsequent "resolve" call's
 //      prompt so the conflict-resolver agent knows what standard to meet.
 #[test]
-fn conflict_resolution_synthesizes_verify_steps_into_resolver_prompt() {
+fn conflict_resolution_synthesizes_proof_steps_into_resolver_prompt() {
     // --- git repo with a conflicting branch pair ---
     let root = temp_repo();
     init_repo(&root);
@@ -1735,58 +1899,58 @@ fn conflict_resolution_synthesizes_verify_steps_into_resolver_prompt() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    // --- run with session verify steps (command + prompt) and a task verify ---
+    // --- squad with cell proof steps (command + prompt) and a task proof ---
     const TASK_TOML: &str = r#"
 [[task]]
 name = "my-task"
-[[task.session]]
+[[task.cell]]
 id = "impl"
 cwd = "/repo"
 prompt = "implement the feature"
-[[task.session.verify]]
+[[task.cell.proof]]
 command = "cargo fmt --check"
-[[task.session.verify]]
+[[task.cell.proof]]
 prompt = "The code must follow project style guidelines and be readable"
-[[task.verify]]
+[[task.proof]]
 command = "cargo test --workspace"
 "#;
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
 
-    // Insert the run then link the guardian to it. feature/y is the branch that
-    // will conflict (rebased on top of feature/x), so its session gets the verify
-    // steps.
+    // Insert the squad then link the guardian to it. feature/y is the branch
+    // that will conflict (rebased on top of feature/x), so its cell gets the
+    // proof steps.
     let run_id = {
         let task_file: ralphus_core::schema::TaskFile = toml::from_str(TASK_TOML).unwrap();
         store
             .lock()
             .unwrap()
-            .insert_run(&task_file, Some("synthesis test"), false)
+            .insert_squad(&task_file, Some("synthesis test"), false)
             .unwrap()
     };
 
     let guardian_id = {
         let g = store.lock().unwrap();
         let id = g
-            .create_guardian_for_run("review", "main", root.to_str().unwrap(), Some(&run_id))
+            .create_guardian_for_squad("review", "main", root.to_str().unwrap(), Some(&run_id))
             .unwrap();
         g.add_guardian_branch(&id, "feature/x").unwrap();
         g.add_guardian_branch(&id, "feature/y").unwrap();
-        // Link task 0, session 0 to feature/y so its verify steps are picked up
+        // Link task 0, cell 0 to feature/y so its proof steps are picked up
         // during synthesis.
-        g.set_session_review_branch(&run_id, 0, 0, "feature/y")
+        g.set_cell_review_branch(&run_id, 0, 0, "feature/y")
             .unwrap();
         // RAL-168: "each_branch" scope now also verifies a branch that rebases
         // cleanly with no conflict at all (feature/x here) -- opt that back out
-        // so this test's single `resolve-verify` spec stays scoped to the
+        // so this test's single `resolve-proof` spec stays scoped to the
         // conflict-resolution path (feature/y) it's actually testing.
-        g.set_guardian_verify_skip_auto_clean(&id, Some(true))
+        g.set_guardian_proof_skip_auto_clean(&id, Some(true))
             .unwrap();
         id
     };
 
     // --- capturing runner ---
-    // On a "verify-synthesis" call: record the spec and return a fixed summary.
+    // On a "proof-synthesis" call: record the spec and return a fixed summary.
     // On a "resolve" call: record the spec and strip conflict markers so the
     // rebase can complete (mirrors MarkerStrippingRunner).
     const SYNTH_SUMMARY: &str = "Run `cargo fmt --check` and fix failures. Run `cargo test --workspace`. \
@@ -1800,7 +1964,7 @@ command = "cargo test --workspace"
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             self.specs.lock().unwrap().push(spec.clone());
 
-            if spec.task == "verify-synthesis" {
+            if spec.task == "proof-synthesis" {
                 return RunnerResult {
                     status: "done".into(),
                     tokens_in: 15,
@@ -1808,7 +1972,7 @@ command = "cargo test --workspace"
                     cost_usd: 0.0,
                     summary: self.synth_summary.into(),
                     error: None,
-                    verified: None,
+                    proofed: None,
                     agent_session_id: None,
                     ghost: None,
                 };
@@ -1844,12 +2008,12 @@ command = "cargo test --workspace"
                 cost_usd: 0.0,
                 summary: "resolved".into(),
                 error: None,
-                // RAL-149: the dedicated final-verify call is `verify: true`;
+                // RAL-149: the dedicated final-proof call is `proof: true`;
                 // report a PASS verdict for it so the branch's merge status
                 // still lands on `conflict_resolved` (a FAIL verdict is
                 // otherwise a valid, non-blocking outcome, but this test is
-                // about the resolver/synthesis prompts, not verify verdicts).
-                verified: spec.verify.then_some(true),
+                // about the resolver/synthesis prompts, not proof verdicts).
+                proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
             }
@@ -1873,25 +2037,25 @@ command = "cargo test --workspace"
     // 1. A synthesis call was issued for the conflicting branch (feature/y).
     let synth = specs
         .iter()
-        .find(|s| s.task == "verify-synthesis")
-        .expect("verify-synthesis spec not found — synthesis was never invoked");
+        .find(|s| s.task == "proof-synthesis")
+        .expect("proof-synthesis spec not found — synthesis was never invoked");
 
     let synth_prompt = synth.prompt.as_deref().unwrap_or("");
 
-    // Session-level command verify step must appear.
+    // Cell-level command proof step must appear.
     assert!(
         synth_prompt.contains("[command] cargo fmt --check"),
-        "synthesis prompt missing session command step:\n{synth_prompt}"
+        "synthesis prompt missing cell command step:\n{synth_prompt}"
     );
-    // Session-level prompt verify step must appear.
+    // Cell-level prompt proof step must appear.
     assert!(
         synth_prompt.contains("[prompt]") && synth_prompt.contains("style guidelines"),
-        "synthesis prompt missing session prompt-kind step:\n{synth_prompt}"
+        "synthesis prompt missing cell prompt-kind step:\n{synth_prompt}"
     );
-    // Task-level command verify step must appear.
+    // Task-level command proof step must appear.
     assert!(
         synth_prompt.contains("[command] cargo test --workspace"),
-        "synthesis prompt missing task-level verify step:\n{synth_prompt}"
+        "synthesis prompt missing task-level proof step:\n{synth_prompt}"
     );
 
     // 2. The synthesis system prompt is present and mentions the rebase constraint.
@@ -1903,7 +2067,7 @@ command = "cargo test --workspace"
 
     // 3. RAL-168: the fix pass's own ("resolve") prompt never carries the
     //    quality bar -- that responsibility belongs solely to the dedicated
-    //    final-verify call.
+    //    final-proof call.
     let resolve = specs
         .iter()
         .find(|s| s.task == "resolve")
@@ -1914,22 +2078,22 @@ command = "cargo test --workspace"
         "fix pass prompt should never carry the quality bar (RAL-168):\n{resolve_prompt}"
     );
 
-    // ...it must instead appear in the dedicated final-verify call, which
+    // ...it must instead appear in the dedicated final-proof call, which
     // runs the quality-bar instructions under the default "each_branch"
-    // Verify scope (RAL-168).
-    let verify_call = specs
+    // Proof scope (RAL-168).
+    let proof_call = specs
         .iter()
-        .find(|s| s.task == "resolve-verify")
-        .expect("resolve-verify spec not found — final-verify call was never invoked");
-    assert!(verify_call.verify, "final-verify call must be verify: true");
-    let verify_prompt = verify_call.prompt.as_deref().unwrap_or("");
+        .find(|s| s.task == "resolve-proof")
+        .expect("resolve-proof spec not found — final-proof call was never invoked");
+    assert!(proof_call.proof, "final-proof call must be proof: true");
+    let proof_prompt = proof_call.prompt.as_deref().unwrap_or("");
     assert!(
-        verify_prompt.contains("quality bar"),
-        "final-verify prompt missing synthesised quality bar:\n{verify_prompt}"
+        proof_prompt.contains("quality bar"),
+        "final-proof prompt missing synthesised quality bar:\n{proof_prompt}"
     );
     assert!(
-        verify_prompt.contains(SYNTH_SUMMARY),
-        "final-verify prompt does not contain the synthesised text:\n{verify_prompt}"
+        proof_prompt.contains(SYNTH_SUMMARY),
+        "final-proof prompt does not contain the synthesised text:\n{proof_prompt}"
     );
 
     // 4. Synthesis events were written to the guardian log.
@@ -1941,7 +2105,7 @@ command = "cargo test --workspace"
     assert!(
         events
             .iter()
-            .any(|e| e.message.contains("synthesizing verify instructions")),
+            .any(|e| e.message.contains("synthesizing proof instructions")),
         "expected synthesis-start event in guardian log; got: {events:?}"
     );
     assert!(
@@ -2098,7 +2262,7 @@ impl Runner for RouteBlockRunner {
                     self.target_branch, self.target_branch
                 ),
                 error: None,
-                verified: None,
+                proofed: None,
                 agent_session_id: None,
                 ghost: None,
             };
@@ -2114,7 +2278,7 @@ impl Runner for RouteBlockRunner {
             cost_usd: 0.0,
             summary: "edited".into(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -2124,12 +2288,14 @@ impl Runner for RouteBlockRunner {
 #[test]
 fn chat_no_commit_leaves_working_tree_dirty() {
     let (root, store, id) = single_feature_repo();
-    // Use an unsupported resolver agent so call_direct returns Err immediately and
-    // the subprocess fallback (our mock runner) is used for the triage call.
+    // Use a resolvable-but-`call_direct`-unsupported resolver agent (see
+    // `chat_client::call_direct`: only claude/anthropic/ollama go direct) so
+    // `call_direct` returns Err immediately and the subprocess fallback (our
+    // mock runner) is used for the triage call.
     store
         .lock()
         .unwrap()
-        .set_guardian_resolver(&id, Some("noop"), None)
+        .set_guardian_resolver(&id, Some("claude-code"), None)
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
 
@@ -2183,12 +2349,14 @@ fn chat_no_commit_leaves_working_tree_dirty() {
 #[test]
 fn chat_replies_with_friendly_message_when_workspace_missing() {
     let (root, store, id) = single_feature_repo();
-    // Use an unsupported resolver agent so call_direct returns Err immediately
-    // and the subprocess fallback path (under test) is used for the triage call.
+    // Use a resolvable-but-`call_direct`-unsupported resolver agent (see
+    // `chat_client::call_direct`: only claude/anthropic/ollama go direct) so
+    // `call_direct` returns Err immediately and the subprocess fallback path
+    // (under test) is used for the triage call.
     store
         .lock()
         .unwrap()
-        .set_guardian_resolver(&id, Some("noop"), None)
+        .set_guardian_resolver(&id, Some("claude-code"), None)
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
 
@@ -2447,7 +2615,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 cost_usd: 0.0,
                 summary: "resolved".into(),
                 error: None,
-                verified: None,
+                proofed: None,
                 agent_session_id: None,
                 ghost: None,
             }
@@ -2485,6 +2653,85 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
     assert!(
         sys.contains("git add -A"),
         "resolver system prompt must instruct the agent to run git add -A:\n{sys}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn review_resolver_agent_resolves_a_custom_agent_profile() {
+    // A review's `resolver_agent` naming a configured `.ralphus.toml` custom
+    // profile (the pattern used to reach e.g. OpenRouter through the
+    // claude-code harness) must resolve to that profile's real backend and
+    // pick up its env vars -- not reach the runner as the raw, unresolved
+    // profile name. This is the regression test for the bug where the review
+    // path never called `agent_profiles::resolve_agent_for_path` at all.
+    let root = temp_repo();
+    init_repo(&root);
+    write(
+        &root,
+        ".ralphus.toml",
+        "[agent.profiles.test-profile]\n\
+         backend = \"claude-code\"\n\
+         [agent.profiles.test-profile.env]\n\
+         TEST_MARKER = \"openrouter-value\"\n",
+    );
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let captured: Arc<Mutex<Vec<RunnerSpec>>> = Arc::new(Mutex::new(Vec::new()));
+    struct CapturingStageDoneRunner {
+        specs: Arc<Mutex<Vec<RunnerSpec>>>,
+    }
+    impl Runner for CapturingStageDoneRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.specs.lock().unwrap().push(spec.clone());
+            StageDoneRunner.run(spec)
+        }
+    }
+    let runner = CapturingStageDoneRunner {
+        specs: captured.clone(),
+    };
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("resolver-profile-check", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        g.set_guardian_resolver(&id, Some("test-profile"), None)
+            .unwrap();
+        id
+    };
+
+    run_merge(&store, &runner, &id);
+
+    let specs = captured.lock().unwrap();
+    let resolve = specs
+        .iter()
+        .find(|s| s.task == "resolve")
+        .expect("resolve spec not found — conflict resolver was never invoked");
+    assert_eq!(
+        resolve.agent, "claude-code",
+        "the resolver spec's agent must be the profile's resolved backend, not the raw profile name"
+    );
+    assert_eq!(
+        resolve.env_overrides.get("TEST_MARKER").map(String::as_str),
+        Some("openrouter-value"),
+        "the profile's env vars must be merged into the resolver's env_overrides"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2543,7 +2790,7 @@ impl Runner for PartialResolutionRunner {
             cost_usd: 0.0,
             summary: "resolved".into(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -3614,12 +3861,12 @@ fn pull_pr_commits_is_a_noop_when_already_up_to_date() {
 /// call behaves like the plain marker-stripping runner used elsewhere in this
 /// file, so the restarted attempt actually completes.
 ///
-/// `verify_scope` (not `skip_worktree_checks` — that setting only trims the
+/// `proof_scope` (not `skip_worktree_checks` — that setting only trims the
 /// resolver's quality-bar note, it does not gate whether the dedicated
-/// "resolve-verify" call runs at all) is the setting flipped mid-flight here,
+/// "resolve-proof" call runs at all) is the setting flipped mid-flight here,
 /// to "nothing": the first (stuck) attempt never gets far enough to invoke
-/// "resolve-verify" for `feature/y` at all (it is still blocked resolving
-/// markers), so the only way this test's "no resolve-verify call ever ran"
+/// "resolve-proof" for `feature/y` at all (it is still blocked resolving
+/// markers), so the only way this test's "no resolve-proof call ever ran"
 /// assertion can pass is if the *restarted* attempt actually observed the new
 /// setting rather than the "each_branch" default it started with.
 #[test]
@@ -3649,9 +3896,9 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         g.add_guardian_branch(&id, "feature/x").unwrap();
         g.add_guardian_branch(&id, "feature/y").unwrap();
         // RAL-168: keep the clean branch (feature/x) out of the picture so the
-        // only "resolve-verify" call this test could ever observe is the one
+        // only "resolve-proof" call this test could ever observe is the one
         // gated behind feature/y's conflict resolution -- see the doc comment.
-        g.set_guardian_verify_skip_auto_clean(&id, Some(true))
+        g.set_guardian_proof_skip_auto_clean(&id, Some(true))
             .unwrap();
         id
     };
@@ -3713,7 +3960,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 cost_usd: 0.0,
                 summary: "resolved".into(),
                 error: None,
-                verified: spec.verify.then_some(true),
+                proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
             }
@@ -3743,7 +3990,11 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
     assert_eq!(reply.status, 202);
 
     // Wait until the merge is genuinely stuck mid-resolve (not just "started").
-    for _ in 0..2000 {
+    // 24000 * 5ms = 120s: generous headroom for `cargo test --all-targets`,
+    // where this repo's git-heavy tests all contend for CPU/IO at once and
+    // the background merge thread can take much longer than in isolation to
+    // reach the resolve call.
+    for _ in 0..24000 {
         if resolve_started.load(Ordering::SeqCst) {
             break;
         }
@@ -3758,13 +4009,13 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         "merging"
     );
 
-    // The settings change: turn Verify off entirely, then trigger the same
+    // The settings change: turn Proof off entirely, then trigger the same
     // restart path `guardian_settings`'s HTTP handler now calls whenever a
     // setting is changed while `status == "merging"`.
     store
         .lock()
         .unwrap()
-        .set_guardian_verify_scope(&id, Some("nothing"))
+        .set_guardian_proof_scope(&id, Some("nothing"))
         .unwrap();
     let restart_reply = restart_guardian_merge(
         Arc::clone(&store),
@@ -3779,8 +4030,9 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         restart_reply.body
     );
 
+    // Same 120s headroom as the wait above, for the same reason.
     let mut status = String::new();
-    for _ in 0..2000 {
+    for _ in 0..24000 {
         status = store.lock().unwrap().get_guardian(&id).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
@@ -3801,7 +4053,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
     );
 
     // (b) Every branch ends in a clean, consistent terminal status -- not
-    // stuck `in_progress`/`verify_pending` from the cancelled first attempt.
+    // stuck `in_progress`/`proof_pending` from the cancelled first attempt.
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     for b in &view.branches {
         assert!(
@@ -3824,18 +4076,18 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         }
     }
 
-    // (d) The NEW setting (verify_scope = "nothing") took effect on the
-    // restarted attempt: `resolve-verify` never ran at all -- see this test's
+    // (d) The NEW setting (proof_scope = "nothing") took effect on the
+    // restarted attempt: `resolve-proof` never ran at all -- see this test's
     // doc comment for why that's proof the restarted pass, not the original
     // "each_branch" one, is what resolved feature/y's conflict.
-    let has_resolve_verify = specs
+    let has_resolve_proof = specs
         .lock()
         .unwrap()
         .iter()
-        .any(|s| s.task == "resolve-verify");
+        .any(|s| s.task == "resolve-proof");
     assert!(
-        !has_resolve_verify,
-        "resolve-verify must not run once verify_scope is \"nothing\" on the restarted attempt"
+        !has_resolve_proof,
+        "resolve-proof must not run once proof_scope is \"nothing\" on the restarted attempt"
     );
 
     let _ = std::fs::remove_dir_all(&root);

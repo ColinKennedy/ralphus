@@ -1,19 +1,25 @@
 //! Placeholder `cwd` resolution + git worktree materialization (RAL-100).
 //!
-//! A session `cwd` of the form `ralphus:new-worktree/<branch>` names a branch
-//! to check out in a dedicated worktree under `.git/.ralphus/w/<short>`
-//! (`<short>` is a truncated form of `branch`; see `crate::short_paths`. Git
-//! branch names are never shortened, only this directory name), rather than a
-//! real filesystem path. The project to materialize it under is
-//! NOT embedded in the `cwd` string -- it's the owning task's `project` field
-//! (required whenever any of its sessions uses this placeholder).
-//! [`resolve_placeholders`] resolves every placeholder among a run's sessions
+//! A cell `cwd` of the form `ralphus:new-worktree/<branch>?upstream=<upstream>`
+//! names a branch to check out in a dedicated worktree under
+//! `.git/.ralphus/w/<short>` (`<short>` is a truncated form of `branch`; see
+//! `crate::short_paths`. Git branch names are never shortened, only this
+//! directory name), rather than a real filesystem path. The project to
+//! materialize it under is NOT embedded in the `cwd` string -- it's the
+//! owning task's `project` field (required whenever any of its cells uses
+//! this placeholder). The `?upstream=<upstream>` suffix is REQUIRED too:
+//! submit-time validation (`ralphus_core::validate`) rejects a placeholder
+//! cwd with none, and [`ensure_worktree`] always applies it via
+//! `git branch --set-upstream-to`, so a freshly materialized branch's
+//! tracking target is always the author's explicit choice, never a guess
+//! from whatever `HEAD` happened to be at materialization time.
+//! [`resolve_placeholders`] resolves every placeholder among a squad's cells
 //! exactly once (memoized by the literal placeholder string, so the same
-//! value repeated across sessions/tasks only materializes one worktree),
-//! rewriting each session's stored `cwd` to the real resolved path.
+//! value repeated across cells/tasks only materializes one worktree),
+//! rewriting each cell's stored `cwd` to the real resolved path.
 //!
-//! Restart safety falls out of that rewrite: once a session's `cwd` has been
-//! resolved and persisted, a restarted run reads the real path back from the
+//! Restart safety falls out of that rewrite: once a cell's `cwd` has been
+//! resolved and persisted, a restarted squad reads the real path back from the
 //! store — the placeholder string is gone; there's nothing left to resolve.
 
 use std::collections::HashMap;
@@ -24,29 +30,121 @@ use opentelemetry::trace::{SpanKind, Status};
 
 use crate::guardian_merge::git;
 use crate::otel;
-use crate::store::{SessionRow, Store, TaskRow};
+use crate::store::{CellRow, Store, TaskRow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchMaterialization {
     ExistingLocal,
-    NewFromRemote {
-        remote_ref: String,
-    },
-    NewFromHead {
-        base: Option<String>,
-        warning: Option<String>,
-    },
+    NewFromRemote { remote_ref: String },
+    NewFromHead { warning: Option<String> },
 }
 
 /// The on-disk worktree directory for `branch` under a project's `root`:
 /// `.git/.ralphus/w/<short>`, `<short>` a truncated form of `branch` (see
 /// `crate::short_paths`) so a deeply nested `root` still fits inside
 /// Windows' `MAX_PATH`; the git branch itself keeps its full name.
+///
+/// Collision-*unaware*, like [`crate::short_paths::short_name`] itself: two
+/// branches that truncate to the same short name compute the same directory
+/// here. Only [`ensure_worktree`] (via [`resolve_task_worktree_dir`]) is
+/// safe to use for actually materializing a worktree; this function stays a
+/// pure, git-free helper for tests and for spots that just need "the
+/// directory a branch would land in absent any collision."
 #[must_use]
 pub fn worktree_dir(root: &Path, branch: &str) -> PathBuf {
     crate::short_paths::ralphus_root(root)
         .join("w")
         .join(crate::short_paths::short_name(branch))
+}
+
+/// The `<short>` component of `path`, if `path` is a direct child of some
+/// `.git/.ralphus/w/` directory -- found by matching that contiguous
+/// component *run* rather than comparing `path.parent()` against a
+/// separately-built `PathBuf` for equality, since `git worktree list
+/// --porcelain` prints forward-slash paths even on Windows while a
+/// `PathBuf` built with `.join()` uses `\`; two `Path`s naming the same
+/// directory but spelled with different separators are not `==` to each
+/// other (same class of mismatch [`crate::short_paths::worktree_belongs_to_guardian`]
+/// already guards against, for a different underlying cause).
+fn short_name_under_w(path: &Path) -> Option<String> {
+    let comps: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    comps
+        .windows(4)
+        .find(|w| w[0] == ".git" && w[1] == ".ralphus" && w[2] == "w")
+        .map(|w| w[3].clone())
+}
+
+/// Every task-worktree short name currently in use under `root`'s `w/`
+/// directory, mapped to the branch it's checked out on -- read straight from
+/// `git worktree list --porcelain` (the same technique
+/// `guardian_merge::find_worktree_for_branch` uses), never from `w/`'s
+/// directory listing, so a worktree git considers prunable/stale still
+/// counts as occupying its slot until git itself says otherwise.
+fn existing_task_worktree_branches(root: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(list) = git(root, &["worktree", "list", "--porcelain"]) else {
+        return out;
+    };
+    let mut cur_short: Option<String> = None;
+    for line in list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            cur_short = short_name_under_w(Path::new(path.trim()));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            if let Some(short) = cur_short.take() {
+                out.insert(short, branch.trim().to_string());
+            }
+        } else if line.is_empty() {
+            cur_short = None;
+        }
+    }
+    out
+}
+
+/// The on-disk worktree directory to actually materialize `branch` into,
+/// disambiguated against every other branch already occupying a `w/<short>`
+/// slot (RAL-100 follow-up): two branches that [`worktree_dir`] would collide
+/// on (e.g. `test-pr-submission-a` and `test-pr-submission-b`, which agree on
+/// every character [`crate::short_paths::short_name`] looks at) get distinct
+/// directories, `<short>` and `<short>-2`, instead of silently sharing one
+/// worktree and racing on its git index.
+///
+/// Queries live git state (via [`existing_task_worktree_branches`]) rather
+/// than an in-memory set, and reuses the exact suffix scheme
+/// [`crate::short_paths::dedupe_short_names`] uses for guardian branches
+/// (`-2`, `-3`, ...) -- but computed incrementally here since, unlike a
+/// guardian's fixed branch list, task-worktree branches are discovered one
+/// `ensure_worktree` call at a time, potentially across many squads over the
+/// project's lifetime. That live query is also what makes this safe under
+/// concurrent squads: [`resolve_placeholders`] runs its whole pass under the
+/// daemon's global store lock, so by the time a second squad's call re-reads
+/// `git worktree list`, the first squad's `git worktree add` has already
+/// landed and claims its slot.
+///
+/// A directory already occupied by `branch` itself is reused as-is (restart
+/// safety: the branch keeps the same directory across a squad restart). A
+/// directory occupied by any other branch is skipped in favor of the next
+/// suffix. A short name with no worktree registered at all is free.
+fn resolve_task_worktree_dir(root: &Path, branch: &str) -> PathBuf {
+    let existing = existing_task_worktree_branches(root);
+    let base = crate::short_paths::short_name(branch);
+    let mut candidate = base.clone();
+    let mut n = 2;
+    loop {
+        match existing.get(&candidate) {
+            None => break,
+            Some(owner) if owner == branch => break,
+            Some(_) => {
+                candidate = format!("{base}-{n}");
+                n += 1;
+            }
+        }
+    }
+    crate::short_paths::ralphus_root(root)
+        .join("w")
+        .join(candidate)
 }
 
 /// The OS path-length budget a worktree checkout is held to. Windows'
@@ -98,7 +196,6 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
             return Ok(BranchMaterialization::NewFromRemote { remote_ref });
         }
     }
-    let base = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
     let warning = branch.contains('/').then(|| {
         format!(
             "placeholder branch \"{branch}\" looks like <remote>/<branch>, but \
@@ -107,7 +204,67 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
             root.display()
         )
     });
-    Ok(BranchMaterialization::NewFromHead { base, warning })
+    Ok(BranchMaterialization::NewFromHead { warning })
+}
+
+/// Set `branch`'s (checked out in worktree `wt`) upstream to the explicit
+/// `?upstream=` value from a `ralphus:new-worktree/<branch>?upstream=<upstream>`
+/// placeholder ([`ensure_worktree`]'s `upstream` parameter is now mandatory --
+/// see [`ralphus_core::schema::parse_worktree_placeholder_upstream`]). Unlike
+/// the old best-effort HEAD-inferred default this replaced, a failure here is
+/// a hard error: the user named this upstream explicitly, so a value that
+/// doesn't resolve (a typo, or a remote branch that hasn't been fetched into
+/// `root` yet) must surface immediately rather than leaving the branch
+/// silently untracked.
+///
+/// Deliberately does NOT delegate to `git branch --set-upstream-to <upstream>`
+/// with the raw string: git resolves that through a DWIM ref search across
+/// `refs/heads/`, `refs/remotes/`, etc., which reports `<upstream>` as
+/// "ambiguous" whenever it matches refs in more than one namespace -- exactly
+/// what happens for e.g. `?upstream=origin/foo` on a branch [`ensure_worktree`]
+/// itself may have just created *literally named* `origin/foo` while tracking
+/// remote-tracking ref `refs/remotes/origin/foo` (the `NewFromRemote` case
+/// above). Resolving `upstream` ourselves first -- an unambiguous, fully
+/// qualified `rev-parse --verify` against each candidate namespace -- and then
+/// writing `branch.<branch>.remote`/`.merge` directly sidesteps that ambiguity
+/// entirely. A remote-tracking match is preferred over a same-named local
+/// branch, since tracking a remote is `?upstream=`'s primary purpose.
+fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
+    let fail = |e: String| -> String {
+        format!(
+            "could not set upstream to \"{upstream}\" for the worktree at {}: {e} -- the \
+             \"?upstream=\" value must already exist as a local branch or a remote-tracking ref \
+             (fetch the remote first if it names a \"<remote>/<branch>\" value)",
+            wt.display()
+        )
+    };
+    if let Some((remote, remote_branch)) = upstream.split_once('/') {
+        let remote_ref = format!("refs/remotes/{upstream}");
+        if git(wt, &["rev-parse", "--verify", &remote_ref]).is_ok() {
+            git(wt, &["config", &format!("branch.{branch}.remote"), remote]).map_err(fail)?;
+            git(
+                wt,
+                &[
+                    "config",
+                    &format!("branch.{branch}.merge"),
+                    &format!("refs/heads/{remote_branch}"),
+                ],
+            )
+            .map_err(fail)?;
+            return Ok(());
+        }
+    }
+    let local_ref = format!("refs/heads/{upstream}");
+    if git(wt, &["rev-parse", "--verify", &local_ref]).is_ok() {
+        git(wt, &["config", &format!("branch.{branch}.remote"), "."]).map_err(fail)?;
+        git(
+            wt,
+            &["config", &format!("branch.{branch}.merge"), &local_ref],
+        )
+        .map_err(fail)?;
+        return Ok(());
+    }
+    Err(fail("no matching ref found".to_string()))
 }
 
 /// If `wt`'s checked-out branch tracks a remote (its `@{upstream}` resolves
@@ -161,13 +318,25 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
 }
 
 /// Create (or reuse) a git worktree for `branch` under `root`, returning its
-/// path.
+/// path. `upstream` is the branch's `?upstream=` value from its
+/// `ralphus:new-worktree/<branch>?upstream=<upstream>` placeholder --
+/// REQUIRED (submit-time validation in `ralphus_core::validate` rejects a
+/// placeholder cwd with no `?upstream=`, and [`resolve_placeholders`]
+/// re-checks it defensively for hand-edited/stale data) rather than inferred,
+/// so ralphus never has to guess what a freshly materialized branch is meant
+/// to track.
+///
+/// The path is [`resolve_task_worktree_dir`], not the plain [`worktree_dir`]
+/// -- so a branch whose short name collides with another branch already
+/// occupying that `w/<short>` slot lands in `w/<short>-2` instead of silently
+/// reusing the other branch's worktree.
 ///
 /// Restart-safe: if the worktree directory's `.git` already exists, the
 /// directory is assumed to be a previously materialized worktree and is
 /// reused rather than recreated (or erroring because the branch or directory
-/// already exists) — except that a branch tracking a remote is first resynced
-/// to that remote; see [`resync_remote_tracking_branch`].
+/// already exists). Either way -- fresh or reused -- `upstream` is
+/// (re-)applied via [`set_explicit_upstream`] and the branch is resynced if
+/// it tracks a remote; see [`resync_remote_tracking_branch`].
 ///
 /// Branch names are first validated through `git check-ref-format --branch`,
 /// so the daemon inherits git's exact acceptance rules instead of trying to
@@ -176,29 +345,21 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
 ///
 /// If no local branch by that literal name exists but a remote-tracking ref
 /// `refs/remotes/<branch>` does, the new local branch is created from that
-/// remote-tracking ref and configured to track it — a real, attached branch
-/// checkout (never a detached HEAD), so ordinary git operations (commit,
-/// diff, `@{upstream}`) behave normally inside it. It does not stay frozen at
-/// whatever the remote held at creation time: every later call to
-/// `ensure_worktree` for the same worktree resyncs it to the remote (see
-/// [`resync_remote_tracking_branch`]), so a review worktree keeps up with
-/// pushes to that remote branch over the life of the project. Otherwise the
-/// branch name is treated literally — slashes included — and a new local
-/// branch is forked from `root`'s current `HEAD`; when that literal name
-/// *looks* like `<remote>/<branch>` but no matching remote-tracking ref
-/// exists, a warning is emitted so the fallback is explicit rather than
-/// silently guessed.
-///
-/// A branch created from local `HEAD` has its upstream tracking set to that
-/// branch (best effort). `derive_reviews` (reviews.rs) requires an upstream
-/// tracking branch on every review-opted-in session's branch to determine the
-/// review's base — without this, a `ralphus:new-worktree/...` placeholder
-/// combined with `review = ...` would always fail preflight, since
-/// `git worktree add -b` alone never configures one.
-pub fn ensure_worktree(root: &Path, branch: &str) -> Result<PathBuf, String> {
+/// remote-tracking ref — a real, attached branch checkout (never a detached
+/// HEAD), so ordinary git operations (commit, diff, `@{upstream}`) behave
+/// normally inside it. Otherwise the branch name is treated literally —
+/// slashes included — and a new local branch is forked from `root`'s current
+/// `HEAD`; when that literal name *looks* like `<remote>/<branch>` but no
+/// matching remote-tracking ref exists, a warning is emitted so the fallback
+/// is explicit rather than silently guessed. Either way, `upstream` -- not
+/// the branch's own name or `root`'s `HEAD` -- decides what tracking gets
+/// configured; a review worktree tracking a remote keeps up with pushes to
+/// that branch over the life of the project via the resync described above.
+pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<PathBuf, String> {
     let materialization = branch_materialization(root, branch)?;
-    let wt = worktree_dir(root, branch);
+    let wt = resolve_task_worktree_dir(root, branch);
     if wt.join(".git").exists() {
+        set_explicit_upstream(&wt, branch, upstream)?;
         resync_remote_tracking_branch(&wt)?;
         return Ok(wt);
     }
@@ -227,28 +388,20 @@ pub fn ensure_worktree(root: &Path, branch: &str) -> Result<PathBuf, String> {
                 ],
             )?;
         }
-        BranchMaterialization::NewFromHead { base, warning } => {
+        BranchMaterialization::NewFromHead { warning } => {
             if let Some(warning) = warning {
                 crate::rlog!(WARNING, "ralphus [scheduler] {warning}");
             }
             preflight_worktree_budget(root, &wt, "HEAD", path_budget_limit())?;
             git(root, &["worktree", "add", "-b", branch, &wt_str])?;
-            if let Some(base) = base
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty() && *b != "HEAD")
-            {
-                // Best-effort: a detached HEAD or other oddity in `root` just means
-                // no upstream gets set, and the review preflight's own error message
-                // already tells the user how to configure one manually.
-                let _ = git(&wt, &["branch", "--set-upstream-to", base]);
-            }
         }
     }
+    set_explicit_upstream(&wt, branch, upstream)?;
+    resync_remote_tracking_branch(&wt)?;
     Ok(wt)
 }
 
-/// Classify a session `cwd` as a placeholder needing materialization, a plain
+/// Classify a cell `cwd` as a placeholder needing materialization, a plain
 /// path, or an unsupported scheme (RAL-185).
 ///
 /// This is the registry-dispatch seam that generalizes the original hardcoded
@@ -282,7 +435,7 @@ fn classify_placeholder(cwd: &str) -> Result<Option<&str>, String> {
     }
     // Any other `scheme:uri` that parses as a *machine* URI is a scheme in the
     // wrong field: the machine belongs in `machine = "..."`, and `cwd` stays a
-    // path (or a `ralphus:new-worktree/` placeholder, which the session's
+    // path (or a `ralphus:new-worktree/` placeholder, which the cell's
     // machine then provisions remotely). Saying so beats silently creating a
     // directory named after the scheme.
     if let Ok(ralphus_core::schema::MachineRef::Provider { scheme, .. }) =
@@ -290,7 +443,7 @@ fn classify_placeholder(cwd: &str) -> Result<Option<&str>, String> {
     {
         return Err(format!(
             "\"{scheme}:...\" is a machine, not a working directory — set it as \
-             this session's `machine` and give `cwd` a plain path or \
+             this cell's `machine` and give `cwd` a plain path or \
              \"{}<branch>\"",
             ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
         ));
@@ -311,17 +464,17 @@ fn provision_remote(
     machine: &str,
     project: &crate::store::ProjectView,
     branch: &str,
-    session: &SessionRow,
-    run_id: &str,
+    cell: &CellRow,
+    squad_id: &str,
 ) -> Result<String, String> {
     let provider = crate::remote_runner::provider_from_store(store, machine)
-        .map_err(|e| format!("session '{}': {e}", session.session_id))?
+        .map_err(|e| format!("cell '{}': {e}", cell.cell_id))?
         .ok_or_else(|| {
             // `provision_remote` is only called for a non-empty machine, so a
             // local resolution here means the value changed under us.
             format!(
-                "session '{}': machine \"{machine}\" resolved to the local host",
-                session.session_id
+                "cell '{}': machine \"{machine}\" resolved to the local host",
+                cell.cell_id
             )
         })?;
     // Only git has a clone URL to resolve; every other kind gets `None` and
@@ -338,13 +491,13 @@ fn provision_remote(
             url,
             branch: Some(branch.to_string()),
         },
-        run_id: run_id.to_string(),
-        session_id: session.session_id.clone(),
+        squad_id: squad_id.to_string(),
+        cell_id: cell.cell_id.clone(),
     };
-    let spec = crate::runner::RunnerSpec::from_row(run_id, session);
+    let spec = crate::runner::RunnerSpec::from_row(squad_id, cell);
     let result = provider
         .provision(&req, &spec)
-        .map_err(|e| format!("session '{}': {e}", session.session_id));
+        .map_err(|e| format!("cell '{}': {e}", cell.cell_id));
     // RAL-201: `provision` had no Cartographer coverage at all -- a failure
     // was only visible via the caller's generic "worktree placeholder
     // resolution failed" `rlog!` line, and success left no record whatsoever.
@@ -354,9 +507,9 @@ fn provision_remote(
         } else {
             crate::logging::LogLevel::WARNING
         })
-        .scope("session")
-        .run(run_id)
-        .session(&session.session_id)
+        .scope("cell")
+        .squad(squad_id)
+        .cell(&cell.cell_id)
         .emit(
             store,
             "machine provision",
@@ -372,35 +525,35 @@ fn provision_remote(
 }
 
 /// Resolve every placeholder `cwd` (`ralphus:new-worktree/<branch>`) among
-/// `sessions` in place, persisting each resolution to the store. Each
-/// session's project comes from its owning task's `project` field in `tasks`,
+/// `cells` in place, persisting each resolution to the store. Each
+/// cell's project comes from its owning task's `project` field in `tasks`,
 /// not from the placeholder string itself. A placeholder string repeated
-/// across sessions/tasks is only materialized once per call (memoized in
-/// `cache`), so concurrent sessions sharing one worktree never race to create
+/// across cells/tasks is only materialized once per call (memoized in
+/// `cache`), so concurrent cells sharing one worktree never race to create
 /// it twice.
 ///
 /// Wrapped in its own `scheduler.resolve_worktrees` span (RAL-96/RAL-100), a
-/// child of `parent` (the owning run's span), so a slow `git worktree add`
+/// child of `parent` (the owning squad's span), so a slow `git worktree add`
 /// against a large repo is visible as its own timed step in the trace rather
 /// than being folded into the surrounding `scheduler.run_execute` span.
 ///
-/// Returns an error naming the first session whose project can't be resolved
+/// Returns an error naming the first cell whose project can't be resolved
 /// or whose worktree can't be created — submit-time validation should already
-/// have ruled this out, but the scheduler must fail the run cleanly rather
+/// have ruled this out, but the scheduler must fail the squad cleanly rather
 /// than panic on stale or hand-edited data (e.g. a project deregistered after
 /// submit). The error is logged here (WARNING) before being returned, since
-/// the scheduler's own failure path only records run/task state transitions,
+/// the scheduler's own failure path only records squad/task state transitions,
 /// not the reason string itself.
 pub fn resolve_placeholders(
     store: &Store,
-    run_id: &str,
-    sessions: &mut [SessionRow],
+    squad_id: &str,
+    cells: &mut [CellRow],
     tasks: &[TaskRow],
     parent: &Context,
 ) -> Result<(), String> {
     let span = otel::start_span("scheduler.resolve_worktrees", parent, SpanKind::Internal);
-    span.set_attribute("run_id", run_id.to_string());
-    match resolve_placeholders_inner(store, run_id, sessions, tasks) {
+    span.set_attribute("squad_id", squad_id.to_string());
+    match resolve_placeholders_inner(store, squad_id, cells, tasks) {
         Ok(materialized) => {
             span.set_attribute("worktrees.materialized", materialized as i64);
             span.set_status(Status::Ok);
@@ -410,7 +563,7 @@ pub fn resolve_placeholders(
             span.set_status(Status::error(e.clone()));
             crate::rlog!(
                 WARNING,
-                "ralphus [scheduler] run {run_id} worktree placeholder resolution failed: {e}"
+                "ralphus [scheduler] squad {squad_id} worktree placeholder resolution failed: {e}"
             );
             Err(e)
         }
@@ -418,13 +571,13 @@ pub fn resolve_placeholders(
 }
 
 /// The count returned is how many distinct placeholders were newly
-/// materialized (i.e. not already resolved from a prior run/restart or a
+/// materialized (i.e. not already resolved from a prior squad/restart or a
 /// dedup hit within this call) — reported on the span as
 /// `worktrees.materialized`.
 fn resolve_placeholders_inner(
     store: &Store,
-    run_id: &str,
-    sessions: &mut [SessionRow],
+    squad_id: &str,
+    cells: &mut [CellRow],
     tasks: &[TaskRow],
 ) -> Result<usize, String> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
@@ -433,35 +586,48 @@ fn resolve_placeholders_inner(
         .collect();
     let mut cache: HashMap<String, String> = HashMap::new();
     let mut materialized = 0usize;
-    for session in sessions.iter_mut() {
-        let Some(cwd) = session.cwd.clone() else {
+    for cell in cells.iter_mut() {
+        let Some(cwd) = cell.cwd.clone() else {
             continue;
         };
         let Some(branch) = classify_placeholder(&cwd).map_err(|e| {
             format!(
-                "session '{}': could not resolve cwd \"{cwd}\": {e}",
-                session.session_id
+                "cell '{}': could not resolve cwd \"{cwd}\": {e}",
+                cell.cell_id
             )
         })?
         else {
             continue;
         };
+        // Submit-time validation (`ralphus_core::validate`) already requires
+        // every placeholder cwd to carry an explicit `?upstream=`; this is the
+        // scheduler's own defensive re-check for stale/hand-edited data (the
+        // same reasoning as the project-registration check below).
+        let upstream =
+            ralphus_core::schema::parse_worktree_placeholder_upstream(&cwd).ok_or_else(|| {
+                format!(
+                    "cell '{}': cwd \"{cwd}\" is missing the required \"?upstream=<upstream>\" \
+                     suffix (e.g. \"{}{branch}?upstream=main\")",
+                    cell.cell_id,
+                    ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
+                )
+            })?;
         // RAL-185: the same placeholder on two different machines must
         // materialize two different workspaces, so the memo key carries the
         // machine. A purely `cwd`-keyed cache would hand machine B the path
         // machine A was given.
-        let cache_key = format!("{}\u{0}{cwd}", session.machine.as_deref().unwrap_or(""));
+        let cache_key = format!("{}\u{0}{cwd}", cell.machine.as_deref().unwrap_or(""));
         let resolved = if let Some(cached) = cache.get(&cache_key) {
             cached.clone()
         } else {
             let project_name = task_projects
-                .get(&session.task_idx)
+                .get(&cell.task_idx)
                 .copied()
                 .flatten()
                 .ok_or_else(|| {
                     format!(
-                        "session '{}': task \"{}\" has no 'project' set for its placeholder cwd",
-                        session.session_id, session.task_name
+                        "cell '{}': task \"{}\" has no 'project' set for its placeholder cwd",
+                        cell.cell_id, cell.task_name
                     )
                 })?;
             let project = store
@@ -469,26 +635,28 @@ fn resolve_placeholders_inner(
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| {
                     format!(
-                        "session '{}': project \"{project_name}\" is not registered",
-                        session.session_id
+                        "cell '{}': project \"{project_name}\" is not registered",
+                        cell.cell_id
                     )
                 })?;
-            let resolved = match session.machine.as_deref() {
+            let resolved = match cell.machine.as_deref() {
                 // Remote: the provider owns workspace creation on its own
                 // machine. Materializing locally and shipping the path would
                 // point the agent at a directory that either doesn't exist
                 // there or — on a fleet with a matching layout — is the wrong
                 // checkout entirely.
                 Some(machine) if !machine.trim().is_empty() => {
-                    provision_remote(store, machine, &project, branch, session, run_id)?
+                    provision_remote(store, machine, &project, branch, cell, squad_id)?
                 }
                 _ => {
-                    let wt = ensure_worktree(Path::new(&project.path), branch).map_err(|e| {
-                        format!(
-                            "session '{}': could not materialize worktree for \"{cwd}\": {e}",
-                            session.session_id
-                        )
-                    })?;
+                    let wt = ensure_worktree(Path::new(&project.path), branch, upstream).map_err(
+                        |e| {
+                            format!(
+                                "cell '{}': could not materialize worktree for \"{cwd}\": {e}",
+                                cell.cell_id
+                            )
+                        },
+                    )?;
                     wt.to_string_lossy().into_owned()
                 }
             };
@@ -497,14 +665,14 @@ fn resolve_placeholders_inner(
             resolved
         };
         store
-            .set_session_cwd(run_id, session.task_idx, session.idx, &resolved)
+            .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
         crate::rlog!(
             INFO,
-            "ralphus [scheduler] session {run_id}/{} cwd placeholder \"{cwd}\" resolved to {resolved}",
-            session.session_id
+            "ralphus [scheduler] cell {squad_id}/{} cwd placeholder \"{cwd}\" resolved to {resolved}",
+            cell.cell_id
         );
-        session.cwd = Some(resolved);
+        cell.cwd = Some(resolved);
     }
     Ok(materialized)
 }
@@ -606,12 +774,12 @@ mod tests {
         (clone, branch_sha)
     }
 
-    fn session_row(task_idx: i64, idx: i64, session_id: &str, cwd: Option<&str>) -> SessionRow {
-        SessionRow {
+    fn cell_row(task_idx: i64, idx: i64, cell_id: &str, cwd: Option<&str>) -> CellRow {
+        CellRow {
             task_idx,
             idx,
             task_name: format!("task{task_idx}"),
-            session_id: session_id.to_string(),
+            cell_id: cell_id.to_string(),
             cwd: cwd.map(str::to_string),
             subprojects: vec![],
             prompt: Some("do work".to_string()),
@@ -642,7 +810,7 @@ mod tests {
     #[test]
     fn ensure_worktree_creates_new_branch_and_worktree() {
         let repo = init_repo("new-branch");
-        let wt = ensure_worktree(&repo, "feature-x").expect("materialize");
+        let wt = ensure_worktree(&repo, "feature-x", "main").expect("materialize");
         assert_eq!(wt, worktree_dir(&repo, "feature-x"));
         assert!(
             wt.join(".git").exists(),
@@ -657,14 +825,57 @@ mod tests {
     }
 
     #[test]
-    fn ensure_worktree_sets_upstream_to_the_branch_it_forked_from() {
+    fn ensure_worktree_disambiguates_branches_sharing_a_short_name() {
+        // "test-pr-submission-a" and "test-pr-submission-b" agree on every
+        // character short_name's 12-character truncation window looks at, so
+        // both compute the plain `worktree_dir` short name "test-pr". Without
+        // disambiguation the second `ensure_worktree` call would silently
+        // reuse the first branch's worktree instead of creating its own.
+        let repo = init_repo("collide");
+        let wt_a = ensure_worktree(&repo, "test-pr-submission-a", "main").expect("materialize a");
+        let wt_b = ensure_worktree(&repo, "test-pr-submission-b", "main").expect("materialize b");
+
+        assert_ne!(
+            wt_a, wt_b,
+            "colliding branches must land in distinct worktrees"
+        );
+        assert_eq!(wt_a, worktree_dir(&repo, "test-pr-submission-a"));
+
+        assert_eq!(
+            git(&wt_a, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "test-pr-submission-a"
+        );
+        assert_eq!(
+            git(&wt_b, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "test-pr-submission-b"
+        );
+
+        // Calling again for the same branches must reuse the same two
+        // directories rather than drifting to a third (restart safety).
+        assert_eq!(
+            wt_a,
+            ensure_worktree(&repo, "test-pr-submission-a", "main").unwrap()
+        );
+        assert_eq!(
+            wt_b,
+            ensure_worktree(&repo, "test-pr-submission-b", "main").unwrap()
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_sets_the_explicit_upstream_it_is_given() {
         // reviews.rs::derive_reviews requires `@{upstream}` to be resolvable on
-        // every review-opted-in session's branch to determine the review base.
+        // every review-opted-in cell's branch to determine the review base.
         // A brand-new `ralphus:new-worktree/...` branch must come out of
-        // `ensure_worktree` with that already configured, or every such
-        // placeholder+review combination would fail preflight.
+        // `ensure_worktree` with the caller's explicit `upstream` argument
+        // already configured, or every such placeholder+review combination
+        // would fail preflight.
         let repo = init_repo("new-branch-upstream");
-        let wt = ensure_worktree(&repo, "feature-z").expect("materialize");
+        let wt = ensure_worktree(&repo, "feature-z", "main").expect("materialize");
         let upstream = git(
             &wt,
             &[
@@ -676,6 +887,17 @@ mod tests {
         )
         .expect("new branch must have an upstream configured");
         assert_eq!(upstream.trim(), "main");
+    }
+
+    #[test]
+    fn ensure_worktree_fails_when_the_explicit_upstream_does_not_exist() {
+        // Unlike the old best-effort HEAD-inferred default, an explicit
+        // `upstream` that doesn't resolve to any branch is a hard error, not
+        // a silently-untracked branch.
+        let repo = init_repo("bad-explicit-upstream");
+        let err = ensure_worktree(&repo, "feature-w", "does-not-exist")
+            .expect_err("a nonexistent upstream must fail");
+        assert!(err.contains("does-not-exist"), "{err}");
     }
 
     #[test]
@@ -709,7 +931,7 @@ mod tests {
     fn ensure_worktree_attaches_to_pre_existing_branch() {
         let repo = init_repo("existing-branch");
         g(&repo, &["branch", "already-here"]);
-        let wt = ensure_worktree(&repo, "already-here").expect("materialize");
+        let wt = ensure_worktree(&repo, "already-here", "main").expect("materialize");
         assert_eq!(
             git(&wt, &["symbolic-ref", "--short", "HEAD"])
                 .unwrap()
@@ -732,7 +954,7 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::write(old_dir.join("leftover.txt"), "abandoned\n").unwrap();
 
-        let wt = ensure_worktree(&repo, "feature-long-name").expect("materialize");
+        let wt = ensure_worktree(&repo, "feature-long-name", "main").expect("materialize");
         assert_eq!(wt, worktree_dir(&repo, "feature-long-name"));
         assert!(
             wt.to_string_lossy().contains(".ralphus")
@@ -748,7 +970,8 @@ mod tests {
     #[test]
     fn ensure_worktree_bootstraps_a_remote_tracking_branch_when_it_exists() {
         let (repo, remote_sha) = init_repo_with_remote_branch("remote-branch", "origin/foo");
-        let wt = ensure_worktree(&repo, "origin/foo").expect("materialize from remote");
+        let wt =
+            ensure_worktree(&repo, "origin/foo", "origin/foo").expect("materialize from remote");
         assert_eq!(wt, worktree_dir(&repo, "origin/foo"));
         assert!(
             wt.join("remote-only.txt").exists(),
@@ -780,7 +1003,7 @@ mod tests {
     #[test]
     fn ensure_worktree_resyncs_a_remote_tracking_branch_to_new_pushes() {
         let (repo, first_sha) = init_repo_with_remote_branch("resync-new-push", "origin/foo");
-        let wt = ensure_worktree(&repo, "origin/foo").expect("first materialize");
+        let wt = ensure_worktree(&repo, "origin/foo", "origin/foo").expect("first materialize");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), first_sha);
 
         // Simulate a new push to the remote branch, from the seed clone that
@@ -796,7 +1019,7 @@ mod tests {
 
         // Re-resolving the same (already materialized) worktree must pick up
         // the new remote commit, not stay frozen at the first-materialize SHA.
-        let wt2 = ensure_worktree(&repo, "origin/foo").expect("resync on reuse");
+        let wt2 = ensure_worktree(&repo, "origin/foo", "origin/foo").expect("resync on reuse");
         assert_eq!(wt2, wt);
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), second_sha);
     }
@@ -804,7 +1027,7 @@ mod tests {
     #[test]
     fn ensure_worktree_rebases_local_commits_onto_the_resynced_remote_instead_of_discarding_them() {
         let (repo, _first_sha) = init_repo_with_remote_branch("resync-rebase-local", "origin/bar");
-        let wt = ensure_worktree(&repo, "origin/bar").expect("first materialize");
+        let wt = ensure_worktree(&repo, "origin/bar", "origin/bar").expect("first materialize");
 
         // A prior agent session committed local work directly in the worktree.
         std::fs::write(wt.join("local-work.txt"), "agent work\n").unwrap();
@@ -817,7 +1040,7 @@ mod tests {
         g(&seed, &["commit", "-am", "second remote commit"]);
         g(&seed, &["push", "origin", "bar"]);
 
-        ensure_worktree(&repo, "origin/bar").expect("resync via rebase");
+        ensure_worktree(&repo, "origin/bar", "origin/bar").expect("resync via rebase");
 
         assert!(
             wt.join("local-work.txt").exists(),
@@ -834,7 +1057,7 @@ mod tests {
     #[test]
     fn ensure_worktree_aborts_and_errors_when_the_resync_rebase_conflicts() {
         let (repo, _first_sha) = init_repo_with_remote_branch("resync-conflict", "origin/baz");
-        let wt = ensure_worktree(&repo, "origin/baz").expect("first materialize");
+        let wt = ensure_worktree(&repo, "origin/baz", "origin/baz").expect("first materialize");
 
         // A local commit that edits the same file the remote is about to change.
         std::fs::write(wt.join("remote-only.txt"), "local edit\n").unwrap();
@@ -845,7 +1068,8 @@ mod tests {
         g(&seed, &["commit", "-am", "conflicting remote edit"]);
         g(&seed, &["push", "origin", "baz"]);
 
-        let err = ensure_worktree(&repo, "origin/baz").expect_err("conflicting rebase must fail");
+        let err = ensure_worktree(&repo, "origin/baz", "origin/baz")
+            .expect_err("conflicting rebase must fail");
         assert!(err.contains("rebase"), "{err}");
 
         // A failed resync must leave the worktree attached to its branch, not
@@ -865,7 +1089,6 @@ mod tests {
         assert_eq!(
             plan,
             BranchMaterialization::NewFromHead {
-                base: Some("main\n".to_string()),
                 warning: Some(format!(
                     "placeholder branch \"alternative/foo\" looks like <remote>/<branch>, but \
              refs/remotes/alternative/foo does not exist in {}. Reusing or creating a \
@@ -875,7 +1098,7 @@ mod tests {
             }
         );
 
-        let wt = ensure_worktree(&repo, "alternative/foo").expect("materialize");
+        let wt = ensure_worktree(&repo, "alternative/foo", "main").expect("materialize");
         assert_eq!(wt, worktree_dir(&repo, "alternative/foo"));
         assert_eq!(
             git(&wt, &["symbolic-ref", "--short", "HEAD"])
@@ -888,7 +1111,8 @@ mod tests {
     #[test]
     fn ensure_worktree_rejects_invalid_branch_names_before_path_joining() {
         let repo = init_repo("invalid-branch");
-        let err = ensure_worktree(&repo, "../escape").expect_err("invalid branch must fail");
+        let err =
+            ensure_worktree(&repo, "../escape", "main").expect_err("invalid branch must fail");
         assert!(err.contains("check-ref-format"), "{err}");
         assert!(
             !repo.join(".git").join(".ralphus").exists(),
@@ -899,13 +1123,14 @@ mod tests {
     #[test]
     fn ensure_worktree_reuses_existing_worktree_without_wiping_it() {
         let repo = init_repo("reuse");
-        let wt = ensure_worktree(&repo, "feature-y").expect("first materialize");
+        let wt = ensure_worktree(&repo, "feature-y", "main").expect("first materialize");
         std::fs::write(wt.join("in-progress.txt"), "agent work\n").unwrap();
 
-        // A second call (simulating a restarted run) must reuse the same
+        // A second call (simulating a restarted squad) must reuse the same
         // worktree rather than recreating it, so the agent's uncommitted work
         // survives.
-        let wt2 = ensure_worktree(&repo, "feature-y").expect("second materialize (restart)");
+        let wt2 =
+            ensure_worktree(&repo, "feature-y", "main").expect("second materialize (restart)");
         assert_eq!(wt, wt2);
         assert!(
             wt2.join("in-progress.txt").exists(),
@@ -951,12 +1176,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_placeholders_surfaces_an_unsupported_scheme_as_a_run_failure() {
+    fn resolve_placeholders_surfaces_an_unsupported_scheme_as_a_squad_failure() {
         let store = Store::open_in_memory().unwrap();
-        let mut sessions = vec![session_row(0, 0, "s0", Some("incredibuild:/build/wt"))];
-        let err = resolve_placeholders(&store, "run-1", &mut sessions, &[], &Context::new())
-            .expect_err("unsupported cwd scheme must fail the run");
-        assert!(err.contains("s0"), "error should name the session: {err}");
+        let mut cells = vec![cell_row(0, 0, "s0", Some("incredibuild:/build/wt"))];
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &[], &Context::new())
+            .expect_err("unsupported cwd scheme must fail the squad");
+        assert!(err.contains("s0"), "error should name the cell: {err}");
         assert!(
             err.contains("is a machine, not a working directory"),
             "{err}"
@@ -980,20 +1205,20 @@ mod tests {
         path
     }
 
-    fn session_row_on(
+    fn cell_row_on(
         task_idx: i64,
         idx: i64,
-        session_id: &str,
+        cell_id: &str,
         cwd: Option<&str>,
         machine: Option<&str>,
-    ) -> SessionRow {
-        let mut row = session_row(task_idx, idx, session_id, cwd);
+    ) -> CellRow {
+        let mut row = cell_row(task_idx, idx, cell_id, cwd);
         row.machine = machine.map(str::to_string);
         row
     }
 
     #[test]
-    fn a_remote_session_provisions_through_its_provider_instead_of_locally() {
+    fn a_remote_cell_provisions_through_its_provider_instead_of_locally() {
         let repo = init_repo("remote-provision");
         let script = fake_provisioner(
             "remote-provision-p",
@@ -1013,21 +1238,21 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut sessions = vec![session_row_on(
+        let mut cells = vec![cell_row_on(
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-r"),
+            Some("ralphus:new-worktree/feat-r?upstream=main"),
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
-        resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("remote provision");
-        assert_eq!(sessions[0].cwd.as_deref(), Some("/remote/wt/feat-r"));
-        // Nothing may be created on the daemon's own disk for a remote session.
+        assert_eq!(cells[0].cwd.as_deref(), Some("/remote/wt/feat-r"));
+        // Nothing may be created on the daemon's own disk for a remote cell.
         assert!(
             !worktree_dir(&repo, "feat-r").exists(),
-            "a remote session must not materialize a local worktree"
+            "a remote cell must not materialize a local worktree"
         );
     }
 
@@ -1059,31 +1284,31 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut sessions = vec![
-            session_row_on(
+        let mut cells = vec![
+            cell_row_on(
                 0,
                 0,
                 "s0",
-                Some("ralphus:new-worktree/shared"),
+                Some("ralphus:new-worktree/shared?upstream=main"),
                 Some("ma:1"),
             ),
-            session_row_on(
+            cell_row_on(
                 1,
                 0,
                 "s1",
-                Some("ralphus:new-worktree/shared"),
+                Some("ralphus:new-worktree/shared?upstream=main"),
                 Some("mb:1"),
             ),
         ];
         let tasks = vec![task_row(0, Some("proj")), task_row(1, Some("proj"))];
-        resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("provision both");
-        assert_eq!(sessions[0].cwd.as_deref(), Some("/on/a"));
-        assert_eq!(sessions[1].cwd.as_deref(), Some("/on/b"));
+        assert_eq!(cells[0].cwd.as_deref(), Some("/on/a"));
+        assert_eq!(cells[1].cwd.as_deref(), Some("/on/b"));
     }
 
     #[test]
-    fn a_provider_that_returns_no_workspace_path_fails_the_run() {
+    fn a_provider_that_returns_no_workspace_path_fails_the_squad() {
         let repo = init_repo("no-workspace");
         let script = fake_provisioner("no-workspace-p", r#"{"ok":true,"protocol_version":1}"#);
         let store = Store::open_in_memory().unwrap();
@@ -1100,16 +1325,16 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut sessions = vec![session_row_on(
+        let mut cells = vec![cell_row_on(
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/x"),
+            Some("ralphus:new-worktree/x?upstream=main"),
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
-        let err = resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
-            .expect_err("a provider that provisions nothing must fail the run");
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect_err("a provider that provisions nothing must fail the squad");
         assert!(err.contains("workspace"), "{err}");
     }
 
@@ -1118,18 +1343,23 @@ mod tests {
         let repo = init_repo("plain-cwd");
         let store = Store::open_in_memory().unwrap();
         let plain = repo.to_string_lossy().into_owned();
-        let mut sessions = vec![session_row(0, 0, "s0", Some(&plain))];
-        resolve_placeholders(&store, "run-1", &mut sessions, &[], &Context::new())
+        let mut cells = vec![cell_row(0, 0, "s0", Some(&plain))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &[], &Context::new())
             .expect("no-op for plain cwd");
-        assert_eq!(sessions[0].cwd.as_deref(), Some(plain.as_str()));
+        assert_eq!(cells[0].cwd.as_deref(), Some(plain.as_str()));
     }
 
     #[test]
     fn resolve_placeholders_fails_for_unregistered_project() {
         let store = Store::open_in_memory().unwrap();
-        let mut sessions = vec![session_row(0, 0, "s0", Some("ralphus:new-worktree/feat"))];
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat?upstream=main"),
+        )];
         let tasks = vec![task_row(0, Some("ghost-project"))];
-        let err = resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect_err("unregistered project must fail");
         assert!(
             err.contains("ghost-project"),
@@ -1142,13 +1372,74 @@ mod tests {
         // Submit-time validation should already rule this out, but the
         // scheduler must still fail cleanly on stale/hand-edited data.
         let store = Store::open_in_memory().unwrap();
-        let mut sessions = vec![session_row(0, 0, "s0", Some("ralphus:new-worktree/feat"))];
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat?upstream=main"),
+        )];
         let tasks = vec![task_row(0, None)];
-        let err = resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect_err("missing task project must fail");
         assert!(
             err.contains("no 'project' set"),
             "error should explain the missing project: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_placeholders_fails_when_upstream_is_missing_from_a_placeholder_cwd() {
+        // Submit-time validation (`ralphus_core::validate`) already requires
+        // every placeholder cwd to carry an explicit `?upstream=`; this is the
+        // scheduler's own defensive re-check for stale/hand-edited data.
+        let store = Store::open_in_memory().unwrap();
+        let mut cells = vec![cell_row(0, 0, "s0", Some("ralphus:new-worktree/feat"))];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect_err("a placeholder cwd with no ?upstream= must fail");
+        assert!(err.contains("upstream"), "{err}");
+        assert!(err.contains("s0"), "error should name the cell: {err}");
+    }
+
+    #[test]
+    fn resolve_placeholders_honors_an_explicit_upstream_query_override() {
+        // The `?upstream=` value, not the branch's own name or the repo's
+        // HEAD, decides what the freshly materialized branch tracks.
+        let repo = init_repo("explicit-upstream");
+        g(&repo, &["checkout", "-b", "other"]);
+        std::fs::write(repo.join("other.txt"), "on other\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "other branch commit"]);
+        g(&repo, &["checkout", "main"]);
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-override?upstream=other"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize");
+        let resolved = cells[0].cwd.clone().expect("resolved cwd");
+        assert_eq!(
+            git(
+                Path::new(&resolved),
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )
+            .unwrap()
+            .trim(),
+            "other",
+            "the branch must track the explicit ?upstream= value, not HEAD (main)"
         );
     }
 
@@ -1159,33 +1450,48 @@ mod tests {
         store
             .register_project("myproj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let mut sessions = vec![session_row(0, 0, "s0", Some("ralphus:new-worktree/feat-a"))];
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-a?upstream=main"),
+        )];
         let tasks = vec![task_row(0, Some("myproj"))];
-        resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("materialize");
-        let resolved = sessions[0].cwd.clone().expect("resolved cwd");
+        let resolved = cells[0].cwd.clone().expect("resolved cwd");
         assert_eq!(resolved, worktree_dir(&repo, "feat-a").to_string_lossy());
         assert!(Path::new(&resolved).join(".git").exists());
     }
 
     #[test]
-    fn resolve_placeholders_reuses_one_worktree_across_sessions() {
-        // The same placeholder string repeated across two sessions (as if two
+    fn resolve_placeholders_reuses_one_worktree_across_cells() {
+        // The same placeholder string repeated across two cells (as if two
         // tasks in one submission both referenced it) must materialize exactly
-        // one worktree and resolve both sessions to the identical real path.
+        // one worktree and resolve both cells to the identical real path.
         let repo = init_repo("dedupe");
         let store = Store::open_in_memory().unwrap();
         store
             .register_project("shared", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let mut sessions = vec![
-            session_row(0, 0, "s0", Some("ralphus:new-worktree/feat-b")),
-            session_row(1, 0, "s1", Some("ralphus:new-worktree/feat-b")),
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "s0",
+                Some("ralphus:new-worktree/feat-b?upstream=main"),
+            ),
+            cell_row(
+                1,
+                0,
+                "s1",
+                Some("ralphus:new-worktree/feat-b?upstream=main"),
+            ),
         ];
         let tasks = vec![task_row(0, Some("shared")), task_row(1, Some("shared"))];
-        resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("materialize");
-        assert_eq!(sessions[0].cwd, sessions[1].cwd);
+        assert_eq!(cells[0].cwd, cells[1].cwd);
 
         // Only one worktree is registered with git for that branch.
         let list = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
@@ -1200,8 +1506,58 @@ mod tests {
     }
 
     #[test]
+    fn resolve_placeholders_disambiguates_two_tasks_whose_branches_share_a_short_name() {
+        // Regression for the RAL-239 smoke-test squad failure: two
+        // independent tasks, each `ralphus:new-worktree/test-pr-submission-*`,
+        // used to resolve to the identical worktree directory and race each
+        // other's `git add`/`commit` in the same index (one cell exiting 1,
+        // the other 128). Each must now resolve to its own worktree.
+        let repo = init_repo("two-task-collide");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("ralphus", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
+            ),
+            cell_row(
+                1,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
+            ),
+        ];
+        let tasks = vec![task_row(0, Some("ralphus")), task_row(1, Some("ralphus"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize both");
+
+        let resolved_a = cells[0].cwd.clone().expect("resolved a");
+        let resolved_b = cells[1].cwd.clone().expect("resolved b");
+        assert_ne!(
+            resolved_a, resolved_b,
+            "each task's branch must materialize its own worktree"
+        );
+        assert_eq!(
+            git(Path::new(&resolved_a), &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "test-pr-submission-a"
+        );
+        assert_eq!(
+            git(Path::new(&resolved_b), &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "test-pr-submission-b"
+        );
+    }
+
+    #[test]
     fn resolve_placeholders_is_restart_safe() {
-        // Simulate a restart: after the first resolution the session's cwd is a
+        // Simulate a restart: after the first resolution the cell's cwd is a
         // real path (as it would be, re-read from the store), so a second call
         // must be a no-op that neither errors nor recreates the worktree.
         let repo = init_repo("restart-safe");
@@ -1209,18 +1565,23 @@ mod tests {
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let mut sessions = vec![session_row(0, 0, "s0", Some("ralphus:new-worktree/feat-c"))];
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-c?upstream=main"),
+        )];
         let tasks = vec![task_row(0, Some("proj"))];
-        resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("first resolution");
-        let resolved = sessions[0].cwd.clone().unwrap();
+        let resolved = cells[0].cwd.clone().unwrap();
 
         std::fs::write(Path::new(&resolved).join("marker.txt"), "kept\n").unwrap();
 
         // Second call over freshly-loaded rows carrying the already-resolved cwd.
-        resolve_placeholders(&store, "run-1", &mut sessions, &tasks, &Context::new())
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("restart no-op");
-        assert_eq!(sessions[0].cwd.as_deref(), Some(resolved.as_str()));
+        assert_eq!(cells[0].cwd.as_deref(), Some(resolved.as_str()));
         assert!(Path::new(&resolved).join("marker.txt").exists());
     }
 }

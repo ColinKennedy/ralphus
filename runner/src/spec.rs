@@ -1,6 +1,6 @@
-//! The daemon<->runner JSON wire contract, ported 1:1 from
-//! `cli/src/ralphus/runner/spec.py`. [`SessionSpec`] is read from stdin,
-//! [`SessionResult`] is written to stdout. Matches `daemon/src/runner.rs`'s
+//! The daemon<->runner JSON wire contract.
+//! [`CellSpec`] is read from stdin,
+//! [`CellResult`] is written to stdout. Matches `daemon/src/runner.rs`'s
 //! `RunnerSpec`/`RunnerResult` field-for-field (that file documents itself as
 //! the daemon-side mirror of this wire format).
 
@@ -19,32 +19,33 @@ impl std::fmt::Display for SpecError {
 
 impl std::error::Error for SpecError {}
 
-/// The session the daemon wants run, as received on stdin.
+/// The cell the daemon wants run, as received on stdin.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionSpec {
-    pub run_id: String,
+pub struct CellSpec {
+    pub squad_id: String,
     pub task: String,
-    pub session_id: String,
+    pub cell_id: String,
     pub cwd: String,
     /// Exactly one of `prompt`/`command` is `Some` -- enforced in [`Self::from_json`].
     pub prompt: Option<String>,
     pub command: Option<String>,
     pub agent: String,
+    pub executable: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub system_prompt_position: Option<String>,
     pub args: Vec<String>,
     pub budget_tokens: Option<u64>,
     pub timeout_sec: Option<u64>,
-    pub verify: bool,
+    pub proof: bool,
     pub trace_context: Option<String>,
     pub resume_agent_session_id: Option<String>,
 }
 
-impl SessionSpec {
-    /// Parse and validate a `SessionSpec` from raw JSON text (the daemon's
+impl CellSpec {
+    /// Parse and validate a `CellSpec` from raw JSON text (the daemon's
     /// stdin payload). Rejects a wrong JSON type per field -- including a
-    /// bare `bool` where an `int` is expected -- exactly as the Python
+    /// bare `bool` where an `int` is expected -- exactly as the
     /// `_require_str`/`_opt_int`/etc. helpers do, and enforces that exactly
     /// one of `prompt`/`command` is set.
     pub fn from_json(text: &str) -> Result<Self, SpecError> {
@@ -54,20 +55,21 @@ impl SessionSpec {
             .as_object()
             .ok_or_else(|| SpecError("spec must be a JSON object".to_string()))?;
 
-        let run_id = require_str(obj, "run_id")?;
+        let squad_id = require_str(obj, "squad_id")?;
         let task = require_str(obj, "task")?;
-        let session_id = require_str(obj, "session_id")?;
+        let cell_id = require_str(obj, "cell_id")?;
         let cwd = require_str(obj, "cwd")?;
         let prompt = opt_str(obj, "prompt")?;
         let command = opt_str(obj, "command")?;
         let agent = opt_str(obj, "agent")?.unwrap_or_else(|| "claude".to_string());
+        let executable = opt_str(obj, "executable")?;
         let model = opt_str(obj, "model")?;
         let system_prompt = opt_str(obj, "system_prompt")?;
         let system_prompt_position = opt_str(obj, "system_prompt_position")?;
         let args = str_list(obj, "args")?;
         let budget_tokens = opt_uint(obj, "budget_tokens")?;
         let timeout_sec = opt_uint(obj, "timeout_sec")?;
-        let verify = opt_bool(obj, "verify")?.unwrap_or(false);
+        let proof = opt_bool(obj, "proof")?.unwrap_or(false);
         let trace_context = opt_str(obj, "trace_context")?;
         let resume_agent_session_id = opt_str(obj, "resume_agent_session_id")?;
 
@@ -78,20 +80,21 @@ impl SessionSpec {
         }
 
         Ok(Self {
-            run_id,
+            squad_id,
             task,
-            session_id,
+            cell_id,
             cwd,
             prompt,
             command,
             agent,
+            executable,
             model,
             system_prompt,
             system_prompt_position,
             args,
             budget_tokens,
             timeout_sec,
-            verify,
+            proof,
             trace_context,
             resume_agent_session_id,
         })
@@ -156,10 +159,10 @@ fn str_list(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Vec<Strin
     }
 }
 
-/// The outcome the daemon reads back from stdout. Mirrors Python's
-/// `SessionResult`.
+/// The outcome the daemon reads back from stdout. Mirrors the daemon's
+/// `RunnerResult`.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct SessionResult {
+pub struct CellResult {
     pub status: String,
     #[serde(default)]
     pub tokens_in: i64,
@@ -170,12 +173,12 @@ pub struct SessionResult {
     #[serde(default)]
     pub summary: String,
     pub error: Option<String>,
-    pub verified: Option<bool>,
+    pub proofed: Option<bool>,
     pub agent_session_id: Option<String>,
     pub ghost: Option<String>,
 }
 
-impl SessionResult {
+impl CellResult {
     #[must_use]
     pub fn done(summary: impl Into<String>) -> Self {
         Self {
@@ -185,7 +188,7 @@ impl SessionResult {
             cost_usd: 0.0,
             summary: summary.into(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -200,7 +203,7 @@ impl SessionResult {
             cost_usd: 0.0,
             summary: summary.into(),
             error: Some(error.into()),
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -211,10 +214,10 @@ impl SessionResult {
         self.status == "done"
     }
 
-    /// Serializes all fields unconditionally (including `None`s), matching
-    /// Python's `to_json` -- the daemon's `RunnerResult` deserialization uses
+    /// Serializes all fields unconditionally (including `None`s) -- the
+    /// daemon's `RunnerResult` deserialization uses
     /// `#[serde(default)]` per field, so omitted keys would also work, but
-    /// this keeps the two runner implementations wire-identical.
+    /// this keeps the two sides wire-identical.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| {
             r#"{"status":"failed","error":"result serialization failed"}"#.to_string()
@@ -228,9 +231,9 @@ mod tests {
 
     fn base() -> serde_json::Value {
         serde_json::json!({
-            "run_id": "r1",
+            "squad_id": "r1",
             "task": "t1",
-            "session_id": "s1",
+            "cell_id": "s1",
             "cwd": "/tmp/work",
             "prompt": "do the thing",
         })
@@ -238,12 +241,12 @@ mod tests {
 
     #[test]
     fn parses_minimal_prompt_spec() {
-        let spec = SessionSpec::from_json(&base().to_string()).unwrap();
-        assert_eq!(spec.run_id, "r1");
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert_eq!(spec.squad_id, "r1");
         assert_eq!(spec.prompt.as_deref(), Some("do the thing"));
         assert_eq!(spec.command, None);
         assert_eq!(spec.agent, "claude");
-        assert!(!spec.verify);
+        assert!(!spec.proof);
         assert!(spec.args.is_empty());
     }
 
@@ -251,7 +254,7 @@ mod tests {
     fn rejects_neither_prompt_nor_command() {
         let mut v = base();
         v.as_object_mut().unwrap().remove("prompt");
-        let err = SessionSpec::from_json(&v.to_string()).unwrap_err();
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("exactly one"));
     }
 
@@ -259,23 +262,23 @@ mod tests {
     fn rejects_both_prompt_and_command() {
         let mut v = base();
         v["command"] = serde_json::json!("echo hi");
-        let err = SessionSpec::from_json(&v.to_string()).unwrap_err();
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("exactly one"));
     }
 
     #[test]
     fn rejects_wrong_type_for_string_field() {
         let mut v = base();
-        v["run_id"] = serde_json::json!(42);
-        let err = SessionSpec::from_json(&v.to_string()).unwrap_err();
-        assert!(err.0.contains("run_id"));
+        v["squad_id"] = serde_json::json!(42);
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("squad_id"));
     }
 
     #[test]
     fn rejects_bool_for_int_field() {
         let mut v = base();
         v["timeout_sec"] = serde_json::json!(true);
-        let err = SessionSpec::from_json(&v.to_string()).unwrap_err();
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("timeout_sec"));
     }
 
@@ -283,7 +286,7 @@ mod tests {
     fn rejects_missing_required_field() {
         let mut v = base();
         v.as_object_mut().unwrap().remove("cwd");
-        let err = SessionSpec::from_json(&v.to_string()).unwrap_err();
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("cwd"));
     }
 
@@ -297,28 +300,29 @@ mod tests {
         v["args"] = serde_json::json!(["--flag", "value"]);
         v["budget_tokens"] = serde_json::json!(1000);
         v["timeout_sec"] = serde_json::json!(60);
-        v["verify"] = serde_json::json!(true);
-        let spec = SessionSpec::from_json(&v.to_string()).unwrap();
+        v["proof"] = serde_json::json!(true);
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
         assert_eq!(spec.command.as_deref(), Some("echo hi"));
         assert_eq!(spec.agent, "ollama");
+        assert!(spec.executable.is_none());
         assert_eq!(spec.args, vec!["--flag".to_string(), "value".to_string()]);
         assert_eq!(spec.budget_tokens, Some(1000));
-        assert!(spec.verify);
+        assert!(spec.proof);
     }
 
     #[test]
-    fn session_result_done_and_failed() {
-        let d = SessionResult::done("ok");
+    fn cell_result_done_and_failed() {
+        let d = CellResult::done("ok");
         assert!(d.ok());
         assert_eq!(d.summary, "ok");
-        let f = SessionResult::failed("boom", "");
+        let f = CellResult::failed("boom", "");
         assert!(!f.ok());
         assert_eq!(f.error.as_deref(), Some("boom"));
     }
 
     #[test]
     fn to_json_roundtrips_status() {
-        let r = SessionResult::done("summary text");
+        let r = CellResult::done("summary text");
         let text = r.to_json();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["status"], "done");

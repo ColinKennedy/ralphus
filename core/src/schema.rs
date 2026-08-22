@@ -1,10 +1,10 @@
 //! Task-file schema: the serde types a submitted TOML batch deserializes into.
 //!
 //! Ported from the predecessor project (`old:src/tasks/schema.rs`) with one
-//! deliberate fix: a session's `prompt` is now `Option<String>` and pairs with
+//! deliberate fix: a cell's `prompt` is now `Option<String>` and pairs with
 //! `command`. In the old project `prompt` was a required `String` even though
-//! the validator and UI allowed `command`-only sessions, so a valid
-//! `command`-only session would pass validation and then fail to deserialize in
+//! the validator and UI allowed `command`-only cells, so a valid
+//! `command`-only cell would pass validation and then fail to deserialize in
 //! the runner (see `FINDINGS.local.md` §2.3). Making both optional and enforcing
 //! "exactly one" in the validator keeps the type and the rules in agreement.
 
@@ -17,7 +17,7 @@ use serde::Deserialize;
 /// Declared via `[[default]]` blocks in TOML; only the first block is used.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultBlock {
-    /// Other run IDs (or `run-id/task/session` paths) that must be Done before
+    /// Other squad IDs (or `squad-id/task/cell` paths) that must be Done before
     /// this submission is allowed to start.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -32,20 +32,20 @@ pub struct TaskFile {
     /// The tasks in this submission.
     #[serde(default)]
     pub task: Vec<TaskDef>,
-    /// Top-level review (guardian) declarations. Sessions opt in by setting
+    /// Top-level review (guardian) declarations. Cells opt in by setting
     /// `review = "<id>"` to match a review's `id` field.
     #[serde(default)]
     pub review: Vec<ReviewDef>,
 }
 
-/// One task: a unit of work made of one or more agent sessions plus verify steps.
+/// One task: a unit of work made of one or more agent cells plus proof steps.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskDef {
     /// Task name / identifier (unique within a submission).
     pub name: String,
     /// Namespace label for a plain-path task; purely cosmetic and left unset if
     /// the caller doesn't care to name it (the UI shows "--"). When any of this
-    /// task's sessions uses a `<project>:worktree/<branch>` placeholder `cwd`
+    /// task's cells uses a `<project>:worktree/<branch>` placeholder `cwd`
     /// (RAL-100), this field's meaning changes: it becomes required and must
     /// name a project registered via `ralphus project git` -- checked
     /// structurally here (`project` set whenever a placeholder is present, see
@@ -53,32 +53,32 @@ pub struct TaskDef {
     /// registry lives in the daemon's store, which `core` cannot see).
     #[serde(default)]
     pub project: Option<String>,
-    /// Agent binary for all sessions (e.g. `"claude"`). Sessions inherit unless overridden.
+    /// Agent binary for all cells (e.g. `"claude"`). Cells inherit unless overridden.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Default model for all sessions. Sessions may override.
+    /// Default model for all cells. Cells may override.
     #[serde(default)]
     pub model: Option<String>,
-    /// The machine every session (and verify step) under this task runs on
+    /// The machine every cell (and proof step) under this task runs on
     /// (RAL-185), written `scheme:uri` — e.g. `"incredibuild:A"`. `scheme`
     /// names a provider registered with the daemon; `uri` is opaque and
     /// handed to that provider verbatim. Unset means [`LOCAL_MACHINE`].
     ///
-    /// Sessions and verify steps inherit this and may override it, exactly
+    /// Cells and proof steps inherit this and may override it, exactly
     /// like `agent`/`model` — but note that the affinity rules reject a
-    /// submission whose sessions within one task disagree, so an override is
+    /// submission whose cells within one task disagree, so an override is
     /// only meaningful for restating the same value.
     #[serde(default)]
     pub machine: Option<String>,
-    /// Extra CLI args passed to the agent for every session; task-level first.
+    /// Extra CLI args passed to the agent for every cell; task-level first.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Task budget cap in total tokens (input + output). A session exceeding it
-    /// is failed. Sessions/verifies inherit this unless they set their own.
+    /// Task budget cap in total tokens (input + output). A cell exceeding it
+    /// is failed. Cells/proofs inherit this unless they set their own.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
-    /// Task-level max spend cap in USD. A session exceeding it is killed
-    /// mid-run and failed. Sessions inherit this unless they set their own
+    /// Task-level max spend cap in USD. A cell exceeding it is killed
+    /// mid-run and failed. Cells inherit this unless they set their own
     /// `maximum_budget_usd`.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
@@ -90,48 +90,48 @@ pub struct TaskDef {
     /// thereafter, so this is only a starting position, not an authoritative cap.
     #[serde(default)]
     pub priority: Option<u32>,
-    /// Default wall-clock timeout in minutes for the task's sessions and verify
+    /// Default wall-clock timeout in minutes for the task's cells and proof
     /// steps; each may override with its own `timeout_minutes`.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
-    /// Other tasks/sessions this whole task waits on.
+    /// Other tasks/cells this whole task waits on.
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Environment variables for every session (and session verify step)
-    /// under this task's spawned subprocess (RAL-172). A session sets the
+    /// Environment variables for every cell (and cell proof step)
+    /// under this task's spawned subprocess (RAL-172). A cell sets the
     /// same key to override it just for itself, mirroring `agent`/`model`
     /// inheritance. At submission time these seed the task's row in the
     /// daemon's existing hierarchical env-override store (`env_overrides`
-    /// column; see `daemon/src/store.rs`'s `run < task < session` layering,
+    /// column; see `daemon/src/store.rs`'s `squad < task < cell` layering,
     /// RAL-150) rather than being a separate delivery mechanism -- from
     /// there on they're indistinguishable from an override set later via
-    /// `POST /api/runs/{id}/tasks/{ti}/env`.
+    /// `POST /api/squads/{id}/tasks/{ti}/env`.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     /// Opts a git-backed task out of the daemon's automatic no-new-commits
     /// guard (RAL-156): normally, when the task's `project` is registered as
-    /// git, the finalizer fails the task if none of its sessions produced a
+    /// git, the finalizer fails the task if none of its cells produced a
     /// commit since the task started. Set this for tasks that are legitimately
     /// expected to produce no commits (e.g. a read-only investigation). Has no
     /// effect on non-git-backed tasks, and never affects the manual
     /// `set_status → Done` override (RAL-74), which always bypasses the guard.
     #[serde(default)]
     pub no_commit_required: bool,
-    /// The agent sessions.
+    /// The agent cells.
     #[serde(default)]
-    pub session: Vec<SessionDef>,
-    /// Verify steps that run after ALL sessions complete.
+    pub cell: Vec<CellDef>,
+    /// Proof steps that run after ALL cells complete.
     #[serde(default)]
-    pub verify: Vec<VerifyStep>,
+    pub proof: Vec<ProofStep>,
 }
 
-/// One agent session within a task.
+/// One agent cell within a task.
 #[derive(Debug, Clone, Deserialize)]
-pub struct SessionDef {
-    /// Session ID (for dependency references). Must not contain `/`.
+pub struct CellDef {
+    /// Cell ID (for dependency references). Must not contain `/`.
     #[serde(default)]
     pub id: Option<String>,
-    /// Human-readable display label. Shown in the board wherever sessions are
+    /// Human-readable display label. Shown in the board wherever cells are
     /// listed; falls back to `id` when unset. Has no structural meaning.
     #[serde(default)]
     pub name: Option<String>,
@@ -147,23 +147,23 @@ pub struct SessionDef {
     /// Deterministic shell command. Mutually exclusive with `prompt`.
     #[serde(default)]
     pub command: Option<String>,
-    /// Sessions that must complete before this one starts. Within-task session
-    /// ID (`"session-a"`) or cross-task `"<task-name>/<session-id>"`.
+    /// Cells that must complete before this one starts. Within-task cell
+    /// ID (`"cell-a"`) or cross-task `"<task-name>/<cell-id>"`.
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Override the task-level agent for this session.
+    /// Override the task-level agent for this cell.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Override the task-level model for this session.
+    /// Override the task-level model for this cell.
     #[serde(default)]
     pub model: Option<String>,
-    /// Override the task-level `machine` for this session (RAL-185). See
-    /// [`TaskDef::machine`] — the affinity rules require every session within
+    /// Override the task-level `machine` for this cell (RAL-185). See
+    /// [`TaskDef::machine`] — the affinity rules require every cell within
     /// one task to resolve to the same machine, so this may only restate the
     /// task's value, never diverge from it.
     #[serde(default)]
     pub machine: Option<String>,
-    /// Subdirectories of a monorepo this session is scoped to (e.g.
+    /// Subdirectories of a monorepo this cell is scoped to (e.g.
     /// `["packages/foo", "packages/bar"]`). At run time the daemon injects a
     /// system-prompt addendum instructing the agent to confine its edits to
     /// those paths. The `cwd` itself always points to the repo root (RAL-23).
@@ -172,7 +172,7 @@ pub struct SessionDef {
     /// System-prompt text delivered to the agent as an *appended* system prompt
     /// (via the backend's own mechanism, e.g. the Claude Code CLI's
     /// `--append-system-prompt`) rather than concatenated into the user prompt.
-    /// Session-level only; validation restricts it to the `claude-code` backend
+    /// Cell-level only; validation restricts it to the `claude-code` backend
     /// until the other backends' support is complete (RAL-5).
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -181,43 +181,43 @@ pub struct SessionDef {
     /// rejects any other value.
     #[serde(default)]
     pub system_prompt_position: Option<String>,
-    /// Extra args appended after any task-level args for this session only.
+    /// Extra args appended after any task-level args for this cell only.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Per-session budget in total tokens (input + output). Falls back to the
-    /// task-level `budget_tokens` when unset. Exceeding it fails the session.
+    /// Per-cell budget in total tokens (input + output). Falls back to the
+    /// task-level `budget_tokens` when unset. Exceeding it fails the cell.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
-    /// Per-session max spend cap in USD. Falls back to the task-level
-    /// `maximum_budget_usd` when unset. Once the session's live running cost
+    /// Per-cell max spend cap in USD. Falls back to the task-level
+    /// `maximum_budget_usd` when unset. Once the cell's live running cost
     /// exceeds this, the daemon kills it mid-run and fails it.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
-    /// Per-session wall-clock timeout in minutes. Falls back to the task-level
+    /// Per-cell wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
-    /// Initial queue-priority hint for this session (lower value = higher
+    /// Initial queue-priority hint for this cell (lower value = higher
     /// priority = runs sooner). Seeds the live queue rank at submit time; the
     /// Queue view/CLI own ordering thereafter.
     #[serde(default)]
     pub priority: Option<u32>,
-    /// Session-level verify steps.
+    /// Cell-level proof steps.
     #[serde(default)]
-    pub verify: Vec<VerifyStep>,
+    pub proof: Vec<ProofStep>,
     /// Review (guardian) opt-in. Set to the `id` of a top-level `[[review]]`
-    /// block to include this session's worktree branch in that review.
+    /// block to include this cell's worktree branch in that review.
     #[serde(default)]
     pub review: Option<String>,
-    /// Environment variables for this session's spawned subprocess
+    /// Environment variables for this cell's spawned subprocess
     /// (RAL-172). Merges with (and wins over on a shared key) the owning
     /// task's `environment`; see [`TaskDef::environment`] for how these
     /// values reach the runner.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    /// Upstream branch source for this session's branch. When set to
-    /// `"<<task:task-name>>"` (or `"<<task:task-name/session-id>>"`), the daemon
-    /// rebases this session's branch onto the named dependency's current branch
+    /// Upstream branch source for this cell's branch. When set to
+    /// `"<<task:task-name>>"` (or `"<<task:task-name/cell-id>>"`), the daemon
+    /// rebases this cell's branch onto the named dependency's current branch
     /// tip immediately before starting the runner. Both worktrees must be in the
     /// same git repository; cross-repo upstreams are skipped with a warning.
     #[serde(default)]
@@ -225,13 +225,13 @@ pub struct SessionDef {
 }
 
 /// Sentinel prefix for `upstream = "<<task:task-name>>"` or
-/// `"<<task:task-name/session-id>>"`: rebase this session's branch onto the
-/// named dependency's current branch tip before the session starts. The daemon
+/// `"<<task:task-name/cell-id>>"`: rebase this cell's branch onto the
+/// named dependency's current branch tip before the cell starts. The daemon
 /// resolves this at run time, immediately before launching the runner.
 pub const UPSTREAM_TASK_REF_PREFIX: &str = "<<task:";
 
-/// Parse the task/session ref from an `upstream = "<<task:...>>"` sentinel.
-/// Returns the inner ref string (e.g. `"task-a"` or `"task-a/session-1"`)
+/// Parse the task/cell ref from an `upstream = "<<task:...>>"` sentinel.
+/// Returns the inner ref string (e.g. `"task-a"` or `"task-a/cell-1"`)
 /// when the sentinel matches, `None` otherwise (a plain branch-name string,
 /// or any other non-matching value).
 #[must_use]
@@ -241,41 +241,82 @@ pub fn parse_upstream_task_ref(upstream: &str) -> Option<&str> {
         .and_then(|s| s.strip_suffix(">>"))
 }
 
-/// Scheme prefix for a placeholder session `cwd` that names a branch to
+/// Scheme prefix for a placeholder cell `cwd` that names a branch to
 /// materialize a fresh (or reused) worktree for, e.g.
-/// `"ralphus:new-worktree/RAL-100-feature"` (RAL-100). Rather than a real
-/// filesystem path, this names a branch; the owning task's `project` field
-/// (REQUIRED whenever any of its sessions uses this placeholder) names which
-/// project registered via `ralphus project git` to materialize it under. The
-/// daemon resolves that project, materializes (or reuses) a git worktree for
-/// the branch under `.git/.ralphus_worktrees/<branch>`, and rewrites the
-/// session's `cwd` to that real path before the session runs.
+/// `"ralphus:new-worktree/RAL-100-feature?upstream=main"` (RAL-100). Rather
+/// than a real filesystem path, this names a branch; the owning task's
+/// `project` field (REQUIRED whenever any of its cells uses this placeholder)
+/// names which project registered via `ralphus project git` to materialize it
+/// under. The trailing `?upstream=<upstream>` is REQUIRED (see
+/// [`parse_worktree_placeholder_upstream`]) so ralphus always knows what the
+/// branch tracks, rather than guessing from whatever `HEAD` happens to be at
+/// materialization time. The daemon resolves that project, materializes (or
+/// reuses) a git worktree for the branch under
+/// `.git/.ralphus_worktrees/<branch>`, and rewrites the cell's `cwd` to that
+/// real path before the cell runs.
 pub const WORKTREE_PLACEHOLDER_PREFIX: &str = "ralphus:new-worktree/";
 
-/// Parse a session `cwd` as a `ralphus:new-worktree/<branch>` placeholder
-/// (RAL-100). Returns the branch name when non-empty; `None` for a plain
-/// filesystem path or a malformed placeholder-shaped string (empty branch). A
-/// real absolute path never starts with the literal `ralphus:new-worktree/`
-/// prefix, so this is unambiguous. The project to materialize the branch
-/// under is NOT embedded here -- it comes from the owning task's `project`
-/// field (see [`crate::validate`]). The parser does no further segmentation:
-/// everything after the prefix, slashes included, is returned as one literal
-/// branch name. A value like `ralphus:new-worktree/origin/feature/x` therefore
-/// parses as the branch name `origin/feature/x`; any later interpretation of
-/// that shape as "maybe a remote-tracking branch" happens in daemon-side
-/// worktree materialization, not here.
+/// Parse a cell `cwd` as a `ralphus:new-worktree/<branch>[?upstream=<upstream>]`
+/// placeholder (RAL-100). Returns the branch name when non-empty; `None` for a
+/// plain filesystem path or a malformed placeholder-shaped string (empty
+/// branch). A real absolute path never starts with the literal
+/// `ralphus:new-worktree/` prefix, so this is unambiguous. The project to
+/// materialize the branch under is NOT embedded here -- it comes from the
+/// owning task's `project` field (see [`crate::validate`]). The parser does no
+/// further segmentation beyond the optional `?upstream=...` query suffix (see
+/// [`parse_worktree_placeholder_upstream`]): everything else after the
+/// prefix, slashes included, is returned as one literal branch name. A value
+/// like `ralphus:new-worktree/origin/feature/x` therefore parses as the
+/// branch name `origin/feature/x`; any later interpretation of that shape as
+/// "maybe a remote-tracking branch" happens in daemon-side worktree
+/// materialization, not here.
 #[must_use]
 pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
-    let branch = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
+    let rest = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
+    let branch = rest.split_once('?').map_or(rest, |(branch, _)| branch);
     if branch.is_empty() {
         return None;
     }
     Some(branch)
 }
 
+/// Parse the `?upstream=<upstream>` query suffix off a
+/// `ralphus:new-worktree/<branch>?upstream=<upstream>` placeholder. Returns
+/// `None` when the placeholder has no query suffix, an empty `upstream=`
+/// value, or any other malformed/unrecognized query -- callers that require
+/// an explicit upstream (submit-time validation in [`crate::validate`], and
+/// the daemon's own defensive re-check at worktree-resolution time) treat
+/// `None` as "no upstream given" and report it themselves; this function does
+/// no error reporting of its own.
+///
+/// `?` is never valid inside a git branch name (`git check-ref-format`
+/// rejects it), so splitting the placeholder on the first `?` unambiguously
+/// separates the branch from the query string.
+///
+/// This is a *worktree tracking* upstream -- the `git branch
+/// --set-upstream-to` target that `derive_reviews` needs to determine a
+/// review's base and that drives resync-on-reuse (fetch + rebase) for a
+/// remote-tracking branch. It is unrelated to a cell's own top-level
+/// `upstream = "<<task:...>>"` field ([`CellDef::upstream`]), which rebases
+/// this cell's branch onto another task/cell's tip immediately before the
+/// cell runs -- a content operation, not a tracking-configuration one. A cell
+/// can set both: the `cwd` placeholder's `?upstream=` for tracking, and its
+/// own `upstream` field for a pre-run rebase.
+#[must_use]
+pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
+    let rest = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
+    let (_, query) = rest.split_once('?')?;
+    let value = query.strip_prefix("upstream=")?;
+    let value = value.split_once('&').map_or(value, |(value, _)| value);
+    if value.is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
 /// The scheme prefix for a new-review placeholder id. A review whose `id` is
 /// `ralphus:new-review/<key>` is a *submission-local placeholder* for a review id
-/// that does not exist yet: within a single submission, every session that names
+/// that does not exist yet: within a single submission, every cell that names
 /// the same `<key>` collapses into one freshly-minted guardian, and distinct
 /// `<key>`s mint distinct guardians. The placeholder ALWAYS creates a new review —
 /// a later submission that happens to reuse the same `<key>` string gets its own
@@ -385,24 +426,23 @@ pub fn parse_machine(machine: &str) -> Result<MachineRef<'_>, MachineParseError>
     Ok(MachineRef::Provider { scheme, uri })
 }
 
-/// The effective `machine` for a session: its own value, else the owning
+/// The effective `machine` for a cell: its own value, else the owning
 /// task's, else `None` (meaning [`LOCAL_MACHINE`]). Mirrors how `agent` and
 /// `model` inherit in [`ResolvedAgent::resolve`].
 #[must_use]
-pub fn resolve_session_machine(task: &TaskDef, session: &SessionDef) -> Option<String> {
-    session
-        .machine
+pub fn resolve_cell_machine(task: &TaskDef, cell: &CellDef) -> Option<String> {
+    cell.machine
         .clone()
         .or_else(|| task.machine.clone())
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
 }
 
-/// The effective `machine` for a task-scope verify step (one with no owning
-/// session): the step's own value, else the task's.
+/// The effective `machine` for a task-scope proof step (one with no owning
+/// cell): the step's own value, else the task's.
 #[must_use]
-pub fn resolve_task_verify_machine(task: &TaskDef, verify: &VerifyStep) -> Option<String> {
-    verify
+pub fn resolve_task_proof_machine(task: &TaskDef, proof: &ProofStep) -> Option<String> {
+    proof
         .machine
         .clone()
         .or_else(|| task.machine.clone())
@@ -410,26 +450,26 @@ pub fn resolve_task_verify_machine(task: &TaskDef, verify: &VerifyStep) -> Optio
         .filter(|m| !m.is_empty())
 }
 
-/// The effective `machine` for a session-scope verify step: the step's own
-/// value, else the owning session's resolved machine (which itself falls back
+/// The effective `machine` for a cell-scope proof step: the step's own
+/// value, else the owning cell's resolved machine (which itself falls back
 /// to the task's).
 #[must_use]
-pub fn resolve_session_verify_machine(
+pub fn resolve_cell_proof_machine(
     task: &TaskDef,
-    session: &SessionDef,
-    verify: &VerifyStep,
+    cell: &CellDef,
+    proof: &ProofStep,
 ) -> Option<String> {
-    verify
+    proof
         .machine
         .clone()
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
-        .or_else(|| resolve_session_machine(task, session))
+        .or_else(|| resolve_cell_machine(task, cell))
 }
 
 /// A top-level review (guardian) declaration via `[[review]]`.
 ///
-/// Sessions opt in by declaring `review = "<id>"`. When several sessions resolve
+/// Cells opt in by declaring `review = "<id>"`. When several cells resolve
 /// to the same project they collapse into one guardian; across N projects the
 /// daemon materialises N guardians and disambiguates their names. The base branch
 /// is always resolved from each worktree's tracking upstream at submit time.
@@ -458,7 +498,7 @@ pub struct ReviewDef {
     ///
     /// A local review normally infers its base from each contributing
     /// worktree's git upstream. That read only works on the machine holding
-    /// the worktree, so a review fed by a **remote** session must state its
+    /// the worktree, so a review fed by a **remote** cell must state its
     /// base here — the daemon has no way to look it up across machines, and
     /// guessing the project's default branch would silently produce a review
     /// against the wrong base.
@@ -477,11 +517,11 @@ pub struct ReviewDef {
     #[serde(default)]
     pub machine: Option<String>,
     /// Max spend cap in USD for this review's own agent cost -- conflict
-    /// resolution and verifier calls made by the guardian merge machinery,
+    /// resolution and prover calls made by the guardian merge machinery,
     /// summed cumulatively across every rebase/re-merge attempt (RAL-193).
     /// Enforced the same way [`TaskDef::maximum_budget_usd`]/
-    /// [`SessionDef::maximum_budget_usd`] are: once exceeded, the daemon
-    /// stops making further resolver/verifier calls for this review and
+    /// [`CellDef::maximum_budget_usd`] are: once exceeded, the daemon
+    /// stops making further resolver/prover calls for this review and
     /// fails it.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
@@ -534,10 +574,10 @@ pub struct ReviewActionInputDef {
     pub default: String,
 }
 
-/// One verify step. Exactly one of `command` / `brain` / `prompt` must be set.
+/// One proof step. Exactly one of `command` / `brain` / `prompt` must be set.
 #[derive(Debug, Clone, Deserialize)]
-pub struct VerifyStep {
-    /// Verify step ID (for `restart_on` / verify-level dependencies).
+pub struct ProofStep {
+    /// Proof step ID (for `restart_on` / proof-level dependencies).
     #[serde(default)]
     pub id: Option<String>,
     /// Shell command; exit code is the verdict.
@@ -546,73 +586,100 @@ pub struct VerifyStep {
     /// Prompt routed to the local brain (deferred in ralphus MVP).
     #[serde(default)]
     pub brain: Option<String>,
-    /// Headless AI verifier prompt. Runs using the owning session's
+    /// Headless AI proof-step prompt. Runs using the owning cell's
     /// resolved backend program (its `agent`), with this step's own `model`
-    /// as an override — a verify step has no separate backend selector.
+    /// as an override — a proof step has no separate backend selector.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Model override for the `prompt` verify (falls back to the owning
-    /// session's resolved model when unset).
+    /// Model override for the `prompt` proof (falls back to the owning
+    /// cell's resolved model when unset).
     #[serde(default)]
     pub model: Option<String>,
-    /// Override the inherited `machine` for this verify step (RAL-185). Falls
-    /// back to the owning session's resolved machine for a session-scope step,
+    /// Override the inherited `machine` for this proof step (RAL-185). Falls
+    /// back to the owning cell's resolved machine for a cell-scope step,
     /// or the task's for a task-scope one. See [`TaskDef::machine`] — the
     /// affinity rules require every step under one task to agree.
     #[serde(default)]
     pub machine: Option<String>,
-    /// Extra CLI args for the prompt-verifier invocation (e.g. `--append-system-prompt`).
+    /// Extra CLI args for the proof-prompt invocation (e.g. `--append-system-prompt`).
     #[serde(default)]
     pub arguments: Vec<String>,
-    /// Budget for the verify prompt, in total tokens (input + output). Falls
+    /// Budget for the proof prompt, in total tokens (input + output). Falls
     /// back to the task-level `budget_tokens` when unset.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
-    /// Per-verify wall-clock timeout in minutes. Falls back to the task-level
+    /// Per-proof wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
     /// Whether the step needs human approval.
     #[serde(default)]
     pub requires_approval: bool,
-    /// Other verify steps that, when they fire, re-run this session's verify
-    /// cursor from the start. Grammar: `task/session/verify?on=pass|fail|both`,
-    /// with wildcards `task/*` and `task/session/*`.
+    /// Other proof steps that, when they fire, re-run this cell's proof
+    /// cursor from the start. Grammar: `task/cell/proof?on=pass|fail|both`,
+    /// with wildcards `task/*` and `task/cell/*`.
     #[serde(default)]
     pub restart_on: Vec<String>,
-    /// Environment variables for **this one verify step's** spawned subprocess
+    /// Environment variables for **this one proof step's** spawned subprocess
     /// (RAL-191). The narrowest layer in the hierarchy: merged on top of the
-    /// owning scope's `verify` overrides, which themselves sit on top of the
-    /// session's/task's/run's — see [`TaskDef::environment`].
+    /// owning scope's `proof` overrides, which themselves sit on top of the
+    /// cell's/task's/squad's — see [`TaskDef::environment`].
     ///
-    /// Kept per-step rather than folded into the owning task's/session's
-    /// single `verify_env_overrides` row precisely because `verify` is an
-    /// array: two `[[task.verify]]` blocks setting the same key to different
+    /// Kept per-step rather than folded into the owning task's/cell's
+    /// single `proof_env_overrides` row precisely because `proof` is an
+    /// array: two `[[task.proof]]` blocks setting the same key to different
     /// values must not collide. At submission time this seeds that step's own
-    /// row in the daemon's override store (`verifies.env_overrides`), after
+    /// row in the daemon's override store (`proofs.env_overrides`), after
     /// which it is indistinguishable from one set later via
-    /// `POST /api/runs/{id}/tasks/{ti}/verify/{vi}/env`.
+    /// `POST /api/squads/{id}/tasks/{ti}/proof/{vi}/env`.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
 }
 
-/// Resolved agent config after task→session inheritance is applied.
+/// Resolved agent config after task→cell inheritance is applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgent {
     /// Binary name or path to invoke.
     pub program: String,
     /// Effective model, if set.
     pub model: Option<String>,
-    /// Extra args, task-level first then session-level.
+    /// Extra args, task-level first then cell-level.
     pub args: Vec<String>,
 }
 
-/// The default agent program when neither session nor task specifies one.
+/// The default agent program when neither cell nor task specifies one.
 pub const DEFAULT_AGENT: &str = "claude";
 
-/// The [`SessionDef::system_prompt_position`] value meaning "append to the
+/// The [`CellDef::system_prompt_position`] value meaning "append to the
 /// agent's system prompt". Currently the only accepted position (RAL-5).
 pub const SYSTEM_PROMPT_POSITION_APPEND: &str = "append";
+
+/// The built-in backend names and their aliases -- the only `agent` values
+/// `core` can classify on its own. Any other name might be a custom
+/// `[agent.profiles.*]` entry (see `daemon/src/agent_profiles.rs`), whose
+/// backend `core` cannot see: the profile registry lives in the daemon's
+/// config/store, not in this dependency-light crate. This is the single
+/// source of truth for that reserved set -- `daemon::agent_profiles` reuses
+/// it rather than keeping its own copy, so a profile can never be named
+/// after a built-in.
+///
+/// UPDATE THIS whenever a new agent backend/harness is added (see also
+/// `ralphus agent list` / `cli-rs/src/agents.rs` and `PROFILE_BACKENDS` in
+/// `daemon/src/agent_profiles.rs`, which enumerate backends too) --
+/// otherwise the new name stays eligible to collide with a future custom
+/// profile, and `check_system_prompt` in `core/src/validate.rs` will
+/// silently defer its system_prompt support check to the daemon instead of
+/// answering it offline.
+pub const RESERVED_AGENT_NAMES: &[&str] = &[
+    "claude",
+    "anthropic",
+    "ollama",
+    "claude-code",
+    "claude-cli",
+    "codex",
+    "codex-cli",
+    "raw",
+];
 
 /// Whether `agent` is a backend with complete appended-system-prompt support.
 ///
@@ -623,23 +690,29 @@ pub const SYSTEM_PROMPT_POSITION_APPEND: &str = "append";
 /// dedicated flag). Support for other backends is best-effort but not
 /// complete, so validation rejects `system_prompt`/`system_prompt_position`
 /// for any other agent (RAL-5).
+///
+/// Also used, unmodified, to test a *resolved backend* string (e.g. a custom
+/// agent profile's `backend = "claude-code"`) -- see
+/// `daemon::agent_profiles::validate_task_file_profiles`, which is the only
+/// place a custom-profile cell's `system_prompt` gets checked, since `core`
+/// itself defers on any agent name outside [`RESERVED_AGENT_NAMES`].
 #[must_use]
 pub fn agent_supports_system_prompt(agent: &str) -> bool {
     matches!(agent, "claude-code" | "claude-cli" | "codex" | "codex-cli")
 }
 
 impl ResolvedAgent {
-    /// Merge task defaults with session overrides (session wins).
+    /// Merge task defaults with cell overrides (cell wins).
     #[must_use]
-    pub fn resolve(task: &TaskDef, session: &SessionDef) -> Self {
-        let program = session
+    pub fn resolve(task: &TaskDef, cell: &CellDef) -> Self {
+        let program = cell
             .agent
             .clone()
             .or_else(|| task.agent.clone())
             .unwrap_or_else(|| DEFAULT_AGENT.to_string());
-        let model = session.model.clone().or_else(|| task.model.clone());
+        let model = cell.model.clone().or_else(|| task.model.clone());
         let mut args = task.args.clone();
-        args.extend_from_slice(&session.args);
+        args.extend_from_slice(&cell.args);
         Self {
             program,
             model,
@@ -647,7 +720,7 @@ impl ResolvedAgent {
         }
     }
 
-    /// Task-level defaults only (for task-level verify steps that have no session).
+    /// Task-level defaults only (for task-level proof steps that have no cell).
     #[must_use]
     pub fn from_task(task: &TaskDef) -> Self {
         Self {
@@ -681,13 +754,13 @@ mod tests {
             depends_on: vec![],
             environment: BTreeMap::new(),
             no_commit_required: false,
-            session: vec![],
-            verify: vec![],
+            cell: vec![],
+            proof: vec![],
         }
     }
 
-    fn session_with(agent: Option<&str>, model: Option<&str>, args: &[&str]) -> SessionDef {
-        SessionDef {
+    fn cell_with(agent: Option<&str>, model: Option<&str>, args: &[&str]) -> CellDef {
+        CellDef {
             id: None,
             name: None,
             role: None,
@@ -707,16 +780,16 @@ mod tests {
             timeout_minutes: None,
             priority: None,
             environment: BTreeMap::new(),
-            verify: vec![],
+            proof: vec![],
             review: None,
             upstream: None,
         }
     }
 
     #[test]
-    fn session_overrides_task_agent_and_model() {
+    fn cell_overrides_task_agent_and_model() {
         let task = task_with(Some("claude"), Some("task-model"), &["--task"]);
-        let sess = session_with(Some("aider"), Some("sess-model"), &["--sess"]);
+        let sess = cell_with(Some("aider"), Some("sess-model"), &["--sess"]);
         let r = ResolvedAgent::resolve(&task, &sess);
         assert_eq!(r.program, "aider");
         assert_eq!(r.model.as_deref(), Some("sess-model"));
@@ -724,9 +797,9 @@ mod tests {
     }
 
     #[test]
-    fn session_inherits_task_when_unset() {
+    fn cell_inherits_task_when_unset() {
         let task = task_with(Some("codex"), Some("m"), &["--a"]);
-        let sess = session_with(None, None, &[]);
+        let sess = cell_with(None, None, &[]);
         let r = ResolvedAgent::resolve(&task, &sess);
         assert_eq!(r.program, "codex");
         assert_eq!(r.model.as_deref(), Some("m"));
@@ -736,7 +809,7 @@ mod tests {
     #[test]
     fn defaults_to_claude_when_nothing_set() {
         let task = task_with(None, None, &[]);
-        let sess = session_with(None, None, &[]);
+        let sess = cell_with(None, None, &[]);
         assert_eq!(ResolvedAgent::resolve(&task, &sess).program, DEFAULT_AGENT);
     }
 
@@ -745,7 +818,7 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
             review = "backend"
@@ -765,7 +838,7 @@ mod tests {
             prompt = "Open localhost:3000 and click through the new wizard"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        assert_eq!(parsed.task[0].session[0].review.as_deref(), Some("backend"));
+        assert_eq!(parsed.task[0].cell[0].review.as_deref(), Some("backend"));
         let review = &parsed.review;
         assert_eq!(review.len(), 1);
         assert_eq!(review[0].id.as_deref(), Some("backend"));
@@ -786,7 +859,7 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
             review = "backend"
@@ -821,7 +894,7 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
             review = "backend"
@@ -844,7 +917,7 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo"
             prompt = "do work"
             agent = "claude-code"
@@ -852,7 +925,7 @@ mod tests {
             system_prompt_position = "append"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        let sess = &parsed.task[0].session[0];
+        let sess = &parsed.task[0].cell[0];
         assert_eq!(
             sess.system_prompt.as_deref(),
             Some("Follow the house style guide.")
@@ -868,26 +941,26 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo"
             prompt = "do work"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        let sess = &parsed.task[0].session[0];
+        let sess = &parsed.task[0].cell[0];
         assert!(sess.system_prompt.is_none());
         assert!(sess.system_prompt_position.is_none());
     }
 
     #[test]
-    fn environment_deserializes_at_task_and_session_level() {
+    fn environment_deserializes_at_task_and_cell_level() {
         let toml = r#"
             [[task]]
             name = "t"
             environment = { SHARED = "from-task", TASK_ONLY = "1" }
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo"
             prompt = "do work"
-            environment = { SHARED = "from-session", SESSION_ONLY = "2" }
+            environment = { SHARED = "from-cell", CELL_ONLY = "2" }
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let task = &parsed.task[0];
@@ -899,57 +972,57 @@ mod tests {
             task.environment.get("TASK_ONLY").map(String::as_str),
             Some("1")
         );
-        let sess = &task.session[0];
+        let sess = &task.cell[0];
         assert_eq!(
             sess.environment.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
         assert_eq!(
-            sess.environment.get("SESSION_ONLY").map(String::as_str),
+            sess.environment.get("CELL_ONLY").map(String::as_str),
             Some("2")
         );
     }
 
     #[test]
-    fn environment_deserializes_on_task_and_session_verify_steps() {
-        // RAL-191: `environment` is per verify *step*, not per verify scope --
+    fn environment_deserializes_on_task_and_cell_proof_steps() {
+        // RAL-191: `environment` is per proof *step*, not per proof scope --
         // two steps under the same task must be able to set the same key to
         // different values without colliding.
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.verify]]
+            [[task.proof]]
             command = "cargo test"
             environment = { RUST_LOG = "debug" }
-            [[task.verify]]
+            [[task.proof]]
             command = "cargo clippy"
             environment = { RUST_LOG = "warn" }
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo"
             prompt = "do work"
-            [[task.session.verify]]
+            [[task.cell.proof]]
             command = "npm test"
             environment = { CI = "1" }
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let task = &parsed.task[0];
         assert_eq!(
-            task.verify[0]
+            task.proof[0]
                 .environment
                 .get("RUST_LOG")
                 .map(String::as_str),
             Some("debug")
         );
         assert_eq!(
-            task.verify[1]
+            task.proof[1]
                 .environment
                 .get("RUST_LOG")
                 .map(String::as_str),
             Some("warn"),
-            "each verify step keeps its own value for the same key"
+            "each proof step keeps its own value for the same key"
         );
         assert_eq!(
-            task.session[0].verify[0]
+            task.cell[0].proof[0]
                 .environment
                 .get("CI")
                 .map(String::as_str),
@@ -962,13 +1035,13 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/repo"
             prompt = "do work"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         assert!(parsed.task[0].environment.is_empty());
-        assert!(parsed.task[0].session[0].environment.is_empty());
+        assert!(parsed.task[0].cell[0].environment.is_empty());
     }
 
     #[test]
@@ -977,10 +1050,10 @@ mod tests {
     }
 
     #[test]
-    fn upstream_task_ref_matches_task_session() {
+    fn upstream_task_ref_matches_task_cell() {
         assert_eq!(
-            parse_upstream_task_ref("<<task:my-task/session-1>>"),
-            Some("my-task/session-1")
+            parse_upstream_task_ref("<<task:my-task/cell-1>>"),
+            Some("my-task/cell-1")
         );
     }
 
@@ -1016,6 +1089,59 @@ mod tests {
     fn worktree_placeholder_rejects_empty_branch() {
         assert_eq!(parse_worktree_placeholder("ralphus:new-worktree/"), None);
         assert_eq!(parse_worktree_placeholder("ralphus:new-worktree"), None);
+    }
+
+    #[test]
+    fn worktree_placeholder_strips_the_upstream_query_from_the_branch() {
+        assert_eq!(
+            parse_worktree_placeholder("ralphus:new-worktree/feat?upstream=main"),
+            Some("feat")
+        );
+        assert_eq!(
+            parse_worktree_placeholder(
+                "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
+            ),
+            Some("origin/feature/x")
+        );
+    }
+
+    #[test]
+    fn worktree_placeholder_upstream_parses() {
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?upstream=main"),
+            Some("main")
+        );
+        assert_eq!(
+            parse_worktree_placeholder_upstream(
+                "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
+            ),
+            Some("origin/blah")
+        );
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/foo?upstream=bar"),
+            Some("bar")
+        );
+    }
+
+    #[test]
+    fn worktree_placeholder_upstream_is_none_when_absent_or_malformed() {
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat"),
+            None
+        );
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?upstream="),
+            None
+        );
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?"),
+            None
+        );
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?bogus=main"),
+            None
+        );
+        assert_eq!(parse_worktree_placeholder_upstream("/home/me/repo"), None);
     }
 
     // ── machine URI parsing (RAL-185) ─────────────────────────────────────
@@ -1082,15 +1208,15 @@ mod tests {
     }
 
     #[test]
-    fn session_machine_overrides_task_and_unset_falls_through_to_none() {
+    fn cell_machine_overrides_task_and_unset_falls_through_to_none() {
         let toml = r#"
             [[task]]
             name = "t"
             machine = "incredibuild:A"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "x"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "y"
             machine = "incredibuild:B"
@@ -1098,59 +1224,59 @@ mod tests {
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let task = &parsed.task[0];
         assert_eq!(
-            resolve_session_machine(task, &task.session[0]).as_deref(),
+            resolve_cell_machine(task, &task.cell[0]).as_deref(),
             Some("incredibuild:A"),
-            "an unset session machine inherits the task's"
+            "an unset cell machine inherits the task's"
         );
         assert_eq!(
-            resolve_session_machine(task, &task.session[1]).as_deref(),
+            resolve_cell_machine(task, &task.cell[1]).as_deref(),
             Some("incredibuild:B"),
-            "an explicit session machine wins"
+            "an explicit cell machine wins"
         );
 
         let bare = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "x"
         "#;
         let parsed: TaskFile = toml::from_str(bare).expect("should deserialize");
         let task = &parsed.task[0];
         assert_eq!(
-            resolve_session_machine(task, &task.session[0]),
+            resolve_cell_machine(task, &task.cell[0]),
             None,
             "no machine anywhere means local, represented as None"
         );
     }
 
     #[test]
-    fn verify_machine_inherits_from_its_owner() {
+    fn proof_machine_inherits_from_its_owner() {
         let toml = r#"
             [[task]]
             name = "t"
             machine = "incredibuild:A"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "x"
             machine = "incredibuild:S"
-            [[task.session.verify]]
+            [[task.cell.proof]]
             command = "cargo test"
-            [[task.verify]]
+            [[task.proof]]
             command = "cargo fmt"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let task = &parsed.task[0];
-        let session = &task.session[0];
+        let cell = &task.cell[0];
         assert_eq!(
-            resolve_session_verify_machine(task, session, &session.verify[0]).as_deref(),
+            resolve_cell_proof_machine(task, cell, &cell.proof[0]).as_deref(),
             Some("incredibuild:S"),
-            "a session-scope verify follows its session, not the task"
+            "a cell-scope proof follows its cell, not the task"
         );
         assert_eq!(
-            resolve_task_verify_machine(task, &task.verify[0]).as_deref(),
+            resolve_task_proof_machine(task, &task.proof[0]).as_deref(),
             Some("incredibuild:A"),
-            "a task-scope verify follows the task"
+            "a task-scope proof follows the task"
         );
     }
 
@@ -1159,7 +1285,7 @@ mod tests {
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "cargo build"
         "#;
@@ -1173,7 +1299,7 @@ mod tests {
             [[task]]
             name = "t"
             no_commit_required = true
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "cargo build"
         "#;
@@ -1182,17 +1308,17 @@ mod tests {
     }
 
     #[test]
-    fn command_only_session_deserializes() {
+    fn command_only_cell_deserializes() {
         // The old project's bug: this used to fail because `prompt` was required.
         let toml = r#"
             [[task]]
             name = "t"
-            [[task.session]]
+            [[task.cell]]
             cwd = "/tmp"
             command = "cargo build"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        let sess = &parsed.task[0].session[0];
+        let sess = &parsed.task[0].cell[0];
         assert!(sess.prompt.is_none());
         assert_eq!(sess.command.as_deref(), Some("cargo build"));
     }

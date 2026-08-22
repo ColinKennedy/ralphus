@@ -5,7 +5,7 @@ members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "benc
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Proprietary"
 rust-version = "1.85"
 
 # Shared dependency versions. Individual crates opt in as they need them, so a
@@ -39,6 +39,10 @@ sysinfo = { version = "0.36.1", default-features = false, features = ["system"] 
 # transitive deps, not used for anything security-sensitive (just a stable
 # cache-key filename), but a well-tested crate beats hand-rolling a hash.
 sha2 = "0.10"
+# CSPRNG source for the daemon's bearer-token generation (RAL-219) — a small,
+# dependency-light crate (already resolved transitively via the TLS stack)
+# rather than pulling in the full `rand` ecosystem for one `getrandom()` call.
+getrandom = "0.2"
 # UTC wall-clock parsing only (RAL-122 scheduler down-time windows) — no other
 # crate in the workspace needs date/time handling, so this is deliberately
 # minimal: no "clock"-derived local-time features beyond `Utc::now`.

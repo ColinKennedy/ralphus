@@ -565,7 +565,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
             "--skip-auto-clean/--no-skip-auto-clean",
             "--skip-worktree-checks/--no-skip-worktree-checks",
             "--skip-worktrees/--no-skip-worktrees",
-            "--verify-scope [each_branch|final_branch|nothing]",
+            "--proof-scope [each_branch|final_branch|nothing]",
         ],
         "Update per-review opt-out settings.",
         false,
@@ -711,7 +711,7 @@ const PROJECT_CHILDREN: &[HelpNode] = &[
         "git",
         &[],
         &["--description [text]", "--name [name]", "--path [path]"],
-        "Register a git repository as a project the daemon can resolve placeholder session \
+        "Register a git repository as a project the daemon can resolve placeholder cell \
 cwds against.",
         false,
         false,
@@ -727,6 +727,16 @@ cwds against.",
         &[],
     ),
 ];
+
+const MAILBOX_CHILDREN: &[HelpNode] = &[node(
+    "check",
+    &[],
+    &["--priority [urgent|high|normal]"],
+    "Drain unread escalation mailbox messages and print them (RAL-241).",
+    false,
+    false, // drains (marks read) as a side effect -- not read-only
+    &[],
+)];
 
 const QUEUE_CHILDREN: &[HelpNode] = &[
     node(
@@ -760,46 +770,46 @@ const QUEUE_CHILDREN: &[HelpNode] = &[
         "set-status",
         &["path [str]", "state [str]"],
         &[],
-        "Set a run/task/session/verify status (e.g. ignored) by item path or run id.",
+        "Set a squad/task/cell/proof status (e.g. ignored) by item path or squad id.",
         false,
         false,
         &[],
     ),
 ];
 
-const RUN_CHILDREN: &[HelpNode] = &[
+const SQUAD_CHILDREN: &[HelpNode] = &[
     node(
         "activate",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &[],
-        "Promote a held (queued) run to pending.",
+        "Promote a held (queued) squad to pending.",
         false,
         false,
         &[],
     ),
     node(
         "cancel",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &[],
-        "Cancel a run.",
+        "Cancel a squad.",
         false,
         false,
         &[],
     ),
     node(
         "delete",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &["--yes"],
-        "Permanently delete a run.",
+        "Permanently delete a squad.",
         false,
         false,
         &[],
     ),
     node(
         "edit",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &["--label [text]"],
-        "Edit a run's fields.",
+        "Edit a squad's fields.",
         false,
         false,
         &[],
@@ -812,41 +822,41 @@ const RUN_CHILDREN: &[HelpNode] = &[
             "--sort [date|name]",
             "--status [states]",
         ],
-        "List runs.",
+        "List squads.",
         false,
-        true, // ("run", "list")
+        true, // ("squad", "list")
         &[],
     ),
     node(
         "logs",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &[],
-        "Show a run's state-transition audit log.",
+        "Show a squad's state-transition audit log.",
         false,
-        true, // ("run", "logs")
+        true, // ("squad", "logs")
         &[],
     ),
     node(
         "rename",
-        &["run_id [str]", "label [str]"],
+        &["squad_id [str]", "label [str]"],
         &[],
-        "Rename a run's label.",
+        "Rename a squad's label.",
         false,
         false,
         &[],
     ),
     node(
         "restart",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &[],
-        "Restart a whole run, dirtying every run that depends on it.",
+        "Restart a whole squad, dirtying every squad that depends on it.",
         false,
         false,
         &[],
     ),
     node(
         "retry",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &[],
         "Re-run with the same parameters (reset to pending).",
         false,
@@ -855,34 +865,34 @@ const RUN_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set-status",
-        &["run_id [str]", "state [str]"],
+        &["squad_id [str]", "state [str]"],
         &[],
-        "Manually override a run's status.",
+        "Manually override a squad's status.",
         false,
         false,
         &[],
     ),
     node(
         "show",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &[],
-        "Show a single run's detail.",
+        "Show a single squad's detail.",
         false,
-        true, // ("run", "show")
+        true, // ("squad", "show")
         &[],
     ),
     node(
         "timeline",
-        &["run_id [str]"],
+        &["squad_id [str]"],
         &["--write [path]"],
-        "Generate the merged, chronological uber-log-viewer timeline for a run (RAL-155).",
+        "Generate the merged, chronological uber-log-viewer timeline for a squad (RAL-155).",
         false,
         false,
         &[],
     ),
 ];
 
-const SESSION_CHILDREN: &[HelpNode] = &[
+const CELL_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
         &["selector [str]"],
@@ -893,7 +903,7 @@ const SESSION_CHILDREN: &[HelpNode] = &[
             "--model [name]",
             "--prompt [text]",
         ],
-        "Edit a session's fields.",
+        "Edit a cell's fields.",
         false,
         false,
         &[],
@@ -902,16 +912,16 @@ const SESSION_CHILDREN: &[HelpNode] = &[
         "restart",
         &["selector [str]"],
         &[],
-        "Restart a session (and its downstream), dirtying dependent runs.",
+        "Restart a cell (and its downstream), dirtying dependent squads.",
         false,
         false,
         &[],
     ),
     node(
-        "restart-verify",
+        "restart-proof",
         &["selector [str]"],
         &["--from [index]"],
-        "Restart a session's verify steps from an index onwards.",
+        "Restart a cell's proof steps from an index onwards.",
         false,
         false,
         &[],
@@ -920,16 +930,16 @@ const SESSION_CHILDREN: &[HelpNode] = &[
         "reviews",
         &["selector [str]"],
         &[],
-        "The reviews this session's branch participates in.",
+        "The reviews this cell's branch participates in.",
         false,
-        true, // ("session", "reviews")
+        true, // ("cell", "reviews")
         &[],
     ),
     node(
         "set-status",
         &["selector [str]", "state [str]"],
         &[],
-        "Manually override a session's status.",
+        "Manually override a cell's status.",
         false,
         false,
         &[],
@@ -938,27 +948,27 @@ const SESSION_CHILDREN: &[HelpNode] = &[
         "show",
         &["selector [str]"],
         &[],
-        "Show a single session's detail.",
+        "Show a single cell's detail.",
         false,
-        true, // ("session", "show")
+        true, // ("cell", "show")
         &[],
     ),
     node(
         "terminal",
         &["selector [str]"],
         &["--mode [open|readonly]"],
-        "Print the command to resume a session's conversation locally.",
+        "Print the command to resume a cell's conversation locally.",
         false,
-        true, // ("session", "terminal")
+        true, // ("cell", "terminal")
         &[],
     ),
     node(
         "worktree",
         &["selector [str]"],
         &[],
-        "Show the worktree/project a session is using.",
+        "Show the worktree/project a cell is using.",
         false,
-        true, // ("session", "worktree")
+        true, // ("cell", "worktree")
         &[],
     ),
 ];
@@ -985,10 +995,10 @@ const TASK_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
-        "restart-verify",
+        "restart-proof",
         &["selector [str]"],
         &["--from [index]"],
-        "Restart a task's verify steps from an index onwards.",
+        "Restart a task's proof steps from an index onwards.",
         false,
         false,
         &[],
@@ -1016,12 +1026,12 @@ const TASK_CHILDREN: &[HelpNode] = &[
     // `commands/task.rs`'s own doc comment).
 ];
 
-const VERIFY_CHILDREN: &[HelpNode] = &[
+const PROOF_CHILDREN: &[HelpNode] = &[
     node(
         "restart",
         &["selector [str]"],
         &[],
-        "Restart this verify step (and any later ones in its scope).",
+        "Restart this proof step (and any later ones in its scope).",
         false,
         false,
         &[],
@@ -1030,7 +1040,7 @@ const VERIFY_CHILDREN: &[HelpNode] = &[
         "set-status",
         &["selector [str]", "state [str]"],
         &[],
-        "Manually override a verify step's status.",
+        "Manually override a proof step's status.",
         false,
         false,
         &[],
@@ -1039,9 +1049,9 @@ const VERIFY_CHILDREN: &[HelpNode] = &[
         "show",
         &["selector [str]"],
         &[],
-        "Show a single verify step's detail.",
+        "Show a single proof step's detail.",
         false,
-        true, // ("verify", "show")
+        true, // ("proof", "show")
         &[],
     ),
 ];
@@ -1055,7 +1065,7 @@ const VERIFY_CHILDREN: &[HelpNode] = &[
 pub const ROOT: HelpNode = node(
     "ralphus",
     &[],
-    &["--daemon-url [url]", "--json"],
+    &["--daemon-url [url]", "--json", "--version"],
     "Submit and manage autonomous agent tasks against the ralphus daemon.",
     false,
     false,
@@ -1074,6 +1084,7 @@ pub const ROOT: HelpNode = node(
             &[],
             &[
                 "--ascending",
+                "--cell [str]",
                 "--entity [str]",
                 "--for [str]",
                 "--guardian [str]",
@@ -1081,10 +1092,9 @@ pub const ROOT: HelpNode = node(
                 "--limit [integer]",
                 "--offset [integer]",
                 "--q [str]",
-                "--run [str]",
                 "--scope [str]",
-                "--session [str]",
                 "--source [str]",
+                "--squad [str]",
                 "--task [str]",
             ],
             "Query the structured Cartographer event log (RAL-98/RAL-155).",
@@ -1142,7 +1152,7 @@ placeholder message; Python's `shell` argument is not read.)",
         ),
         node(
             "graph",
-            &["run_id [str, optional]"],
+            &["squad_id [str, optional]"],
             &["--all", "--dot"],
             "Render the task-order dependency graph. (Rust port simplifies Python's \
 --global/--format ascii|dot choice to plain --dot/--all boolean flags.)",
@@ -1154,7 +1164,7 @@ placeholder message; Python's `shell` argument is not read.)",
             "history",
             &["selector [str]"],
             &[],
-            "Show a session/verify step's tmux history (one-shot snapshot; Python's --live \
+            "Show a cell/proof step's tmux history (one-shot snapshot; Python's --live \
 tailing and --wait-until-valid are not yet ported).",
             false,
             true, // ("history",)
@@ -1173,9 +1183,18 @@ tailing and --wait-until-valid are not yet ported).",
             "listen",
             &["selector [str]"],
             &["--timeout [seconds]", "--until [status]"],
-            "Block until a run/task/session/verify/review/review-worktree reaches a status.",
+            "Block until a squad/task/cell/proof/review/review-worktree reaches a status.",
             false,
             true, // ("listen",)
+            &[],
+        ),
+        node(
+            "license",
+            &[],
+            &[],
+            "Print the embedded LICENSE text decoded from the binary's obfuscated copy.",
+            false,
+            true, // ("license",)
             &[],
         ),
         node(
@@ -1186,6 +1205,15 @@ tailing and --wait-until-valid are not yet ported).",
             false,
             false,
             MACHINE_CHILDREN,
+        ),
+        node(
+            "mailbox",
+            &[],
+            &[],
+            "Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention.",
+            false,
+            false,
+            MAILBOX_CHILDREN,
         ),
         node(
             "project",
@@ -1200,7 +1228,7 @@ tailing and --wait-until-valid are not yet ported).",
             "queue",
             &[],
             &[],
-            "Inspect and reorder the run queue by priority.",
+            "Inspect and reorder the squad queue by priority.",
             false,
             false,
             QUEUE_CHILDREN,
@@ -1216,9 +1244,9 @@ tailing and --wait-until-valid are not yet ported).",
         ),
         node(
             "retry",
-            &["run_id [str]"],
+            &["squad_id [str]"],
             &[],
-            "Re-run a run from scratch (reset to pending). (Rust port: run-level only; \
+            "Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; \
 Python's per-selector --environment/--env-file overrides are not yet ported.)",
             false,
             false,
@@ -1234,22 +1262,22 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
             REVIEW_CHILDREN,
         ),
         node(
-            "run",
+            "squad",
             &[],
             &[],
-            "Inspect and act on runs.",
+            "Inspect and act on squads.",
             false,
             false,
-            RUN_CHILDREN,
+            SQUAD_CHILDREN,
         ),
         node(
-            "session",
+            "cell",
             &[],
             &[],
-            "Inspect and act on sessions.",
+            "Inspect and act on cells.",
             false,
             false,
-            SESSION_CHILDREN,
+            CELL_CHILDREN,
         ),
         node(
             "show",
@@ -1262,9 +1290,9 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
         ),
         node(
             "status",
-            &["run_id [str, optional]"],
+            &["squad_id [str, optional]"],
             &["--concurrency"],
-            "Show run status from the daemon.",
+            "Show squad status from the daemon.",
             false,
             true, // ("status",)
             &[],
@@ -1313,13 +1341,13 @@ Python's `task show-tutor` to this top-level command.)",
             &[],
         ),
         node(
-            "verify",
+            "proof",
             &[],
             &[],
-            "Inspect and act on verify steps.",
+            "Inspect and act on proof steps.",
             false,
             false,
-            VERIFY_CHILDREN,
+            PROOF_CHILDREN,
         ),
     ],
 );
@@ -1357,6 +1385,79 @@ fn render(n: &HelpNode, depth: usize, out: &mut String) {
     for child in children {
         render(child, depth + 1, out);
     }
+}
+
+fn find_node<'a>(node: &'a HelpNode, path: &[&str]) -> Option<&'a HelpNode> {
+    match path.split_first() {
+        None => Some(node),
+        Some((head, tail)) => node
+            .children
+            .iter()
+            .find(|child| child.name == *head)
+            .and_then(|child| find_node(child, tail)),
+    }
+}
+
+fn signature(n: &HelpNode) -> String {
+    let mut chips: Vec<&str> = n.positionals.to_vec();
+    let mut opts: Vec<&str> = n.options.to_vec();
+    opts.sort_unstable();
+    chips.extend(opts);
+    if chips.is_empty() {
+        n.name.to_string()
+    } else {
+        format!("{} {}", n.name, chips.join(" "))
+    }
+}
+
+fn command_path(path: &[&str]) -> String {
+    if path.is_empty() {
+        "ralphus".to_string()
+    } else {
+        format!("ralphus {}", path.join(" "))
+    }
+}
+
+#[must_use]
+pub fn command_help(path: &[&str]) -> Option<String> {
+    let node = find_node(&ROOT, path)?;
+    let full = command_path(path);
+    let mut out = String::new();
+    out.push_str(&format!("{full} -- {}\n", node.description));
+    out.push_str("USAGE:\n    ");
+    out.push_str(&full);
+    if !node.positionals.is_empty() {
+        out.push(' ');
+        out.push_str(&node.positionals.join(" "));
+    }
+    if !node.options.is_empty() {
+        out.push_str(" [OPTIONS]");
+    }
+    if !node.children.is_empty() {
+        out.push_str(" <SUBCOMMAND> [ARGS...]");
+    }
+    out.push('\n');
+    if !node.options.is_empty() {
+        let mut opts: Vec<&str> = node.options.to_vec();
+        opts.sort_unstable();
+        out.push_str("\nOPTIONS:\n");
+        for opt in opts {
+            out.push_str(&format!("    {opt}\n"));
+        }
+    }
+    if !node.children.is_empty() {
+        let mut children: Vec<&HelpNode> = node.children.iter().collect();
+        children.sort_by_key(|child| child.name);
+        out.push_str("\nSUBCOMMANDS:\n");
+        for child in children {
+            out.push_str(&format!(
+                "    {:<32} {}\n",
+                signature(child),
+                child.description
+            ));
+        }
+    }
+    Some(out.trim_end().to_string())
 }
 
 /// The full alphabetized, indented help-map tree, as one string -- ports
@@ -1472,7 +1573,7 @@ mod tests {
     fn real_tree_covers_top_level_groups_and_excludes_hidden_commands() {
         let names: Vec<&str> = ROOT.children.iter().map(|c| c.name).collect();
         assert!(names.contains(&"review"));
-        assert!(names.contains(&"run"));
+        assert!(names.contains(&"squad"));
         assert!(names.contains(&"task"));
         assert!(names.contains(&"cartographer"));
         assert!(names.contains(&"completion"));
@@ -1547,5 +1648,39 @@ mod tests {
         let health = check.children.iter().find(|c| c.name == "health").unwrap();
         assert!(health.subagent);
         assert!(health.read_only_safe);
+    }
+
+    #[test]
+    fn command_help_lists_root_subcommands_alphabetically() {
+        let text = command_help(&[]).expect("root help");
+        assert!(text.contains("USAGE:\n    ralphus [OPTIONS] <SUBCOMMAND> [ARGS...]"));
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("    "))
+            .collect();
+        let queue = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("queue"))
+            .expect("queue present");
+        let review = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("review"))
+            .expect("review present");
+        let show = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("show"))
+            .expect("show present");
+        assert!(queue < review);
+        assert!(review < show);
+    }
+
+    #[test]
+    fn command_help_for_nested_group_lists_immediate_children() {
+        let text = command_help(&["review", "pr"]).expect("review pr help");
+        assert!(text.contains("ralphus review pr --"));
+        assert!(text.contains("SUBCOMMANDS:"));
+        assert!(text.contains("comments"));
+        assert!(text.contains("pull-feedback"));
+        assert!(text.contains("submit"));
     }
 }

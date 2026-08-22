@@ -3,16 +3,16 @@
 The scheduler always runs whatever is dependency-ready, up to the
 concurrency limit — but when several things are ready at once, *which one
 goes first* is a priority call ralphus can't make for you. The Queue tab is
-where you make it: drag ready-to-run sessions and verify steps into the
+where you make it: drag ready-to-run cells and proof steps into the
 order you want them picked up. Order here is a best-effort hint honored the
 next time a compute slot frees, not a hard guarantee.
 
 ## The list
 
-![Queue tab showing a run/task hierarchy with ready, blocked, excluded, and running readiness badges](../screenshots/queue-overview.png)
+![Queue tab showing a squad/task hierarchy with ready, blocked, excluded, and running readiness badges](../screenshots/queue-overview.png)
 
-Each row is one **session**, **session-level verify step**, or **task-level
-verify step**, grouped under collapsible run and task headers. The badge on
+Each row is one **cell**, **cell-level proof step**, or **task-level
+proof step**, grouped under collapsible squad and task headers. The badge on
 the right is its **readiness**:
 
 - **ready** — nothing is stopping it; it'll be picked up as soon as a slot
@@ -28,7 +28,7 @@ the right is its **readiness**:
 ## Dragging, and the lazy-anchoring rule
 
 You can drag any ready/blocked/excluded row (not a running one) to reprioritize
-it. But a raw reorder could easily produce nonsense — a session ranked ahead
+it. But a raw reorder could easily produce nonsense — a cell ranked ahead
 of the very dependency it needs. Instead of rejecting the drop or forcing you
 to move both rows yourself, the Queue applies a **lazy, anchored repair**:
 the item you dragged lands exactly where you dropped it (the anchor); only

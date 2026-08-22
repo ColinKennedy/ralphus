@@ -40,7 +40,7 @@ pub enum ProjectCommand {
 pub fn parse(args: &[String]) -> ProjectCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ProjectCommand::Help,
+        None | Some("help" | "--help" | "-h") => ProjectCommand::Help,
         Some("git") => match parse_git(&mut scanner) {
             Ok(cmd) => cmd,
             Err(e) => ProjectCommand::UsageError(e.0),
@@ -79,7 +79,10 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
     let client = opts.client();
     match cmd {
         ProjectCommand::Help => {
-            println!("ralphus project <git|list|get>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["project"]).expect("project help exists")
+            );
             0
         }
         ProjectCommand::UsageError(m) => {
@@ -91,11 +94,12 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
             name,
             description,
         } => {
-            // No `~`/relative-path expansion here (parity with this crate's
-            // existing `cmd_initialize_git` in misc.rs, which makes the same
-            // simplification against Python's `Path.expanduser().resolve()`).
-            let target = std::path::PathBuf::from(&path);
-            let target = target.canonicalize().unwrap_or(target);
+            // A leading `~` is expanded (see `ralphus_core::expand_home`); no
+            // other relative-path expansion is done, matching this crate's
+            // `cmd_initialize_git` in misc.rs.
+            let target = ralphus_core::expand_home(&path);
+            let target =
+                ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
             let target_str = target.to_string_lossy().to_string();
             match client.register_project(&name, &target_str, &description, "git") {
                 Ok(_) => {

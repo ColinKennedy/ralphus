@@ -12,11 +12,11 @@ use std::path::Path;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Result, Store, StoreError, VerifyView};
+use crate::store::{ProofView, Result, Store, StoreError};
 
-/// Return type of [`Store::verify_steps_for_review_branch`]:
-/// `(session_verifies, task_verifies, session_system_prompt)`.
-pub type BranchVerifyInfo = (Vec<VerifyView>, Vec<VerifyView>, Option<String>);
+/// Return type of [`Store::proof_steps_for_review_branch`]:
+/// `(cell_proofs, task_proofs, cell_system_prompt)`.
+pub type BranchProofInfo = (Vec<ProofView>, Vec<ProofView>, Option<String>);
 
 /// A named, defaulted input referenced by a [`GuardianCheck`]'s
 /// `command`/`cleanup_command` as a `{name}` placeholder (RAL-164), e.g. a
@@ -32,6 +32,51 @@ pub struct CheckInput {
     /// agent, via "set it for me") submits a different one.
     #[serde(default)]
     pub default: String,
+    /// Declared value type (RAL-221), enforced against every
+    /// submitted/stored value for this input before it is substituted into
+    /// a check's `command`/`cleanup_command` -- see
+    /// `server::check_input_type_failures`. Defaults to `String`
+    /// (unconstrained) so an input declared before this field existed keeps
+    /// behaving exactly as before.
+    #[serde(default)]
+    pub r#type: CheckInputType,
+}
+
+/// Declared value type for a [`CheckInput`] (RAL-221). A submitted or stored
+/// value that doesn't match its input's declared type is rejected before
+/// substitution -- the fix for a command-injection path where a value like
+/// `1.0 & calc.exe & rem` submitted for a should-be-numeric input flowed
+/// straight into a `cmd /K` spawn unchecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckInputType {
+    /// No constraint on the value's shape -- the default, matching every
+    /// input declared before this field existed.
+    #[default]
+    String,
+    /// Value must parse as a base-10 signed integer (surrounding whitespace
+    /// tolerated, nothing else -- in particular no shell metacharacters).
+    Int,
+}
+
+impl CheckInputType {
+    /// Whether `value` is well-formed for this declared type.
+    #[must_use]
+    pub fn accepts(self, value: &str) -> bool {
+        match self {
+            Self::String => true,
+            Self::Int => value.trim().parse::<i64>().is_ok(),
+        }
+    }
+
+    /// Human-readable name for error messages.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Int => "int",
+        }
+    }
 }
 
 /// Status of a "set it for me" AI resolution for one named [`CheckInput`]
@@ -126,21 +171,29 @@ impl GuardianStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStatus {
-    /// Waiting for linked task sessions to complete.
+    /// Waiting for linked task cells to complete.
     Pending,
-    /// All linked task sessions are done; branch is waiting for the rebase to start.
+    /// All linked task cells are done; branch is waiting for the rebase to start.
     Ready,
     /// Being rebased onto the stack.
     InProgress,
+    /// Reviewer feedback is being applied: the resolver agent is editing the
+    /// worktree in response to `review feedback` (and, once it finishes, the
+    /// target-branch proof/commit/push steps run). Transient — set right
+    /// before the resolver agent runs and cleared to [`Self::Done`] or
+    /// [`Self::Failed`] once the whole feedback pass for this branch
+    /// finishes. Distinct from [`Self::InProgress`], which is a stack
+    /// rebase, not a feedback revision.
+    Actioning,
     /// Rebased cleanly.
     Done,
     /// All conflict markers for this branch have been resolved and committed,
-    /// but the dedicated final-verification agent call (RAL-149) has not yet
+    /// but the dedicated final-proof agent call (RAL-149) has not yet
     /// run. Transient: set right before that call and cleared (to
     /// [`Self::ConflictResolved`]) once it completes, pass or fail.
-    VerifyPending,
+    ProofPending,
     /// Rebased after resolving conflicts (and, when the fix pass hit
-    /// conflicts, after the RAL-149 final-verification call has run).
+    /// conflicts, after the RAL-149 final-proof call has run).
     ConflictResolved,
     /// Failed to rebase.
     Failed,
@@ -154,8 +207,9 @@ impl MergeStatus {
             Self::Pending => "pending",
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
+            Self::Actioning => "actioning",
             Self::Done => "done",
-            Self::VerifyPending => "verify_pending",
+            Self::ProofPending => "proof_pending",
             Self::ConflictResolved => "conflict_resolved",
             Self::Failed => "failed",
         }
@@ -176,7 +230,7 @@ pub(crate) fn branch_env_to_json(m: &BTreeMap<String, Option<String>>) -> String
 }
 
 /// Apply a review branch's own overrides on top of the environment it
-/// inherited from its source session (RAL-191): `Some(v)` replaces the
+/// inherited from its source cell (RAL-191): `Some(v)` replaces the
 /// inherited value (or adds a new one), `None` removes the key entirely.
 #[must_use]
 pub(crate) fn apply_branch_env(
@@ -206,7 +260,7 @@ pub(crate) fn apply_branch_env(
 /// This is the shared "last worktree in the branch chain" baseline both
 /// [`GuardianView::build_env`] and [`GuardianView::manual_checks_env`]
 /// layer their own section-specific overrides on top of -- the combined
-/// worktree has no upstream task session of its own to inherit from, so it
+/// worktree has no upstream task cell of its own to inherit from, so it
 /// borrows this instead.
 #[must_use]
 pub(crate) fn combined_env_from_branches(branches: &[BranchView]) -> BTreeMap<String, String> {
@@ -258,36 +312,36 @@ pub struct BranchView {
     /// The flag is kept separate from the `failed` status so the board can say
     /// *why* it failed — `board.html`'s `⌀ empty` badge takes precedence over
     /// the generic conflict badge, since the fix here is to go look at the
-    /// task's session rather than at a diff.
+    /// task's cell rather than at a diff.
     pub is_empty: bool,
-    /// The machine the session that produced this branch ran on (RAL-185).
+    /// The machine the cell that produced this branch ran on (RAL-185).
     /// `None` means the daemon's own host — every pre-RAL-185 branch, and any
     /// branch whose work was done locally.
     ///
     /// When this is set, the branch's commits live on *that* machine, so the
     /// review must fetch them from the project's shared remote before it can
-    /// stack them (see `guardian_merge::fetch_branch_for_remote_session`).
-    pub source_session_machine: Option<String>,
+    /// stack them (see `guardian_merge::fetch_branch_for_remote_cell`).
+    pub source_cell_machine: Option<String>,
     /// Whether this branch is included in the rebase stack (RAL-43). Disabled
     /// branches are skipped during merge but remain visible in the branch list.
     pub enabled: bool,
     /// Which git project root this branch lives in (RAL-29). `None` means the
     /// guardian's primary `git_root` (backward compatible with single-project).
     pub project: Option<String>,
-    /// State of the session whose work lives in this branch's worktree (RAL-69).
-    /// `None` when no session has `review_branch = branch` (branch was never
+    /// State of the cell whose work lives in this branch's worktree (RAL-69).
+    /// `None` when no cell has `review_branch = branch` (branch was never
     /// submitted or was added manually). Used to determine force-start readiness.
-    pub source_session_state: Option<String>,
-    /// `true` when this branch is disabled, all its source sessions are `done`,
+    pub source_cell_state: Option<String>,
+    /// `true` when this branch is disabled, all its source cells are `done`,
     /// and the "can re-enable" notification has not been dismissed (RAL-69).
     /// TODO(RAL-73): wire to the dedicated `ready` signal when that lands.
     pub can_reenable: bool,
-    /// Run ID of the most recent session submitted for this branch (for board navigation).
-    pub source_run_id: Option<String>,
-    /// Task index within the run for the source session.
+    /// Squad ID of the most recent cell submitted for this branch (for board navigation).
+    pub source_squad_id: Option<String>,
+    /// Task index within the squad for the source cell.
     pub source_task_idx: Option<i64>,
-    /// Session index within the task for the source session.
-    pub source_session_idx: Option<i64>,
+    /// Cell index within the task for the source cell.
+    pub source_cell_idx: Option<i64>,
     /// agent_session_id from the conflict-resolver run on this branch.
     /// Only populated when resolver_agent is "claude-code". Enables terminal resume.
     pub resolver_agent_session_id: Option<String>,
@@ -296,8 +350,8 @@ pub struct BranchView {
     /// `branchBadge` (CLI_PARITY_PLAN.local.md Phase 5).
     pub ready: bool,
     /// Which terminal-resume modes are available for this branch's conflict
-    /// resolver: `"readonly"`/`"open"` once a resolver session exists, or
-    /// `"worktree"` for a CLI agent with a worktree but no session yet. Empty
+    /// resolver: `"readonly"`/`"open"` once a resolver cell exists, or
+    /// `"worktree"` for a CLI agent with a worktree but no cell yet. Empty
     /// when none apply. Ported from board.html's `resolverTerminalBtns`
     /// (button *labels*/tooltips are UI-only and not reproduced here).
     pub terminal_modes: Vec<&'static str>,
@@ -315,19 +369,19 @@ pub struct BranchView {
     /// `rebase-merge/git-rebase-todo`). See [`Self::rebase_commands_done`].
     pub rebase_commands_total: Option<i64>,
     /// RAL-191: this branch's *own* environment-variable overrides, layered on
-    /// top of whatever its source session resolves to. A `Some(value)` entry
+    /// top of whatever its source cell resolves to. A `Some(value)` entry
     /// overrides the inherited value; a `None` entry is a tombstone meaning
     /// "remove this inherited variable entirely". A key absent from this map
     /// is simply inherited. Set via
     /// `POST /api/guardians/{id}/branches/{bid}/env`.
     pub env_overrides: BTreeMap<String, Option<String>>,
     /// RAL-191: the *effective* environment this branch's review worktree runs
-    /// under — the source session's resolved overrides with this branch's own
+    /// under — the source cell's resolved overrides with this branch's own
     /// [`Self::env_overrides`] applied (values replaced, tombstones removed).
     /// This is exactly what the conflict resolver, feedback routing, and check
     /// gates are spawned with.
     pub resolved_env: BTreeMap<String, String>,
-    /// RAL-191: the environment inherited from the source session *before*
+    /// RAL-191: the environment inherited from the source cell *before*
     /// this branch's own overrides are applied. Lets the board show which keys
     /// are inherited, overridden, or tombstoned without recomputing the merge.
     pub inherited_env: BTreeMap<String, String>,
@@ -372,8 +426,8 @@ pub struct GuardianView {
     /// Optional detail (e.g. merge failure reason, a check-gate opt-out note,
     /// or the RAL-101 auto-build note recorded on reaching `in_review`).
     pub detail: Option<String>,
-    /// The run this review was derived from, if any (manual reviews have none).
-    pub run_id: Option<String>,
+    /// The squad this review was derived from, if any (manual reviews have none).
+    pub squad_id: Option<String>,
     /// The stable, read-only combined review worktree (head of the last branch).
     pub combined_worktree: Option<String>,
     /// Total conflict marker blocks detected across all files when last resolving.
@@ -389,7 +443,7 @@ pub struct GuardianView {
     pub skip_auto_build: bool,
     /// When true, the quality-bar system prompt normally folded into each
     /// per-branch conflict-resolution agent call is omitted (RAL-110) — the
-    /// resolver is not told to run task/session verify steps while fixing
+    /// resolver is not told to run task/cell proof steps while fixing
     /// conflicts. Independent of [`Self::skip_auto_build`].
     pub skip_worktree_checks: bool,
     /// The machine this review's worktrees, rebase and conflict resolution run
@@ -472,28 +526,28 @@ pub struct GuardianView {
     /// action. Data-model only for v1 -- no background poller reads this flag
     /// yet; it exists so a future automatic mode has somewhere to persist to.
     pub auto_pr_feedback: bool,
-    /// RAL-168: this review's own Verify-scope override -- `"each_branch"`,
+    /// RAL-168: this review's own Proof-scope override -- `"each_branch"`,
     /// `"final_branch"`, or `"nothing"`. `None` means "inherit the
-    /// project-level default" (`.ralphus.toml [review] verify_scope`,
-    /// resolved into [`Self::effective_verify_scope`] at hydration time).
-    /// Governs whether/how often the dedicated LLM-based final-verify call
-    /// ([`crate::guardian_merge::run_final_verify`]) fires -- replaces the
+    /// project-level default" (`.ralphus.toml [review] proof_scope`,
+    /// resolved into [`Self::effective_proof_scope`] at hydration time).
+    /// Governs whether/how often the dedicated LLM-based final-proof call
+    /// ([`crate::guardian_merge::run_final_proof`]) fires -- replaces the
     /// old `verify_mid_resolution` flag outright, not layered alongside it.
-    pub verify_scope: Option<String>,
+    pub proof_scope: Option<String>,
     /// RAL-168: this review's own override for whether `"each_branch"` scope
-    /// additionally skips verification on branches whose rebase applied
+    /// additionally skips proving on branches whose rebase applied
     /// cleanly with no conflict (an "auto-clean" branch). `None` means
     /// "inherit the project-level default".
-    pub verify_skip_auto_clean: Option<bool>,
-    /// RAL-168: [`Self::verify_scope`] resolved against the project-level
-    /// `.ralphus.toml [review] verify_scope` default -- always one of
+    pub proof_skip_auto_clean: Option<bool>,
+    /// RAL-168: [`Self::proof_scope`] resolved against the project-level
+    /// `.ralphus.toml [review] proof_scope` default -- always one of
     /// `"each_branch"`/`"final_branch"`/`"nothing"`, never empty. This is
     /// what the merge engine actually gates on; the raw field above is only
     /// for the UI to distinguish "explicit override" from "inherited".
-    pub effective_verify_scope: String,
-    /// RAL-168: [`Self::verify_skip_auto_clean`] resolved against the
+    pub effective_proof_scope: String,
+    /// RAL-168: [`Self::proof_skip_auto_clean`] resolved against the
     /// project-level default.
-    pub effective_verify_skip_auto_clean: bool,
+    pub effective_proof_skip_auto_clean: bool,
     /// `true` once the review is built and awaiting human approval
     /// (`status == "in_review"`). Ported from board.html's "ready to act on"
     /// banner condition (`renderReadyBanner`, minus its client-only dismissed
@@ -556,8 +610,8 @@ pub struct GuardianView {
     /// this attempt.
     pub merge_attempt: i64,
     /// RAL-193: input tokens spent on this review's own conflict-resolution
-    /// and verifier agent calls during the current merge attempt only --
-    /// excludes the tasks/sessions that fed into the review.
+    /// and prover agent calls during the current merge attempt only --
+    /// excludes the tasks/cells that fed into the review.
     pub attempt_tokens_in: i64,
     /// RAL-193: output tokens, current merge attempt only. See
     /// [`Self::attempt_tokens_in`].
@@ -566,7 +620,7 @@ pub struct GuardianView {
     /// [`Self::attempt_tokens_in`].
     pub attempt_cost_usd: f64,
     /// RAL-193: input tokens spent on this review's own conflict-resolution
-    /// and verifier agent calls, cumulative across every rebase/re-merge
+    /// and prover agent calls, cumulative across every rebase/re-merge
     /// attempt this review has gone through.
     pub cumulative_tokens_in: i64,
     /// RAL-193: output tokens, cumulative across every attempt. See
@@ -619,11 +673,11 @@ impl MergeProgress {
     }
 }
 
-/// Session state priority for picking the "worst" state among several linked
-/// sessions, worst-first order (NOT a numeric scale -- first match in this
-/// list wins). Ported verbatim from board.html's `SESSION_STATE_RANK`
+/// Cell state priority for picking the "worst" state among several linked
+/// cells, worst-first order (NOT a numeric scale -- first match in this
+/// list wins). Ported verbatim from board.html's `CELL_STATE_RANK`
 /// (CLI_PARITY_PLAN.local.md Phase 5).
-pub const SESSION_STATE_RANK: [&str; 6] = [
+pub const CELL_STATE_RANK: [&str; 6] = [
     "running",
     "failed",
     "pending",
@@ -632,12 +686,12 @@ pub const SESSION_STATE_RANK: [&str; 6] = [
     "done",
 ];
 
-/// The first state in [`SESSION_STATE_RANK`] present in `states`, or `states[0]`
-/// if none match (mirrors the JS `SESSION_STATE_RANK.find(...) || sessions[0].state`
+/// The first state in [`CELL_STATE_RANK`] present in `states`, or `states[0]`
+/// if none match (mirrors the JS `CELL_STATE_RANK.find(...) || cells[0].state`
 /// fallback). `None` when `states` is empty.
 #[must_use]
-pub fn worst_session_state<'a>(states: &[&'a str]) -> Option<&'a str> {
-    for rank in SESSION_STATE_RANK {
+pub fn worst_cell_state<'a>(states: &[&'a str]) -> Option<&'a str> {
+    for rank in CELL_STATE_RANK {
         if let Some(s) = states.iter().find(|s| **s == rank) {
             return Some(*s);
         }
@@ -654,11 +708,15 @@ pub fn terminal_modes_for(
     resolver_agent: Option<&str>,
     has_session_id: bool,
     has_worktree: bool,
+    cwd: &Path,
 ) -> Vec<&'static str> {
     if has_session_id {
         return vec!["readonly", "open"];
     }
-    let agent = resolver_agent.unwrap_or("ollama");
+    let default_agent = crate::config::resolve(cwd)
+        .default_resolver_agent()
+        .to_string();
+    let agent = resolver_agent.unwrap_or(&default_agent);
     let is_cli_agent = matches!(agent, "claude-code" | "codex" | "codex-cli");
     if is_cli_agent && has_worktree {
         return vec!["worktree"];
@@ -683,21 +741,21 @@ pub struct OrderedBranch {
 impl Store {
     /// Create a guardian in the `Collecting` state; returns its id.
     pub fn create_guardian(&self, name: &str, base_branch: &str, git_root: &str) -> Result<String> {
-        self.create_guardian_for_run(name, base_branch, git_root, None)
+        self.create_guardian_for_squad(name, base_branch, git_root, None)
     }
 
-    /// Create a guardian, optionally tagged with the run it was derived from.
-    pub fn create_guardian_for_run(
+    /// Create a guardian, optionally tagged with the squad it was derived from.
+    pub fn create_guardian_for_squad(
         &self,
         name: &str,
         base_branch: &str,
         git_root: &str,
-        run_id: Option<&str>,
+        squad_id: Option<&str>,
     ) -> Result<String> {
-        self.create_guardian_keyed(name, base_branch, git_root, run_id, None)
+        self.create_guardian_keyed(name, base_branch, git_root, squad_id, None)
     }
 
-    /// Like [`Store::create_guardian_for_run`] but also stores a stable
+    /// Like [`Store::create_guardian_for_squad`] but also stores a stable
     /// `review_key` (from a `ralphus:new-review/<key>` link id) so later
     /// submissions can find this guardian and append their branches to it.
     pub fn create_guardian_keyed(
@@ -705,15 +763,15 @@ impl Store {
         name: &str,
         base_branch: &str,
         git_root: &str,
-        run_id: Option<&str>,
+        squad_id: Option<&str>,
         review_key: Option<&str>,
     ) -> Result<String> {
         let id = self.next_id("guardian_seq", "guardian")?;
         let now = crate::store::now_ms();
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, run_id, review_key, created_at_ms, updated_at_ms)
+            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms)
              VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?)",
-            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), run_id, review_key, now, now],
+            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now],
         )?;
         Ok(id)
     }
@@ -767,9 +825,9 @@ impl Store {
                 source: "recovery",
                 message: "guardian merge interrupted: merging → merge_failed (daemon restart)",
                 scope: Some("guardian"),
-                run_id: None,
+                squad_id: None,
                 guardian_id: Some(id),
-                session_id: None,
+                cell_id: None,
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
@@ -880,56 +938,56 @@ impl Store {
         Ok(pairs)
     }
 
-    /// Ids of the guardians derived from a run, oldest first.
-    pub fn guardians_for_run(&self, run_id: &str) -> Result<Vec<String>> {
+    /// Ids of the guardians derived from a squad, oldest first.
+    pub fn guardians_for_squad(&self, squad_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM guardians WHERE run_id=? ORDER BY created_at_ms, id")?;
+            .prepare("SELECT id FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id")?;
         let ids = stmt
-            .query_map(params![run_id], |r| r.get::<_, String>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(ids)
     }
 
     /// Ids of collecting guardians that have at least one branch whose name
-    /// matches a session `review_branch` in the given run. This catches linked
-    /// reviews whose guardian `run_id` points to an earlier submission (because
-    /// the guardian was found — not created — when the newer run was submitted).
-    pub fn collecting_guardians_for_sessions(&self, run_id: &str) -> Result<Vec<String>> {
+    /// matches a cell `review_branch` in the given squad. This catches linked
+    /// reviews whose guardian `squad_id` points to an earlier submission (because
+    /// the guardian was found — not created — when the newer squad was submitted).
+    pub fn collecting_guardians_for_cells(&self, squad_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT g.id FROM guardians g
              JOIN guardian_branches gb ON g.id = gb.guardian_id
-             JOIN sessions s ON s.review_branch = gb.branch
-             WHERE s.run_id = ? AND g.status = 'collecting'
+             JOIN cells s ON s.review_branch = gb.branch
+             WHERE s.squad_id = ? AND g.status = 'collecting'
              ORDER BY g.created_at_ms, g.id",
         )?;
         let ids = stmt
-            .query_map(params![run_id], |r| r.get::<_, String>(0))?
+            .query_map(params![squad_id], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(ids)
     }
 
     /// Ids of collecting guardians that are ready to start: every enabled branch
-    /// that has a contributing session (matched by `sessions.review_branch =
+    /// that has a contributing cell (matched by `cells.review_branch =
     /// guardian_branches.branch`) is in the `done` state. Guardians with no
-    /// session-linked branches are excluded (they haven't been triggered yet).
+    /// cell-linked branches are excluded (they haven't been triggered yet).
     /// Used at daemon startup to recover guardians that were left `collecting`
-    /// because the daemon was restarted after the run completed.
+    /// because the daemon was restarted after the squad completed.
     ///
-    /// This already requires ALL matching sessions done, not just one — which,
+    /// This already requires ALL matching cells done, not just one — which,
     /// since RAL-159, includes implicit worktree-sharing siblings alongside the
-    /// explicitly review-linked session (see `mark_ready_branches_with_done_sessions`).
+    /// explicitly review-linked cell (see `mark_ready_branches_with_done_cells`).
     pub fn collecting_guardians_ready(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM guardians WHERE status = 'collecting'
              AND EXISTS (
                  SELECT 1 FROM guardian_branches gb
-                 JOIN sessions s ON s.review_branch = gb.branch
+                 JOIN cells s ON s.review_branch = gb.branch
                  WHERE gb.guardian_id = guardians.id AND gb.enabled = 1
              )
              AND NOT EXISTS (
                  SELECT 1 FROM guardian_branches gb
-                 JOIN sessions s ON s.review_branch = gb.branch
+                 JOIN cells s ON s.review_branch = gb.branch
                  WHERE gb.guardian_id = guardians.id AND gb.enabled = 1
                    AND s.state != 'done'
              )
@@ -943,10 +1001,10 @@ impl Store {
 
     /// Ids of guardians that have already left `collecting` (`in_review` or
     /// `merge_failed`) but still have an enabled branch stuck at `pending` whose
-    /// contributing session has since finished. This is the straggler case: a
-    /// linked review (RAL-97/98) whose branches arrive from separate runs, where
-    /// the guardian moved on after its first run's task finished, before the
-    /// second run's task — and therefore `collecting_guardians_for_sessions`,
+    /// contributing cell has since finished. This is the straggler case: a
+    /// linked review (RAL-97/98) whose branches arrive from separate squads, where
+    /// the guardian moved on after its first squad's task finished, before the
+    /// second squad's task — and therefore `collecting_guardians_for_cells`,
     /// which only matches `status = 'collecting'` — ever saw it. Picked up by
     /// [`crate::guardian_merge::review_maintenance`]'s periodic sweep so the
     /// branch is not stuck `pending` forever.
@@ -954,7 +1012,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT g.id FROM guardians g
              JOIN guardian_branches gb ON g.id = gb.guardian_id
-             JOIN sessions s ON s.review_branch = gb.branch
+             JOIN cells s ON s.review_branch = gb.branch
              WHERE g.status IN ('in_review','merge_failed')
                AND gb.enabled = 1 AND gb.merge_status = 'pending' AND s.state = 'done'
              ORDER BY g.created_at_ms, g.id",
@@ -966,31 +1024,31 @@ impl Store {
     }
 
     /// Promote a guardian's enabled `pending` branches to `ready`, but only those
-    /// whose contributing session(s) have ALL actually finished — unlike
+    /// whose contributing cell(s) have ALL actually finished — unlike
     /// [`Self::mark_guardian_branches_ready`], which blindly promotes every
     /// pending branch and is only safe to call once the caller has separately
     /// verified every blocking task is done. Used for the straggler sweep, where
     /// a guardian may still have other, genuinely-unfinished pending branches
     /// that must not be promoted early.
     ///
-    /// RAL-159: a branch's `sessions.review_branch` set can now contain more
-    /// than one row — an explicitly review-linked session plus any sibling
-    /// sessions that merely share its git worktree (e.g. a nested cwd
+    /// RAL-159: a branch's `cells.review_branch` set can now contain more
+    /// than one row — an explicitly review-linked cell plus any sibling
+    /// cells that merely share its git worktree (e.g. a nested cwd
     /// subfolder), attached by `reviews::derive_reviews`. Requiring `NOT
     /// EXISTS` a non-done contributor (rather than the old `EXISTS` a done
     /// one) means the branch is only marked `ready` once every one of them —
     /// explicit or implicit — has finished, not just the first.
-    pub fn mark_ready_branches_with_done_sessions(&self, guardian_id: &str) -> Result<usize> {
+    pub fn mark_ready_branches_with_done_cells(&self, guardian_id: &str) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE guardian_branches
              SET merge_status='ready'
              WHERE guardian_id=? AND enabled=1 AND merge_status='pending'
                AND EXISTS (
-                   SELECT 1 FROM sessions s
+                   SELECT 1 FROM cells s
                    WHERE s.review_branch = guardian_branches.branch
                )
                AND NOT EXISTS (
-                   SELECT 1 FROM sessions s
+                   SELECT 1 FROM cells s
                    WHERE s.review_branch = guardian_branches.branch AND s.state != 'done'
                )",
             params![guardian_id],
@@ -998,15 +1056,15 @@ impl Store {
         Ok(n)
     }
 
-    /// The `cwd` of the most recent session that contributed to `branch` (matched
-    /// via `sessions.review_branch`), if any (RAL-103). Used to compute a
+    /// The `cwd` of the most recent cell that contributed to `branch` (matched
+    /// via `cells.review_branch`), if any (RAL-103). Used to compute a
     /// preliminary, git-log-only change summary from the task's own worktree
     /// before any review worktree has been built for that branch.
-    pub fn session_cwd_for_branch(&self, branch: &str) -> Result<Option<String>> {
+    pub fn cell_cwd_for_branch(&self, branch: &str) -> Result<Option<String>> {
         let cwd: Option<Option<String>> = self
             .conn
             .query_row(
-                "SELECT cwd FROM sessions WHERE review_branch=? ORDER BY rowid DESC LIMIT 1",
+                "SELECT cwd FROM cells WHERE review_branch=? ORDER BY rowid DESC LIMIT 1",
                 params![branch],
                 |r| r.get(0),
             )
@@ -1415,7 +1473,7 @@ impl Store {
     /// Set this review's own USD spend cap (RAL-193), from the top-level
     /// `[[review]]` block's `maximum_budget_usd`. Enforced by the guardian
     /// merge machinery against the cumulative sum of [`Self::guardian_cost_total`]
-    /// the same way a task/session cap is enforced against a live `cost_usd`
+    /// the same way a task/cell cap is enforced against a live `cost_usd`
     /// (RAL-161). `None` means no cap.
     ///
     /// # Errors
@@ -1434,7 +1492,7 @@ impl Store {
 
     /// This review's own USD spend cap (RAL-193), a lightweight single-column
     /// read for the merge engine's per-call budget check -- avoids paying for
-    /// a full [`Self::get_guardian`] hydration on every resolver/verifier call.
+    /// a full [`Self::get_guardian`] hydration on every resolver/prover call.
     ///
     /// # Errors
     /// [`StoreError::NotFound`] when no such guardian exists.
@@ -1491,10 +1549,10 @@ impl Store {
     }
 
     /// Record one guardian LLM call's cost as a line item (RAL-193) --
-    /// conflict resolution, verification, chat, feedback, summary
+    /// conflict resolution, proving, chat, feedback, summary
     /// generation, etc. `branch_id` is the stable per-branch id
     /// (`guardian_branches.id`) when the call is scoped to one stacked
-    /// branch, `None` for a review-wide call (chat, combined final verify).
+    /// branch, `None` for a review-wide call (chat, combined final proof).
     #[allow(clippy::too_many_arguments)]
     pub fn record_guardian_cost(
         &self,
@@ -1615,12 +1673,12 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Set this review's own Verify-scope override (RAL-168): one of
+    /// Set this review's own Proof-scope override (RAL-168): one of
     /// `"each_branch"`/`"final_branch"`/`"nothing"`. `None` resets it to
     /// "inherit the project-level default".
-    pub fn set_guardian_verify_scope(&self, id: &str, scope: Option<&str>) -> Result<()> {
+    pub fn set_guardian_proof_scope(&self, id: &str, scope: Option<&str>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardians SET verify_scope=?, updated_at_ms=? WHERE id=?",
+            "UPDATE guardians SET proof_scope=?, updated_at_ms=? WHERE id=?",
             params![scope, crate::store::now_ms(), id],
         )?;
         if n == 0 {
@@ -1633,9 +1691,9 @@ impl Store {
     /// Set this review's own override for whether `"each_branch"` scope skips
     /// auto-clean branches (RAL-168). `None` resets it to "inherit the
     /// project-level default".
-    pub fn set_guardian_verify_skip_auto_clean(&self, id: &str, skip: Option<bool>) -> Result<()> {
+    pub fn set_guardian_proof_skip_auto_clean(&self, id: &str, skip: Option<bool>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardians SET verify_skip_auto_clean=?, updated_at_ms=? WHERE id=?",
+            "UPDATE guardians SET proof_skip_auto_clean=?, updated_at_ms=? WHERE id=?",
             params![skip.map(i64::from), crate::store::now_ms(), id],
         )?;
         if n == 0 {
@@ -1673,42 +1731,42 @@ impl Store {
         Ok(crate::store::from_json(&s.ok_or(StoreError::NotFound)?))
     }
 
-    /// Returns `(session_verifies, task_verifies, session_system_prompt)` for the
-    /// session whose `review_branch` matches `branch` in this guardian's linked run.
-    /// Returns `None` when the guardian has no `run_id` or no session with a matching
+    /// Returns `(cell_proofs, task_proofs, cell_system_prompt)` for the
+    /// cell whose `review_branch` matches `branch` in this guardian's linked squad.
+    /// Returns `None` when the guardian has no `squad_id` or no cell with a matching
     /// `review_branch` exists (e.g. a manually-created review with no task linkage).
-    pub fn verify_steps_for_review_branch(
+    pub fn proof_steps_for_review_branch(
         &self,
         guardian_id: &str,
         branch: &str,
-    ) -> Result<Option<BranchVerifyInfo>> {
-        let run_id: Option<String> = self
+    ) -> Result<Option<BranchProofInfo>> {
+        let squad_id: Option<String> = self
             .conn
             .query_row(
-                "SELECT run_id FROM guardians WHERE id=?",
+                "SELECT squad_id FROM guardians WHERE id=?",
                 params![guardian_id],
                 |r| r.get(0),
             )
             .optional()?
             .flatten();
-        let Some(run_id) = run_id else {
+        let Some(squad_id) = squad_id else {
             return Ok(None);
         };
         let row: Option<(i64, i64, Option<String>)> = self
             .conn
             .query_row(
                 "SELECT task_idx, idx, system_prompt \
-                 FROM sessions WHERE run_id=? AND review_branch=?",
-                params![run_id, branch],
+                 FROM cells WHERE squad_id=? AND review_branch=?",
+                params![squad_id, branch],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((task_idx, session_idx, system_prompt)) = row else {
+        let Some((task_idx, cell_idx, system_prompt)) = row else {
             return Ok(None);
         };
-        let session_verifies = self.verifies_for(&run_id, task_idx, "session", session_idx)?;
-        let task_verifies = self.verifies_for(&run_id, task_idx, "task", -1)?;
-        Ok(Some((session_verifies, task_verifies, system_prompt)))
+        let cell_proofs = self.proofs_for(&squad_id, task_idx, "cell", cell_idx)?;
+        let task_proofs = self.proofs_for(&squad_id, task_idx, "task", -1)?;
+        Ok(Some((cell_proofs, task_proofs, system_prompt)))
     }
 
     /// Update the base branch for a review and clear the recorded base commit so the
@@ -1876,7 +1934,7 @@ impl Store {
     }
 
     /// Retrieve the review worktree path for a branch (for opening a plain terminal
-    /// when no session ID is available yet).
+    /// when no cell ID is available yet).
     pub fn get_branch_worktree(
         &self,
         guardian_id: &str,
@@ -1896,8 +1954,8 @@ impl Store {
     /// Fetch a branch's recorded conflict-resolver Claude Code session id,
     /// for its "Open Agent" terminal action (resuming the real `claude` CLI
     /// rather than re-attaching to the runner's tmux wrapper) — see
-    /// `Store::get_session_agent_resume`'s doc comment for the same idea
-    /// applied to a plain session.
+    /// `Store::get_cell_agent_resume`'s doc comment for the same idea
+    /// applied to a plain cell.
     pub fn get_branch_resolver_agent_session_id(
         &self,
         guardian_id: &str,
@@ -2144,9 +2202,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// Disable all enabled branches whose source session is not yet `done`
-    /// (or have no linked session at all). Returns the list of disabled branch
-    /// names with their source session state (None = never submitted). Called by
+    /// Disable all enabled branches whose source cell is not yet `done`
+    /// (or have no linked cell at all). Returns the list of disabled branch
+    /// names with their source cell state (None = never submitted). Called by
     /// the force-start endpoint (RAL-69).
     pub fn force_start_disable_branches(
         &self,
@@ -2154,9 +2212,9 @@ impl Store {
     ) -> Result<Vec<(String, Option<String>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT gb.branch,
-                    (SELECT s.state FROM sessions s
+                    (SELECT s.state FROM cells s
                      WHERE s.review_branch = gb.branch
-                     ORDER BY s.rowid DESC LIMIT 1) AS source_session_state
+                     ORDER BY s.rowid DESC LIMIT 1) AS source_cell_state
              FROM guardian_branches gb
              WHERE gb.guardian_id=? AND gb.enabled=1
              ORDER BY gb.position",
@@ -2177,7 +2235,7 @@ impl Store {
     }
 
     /// A review branch's own environment-variable overrides (RAL-191), not
-    /// merged with the source session's. `Some(v)` is an override, `None` is a
+    /// merged with the source cell's. `Some(v)` is an override, `None` is a
     /// tombstone — see [`BranchView::env_overrides`].
     ///
     /// # Errors
@@ -2204,7 +2262,7 @@ impl Store {
     /// Three operations, applied in order so the last one named for a given key
     /// wins deterministically:
     /// - `clear` drops the branch's entry entirely, so the key reverts to
-    ///   whatever the source session resolves to.
+    ///   whatever the source cell resolves to.
     /// - `unset` writes a tombstone, removing the inherited key from the
     ///   review worktree's environment.
     /// - `set` writes an override value.
@@ -2237,10 +2295,10 @@ impl Store {
     }
 
     /// The effective environment a review branch's worktree runs under
-    /// (RAL-191): the source session's resolved `run < task < session`
+    /// (RAL-191): the source cell's resolved `squad < task < cell`
     /// overrides with this branch's own layer applied on top.
     ///
-    /// A branch with no source session (added manually, or whose session was
+    /// A branch with no source cell (added manually, or whose cell was
     /// deleted) inherits nothing — its own overrides are the whole map, and a
     /// tombstone for a key that was never inherited is simply a no-op.
     ///
@@ -2255,10 +2313,10 @@ impl Store {
         let source: Option<(String, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT s.run_id, s.task_idx, s.idx
+                "SELECT s.squad_id, s.task_idx, s.idx
                  FROM guardian_branches gb
-                 JOIN sessions s ON s.rowid = (
-                     SELECT s2.rowid FROM sessions s2
+                 JOIN cells s ON s.rowid = (
+                     SELECT s2.rowid FROM cells s2
                      WHERE s2.review_branch = gb.branch
                      ORDER BY s2.rowid DESC LIMIT 1
                  )
@@ -2268,8 +2326,8 @@ impl Store {
             )
             .optional()?;
         let inherited = match source {
-            Some((run_id, ti, si)) => self
-                .resolve_session_env_overrides(&run_id, ti, si)
+            Some((squad_id, ti, si)) => self
+                .resolve_cell_env_overrides(&squad_id, ti, si)
                 .unwrap_or_default(),
             None => BTreeMap::new(),
         };
@@ -2437,7 +2495,7 @@ impl Store {
     }
 
     /// Transition all enabled `pending` branches of a guardian to `ready`,
-    /// signalling that every linked task session is done and the branch is
+    /// signalling that every linked task cell is done and the branch is
     /// waiting for the rebase to start (RAL-73). Branches already past
     /// `pending` (e.g. `in_progress`, `done`, `failed`) are left unchanged.
     pub fn mark_guardian_branches_ready(&self, guardian_id: &str) -> Result<()> {
@@ -2454,7 +2512,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -2467,7 +2525,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -2486,7 +2544,7 @@ impl Store {
             status: r.get(5)?,
             detail: r.get(6)?,
             checks: r.get(7)?,
-            run_id: r.get(8)?,
+            squad_id: r.get(8)?,
             combined_worktree: r.get(9)?,
             conflicts_found: r.get(10)?,
             conflicts_fixed: r.get(11)?,
@@ -2513,8 +2571,8 @@ impl Store {
             squash_projects: r.get(32)?,
             auto_pr_feedback: r.get(33)?,
             input_values: r.get(34)?,
-            verify_scope: r.get(35)?,
-            verify_skip_auto_clean: r.get::<_, Option<i64>>(36)?.map(|v| v != 0),
+            proof_scope: r.get(35)?,
+            proof_skip_auto_clean: r.get::<_, Option<i64>>(36)?.map(|v| v != 0),
             machine: r.get(37)?,
             build_env_overrides: r.get(38)?,
             manual_checks_env_overrides: r.get(39)?,
@@ -2525,25 +2583,25 @@ impl Store {
 
     fn hydrate_guardian(&self, row: GuardianRow) -> Result<GuardianView> {
         // RAL-121: one correlated subquery per branch (finding that branch's
-        // most-recent session by rowid) instead of the previous four -- each of
-        // state/run_id/task_idx/idx was a separate subquery re-scanning
-        // `sessions` for the same row. Paired with `idx_sessions_review_branch`
+        // most-recent cell by rowid) instead of the previous four -- each of
+        // state/squad_id/task_idx/idx was a separate subquery re-scanning
+        // `cells` for the same row. Paired with `idx_cells_review_branch`
         // (see `store.rs`'s migration list) this is now an index seek, not a
         // table scan, per branch.
         let mut stmt = self.conn.prepare(
             "SELECT gb.position, gb.branch, gb.merge_status, gb.detail, gb.review_branch,
                     gb.worktree, gb.conflicts_found, gb.conflicts_fixed, gb.conflicts_committed,
                     gb.enabled, gb.project, gb.dismissed_reenable,
-                    s.state AS source_session_state,
-                    s.run_id AS source_run_id,
+                    s.state AS source_cell_state,
+                    s.squad_id AS source_squad_id,
                     s.task_idx AS source_task_idx,
-                    s.idx AS source_session_idx,
+                    s.idx AS source_cell_idx,
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
-                    gb.is_empty, s.machine AS source_session_machine,
+                    gb.is_empty, s.machine AS source_cell_machine,
                     gb.env_overrides
              FROM guardian_branches gb
-             LEFT JOIN sessions s ON s.rowid = (
-                 SELECT s2.rowid FROM sessions s2
+             LEFT JOIN cells s ON s.rowid = (
+                 SELECT s2.rowid FROM cells s2
                  WHERE s2.review_branch = gb.branch
                  ORDER BY s2.rowid DESC LIMIT 1
              )
@@ -2552,12 +2610,12 @@ impl Store {
         let mut branches = stmt
             .query_map(params![row.id], |r| {
                 let is_empty = r.get::<_, i64>(19).map(|v| v != 0).unwrap_or(false);
-                let source_session_machine: Option<String> = r.get(20)?;
+                let source_cell_machine: Option<String> = r.get(20)?;
                 let enabled = r.get::<_, i64>(9).map(|v| v != 0).unwrap_or(true);
                 let dismissed = r.get::<_, i64>(11).map(|v| v != 0).unwrap_or(false);
-                let source_session_state: Option<String> = r.get(12)?;
+                let source_cell_state: Option<String> = r.get(12)?;
                 let can_reenable =
-                    !enabled && source_session_state.as_deref() == Some("done") && !dismissed;
+                    !enabled && source_cell_state.as_deref() == Some("done") && !dismissed;
                 let merge_status: String = r.get(2)?;
                 let ready = merge_status == "ready";
                 let worktree: Option<String> = r.get(5)?;
@@ -2566,6 +2624,7 @@ impl Store {
                     row.resolver_agent.as_deref(),
                     resolver_agent_session_id.is_some(),
                     worktree.is_some(),
+                    Path::new(&row.git_root),
                 );
                 Ok(BranchView {
                     id: r.get(18)?,
@@ -2579,14 +2638,14 @@ impl Store {
                     conflicts_fixed: r.get(7)?,
                     conflicts_committed: r.get(8)?,
                     is_empty,
-                    source_session_machine,
+                    source_cell_machine,
                     enabled,
                     project: r.get(10)?,
-                    source_session_state,
+                    source_cell_state,
                     can_reenable,
-                    source_run_id: r.get(13)?,
+                    source_squad_id: r.get(13)?,
                     source_task_idx: r.get(14)?,
-                    source_session_idx: r.get(15)?,
+                    source_cell_idx: r.get(15)?,
                     resolver_agent_session_id,
                     ready,
                     terminal_modes,
@@ -2595,7 +2654,7 @@ impl Store {
                     rebase_commands_total: None,
                     // RAL-191: the raw per-branch layer; `inherited_env` and
                     // `resolved_env` are filled in below, where the source
-                    // session's own resolution is reachable.
+                    // cell's own resolution is reachable.
                     env_overrides: branch_env_from_json(&r.get::<_, String>(21)?),
                     resolved_env: BTreeMap::new(),
                     inherited_env: BTreeMap::new(),
@@ -2603,18 +2662,39 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         // RAL-191: resolve each branch's effective environment. The inherited
-        // half needs the source session's full `run < task < session` chain, so
+        // half needs the source cell's full `squad < task < cell` chain, so
         // it is a second pass rather than more columns on the query above.
+        // RAL-121 follow-up: batched into one query per table instead of
+        // three per branch -- hydrate_guardian runs on every guardian on
+        // every board poll, so this was the same N+1 shape the squads/tasks
+        // board view was already fixed for.
+        let env_refs: Vec<crate::store::CellRef> = branches
+            .iter()
+            .filter_map(|b| {
+                match (
+                    b.source_squad_id.as_deref(),
+                    b.source_task_idx,
+                    b.source_cell_idx,
+                ) {
+                    (Some(squad_id), Some(ti), Some(si)) => Some((squad_id.to_string(), ti, si)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let resolved_envs = self
+            .resolve_cell_env_overrides_batch(&env_refs)
+            .unwrap_or_default();
         for b in &mut branches {
             b.inherited_env = match (
-                b.source_run_id.as_deref(),
+                b.source_squad_id.as_deref(),
                 b.source_task_idx,
-                b.source_session_idx,
+                b.source_cell_idx,
             ) {
-                (Some(run_id), Some(ti), Some(si)) => self
-                    .resolve_session_env_overrides(run_id, ti, si)
+                (Some(squad_id), Some(ti), Some(si)) => resolved_envs
+                    .get(&(squad_id.to_string(), ti, si))
+                    .cloned()
                     .unwrap_or_default(),
-                // A branch added manually (or whose source session has since
+                // A branch added manually (or whose source cell has since
                 // been deleted) has nothing to inherit -- its own overrides are
                 // the whole environment.
                 _ => BTreeMap::new(),
@@ -2701,9 +2781,9 @@ impl Store {
         };
         let input_resolutions = self.guardian_input_resolutions(&row.id)?;
 
-        // RAL-203: the combined worktree has no upstream task session of its
+        // RAL-203: the combined worktree has no upstream task cell of its
         // own to inherit an environment from (unlike a per-branch worktree,
-        // which borrows its source session's), so the build/check-gate and
+        // which borrows its source cell's), so the build/check-gate and
         // manual-checks steps against it instead borrow the union of every
         // enabled branch's own resolved environment -- computed now that
         // `branches` above has each one's `resolved_env` filled in.
@@ -2715,30 +2795,30 @@ impl Store {
         let build_env = apply_branch_env(&combined_env, &build_env_overrides);
         let manual_checks_env = apply_branch_env(&combined_env, &manual_checks_env_overrides);
 
-        // RAL-168: resolve this review's own Verify-scope override (if any)
+        // RAL-168: resolve this review's own Proof-scope override (if any)
         // against the project-level `.ralphus.toml [review] verify_scope`
         // default -- so the UI can show the effective value as the dropdown's
         // initial selection (interview Q7) without a second round-trip, and
         // the merge engine (`guardian_merge.rs`) has a single, always-populated
         // field to gate on.
         let project_review_config = crate::config::resolve(Path::new(&row.git_root));
-        let effective_verify_scope = row
-            .verify_scope
+        let effective_proof_scope = row
+            .proof_scope
             .as_deref()
             .filter(|s| matches!(*s, "each_branch" | "final_branch" | "nothing"))
             .unwrap_or_else(|| project_review_config.verify_scope())
             .to_string();
-        let effective_verify_skip_auto_clean = row
-            .verify_skip_auto_clean
+        let effective_proof_skip_auto_clean = row
+            .proof_skip_auto_clean
             .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
 
         // RAL-193: this review's own agent cost -- conflict resolution and
-        // verifier calls made by the guardian merge machinery -- scoped to
+        // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
         // rebase/re-merge attempt. Deliberately excludes the cost of the
-        // tasks/sessions that fed into the review (per the RAL-193 user
+        // tasks/cells that fed into the review (per the RAL-193 user
         // decision), which is why this sums `guardian_costs` rather than
-        // joining `sessions`.
+        // joining `cells`.
         let (attempt_tokens_in, attempt_tokens_out, attempt_cost_usd) =
             self.guardian_cost_total_for_attempt(&row.id, row.merge_attempt)?;
         let (cumulative_tokens_in, cumulative_tokens_out, cumulative_cost_usd) =
@@ -2753,7 +2833,7 @@ impl Store {
             review_branch: row.review_branch,
             status: row.status,
             detail: row.detail,
-            run_id: row.run_id,
+            squad_id: row.squad_id,
             combined_worktree: row.combined_worktree,
             conflicts_found: row.conflicts_found,
             conflicts_fixed: row.conflicts_fixed,
@@ -2787,11 +2867,11 @@ impl Store {
                 row.squash_projects.as_deref().unwrap_or("[]"),
             ),
             auto_pr_feedback: row.auto_pr_feedback,
-            verify_scope: row.verify_scope,
-            verify_skip_auto_clean: row.verify_skip_auto_clean,
+            proof_scope: row.proof_scope,
+            proof_skip_auto_clean: row.proof_skip_auto_clean,
             machine: row.machine,
-            effective_verify_scope,
-            effective_verify_skip_auto_clean,
+            effective_proof_scope,
+            effective_proof_skip_auto_clean,
             ready,
             merge_progress,
             summary_state,
@@ -3003,7 +3083,7 @@ struct GuardianRow {
     status: String,
     detail: Option<String>,
     checks: String,
-    run_id: Option<String>,
+    squad_id: Option<String>,
     combined_worktree: Option<String>,
     conflicts_found: Option<i64>,
     conflicts_fixed: Option<i64>,
@@ -3032,12 +3112,12 @@ struct GuardianRow {
     /// JSON map of {input_name: value} -- resolved/submitted [`CheckInput`]
     /// values, scoped to this guardian (RAL-164).
     input_values: Option<String>,
-    /// RAL-168: per-review Verify-scope override. `None` inherits the
+    /// RAL-168: per-review Proof-scope override. `None` inherits the
     /// project-level default.
-    verify_scope: Option<String>,
+    proof_scope: Option<String>,
     /// RAL-168: per-review auto-clean-skip override. `None` inherits the
     /// project-level default.
-    verify_skip_auto_clean: Option<bool>,
+    proof_skip_auto_clean: Option<bool>,
     /// RAL-185: the machine this review runs on. NULL means the daemon's host.
     machine: Option<String>,
     /// RAL-203: this review's own env overrides for the finalize-time
@@ -3059,34 +3139,31 @@ mod tests {
     // ── CLI_PARITY_PLAN.local.md Phase 5: ported board.html domain logic ────────
 
     #[test]
-    fn worst_session_state_picks_first_rank_match() {
+    fn worst_cell_state_picks_first_rank_match() {
         // "running" outranks "done" regardless of array order.
-        assert_eq!(worst_session_state(&["done", "running"]), Some("running"));
-        assert_eq!(worst_session_state(&["done", "failed"]), Some("failed"));
-        assert_eq!(
-            worst_session_state(&["queued", "cancelled"]),
-            Some("queued")
-        );
+        assert_eq!(worst_cell_state(&["done", "running"]), Some("running"));
+        assert_eq!(worst_cell_state(&["done", "failed"]), Some("failed"));
+        assert_eq!(worst_cell_state(&["queued", "cancelled"]), Some("queued"));
     }
 
     #[test]
-    fn worst_session_state_falls_back_to_first_element() {
-        // An unranked state (not in SESSION_STATE_RANK) falls back to states[0],
-        // mirroring the JS `SESSION_STATE_RANK.find(...) || sessions[0].state`.
-        assert_eq!(worst_session_state(&["weird_state"]), Some("weird_state"));
-        assert_eq!(worst_session_state(&[]), None);
+    fn worst_cell_state_falls_back_to_first_element() {
+        // An unranked state (not in CELL_STATE_RANK) falls back to states[0],
+        // mirroring the JS `CELL_STATE_RANK.find(...) || cells[0].state`.
+        assert_eq!(worst_cell_state(&["weird_state"]), Some("weird_state"));
+        assert_eq!(worst_cell_state(&[]), None);
     }
 
     #[test]
     fn terminal_modes_with_session_id_are_always_readonly_and_open() {
-        // A resolver session id makes both modes available regardless of agent
+        // A resolver cell id makes both modes available regardless of agent
         // or worktree presence.
         assert_eq!(
-            terminal_modes_for(None, true, false),
+            terminal_modes_for(None, true, false, Path::new(".")),
             vec!["readonly", "open"]
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), true, true),
+            terminal_modes_for(Some("ollama"), true, true, Path::new(".")),
             vec!["readonly", "open"]
         );
     }
@@ -3095,23 +3172,26 @@ mod tests {
     fn terminal_modes_cli_agent_with_worktree_offers_worktree_only() {
         for agent in ["claude-code", "codex", "codex-cli"] {
             assert_eq!(
-                terminal_modes_for(Some(agent), false, true),
+                terminal_modes_for(Some(agent), false, true, Path::new(".")),
                 vec!["worktree"]
             );
         }
     }
 
     #[test]
-    fn terminal_modes_none_available_without_session_or_worktree() {
+    fn terminal_modes_none_available_without_cell_or_worktree() {
         assert_eq!(
-            terminal_modes_for(Some("claude-code"), false, false),
+            terminal_modes_for(Some("claude-code"), false, false, Path::new(".")),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), false, true),
+            terminal_modes_for(Some("ollama"), false, true, Path::new(".")),
             Vec::<&str>::new()
         );
-        assert_eq!(terminal_modes_for(None, false, false), Vec::<&str>::new());
+        assert_eq!(
+            terminal_modes_for(None, false, false, Path::new(".")),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
@@ -3150,14 +3230,14 @@ mod tests {
             conflicts_fixed: None,
             conflicts_committed: None,
             is_empty: false,
-            source_session_machine: None,
+            source_cell_machine: None,
             enabled: true,
             project: None,
-            source_session_state: None,
+            source_cell_state: None,
             can_reenable: false,
-            source_run_id: None,
+            source_squad_id: None,
             source_task_idx: None,
-            source_session_idx: None,
+            source_cell_idx: None,
             resolver_agent_session_id: None,
             ready: merge_status == "ready",
             terminal_modes: Vec::new(),
@@ -3207,16 +3287,16 @@ mod tests {
 
     // ── RAL-191: review-worktree environment inheritance + per-branch overrides ──
 
-    /// Build a guardian whose single branch `feat` is linked to a real session
-    /// carrying task- and session-level env, so inheritance has something to
+    /// Build a guardian whose single branch `feat` is linked to a real cell
+    /// carrying task- and cell-level env, so inheritance has something to
     /// resolve. Returns `(guardian_id, branch_id)`.
-    fn guardian_with_env_source_session(store: &mut Store) -> (String, String) {
+    fn guardian_with_env_source_cell(store: &mut Store) -> (String, String) {
         let src = "[[task]]\nname=\"t0\"\nenvironment={SHARED=\"from-task\", TASK_ONLY=\"1\"}\n\
-                   [[task.session]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   environment={SHARED=\"from-session\", SESSION_ONLY=\"2\"}\n";
+                   [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={SHARED=\"from-cell\", CELL_ONLY=\"2\"}\n";
         let tf: ralphus_core::schema::TaskFile = toml::from_str(src).expect("valid fixture");
-        let run = store.insert_run(&tf, Some("r"), false).unwrap();
-        store.set_session_review_branch(&run, 0, 0, "feat").unwrap();
+        let run = store.insert_squad(&tf, Some("r"), false).unwrap();
+        store.set_cell_review_branch(&run, 0, 0, "feat").unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
         let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
@@ -3224,17 +3304,17 @@ mod tests {
     }
 
     #[test]
-    fn a_review_branch_inherits_its_source_sessions_resolved_environment() {
-        // The core of RAL-191: a review worktree is built from a session's
-        // work, so by default it runs under that session's environment --
-        // including the task-level values the session itself inherited.
+    fn a_review_branch_inherits_its_source_cells_resolved_environment() {
+        // The core of RAL-191: a review worktree is built from a cell's
+        // work, so by default it runs under that cell's environment --
+        // including the task-level values the cell itself inherited.
         let mut store = Store::open_in_memory().unwrap();
-        let (id, bid) = guardian_with_env_source_session(&mut store);
+        let (id, bid) = guardian_with_env_source_cell(&mut store);
 
         let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
-        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-session"));
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-cell"));
         assert_eq!(env.get("TASK_ONLY").map(String::as_str), Some("1"));
-        assert_eq!(env.get("SESSION_ONLY").map(String::as_str), Some("2"));
+        assert_eq!(env.get("CELL_ONLY").map(String::as_str), Some("2"));
 
         // ...and the same values are on the view the board renders.
         let b = &store.get_guardian(&id).unwrap().branches[0];
@@ -3250,9 +3330,9 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_override_shadows_the_inherited_value_without_touching_the_session() {
+    fn a_branch_override_shadows_the_inherited_value_without_touching_the_cell() {
         let mut store = Store::open_in_memory().unwrap();
-        let (id, bid) = guardian_with_env_source_session(&mut store);
+        let (id, bid) = guardian_with_env_source_cell(&mut store);
 
         let mut set = BTreeMap::new();
         set.insert("SHARED".to_string(), "from-review".to_string());
@@ -3262,17 +3342,17 @@ mod tests {
 
         let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
         assert_eq!(env.get("SHARED").map(String::as_str), Some("from-review"));
-        // Untouched keys still come through from the session.
-        assert_eq!(env.get("SESSION_ONLY").map(String::as_str), Some("2"));
-        // The source session itself is unchanged -- the override is review-only.
-        let run = store.list_runs().unwrap()[0].id.clone();
+        // Untouched keys still come through from the cell.
+        assert_eq!(env.get("CELL_ONLY").map(String::as_str), Some("2"));
+        // The source cell itself is unchanged -- the override is review-only.
+        let run = store.list_squads().unwrap()[0].id.clone();
         assert_eq!(
             store
-                .resolve_session_env_overrides(&run, 0, 0)
+                .resolve_cell_env_overrides(&run, 0, 0)
                 .unwrap()
                 .get("SHARED")
                 .map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
     }
 
@@ -3280,30 +3360,30 @@ mod tests {
     fn a_branch_tombstone_removes_an_inherited_variable_entirely() {
         // The distinguishing case for the tombstone design: `unset` here must
         // mean "this worktree does not get the variable at all", not "drop my
-        // override and fall back to the session's value" (which is `clear`).
+        // override and fall back to the cell's value" (which is `clear`).
         let mut store = Store::open_in_memory().unwrap();
-        let (id, bid) = guardian_with_env_source_session(&mut store);
+        let (id, bid) = guardian_with_env_source_cell(&mut store);
 
         store
             .set_guardian_branch_env_overrides(
                 &id,
                 &bid,
                 &BTreeMap::new(),
-                &["SESSION_ONLY".to_string()],
+                &["CELL_ONLY".to_string()],
                 &[],
             )
             .unwrap();
 
         let env = store.resolve_guardian_branch_env(&id, &bid).unwrap();
         assert!(
-            !env.contains_key("SESSION_ONLY"),
+            !env.contains_key("CELL_ONLY"),
             "tombstoned key must not reach the review worktree, got {env:?}"
         );
-        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-session"));
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("from-cell"));
 
         // The stored layer records the tombstone explicitly as `None`.
         let own = store.get_guardian_branch_env_overrides(&id, &bid).unwrap();
-        assert_eq!(own.get("SESSION_ONLY"), Some(&None));
+        assert_eq!(own.get("CELL_ONLY"), Some(&None));
     }
 
     #[test]
@@ -3311,7 +3391,7 @@ mod tests {
         // `clear` is the third operation -- it drops the branch's own entry
         // (override *or* tombstone) so the key inherits again.
         let mut store = Store::open_in_memory().unwrap();
-        let (id, bid) = guardian_with_env_source_session(&mut store);
+        let (id, bid) = guardian_with_env_source_cell(&mut store);
 
         store
             .set_guardian_branch_env_overrides(
@@ -3344,14 +3424,14 @@ mod tests {
                 .unwrap()
                 .get("SHARED")
                 .map(String::as_str),
-            Some("from-session"),
+            Some("from-cell"),
             "clearing the tombstone must restore inheritance, not leave it removed"
         );
     }
 
     #[test]
-    fn a_branch_with_no_source_session_has_only_its_own_overrides() {
-        // A manually-added branch (or one whose session was deleted) inherits
+    fn a_branch_with_no_source_cell_has_only_its_own_overrides() {
+        // A manually-added branch (or one whose cell was deleted) inherits
         // nothing; a tombstone for a never-inherited key is a harmless no-op.
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
@@ -3385,18 +3465,18 @@ mod tests {
 
     #[test]
     fn combined_worktree_steps_inherit_the_last_branch_env_by_default() {
-        // The core of RAL-203: the combined worktree has no source session of
+        // The core of RAL-203: the combined worktree has no source cell of
         // its own, so both the build/check-gate step and the manual-checks
         // step borrow `combined_env` (the last enabled branch's resolved
         // env) by default, with no overrides of their own yet.
         let mut store = Store::open_in_memory().unwrap();
-        let (id, _bid) = guardian_with_env_source_session(&mut store);
+        let (id, _bid) = guardian_with_env_source_cell(&mut store);
 
         let g = store.get_guardian(&id).unwrap();
         for env in [&g.combined_env, &g.build_env, &g.manual_checks_env] {
-            assert_eq!(env.get("SHARED").map(String::as_str), Some("from-session"));
+            assert_eq!(env.get("SHARED").map(String::as_str), Some("from-cell"));
             assert_eq!(env.get("TASK_ONLY").map(String::as_str), Some("1"));
-            assert_eq!(env.get("SESSION_ONLY").map(String::as_str), Some("2"));
+            assert_eq!(env.get("CELL_ONLY").map(String::as_str), Some("2"));
         }
         assert!(g.build_env_overrides.is_empty());
         assert!(g.manual_checks_env_overrides.is_empty());
@@ -3405,7 +3485,7 @@ mod tests {
     #[test]
     fn a_build_only_override_does_not_leak_into_manual_checks_or_combined_env() {
         let mut store = Store::open_in_memory().unwrap();
-        let (id, _bid) = guardian_with_env_source_session(&mut store);
+        let (id, _bid) = guardian_with_env_source_cell(&mut store);
 
         let mut set = BTreeMap::new();
         set.insert("SHARED".to_string(), "from-build-override".to_string());
@@ -3422,18 +3502,18 @@ mod tests {
         // combined baseline are both untouched.
         assert_eq!(
             g.manual_checks_env.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
         assert_eq!(
             g.combined_env.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
     }
 
     #[test]
     fn a_manual_checks_only_override_does_not_leak_into_build_or_combined_env() {
         let mut store = Store::open_in_memory().unwrap();
-        let (id, _bid) = guardian_with_env_source_session(&mut store);
+        let (id, _bid) = guardian_with_env_source_cell(&mut store);
 
         let mut set = BTreeMap::new();
         set.insert("SHARED".to_string(), "from-manual-override".to_string());
@@ -3448,18 +3528,18 @@ mod tests {
         );
         assert_eq!(
             g.build_env.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
         assert_eq!(
             g.combined_env.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
     }
 
     #[test]
     fn build_and_manual_checks_overrides_apply_independently_and_differently() {
         let mut store = Store::open_in_memory().unwrap();
-        let (id, _bid) = guardian_with_env_source_session(&mut store);
+        let (id, _bid) = guardian_with_env_source_cell(&mut store);
 
         let mut build_set = BTreeMap::new();
         build_set.insert("SHARED".to_string(), "build-value".to_string());
@@ -3500,7 +3580,7 @@ mod tests {
         );
         assert_eq!(
             g.combined_env.get("SHARED").map(String::as_str),
-            Some("from-session"),
+            Some("from-cell"),
             "the shared branch-union baseline is never mutated by either section's overrides"
         );
 
@@ -3511,7 +3591,7 @@ mod tests {
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(
             g.build_env.get("SHARED").map(String::as_str),
-            Some("from-session")
+            Some("from-cell")
         );
         assert_eq!(
             g.manual_checks_env.get("SHARED").map(String::as_str),
@@ -3606,6 +3686,7 @@ mod tests {
                     name: "port".to_string(),
                     message: "Port for the daemon".to_string(),
                     default: "7890".to_string(),
+                    r#type: CheckInputType::Int,
                 }],
             },
         ];
@@ -3637,6 +3718,7 @@ mod tests {
                 name: "port".to_string(),
                 message: "Port for the daemon".to_string(),
                 default: "7890".to_string(),
+                r#type: CheckInputType::Int,
             }],
         }];
         store.set_guardian_action_hints(&id, &hints).unwrap();
@@ -4046,58 +4128,58 @@ mod tests {
     }
 
     #[test]
-    fn verify_scope_defaults_to_inherited_each_branch_and_toggles_independently() {
+    fn proof_scope_defaults_to_inherited_each_branch_and_toggles_independently() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.verify_scope, None);
-        assert_eq!(g.effective_verify_scope, "each_branch");
-        assert!(!g.effective_verify_skip_auto_clean);
+        assert_eq!(g.proof_scope, None);
+        assert_eq!(g.effective_proof_scope, "each_branch");
+        assert!(!g.effective_proof_skip_auto_clean);
 
         store
-            .set_guardian_verify_scope(&id, Some("final_branch"))
+            .set_guardian_proof_scope(&id, Some("final_branch"))
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.verify_scope.as_deref(), Some("final_branch"));
-        assert_eq!(g.effective_verify_scope, "final_branch");
+        assert_eq!(g.proof_scope.as_deref(), Some("final_branch"));
+        assert_eq!(g.effective_proof_scope, "final_branch");
 
         store
-            .set_guardian_verify_skip_auto_clean(&id, Some(true))
+            .set_guardian_proof_skip_auto_clean(&id, Some(true))
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.verify_skip_auto_clean, Some(true));
-        assert!(g.effective_verify_skip_auto_clean);
+        assert_eq!(g.proof_skip_auto_clean, Some(true));
+        assert!(g.effective_proof_skip_auto_clean);
         // Independent axis: toggling skip_auto_clean must not affect the scope.
-        assert_eq!(g.effective_verify_scope, "final_branch");
+        assert_eq!(g.effective_proof_scope, "final_branch");
 
         // Resetting back to None restores "inherit the project default".
-        store.set_guardian_verify_scope(&id, None).unwrap();
+        store.set_guardian_proof_scope(&id, None).unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.verify_scope, None);
-        assert_eq!(g.effective_verify_scope, "each_branch");
+        assert_eq!(g.proof_scope, None);
+        assert_eq!(g.effective_proof_scope, "each_branch");
 
         assert!(
             store
-                .set_guardian_verify_scope("nope", Some("nothing"))
+                .set_guardian_proof_scope("nope", Some("nothing"))
                 .is_err()
         );
         assert!(
             store
-                .set_guardian_verify_skip_auto_clean("nope", Some(true))
+                .set_guardian_proof_skip_auto_clean("nope", Some(true))
                 .is_err()
         );
     }
 
     #[test]
-    fn verify_scope_unrecognized_stored_value_falls_back_to_each_branch() {
+    fn proof_scope_unrecognized_stored_value_falls_back_to_each_branch() {
         // Defense in depth: a value that somehow got into the DB outside the
         // three recognized scopes (manual SQL edit, future rollback) must not
-        // silently disable verification.
+        // silently disable proving.
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store.set_guardian_verify_scope(&id, Some("bogus")).unwrap();
+        store.set_guardian_proof_scope(&id, Some("bogus")).unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.effective_verify_scope, "each_branch");
+        assert_eq!(g.effective_proof_scope, "each_branch");
     }
 
     #[test]
@@ -4674,7 +4756,7 @@ mod tests {
             .record_guardian_cost(&id, Some(&bid), attempt1, "resolve_conflict", 100, 50, 0.01)
             .unwrap();
         store
-            .record_guardian_cost(&id, Some(&bid), attempt1, "verify", 30, 10, 0.002)
+            .record_guardian_cost(&id, Some(&bid), attempt1, "proof", 30, 10, 0.002)
             .unwrap();
         let attempt2 = store.bump_guardian_merge_attempt(&id).unwrap();
         store

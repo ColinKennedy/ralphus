@@ -7,7 +7,7 @@
 //! failure it carries `ok: false` and an `error` string. Exactly one JSON
 //! object goes to stdout per invocation -- everything else this program wants
 //! to say goes to stderr (diagnostics, and `RALPHUS_EVENT:`-prefixed lines
-//! forwarded from the remote session).
+//! forwarded from the remote cell).
 
 use serde_json::{Value, json};
 
@@ -32,7 +32,7 @@ pub fn reply(extra: Value) {
 
 /// Reply that the *invocation* failed (an infrastructure problem: couldn't
 /// reach the host, couldn't sync source, couldn't spawn ssh). Distinct from a
-/// session that ran and failed, which is `ok: true` with a `result.status` of
+/// cell that ran and failed, which is `ok: true` with a `result.status` of
 /// `"failed"` -- collapsing the two would make a broken connection
 /// indistinguishable from legitimately failing work.
 pub fn reply_err(message: impl AsRef<str>) {
@@ -40,7 +40,7 @@ pub fn reply_err(message: impl AsRef<str>) {
 }
 
 /// Reply that `exec` ran (synchronously) and produced `result` -- the remote
-/// `ralphus-runner`'s own `SessionResult` JSON, forwarded through unchanged
+/// `ralphus-runner`'s own `CellResult` JSON, forwarded through unchanged
 /// rather than re-typed, so this provider never drifts out of sync with the
 /// daemon's `RunnerResult` shape.
 pub fn reply_exec_result(result: Value) {

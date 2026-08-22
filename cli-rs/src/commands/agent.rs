@@ -31,7 +31,10 @@ pub fn dispatch(cmd: AgentCommand, _opts: &GlobalOpts) -> i32 {
             0
         }
         AgentCommand::Help => {
-            println!("ralphus agent <list>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["agent"]).expect("agent help exists")
+            );
             0
         }
         AgentCommand::UsageError(m) => {

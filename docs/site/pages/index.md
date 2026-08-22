@@ -2,7 +2,7 @@
 
 ralphus orchestrates autonomous agent tasks: you describe work as a TOML task
 file, the system runs it with whatever model you point it at — a cloud model
-like Claude, or a fully local Ollama model — verifies the result actually
+like Claude, or a fully local Ollama model — proves the result actually
 did what it claimed, and shows the whole thing on a live web board.
 
 ## The problem it solves
@@ -10,7 +10,7 @@ did what it claimed, and shows the whole thing on a live web board.
 ralphus is a from-scratch successor to an earlier internal project
 (`claudectl`) whose *task graph* — dependencies between steps, verification
 gates, review workflows — worked well, but whose **agent provisioning**
-routinely broke: sessions would silently hang, model backends would drift out
+routinely broke: cells would silently hang, model backends would drift out
 of sync with what the task file declared, and a submitted task could sit
 forever in a "queued" state without anyone noticing.
 
@@ -26,8 +26,8 @@ model. Concretely, that means:
 - **Submissions run immediately, not silently.** A submitted task lands in a
   schedulable state right away — no more tasks stuck in a "queued forever"
   limbo unless you explicitly ask to hold one back.
-- **Verification is part of the pipeline, not an afterthought.** A task can
-  declare shell-command or prompt-based verify steps that actually run and
+- **Proof is part of the pipeline, not an afterthought.** A task can
+  declare shell-command or prompt-based proof steps that actually run and
   actually gate whether the work is considered done.
 - **Review is a first-class workflow.** Guardian reviews stack each task's
   branch into a rebased review branch, resolve conflicts with an agent, run
@@ -38,7 +38,7 @@ model. Concretely, that means:
 
 Anyone who wants to hand off a batch of well-scoped coding tasks to an agent,
 walk away, and come back to a board that shows exactly what ran, what passed
-verification, and what needs a human look — without babysitting a terminal
+its proof steps, and what needs a human look — without babysitting a terminal
 per task.
 
 > **TODO:** comparison to similar tools (e.g. other agent-orchestration or
@@ -46,7 +46,7 @@ per task.
 
 ## Where to go next
 
-- [Overview](overview.md) for the core concepts (tasks, sessions, verify
+- [Overview](overview.md) for the core concepts (tasks, cells, proof
   steps, dependency scheduling, Guardian reviews) in one page.
 - [Installation](installation.md) to get a daemon and board running locally.
 - The [Tasks](views/tasks.md), [Queue](views/queue.md),

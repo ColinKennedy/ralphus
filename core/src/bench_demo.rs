@@ -20,7 +20,7 @@ use crate::validate::validate_toml;
 const MINIMAL_VALID_TASK: &str = r#"
 [[task]]
 name = "build"
-[[task.session]]
+[[task.cell]]
 cwd = "/repo"
 prompt = "make it build"
 "#;

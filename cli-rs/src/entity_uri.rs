@@ -16,24 +16,24 @@ use crate::selector::{ResolvedGuardianSelector, ResolvedSelector};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityUri {
-    Run {
-        run_id: String,
+    Squad {
+        squad_id: String,
     },
     Task {
-        run_id: String,
+        squad_id: String,
         task_idx: i64,
     },
-    Session {
-        run_id: String,
+    Cell {
+        squad_id: String,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     },
-    Verify {
-        run_id: String,
+    Proof {
+        squad_id: String,
         task_idx: i64,
-        verify_scope: String,
-        session_idx: i64,
-        verify_idx: i64,
+        proof_scope: String,
+        cell_idx: i64,
+        proof_idx: i64,
     },
     Guardian {
         guardian_id: String,
@@ -42,12 +42,12 @@ pub enum EntityUri {
 
 impl EntityUri {
     #[must_use]
-    pub fn run_id(&self) -> Option<&str> {
+    pub fn squad_id(&self) -> Option<&str> {
         match self {
-            Self::Run { run_id }
-            | Self::Task { run_id, .. }
-            | Self::Session { run_id, .. }
-            | Self::Verify { run_id, .. } => Some(run_id),
+            Self::Squad { squad_id }
+            | Self::Task { squad_id, .. }
+            | Self::Cell { squad_id, .. }
+            | Self::Proof { squad_id, .. } => Some(squad_id),
             Self::Guardian { .. } => None,
         }
     }
@@ -64,22 +64,22 @@ impl EntityUri {
 impl fmt::Display for EntityUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Run { run_id } => write!(f, "run:{run_id}"),
-            Self::Task { run_id, task_idx } => write!(f, "task:{run_id}:{task_idx}"),
-            Self::Session {
-                run_id,
+            Self::Squad { squad_id } => write!(f, "squad:{squad_id}"),
+            Self::Task { squad_id, task_idx } => write!(f, "task:{squad_id}:{task_idx}"),
+            Self::Cell {
+                squad_id,
                 task_idx,
-                session_idx,
-            } => write!(f, "session:{run_id}:{task_idx}:{session_idx}"),
-            Self::Verify {
-                run_id,
+                cell_idx,
+            } => write!(f, "cell:{squad_id}:{task_idx}:{cell_idx}"),
+            Self::Proof {
+                squad_id,
                 task_idx,
-                verify_scope,
-                session_idx,
-                verify_idx,
+                proof_scope,
+                cell_idx,
+                proof_idx,
             } => write!(
                 f,
-                "verify:{run_id}:{task_idx}:{verify_scope}:{session_idx}:{verify_idx}"
+                "proof:{squad_id}:{task_idx}:{proof_scope}:{cell_idx}:{proof_idx}"
             ),
             Self::Guardian { guardian_id } => write!(f, "guardian:{guardian_id}"),
         }
@@ -88,37 +88,37 @@ impl fmt::Display for EntityUri {
 
 /// Parses an entity URI string, or `None` if it doesn't match a recognised
 /// grammar (unknown kind, wrong arity, non-numeric index, empty id, or an
-/// invalid `verify_scope`).
+/// invalid `proof_scope`).
 #[must_use]
 pub fn parse(uri: &str) -> Option<EntityUri> {
     let mut parts = uri.split(':');
     let kind = parts.next()?;
     let result = match kind {
-        "run" => EntityUri::Run {
-            run_id: non_empty(parts.next()?)?.to_string(),
+        "squad" => EntityUri::Squad {
+            squad_id: non_empty(parts.next()?)?.to_string(),
         },
         "task" => EntityUri::Task {
-            run_id: non_empty(parts.next()?)?.to_string(),
+            squad_id: non_empty(parts.next()?)?.to_string(),
             task_idx: parts.next()?.parse().ok()?,
         },
-        "session" => EntityUri::Session {
-            run_id: non_empty(parts.next()?)?.to_string(),
+        "cell" => EntityUri::Cell {
+            squad_id: non_empty(parts.next()?)?.to_string(),
             task_idx: parts.next()?.parse().ok()?,
-            session_idx: parts.next()?.parse().ok()?,
+            cell_idx: parts.next()?.parse().ok()?,
         },
-        "verify" => {
-            let run_id = non_empty(parts.next()?)?.to_string();
+        "proof" => {
+            let squad_id = non_empty(parts.next()?)?.to_string();
             let task_idx = parts.next()?.parse().ok()?;
-            let verify_scope = parts.next()?;
-            if verify_scope != "task" && verify_scope != "session" {
+            let proof_scope = parts.next()?;
+            if proof_scope != "task" && proof_scope != "cell" {
                 return None;
             }
-            EntityUri::Verify {
-                run_id,
+            EntityUri::Proof {
+                squad_id,
                 task_idx,
-                verify_scope: verify_scope.to_string(),
-                session_idx: parts.next()?.parse().ok()?,
-                verify_idx: parts.next()?.parse().ok()?,
+                proof_scope: proof_scope.to_string(),
+                cell_idx: parts.next()?.parse().ok()?,
+                proof_idx: parts.next()?.parse().ok()?,
             }
         }
         "guardian" => EntityUri::Guardian {
@@ -136,36 +136,36 @@ fn non_empty(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Bridges a resolved run/task/session/verify selector into this wire
+/// Bridges a resolved squad/task/cell/proof selector into this wire
 /// format, matching `ResolvedSelector.kind`'s four values.
 #[must_use]
 pub fn from_resolved_selector(resolved: &ResolvedSelector) -> EntityUri {
     match resolved.kind.as_str() {
         "task" => EntityUri::Task {
-            run_id: resolved.run_id.clone(),
+            squad_id: resolved.squad_id.clone(),
             task_idx: resolved.task_idx,
         },
-        "session" => EntityUri::Session {
-            run_id: resolved.run_id.clone(),
+        "cell" => EntityUri::Cell {
+            squad_id: resolved.squad_id.clone(),
             task_idx: resolved.task_idx,
-            session_idx: resolved.session_idx,
+            cell_idx: resolved.cell_idx,
         },
-        "verify" => EntityUri::Verify {
-            run_id: resolved.run_id.clone(),
+        "proof" => EntityUri::Proof {
+            squad_id: resolved.squad_id.clone(),
             task_idx: resolved.task_idx,
-            verify_scope: resolved.verify_scope.clone(),
-            session_idx: resolved.session_idx,
-            verify_idx: resolved.verify_idx,
+            proof_scope: resolved.proof_scope.clone(),
+            cell_idx: resolved.cell_idx,
+            proof_idx: resolved.proof_idx,
         },
-        _ => EntityUri::Run {
-            run_id: resolved.run_id.clone(),
+        _ => EntityUri::Squad {
+            squad_id: resolved.squad_id.clone(),
         },
     }
 }
 
 /// Bridges a resolved review/branch selector into this wire format -- a
 /// review addresses only the `guardian:` kind; branch/combined addressing
-/// has no entity-URI equivalent (Cartographer rows are per-run/per-guardian,
+/// has no entity-URI equivalent (Cartographer rows are per-squad/per-guardian,
 /// not per-branch).
 #[must_use]
 pub fn from_resolved_guardian_selector(resolved: &ResolvedGuardianSelector) -> EntityUri {
@@ -181,24 +181,24 @@ mod tests {
     #[test]
     fn round_trips_every_kind() {
         let cases = [
-            EntityUri::Run {
-                run_id: "run-1".to_string(),
+            EntityUri::Squad {
+                squad_id: "squad-1".to_string(),
             },
             EntityUri::Task {
-                run_id: "run-1".to_string(),
+                squad_id: "squad-1".to_string(),
                 task_idx: 2,
             },
-            EntityUri::Session {
-                run_id: "run-1".to_string(),
+            EntityUri::Cell {
+                squad_id: "squad-1".to_string(),
                 task_idx: 2,
-                session_idx: 0,
+                cell_idx: 0,
             },
-            EntityUri::Verify {
-                run_id: "run-1".to_string(),
+            EntityUri::Proof {
+                squad_id: "squad-1".to_string(),
                 task_idx: 2,
-                verify_scope: "session".to_string(),
-                session_idx: 0,
-                verify_idx: 1,
+                proof_scope: "cell".to_string(),
+                cell_idx: 0,
+                proof_idx: 1,
             },
             EntityUri::Guardian {
                 guardian_id: "guardian-1".to_string(),
@@ -212,36 +212,36 @@ mod tests {
 
     #[test]
     fn rejects_unknown_kind_and_wrong_arity() {
-        assert_eq!(parse("bogus:run-1"), None);
-        assert_eq!(parse("run:run-1:extra"), None);
-        assert_eq!(parse("task:run-1"), None);
+        assert_eq!(parse("bogus:squad-1"), None);
+        assert_eq!(parse("squad:squad-1:extra"), None);
+        assert_eq!(parse("task:squad-1"), None);
     }
 
     #[test]
     fn rejects_empty_ids_and_bad_indices() {
-        assert_eq!(parse("run:"), None);
-        assert_eq!(parse("task:run-1:not-a-number"), None);
-        assert_eq!(parse("verify:run-1:0:bogus:-1:0"), None);
+        assert_eq!(parse("squad:"), None);
+        assert_eq!(parse("task:squad-1:not-a-number"), None);
+        assert_eq!(parse("proof:squad-1:0:bogus:-1:0"), None);
     }
 
     #[test]
     fn from_resolved_selector_maps_every_kind() {
         let base = ResolvedSelector {
-            kind: "verify".to_string(),
-            run_id: "run-1".to_string(),
+            kind: "proof".to_string(),
+            squad_id: "squad-1".to_string(),
             task_idx: 2,
-            session_idx: 1,
-            verify_idx: 0,
-            verify_scope: "session".to_string(),
+            cell_idx: 1,
+            proof_idx: 0,
+            proof_scope: "cell".to_string(),
         };
         assert_eq!(
             from_resolved_selector(&base),
-            EntityUri::Verify {
-                run_id: "run-1".to_string(),
+            EntityUri::Proof {
+                squad_id: "squad-1".to_string(),
                 task_idx: 2,
-                verify_scope: "session".to_string(),
-                session_idx: 1,
-                verify_idx: 0,
+                proof_scope: "cell".to_string(),
+                cell_idx: 1,
+                proof_idx: 0,
             }
         );
     }
