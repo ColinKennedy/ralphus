@@ -13,8 +13,8 @@ use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::guardian_merge::{run_merge, start_merge};
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
-use ralphus_daemon::scheduler::{Semaphore, execute_run, execute_run_with};
-use ralphus_daemon::store::{NodeState, RunState, Store};
+use ralphus_daemon::scheduler::{Semaphore, execute_squad, execute_squad_with};
+use ralphus_daemon::store::{NodeState, SquadState, Store};
 
 /// A runner that reports every session done without touching disk.
 struct OkRunner;
@@ -27,7 +27,7 @@ impl Runner for OkRunner {
             cost_usd: 0.0,
             summary: "ok".to_string(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -79,7 +79,7 @@ impl Runner for ConflictResolvingRunner {
             cost_usd: 0.0,
             summary: "conflicts resolved".to_string(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -174,7 +174,7 @@ fn commit_on_worktree(cwd: &str, file: &str, contents: &str) {
 /// lines to append inside the `[[review]]` block (may be empty).
 fn session_toml(cwd: &str, review_id: &str, review_attrs: &str) -> String {
     format!(
-        "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+        "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
          [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
     )
 }
@@ -186,8 +186,8 @@ fn session_toml(cwd: &str, review_id: &str, review_attrs: &str) -> String {
 fn two_session_toml(cwd_a: &str, cwd_b: &str, review_id: &str, review_attrs: &str) -> String {
     format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
          [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
     )
 }
@@ -204,20 +204,20 @@ fn single_project_makes_one_review() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 1);
     let g = store.get_guardian(&ids[0]).unwrap();
     assert_eq!(g.name, "backend");
     assert_eq!(g.base_branch, "main");
-    assert_eq!(g.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(g.squad_id.as_deref(), Some(run_id.as_str()));
     // The review's declared conflict-resolver backend/model is persisted.
     assert_eq!(g.resolver_agent.as_deref(), Some("claude"));
     assert_eq!(g.resolver_model.as_deref(), Some("claude-opus-4-8"));
     assert_eq!(g.branches.len(), 1);
     assert_eq!(g.branches[0].branch, "feature/a");
-    assert_eq!(store.guardians_for_run(&run_id).unwrap(), ids);
+    assert_eq!(store.guardians_for_squad(&run_id).unwrap(), ids);
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -230,15 +230,15 @@ fn two_projects_make_two_disambiguated_reviews() {
     let cwd_b = repo_with_worktree(&base_b, "feature/b");
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"one\"\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"two\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"one\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"two\"\n\
          [[review]]\nid=\"one\"\n\
          [[review]]\nid=\"two\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 2, "two projects -> two reviews");
@@ -298,7 +298,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
         "name=\"My Batch\"",
     ))
     .unwrap();
-    let run1 = store.insert_run(&file1, None, false).unwrap();
+    let run1 = store.insert_squad(&file1, None, false).unwrap();
     let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
     assert_eq!(ids1.len(), 1, "first submission mints one guardian");
     let gid1 = ids1[0].clone();
@@ -312,7 +312,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
         "name=\"My Batch\"",
     ))
     .unwrap();
-    let run2 = store.insert_run(&file2, None, false).unwrap();
+    let run2 = store.insert_squad(&file2, None, false).unwrap();
     let ids2 = derive_reviews(&store, &run2, &file2).expect("derive 2");
     assert_eq!(
         ids2.len(),
@@ -322,7 +322,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
     let gid2 = ids2[0].clone();
     assert_ne!(gid1, gid2, "the two submissions must not share a guardian");
     assert_eq!(
-        store.guardians_for_run(&run2).unwrap(),
+        store.guardians_for_squad(&run2).unwrap(),
         vec![gid2.clone()],
         "the new guardian is tagged with the second run"
     );
@@ -404,20 +404,20 @@ fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
     // File 1: task "t1", opts into the shared key.
     let file1_text = format!(
         "[[task]]\nname=\"t1\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
          [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
     );
     // File 2: task "t2", opts into the SAME shared key (repeated [[review]]
     // block, matching the documented multi-file convention).
     let file2_text = format!(
         "[[task]]\nname=\"t2\"\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
          [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
     );
     // File 3: task "t3", opts into a DIFFERENT key -- must end up in its own review.
     let file3_text = format!(
         "[[task]]\nname=\"t3\"\n\
-         [[task.session]]\ncwd=\"{cwd_c}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/solo\"\n\
+         [[task.cell]]\ncwd=\"{cwd_c}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/solo\"\n\
          [[review]]\nid=\"ralphus:new-review/solo\"\nname=\"Solo\"\n"
     );
 
@@ -427,7 +427,7 @@ fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
     let file: TaskFile = toml::from_str(&combined).expect("combined TOML parses");
 
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(
@@ -472,7 +472,7 @@ fn upstream_base_without_upstream_is_rejected() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let err = derive_reviews(&store, &run_id, &file).expect_err("no upstream -> error");
     assert!(err.message.contains("upstream"), "msg: {}", err.message);
 
@@ -485,13 +485,13 @@ fn reviews_auto_start_when_the_run_succeeds() {
     // Deliberately left with NO commits of its own. Unlike the other merge
     // tests here, this one's merge is auto-started by the *scheduler*, which
     // builds its own real runner rather than taking `&OkRunner` -- so a branch
-    // with real work would drive the rebase on into the resolver/final-verify
+    // with real work would drive the rebase on into the resolver/final-proof
     // machinery and call a live Ollama model, which this suite must never do
     // by default (see the Ollama opt-in rule in AGENTS.md). An empty branch
     // terminates the auto-started merge immediately and hermetically.
     let cwd = repo_with_worktree(&base, "feature/a");
     let toml = format!(
-        "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"r\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -499,17 +499,17 @@ fn reviews_auto_start_when_the_run_succeeds() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
         let mut g = store.lock().unwrap();
-        let run_id = g.insert_run(&file, None, false).unwrap();
+        let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         assert_eq!(g.get_guardian(&ids[0]).unwrap().status, "collecting");
         (run_id, ids[0].clone())
     };
 
     // Running the run to success should auto-start the review merge.
-    execute_run(&store, &OkRunner, &run_id);
+    execute_squad(&store, &OkRunner, &run_id);
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done
+        store.lock().unwrap().squad_state(&run_id).unwrap(),
+        SquadState::Done
     );
 
     // The merge runs on a spawned thread; poll until it reaches review. Bounded
@@ -552,9 +552,9 @@ fn start_merge_resolves_conflicts_with_agent() {
     let (cwd_a, cwd_b) = two_conflicting_worktrees(&base);
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -562,7 +562,7 @@ fn start_merge_resolves_conflicts_with_agent() {
     let run_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
     let gid = {
         let g = store.lock().unwrap();
@@ -655,9 +655,9 @@ fn force_push_then_merge_resolves_cleanly() {
     let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -665,7 +665,7 @@ fn force_push_then_merge_resolves_cleanly() {
     let run_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
     let gid = {
         let g = store.lock().unwrap();
@@ -766,9 +766,9 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -776,7 +776,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     let run_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
     let gid = {
         let g = store.lock().unwrap();
@@ -861,7 +861,7 @@ fn no_checks_configured_runs_project_auto_build_default() {
     let run_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
     let gid = {
         let g = store.lock().unwrap();
@@ -927,7 +927,7 @@ fn checks_configured_does_not_also_run_auto_build() {
     let run_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
     let gid = {
         let g = store.lock().unwrap();
@@ -967,7 +967,7 @@ fn ok_result() -> RunnerResult {
         cost_usd: 0.0,
         summary: "ok".to_string(),
         error: None,
-        verified: None,
+        proofed: None,
         agent_session_id: None,
         ghost: None,
     }
@@ -1002,7 +1002,7 @@ impl Runner for GatableRunner {
                 cost_usd: 0.0,
                 summary: String::new(),
                 error: Some("cancelled".to_string()),
-                verified: None,
+                proofed: None,
                 agent_session_id: None,
                 ghost: None,
             };
@@ -1037,8 +1037,8 @@ fn non_overlapping_task_does_not_block_readiness() {
     // Task A: fast, in project-X, declares a review.
     // Task B: slow/blocking, in project-Y, no review declaration.
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
-         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -1046,7 +1046,7 @@ fn non_overlapping_task_does_not_block_readiness() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
         let mut g = store.lock().unwrap();
-        let run_id = g.insert_run(&file, None, false).unwrap();
+        let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only task A declared a review");
         (run_id, ids[0].clone())
@@ -1069,7 +1069,7 @@ fn non_overlapping_task_does_not_block_readiness() {
     // task-completion-triggered review-start path, not a guardian-merge
     // restart via that registry.
     let handle = std::thread::spawn(move || {
-        execute_run_with(
+        execute_squad_with(
             &store2,
             runner2.as_ref(),
             &run_id2,
@@ -1098,7 +1098,7 @@ fn non_overlapping_task_does_not_block_readiness() {
         "guardian should have started before task B was released"
     );
 
-    // Clean up: release task B so execute_run can finish.
+    // Clean up: release task B so execute_squad can finish.
     released.store(true, Ordering::SeqCst);
     handle.join().unwrap();
 
@@ -1118,8 +1118,8 @@ fn undeclared_overlapping_task_blocks_readiness() {
 
     // Task A: fast, declares a review. Task B: blocking, no review declaration.
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
-         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -1127,7 +1127,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
         let mut g = store.lock().unwrap();
-        let run_id = g.insert_run(&file, None, false).unwrap();
+        let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only one project so one review");
         (run_id, ids[0].clone())
@@ -1150,7 +1150,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
     // task-completion-triggered review-start path, not a guardian-merge
     // restart via that registry.
     let handle = std::thread::spawn(move || {
-        execute_run_with(
+        execute_squad_with(
             &store2,
             runner2.as_ref(),
             &run_id2,
@@ -1314,9 +1314,9 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     // 1) The "ticket": a Task TOML. Validate it with the offline validator.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     assert!(
@@ -1330,12 +1330,12 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let run_id = {
         let mut g = store.lock().unwrap();
-        g.insert_run(&file, Some("ticket-42"), false).unwrap()
+        g.insert_squad(&file, Some("ticket-42"), false).unwrap()
     };
-    execute_run(&store, &OkRunner, &run_id);
+    execute_squad(&store, &OkRunner, &run_id);
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done
+        store.lock().unwrap().squad_state(&run_id).unwrap(),
+        SquadState::Done
     );
 
     // 4) Derive the review: both worktrees are one project -> one guardian with
@@ -1389,12 +1389,12 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
 #[test]
 fn no_review_declaration_makes_no_guardians() {
     let mut store = Store::open_in_memory().unwrap();
-    let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/tmp\"\nprompt=\"p\"\n";
+    let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/tmp\"\nprompt=\"p\"\n";
     let file: TaskFile = toml::from_str(toml).unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     // No git access happens because no session declares a review.
     assert!(derive_reviews(&store, &run_id, &file).unwrap().is_empty());
-    assert!(store.guardians_for_run(&run_id).unwrap().is_empty());
+    assert!(store.guardians_for_squad(&run_id).unwrap().is_empty());
 }
 
 // ── Multi-project tests (RAL-29) ─────────────────────────────────────────────
@@ -1420,7 +1420,7 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
         "name=\"Cross Review\"",
     ))
     .unwrap();
-    let run = store.insert_run(&file, None, false).unwrap();
+    let run = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run, &file).expect("derive");
     assert_eq!(ids.len(), 1, "one submission mints one guardian");
     let gid = ids[0].clone();
@@ -1471,7 +1471,7 @@ fn link_key_same_repo_branches_have_no_project_tag() {
         "name=\"Same Repo\"",
     ))
     .unwrap();
-    let run = store.insert_run(&file, None, false).unwrap();
+    let run = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run, &file).expect("derive");
 
     let g = store.get_guardian(&ids[0]).unwrap();
@@ -1499,14 +1499,14 @@ fn proj_group_branches_carry_no_project_tag() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"rA\"\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"rB\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"rA\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"rB\"\n\
          [[review]]\nid=\"rA\"\n\
          [[review]]\nid=\"rB\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 2, "two projects -> two guardians");
@@ -1561,7 +1561,7 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
     .unwrap();
     let gid = {
         let mut g = store.lock().unwrap();
-        let r = g.insert_run(&file, None, false).unwrap();
+        let r = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &r, &file).expect("derive");
         ids[0].clone()
     };
@@ -1721,15 +1721,15 @@ fn nested_cwd_session_implicitly_joins_review_and_reviews_list() {
     std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
 
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd_share}\"\nprompt=\"p\"\nreview=\"r\"\n\
-         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
-         [[task]]\nname=\"c\"\n[[task.session]]\ncwd=\"{cwd_other}\"\nprompt=\"p\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_share}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+         [[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"{cwd_other}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 1, "only one project declares a review");
@@ -1738,10 +1738,10 @@ fn nested_cwd_session_implicitly_joins_review_and_reviews_list() {
     assert_eq!(g.branches.len(), 1);
     assert_eq!(g.branches[0].branch, "feature/share");
 
-    let view = store.get_run(&run_id).unwrap();
-    let a_reviews = view.tasks[0].sessions[0].reviews.clone();
-    let b_reviews = view.tasks[1].sessions[0].reviews.clone();
-    let c_reviews = view.tasks[2].sessions[0].reviews.clone();
+    let view = store.get_squad(&run_id).unwrap();
+    let a_reviews = view.tasks[0].cells[0].reviews.clone();
+    let b_reviews = view.tasks[1].cells[0].reviews.clone();
+    let c_reviews = view.tasks[2].cells[0].reviews.clone();
 
     assert_eq!(a_reviews.len(), 1, "explicit session is in the review");
     assert_eq!(
@@ -1771,23 +1771,23 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
 
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
-         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_run(&file, None, false).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
     let gid = ids[0].clone();
 
     // Task A (explicit) finishes -- branch must stay `pending`: task B (the
     // implicit worktree sibling) hasn't finished yet.
     store
-        .set_session_state(&run_id, 0, 0, NodeState::Done)
+        .set_cell_state(&run_id, 0, 0, NodeState::Done)
         .unwrap();
-    let n = store.mark_ready_branches_with_done_sessions(&gid).unwrap();
+    let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
     assert_eq!(n, 0, "must not promote while a sibling is still pending");
     assert_eq!(
         store.get_guardian(&gid).unwrap().branches[0].merge_status,
@@ -1796,9 +1796,9 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
 
     // Task B finishes too -- now every worktree-sharing session is done.
     store
-        .set_session_state(&run_id, 1, 0, NodeState::Done)
+        .set_cell_state(&run_id, 1, 0, NodeState::Done)
         .unwrap();
-    let n = store.mark_ready_branches_with_done_sessions(&gid).unwrap();
+    let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
     assert_eq!(n, 1, "promotes exactly the one branch");
     assert_eq!(
         store.get_guardian(&gid).unwrap().branches[0].merge_status,
@@ -1825,8 +1825,8 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
     std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
 
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.session]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
-         [[task]]\nname=\"b\"\n[[task.session]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
+         [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -1834,7 +1834,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
         let mut g = store.lock().unwrap();
-        let run_id = g.insert_run(&file, None, false).unwrap();
+        let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         (run_id, ids[0].clone())
     };
@@ -1852,7 +1852,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
                 store
                     .lock()
                     .unwrap()
-                    .set_session_state(&run_id, task_idx, idx, NodeState::Done)
+                    .set_cell_state(&run_id, task_idx, idx, NodeState::Done)
                     .unwrap();
             })
         })
@@ -1873,7 +1873,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
                 store
                     .lock()
                     .unwrap()
-                    .mark_ready_branches_with_done_sessions(&gid)
+                    .mark_ready_branches_with_done_cells(&gid)
                     .unwrap()
             })
         })

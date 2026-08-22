@@ -1,21 +1,24 @@
 //! Integration tests for project registration + placeholder `cwd` worktree
-//! materialization (RAL-100): a session `cwd` of the form
-//! `ralphus:new-worktree/<branch>` names a branch to check out, and the
-//! owning task's `project` field names a project registered via
-//! `POST /api/projects` (or `ralphus project git`) to materialize it under,
-//! instead of a real filesystem path; the scheduler resolves it to a real git
-//! worktree before running the session.
+//! materialization (RAL-100): a cell `cwd` of the form
+//! `ralphus:new-worktree/<branch>?upstream=<upstream>` names a branch to
+//! check out, and the owning task's `project` field names a project
+//! registered via `POST /api/projects` (or `ralphus project git`) to
+//! materialize it under, instead of a real filesystem path; the scheduler
+//! resolves it to a real git worktree before running the cell. The
+//! `?upstream=` suffix is required (validated at submit time and re-checked
+//! defensively at resolution time) and decides what the freshly materialized
+//! branch tracks.
 //!
 //! Two levels, both always run (no live agent/model needed -- placeholder
 //! resolution and validation are pure daemon/store logic):
 //!
-//! 1. **HTTP-level** -- drives `POST /api/projects` and `POST /api/runs`
+//! 1. **HTTP-level** -- drives `POST /api/projects` and `POST /api/squads`
 //!    through `server::route` (no socket) to prove submit-time validation
-//!    (missing/unregistered `project`) fails fast, before a run is ever
+//!    (missing/unregistered `project`) fails fast, before a squad is ever
 //!    scheduled.
 //! 2. **Pipeline-level** -- submits a placeholder-`cwd` task, runs it with a
 //!    `CapturingRunner` (mirrors `monorepo.rs`), and asserts the resolved real
-//!    worktree path reaches the runner. A second `execute_run` pass (as a
+//!    worktree path reaches the runner. A second `execute_squad` pass (as a
 //!    restart would trigger) proves the worktree is reused, not recreated.
 
 use std::path::{Path, PathBuf};
@@ -25,9 +28,9 @@ use std::sync::{Arc, Mutex};
 
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
-use ralphus_daemon::scheduler::execute_run;
+use ralphus_daemon::scheduler::execute_squad;
 use ralphus_daemon::server::{Daemon, route};
-use ralphus_daemon::store::{RunState, Store};
+use ralphus_daemon::store::{SquadState, Store};
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -133,14 +136,14 @@ impl Runner for CapturingRunner {
             cost_usd: 0.0,
             summary: "captured".to_string(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
     }
 }
 
-fn run_placeholder_task(repo: &str, branch: &str) -> String {
+fn run_placeholder_task(repo: &str, branch: &str, upstream: &str) -> String {
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
     let reg_body =
         serde_json::json!({"name": "proj", "description": "", "path": repo, "vcs": "git"})
@@ -150,24 +153,27 @@ fn run_placeholder_task(repo: &str, branch: &str) -> String {
         201
     );
 
+    // no_commit_required: this helper is about worktree/branch placeholder
+    // resolution, not the RAL-156 commit guard, and CapturingRunner never
+    // actually commits.
     let toml = format!(
-        "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
-         [[task.session]]\ncwd=\"ralphus:new-worktree/{branch}\"\nprompt=\"do work\"\n"
+        "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n\
+         [[task.cell]]\ncwd=\"ralphus:new-worktree/{branch}?upstream={upstream}\"\nprompt=\"do work\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = daemon.store_handle();
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done,
-        "run must complete"
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done,
+        "squad must complete"
     );
 
     let specs = runner.captured();
@@ -190,9 +196,9 @@ fn placeholder_cwd_with_registered_project_submits_successfully() {
     assert_eq!(reply.status, 201, "register: {}", reply.body);
 
     let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"do work\"\n";
     let submit_body = serde_json::json!({"toml": toml}).to_string();
-    let reply = route(&daemon, "POST", "/api/runs", &submit_body);
+    let reply = route(&daemon, "POST", "/api/squads", &submit_body);
     assert_eq!(reply.status, 201, "submit: {}", reply.body);
 
     let _ = std::fs::remove_dir_all(&base);
@@ -203,9 +209,9 @@ fn placeholder_cwd_with_unregistered_project_is_rejected_at_submit() {
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
 
     let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"do work\"\n";
     let submit_body = serde_json::json!({"toml": toml}).to_string();
-    let reply = route(&daemon, "POST", "/api/runs", &submit_body);
+    let reply = route(&daemon, "POST", "/api/squads", &submit_body);
     assert_eq!(reply.status, 400, "submit: {}", reply.body);
     assert!(
         reply.body.contains("ghost"),
@@ -222,9 +228,9 @@ fn placeholder_cwd_without_task_project_fails_structural_validation() {
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
 
     let toml = "[[task]]\nname=\"t\"\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"do work\"\n";
     let submit_body = serde_json::json!({"toml": toml}).to_string();
-    let reply = route(&daemon, "POST", "/api/runs", &submit_body);
+    let reply = route(&daemon, "POST", "/api/squads", &submit_body);
     assert_eq!(reply.status, 400, "submit: {}", reply.body);
     assert!(
         reply.body.contains("validation_failed"),
@@ -254,7 +260,7 @@ fn register_project_rejects_non_git_path() {
 
 // ── Pipeline-level: placeholder resolves through submit -> schedule -> run ──
 
-/// A placeholder-cwd session, once submitted and run, must reach the runner
+/// A placeholder-cwd cell, once submitted and run, must reach the runner
 /// with `cwd` rewritten to the real materialized worktree path -- and that
 /// worktree must actually exist on disk as a linked git worktree.
 #[test]
@@ -274,23 +280,23 @@ fn placeholder_cwd_resolves_to_a_real_worktree_through_full_pipeline() {
     // no_commit_required: this test is about worktree materialization, not
     // the RAL-156 commit guard, and CapturingRunner never actually commits.
     let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/feat-x\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/feat-x?upstream=main\"\nprompt=\"do work\"\n";
     let file: TaskFile = toml::from_str(toml).unwrap();
 
     let store = daemon.store_handle();
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done,
-        "run must complete"
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done,
+        "squad must complete"
     );
 
     let specs = runner.captured();
@@ -312,11 +318,11 @@ fn placeholder_cwd_resolves_to_a_real_worktree_through_full_pipeline() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The same placeholder repeated across two sessions in one submission must
-/// materialize exactly one worktree, and both sessions must resolve to the
+/// The same placeholder repeated across two cells in one submission must
+/// materialize exactly one worktree, and both cells must resolve to the
 /// identical real path.
 #[test]
-fn shared_placeholder_across_sessions_builds_one_worktree() {
+fn shared_placeholder_across_cells_builds_one_worktree() {
     let base = temp_base("shared");
     let repo = init_repo(&base);
 
@@ -332,31 +338,31 @@ fn shared_placeholder_across_sessions_builds_one_worktree() {
     // no_commit_required: this test is about worktree deduplication, not
     // the RAL-156 commit guard, and CapturingRunner never actually commits.
     let toml = "[[task]]\nname=\"t1\"\nproject=\"proj\"\nno_commit_required=true\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/shared-branch\"\nprompt=\"a\"\n\
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/shared-branch?upstream=main\"\nprompt=\"a\"\n\
                 [[task]]\nname=\"t2\"\nproject=\"proj\"\nno_commit_required=true\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/shared-branch\"\nprompt=\"b\"\n";
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/shared-branch?upstream=main\"\nprompt=\"b\"\n";
     let file: TaskFile = toml::from_str(toml).unwrap();
 
     let store = daemon.store_handle();
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done
     );
 
     let specs = runner.captured();
     assert_eq!(specs.len(), 2);
     assert_eq!(
         specs[0].cwd, specs[1].cwd,
-        "both sessions must resolve to the identical worktree path"
+        "both cells must resolve to the identical worktree path"
     );
 
     let list = git(Path::new(&repo), &["worktree", "list", "--porcelain"]);
@@ -369,10 +375,10 @@ fn shared_placeholder_across_sessions_builds_one_worktree() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A restarted run whose placeholder was already materialized must not
+/// A restarted squad whose placeholder was already materialized must not
 /// recreate (or error on) the worktree -- it reuses the persisted real path.
 #[test]
-fn restarted_run_reuses_already_materialized_worktree() {
+fn restarted_squad_reuses_already_materialized_worktree() {
     let base = temp_base("restart");
     let repo = init_repo(&base);
 
@@ -389,34 +395,38 @@ fn restarted_run_reuses_already_materialized_worktree() {
     // restart, not the RAL-156 commit guard, and CapturingRunner never
     // actually commits.
     let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n\
-                [[task.session]]\ncwd=\"ralphus:new-worktree/restart-branch\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"ralphus:new-worktree/restart-branch?upstream=main\"\nprompt=\"do work\"\n";
     let file: TaskFile = toml::from_str(toml).unwrap();
 
     let store = daemon.store_handle();
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
     let first_cwd = runner.captured()[0].cwd.clone();
 
     // Leave a marker so a wipe-and-recreate would be caught.
     std::fs::write(Path::new(&first_cwd).join("marker.txt"), "keep me\n").unwrap();
 
-    // Simulate a restart: reset run/task/session state to Pending (mirrors
-    // Store::restart_run) without touching the already-resolved `cwd` column.
-    store.lock().unwrap().reset_run_to_pending(&run_id).unwrap();
+    // Simulate a restart: reset squad/task/cell state to Pending (mirrors
+    // Store::restart_squad) without touching the already-resolved `cwd` column.
+    store
+        .lock()
+        .unwrap()
+        .reset_squad_to_pending(&squad_id)
+        .unwrap();
 
     let runner2 = CapturingRunner::default();
-    execute_run(&store, &runner2, &run_id);
+    execute_squad(&store, &runner2, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done,
-        "restarted run must complete"
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done,
+        "restarted squad must complete"
     );
     let second_cwd = runner2.captured()[0].cwd.clone();
     assert_eq!(
@@ -443,7 +453,7 @@ fn placeholder_cwd_origin_foo_uses_the_remote_tracking_branch_when_present() {
     let base = temp_base("origin-foo");
     let (repo, remote_sha) = init_repo_with_remote_branch(&base, "origin/foo");
 
-    let resolved_cwd = run_placeholder_task(&repo, "origin/foo");
+    let resolved_cwd = run_placeholder_task(&repo, "origin/foo", "origin/foo");
     let wt = Path::new(&resolved_cwd);
     assert!(
         resolved_cwd
@@ -487,7 +497,7 @@ fn placeholder_cwd_origin_foo_resyncs_across_separate_run_submissions() {
     let base = temp_base("origin-foo-resync");
     let (repo, first_sha) = init_repo_with_remote_branch(&base, "origin/foo");
 
-    let first_cwd = run_placeholder_task(&repo, "origin/foo");
+    let first_cwd = run_placeholder_task(&repo, "origin/foo", "origin/foo");
     assert_eq!(
         git(Path::new(&first_cwd), &["rev-parse", "HEAD"]).trim(),
         first_sha
@@ -500,7 +510,7 @@ fn placeholder_cwd_origin_foo_resyncs_across_separate_run_submissions() {
     let second_sha = git(&seed, &["rev-parse", "HEAD"]).trim().to_string();
     git(&seed, &["push", "origin", "foo"]);
 
-    let second_cwd = run_placeholder_task(&repo, "origin/foo");
+    let second_cwd = run_placeholder_task(&repo, "origin/foo", "origin/foo");
     assert_eq!(first_cwd, second_cwd, "the same worktree path is reused");
     assert_eq!(
         git(Path::new(&second_cwd), &["rev-parse", "HEAD"]).trim(),
@@ -516,7 +526,7 @@ fn placeholder_cwd_alternative_foo_creates_a_literal_local_branch_when_no_remote
     let base = temp_base("alternative-foo");
     let repo = init_repo(&base);
 
-    let resolved_cwd = run_placeholder_task(&repo, "alternative/foo");
+    let resolved_cwd = run_placeholder_task(&repo, "alternative/foo", "main");
     let wt = Path::new(&resolved_cwd);
     assert!(
         resolved_cwd
@@ -550,7 +560,7 @@ fn placeholder_cwd_nested_remote_looking_name_keeps_literal_branch_but_collapses
     // name (RAL-211), so a deeply nested repo root still fits Windows'
     // MAX_PATH regardless of how long the placeholder branch name is.
     let branch = "alternative/feature/nested/foo";
-    let resolved_cwd = run_placeholder_task(&repo, branch);
+    let resolved_cwd = run_placeholder_task(&repo, branch, "main");
     let wt = Path::new(&resolved_cwd);
     assert!(
         resolved_cwd

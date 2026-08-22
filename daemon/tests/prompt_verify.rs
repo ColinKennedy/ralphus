@@ -1,9 +1,9 @@
-//! Real end-to-end integration test for `prompt`-kind verify execution.
+//! Real end-to-end integration test for `prompt`-kind proof execution.
 //!
-//! A Task TOML with an `[[task.verify]]` `prompt` step is validated, submitted,
+//! A Task TOML with an `[[task.proof]]` `prompt` step is validated, submitted,
 //! and run through the *real* `ralphus-runner` subprocess against a live local
 //! Ollama model — the same store/scheduler/runner path production code takes,
-//! with no fakes. The verify step's final state is asserted from the store.
+//! with no fakes. The proof step's final state is asserted from the store.
 //!
 //! Skips (prints `SKIP`, does not fail) unless ollama is up on
 //! `127.0.0.1:11434`, the model (`RALPHUS_VERIFY_MODEL`, default `qwen3:8b`)
@@ -15,11 +15,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::runner::SubprocessRunner;
-use ralphus_daemon::scheduler::execute_run;
-use ralphus_daemon::store::{RunState, Store};
+use ralphus_daemon::scheduler::execute_squad;
+use ralphus_daemon::store::{SquadState, Store};
 
 /// Both tests below build a fresh in-memory `Store` and therefore get the
-/// same deterministic run/task/session ids, which collapse to the same tmux
+/// same deterministic squad/task/cell ids, which collapse to the same tmux
 /// session name (`session_name` only keys on those ids). Run them one at a
 /// time so two "new-session" calls for that identical name can't race.
 fn test_lock() -> &'static Mutex<()> {
@@ -80,18 +80,18 @@ fn temp_base(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Build, validate, submit, and run a one-task TOML whose task-level verify is
-/// a `prompt` step with the given claim, returning the verify step's state and
-/// output. The session itself is a deterministic `command` (no model needed);
-/// its `agent`/`model` are only there to be inherited by the verify step.
-fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>, RunState) {
+/// Build, validate, submit, and run a one-task TOML whose task-level proof is
+/// a `prompt` step with the given claim, returning the proof step's state and
+/// output. The cell itself is a deterministic `command` (no model needed);
+/// its `agent`/`model` are only there to be inherited by the proof step.
+fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>, SquadState) {
     let runner_cmd = find_runner().expect("checked by caller");
     let base = temp_base(tag);
     let cwd = base.to_string_lossy().replace('\\', "/");
 
-    // The task name feeds `tmux::session_name(run_id, task, session_id)`, and
-    // `run_id` is deterministic per fresh in-memory Store (always
-    // "run-000000000001"). Since cargo runs tests in the same binary
+    // The task name feeds `tmux::session_name(squad_id, task, cell_id)`, and
+    // `squad_id` is deterministic per fresh in-memory Store (always
+    // "squad-000000000001"). Since cargo runs tests in the same binary
     // concurrently by default, two tests both named "t" would race on the
     // *same* tmux session name — one test's setup can kill/overwrite the
     // other's live session mid-run, so a test can read back its sibling's
@@ -99,31 +99,31 @@ fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>
     // distinct.
     let toml = format!(
         "[[task]]\nname=\"t-{tag}\"\n\
-         [[task.session]]\ncwd=\"{cwd}\"\ncommand=\"echo noop\"\nagent=\"ollama\"\nmodel=\"{model}\"\n\
-         [[task.verify]]\nid=\"claim\"\nprompt=\"Confirm this arithmetic claim: {claim}\"\n"
+         [[task.cell]]\ncwd=\"{cwd}\"\ncommand=\"echo noop\"\nagent=\"ollama\"\nmodel=\"{model}\"\n\
+         [[task.proof]]\nid=\"claim\"\nprompt=\"Confirm this arithmetic claim: {claim}\"\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
-        "verify TOML must validate: {:?}",
+        "proof TOML must validate: {:?}",
         ralphus_core::validate::validate_toml(&toml).errors
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = {
+    let squad_id = {
         let mut g = store.lock().unwrap();
-        g.insert_run(&file, Some("prompt-verify-test"), false)
+        g.insert_squad(&file, Some("prompt-verify-test"), false)
             .unwrap()
     };
 
     let runner = SubprocessRunner::new(&runner_cmd);
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
 
     let guard = store.lock().unwrap();
-    let run_state = guard.run_state(&run_id).unwrap();
-    let run = guard.get_run(&run_id).unwrap();
-    let verify = &run.tasks[0].verify[0];
-    let result = (verify.kind.clone(), verify.output.clone(), run_state);
+    let squad_state = guard.squad_state(&squad_id).unwrap();
+    let squad = guard.get_squad(&squad_id).unwrap();
+    let proof = &squad.tasks[0].proof[0];
+    let result = (proof.kind.clone(), proof.output.clone(), squad_state);
 
     let _ = std::fs::remove_dir_all(&base);
     result
@@ -147,9 +147,9 @@ fn prompt_verify_passes_a_true_claim_via_real_ollama() {
     }
 
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let (kind, output, run_state) = run_one_claim(&model, "2 + 2 = 4", "true");
+    let (kind, output, squad_state) = run_one_claim(&model, "2 + 2 = 4", "true");
     assert_eq!(kind, "prompt");
-    assert_eq!(run_state, RunState::Done, "verify output: {output:?}");
+    assert_eq!(squad_state, SquadState::Done, "proof output: {output:?}");
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn prompt_verify_fails_a_false_claim_via_real_ollama() {
     }
 
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let (kind, output, run_state) = run_one_claim(&model, "2 + 2 = 5", "false");
+    let (kind, output, squad_state) = run_one_claim(&model, "2 + 2 = 5", "false");
     assert_eq!(kind, "prompt");
-    assert_eq!(run_state, RunState::Failed, "verify output: {output:?}");
+    assert_eq!(squad_state, SquadState::Failed, "proof output: {output:?}");
 }

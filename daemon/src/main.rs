@@ -15,10 +15,18 @@ use ralphus_daemon::{
 };
 
 fn main() -> ExitCode {
+    // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
+    // builds don't strip it as dead code ahead of the `ralphus license`
+    // subcommand landing.
+    std::hint::black_box(ralphus_core::license::embedded_license());
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Command::Version => {
             println!("ralphus-daemon {}", ralphus_core::version());
+            ExitCode::SUCCESS
+        }
+        Command::License => {
+            print!("{}", ralphus_core::license::embedded_license());
             ExitCode::SUCCESS
         }
         Command::Help => {
@@ -70,11 +78,22 @@ fn main() -> ExitCode {
         Command::Stop { port, auto_cancel } => {
             let url = format!("http://127.0.0.1:{port}/api/daemon/shutdown");
             let body = serde_json::json!({ "auto_cancel": auto_cancel }).to_string();
-            match ureq::post(&url)
+            // RAL-219: shutdown is a route like any other, so it now requires
+            // the daemon's token too. Read it from the same file the daemon
+            // itself wrote it to; a daemon with no token file yet (or an
+            // unreadable one) just sends no header and lets the daemon's 401
+            // explain why the stop failed, rather than erroring out here.
+            let token = std::fs::read_to_string(ralphus_daemon::token_path())
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let mut req = ureq::post(&url)
                 .timeout(Duration::from_secs(10))
-                .set("Content-Type", "application/json")
-                .send_string(&body)
-            {
+                .set("Content-Type", "application/json");
+            if let Some(token) = &token {
+                req = req.set("Authorization", &format!("Bearer {token}"));
+            }
+            match req.send_string(&body) {
                 Ok(resp) => {
                     let text = resp.into_string().unwrap_or_default();
                     println!("daemon on port {port} is stopping: {text}");
@@ -107,12 +126,27 @@ fn main() -> ExitCode {
                 daemon_cfg.log_path.as_deref(),
                 daemon_cfg.log_level.as_deref(),
             );
+            // A misconfigured agent profile (e.g. a `from_env` var that isn't
+            // set yet) is not fatal here -- the var may be provided later, or
+            // the profile may never be used this session. `ralphus check
+            // health` (`GET /api/health/agent-profiles`) re-validates this
+            // independently and surfaces it there instead of blocking every
+            // daemon startup on one profile's config.
+            if let Err(e) = ralphus_daemon::agent_profiles::load_profiles_for_current_dir() {
+                ralphus_daemon::logging::write_line(
+                    ralphus_daemon::logging::LogLevel::WARNING,
+                    &format!("agent profile config issue (see `ralphus check health`): {e}"),
+                );
+            }
             let db = db.unwrap_or_else(default_db_path);
-            let addr = ("127.0.0.1", port);
+            let bind_host = ralphus_daemon::resolve_bind_host(
+                std::env::var(ralphus_daemon::BIND_ADDR_ENV).ok().as_deref(),
+            );
+            let addr = (bind_host.as_str(), port);
             ralphus_daemon::logging::write_line(
                 ralphus_daemon::logging::LogLevel::INFO,
                 &format!(
-                    "ralphus-daemon serving on http://127.0.0.1:{port} (db: {})",
+                    "ralphus-daemon serving on http://{bind_host}:{port} (db: {})",
                     db.display()
                 ),
             );

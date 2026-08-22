@@ -1,0 +1,9 @@
+# Roadmap status
+
+## Built (Phases 0–5)
+
+Task pipeline (submit → schedule → run via native agent *or* harness backend → command/prompt proof → board); dependency-graph scheduling + `{handoff:...}`; cross-squad gating; Guardian reviews (stacked **rebase** merge in a worktree — each branch rebased onto the prior against one snapshotted base commit, agent conflict resolution, check gates, auto-rebuild when the base branch shifts, feedback chat, Reviews UI); `ralphus` CLI (validate/submit/status/check health/review/...); harness backend (external agents like `claude-code`, `codex`); standalone release builds; secure-distribution licensing (`ralphus-auth` + `ralphus-keygen`, see [[../auth/AGENTS|auth/AGENTS.md]]); the escalation mailbox (RAL-241, poll-only scope — `crate::mailbox`, `ralphus mailbox check`, `ralphus quick-start watcher claude-code|codex`; direct-push delivery into a live tmux-tracked session is not yet built, see below). `ralphus author` (agentic TOML generation) was built during this phase but has since been retired entirely — see "The Rust CLI/runner port" in the root `AGENTS.md`. See `PLAN.local.md` for per-item detail.
+
+## What is NOT built yet
+
+`brain`/`approval` proof kinds + proof retry policy; a proof step's `arguments`/`budget_usd` (parsed but not enforced); Guardian review cycles (multi-round approve/iterate beyond the single auto-rebuild); detached daemon lifecycle (`ralphus daemon start/stop/status` with PID file); prism ("Open in Prism") desktop handoff; multi-user hardening (auth, per-user attribution, worker pool); editable detail pane; full URL-state routing; the draggable node-graph canvas + Logs modal in the UI; mailbox direct-push delivery into a live tmux-tracked session, turn-boundary detection on the daemon side for push purposes, and idle-detection (RAL-241 follow-up). See `PLAN.local.md` for the full phased build plan.

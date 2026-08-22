@@ -5,6 +5,8 @@
 //! `docs/daemon-api.md`). Splitting the logic into a library (with a thin
 //! `main.rs` binary on top) keeps it unit-testable.
 
+pub mod agent_access;
+pub mod agent_profiles;
 pub mod cancel;
 pub mod cartographer;
 pub mod channel;
@@ -19,10 +21,12 @@ pub mod guardian_merge;
 pub mod jobobject;
 pub mod logging;
 pub mod machines;
+pub mod mailbox;
 pub mod otel;
 pub mod plan;
 pub mod pr;
 pub mod procreg;
+pub mod proof;
 pub mod remote_runner;
 pub mod resources;
 pub mod reviews;
@@ -35,8 +39,9 @@ pub mod summary_worker;
 pub mod terminal_log;
 pub mod timeline;
 pub mod tmux;
+pub mod token;
+pub mod users;
 pub mod vcs;
-pub mod verify;
 pub mod workspace;
 pub mod worktrees;
 
@@ -45,20 +50,40 @@ use std::path::PathBuf;
 /// Default port the daemon's HTTP API listens on.
 pub const DEFAULT_PORT: u16 = 7890;
 
-/// Default maximum number of concurrently running runs.
+/// Default maximum number of concurrently running squads.
 pub const DEFAULT_MAX_CONCURRENT: i64 = 12;
+
+/// Overrides the host the daemon's HTTP listener binds to.
+pub const BIND_ADDR_ENV: &str = "RALPHUS_BIND_ADDR";
+
+/// Resolve the host the daemon's HTTP listener binds to: `env_override`
+/// (read from [`BIND_ADDR_ENV`] by the caller) when non-empty, else the
+/// bare-subprocess default `127.0.0.1`.
+///
+/// The container execution mode (RAL-225) sets `RALPHUS_BIND_ADDR=0.0.0.0`
+/// so a `docker run -p`/compose published port can reach the listener from
+/// outside the container's network namespace -- binding only `127.0.0.1`
+/// inside a container is unreachable from the host despite the port
+/// mapping. Every other setup must keep the `127.0.0.1` default: binding
+/// `0.0.0.0` there would expose the daemon's unauthenticated HTTP API on
+/// every network interface, not just loopback.
+#[must_use]
+pub fn resolve_bind_host(env_override: Option<&str>) -> String {
+    match env_override.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "127.0.0.1".to_string(),
+    }
+}
 
 /// Resolve the daemon's state directory (`~/.ralphus`), creating it if needed.
 ///
-/// Falls back to `./.ralphus` when no home directory is set.
+/// Falls back to `./.ralphus` when no home directory is set. Delegates to
+/// `ralphus_core::state_dir()` so the librarian (which does not depend on this
+/// crate) can resolve the same path — see that function's doc comment
+/// (including the RAL-230 owner-only permission tightening it performs).
 #[must_use]
 pub fn state_dir() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let dir = home.join(".ralphus");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    ralphus_core::state_dir()
 }
 
 /// Path to the daemon's SQLite database.
@@ -67,16 +92,27 @@ pub fn default_db_path() -> PathBuf {
     state_dir().join("tasks.db")
 }
 
+/// Path to the daemon's bearer-token file (RAL-219). See
+/// `ralphus_core::daemon_token_path()` and `docs/daemon-api.md`'s
+/// "Authentication" section.
+#[must_use]
+pub fn token_path() -> PathBuf {
+    ralphus_core::daemon_token_path()
+}
+
 /// Command-line action parsed from the daemon's arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Print version and exit.
     Version,
+    /// Print the embedded LICENSE text and exit.
+    License,
     /// Print usage and exit.
     Help,
     /// Run the daemon (serve the HTTP API).
     Serve {
-        /// Port the HTTP API binds to on `127.0.0.1`.
+        /// Port the HTTP API binds to on `127.0.0.1` (see [`resolve_bind_host`]
+        /// for the `RALPHUS_BIND_ADDR`-overridable host).
         port: u16,
         /// SQLite database path. Defaults to `default_db_path()` when unset.
         /// Explicit only (RAL-164) -- multiple instances (e.g. one per git
@@ -89,12 +125,12 @@ pub enum Command {
     /// Forward arguments raw to the resolved tmux binary (RAL-102). CLI-only —
     /// never exposed over the HTTP API.
     Mux(Vec<String>),
-    /// Ask a running daemon to kill every process it has spawned (sessions,
-    /// verifies, reviews, chats, summaries — everything) and exit.
+    /// Ask a running daemon to kill every process it has spawned (cells,
+    /// proofs, reviews, chats, summaries — everything) and exit.
     Stop {
         /// Port the target daemon's HTTP API is listening on.
         port: u16,
-        /// When true, also mark every in-flight run/guardian as `cancelled`
+        /// When true, also mark every in-flight squad/guardian as `cancelled`
         /// in the store instead of leaving them for crash-recovery to
         /// resume on the next `serve()`.
         auto_cancel: bool,
@@ -109,6 +145,7 @@ pub enum Command {
 pub fn parse_args(args: &[String]) -> Command {
     match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => Command::Version,
+        Some("license") => Command::License,
         Some("serve") => {
             let tail = &args[1..];
             let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
@@ -153,7 +190,7 @@ fn parse_db_flag(tail: &[String]) -> Option<PathBuf> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    version           Print version and exit\n    help              Print this message\n",
+        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n",
         ralphus_core::version()
     )
 }
@@ -203,6 +240,11 @@ mod tests {
         assert_eq!(parse_args(&args(&["--version"])), Command::Version);
         assert_eq!(parse_args(&args(&["-V"])), Command::Version);
         assert_eq!(parse_args(&args(&["version"])), Command::Version);
+    }
+
+    #[test]
+    fn parses_license() {
+        assert_eq!(parse_args(&args(&["license"])), Command::License);
     }
 
     #[test]
@@ -340,5 +382,23 @@ mod tests {
     #[test]
     fn usage_mentions_stop() {
         assert!(usage().contains("stop"));
+    }
+
+    #[test]
+    fn usage_mentions_license() {
+        assert!(usage().contains("license"));
+    }
+
+    #[test]
+    fn bind_host_defaults_to_loopback() {
+        assert_eq!(resolve_bind_host(None), "127.0.0.1");
+        assert_eq!(resolve_bind_host(Some("")), "127.0.0.1");
+        assert_eq!(resolve_bind_host(Some("   ")), "127.0.0.1");
+    }
+
+    #[test]
+    fn bind_host_honors_explicit_override() {
+        assert_eq!(resolve_bind_host(Some("0.0.0.0")), "0.0.0.0");
+        assert_eq!(resolve_bind_host(Some("  0.0.0.0  ")), "0.0.0.0");
     }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "ralphus docs tooling — screenshot generation for the docs site (docsgen)."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Proprietary" }
 dependencies = []
 
 [project.optional-dependencies]

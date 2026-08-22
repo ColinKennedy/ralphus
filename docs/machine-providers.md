@@ -1,6 +1,6 @@
 # Machine providers (RAL-185)
 
-A task, session, verify step or review may declare which **machine** it runs on:
+A task, cell, proof step or review may declare which **machine** it runs on:
 
 ```toml
 [[task]]
@@ -16,7 +16,7 @@ means — a build-farm slot, a hostname, a URL, a container tag — is entirely 
 provider's business.
 
 > **Status:** implemented — registry, `machine` syntax, validation, remote
-> session/verify execution, and every documented verb (`provision`, `exec`,
+> cell/proof execution, and every documented verb (`provision`, `exec`,
 > `status`, `stream`, `cancel`, `run`, `read-file`, `write-file`,
 > `remove-path`, `ping`, `channel`, `cleanup`), each dispatched genericly
 > through the same registry with no daemon-side branching on scheme. Guardian
@@ -55,9 +55,9 @@ anything — `some_provider:https://useful.com/x` passes
 
 ```
 task.machine
-  └─ session.machine          (overrides the task)
-       └─ verify.machine      (overrides the session)
-task.verify.machine           (overrides the task)
+  └─ cell.machine             (overrides the task)
+       └─ proof.machine       (overrides the cell)
+task.proof.machine            (overrides the task)
 review.machine                (independent of every task)
 ```
 
@@ -74,7 +74,7 @@ One scheme always resolves with no registry entry:
 
 `ralphus` is additionally **reserved** — it already means the worktree
 placeholder (`ralphus:new-worktree/<branch>`) and the entity URI
-(`ralphus:/RUN[...]`), so registering it as a third thing is rejected.
+(`ralphus:/SQUAD[...]`), so registering it as a third thing is rejected.
 
 Attempting to register a provider under either name is rejected.
 
@@ -143,8 +143,8 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 
 | Verb | Flags | Request struct | Purpose |
 |---|---|---|---|
-| `provision` | `--uri` | [`ProvisionRequest`](../daemon/src/remote_runner.rs) (`project: String`, `source: WorkspaceSource { kind, url?, branch? }`, `run_id: String`, `session_id: String`) | Ensure a workspace exists; reply `{"workspace": "<abs path on this machine>"}`. Must be idempotent — a re-run after a daemon restart reuses the existing workspace (no daemon-side handle backs this; see "Restart safety" below). |
-| `exec` | `--uri` | The full session spec (`RunnerSpec` in `daemon/src/runner.rs`: `run_id`, `task`, `session_id`, `cwd`, `prompt`/`command`, `agent`, `model`, `system_prompt`, `timeout_sec`, `budget_tokens`, `maximum_budget_usd`, `verify`, `trace_context`, `env_overrides`, ...) | Run one session/verify. Reply with **either** `{"result": {...}}` (ran synchronously) **or** `{"handle": "..."}` (started asynchronously). `result`'s shape is `RunnerResult` (`daemon/src/runner.rs`): `status` (`"done"`/`"failed"`), `tokens_in`, `tokens_out`, `cost_usd`, `summary`, `error?`, `verified?`, `agent_session_id?`, `ghost?`. |
+| `provision` | `--uri` | [`ProvisionRequest`](../daemon/src/remote_runner.rs) (`project: String`, `source: WorkspaceSource { kind, url?, branch? }`, `squad_id: String`, `cell_id: String`) | Ensure a workspace exists; reply `{"workspace": "<abs path on this machine>"}`. Must be idempotent — a re-run after a daemon restart reuses the existing workspace (no daemon-side handle backs this; see "Restart safety" below). |
+| `exec` | `--uri` | The full cell spec (`RunnerSpec` in `daemon/src/runner.rs`: `squad_id`, `task`, `cell_id`, `cwd`, `prompt`/`command`, `agent`, `model`, `system_prompt`, `timeout_sec`, `budget_tokens`, `maximum_budget_usd`, `proof`, `trace_context`, `env_overrides`, ...) | Run one cell/proof. Reply with **either** `{"result": {...}}` (ran synchronously) **or** `{"handle": "..."}` (started asynchronously). `result`'s shape is `RunnerResult` (`daemon/src/runner.rs`): `status` (`"done"`/`"failed"`), `tokens_in`, `tokens_out`, `cost_usd`, `summary`, `error?`, `proofed?`, `agent_session_id?`, `ghost?`. |
 | `status` | `--uri --handle` | none | For an async handle: `{"state": "running"}`, or `{"state": "done"\|"failed", "result": {...}}` (`result` is the same `RunnerResult` shape as `exec`). |
 | `stream` | `--uri --handle [--since N]` | none | `{"output": "...", "next": N}` — output since the cursor. Optional; omitting it costs Live View, not execution. |
 | `cancel` | `--uri --handle` | none | Stop the work behind a handle. Reply is the standard `{"ok": true, "protocol_version": 1}` envelope — no extra fields. |
@@ -156,7 +156,7 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 | `channel` | `--uri` | newline-delimited `RunRequest`s | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
 | `cleanup` | `--uri` | none | Tear the workspace down (see "The `cleanup` verb and its retention policy" below). |
 
-The session spec arrives on stdin for `exec`; the provision request arrives on
+The cell spec arrives on stdin for `exec`; the provision request arrives on
 stdin for `provision`; the file/run requests above arrive on stdin for their
 own verb. Handle-scoped verbs (`status`/`stream`/`cancel`) and `ping`/`cleanup`
 take no stdin payload.
@@ -169,10 +169,10 @@ implementing three more verbs. Both are first-class; pick per provider.
 ### The `cleanup` verb and its retention policy
 
 `cleanup` tears a provisioned workspace down. It is **never called
-automatically** by the daemon — a local session's worktree
+automatically** by the daemon — a local cell's worktree
 (`.git/.ralphus_worktrees/<branch>`) is never auto-deleted either, so a remote
 workspace keeps the same property rather than being reclaimed the instant a
-run ends. An operator reclaims one explicitly, once they are actually done
+squad ends. An operator reclaims one explicitly, once they are actually done
 inspecting it:
 
 ```bash
@@ -185,7 +185,7 @@ ralphus machine cleanup incredibuild:A
 **Retention on failure: nothing is discarded.** The daemon keeps no record of
 a provisioned workspace to roll back or retry against — `provision` is
 idempotent and re-derives the same workspace deterministically every time
-(from `run_id`/`session_id`/the requested branch), so there is nothing to
+(from `squad_id`/`cell_id`/the requested branch), so there is nothing to
 "forget" on a failed cleanup. If your `cleanup` implementation fails partway
 through (permissions, a process still holding the directory open, a dead
 machine), leave the workspace exactly as it was and reply `{"ok": false,
@@ -197,7 +197,7 @@ rather than swallowing it, so a human can retry or investigate.
 Two different things survive a daemon restart, by two different mechanisms:
 
 - **A provisioned workspace** has no daemon-side record at all. `provision`
-  being idempotent (re-deriving the same path from `run_id`/`session_id`/the
+  being idempotent (re-deriving the same path from `squad_id`/`cell_id`/the
   branch every time) *is* the restart-safety mechanism — see
   [`crate::worktrees::ensure_worktree`]'s identical local-only property.
 - **An in-flight async `exec` handle** *is* recorded — in the
@@ -219,7 +219,7 @@ The provision payload's `source` is deliberately **not** git-shaped:
 ```json
 {"project": "ralphus",
  "source": {"kind": "git", "url": "git@host:acme/repo.git", "branch": "RAL-169-foo"},
- "run_id": "...", "session_id": "work"}
+ "squad_id": "...", "cell_id": "work"}
 ```
 
 `kind` comes from the registered project's own `vcs` column. `url` and
@@ -237,8 +237,8 @@ the contract — and the transport is entirely yours: a fresh SSH invocation, an
 LAN farm and a machine across a slow link can make different choices without
 ralphus changing.
 
-(*Channel*, not *session*: a session is already a ralphus concept — a task
-contains sessions, which contain verify steps — so the word is kept clear of
+(*Channel*, not *cell*: a cell is already a ralphus concept — a task
+contains cells, which contain proof steps — so the word is kept clear of
 transport. See [`glossary.md`](glossary.md).)
 
 ### The `channel` verb
@@ -276,7 +276,7 @@ of bug impossible.
 
 **`ping` is deliberately separate from every other verb.** A machine being down
 is a different fact from work failing on it; conflating them leaves someone
-debugging a failed run unable to tell "the build broke" from "the build box is
+debugging a failed squad unable to tell "the build broke" from "the build box is
 unplugged". Keep it cheap — it is called to paint a status chip, not to do
 anything.
 
@@ -297,10 +297,10 @@ Three requirements are easy to miss, and the first two fail *silently*:
 
 - **Forward `RALPHUS_EVENT:` lines.** The runner emits structured events on
   stderr behind that marker (see the Logging Policy in `AGENTS.md`). A provider
-  that drops them leaves Cartographer blind for every remote session.
+  that drops them leaves Cartographer blind for every remote cell.
 
   The daemon scrapes that marker from the stderr of **every** verb it invokes,
-  not just `exec` — which matters most for an async provider. Its session's
+  not just `exec` — which matters most for an async provider. Its cell's
   events are produced long after `exec` returned a handle, so the only place
   left to surface them is the stderr of the later `status`/`stream` calls. Echo
   them there. `examples/providers/loopback.py`'s `cmd_stream` shows the whole
@@ -308,11 +308,11 @@ Three requirements are easy to miss, and the first two fail *silently*:
 - **Forward `llm-invoke` usage events specifically.** The live cost-cap kill
   reads token/cost usage from them — the daemon compares the latest snapshot
   against `maximum_budget_usd` on every `status`/`stream` poll and cancels the
-  handle the moment it's exceeded, the same as it does for a local session. A
+  handle the moment it's exceeded, the same as it does for a local cell. A
   provider that drops these events silently disables budget enforcement for
-  its sessions — the run still completes, just uncapped, since there is
+  its cells — the squad still completes, just uncapped, since there is
   nothing for the daemon to compare against.
-- **Honor `trace_context`.** The session spec carries a W3C `traceparent`
+- **Honor `trace_context`.** The cell spec carries a W3C `traceparent`
   (RAL-96). A provider that starts its work without propagating it into the
   remote environment gets a disconnected trace rather than one end-to-end
   waterfall — visible, but only if you go looking.
@@ -323,17 +323,17 @@ Three requirements are easy to miss, and the first two fail *silently*:
 `git add`, what commit message to write, and whether the work is even in a
 committable state is judgment, not orchestration — a generic
 `git add -A && commit && push` would sweep up build artifacts and scratch files,
-and would contradict the per-session control task files already exercise
+and would contradict the per-cell control task files already exercise
 (`system_prompt = "Do NOT commit and do NOT push under any circumstances."`).
 
 So the split is:
 
 | Operation | Who |
 |---|---|
-| Publish (`add` / `commit` / `push`) | **the task's own session**, authored in its prompt or command |
+| Publish (`add` / `commit` / `push`) | **the task's own cell**, authored in its prompt or command |
 | Fetch a known branch onto another machine | **the daemon** — the branch name and remote are already known, so nothing is left to judgment |
 
-The contract is **between tasks**: once a task is Done, one of its sessions has
+The contract is **between tasks**: once a task is Done, one of its cells has
 already published whatever downstream work needs. The existing dependency graph
 supplies the ordering barrier — a downstream task starts only after its upstream
 tasks complete.
@@ -365,7 +365,7 @@ You can also drive it by hand, exactly as the daemon does:
 
 ```bash
 echo '{"project":"demo","source":{"kind":"git","url":"...","branch":"x"}}'   | python examples/providers/loopback.py provision --uri sandbox
-echo '{"run_id":"r1","session_id":"s0","cwd":"."}'   | python examples/providers/loopback.py exec --uri sandbox
+echo '{"squad_id":"r1","cell_id":"s0","cwd":"."}'   | python examples/providers/loopback.py exec --uri sandbox
 python examples/providers/loopback.py status --handle <handle>
 python examples/providers/loopback.py stream --handle <handle> --since 0
 python examples/providers/loopback.py cancel --handle <handle>
@@ -381,7 +381,7 @@ throwaway-example) provider in the repo.
 > **Status: `exec` only.** `provision`/`stream`/`status`/`cancel`/`cleanup`
 > daemon-side dispatch is a separate ticket (RAL-201) — check its status
 > before assuming those verbs are wired up. This provider's `exec` runs
-> **synchronously**: it blocks until the remote session finishes and replies
+> **synchronously**: it blocks until the remote cell finishes and replies
 > with `result` directly, so nothing on the daemon side needs to poll
 > `status`/`stream`/`cancel` for it regardless of RAL-201. It also implements
 > `ping`, since the daemon already dispatches that verb independently (the
@@ -399,12 +399,12 @@ throwaway-example) provider in the repo.
 
 ### What `exec` actually does
 
-The daemon hands this provider the same session spec it would hand a local
+The daemon hands this provider the same cell spec it would hand a local
 runner, `cwd` included — but that `cwd` is a path on the **daemon's own
 host**. `exec`:
 
 1. Derives a deterministic remote workspace directory from the local `cwd`
-   (so repeated calls against the same session reuse it rather than
+   (so repeated calls against the same cell reuse it rather than
    recreating it from scratch).
 2. Syncs the local `cwd`'s contents there — `rsync` when available (Linux/macOS
    daemon hosts, opportunistically), or a `tar | ssh tar -x` stream everywhere
@@ -414,12 +414,12 @@ host**. `exec`:
 3. Rewrites the spec's `cwd` to the remote path and pipes it into `ralphus-runner`
    on the remote host over one non-interactive `ssh` invocation, forwarding
    `RALPHUS_EVENT:` stderr lines (**including `llm-invoke` usage events**) onto
-   its own stderr *as they arrive*, not buffered until the session ends — this
+   its own stderr *as they arrive*, not buffered until the cell ends — this
    is what keeps the daemon's live cost-cap kill able to act mid-run rather
-   than only after the whole remote session has already finished.
-4. Parses the remote runner's stdout as the session's `SessionResult` and
+   than only after the whole remote cell has already finished.
+4. Parses the remote runner's stdout as the cell's `CellResult` and
    returns it verbatim as `result`, regardless of the remote command's own
-   exit code (`ralphus-runner` exits non-zero for a *failed session* just as
+   exit code (`ralphus-runner` exits non-zero for a *failed cell* just as
    validly as it exits zero for a done one — the JSON on stdout is the source
    of truth, not the process exit code).
 
@@ -478,7 +478,7 @@ Then point a task at it:
 name    = "ral-200-demo"
 project = "ralphus"
 machine = "ssh:alice@build-box"
-  [[task.session]]
+  [[task.cell]]
   cwd    = "/home/alice/work/ralphus-checkout"
   prompt = "..."
 ```

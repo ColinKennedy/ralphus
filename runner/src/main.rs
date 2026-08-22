@@ -1,54 +1,97 @@
-//! `ralphus-runner` binary: reads one `SessionSpec` JSON object (from stdin,
-//! or a file path given as the first positional argument) and reports one
-//! `SessionResult`. Spawned once per session by
+//! `ralphus-runner` binary: `send` reads one `CellSpec` JSON object (from
+//! stdin, or a file path given as the first positional argument) and reports
+//! one `CellResult`. Spawned once per cell by
 //! `daemon/src/runner.rs::SubprocessRunner`, which always runs it tmux-
-//! wrapped and always passes `--result-file <path>` (see `run_via_tmux_attempt`)
-//! -- when the daemon can't read this process's stdout as a pipe (it lands in
-//! a tmux pane instead), the result is written to that file instead of
-//! printed, and a `RALPHUS_TMUX_DONE: <status>` sentinel line is printed to
-//! stdout in its place for `daemon/src/runner.rs::pane_shows_done_sentinel`
-//! to notice. Without `--result-file` (plain subprocess invocation), the
-//! `SessionResult` JSON goes to stdout instead. Mirrors
-//! `cli/src/ralphus/runner/__main__.py`'s `_parse_argv`/`_finish` exactly --
-//! this is the wire contract the daemon already speaks.
+//! wrapped and always passes `send --result-file <path>` (see
+//! `run_via_tmux_attempt`) -- when the daemon can't read this process's
+//! stdout as a pipe (it lands in a tmux pane instead), the result is written
+//! to that file instead of printed, and a `RALPHUS_TMUX_DONE: <status>`
+//! sentinel line is printed to stdout in its place for
+//! `daemon/src/runner.rs::pane_shows_done_sentinel` to notice. Without
+//! `--result-file` (plain subprocess invocation), the `CellResult` JSON goes
+//! to stdout instead. This is the wire contract the daemon already speaks.
 
 use std::io::Read as _;
 
 use opentelemetry::trace::SpanKind;
-use ralphus_runner::execute::run_session;
-use ralphus_runner::spec::{SessionResult, SessionSpec};
+use ralphus_runner::execute::run_cell;
+use ralphus_runner::spec::{CellResult, CellSpec};
 use ralphus_runner::{config, otel};
 
 /// Must match `daemon/src/runner.rs::TMUX_DONE_MARKER`.
 const TMUX_DONE_MARKER: &str = "RALPHUS_TMUX_DONE";
 
-fn main() -> std::process::ExitCode {
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let (positional, result_file) = parse_args(&raw_args);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    Help,
+    Version,
+    License,
+    Send {
+        spec_path: Option<String>,
+        result_file: Option<String>,
+    },
+}
 
-    let input = match read_spec_text(positional.first().map(String::as_str)) {
+fn main() -> std::process::ExitCode {
+    // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
+    // builds don't strip it as dead code ahead of the `ralphus license`
+    // subcommand landing.
+    std::hint::black_box(ralphus_core::license::embedded_license());
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args(&raw_args) {
+        Command::Help => print_help(),
+        Command::Version => print_version(),
+        Command::License => print_license(),
+        Command::Send {
+            spec_path,
+            result_file,
+        } => send(spec_path.as_deref(), result_file.as_deref()),
+    }
+}
+
+/// `help`/`version`/`license` are ordinary CLI-facing output, not the
+/// daemon<->runner wire contract that the reserved stdout channel (see
+/// `finish` below) exists to protect, hence the local opt-out from the
+/// workspace-wide `clippy::print_stdout = "deny"`.
+#[allow(clippy::print_stdout)]
+fn print_help() -> std::process::ExitCode {
+    print!("{}", usage());
+    std::process::ExitCode::SUCCESS
+}
+
+#[allow(clippy::print_stdout)] // see `print_help`
+fn print_version() -> std::process::ExitCode {
+    println!("ralphus-runner {}", ralphus_core::version());
+    std::process::ExitCode::SUCCESS
+}
+
+#[allow(clippy::print_stdout)] // see `print_help`
+fn print_license() -> std::process::ExitCode {
+    print!("{}", ralphus_core::license::embedded_license());
+    std::process::ExitCode::SUCCESS
+}
+
+fn send(spec_path: Option<&str>, result_file: Option<&str>) -> std::process::ExitCode {
+    let input = match read_spec_text(spec_path) {
         Ok(s) => s,
         Err(e) => {
             return finish(
-                &SessionResult::failed(format!("could not read session spec: {e}"), ""),
-                result_file.as_deref(),
+                &CellResult::failed(format!("could not read cell spec: {e}"), ""),
+                result_file,
             );
         }
     };
 
-    let spec = match SessionSpec::from_json(&input) {
+    let spec = match CellSpec::from_json(&input) {
         Ok(s) => s,
         Err(e) => {
-            return finish(
-                &SessionResult::failed(e.to_string(), ""),
-                result_file.as_deref(),
-            );
+            return finish(&CellResult::failed(e.to_string(), ""), result_file);
         }
     };
 
     eprintln!(
-        "ralphus [runner] invoked run={} session={} agent={:?} model={:?} verify={}",
-        spec.run_id, spec.session_id, spec.agent, spec.model, spec.verify
+        "ralphus [runner] invoked squad={} cell={} agent={:?} model={:?} proof={}",
+        spec.squad_id, spec.cell_id, spec.agent, spec.model, spec.proof
     );
 
     let runner_config = config::load(std::path::Path::new(&spec.cwd));
@@ -57,14 +100,26 @@ fn main() -> std::process::ExitCode {
     let result = run_traced(&spec, runner_config.keep_temporary_files);
 
     otel::shutdown(provider);
-    finish(&result, result_file.as_deref())
+    finish(&result, result_file)
 }
 
-/// Splits an optional `--result-file PATH` out of `args`, mirroring the old
-/// Python `_parse_argv`. Returns the remaining positional args (the spec
-/// file path, if any) and the result-file path (`None` when absent).
-fn parse_args(args: &[String]) -> (Vec<String>, Option<String>) {
-    let mut rest = Vec::new();
+/// Parse the runner CLI. `send` is the explicit command surface, but the
+/// historical "implicit send" argv shape remains accepted as a compatibility
+/// fallback for callers that still invoke `ralphus-runner [spec]`.
+fn parse_args(args: &[String]) -> Command {
+    match args.first().map(String::as_str) {
+        Some("--version" | "-V" | "version") => Command::Version,
+        Some("license") => Command::License,
+        Some("--help" | "-h" | "help") => Command::Help,
+        Some("send") => parse_send_args(&args[1..]),
+        _ => parse_send_args(args),
+    }
+}
+
+/// Splits an optional `--result-file PATH` out of a `send` invocation,
+/// mirroring the old Python `_parse_argv`.
+fn parse_send_args(args: &[String]) -> Command {
+    let mut positionals = Vec::new();
     let mut result_file = None;
     let mut i = 0;
     while i < args.len() {
@@ -73,10 +128,20 @@ fn parse_args(args: &[String]) -> (Vec<String>, Option<String>) {
             i += 2;
             continue;
         }
-        rest.push(args[i].clone());
+        positionals.push(args[i].clone());
         i += 1;
     }
-    (rest, result_file)
+    Command::Send {
+        spec_path: positionals.into_iter().next(),
+        result_file,
+    }
+}
+
+fn usage() -> String {
+    format!(
+        "ralphus-runner {}\n\nUSAGE:\n    ralphus-runner send [spec.json] [--result-file <path>]\n    ralphus-runner license\n    ralphus-runner version\n    ralphus-runner help\n\nCOMMANDS:\n    send              Execute one cell spec from stdin or a file path\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n",
+        ralphus_core::version()
+    )
 }
 
 /// Reads the spec JSON from `path` when given, else from stdin -- mirrors
@@ -92,23 +157,19 @@ fn read_spec_text(path: Option<&str>) -> std::io::Result<String> {
     }
 }
 
-fn run_traced(spec: &SessionSpec, keep_temporary_files: bool) -> SessionResult {
+fn run_traced(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
     if spec.command.is_some() {
-        // No LLM call for a command session -- no span needed.
-        return run_session(spec, keep_temporary_files);
+        // No LLM call for a command cell -- no span needed.
+        return run_cell(spec, keep_temporary_files);
     }
     let root = otel::context_from_traceparent(spec.trace_context.as_deref());
-    let span_name = if spec.verify {
-        "llm.verify"
-    } else {
-        "llm.session"
-    };
+    let span_name = if spec.proof { "llm.proof" } else { "llm.cell" };
     let span = otel::start_span(span_name, &root, SpanKind::Client);
-    span.set_attribute("run_id", spec.run_id.clone());
-    span.set_attribute("session_id", spec.session_id.clone());
+    span.set_attribute("squad_id", spec.squad_id.clone());
+    span.set_attribute("cell_id", spec.cell_id.clone());
     span.set_attribute("agent", spec.agent.clone());
 
-    let result = run_session(spec, keep_temporary_files);
+    let result = run_cell(spec, keep_temporary_files);
 
     if result.ok() {
         span.set_status(opentelemetry::trace::Status::Ok);
@@ -126,7 +187,7 @@ fn run_traced(spec: &SessionSpec, keep_temporary_files: bool) -> SessionResult {
 /// (`clippy::print_stdout = "deny"` workspace-wide; these are the two
 /// legitimate writers, hence the local opt-out).
 #[allow(clippy::print_stdout)]
-fn finish(result: &SessionResult, result_file: Option<&str>) -> std::process::ExitCode {
+fn finish(result: &CellResult, result_file: Option<&str>) -> std::process::ExitCode {
     match result_file {
         Some(path) => {
             if let Err(e) = std::fs::write(path, result.to_json()) {
@@ -140,5 +201,49 @@ fn finish(result: &SessionResult, result_file: Option<&str>) -> std::process::Ex
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_send_subcommand_with_result_file() {
+        assert_eq!(
+            parse_args(&v(&["send", "spec.json", "--result-file", "result.json"])),
+            Command::Send {
+                spec_path: Some("spec.json".to_string()),
+                result_file: Some("result.json".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_legacy_implicit_send_shape_still_works() {
+        assert_eq!(
+            parse_args(&v(&["spec.json", "--result-file", "result.json"])),
+            Command::Send {
+                spec_path: Some("spec.json".to_string()),
+                result_file: Some("result.json".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_license_and_help_commands() {
+        assert_eq!(parse_args(&v(&["license"])), Command::License);
+        assert_eq!(parse_args(&v(&["help"])), Command::Help);
+    }
+
+    #[test]
+    fn usage_mentions_send_and_license() {
+        let text = usage();
+        assert!(text.contains("send"));
+        assert!(text.contains("license"));
     }
 }

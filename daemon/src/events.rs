@@ -3,13 +3,13 @@
 //! the primary live-update path.
 //!
 //! Fed by [`crate::store::Store::cartographer_log`] — Cartographer already
-//! instruments every notable state transition (task/run/session lifecycle,
-//! verify starts/results, Guardian review lifecycle; see the "Logging
+//! instruments every notable state transition (task/squad/cell lifecycle,
+//! proof starts/results, Guardian review lifecycle; see the "Logging
 //! Policy" section of `AGENTS.md`) — so tapping its single write path gives
-//! push coverage for run/task/session/guardian/queue/cartographer changes
+//! push coverage for squad/task/cell/guardian/queue/cartographer changes
 //! without a second, parallel set of instrumentation call sites. The queue
-//! view is a derived, filtered projection over run/task state (see
-//! `Store::queue`), so any event carrying a `run_id` implies "the queue may
+//! view is a derived, filtered projection over squad/task state (see
+//! `Store::queue`), so any event carrying a `squad_id` implies "the queue may
 //! have changed" too — there is no separate queue-specific event kind.
 
 use std::sync::Mutex;
@@ -28,10 +28,10 @@ pub enum EventKind {
     /// Carries a `guardian_id` — a review changed (branches, chat, checks,
     /// merge/rebase state, ...).
     Guardian,
-    /// Carries a `run_id` (no `guardian_id`) — a run/task/session (and, by
+    /// Carries a `squad_id` (no `guardian_id`) — a squad/task/cell (and, by
     /// extension, the queue view) changed.
-    Run,
-    /// Neither — still Cartographer-worthy, but not scoped to one run or
+    Squad,
+    /// Neither — still Cartographer-worthy, but not scoped to one squad or
     /// guardian (e.g. daemon-wide startup recovery events).
     Other,
 }
@@ -41,7 +41,7 @@ impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::Guardian => "guardian",
-            EventKind::Run => "run",
+            EventKind::Squad => "squad",
             EventKind::Other => "other",
         }
     }
@@ -49,8 +49,8 @@ impl EventKind {
     fn for_row(row: &CartographerRow) -> Self {
         if row.guardian_id.is_some() {
             EventKind::Guardian
-        } else if row.run_id.is_some() {
-            EventKind::Run
+        } else if row.squad_id.is_some() {
+            EventKind::Squad
         } else {
             EventKind::Other
         }
@@ -138,7 +138,7 @@ impl EventBus {
 mod tests {
     use super::*;
 
-    fn row(guardian_id: Option<&str>, run_id: Option<&str>) -> CartographerRow {
+    fn row(guardian_id: Option<&str>, squad_id: Option<&str>) -> CartographerRow {
         CartographerRow {
             id: 1,
             at_ms: 0,
@@ -146,9 +146,9 @@ mod tests {
             source: "test".to_string(),
             message: "hi".to_string(),
             scope: None,
-            run_id: run_id.map(str::to_string),
+            squad_id: squad_id.map(str::to_string),
             guardian_id: guardian_id.map(str::to_string),
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
             payload: serde_json::json!({}),
@@ -159,17 +159,17 @@ mod tests {
     fn subscribe_then_publish_delivers_the_event() {
         let bus = EventBus::new();
         let (_id, rx) = bus.subscribe();
-        bus.publish(row(None, Some("run-1")));
+        bus.publish(row(None, Some("squad-1")));
         let event = rx.recv().expect("event delivered");
-        assert_eq!(event.kind, EventKind::Run);
-        assert_eq!(event.row.run_id.as_deref(), Some("run-1"));
+        assert_eq!(event.kind, EventKind::Squad);
+        assert_eq!(event.row.squad_id.as_deref(), Some("squad-1"));
     }
 
     #[test]
-    fn kind_prefers_guardian_over_run() {
+    fn kind_prefers_guardian_over_squad() {
         let bus = EventBus::new();
         let (_id, rx) = bus.subscribe();
-        bus.publish(row(Some("guardian-1"), Some("run-1")));
+        bus.publish(row(Some("guardian-1"), Some("squad-1")));
         let event = rx.recv().unwrap();
         assert_eq!(event.kind, EventKind::Guardian);
     }
@@ -188,7 +188,7 @@ mod tests {
         let bus = EventBus::new();
         let (_id_a, rx_a) = bus.subscribe();
         let (_id_b, rx_b) = bus.subscribe();
-        bus.publish(row(None, Some("run-1")));
+        bus.publish(row(None, Some("squad-1")));
         assert!(rx_a.try_recv().is_ok());
         assert!(rx_b.try_recv().is_ok());
     }
@@ -199,7 +199,7 @@ mod tests {
         let (id, rx) = bus.subscribe();
         bus.unsubscribe(id);
         assert_eq!(bus.subscriber_count(), 0);
-        bus.publish(row(None, Some("run-1")));
+        bus.publish(row(None, Some("squad-1")));
         assert!(rx.try_recv().is_err());
     }
 
@@ -209,7 +209,7 @@ mod tests {
         let (_id, rx) = bus.subscribe();
         drop(rx);
         assert_eq!(bus.subscriber_count(), 1);
-        bus.publish(row(None, Some("run-1")));
+        bus.publish(row(None, Some("squad-1")));
         assert_eq!(bus.subscriber_count(), 0);
     }
 
@@ -218,7 +218,7 @@ mod tests {
         let bus = EventBus::new();
         let (_id, rx) = bus.subscribe();
         for _ in 0..(SUBSCRIBER_CHANNEL_CAPACITY + 10) {
-            bus.publish(row(None, Some("run-1")));
+            bus.publish(row(None, Some("squad-1")));
         }
         assert_eq!(bus.subscriber_count(), 1);
         // Drain what made it through -- must not panic/deadlock, and must be
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn event_kind_as_str_matches_sse_event_names() {
         assert_eq!(EventKind::Guardian.as_str(), "guardian");
-        assert_eq!(EventKind::Run.as_str(), "run");
+        assert_eq!(EventKind::Squad.as_str(), "squad");
         assert_eq!(EventKind::Other.as_str(), "other");
     }
 }

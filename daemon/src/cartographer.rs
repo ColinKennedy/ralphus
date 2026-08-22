@@ -1,10 +1,10 @@
 //! Cartographer: the unified, structured, cross-system event log (RAL-98).
 //!
-//! Every notable thing that happens in the daemon — task/session lifecycle,
-//! verify starts/results, status transitions, Guardian review lifecycle
+//! Every notable thing that happens in the daemon — task/cell lifecycle,
+//! proof starts/results, status transitions, Guardian review lifecycle
 //! events — is recorded here as one row with a timestamp, a human-readable
 //! message, the source location that emitted it, optional entity references
-//! (run/guardian/session/task), and an arbitrary JSON payload.
+//! (squad/guardian/cell/task), and an arbitrary JSON payload.
 //!
 //! Cartographer formally replaces `rlog!` as the primary logging mechanism
 //! (see `AGENTS.md`'s Logging Policy). A human-readable line is still written
@@ -35,15 +35,15 @@ pub struct CartographerRow {
     pub source: String,
     /// Human-readable description of what happened.
     pub message: String,
-    /// Entity scope this event concerns, e.g. `"run"` / `"session"` /
-    /// `"guardian"` / `"verify"`, if any.
+    /// Entity scope this event concerns, e.g. `"squad"` / `"cell"` /
+    /// `"guardian"` / `"proof"`, if any.
     pub scope: Option<String>,
-    /// Owning run id, if any.
-    pub run_id: Option<String>,
+    /// Owning squad id, if any.
+    pub squad_id: Option<String>,
     /// Owning guardian (review) id, if any.
     pub guardian_id: Option<String>,
-    /// Owning session id, if any.
-    pub session_id: Option<String>,
+    /// Owning cell id, if any.
+    pub cell_id: Option<String>,
     /// Owning task name, if any.
     pub task: Option<String>,
     /// Path to an on-disk log file this event references (RAL-155), e.g. a
@@ -62,19 +62,19 @@ pub struct CartographerRow {
 pub struct CartographerFilter {
     /// Exact-match source, e.g. `"scheduler"`.
     pub source: Option<String>,
-    /// Exact-match scope, e.g. `"run"`.
+    /// Exact-match scope, e.g. `"squad"`.
     pub scope: Option<String>,
     /// Exact-match level, e.g. `"error"`.
     pub level: Option<String>,
-    /// Exact-match run id.
-    pub run_id: Option<String>,
+    /// Exact-match squad id.
+    pub squad_id: Option<String>,
     /// Exact-match guardian id.
     pub guardian_id: Option<String>,
-    /// Exact-match session id.
-    pub session_id: Option<String>,
+    /// Exact-match cell id.
+    pub cell_id: Option<String>,
     /// Exact-match task name (RAL-155 Q2). Populated on rows whose emitter
-    /// knew the owning task's name at emit time (most session/verify-scoped
-    /// events do; run-level `Store::log_event`-derived transitions do not).
+    /// knew the owning task's name at emit time (most cell/proof-scoped
+    /// events do; squad-level `Store::log_event`-derived transitions do not).
     pub task: Option<String>,
     /// Substring match against the message (case-insensitive).
     pub q: Option<String>,
@@ -117,17 +117,17 @@ pub struct CartographerPage {
 ///
 /// ```ignore
 /// Note::new("scheduler")
-///     .run(&run_id)
-///     .scope("run")
-///     .emit(&store, format!("run {run_id} claimed → running"), serde_json::json!({}));
+///     .squad(&squad_id)
+///     .scope("squad")
+///     .emit(&store, format!("squad {squad_id} claimed → running"), serde_json::json!({}));
 /// ```
 pub struct Note<'a> {
     source: &'a str,
     level: LogLevel,
     scope: Option<&'a str>,
-    run_id: Option<&'a str>,
+    squad_id: Option<&'a str>,
     guardian_id: Option<&'a str>,
-    session_id: Option<&'a str>,
+    cell_id: Option<&'a str>,
     task: Option<&'a str>,
     log_path: Option<&'a str>,
 }
@@ -141,9 +141,9 @@ impl<'a> Note<'a> {
             source,
             level: LogLevel::INFO,
             scope: None,
-            run_id: None,
+            squad_id: None,
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
         }
@@ -156,17 +156,17 @@ impl<'a> Note<'a> {
         self
     }
 
-    /// Set the entity scope, e.g. `"run"` / `"session"` / `"guardian"`.
+    /// Set the entity scope, e.g. `"squad"` / `"cell"` / `"guardian"`.
     #[must_use]
     pub fn scope(mut self, scope: &'a str) -> Self {
         self.scope = Some(scope);
         self
     }
 
-    /// Attach an owning run id.
+    /// Attach an owning squad id.
     #[must_use]
-    pub fn run(mut self, run_id: &'a str) -> Self {
-        self.run_id = Some(run_id);
+    pub fn squad(mut self, squad_id: &'a str) -> Self {
+        self.squad_id = Some(squad_id);
         self
     }
 
@@ -177,10 +177,10 @@ impl<'a> Note<'a> {
         self
     }
 
-    /// Attach an owning session id.
+    /// Attach an owning cell id.
     #[must_use]
-    pub fn session(mut self, session_id: &'a str) -> Self {
-        self.session_id = Some(session_id);
+    pub fn cell(mut self, cell_id: &'a str) -> Self {
+        self.cell_id = Some(cell_id);
         self
     }
 
@@ -212,9 +212,9 @@ impl<'a> Note<'a> {
             source: self.source,
             message,
             scope: self.scope,
-            run_id: self.run_id,
+            squad_id: self.squad_id,
             guardian_id: self.guardian_id,
-            session_id: self.session_id,
+            cell_id: self.cell_id,
             task: self.task,
             log_path: self.log_path,
             payload,
@@ -229,9 +229,9 @@ pub struct CartographerEntry<'a> {
     pub source: &'a str,
     pub message: &'a str,
     pub scope: Option<&'a str>,
-    pub run_id: Option<&'a str>,
+    pub squad_id: Option<&'a str>,
     pub guardian_id: Option<&'a str>,
-    pub session_id: Option<&'a str>,
+    pub cell_id: Option<&'a str>,
     pub task: Option<&'a str>,
     pub log_path: Option<&'a str>,
     pub payload: serde_json::Value,
@@ -257,12 +257,12 @@ impl Store {
     /// Also broadcasts the row to every connected SSE subscriber via
     /// [`Store::event_bus`] (RAL-167) — this is the single choke point every
     /// Cartographer-instrumented state change already passes through, so it
-    /// gives push coverage for run/task/session/guardian/queue/cartographer
+    /// gives push coverage for squad/task/cell/guardian/queue/cartographer
     /// events without a second, parallel set of instrumentation call sites.
     pub fn cartographer_log(&self, entry: CartographerEntry<'_>) -> Result<()> {
         let at_ms = now_ms();
         self.conn.execute(
-            "INSERT INTO cartographer_events(at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, log_path, payload)
+            "INSERT INTO cartographer_events(at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload)
              VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 at_ms,
@@ -270,9 +270,9 @@ impl Store {
                 entry.source,
                 entry.message,
                 entry.scope,
-                entry.run_id,
+                entry.squad_id,
                 entry.guardian_id,
-                entry.session_id,
+                entry.cell_id,
                 entry.task,
                 entry.log_path,
                 entry.payload.to_string(),
@@ -285,9 +285,9 @@ impl Store {
             source: entry.source.to_string(),
             message: entry.message.to_string(),
             scope: entry.scope.map(str::to_string),
-            run_id: entry.run_id.map(str::to_string),
+            squad_id: entry.squad_id.map(str::to_string),
             guardian_id: entry.guardian_id.map(str::to_string),
-            session_id: entry.session_id.map(str::to_string),
+            cell_id: entry.cell_id.map(str::to_string),
             task: entry.task.map(str::to_string),
             log_path: entry.log_path.map(str::to_string),
             payload: entry.payload,
@@ -311,9 +311,9 @@ impl Store {
         eq_clause!("source", filter.source);
         eq_clause!("scope", filter.scope);
         eq_clause!("level", filter.level);
-        eq_clause!("run_id", filter.run_id);
+        eq_clause!("squad_id", filter.squad_id);
         eq_clause!("guardian_id", filter.guardian_id);
-        eq_clause!("session_id", filter.session_id);
+        eq_clause!("cell_id", filter.cell_id);
         eq_clause!("task", filter.task);
         if let Some(q) = filter.q.as_ref() {
             clauses.push("message LIKE ? ESCAPE '\\'".to_string());
@@ -348,7 +348,7 @@ impl Store {
         let limit = filter.limit.clamp(1, 1000);
         let offset = filter.offset.max(0);
         let sql = format!(
-            "SELECT id, at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, log_path, payload
+            "SELECT id, at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload
              FROM cartographer_events {where_sql}
              ORDER BY at_ms {order}, id {order}
              LIMIT {limit} OFFSET {offset}"
@@ -365,9 +365,9 @@ impl Store {
                     source: r.get(3)?,
                     message: r.get(4)?,
                     scope: r.get(5)?,
-                    run_id: r.get(6)?,
+                    squad_id: r.get(6)?,
                     guardian_id: r.get(7)?,
-                    session_id: r.get(8)?,
+                    cell_id: r.get(8)?,
                     task: r.get(9)?,
                     log_path: r.get(10)?,
                     payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
@@ -413,7 +413,7 @@ impl Store {
     pub fn cartographer_get(&self, id: i64) -> Result<Option<CartographerRow>> {
         self.conn
             .query_row(
-                "SELECT id, at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, log_path, payload
+                "SELECT id, at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload
                  FROM cartographer_events WHERE id = ?",
                 params![id],
                 |r| {
@@ -425,9 +425,9 @@ impl Store {
                         source: r.get(3)?,
                         message: r.get(4)?,
                         scope: r.get(5)?,
-                        run_id: r.get(6)?,
+                        squad_id: r.get(6)?,
                         guardian_id: r.get(7)?,
-                        session_id: r.get(8)?,
+                        cell_id: r.get(8)?,
                         task: r.get(9)?,
                         log_path: r.get(10)?,
                         payload: serde_json::from_str(&payload_str)
@@ -447,9 +447,9 @@ mod tests {
     #[test]
     fn logs_and_queries_a_note() {
         let store = Store::open_in_memory().unwrap();
-        Note::new("scheduler").run("run-1").scope("run").emit(
+        Note::new("scheduler").squad("squad-1").scope("squad").emit(
             &store,
-            "run run-1 claimed",
+            "squad squad-1 claimed",
             serde_json::json!({"foo": "bar"}),
         );
 
@@ -459,7 +459,7 @@ mod tests {
         assert_eq!(page.total, 1);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].source, "scheduler");
-        assert_eq!(page.rows[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(page.rows[0].squad_id.as_deref(), Some("squad-1"));
         assert_eq!(page.rows[0].payload, serde_json::json!({"foo": "bar"}));
     }
 
@@ -467,7 +467,7 @@ mod tests {
     fn log_path_round_trips() {
         let store = Store::open_in_memory().unwrap();
         Note::new("runner")
-            .run("run-1")
+            .squad("squad-1")
             .log_path("/tmp/terminal_logs/sess-a/0000.log")
             .emit(
                 &store,
@@ -487,14 +487,16 @@ mod tests {
     #[test]
     fn filters_by_task() {
         let store = Store::open_in_memory().unwrap();
-        Note::new("scheduler")
-            .run("run-1")
-            .task("build")
-            .emit(&store, "a", serde_json::json!({}));
-        Note::new("scheduler")
-            .run("run-1")
-            .task("test")
-            .emit(&store, "b", serde_json::json!({}));
+        Note::new("scheduler").squad("squad-1").task("build").emit(
+            &store,
+            "a",
+            serde_json::json!({}),
+        );
+        Note::new("scheduler").squad("squad-1").task("test").emit(
+            &store,
+            "b",
+            serde_json::json!({}),
+        );
 
         let filter = CartographerFilter {
             task: Some("build".to_string()),
@@ -507,17 +509,17 @@ mod tests {
     }
 
     #[test]
-    fn filters_by_run_id() {
+    fn filters_by_squad_id() {
         let store = Store::open_in_memory().unwrap();
         Note::new("scheduler")
-            .run("run-1")
+            .squad("squad-1")
             .emit(&store, "a", serde_json::json!({}));
         Note::new("scheduler")
-            .run("run-2")
+            .squad("squad-2")
             .emit(&store, "b", serde_json::json!({}));
 
         let filter = CartographerFilter {
-            run_id: Some("run-1".to_string()),
+            squad_id: Some("squad-1".to_string()),
             limit: 10,
             ..Default::default()
         };
@@ -529,8 +531,8 @@ mod tests {
     #[test]
     fn filters_by_text_query_case_and_wildcard_safe() {
         let store = Store::open_in_memory().unwrap();
-        Note::new("verify").emit(&store, "100% complete", serde_json::json!({}));
-        Note::new("verify").emit(&store, "something else", serde_json::json!({}));
+        Note::new("proof").emit(&store, "100% complete", serde_json::json!({}));
+        Note::new("proof").emit(&store, "something else", serde_json::json!({}));
 
         let filter = CartographerFilter {
             q: Some("100%".to_string()),

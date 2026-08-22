@@ -178,7 +178,7 @@ impl Workspace {
     /// and its combined output.
     ///
     /// Used for a review's check gates. Local workspaces go through
-    /// [`crate::verify::run_command_verify_capture`] exactly as before; remote
+    /// [`crate::proof::run_command_proof_capture`] exactly as before; remote
     /// ones send the command to the provider.
     ///
     /// Distinct from [`Self::git`] because a check gate is an arbitrary shell
@@ -204,7 +204,7 @@ impl Workspace {
         env: &std::collections::BTreeMap<String, String>,
     ) -> (bool, String) {
         match &self.machine {
-            None => crate::verify::run_command_verify_capture(
+            None => crate::proof::run_command_proof_capture(
                 &self.root.to_string_lossy(),
                 command,
                 &opentelemetry::Context::new(),
@@ -339,9 +339,9 @@ impl Workspace {
                 format!("machine \"{machine}\" resolved to the local host unexpectedly")
             })?
         };
-        // These operations belong to no session; the spec exists only to
+        // These operations belong to no cell; the spec exists only to
         // satisfy the invocation shape.
-        let spec = crate::runner::RunnerSpec::for_command_verify(
+        let spec = crate::runner::RunnerSpec::for_command_proof(
             "review-merge",
             "review-merge",
             machine,

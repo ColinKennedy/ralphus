@@ -1,4 +1,4 @@
-//! Integration tests for monorepo (subproject-scoped session) support (RAL-23).
+//! Integration tests for monorepo (subproject-scoped cell) support (RAL-23).
 //!
 //! Tests at two levels:
 //!
@@ -29,8 +29,8 @@ use ralphus_core::schema::TaskFile;
 use ralphus_daemon::guardian_merge::run_merge;
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
-use ralphus_daemon::scheduler::execute_run;
-use ralphus_daemon::store::{RunState, Store};
+use ralphus_daemon::scheduler::execute_squad;
+use ralphus_daemon::store::{SquadState, Store};
 
 // ── Helpers shared by both test levels ───────────────────────────────────────
 
@@ -116,7 +116,7 @@ fn monorepo_with_conflicting_worktrees(base: &Path) -> (String, String, String) 
 
 // ── CapturingRunner ──────────────────────────────────────────────────────────
 
-/// A test runner that immediately marks every session done and records each
+/// A test runner that immediately marks every cell done and records each
 /// `RunnerSpec` it receives. Lets us assert that the system-prompt addendum
 /// was injected without spawning a real subprocess.
 #[derive(Clone, Default)]
@@ -140,7 +140,7 @@ impl Runner for CapturingRunner {
             cost_usd: 0.0,
             summary: "captured".to_string(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id: None,
             ghost: None,
         }
@@ -149,7 +149,7 @@ impl Runner for CapturingRunner {
 
 // ── Pipeline-level tests (always run) ────────────────────────────────────────
 
-/// A session with `subprojects` set must round-trip through submit → store →
+/// A cell with `subprojects` set must round-trip through submit → store →
 /// schedule → run with the subprojects system-prompt addendum present in the
 /// spec delivered to the runner.
 #[test]
@@ -159,7 +159,7 @@ fn subprojects_system_prompt_injected_through_full_pipeline() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nsubprojects=[\"packages/alpha\"]\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nsubprojects=[\"packages/alpha\"]\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -169,23 +169,23 @@ fn subprojects_system_prompt_injected_through_full_pipeline() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done,
-        "run must complete"
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done,
+        "squad must complete"
     );
 
     let specs = runner.captured();
-    assert_eq!(specs.len(), 1, "exactly one session dispatched");
+    assert_eq!(specs.len(), 1, "exactly one cell dispatched");
     let sp = specs[0]
         .system_prompt
         .as_deref()
@@ -202,17 +202,17 @@ fn subprojects_system_prompt_injected_through_full_pipeline() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Two sessions in one task each declare different subprojects. Both must
+/// Two cells in one task each declare different subprojects. Both must
 /// receive independent addenda naming their own package.
 #[test]
-fn two_subprojects_sessions_get_independent_addenda() {
+fn two_subprojects_cells_get_independent_addenda() {
     let base = temp_base("two");
     let repo = monorepo(&base);
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{repo}\"\ncommand=\"echo alpha\"\nsubprojects=[\"packages/alpha\"]\n\
-         [[task.session]]\ncwd=\"{repo}\"\ncommand=\"echo beta\"\nsubprojects=[\"packages/beta\"]\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo alpha\"\nsubprojects=[\"packages/alpha\"]\n\
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo beta\"\nsubprojects=[\"packages/beta\"]\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -222,18 +222,18 @@ fn two_subprojects_sessions_get_independent_addenda() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done
     );
 
     let specs = runner.captured();
@@ -248,13 +248,13 @@ fn two_subprojects_sessions_get_independent_addenda() {
             .as_deref()
             .is_some_and(|sp| sp.contains("packages/beta"))
     });
-    assert!(has_alpha, "alpha session must carry the alpha addendum");
-    assert!(has_beta, "beta session must carry the beta addendum");
+    assert!(has_alpha, "alpha cell must carry the alpha addendum");
+    assert!(has_beta, "beta cell must carry the beta addendum");
 
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A session without `subprojects` must not have a system-prompt injected.
+/// A cell without `subprojects` must not have a system-prompt injected.
 #[test]
 fn no_subprojects_no_injection() {
     let base = temp_base("none");
@@ -262,19 +262,19 @@ fn no_subprojects_no_injection() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.session]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
+    let squad_id = store
         .lock()
         .unwrap()
-        .insert_run(&file, None, false)
+        .insert_squad(&file, None, false)
         .unwrap();
 
     let runner = CapturingRunner::default();
-    execute_run(&store, &runner, &run_id);
+    execute_squad(&store, &runner, &squad_id);
 
     let specs = runner.captured();
     assert_eq!(specs.len(), 1);
@@ -346,7 +346,7 @@ fn pydantic_ai_available(runner_cmd: &str) -> bool {
     false
 }
 
-/// Full monorepo flow: two subproject-scoped sessions in one monorepo repo
+/// Full monorepo flow: two subproject-scoped cells in one monorepo repo
 /// → a review with a merge conflict between their branches → live ollama
 /// agent resolves the conflict. Skips unless ollama + a model + ralphus-runner
 /// are all reachable locally.
@@ -355,7 +355,7 @@ fn pydantic_ai_available(runner_cmd: &str) -> bool {
 ///   cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture
 #[test]
 #[ignore = "calls a live local Ollama model; run explicitly with `cargo test -- --ignored`"]
-fn full_monorepo_flow_with_subproject_sessions() {
+fn full_monorepo_flow_with_subproject_cells() {
     let Some(runner_cmd) = find_runner() else {
         eprintln!("SKIP full_monorepo_flow: ralphus-runner not found (set RALPHUS_RUNNER_CMD)");
         return;
@@ -379,13 +379,13 @@ fn full_monorepo_flow_with_subproject_sessions() {
     let base = temp_base("live");
     let (_repo, cwd_a, cwd_b) = monorepo_with_conflicting_worktrees(&base);
 
-    // 1) Build the ticket TOML: two tasks, each a command session in a worktree
+    // 1) Build the ticket TOML: two tasks, each a command cell in a worktree
     //    of the same monorepo, both scoped to `packages/alpha`.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.session]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.session]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     assert!(
@@ -395,26 +395,27 @@ fn full_monorepo_flow_with_subproject_sessions() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    // 2) Submit and run the tasks. Sessions are command-only, so they succeed
+    // 2) Submit and run the tasks. Cells are command-only, so they succeed
     //    instantly without a real model.
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = {
+    let squad_id = {
         let mut g = store.lock().unwrap();
-        g.insert_run(&file, Some("monorepo-ticket"), false).unwrap()
+        g.insert_squad(&file, Some("monorepo-ticket"), false)
+            .unwrap()
     };
     let ok_runner = SubprocessRunner::new(&runner_cmd);
-    execute_run(&store, &ok_runner, &run_id);
+    execute_squad(&store, &ok_runner, &squad_id);
     assert_eq!(
-        store.lock().unwrap().run_state(&run_id).unwrap(),
-        RunState::Done,
-        "both sessions must succeed"
+        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        SquadState::Done,
+        "both cells must succeed"
     );
 
     // 3) Derive the review: both worktrees are one project (same git root) →
     //    one guardian with two branches.
     let ids = {
         let g = store.lock().unwrap();
-        derive_reviews(&g, &run_id, &file).expect("derive ok")
+        derive_reviews(&g, &squad_id, &file).expect("derive ok")
     };
     assert_eq!(ids.len(), 1, "one git root → one review");
     let gid = ids[0].clone();

@@ -1,8 +1,8 @@
 //! Per-task resource sampling (RAL-11).
 //!
-//! Maps the OS process metrics of each running session's `ralphus-runner`
+//! Maps the OS process metrics of each running cell's `ralphus-runner`
 //! subprocess (CPU%, resident RAM, GPU memory) back to the exact ralphus
-//! run/task/session consuming them, for the board's "Resources" tab.
+//! squad/task/cell consuming them, for the board's "Resources" tab.
 //!
 //! CPU/RAM use no extra crates: on Linux we read `/proc/<pid>/{stat,statm}`
 //! directly; on Windows we shell out to PowerShell's `Get-Process`. CPU% is a
@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::procreg::ProcRegistry;
-use crate::store::RunView;
+use crate::store::SquadView;
 
 /// Interval between the two CPU samples used to compute a percentage.
 const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
@@ -24,18 +24,18 @@ const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 /// One running task's resource usage, as shown in the board's Resources tab.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceRow {
-    /// Owning run id (for the "jump to task" navigation).
-    pub run_id: String,
-    /// Run label, if any (shown alongside the run id).
-    pub run_label: Option<String>,
-    /// Task position within the run (matches the board's task index).
+    /// Owning squad id (for the "jump to task" navigation).
+    pub squad_id: String,
+    /// Squad label, if any (shown alongside the squad id).
+    pub squad_label: Option<String>,
+    /// Task position within the squad (matches the board's task index).
     pub task_idx: usize,
     /// Task name.
     pub task_name: String,
-    /// Session position within the task (matches the board's session index).
-    pub session_idx: usize,
-    /// Session id.
-    pub session_id: String,
+    /// Cell position within the task (matches the board's cell index).
+    pub cell_idx: usize,
+    /// Cell id.
+    pub cell_id: String,
     /// The runner subprocess PID being measured.
     pub pid: u32,
     /// CPU usage as a percentage of one core (may exceed 100 for multi-threaded
@@ -57,39 +57,39 @@ struct ProcSnap {
     mem_bytes: Option<u64>,
 }
 
-/// Build the resource rows for every running session that has a live subprocess,
+/// Build the resource rows for every running cell that has a live subprocess,
 /// sampling CPU/RAM/GPU. Blocks for [`CPU_SAMPLE_INTERVAL`] while measuring CPU,
 /// so callers must not hold the store lock across this call.
 #[must_use]
-pub fn build(runs: &[RunView], procs: &ProcRegistry) -> Vec<ResourceRow> {
-    let mut rows = collect_running(runs, procs);
+pub fn build(squads: &[SquadView], procs: &ProcRegistry) -> Vec<ResourceRow> {
+    let mut rows = collect_running(squads, procs);
     fill_metrics(&mut rows);
     rows
 }
 
-/// Gather the running sessions that currently have a registered PID. Task and
-/// session indices are the enumerate positions the board uses for navigation.
-fn collect_running(runs: &[RunView], procs: &ProcRegistry) -> Vec<ResourceRow> {
+/// Gather the running cells that currently have a registered PID. Task and
+/// cell indices are the enumerate positions the board uses for navigation.
+fn collect_running(squads: &[SquadView], procs: &ProcRegistry) -> Vec<ResourceRow> {
     let mut rows = Vec::new();
-    for run in runs.iter().filter(|r| r.state == "running") {
-        for (task_idx, task) in run.tasks.iter().enumerate() {
+    for squad in squads.iter().filter(|s| s.state == "running") {
+        for (task_idx, task) in squad.tasks.iter().enumerate() {
             if task.state != "running" {
                 continue;
             }
-            for (session_idx, session) in task.sessions.iter().enumerate() {
-                if session.state != "running" {
+            for (cell_idx, cell) in task.cells.iter().enumerate() {
+                if cell.state != "running" {
                     continue;
                 }
-                let Some(pid) = procs.pid_of(&run.id, &session.id) else {
+                let Some(pid) = procs.pid_of(&squad.id, &cell.id) else {
                     continue;
                 };
                 rows.push(ResourceRow {
-                    run_id: run.id.clone(),
-                    run_label: run.label.clone(),
+                    squad_id: squad.id.clone(),
+                    squad_label: squad.label.clone(),
                     task_idx,
                     task_name: task.name.clone(),
-                    session_idx,
-                    session_id: session.id.clone(),
+                    cell_idx,
+                    cell_id: cell.id.clone(),
                     pid,
                     cpu_percent: None,
                     mem_bytes: None,

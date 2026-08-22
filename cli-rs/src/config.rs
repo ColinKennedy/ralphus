@@ -115,7 +115,7 @@ fn type_name(value: &toml::Value) -> &'static str {
 
 fn validate_raw(raw: &toml::Table) -> Vec<String> {
     let mut issues = Vec::new();
-    const KNOWN_TOP: [&str; 4] = ["task", "daemon", "review", "defaults"];
+    const KNOWN_TOP: [&str; 5] = ["task", "daemon", "review", "defaults", "agent"];
     for key in raw.keys() {
         if !KNOWN_TOP.contains(&key.as_str()) {
             issues.push(format!("key \"{key}\" is unknown"));
@@ -248,7 +248,111 @@ fn validate_raw(raw: &toml::Table) -> Vec<String> {
         }
     }
 
+    validate_agent_section(raw, &mut issues);
+
     issues
+}
+
+/// Validate `[agent.profiles.<name>]` (RAL-agent-profile-backend-resolution).
+/// This is a structural lint only -- offline, and without the daemon's
+/// registry, `core` (and this CLI-side checker) can't confirm a profile's
+/// `env.*.from_env` variable is actually set, or (for non-reserved-name
+/// checks) resolve which backends exist beyond the ones baked into
+/// `ralphus_core::schema::RESERVED_AGENT_NAMES`. The authoritative parse +
+/// business rules (backend enum, `raw` requiring `executable`, native
+/// backends rejecting it) live in `daemon::agent_profiles::parse_profile_file`
+/// and run at submit time -- see that module's doc comment on
+/// `RESERVED_AGENT_NAMES` for why the split exists.
+fn validate_agent_section(raw: &toml::Table, issues: &mut Vec<String>) {
+    let Some(agent_raw) = raw.get("agent") else {
+        return;
+    };
+    let Some(agent_table) = agent_raw.as_table() else {
+        issues.push(format!(
+            "key \"agent\" expects a \"table\" but got a \"{}\" type",
+            type_name(agent_raw)
+        ));
+        return;
+    };
+
+    const KNOWN_AGENT: [&str; 1] = ["profiles"];
+    for k in agent_table.keys() {
+        if !KNOWN_AGENT.contains(&k.as_str()) {
+            issues.push(format!("key \"agent.{k}\" is unknown"));
+        }
+    }
+
+    let Some(profiles_raw) = agent_table.get("profiles") else {
+        return;
+    };
+    let Some(profiles_table) = profiles_raw.as_table() else {
+        issues.push(format!(
+            "key \"agent.profiles\" expects a \"table\" but got a \"{}\" type",
+            type_name(profiles_raw)
+        ));
+        return;
+    };
+
+    const KNOWN_PROFILE: [&str; 3] = ["backend", "executable", "env"];
+    for (name, profile_raw) in profiles_table {
+        let path = format!("agent.profiles.{name}");
+        if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&name.as_str()) {
+            issues.push(format!(
+                "key \"{path}\" collides with a reserved built-in backend name"
+            ));
+        }
+        let Some(profile_table) = profile_raw.as_table() else {
+            issues.push(format!(
+                "key \"{path}\" expects a \"table\" but got a \"{}\" type",
+                type_name(profile_raw)
+            ));
+            continue;
+        };
+        for k in profile_table.keys() {
+            if !KNOWN_PROFILE.contains(&k.as_str()) {
+                issues.push(format!("key \"{path}.{k}\" is unknown"));
+            }
+        }
+        match profile_table.get("backend") {
+            None => issues.push(format!("key \"{path}.backend\" is required")),
+            Some(b) if b.as_str().is_none() => issues.push(format!(
+                "key \"{path}.backend\" expects \"string\" but got a \"{}\" type",
+                type_name(b)
+            )),
+            Some(_) => {}
+        }
+        if let Some(exe) = profile_table.get("executable") {
+            if exe.as_str().is_none() {
+                issues.push(format!(
+                    "key \"{path}.executable\" expects \"string\" but got a \"{}\" type",
+                    type_name(exe)
+                ));
+            }
+        }
+        if let Some(env_raw) = profile_table.get("env") {
+            match env_raw.as_table() {
+                None => issues.push(format!(
+                    "key \"{path}.env\" expects \"table\" but got a \"{}\" type",
+                    type_name(env_raw)
+                )),
+                Some(env_table) => {
+                    for (env_key, env_value) in env_table {
+                        let env_path = format!("{path}.env.{env_key}");
+                        let valid = env_value.as_str().is_some()
+                            || env_value.as_table().is_some_and(|t| {
+                                t.get("from_env").is_some_and(toml::Value::is_str)
+                            });
+                        if !valid {
+                            issues.push(format!(
+                                "key \"{env_path}\" expects a string or {{ from_env = \"VAR\" }}, got a \"{}\" type",
+                                type_name(env_value)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn apply_task(base: &TaskConfig, raw: &toml::Table) -> TaskConfig {
@@ -444,6 +548,57 @@ mod tests {
             issues
                 .iter()
                 .any(|i| i.contains("task.maximum_timeout_seconds"))
+        );
+    }
+
+    #[test]
+    fn validate_raw_accepts_well_formed_agent_profile() {
+        let raw: toml::Table = r#"
+[agent.profiles.openrouter-deepseek]
+backend = "claude-code"
+
+[agent.profiles.openrouter-deepseek.env]
+ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
+ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_OPENROUTER_DEEKSEEK_AUTH_TOKEN" }
+"#
+        .parse()
+        .unwrap();
+        let issues = validate_raw(&raw);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn validate_raw_flags_agent_profile_issues() {
+        let raw: toml::Table = r#"
+[agent.profiles.claude]
+backend = "codex"
+
+[agent.profiles.custom]
+executable = "my-runner"
+
+[agent.profiles.custom.env]
+BAD = 5
+"#
+        .parse()
+        .unwrap();
+        let issues = validate_raw(&raw);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("agent.profiles.claude") && i.contains("reserved")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("agent.profiles.custom.backend") && i.contains("required")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("agent.profiles.custom.env.BAD")),
+            "{issues:?}"
         );
     }
 

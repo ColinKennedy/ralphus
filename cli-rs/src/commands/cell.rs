@@ -1,5 +1,5 @@
-//! `ralphus session <subcommand>`, ported from `cli/src/ralphus/__main__.py`'s
-//! `session` group (show/worktree/reviews/set-status/restart/restart-verify/
+//! `ralphus cell <subcommand>`, ported from `cli/src/ralphus/__main__.py`'s
+//! `session` group (show/worktree/reviews/set-status/restart/restart-proof/
 //! edit/terminal).
 
 use serde_json::Value;
@@ -8,10 +8,10 @@ use crate::args::GlobalOpts;
 use crate::client::DaemonClient;
 use crate::commands::{CommandError, emit, run_and_report};
 use crate::flags::Scanner;
-use crate::selector::{ResolvedSelector, SelectorError, resolve_run_selector, run_view_uri};
+use crate::selector::{ResolvedSelector, SelectorError, resolve_squad_selector, squad_view_uri};
 
 #[derive(Debug, Clone)]
-pub enum SessionCommand {
+pub enum CellCommand {
     Help,
     Show {
         selector: String,
@@ -29,7 +29,7 @@ pub enum SessionCommand {
     Restart {
         selector: String,
     },
-    RestartVerify {
+    RestartProof {
         selector: String,
         from: i64,
     },
@@ -49,37 +49,33 @@ pub enum SessionCommand {
 }
 
 #[must_use]
-pub fn parse(args: &[String]) -> SessionCommand {
+pub fn parse(args: &[String]) -> CellCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => SessionCommand::Help,
-        Some("show") => with_selector(scanner, |selector| SessionCommand::Show { selector }),
-        Some("worktree") => {
-            with_selector(scanner, |selector| SessionCommand::Worktree { selector })
-        }
-        Some("reviews") => with_selector(scanner, |selector| SessionCommand::Reviews { selector }),
+        None | Some("help" | "--help" | "-h") => CellCommand::Help,
+        Some("show") => with_selector(scanner, |selector| CellCommand::Show { selector }),
+        Some("worktree") => with_selector(scanner, |selector| CellCommand::Worktree { selector }),
+        Some("reviews") => with_selector(scanner, |selector| CellCommand::Reviews { selector }),
         Some("set-status") => {
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
-                (Some(selector), Some(state)) => SessionCommand::SetStatus {
+                (Some(selector), Some(state)) => CellCommand::SetStatus {
                     selector: selector.clone(),
                     state: state.clone(),
                 },
-                _ => {
-                    SessionCommand::UsageError("set-status requires <selector> <state>".to_string())
-                }
+                _ => CellCommand::UsageError("set-status requires <selector> <state>".to_string()),
             }
         }
-        Some("restart") => with_selector(scanner, |selector| SessionCommand::Restart { selector }),
-        Some("restart-verify") => match scanner.take_parsed::<i64>("--from") {
-            Ok(Some(from)) => with_selector(scanner, |selector| SessionCommand::RestartVerify {
+        Some("restart") => with_selector(scanner, |selector| CellCommand::Restart { selector }),
+        Some("restart-proof") => match scanner.take_parsed::<i64>("--from") {
+            Ok(Some(from)) => with_selector(scanner, |selector| CellCommand::RestartProof {
                 selector,
                 from,
             }),
             Ok(None) => {
-                SessionCommand::UsageError("restart-verify requires --from <index>".to_string())
+                CellCommand::UsageError("restart-proof requires --from <index>".to_string())
             }
-            Err(e) => SessionCommand::UsageError(e.0),
+            Err(e) => CellCommand::UsageError(e.0),
         },
         Some("edit") => {
             let cwd = scanner.take_value("--cwd").ok().flatten();
@@ -87,7 +83,7 @@ pub fn parse(args: &[String]) -> SessionCommand {
             let model = scanner.take_value("--model").ok().flatten();
             let prompt = scanner.take_value("--prompt").ok().flatten();
             let command = scanner.take_value("--command").ok().flatten();
-            with_selector(scanner, |selector| SessionCommand::Edit {
+            with_selector(scanner, |selector| CellCommand::Edit {
                 selector,
                 cwd,
                 agent,
@@ -101,25 +97,22 @@ pub fn parse(args: &[String]) -> SessionCommand {
             let mode = match mode {
                 Some(m) if m == "open" || m == "readonly" => m,
                 Some(other) => {
-                    return SessionCommand::UsageError(format!(
+                    return CellCommand::UsageError(format!(
                         "--mode: invalid choice '{other}' (choose from 'open', 'readonly')"
                     ));
                 }
                 None => "open".to_string(),
             };
-            with_selector(scanner, |selector| SessionCommand::Terminal {
-                selector,
-                mode,
-            })
+            with_selector(scanner, |selector| CellCommand::Terminal { selector, mode })
         }
-        Some(other) => SessionCommand::UsageError(format!("unknown session subcommand: {other}")),
+        Some(other) => CellCommand::UsageError(format!("unknown cell subcommand: {other}")),
     }
 }
 
-fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> SessionCommand) -> SessionCommand {
+fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> CellCommand) -> CellCommand {
     match scanner.remaining().into_iter().next() {
         Some(selector) => make(selector),
-        None => SessionCommand::UsageError("missing required <selector> argument".to_string()),
+        None => CellCommand::UsageError("missing required <selector> argument".to_string()),
     }
 }
 
@@ -130,7 +123,7 @@ fn resolve_scoped(
     selector: &str,
     want_kind: &str,
 ) -> Result<ResolvedSelector, CommandError> {
-    let resolved = resolve_run_selector(client, selector)?;
+    let resolved = resolve_squad_selector(client, selector)?;
     if resolved.kind != want_kind {
         return Err(CommandError::Selector(SelectorError(format!(
             "'{selector}' is a {} selector, not a {want_kind}",
@@ -188,38 +181,39 @@ fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str)
 }
 
 #[must_use]
-pub fn dispatch(cmd: SessionCommand, opts: &GlobalOpts) -> i32 {
+pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
     let client = opts.client();
     match cmd {
-        SessionCommand::Help => {
+        CellCommand::Help => {
             println!(
-                "ralphus session <show|worktree|reviews|set-status|restart|restart-verify|edit|terminal>"
+                "{}",
+                crate::help_map::command_help(&["cell"]).expect("cell help exists")
             );
             0
         }
-        SessionCommand::UsageError(m) => {
+        CellCommand::UsageError(m) => {
             println!("usage error: {m}");
             2
         }
-        SessionCommand::Show { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let run = client.run(&resolved.run_id)?;
-            let uri = run_view_uri(&run, &resolved);
-            let session = with_uri(
-                run["tasks"][resolved.task_idx as usize]["sessions"][resolved.session_idx as usize]
+        CellCommand::Show { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let squad = client.squad(&resolved.squad_id)?;
+            let uri = squad_view_uri(&squad, &resolved);
+            let cell = with_uri(
+                squad["tasks"][resolved.task_idx as usize]["cells"][resolved.cell_idx as usize]
                     .clone(),
                 uri,
             );
-            emit(opts, &session, render_session_detail);
+            emit(opts, &cell, render_cell_detail);
             Ok(())
         }),
-        SessionCommand::Worktree { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let paths = client.run_worktrees(&resolved.run_id)?;
+        CellCommand::Worktree { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let paths = client.squad_worktrees(&resolved.squad_id)?;
             let paths = paths.as_array().cloned().unwrap_or_default();
             let found = paths.iter().find(|p| {
                 p["task_idx"].as_i64() == Some(resolved.task_idx)
-                    && p["session_idx"].as_i64() == Some(resolved.session_idx)
+                    && p["cell_idx"].as_i64() == Some(resolved.cell_idx)
             });
             let Some(found) = found else {
                 return Err(CommandError::Selector(SelectorError(format!(
@@ -238,12 +232,12 @@ pub fn dispatch(cmd: SessionCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
-        SessionCommand::Reviews { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let run = client.run(&resolved.run_id)?;
-            let session = &run["tasks"][resolved.task_idx as usize]["sessions"]
-                [resolved.session_idx as usize];
-            let reviews = session["reviews"].as_array().cloned().unwrap_or_default();
+        CellCommand::Reviews { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let squad = client.squad(&resolved.squad_id)?;
+            let cell =
+                &squad["tasks"][resolved.task_idx as usize]["cells"][resolved.cell_idx as usize];
+            let reviews = cell["reviews"].as_array().cloned().unwrap_or_default();
             let reviews_value = Value::Array(reviews);
             emit(opts, &reviews_value, |rs| {
                 let rs = rs.as_array().cloned().unwrap_or_default();
@@ -261,42 +255,39 @@ pub fn dispatch(cmd: SessionCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
-        SessionCommand::SetStatus { selector, state } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
+        CellCommand::SetStatus { selector, state } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
             let result = client.set_status(
-                &resolved.run_id,
+                &resolved.squad_id,
                 &state,
-                "session",
+                "cell",
                 resolved.task_idx,
-                resolved.session_idx,
+                resolved.cell_idx,
                 -1,
                 "",
             )?;
             emit(opts, &result, |_| println!("{selector} -> {state}"));
             Ok(())
         }),
-        SessionCommand::Restart { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let result = client.restart_session(
-                &resolved.run_id,
-                resolved.task_idx,
-                resolved.session_idx,
-            )?;
+        CellCommand::Restart { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let result =
+                client.restart_cell(&resolved.squad_id, resolved.task_idx, resolved.cell_idx)?;
             emit(opts, &result, render_dirtied);
             Ok(())
         }),
-        SessionCommand::RestartVerify { selector, from } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let result = client.restart_session_verify(
-                &resolved.run_id,
+        CellCommand::RestartProof { selector, from } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let result = client.restart_cell_proof(
+                &resolved.squad_id,
                 resolved.task_idx,
-                resolved.session_idx,
+                resolved.cell_idx,
                 from,
             )?;
             emit(opts, &result, render_dirtied);
             Ok(())
         }),
-        SessionCommand::Edit {
+        CellCommand::Edit {
             selector,
             cwd,
             agent,
@@ -304,11 +295,11 @@ pub fn dispatch(cmd: SessionCommand, opts: &GlobalOpts) -> i32 {
             prompt,
             command,
         } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let result = client.edit_session(
-                &resolved.run_id,
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let result = client.edit_cell(
+                &resolved.squad_id,
                 resolved.task_idx,
-                resolved.session_idx,
+                resolved.cell_idx,
                 cwd.as_deref(),
                 agent.as_deref(),
                 model.as_deref(),
@@ -318,22 +309,22 @@ pub fn dispatch(cmd: SessionCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, |_| println!("{selector} updated"));
             Ok(())
         }),
-        SessionCommand::Terminal { selector, mode } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "session")?;
-            let run = client.run(&resolved.run_id)?;
-            let session = run["tasks"][resolved.task_idx as usize]["sessions"]
-                [resolved.session_idx as usize]
+        CellCommand::Terminal { selector, mode } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let squad = client.squad(&resolved.squad_id)?;
+            let cell = squad["tasks"][resolved.task_idx as usize]["cells"]
+                [resolved.cell_idx as usize]
                 .clone();
-            let agent_session_id = session["agent_session_id"]
+            let agent_session_id = cell["agent_session_id"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
             if agent_session_id.is_empty() {
                 return Err(CommandError::Selector(SelectorError(format!(
-                    "no agent_session_id available for '{selector}' -- the session may not have completed yet"
+                    "no agent_session_id available for '{selector}' -- the cell may not have completed yet"
                 ))));
             }
-            emit(opts, &session, |s| {
+            emit(opts, &cell, |s| {
                 let cmd = agent_resume_command(s["agent"].as_str(), &agent_session_id, &mode);
                 crate::output::print_kv(&[
                     ("cwd", s["cwd"].as_str().unwrap_or("-").to_string()),
@@ -345,7 +336,7 @@ pub fn dispatch(cmd: SessionCommand, opts: &GlobalOpts) -> i32 {
     }
 }
 
-fn render_session_detail(s: &Value) {
+fn render_cell_detail(s: &Value) {
     let prompt = s["prompt"].as_str().filter(|p| !p.is_empty());
     let (label, value) = match prompt {
         Some(p) => ("prompt", p.to_string()),
@@ -366,8 +357,8 @@ fn render_session_detail(s: &Value) {
         ("tokens_out", s["tokens_out"].to_string()),
         (label, value),
     ]);
-    for (vi, v) in s["verify"].as_array().into_iter().flatten().enumerate() {
-        println!("  verify/{vi}  {}  {}", v["kind"], v["state"]);
+    for (vi, v) in s["proof"].as_array().into_iter().flatten().enumerate() {
+        println!("  proof/{vi}  {}  {}", v["kind"], v["state"]);
     }
 }
 
@@ -375,7 +366,7 @@ fn render_dirtied(result: &Value) {
     println!("state: {}", result["state"]);
     let dirtied = result["dirtied"].as_array().cloned().unwrap_or_default();
     if !dirtied.is_empty() {
-        println!("dirtied downstream runs:");
+        println!("dirtied downstream squads:");
         for d in &dirtied {
             println!("  {d}");
         }
@@ -392,25 +383,25 @@ mod tests {
 
     #[test]
     fn parses_show_with_selector() {
-        match parse(&v(&["show", "run-1/build/0"])) {
-            SessionCommand::Show { selector } => assert_eq!(selector, "run-1/build/0"),
+        match parse(&v(&["show", "squad-1/build/0"])) {
+            CellCommand::Show { selector } => assert_eq!(selector, "squad-1/build/0"),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
     fn parses_worktree() {
-        match parse(&v(&["worktree", "run-1/build/0"])) {
-            SessionCommand::Worktree { selector } => assert_eq!(selector, "run-1/build/0"),
+        match parse(&v(&["worktree", "squad-1/build/0"])) {
+            CellCommand::Worktree { selector } => assert_eq!(selector, "squad-1/build/0"),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
     fn parses_set_status_positional_pair() {
-        match parse(&v(&["set-status", "run-1/build/0", "done"])) {
-            SessionCommand::SetStatus { selector, state } => {
-                assert_eq!(selector, "run-1/build/0");
+        match parse(&v(&["set-status", "squad-1/build/0", "done"])) {
+            CellCommand::SetStatus { selector, state } => {
+                assert_eq!(selector, "squad-1/build/0");
                 assert_eq!(state, "done");
             }
             other => panic!("unexpected: {other:?}"),
@@ -418,10 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_restart_verify_with_from_flag() {
-        match parse(&v(&["restart-verify", "run-1/build/0", "--from", "1"])) {
-            SessionCommand::RestartVerify { selector, from } => {
-                assert_eq!(selector, "run-1/build/0");
+    fn parses_restart_proof_with_from_flag() {
+        match parse(&v(&["restart-proof", "squad-1/build/0", "--from", "1"])) {
+            CellCommand::RestartProof { selector, from } => {
+                assert_eq!(selector, "squad-1/build/0");
                 assert_eq!(from, 1);
             }
             other => panic!("unexpected: {other:?}"),
@@ -432,19 +423,19 @@ mod tests {
     fn parses_edit_with_optional_flags() {
         match parse(&v(&[
             "edit",
-            "run-1/build/0",
+            "squad-1/build/0",
             "--agent",
             "claude",
             "--command",
             "echo hi",
         ])) {
-            SessionCommand::Edit {
+            CellCommand::Edit {
                 selector,
                 agent,
                 command,
                 ..
             } => {
-                assert_eq!(selector, "run-1/build/0");
+                assert_eq!(selector, "squad-1/build/0");
                 assert_eq!(agent.as_deref(), Some("claude"));
                 assert_eq!(command.as_deref(), Some("echo hi"));
             }
@@ -454,9 +445,9 @@ mod tests {
 
     #[test]
     fn parses_terminal_default_mode() {
-        match parse(&v(&["terminal", "run-1/build/0"])) {
-            SessionCommand::Terminal { selector, mode } => {
-                assert_eq!(selector, "run-1/build/0");
+        match parse(&v(&["terminal", "squad-1/build/0"])) {
+            CellCommand::Terminal { selector, mode } => {
+                assert_eq!(selector, "squad-1/build/0");
                 assert_eq!(mode, "open");
             }
             other => panic!("unexpected: {other:?}"),
@@ -465,8 +456,8 @@ mod tests {
 
     #[test]
     fn parses_terminal_readonly_mode() {
-        match parse(&v(&["terminal", "run-1/build/0", "--mode", "readonly"])) {
-            SessionCommand::Terminal { mode, .. } => assert_eq!(mode, "readonly"),
+        match parse(&v(&["terminal", "squad-1/build/0", "--mode", "readonly"])) {
+            CellCommand::Terminal { mode, .. } => assert_eq!(mode, "readonly"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -474,8 +465,8 @@ mod tests {
     #[test]
     fn terminal_rejects_invalid_mode() {
         matches!(
-            parse(&v(&["terminal", "run-1/build/0", "--mode", "bogus"])),
-            SessionCommand::UsageError(_)
+            parse(&v(&["terminal", "squad-1/build/0", "--mode", "bogus"])),
+            CellCommand::UsageError(_)
         );
     }
 
@@ -499,11 +490,11 @@ mod tests {
 
     #[test]
     fn missing_selector_is_usage_error() {
-        matches!(parse(&v(&["show"])), SessionCommand::UsageError(_));
+        matches!(parse(&v(&["show"])), CellCommand::UsageError(_));
     }
 
     #[test]
-    fn bare_session_is_help() {
-        matches!(parse(&v(&[])), SessionCommand::Help);
+    fn bare_cell_is_help() {
+        matches!(parse(&v(&[])), CellCommand::Help);
     }
 }

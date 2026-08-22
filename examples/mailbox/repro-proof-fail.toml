@@ -1,0 +1,25 @@
+# RAL-241 manual-verification repro: a cell whose own command succeeds, but
+# whose attached command-kind proof exits nonzero.
+#
+# Before this fix, a cell body succeeding masked a failing proof from the
+# escalation mailbox entirely -- the daemon's scheduler only ever broadcast
+# an `urgent` message from the cell body's own outcome
+# (daemon/src/scheduler.rs::enqueue_cell_failure_mailbox), never from a
+# proof step that ran afterward. The cell below intentionally exercises that
+# gap: `command` succeeds, its proof does not.
+#
+# Usage:
+#   ralphus submit examples/mailbox/repro-proof-fail.toml
+#   ralphus mailbox check
+#   # (or, from a `ralphus quick-start watcher claude-code`/`codex` session,
+#   # just wait for its next turn-boundary `ralphus mailbox check` to surface it)
+
+[[task]]
+name = "mailbox-repro-proof-fail"
+
+[[task.cell]]
+cwd = "."
+command = "exit 0"
+
+[[task.cell.proof]]
+command = "exit 1"

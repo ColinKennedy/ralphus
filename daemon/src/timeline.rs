@@ -1,13 +1,13 @@
-//! RAL-155: the unified, chronological "uber-log-viewer" for a whole Run.
+//! RAL-155: the unified, chronological "uber-log-viewer" for a whole Squad.
 //!
-//! Merges everything Cartographer already knows about a run — state
-//! transitions (`Store::set_run_state`/`set_task_state`/`set_session_state`/
-//! `set_verify_state` all already emit Cartographer rows, see
+//! Merges everything Cartographer already knows about a squad — state
+//! transitions (`Store::set_squad_state`/`set_task_state`/`set_cell_state`/
+//! `set_proof_state` all already emit Cartographer rows, see
 //! `AGENTS.md`'s Logging Policy) and every other Cartographer event scoped to
 //! it — with the durable per-attempt terminal-log content referenced by
 //! `crate::terminal_log`-writing rows (see [`crate::cartographer::Note::log_path`]),
 //! into one time-ordered narrative. "Task-Run" in the ticket's title turned
-//! out to mean the whole Run (all its tasks/sessions/verifies), not a
+//! out to mean the whole Squad (all its tasks/cells/proofs), not a
 //! separate entity — see the ticket's Q1.
 //!
 //! **Ordering / tie-break rule** (the ticket's Risk #1): entries sort by
@@ -20,11 +20,11 @@
 //! documented, deliberate approximation rather than an attempt at more
 //! precision than the data supports.
 //!
-//! **Pruning gaps** (Risk #3): `Store::insert_run` always logs a `"run
+//! **Pruning gaps** (Risk #3): `Store::insert_squad` always logs a `"squad
 //! inserted"` Cartographer row synchronously at submit time, so its absence
-//! from a run's returned rows is a reliable signal that Cartographer's
+//! from a squad's returned rows is a reliable signal that Cartographer's
 //! retention pruning (`cartographer_prune`) has already removed some of this
-//! run's earlier history. [`RunTimelineMeta::gaps_possible`] surfaces that
+//! squad's earlier history. [`SquadTimelineMeta::gaps_possible`] surfaces that
 //! rather than silently presenting a partial timeline as complete (Q6:
 //! best-effort, no obligation to reconstruct pruned history).
 //!
@@ -32,10 +32,10 @@
 //! conservative defaults): [`MAX_EVENTS`] bounds how many Cartographer rows
 //! one timeline pulls in, and [`MAX_LOG_EXCERPT_LINES`] bounds how much of
 //! each referenced terminal-log file is inlined, so one long-running or
-//! multi-session run can't produce an unusably large merged file.
+//! multi-cell squad can't produce an unusably large merged file.
 //!
 //! The generated file is a temp artifact (Q5), rewritten on every call under
-//! a fixed per-run path in the OS temp directory — never intended to persist
+//! a fixed per-squad path in the OS temp directory — never intended to persist
 //! long-term.
 
 use serde::Serialize;
@@ -45,7 +45,7 @@ use crate::store::{Result, Store};
 
 /// Conservative cap on how many Cartographer rows one timeline pulls in.
 /// `crate::cartographer::cartographer_query` itself clamps a single page to
-/// 1000, so this is paginated internally (see [`build_run_timeline`]).
+/// 1000, so this is paginated internally (see [`build_squad_timeline`]).
 const MAX_EVENTS: i64 = 2000;
 /// Page size for the internal pagination loop.
 const PAGE_SIZE: i64 = 500;
@@ -54,11 +54,11 @@ const PAGE_SIZE: i64 = 500;
 const MAX_LOG_EXCERPT_LINES: usize = 200;
 
 /// Metadata describing one generated timeline (RAL-155 AC: "structured JSON
-/// ... including relevant metadata (run id, task id, time range, source
+/// ... including relevant metadata (squad id, task id, time range, source
 /// counts)").
 #[derive(Debug, Clone, Serialize)]
-pub struct RunTimelineMeta {
-    pub run_id: String,
+pub struct SquadTimelineMeta {
+    pub squad_id: String,
     /// When this timeline was generated (Unix epoch milliseconds).
     pub generated_at_ms: i64,
     /// Earliest entry's `at_ms`, if any.
@@ -69,29 +69,29 @@ pub struct RunTimelineMeta {
     pub event_count: i64,
     /// How many of those rows reference a terminal-log file.
     pub terminal_log_count: i64,
-    /// Task count from the run's current structure (not derived from the
+    /// Task count from the squad's current structure (not derived from the
     /// possibly-pruned event history).
     pub task_count: i64,
-    /// Session count from the run's current structure.
-    pub session_count: i64,
+    /// Cell count from the squad's current structure.
+    pub cell_count: i64,
     /// `true` if [`MAX_EVENTS`] was hit — the timeline is a prefix, not the
     /// full history.
     pub truncated: bool,
-    /// `true` if the run's own `"run inserted"` inaugural Cartographer row is
+    /// `true` if the squad's own `"squad inserted"` inaugural Cartographer row is
     /// missing from the returned rows, meaning retention pruning has already
-    /// removed some of this run's earlier history (best-effort, Q6).
+    /// removed some of this squad's earlier history (best-effort, Q6).
     pub gaps_possible: bool,
 }
 
 /// One entry in the merged timeline.
 #[derive(Debug, Clone, Serialize)]
-pub struct RunTimelineEntry {
+pub struct SquadTimelineEntry {
     pub at_ms: i64,
     pub level: String,
     pub source: String,
     pub scope: Option<String>,
     pub task: Option<String>,
-    pub session_id: Option<String>,
+    pub cell_id: Option<String>,
     pub message: String,
     /// Path to a referenced terminal-log file, if this entry has one.
     pub log_path: Option<String>,
@@ -102,11 +102,11 @@ pub struct RunTimelineEntry {
     pub log_excerpt: Option<String>,
 }
 
-/// A generated, merged chronological view of one run.
+/// A generated, merged chronological view of one squad.
 #[derive(Debug, Clone, Serialize)]
-pub struct RunTimeline {
-    pub meta: RunTimelineMeta,
-    pub entries: Vec<RunTimelineEntry>,
+pub struct SquadTimeline {
+    pub meta: SquadTimelineMeta,
+    pub entries: Vec<SquadTimelineEntry>,
     /// The same content as `entries`, rendered as plain text — identical to
     /// what was written to `file_path`.
     pub text: String,
@@ -116,17 +116,17 @@ pub struct RunTimeline {
     pub file_path: String,
 }
 
-/// Build the merged, chronological timeline for `run_id`. `NotFound` if the
-/// run doesn't exist (mirrors every other run-scoped `Store` accessor).
-pub fn build_run_timeline(store: &Store, run_id: &str) -> Result<RunTimeline> {
-    let run = store.get_run(run_id)?;
-    let session_count: i64 = run.tasks.iter().map(|t| t.sessions.len() as i64).sum();
+/// Build the merged, chronological timeline for `squad_id`. `NotFound` if the
+/// squad doesn't exist (mirrors every other squad-scoped `Store` accessor).
+pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeline> {
+    let squad = store.get_squad(squad_id)?;
+    let cell_count: i64 = squad.tasks.iter().map(|t| t.cells.len() as i64).sum();
 
     let mut rows = Vec::new();
     let mut offset = 0i64;
     let total = loop {
         let filter = CartographerFilter {
-            run_id: Some(run_id.to_string()),
+            squad_id: Some(squad_id.to_string()),
             limit: PAGE_SIZE,
             offset,
             ascending: true,
@@ -141,7 +141,7 @@ pub fn build_run_timeline(store: &Store, run_id: &str) -> Result<RunTimeline> {
             break total;
         }
     };
-    let gaps_possible = !rows.iter().any(|r| r.message == "run inserted");
+    let gaps_possible = !rows.iter().any(|r| r.message == "squad inserted");
     let truncated = (rows.len() as i64) < total;
     rows.truncate(MAX_EVENTS as usize);
 
@@ -149,17 +149,17 @@ pub fn build_run_timeline(store: &Store, run_id: &str) -> Result<RunTimeline> {
     let start_ms = rows.first().map(|r| r.at_ms);
     let end_ms = rows.last().map(|r| r.at_ms);
 
-    let entries: Vec<RunTimelineEntry> = rows
+    let entries: Vec<SquadTimelineEntry> = rows
         .into_iter()
         .map(|r| {
             let log_excerpt = r.log_path.as_deref().and_then(read_log_excerpt);
-            RunTimelineEntry {
+            SquadTimelineEntry {
                 at_ms: r.at_ms,
                 level: r.level,
                 source: r.source,
                 scope: r.scope,
                 task: r.task,
-                session_id: r.session_id,
+                cell_id: r.cell_id,
                 message: r.message,
                 log_path: r.log_path,
                 log_excerpt,
@@ -168,23 +168,23 @@ pub fn build_run_timeline(store: &Store, run_id: &str) -> Result<RunTimeline> {
         .collect();
 
     let generated_at_ms = crate::store::now_ms();
-    let meta = RunTimelineMeta {
-        run_id: run_id.to_string(),
+    let meta = SquadTimelineMeta {
+        squad_id: squad_id.to_string(),
         generated_at_ms,
         start_ms,
         end_ms,
         event_count: entries.len() as i64,
         terminal_log_count,
-        task_count: run.tasks.len() as i64,
-        session_count,
+        task_count: squad.tasks.len() as i64,
+        cell_count,
         truncated,
         gaps_possible,
     };
 
     let text = render_text(&meta, &entries);
-    let file_path = write_temp_file(run_id, &text);
+    let file_path = write_temp_file(squad_id, &text);
 
-    Ok(RunTimeline {
+    Ok(SquadTimeline {
         meta,
         entries,
         text,
@@ -200,24 +200,24 @@ fn read_log_excerpt(path: &str) -> Option<String> {
     Some(crate::runner::tail_lines(&content, MAX_LOG_EXCERPT_LINES))
 }
 
-fn render_text(meta: &RunTimelineMeta, entries: &[RunTimelineEntry]) -> String {
+fn render_text(meta: &SquadTimelineMeta, entries: &[SquadTimelineEntry]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "=== ralphus uber-log timeline: run {} ===\n",
-        meta.run_id
+        "=== ralphus uber-log timeline: squad {} ===\n",
+        meta.squad_id
     ));
     out.push_str(&format!(
-        "generated={} events={} (truncated={}) terminal_logs={} tasks={} sessions={}\n",
+        "generated={} events={} (truncated={}) terminal_logs={} tasks={} cells={}\n",
         format_ts(meta.generated_at_ms),
         meta.event_count,
         meta.truncated,
         meta.terminal_log_count,
         meta.task_count,
-        meta.session_count,
+        meta.cell_count,
     ));
     if meta.gaps_possible {
         out.push_str(
-            "NOTE: this run's earliest Cartographer history appears to have been pruned \
+            "NOTE: this squad's earliest Cartographer history appears to have been pruned \
              (retention_days/max_rows) — this timeline is best-effort, not guaranteed complete.\n",
         );
     }
@@ -229,7 +229,7 @@ fn render_text(meta: &RunTimelineMeta, entries: &[RunTimelineEntry]) -> String {
     out
 }
 
-fn render_entry(entry: &RunTimelineEntry) -> String {
+fn render_entry(entry: &SquadTimelineEntry) -> String {
     let mut ctx = Vec::new();
     if let Some(scope) = &entry.scope {
         ctx.push(format!("scope={scope}"));
@@ -237,8 +237,8 @@ fn render_entry(entry: &RunTimelineEntry) -> String {
     if let Some(task) = &entry.task {
         ctx.push(format!("task={task}"));
     }
-    if let Some(sid) = &entry.session_id {
-        ctx.push(format!("session={sid}"));
+    if let Some(sid) = &entry.cell_id {
+        ctx.push(format!("cell={sid}"));
     }
     let ctx_str = if ctx.is_empty() {
         String::new()
@@ -271,22 +271,22 @@ fn format_ts(at_ms: i64) -> String {
         .unwrap_or_else(|| at_ms.to_string())
 }
 
-/// Write the rendered timeline to a fixed, per-run path in the OS temp
+/// Write the rendered timeline to a fixed, per-squad path in the OS temp
 /// directory (RAL-155 Q5: a temp artifact, rewritten on every generation, not
 /// required to persist long-term). Best-effort: a write failure is logged but
 /// never fails the request — the caller still gets `text`/`entries` back.
 ///
 /// Writes to a unique-per-call sibling path first and renames it into place,
 /// rather than writing `path` directly — `std::fs::write` is not atomic, so
-/// two overlapping generations for the same run (e.g. two quick "Timeline"
+/// two overlapping generations for the same squad (e.g. two quick "Timeline"
 /// clicks) could otherwise interleave and leave a reader observing a torn or
 /// empty file. Rename is atomic on both POSIX and Windows.
-fn write_temp_file(run_id: &str, text: &str) -> String {
+fn write_temp_file(squad_id: &str, text: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!("ralphus-timeline-{run_id}.log"));
+    let path = std::env::temp_dir().join(format!("ralphus-timeline-{squad_id}.log"));
     let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp_path = std::env::temp_dir().join(format!(
-        "ralphus-timeline-{run_id}.{}.{unique}.tmp",
+        "ralphus-timeline-{squad_id}.{}.{unique}.tmp",
         std::process::id()
     ));
     if let Err(e) = std::fs::write(&tmp_path, text).and_then(|()| std::fs::rename(&tmp_path, &path))
@@ -301,10 +301,10 @@ fn write_temp_file(run_id: &str, text: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Every `Store::open_in_memory()` used in tests starts its run-id sequence
-/// over from `run-000000000001`, so two tests that each seed a fresh store
+/// Every `Store::open_in_memory()` used in tests starts its squad-id sequence
+/// over from `squad-000000000001`, so two tests that each seed a fresh store
 /// collide on the exact same `write_temp_file` OS path when cargo runs them
-/// concurrently (the default). Any test that calls `build_run_timeline` --
+/// concurrently (the default). Any test that calls `build_squad_timeline` --
 /// here or in `server.rs`'s matching route test -- must hold this lock for
 /// its duration so those writes (and any read-back of the resulting file)
 /// never interleave with one another.
@@ -319,56 +319,61 @@ mod tests {
     const SAMPLE: &str = r#"
 [[task]]
 name = "build"
-[[task.session]]
+[[task.cell]]
 id = "worker"
 cwd = "/repo"
 prompt = "make it build"
 "#;
 
-    fn seeded_run() -> (Store, String) {
+    fn seeded_squad() -> (Store, String) {
         let mut store = Store::open_in_memory().unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(SAMPLE).expect("valid toml");
-        let run_id = store.insert_run(&file, None, false).unwrap();
-        (store, run_id)
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        (store, squad_id)
     }
 
     #[test]
-    fn unknown_run_is_not_found() {
+    fn unknown_squad_is_not_found() {
         let store = Store::open_in_memory().unwrap();
-        assert!(build_run_timeline(&store, "nope").is_err());
+        assert!(build_squad_timeline(&store, "nope").is_err());
     }
 
     #[test]
-    fn includes_the_run_inserted_event_and_reports_no_gaps() {
+    fn includes_the_squad_inserted_event_and_reports_no_gaps() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        let (store, run_id) = seeded_run();
-        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let (store, squad_id) = seeded_squad();
+        let timeline = build_squad_timeline(&store, &squad_id).unwrap();
         assert!(!timeline.meta.gaps_possible);
-        assert!(timeline.entries.iter().any(|e| e.message == "run inserted"));
+        assert!(
+            timeline
+                .entries
+                .iter()
+                .any(|e| e.message == "squad inserted")
+        );
         assert_eq!(timeline.meta.task_count, 1);
-        assert_eq!(timeline.meta.session_count, 1);
-        assert!(timeline.text.contains(&run_id));
+        assert_eq!(timeline.meta.cell_count, 1);
+        assert!(timeline.text.contains(&squad_id));
     }
 
     #[test]
     fn detects_pruning_gaps_when_the_inaugural_event_is_missing() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        let (store, run_id) = seeded_run();
+        let (store, squad_id) = seeded_squad();
         // Simulate retention pruning having removed the earliest row.
         store.cartographer_prune(0, 0).ok(); // no-op caps, seed more first
         Note::new("scheduler")
-            .run(&run_id)
+            .squad(&squad_id)
             .emit(&store, "later event", serde_json::json!({}));
         // Prune down to just the newest row.
         store.cartographer_prune(0, 1).unwrap();
-        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let timeline = build_squad_timeline(&store, &squad_id).unwrap();
         assert!(timeline.meta.gaps_possible);
     }
 
     #[test]
     fn inlines_terminal_log_excerpt_from_log_path() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        let (store, run_id) = seeded_run();
+        let (store, squad_id) = seeded_squad();
         let dir =
             std::env::temp_dir().join(format!("ralphus-timeline-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -376,7 +381,7 @@ prompt = "make it build"
         std::fs::write(&log_file, "hello from the pane\nsecond line").unwrap();
 
         Note::new("runner")
-            .run(&run_id)
+            .squad(&squad_id)
             .scope("terminal_log")
             .log_path(log_file.to_str().unwrap())
             .emit(
@@ -385,7 +390,7 @@ prompt = "make it build"
                 serde_json::json!({}),
             );
 
-        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let timeline = build_squad_timeline(&store, &squad_id).unwrap();
         let entry = timeline
             .entries
             .iter()
@@ -403,9 +408,9 @@ prompt = "make it build"
     #[test]
     fn missing_log_file_is_best_effort_none() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        let (store, run_id) = seeded_run();
+        let (store, squad_id) = seeded_squad();
         Note::new("runner")
-            .run(&run_id)
+            .squad(&squad_id)
             .scope("terminal_log")
             .log_path("/does/not/exist.log")
             .emit(
@@ -414,7 +419,7 @@ prompt = "make it build"
                 serde_json::json!({}),
             );
 
-        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let timeline = build_squad_timeline(&store, &squad_id).unwrap();
         let entry = timeline
             .entries
             .iter()
@@ -426,8 +431,8 @@ prompt = "make it build"
     #[test]
     fn writes_a_temp_file_containing_the_rendered_text() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        let (store, run_id) = seeded_run();
-        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let (store, squad_id) = seeded_squad();
+        let timeline = build_squad_timeline(&store, &squad_id).unwrap();
         let on_disk = std::fs::read_to_string(&timeline.file_path).unwrap();
         assert_eq!(on_disk, timeline.text);
     }
@@ -435,15 +440,15 @@ prompt = "make it build"
     #[test]
     fn entries_are_sorted_ascending_by_at_ms_then_id() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        let (store, run_id) = seeded_run();
+        let (store, squad_id) = seeded_squad();
         for i in 0..5 {
-            Note::new("scheduler").run(&run_id).emit(
+            Note::new("scheduler").squad(&squad_id).emit(
                 &store,
                 format!("event {i}"),
                 serde_json::json!({}),
             );
         }
-        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let timeline = build_squad_timeline(&store, &squad_id).unwrap();
         let at_ms: Vec<i64> = timeline.entries.iter().map(|e| e.at_ms).collect();
         let mut sorted = at_ms.clone();
         sorted.sort_unstable();

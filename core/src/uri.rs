@@ -1,13 +1,13 @@
 //! The ralphus URI scheme (RAL-188): one self-describing way to address any
-//! run/task/session/verify or review entity, readable cold by a human or an AI
+//! squad/task/cell/proof or review entity, readable cold by a human or an AI
 //! agent.
 //!
 //! ```text
-//! ralphus:/RUN[<label>]                                                        ?id=<run_id>
-//! ralphus:/RUN[<label>]/TASK[<name>]                                           ?id=<run_id>
-//! ralphus:/RUN[<label>]/TASK[<name>]/VERIFY[<name-or-~index>]                  ?id=<run_id>
-//! ralphus:/RUN[<label>]/TASK[<name>]/SESSION[<name>]                           ?id=<run_id>
-//! ralphus:/RUN[<label>]/TASK[<name>]/SESSION[<name>]/VERIFY[<name-or-~index>]  ?id=<run_id>
+//! ralphus:/SQUAD[<label>]                                                     ?id=<squad_id>
+//! ralphus:/SQUAD[<label>]/TASK[<name>]                                        ?id=<squad_id>
+//! ralphus:/SQUAD[<label>]/TASK[<name>]/PROOF[<name-or-~index>]                ?id=<squad_id>
+//! ralphus:/SQUAD[<label>]/TASK[<name>]/CELL[<name>]                           ?id=<squad_id>
+//! ralphus:/SQUAD[<label>]/TASK[<name>]/CELL[<name>]/PROOF[<name-or-~index>]   ?id=<squad_id>
 //! ralphus:/REVIEW[<name>]                                                      ?id=<guardian_id>
 //! ralphus:/REVIEW[<name>]?id=<guardian_id>&combined
 //! ralphus:/REVIEW[<name>]?id=<guardian_id>&worktree=<branch-id-or-name-or-~index>
@@ -29,8 +29,8 @@
 //! 3. **`?id=` is the disambiguator** — formally optional, always emitted by
 //!    anything ralphus itself produces, and authoritative when present.
 //! 4. **A positional index uses a [`INDEX_SIGIL_TOKEN`] (`~`) sigil**
-//!    (`VERIFY[~0]`, `?worktree=~2`), so a name and an index can never be
-//!    confused. A bare `VERIFY[0]` addresses a verify step *named* `0`.
+//!    (`PROOF[~0]`, `?worktree=~2`), so a name and an index can never be
+//!    confused. A bare `PROOF[0]` addresses a proof step *named* `0`.
 //! 5. **Balanced groups are extracted before the path is split on `/`**, so
 //!    `REVIEW[RAL-174/175 batch]` — a literal `/` inside a label — still parses.
 //!
@@ -59,16 +59,16 @@ pub const SCHEME: &str = "ralphus:";
 pub const VALUE_OPEN_TOKEN: char = '[';
 /// Closes a segment's bracketed value: the `]` of `TASK[ral-178]`.
 pub const VALUE_CLOSE_TOKEN: char = ']';
-/// Separates one path segment from the next: the `/` of `RUN[r]/TASK[t]`.
+/// Separates one path segment from the next: the `/` of `SQUAD[r]/TASK[t]`.
 pub const SEGMENT_SEPARATOR_TOKEN: char = '/';
-/// Starts the query string: the `?` of `RUN[r]?id=run-1`.
+/// Starts the query string: the `?` of `SQUAD[r]?id=squad-1`.
 pub const QUERY_OPEN_TOKEN: char = '?';
 /// Separates one query pair from the next: the `&` of `?id=g-1&combined`.
 pub const QUERY_PAIR_SEPARATOR_TOKEN: char = '&';
-/// Separates a query key from its value: the `=` of `?id=run-1`.
+/// Separates a query key from its value: the `=` of `?id=squad-1`.
 pub const QUERY_ASSIGN_TOKEN: char = '=';
 /// Introduces a **positional index** rather than a name: the `~` of
-/// `VERIFY[~0]` and `?worktree=~2`.
+/// `PROOF[~0]` and `?worktree=~2`.
 ///
 /// Deliberately an RFC 3986 *unreserved* character. The scheme originally used
 /// `#`, which is the fragment delimiter — a raw one truncates the URI wherever
@@ -93,7 +93,7 @@ const SEGMENT_SEPARATOR_BYTE: u8 = SEGMENT_SEPARATOR_TOKEN as u8;
 const PERCENT_BYTE: u8 = PERCENT_TOKEN as u8;
 
 /// Every segment type the grammar knows about.
-pub const KINDS: [&str; 5] = ["RUN", "TASK", "SESSION", "VERIFY", "REVIEW"];
+pub const KINDS: [&str; 5] = ["SQUAD", "TASK", "CELL", "PROOF", "REVIEW"];
 
 /// Every query key the grammar knows about. Unknown keys are rejected rather
 /// than ignored, so a typo (`?di=`) surfaces instead of silently addressing the
@@ -101,13 +101,13 @@ pub const KINDS: [&str; 5] = ["RUN", "TASK", "SESSION", "VERIFY", "REVIEW"];
 pub const QUERY_KEYS: [&str; 3] = ["id", "worktree", "combined"];
 
 /// The segment-kind sequences that address a real entity. Anything else (e.g.
-/// `SESSION` without a parent `TASK`) is a parse error.
+/// `CELL` without a parent `TASK`) is a parse error.
 const VALID_PATHS: [&[&str]; 6] = [
-    &["RUN"],
-    &["RUN", "TASK"],
-    &["RUN", "TASK", "SESSION"],
-    &["RUN", "TASK", "VERIFY"],
-    &["RUN", "TASK", "SESSION", "VERIFY"],
+    &["SQUAD"],
+    &["SQUAD", "TASK"],
+    &["SQUAD", "TASK", "CELL"],
+    &["SQUAD", "TASK", "PROOF"],
+    &["SQUAD", "TASK", "CELL", "PROOF"],
     &["REVIEW"],
 ];
 
@@ -268,7 +268,7 @@ impl Segment {
         }
     }
 
-    /// A positional segment, e.g. `VERIFY[~0]`.
+    /// A positional segment, e.g. `PROOF[~0]`.
     #[must_use]
     pub fn positional(kind: &str, index: usize) -> Self {
         Self {
@@ -326,7 +326,7 @@ pub struct RalphusUri {
 }
 
 impl RalphusUri {
-    /// The segment kinds, e.g. `["RUN", "TASK", "SESSION"]`.
+    /// The segment kinds, e.g. `["SQUAD", "TASK", "CELL"]`.
     #[must_use]
     pub fn kinds(&self) -> Vec<&str> {
         self.segments.iter().map(|s| s.kind.as_str()).collect()
@@ -528,7 +528,7 @@ fn parse_query(raw: &str) -> Result<Vec<(String, Option<String>)>, UriError> {
 
 /// Parse a ralphus URI. Offline only — names stay unresolved.
 ///
-/// Accepts both the full `ralphus:/RUN[…]` form and the bare `RUN[…]`
+/// Accepts both the full `ralphus:/SQUAD[…]` form and the bare `SQUAD[…]`
 /// shorthand; [`RalphusUri::to_string`] always renders the full form back.
 ///
 /// # Errors
@@ -595,7 +595,7 @@ pub fn parse_uri(raw: &str) -> Result<RalphusUri, UriError> {
 pub enum Token {
     /// Address by name, e.g. `TASK[ral-178]`.
     Name(String),
-    /// Address by position, e.g. `VERIFY[~0]`.
+    /// Address by position, e.g. `PROOF[~0]`.
     Index(usize),
 }
 
@@ -687,21 +687,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_bare_run_uri() {
-        let uri = parsed("ralphus:/RUN[my run]?id=run-000000000151");
-        assert_eq!(uri.kinds(), vec!["RUN"]);
-        assert_eq!(uri.segments[0].name.as_deref(), Some("my run"));
-        assert_eq!(uri.id(), Some("run-000000000151"));
+    fn parses_a_bare_squad_uri() {
+        let uri = parsed("ralphus:/SQUAD[my squad]?id=squad-000000000151");
+        assert_eq!(uri.kinds(), vec!["SQUAD"]);
+        assert_eq!(uri.segments[0].name.as_deref(), Some("my squad"));
+        assert_eq!(uri.id(), Some("squad-000000000151"));
     }
 
     #[test]
     fn accepts_the_bare_shorthand_without_the_scheme() {
-        assert_eq!(parsed("RUN[r]/TASK[t]").kinds(), vec!["RUN", "TASK"]);
+        assert_eq!(parsed("SQUAD[r]/TASK[t]").kinds(), vec!["SQUAD", "TASK"]);
     }
 
     #[test]
     fn round_trips_through_display() {
-        let raw = "ralphus:/RUN[my run]/TASK[ral-178]/SESSION[work]?id=run-000000000151";
+        let raw = "ralphus:/SQUAD[my squad]/TASK[ral-178]/CELL[work]?id=squad-000000000151";
         assert_eq!(parsed(raw).to_string(), raw);
     }
 
@@ -725,11 +725,11 @@ mod tests {
 
     #[test]
     fn a_sigil_token_is_positional_and_a_bare_token_is_a_name() {
-        let uri = parsed("ralphus:/RUN[r]/TASK[t]/VERIFY[~0]");
-        assert_eq!(uri.segment("VERIFY").and_then(|s| s.index), Some(0));
-        let named = parsed("ralphus:/RUN[r]/TASK[t]/VERIFY[0]");
+        let uri = parsed("ralphus:/SQUAD[r]/TASK[t]/PROOF[~0]");
+        assert_eq!(uri.segment("PROOF").and_then(|s| s.index), Some(0));
+        let named = parsed("ralphus:/SQUAD[r]/TASK[t]/PROOF[0]");
         assert_eq!(
-            named.segment("VERIFY").and_then(|s| s.name.clone()),
+            named.segment("PROOF").and_then(|s| s.name.clone()),
             Some("0".to_string())
         );
     }
@@ -743,18 +743,18 @@ mod tests {
             !"!$&'()*+,;=:/?#[]@".contains(INDEX_SIGIL_TOKEN),
             "reserved"
         );
-        let named = parsed("ralphus:/RUN[r]/TASK[t]/VERIFY[%230]");
+        let named = parsed("ralphus:/SQUAD[r]/TASK[t]/PROOF[%230]");
         assert_eq!(
-            named.segment("VERIFY").and_then(|s| s.name.clone()),
+            named.segment("PROOF").and_then(|s| s.name.clone()),
             Some("#0".to_string())
         );
         assert_eq!(encode_label("#0"), "%230");
         // A label that literally starts with the sigil is encoded, so it can
         // never be mistaken for an index on the way back in.
         assert_eq!(encode_label("~0"), "%7E0");
-        let literal = parsed("ralphus:/RUN[r]/TASK[t]/VERIFY[%7E0]");
+        let literal = parsed("ralphus:/SQUAD[r]/TASK[t]/PROOF[%7E0]");
         assert_eq!(
-            literal.segment("VERIFY").and_then(|s| s.name.clone()),
+            literal.segment("PROOF").and_then(|s| s.name.clone()),
             Some("~0".to_string())
         );
     }
@@ -787,45 +787,45 @@ mod tests {
     #[test]
     fn rejects_an_unknown_segment_type_and_query_key() {
         assert!(parse_uri("ralphus:/BOGUS[x]").is_err());
-        assert!(parse_uri("ralphus:/RUN[r]?di=x").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r]?di=x").is_err());
     }
 
     #[test]
     fn rejects_a_shape_that_addresses_nothing() {
-        assert!(parse_uri("ralphus:/RUN[r]/SESSION[s]").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r]/CELL[s]").is_err());
         assert!(parse_uri("ralphus:/TASK[t]").is_err());
     }
 
     #[test]
-    fn rejects_worktree_and_combined_together_and_on_a_run() {
+    fn rejects_worktree_and_combined_together_and_on_a_squad() {
         assert!(parse_uri("ralphus:/REVIEW[r]?worktree=a&combined").is_err());
-        assert!(parse_uri("ralphus:/RUN[r]?combined").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r]?combined").is_err());
     }
 
     #[test]
     fn rejects_unbalanced_and_malformed_brackets() {
-        assert!(parse_uri("ralphus:/RUN[r").is_err());
-        assert!(parse_uri("ralphus:/RUN[]").is_err());
-        assert!(parse_uri("ralphus:/RUN[r]x").is_err());
-        assert!(parse_uri("ralphus:/RUN[r]/").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[]").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r]x").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r]/").is_err());
     }
 
     #[test]
     fn rejects_a_bad_percent_escape_instead_of_passing_it_through() {
-        assert!(parse_uri("ralphus:/RUN[a%zz]").is_err());
-        assert!(parse_uri("ralphus:/RUN[a%2]").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[a%zz]").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[a%2]").is_err());
         // Rust's own `from_str_radix`/`parse` accept a signed "+2"; the Python
         // and JS twins don't, so neither may this.
-        assert!(parse_uri("ralphus:/RUN[a%+2]").is_err());
-        assert!(parse_uri("ralphus:/RUN[r]/TASK[t]/VERIFY[~+2]").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[a%+2]").is_err());
+        assert!(parse_uri("ralphus:/SQUAD[r]/TASK[t]/PROOF[~+2]").is_err());
         assert!(Token::parse("~+2").is_err());
     }
 
     #[test]
     fn a_question_mark_inside_a_label_is_part_of_the_label() {
-        let uri = parsed("ralphus:/RUN[why%3F]?id=run-1");
+        let uri = parsed("ralphus:/SQUAD[why%3F]?id=squad-1");
         assert_eq!(uri.segments[0].name.as_deref(), Some("why?"));
-        assert_eq!(uri.id(), Some("run-1"));
+        assert_eq!(uri.id(), Some("squad-1"));
     }
 
     #[test]
@@ -867,9 +867,9 @@ mod tests {
 
     #[test]
     fn looks_like_uri_ignores_legacy_selectors_and_toml_links() {
-        assert!(looks_like_uri("ralphus:/RUN[r]"));
+        assert!(looks_like_uri("ralphus:/SQUAD[r]"));
         assert!(looks_like_uri("REVIEW[r]"));
-        assert!(!looks_like_uri("run-000000000151/t0/s0"));
+        assert!(!looks_like_uri("squad-000000000151/t0/s0"));
         assert!(!looks_like_uri("ralphus:new-review/my-key"));
         assert!(!looks_like_uri("@my review#2"));
     }
@@ -880,14 +880,14 @@ mod tests {
         assert_eq!(
             Token::parse("test")
                 .unwrap()
-                .resolve(&candidates, "verify")
+                .resolve(&candidates, "proof")
                 .unwrap(),
             2
         );
         assert_eq!(
             Token::parse("~1")
                 .unwrap()
-                .resolve(&candidates, "verify")
+                .resolve(&candidates, "proof")
                 .unwrap(),
             1
         );
@@ -895,13 +895,13 @@ mod tests {
         assert!(
             Token::parse("")
                 .unwrap()
-                .resolve(&candidates, "verify")
+                .resolve(&candidates, "proof")
                 .is_err()
         );
         assert!(
             Token::parse("~9")
                 .unwrap()
-                .resolve(&candidates, "verify")
+                .resolve(&candidates, "proof")
                 .is_err()
         );
         assert!(Token::parse("~x").is_err());

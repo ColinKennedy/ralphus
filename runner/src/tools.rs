@@ -108,6 +108,15 @@ impl Workspace {
     /// after the fact, so this reports an empty capture on timeout rather
     /// than the Python version's "whatever was captured so far" (which relied
     /// on `subprocess.TimeoutExpired.stdout` still being populated).
+    ///
+    /// Unlike `read_file`/`write_file`, this does not attempt path-prefix
+    /// confinement (e.g. rejecting `../`) -- a shell command's text can reach
+    /// outside the workspace in too many ways (absolute paths, symlinks,
+    /// `cd`, command substitution) for string-level checks to meaningfully
+    /// stop it, and a regex trying to catch such patterns is bypassable
+    /// while giving false confidence. Real confinement comes from RAL-225's
+    /// opt-in container execution mode, which restricts what the OS lets the
+    /// subprocess reach regardless of what the command text says.
     pub fn run_bash(
         &self,
         command: &str,

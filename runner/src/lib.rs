@@ -1,7 +1,7 @@
-//! `ralphus-runner` library: executes one [`spec::SessionSpec`] and produces a
-//! [`spec::SessionResult`]. Ported from `cli/src/ralphus/runner/`. The binary
-//! (`src/main.rs`) is a thin shell around [`execute::run_session`] that reads
-//! `SessionSpec` JSON from stdin and writes `SessionResult` JSON to stdout --
+//! `ralphus-runner` library: executes one [`spec::CellSpec`] and produces a
+//! [`spec::CellResult`]. Ported from `cli/src/ralphus/runner/`. The binary
+//! (`src/main.rs`) is a thin shell around [`execute::run_cell`] that reads
+//! `CellSpec` JSON from stdin and writes `CellResult` JSON to stdout --
 //! the daemon<->runner wire contract is unchanged from the Python runner.
 
 pub mod agent_backend;

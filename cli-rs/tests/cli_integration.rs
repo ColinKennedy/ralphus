@@ -8,7 +8,7 @@
 //! attempting a line-for-line port of its ~1,129 lines.
 
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct FakeDaemon {
@@ -20,7 +20,7 @@ impl FakeDaemon {
     /// Serves every request received during the test with the same
     /// `(status, body)`, until the server is dropped. Some commands
     /// legitimately make more than one request per invocation (e.g. `get`
-    /// re-fetches the run after `resolve_run_selector` already fetched it
+    /// re-fetches the squad after `resolve_squad_selector` already fetched it
     /// internally -- a redundancy this port faithfully carries over from
     /// the Python original's own `_cmd_get`), so a single-shot responder
     /// would hang those tests waiting for a second reply that never comes.
@@ -37,6 +37,38 @@ impl FakeDaemon {
             server,
             handle: Some(handle),
         }
+    }
+
+    /// Like [`Self::once`], but also records every request's `Authorization`
+    /// header value (RAL-219) into the returned `Vec` so a test can assert
+    /// the CLI attached the bearer token.
+    fn once_capturing_auth_header(
+        status: u16,
+        body: &'static str,
+    ) -> (Self, Arc<Mutex<Vec<Option<String>>>>) {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let for_thread = Arc::clone(&server);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_thread = Arc::clone(&seen);
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some(request)) = for_thread.recv_timeout(Duration::from_secs(5)) {
+                let header = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.to_string());
+                seen_for_thread.lock().unwrap().push(header);
+                let response = tiny_http::Response::from_string(body).with_status_code(status);
+                let _ = request.respond(response);
+            }
+        });
+        (
+            Self {
+                server,
+                handle: Some(handle),
+            },
+            seen,
+        )
     }
 
     fn url(&self) -> String {
@@ -56,11 +88,16 @@ impl Drop for FakeDaemon {
 }
 
 fn run_cli(daemon_url: &str, args: &[&str]) -> (i32, String) {
+    run_cli_with_env(daemon_url, args, &[])
+}
+
+fn run_cli_with_env(daemon_url: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
     let exe = env!("CARGO_BIN_EXE_ralphus");
     let output = Command::new(exe)
         .arg("--daemon-url")
         .arg(daemon_url)
         .args(args)
+        .envs(env.iter().copied())
         .output()
         .expect("failed to spawn ralphus binary");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -68,25 +105,45 @@ fn run_cli(daemon_url: &str, args: &[&str]) -> (i32, String) {
 }
 
 #[test]
-fn status_prints_run_list_table() {
+fn status_prints_squad_list_table() {
     let daemon = FakeDaemon::once(
         200,
-        r#"{"runs":[{"id":"run-1","state":"done","label":"my run"}]}"#,
+        r#"{"squads":[{"id":"squad-1","state":"done","label":"my squad"}]}"#,
     );
     let (code, stdout) = run_cli(&daemon.url(), &["status"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("run-1"));
+    assert!(stdout.contains("squad-1"));
     assert!(stdout.contains("done"));
-    assert!(stdout.contains("my run"));
+    assert!(stdout.contains("my squad"));
+}
+
+/// RAL-219: the daemon rejects every request with no `Authorization: Bearer
+/// <token>` header. `client.rs::daemon_token()` reads `RALPHUS_DAEMON_TOKEN`
+/// ahead of the token file, so setting that env var is enough to exercise
+/// the header-attaching path without touching the real `~/.ralphus/daemon.token`.
+#[test]
+fn requests_carry_the_bearer_token_from_the_env_override() {
+    let (daemon, seen) = FakeDaemon::once_capturing_auth_header(200, r#"{"squads":[]}"#);
+    let (code, _) = run_cli_with_env(
+        &daemon.url(),
+        &["status"],
+        &[("RALPHUS_DAEMON_TOKEN", "s3cr3t-token")],
+    );
+    assert_eq!(code, 0);
+    let headers = seen.lock().unwrap();
+    assert_eq!(
+        headers.as_slice(),
+        [Some("Bearer s3cr3t-token".to_string())]
+    );
 }
 
 #[test]
 fn status_json_mode_emits_raw_json() {
-    let daemon = FakeDaemon::once(200, r#"{"runs":[]}"#);
+    let daemon = FakeDaemon::once(200, r#"{"squads":[]}"#);
     let (code, stdout) = run_cli(&daemon.url(), &["--json", "status"]);
     assert_eq!(code, 0);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
-    assert_eq!(parsed["runs"].as_array().unwrap().len(), 0);
+    assert_eq!(parsed["squads"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -101,11 +158,11 @@ fn unreachable_daemon_exits_1_with_hint() {
 fn not_found_maps_to_exit_code_3() {
     let daemon = FakeDaemon::once(
         404,
-        r#"{"error":{"code":"not_found","message":"no such run"}}"#,
+        r#"{"error":{"code":"not_found","message":"no such squad"}}"#,
     );
-    let (code, stdout) = run_cli(&daemon.url(), &["run", "show", "missing-run"]);
+    let (code, stdout) = run_cli(&daemon.url(), &["squad", "show", "missing-squad"]);
     assert_eq!(code, 3);
-    assert!(stdout.contains("no such run"));
+    assert!(stdout.contains("no such squad"));
 }
 
 #[test]
@@ -151,12 +208,19 @@ fn quick_start_unknown_subcommand_is_a_usage_error() {
 }
 
 #[test]
+fn license_prints_the_embedded_workspace_license_without_daemon_access() {
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["license"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, ralphus_core::license::embedded_license());
+}
+
+#[test]
 fn get_walks_dotted_field_path() {
     let daemon = FakeDaemon::once(
         200,
-        r#"{"id":"run-1","label":"","tasks":[{"name":"build","state":"done","verify":[],"sessions":[]}]}"#,
+        r#"{"id":"squad-1","label":"","tasks":[{"name":"build","state":"done","proof":[],"cells":[]}]}"#,
     );
-    let (code, stdout) = run_cli(&daemon.url(), &["get", "run-1/0", "state"]);
+    let (code, stdout) = run_cli(&daemon.url(), &["get", "squad-1/0", "state"]);
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "done");
 }
@@ -191,7 +255,7 @@ fn serve_and_capture_body(
 
 #[test]
 fn submit_reads_file_and_posts_its_contents() {
-    let (daemon, rx) = serve_and_capture_body(200, r#"{"run_id":"run-1","state":"pending"}"#);
+    let (daemon, rx) = serve_and_capture_body(200, r#"{"squad_id":"squad-1","state":"pending"}"#);
     let dir = std::env::temp_dir().join(format!("ralphus-cli-it-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let toml_path = dir.join("task.toml");
@@ -202,12 +266,55 @@ fn submit_reads_file_and_posts_its_contents() {
         &["submit", "--no-validate", toml_path.to_str().unwrap()],
     );
     assert_eq!(code, 0);
-    assert!(stdout.contains("run-1"));
+    assert!(stdout.contains("squad-1"));
 
     let body = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("daemon received a request");
     assert!(body.contains("name=\\\"t\\\"") || body.contains("[[task]]"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `ralphus submit a.toml b.toml` joins multiple files' text client-side
+/// into ONE combined submission before validating/posting (see
+/// `cmd_submit`'s `texts.join("\n\n")`) -- so a cross-file `upstream =
+/// "<<task:...>>"` reference resolves fine under `submit`. `ralphus
+/// validate a.toml b.toml` must agree: it now joins the same way before
+/// calling the daemon, rather than validating each file in isolation (which
+/// would have falsely flagged a cross-file reference as unknown). Asserted
+/// here via exactly one captured HTTP request whose body carries both
+/// files' content -- `serve_and_capture_body` only ever answers one
+/// request, so a regression back to per-file validation would hang this
+/// test on the second, unanswered request rather than pass silently.
+#[test]
+fn validate_joins_multiple_files_into_one_request_like_submit_does() {
+    let (daemon, rx) = serve_and_capture_body(200, r#"{"valid":true,"errors":[],"warnings":[]}"#);
+    let dir = std::env::temp_dir().join(format!(
+        "ralphus-cli-it-validate-join-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path_a = dir.join("a.toml");
+    let path_b = dir.join("b.toml");
+    std::fs::write(&path_a, "[[task]]\nname=\"a\"\n").unwrap();
+    std::fs::write(&path_b, "[[task]]\nname=\"b\"\n").unwrap();
+
+    let (code, stdout) = run_cli(
+        &daemon.url(),
+        &[
+            "validate",
+            path_a.to_str().unwrap(),
+            path_b.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{stdout}");
+
+    let body = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("daemon received exactly one combined request");
+    assert!(body.contains("name=\\\"a\\\""), "{body}");
+    assert!(body.contains("name=\\\"b\\\""), "{body}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

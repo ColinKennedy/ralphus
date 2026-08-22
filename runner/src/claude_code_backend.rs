@@ -23,6 +23,7 @@ pub struct ClaudeCodeBackend {
     /// after the run for debugging, instead of deleting them in cleanup --
     /// mirrors `config.daemon.keep_temporary_files`.
     pub keep_temporary_files: bool,
+    pub program_override: Option<String>,
 }
 
 impl ModelBackend for ClaudeCodeBackend {
@@ -41,8 +42,9 @@ impl ModelBackend for ClaudeCodeBackend {
         let prompt_file =
             write_prompt_file(effective_prompt).map_err(|e| BackendError(e.to_string()))?;
 
-        let program =
-            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string());
+        let program = self.program_override.clone().unwrap_or_else(|| {
+            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
+        });
         let compound = crate::cli_agent_common::is_compound_command(&program);
 
         let mut base_args: Vec<String> = vec![
@@ -401,7 +403,7 @@ fn tool_result_text(content: &Value) -> String {
 }
 
 /// Approximate per-million-token pricing by model-name substring, used only
-/// for the *live* progress estimate emitted mid-run (the final `SessionResult`
+/// for the *live* progress estimate emitted mid-run (the final `CellResult`
 /// always uses the authoritative `total_cost_usd` from the terminal `result`
 /// event). Deliberately conservative (falls back to the priciest tier) since
 /// this feeds the RAL-161 cost-cap kill switch -- overestimating triggers an

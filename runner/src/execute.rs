@@ -1,7 +1,6 @@
-//! Turns a [`SessionSpec`] into a [`SessionResult`], ported from
-//! `cli/src/ralphus/runner/execute.py`. The single choke point that
-//! dispatches `command` sessions (no model), and wraps `prompt`/verify
-//! sessions with system-prompt composition, the still-working retry loop,
+//! Turns a [`CellSpec`] into a [`CellResult`]. The single choke point that
+//! dispatches `command` cells (no model), and wraps `prompt`/proof
+//! cells with system-prompt composition, the still-working retry loop,
 //! and verdict/ghost marker parsing.
 
 use crate::agent_backend::AgentBackend;
@@ -9,17 +8,17 @@ use crate::backend::{BackendOutcome, ModelBackend, RunOptions};
 use crate::claude_code_backend::ClaudeCodeBackend;
 use crate::codex_backend::CodexBackend;
 use crate::harness_backend::HarnessBackend;
-use crate::spec::{SessionResult, SessionSpec};
+use crate::spec::{CellResult, CellSpec};
 use crate::tools::Workspace;
 
 // These four constants must stay byte-identical to
-// `daemon/src/runner.rs`'s `VERIFY_SYSTEM_PROMPT`/`GHOST_SYSTEM_PROMPT`/
+// `daemon/src/runner.rs`'s `PROOF_SYSTEM_PROMPT`/`GHOST_SYSTEM_PROMPT`/
 // `ASYNC_SYSTEM_PROMPT`/`NON_INTERACTIVE_SYSTEM_PROMPT` -- that file's own
 // comment says the same about staying in sync with this one.
-const VERIFY_SYSTEM_PROMPT: &str = "This is a VERIFICATION step, not a normal task. Investigate whether the \
+const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate whether the \
      task holds, attempting to fix any problems you find so the check passes \
      if you can reasonably do so. When you are done, your FINAL line of \
-     output must be exactly one of:\nRALPHUS_VERIFY: PASS\nRALPHUS_VERIFY: FAIL\nwith \
+     output must be exactly one of:\nRALPHUS_PROOF: PASS\nRALPHUS_PROOF: FAIL\nwith \
      nothing else on that line.";
 const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
      ralphus task run keeps a short handoff record for whichever agent picks \
@@ -44,7 +43,7 @@ const ASYNC_SYSTEM_PROMPT: &str = "This is a single, non-interactive invocation 
      line instead of trailing off — you will be re-invoked shortly to \
      continue synchronously from where you left off, though only a bounded \
      number of times, so prefer just finishing the check yourself.";
-const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "You are running unattended in a non-interactive session — no human is \
+const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "You are running unattended in a non-interactive cell — no human is \
      available to answer questions or approve a plan. Never ask a clarifying \
      question, never stop to present a plan for confirmation, and never pause \
      waiting for input. Make the most reasonable judgment call yourself and \
@@ -57,34 +56,44 @@ const COMMAND_TAIL_CHARS: usize = 2000;
 /// Resolves an agent name to its backend, mirroring the three-way dispatch
 /// documented in `runner/__main__.py::_load_backend`: `claude-code`/`codex`
 /// drive an external CLI with stream parsing; `claude`/`anthropic`/`ollama`
-/// use the hand-rolled tool loop; anything else is treated as a generic
-/// external harness program.
-fn load_backend(agent: &str, keep_temporary_files: bool) -> Box<dyn ModelBackend> {
+/// use the hand-rolled tool loop; `raw` is the explicit generic harness.
+fn load_backend(
+    agent: &str,
+    executable: Option<&str>,
+    keep_temporary_files: bool,
+) -> Result<Box<dyn ModelBackend>, String> {
     match agent {
-        "claude-code" | "claude-cli" => Box::new(ClaudeCodeBackend {
+        "claude-code" | "claude-cli" => Ok(Box::new(ClaudeCodeBackend {
             keep_temporary_files,
-        }),
-        "codex" | "codex-cli" => Box::new(CodexBackend {
+            program_override: executable.map(str::to_string),
+        })),
+        "codex" | "codex-cli" => Ok(Box::new(CodexBackend {
             keep_temporary_files,
-        }),
-        "claude" | "anthropic" | "ollama" => Box::new(AgentBackend {
+            program_override: executable.map(str::to_string),
+        })),
+        "claude" | "anthropic" | "ollama" => Ok(Box::new(AgentBackend {
             agent: agent.to_string(),
-        }),
-        other => Box::new(HarnessBackend {
-            program: other.to_string(),
-        }),
+        })),
+        "raw" => Ok(Box::new(HarnessBackend {
+            program: executable
+                .ok_or_else(|| "backend \"raw\" requires an executable".to_string())?
+                .to_string(),
+        })),
+        other => Err(format!(
+            "unknown backend {other:?}; expected claude, anthropic, ollama, claude-code, codex, or raw"
+        )),
     }
 }
 
-/// Runs one session end-to-end. Never panics on a bad workspace/backend --
-/// every failure mode becomes a `"failed"` [`SessionResult`], matching
-/// Python's own behavior of always producing a result rather than letting an
+/// Runs one cell end-to-end. Never panics on a bad workspace/backend --
+/// every failure mode becomes a `"failed"` [`CellResult`], always
+/// producing a result rather than letting an
 /// exception escape to a nonzero process exit with no JSON on stdout.
 #[must_use]
-pub fn run_session(spec: &SessionSpec, keep_temporary_files: bool) -> SessionResult {
+pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
     let workspace = match Workspace::create(&spec.cwd) {
         Ok(w) => w,
-        Err(e) => return SessionResult::failed(e.to_string(), ""),
+        Err(e) => return CellResult::failed(e.to_string(), ""),
     };
 
     if let Some(command) = &spec.command {
@@ -92,15 +101,15 @@ pub fn run_session(spec: &SessionSpec, keep_temporary_files: bool) -> SessionRes
     }
 
     let Some(prompt) = &spec.prompt else {
-        return SessionResult::failed("spec has neither prompt nor command", "");
+        return CellResult::failed("spec has neither prompt nor command", "");
     };
 
     run_prompt(spec, prompt, &workspace, keep_temporary_files)
 }
 
-fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -> SessionResult {
+fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -> CellResult {
     match workspace.run_bash(command, timeout_sec) {
-        Ok(out) if out.ok() => SessionResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS)),
+        Ok(out) if out.ok() => CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS)),
         Ok(out) => {
             let detail = tail(&out.stderr, COMMAND_TAIL_CHARS);
             let detail = if detail.is_empty() {
@@ -108,18 +117,18 @@ fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -
             } else {
                 detail
             };
-            SessionResult::failed(format!("command exited {}", out.exit_code), detail)
+            CellResult::failed(format!("command exited {}", out.exit_code), detail)
         }
-        Err(e) => SessionResult::failed(e.to_string(), ""),
+        Err(e) => CellResult::failed(e.to_string(), ""),
     }
 }
 
 fn run_prompt(
-    spec: &SessionSpec,
+    spec: &CellSpec,
     original_prompt: &str,
     workspace: &Workspace,
     keep_temporary_files: bool,
-) -> SessionResult {
+) -> CellResult {
     log_llm_start(spec, original_prompt);
     let result = run_prompt_inner(spec, original_prompt, workspace, keep_temporary_files);
     log_llm_done(spec, &result);
@@ -136,12 +145,12 @@ fn short_prompt_hash(data: &[u8]) -> String {
         .collect::<String>()
 }
 
-fn log_llm_start(spec: &SessionSpec, prompt: &str) {
-    let kind = if spec.verify { "verify " } else { "" };
+fn log_llm_start(spec: &CellSpec, prompt: &str) {
+    let kind = if spec.proof { "proof " } else { "" };
     eprintln!(
-        "ralphus [llm] {kind}start run={} session={} agent={:?} model={:?} prompt_len={} prompt_hash={}",
-        spec.run_id,
-        spec.session_id,
+        "ralphus [llm] {kind}start squad={} cell={} agent={:?} model={:?} prompt_len={} prompt_hash={}",
+        spec.squad_id,
+        spec.cell_id,
         spec.agent,
         spec.model,
         prompt.len(),
@@ -149,36 +158,43 @@ fn log_llm_start(spec: &SessionSpec, prompt: &str) {
     );
 }
 
-fn log_llm_done(spec: &SessionSpec, result: &SessionResult) {
-    let kind = if spec.verify { "verify " } else { "" };
+fn log_llm_done(spec: &CellSpec, result: &CellResult) {
+    let kind = if spec.proof { "proof " } else { "" };
     if result.ok() {
         eprintln!(
-            "ralphus [llm] {kind}done run={} session={} tokens_in={} tokens_out={} cost_usd={:.4}",
-            spec.run_id, spec.session_id, result.tokens_in, result.tokens_out, result.cost_usd
+            "ralphus [llm] {kind}done squad={} cell={} tokens_in={} tokens_out={} cost_usd={:.4}",
+            spec.squad_id, spec.cell_id, result.tokens_in, result.tokens_out, result.cost_usd
         );
     } else {
         eprintln!(
-            "ralphus [llm] {kind}error run={} session={}: {}",
-            spec.run_id,
-            spec.session_id,
+            "ralphus [llm] {kind}error squad={} cell={}: {}",
+            spec.squad_id,
+            spec.cell_id,
             result.error.as_deref().unwrap_or("unknown error")
         );
     }
 }
 
 fn run_prompt_inner(
-    spec: &SessionSpec,
+    spec: &CellSpec,
     original_prompt: &str,
     workspace: &Workspace,
     keep_temporary_files: bool,
-) -> SessionResult {
-    let backend = load_backend(&spec.agent, keep_temporary_files);
+) -> CellResult {
+    let backend = match load_backend(
+        &spec.agent,
+        spec.executable.as_deref(),
+        keep_temporary_files,
+    ) {
+        Ok(backend) => backend,
+        Err(e) => return CellResult::failed(e, ""),
+    };
     let system_prompt = combine_system_prompts(&[
         spec.system_prompt.as_deref(),
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
-        Some(if spec.verify {
-            VERIFY_SYSTEM_PROMPT
+        Some(if spec.proof {
+            PROOF_SYSTEM_PROMPT
         } else {
             GHOST_SYSTEM_PROMPT
         }),
@@ -207,7 +223,7 @@ fn run_prompt_inner(
         };
         let outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
-            Err(e) => return SessionResult::failed(e.to_string(), ""),
+            Err(e) => return CellResult::failed(e.to_string(), ""),
         };
 
         total_tokens_in += outcome.tokens_in;
@@ -222,22 +238,22 @@ fn run_prompt_inner(
                 continue;
             }
             // Exhausted retries while still reporting in-progress: hard
-            // failure for a normal session; fail-closed (verified=false)
-            // for a verify step -- same "budget exceeded" shape below.
-            if spec.verify {
-                return SessionResult {
+            // failure for a normal cell; fail-closed (proofed=false)
+            // for a proof step -- same "budget exceeded" shape below.
+            if spec.proof {
+                return CellResult {
                     status: "done".to_string(),
                     tokens_in: total_tokens_in,
                     tokens_out: total_tokens_out,
                     cost_usd: total_cost_usd,
                     summary: outcome.summary,
                     error: None,
-                    verified: Some(false),
+                    proofed: Some(false),
                     agent_session_id,
                     ghost: None,
                 };
             }
-            return SessionResult {
+            return CellResult {
                 status: "failed".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
@@ -246,7 +262,7 @@ fn run_prompt_inner(
                 error: Some(format!(
                     "still working after {MAX_ASYNC_ATTEMPTS} attempts: {reason}"
                 )),
-                verified: None,
+                proofed: None,
                 agent_session_id,
                 ghost: None,
             };
@@ -255,7 +271,7 @@ fn run_prompt_inner(
         let budget_exceeded =
             budget_exceeded(total_tokens_in, total_tokens_out, spec.budget_tokens);
 
-        if spec.verify {
+        if spec.proof {
             let verdict = if budget_exceeded {
                 Some(false)
             } else {
@@ -266,21 +282,21 @@ fn run_prompt_inner(
             } else {
                 outcome.summary
             };
-            return SessionResult {
+            return CellResult {
                 status: "done".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
                 cost_usd: total_cost_usd,
                 summary,
                 error: None,
-                verified: Some(verdict.unwrap_or(false)),
+                proofed: Some(verdict.unwrap_or(false)),
                 agent_session_id,
                 ghost: None,
             };
         }
 
         if budget_exceeded {
-            return SessionResult {
+            return CellResult {
                 status: "failed".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
@@ -291,26 +307,26 @@ fn run_prompt_inner(
                     total_tokens_in + total_tokens_out,
                     spec.budget_tokens.unwrap_or(0)
                 )),
-                verified: None,
+                proofed: None,
                 agent_session_id,
                 ghost: None,
             };
         }
 
-        return SessionResult {
+        return CellResult {
             status: "done".to_string(),
             tokens_in: total_tokens_in,
             tokens_out: total_tokens_out,
             cost_usd: total_cost_usd,
             summary: outcome.summary.clone(),
             error: None,
-            verified: None,
+            proofed: None,
             agent_session_id,
             ghost: parse_ghost(&outcome.summary),
         };
     }
 
-    SessionResult::failed("unreachable: retry loop exited without returning", "")
+    CellResult::failed("unreachable: retry loop exited without returning", "")
 }
 
 fn combine_system_prompts(parts: &[Option<&str>]) -> Option<String> {
@@ -343,12 +359,12 @@ fn budget_exceeded(tokens_in: i64, tokens_out: i64, budget_tokens: Option<u64>) 
     }
 }
 
-/// Finds the last occurrence of a `RALPHUS_VERIFY: PASS`/`FAIL` marker
+/// Finds the last occurrence of a `RALPHUS_PROOF: PASS`/`FAIL` marker
 /// anywhere in `text` (not requiring it to be alone on its own line -- local
 /// models sometimes embed it mid-sentence).
 fn parse_verdict(text: &str) -> Option<bool> {
-    let pass_idx = text.rfind("RALPHUS_VERIFY: PASS");
-    let fail_idx = text.rfind("RALPHUS_VERIFY: FAIL");
+    let pass_idx = text.rfind("RALPHUS_PROOF: PASS");
+    let fail_idx = text.rfind("RALPHUS_PROOF: FAIL");
     match (pass_idx, fail_idx) {
         (Some(p), Some(f)) => Some(p > f),
         (Some(_), None) => Some(true),
@@ -406,10 +422,10 @@ mod tests {
     #[test]
     fn parse_verdict_trusts_last_occurrence() {
         assert_eq!(
-            parse_verdict("first RALPHUS_VERIFY: FAIL then RALPHUS_VERIFY: PASS"),
+            parse_verdict("first RALPHUS_PROOF: FAIL then RALPHUS_PROOF: PASS"),
             Some(true)
         );
-        assert_eq!(parse_verdict("RALPHUS_VERIFY: FAIL"), Some(false));
+        assert_eq!(parse_verdict("RALPHUS_PROOF: FAIL"), Some(false));
         assert_eq!(parse_verdict("no marker here"), None);
     }
 
@@ -465,31 +481,32 @@ mod tests {
     }
 
     #[test]
-    fn run_session_fails_closed_when_neither_prompt_nor_command() {
+    fn run_cell_fails_closed_when_neither_prompt_nor_command() {
         let dir = std::env::temp_dir().join(format!(
             "ralphus-execute-test-neither-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let spec = SessionSpec {
-            run_id: "r".into(),
+        let spec = CellSpec {
+            squad_id: "r".into(),
             task: "t".into(),
-            session_id: "s".into(),
+            cell_id: "s".into(),
             cwd: dir.display().to_string(),
             prompt: None,
             command: None,
             agent: "claude".into(),
+            executable: None,
             model: None,
             system_prompt: None,
             system_prompt_position: None,
             args: vec![],
             budget_tokens: None,
             timeout_sec: None,
-            verify: false,
+            proof: false,
             trace_context: None,
             resume_agent_session_id: None,
         };
-        let result = run_session(&spec, false);
+        let result = run_cell(&spec, false);
         assert!(!result.ok());
         std::fs::remove_dir_all(&dir).ok();
     }

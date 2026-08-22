@@ -26,55 +26,57 @@ where one exists.
 | POST | `/api/daemon/shutdown` | [Kill every spawned process and exit](#post-apidaemonshutdown) (`ralphus-daemon stop`) |
 | GET | `/api/tasks` | [Board state](#get-apitasks); `?status=&name=&sort=` filter/sort |
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
+| GET | `/api/config/live-view` | [Live View "Show Debug Messages" default](#get-apiconfiglive-view-ral-232) (RAL-232) |
 | GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated; `?entity=` accepts an [entity URI](#entity-uris-ral-155) |
 | GET | `/api/cartographer/{id}` | [One event's full detail](#get-apicartographerid) |
-| GET | `/api/events` | [SSE push stream](#get-apievents-ral-167) — one event per Cartographer write (RAL-167) |
-| GET | `/api/graph` | [Cross-run gating graph](#get-apigraph); `?all=1` includes terminal runs |
+| POST | `/api/events/ticket` | [Mint a short-lived SSE ticket](#post-apieventsticket-ral-222) |
+| GET | `/api/events` | [SSE push stream](#get-apievents-ral-167) — one event per Cartographer write (RAL-167); requires `?ticket=` (RAL-222) |
+| GET | `/api/graph` | [Cross-squad gating graph](#get-apigraph); `?all=1` includes terminal squads |
 | GET | `/api/resolve` | [Resolve a ralphus URI](#get-apiresolve-ral-188) to positional coordinates; `?uri=` |
-| GET | `/api/ghosts/{owner_uri}` | [Fetch a ghost](#get-apighostsowner_uri) by its owning session/review URI |
+| GET | `/api/ghosts/{owner_uri}` | [Fetch a ghost](#get-apighostsowner_uri) by its owning cell/review URI |
 | POST | `/api/ghosts/copy` | [Copy a ghost](#post-apighostscopy) onto another owner, independent of the dependency graph |
 
-**Runs**
+**Squads**
 | Method | Path | What |
 |---|---|---|
-| POST | `/api/runs/validate` | [Validate a TOML batch](#post-apirunsvalidate) without persisting |
-| POST | `/api/runs` | [Submit a TOML batch](#post-apiruns) |
+| POST | `/api/squads/validate` | [Validate a TOML batch](#post-apisquadsvalidate) without persisting |
+| POST | `/api/squads` | [Submit a TOML batch](#post-apisquads) |
 | POST | `/api/clear` | [Bulk-delete](#post-apiclear) tasks and reviews |
 | GET | `/api/queue` | Ordered, classified queue of runnable work items |
 | POST | `/api/queue/reorder` | Reorder the queue (dependency-repaired) |
 | POST | `/api/queue/set-position` | Move item(s) to an absolute/relative position |
-| GET | `/api/runs/{id}` | [One run's full detail](#get-apirunsid) |
-| GET | `/api/runs/{id}/worktrees` | [Per-session worktree/project/upstream](#get-apirunsidworktrees) |
-| GET | `/api/runs/{id}/logs` | [State-transition audit log](#get-apirunsidlogs) |
-| GET | `/api/runs/{id}/timeline` | [Merged, chronological uber-log-viewer](#get-apirunsidtimeline) for the whole run (RAL-155) |
-| GET | `/api/runs/{id}/graph` | [Internal session dependency graph](#get-apirunsidgraph) |
-| POST | `/api/runs/{id}/activate` | [Queued → Pending](#post-apirunsidactivate) |
-| POST | `/api/runs/{id}/cancel/preview` | [Dry-run preview](#post-apirunsidcancelpreview) of a cascading cancel's impact |
-| POST | `/api/runs/{id}/cancel` | [Cancel the run](#post-apirunsidcancel), cascading to downstream dependents |
-| POST | `/api/runs/{id}/set-status` | Manually override a run/task/session/verify's state — for a task/session/verify, any target state but `pending` first captures its running agent's tmux pane into that session's ghost and kills it (RAL-163) |
-| POST | `/api/runs/{id}/edit` | Edit a run/task/session's fields; a run/task edit resets the whole run to Pending, a session edit resets only that session + its downstream |
-| POST | `/api/runs/{id}/retry` | Re-run with existing parameters (reset to Pending) |
-| POST | `/api/runs/{id}/restart/preview` | [Dry-run preview](#post-apirunsidrestartpreview) of a whole-run restart's downstream impact |
-| POST | `/api/runs/{id}/restart` | [Restart the whole run](#post-apirunsidrestart), cascading dirtiness |
-| POST | `/api/runs/{id}/add-dependency` | [Add a cross-run dependency](#post-apirunsidadd-dependency) post-submission |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/restart/preview` | [Dry-run preview](#post-apirunsidsessionstask_idxsession_idxrestartpreview) of a session restart's downstream impact |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/restart` | [Restart one session](#post-apirunsidsessionstask_idxsession_idxrestart) + its downstream |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/{vi}/restart` | Restart a session's verify steps from `vi` |
-| POST | `/api/runs/{id}/tasks/{ti}/verify/{vi}/restart` | Restart a task's verify steps from `vi` |
-| POST | `/api/runs/{id}/tasks/{ti}/restart/preview` | [Dry-run preview](#post-apirunsidtaskstirestartpreview) of a task restart's downstream impact |
-| POST | `/api/runs/{id}/tasks/{ti}/restart` | [Restart a whole task](#post-apirunsidtaskstirestart) + its downstream (RAL-150) |
-| POST | `/api/runs/{id}/env` | [Set/unset persistent environment-variable overrides](#post-apirunsidenv) on the run (RAL-150) |
-| POST | `/api/runs/{id}/tasks/{ti}/env` | Set/unset env overrides on a task ([hierarchical env overrides](#hierarchical-env-overrides-tasksessionverify-layers)) |
-| POST | `/api/runs/{id}/tasks/{ti}/verify/env` | Set/unset env overrides on a task's own verify steps |
-| POST | `/api/runs/{id}/tasks/{ti}/verify/{vi}/env` | Set/unset env overrides on **one** task-scoped verify step (RAL-191) |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/env` | Set/unset env overrides on a session |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/env` | Set/unset env overrides on a session's own verify steps |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/verify/{vi}/env` | Set/unset env overrides on **one** session-scoped verify step (RAL-191) |
-| POST | `/api/runs/{id}/tasks/{ti}/solo` | [Solo a task](#post-apirunsidtaskstisolo) (RAL-157) — pauses every other task in the run until un-soloed |
-| POST | `/api/runs/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apirunsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
-| POST | `/api/runs/{id}/sessions/{ti}/{si}/open-terminal` | Spawn a resume terminal (`claude --resume` or `codex exec resume`, depending on which agent the session ran under) **on the daemon host** (`?mode=readonly\|open`) |
-| POST | `/api/runs/{id}/verifies/{ti}/{scope}/{si}/{vi}/open-terminal` | Same, for a verify step's resolved session |
-| DELETE | `/api/runs/{id}` | Permanently delete a run |
+| GET | `/api/squads/{id}` | [One squad's full detail](#get-apisquadsid) |
+| GET | `/api/squads/{id}/worktrees` | [Per-cell worktree/project/upstream](#get-apisquadsidworktrees) |
+| GET | `/api/squads/{id}/logs` | [State-transition audit log](#get-apisquadsidlogs) |
+| GET | `/api/squads/{id}/timeline` | [Merged, chronological uber-log-viewer](#get-apisquadsidtimeline) for the whole squad (RAL-155) |
+| GET | `/api/squads/{id}/graph` | [Internal cell dependency graph](#get-apisquadsidgraph) |
+| POST | `/api/squads/{id}/activate` | [Queued → Pending](#post-apisquadsidactivate) |
+| POST | `/api/squads/{id}/cancel/preview` | [Dry-run preview](#post-apisquadsidcancelpreview) of a cascading cancel's impact |
+| POST | `/api/squads/{id}/cancel` | [Cancel the squad](#post-apisquadsidcancel), cascading to downstream dependents |
+| POST | `/api/squads/{id}/set-status` | Manually override a squad/task/cell/proof's state — for a task/cell/proof, any target state but `pending` first captures its running agent's tmux pane into that cell's ghost and kills it (RAL-163) |
+| POST | `/api/squads/{id}/edit` | Edit a squad/task/cell's fields; a squad/task edit resets the whole squad to Pending, a cell edit resets only that cell + its downstream |
+| POST | `/api/squads/{id}/retry` | Re-run with existing parameters (reset to Pending) |
+| POST | `/api/squads/{id}/restart/preview` | [Dry-run preview](#post-apisquadsidrestartpreview) of a whole-squad restart's downstream impact |
+| POST | `/api/squads/{id}/restart` | [Restart the whole squad](#post-apisquadsidrestart), cascading dirtiness |
+| POST | `/api/squads/{id}/add-dependency` | [Add a cross-squad dependency](#post-apisquadsidadd-dependency) post-submission |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/restart/preview` | [Dry-run preview](#post-apisquadsidcellstask_idxcell_idxrestartpreview) of a cell restart's downstream impact |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/restart` | [Restart one cell](#post-apisquadsidcellstask_idxcell_idxrestart) + its downstream |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/restart` | Restart a cell's proof steps from `vi` |
+| POST | `/api/squads/{id}/tasks/{ti}/proof/{vi}/restart` | Restart a task's proof steps from `vi` |
+| POST | `/api/squads/{id}/tasks/{ti}/restart/preview` | [Dry-run preview](#post-apisquadsidtaskstirestartpreview) of a task restart's downstream impact |
+| POST | `/api/squads/{id}/tasks/{ti}/restart` | [Restart a whole task](#post-apisquadsidtaskstirestart) + its downstream (RAL-150) |
+| POST | `/api/squads/{id}/env` | [Set/unset persistent environment-variable overrides](#post-apisquadsidenv) on the squad (RAL-150) |
+| POST | `/api/squads/{id}/tasks/{ti}/env` | Set/unset env overrides on a task ([hierarchical env overrides](#hierarchical-env-overrides-taskcellproof-layers)) |
+| POST | `/api/squads/{id}/tasks/{ti}/proof/env` | Set/unset env overrides on a task's own proof steps |
+| POST | `/api/squads/{id}/tasks/{ti}/proof/{vi}/env` | Set/unset env overrides on **one** task-scoped proof step (RAL-191) |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/env` | Set/unset env overrides on a cell |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/proof/env` | Set/unset env overrides on a cell's own proof steps |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/env` | Set/unset env overrides on **one** cell-scoped proof step (RAL-191) |
+| POST | `/api/squads/{id}/tasks/{ti}/solo` | [Solo a task](#post-apisquadsidtaskstisolo) (RAL-157) — pauses every other task in the squad until un-soloed |
+| POST | `/api/squads/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apisquadsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | Spawn a resume terminal (`claude --resume` or `codex exec resume`, depending on which agent the cell ran under) **on the daemon host** (`?mode=readonly\|open`) |
+| POST | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/open-terminal` | Same, for a proof step's resolved cell |
+| DELETE | `/api/squads/{id}` | Permanently delete a squad |
 
 **Guardians (reviews)**
 | Method | Path | What |
@@ -116,15 +118,17 @@ Four routes above are flagged "on the daemon host": they call
 snapshot case below, an external viewer) on whatever machine runs
 `ralphus-daemon`, which only makes sense when the daemon and the caller share
 a desktop session. The CLI deliberately does **not** call these — see
-`docs/cli-reference.md`'s `session terminal` / `review checks run` / `review
+`docs/cli-reference.md`'s `cell terminal` / `review checks run` / `review
 action run` for the headless equivalent (print the resolved command + cwd
 instead).
 
 **Structured checks (RAL-164).** `manual_commands` and `action_hints` on
 `GuardianView` are both `GuardianCheck[]`, not bare strings —
 `{label?, command?, prompt?, cleanup_command?, inputs?}`, where `inputs` is
-`{name, message, default}[]` naming `{name}` placeholders referenced in
-`command`/`cleanup_command`. `GuardianView` also carries `input_values`
+`{name, message, default, type}[]` naming `{name}` placeholders referenced in
+`command`/`cleanup_command`. `type` (RAL-221) is one of `"string"` (default,
+unconstrained) or `"int"` (must parse as a base-10 signed integer);
+`GuardianView` also carries `input_values`
 (`Record<string,string>`, the last value used per input name on this review —
 overrides an input's own literal `default`) and `input_resolutions`
 (`Record<string,{status, value?}>`, `status` one of `resolving`/`ready`/`failed`,
@@ -134,6 +138,11 @@ Record<string,string>, run_cleanup?: boolean}` — `inputs` substitutes named
 placeholders (submitted value wins, then `input_values`, then the input's own
 default) and is persisted as the new `input_values` default; `run_cleanup`
 opts into chaining the check's `cleanup_command` before the main command.
+Every effective value (submitted, else stored, else default) is validated
+against its input's declared `type` before substitution — including a value
+already sitting in `input_values` from before `type` existed on that input —
+and a mismatch fails the whole call with `400 invalid_check_input` naming
+which input(s) failed and why, rather than substituting it.
 
 **Read-only terminal-log viewer (RAL-153).** When `open-terminal`'s target
 tmux session has already ended, the daemon degrades to a read-only path
@@ -160,6 +169,13 @@ produced no pane output.
 | GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
 
+**Mailbox (RAL-241, poll-only scope)**
+| Method | Path | What |
+|---|---|---|
+| POST | `/api/mailbox/register` | Register a new client, returns `{"client_id": "..."}` |
+| GET | `/api/mailbox/{client_id}/messages` | List messages visible to this client; `?unread=true` and `?priority=urgent\|high\|normal` filter |
+| POST | `/api/mailbox/{client_id}/drain` | Mark messages read; `{"message_ids": [...]}` or an empty body to drain every unread message |
+
 ## Conventions
 
 - All request and response bodies are JSON (`Content-Type: application/json`).
@@ -175,9 +191,83 @@ produced no pane output.
 - `code` is a stable machine string; `message` is for humans; `details` is an
   optional array (e.g. per-line validation errors).
 
-## Run lifecycle
+## Authentication (RAL-219)
 
-A *run* is one submitted TOML batch. Its state machine:
+Every route requires a bearer token: `Authorization: Bearer <token>`. A
+request with no `Authorization` header, or the wrong token, gets a `401`
+using the same error envelope as every other error (`{"error":{"code":
+"unauthorized", "message":"missing or invalid bearer token"}}`). This applies
+to reads as well as state-changing requests — Cartographer logs, cell/agent
+transcripts, and registered project paths are all sensitive, so `GET`s are
+gated exactly like `POST`/`DELETE`.
+
+**Where the token lives.** The daemon generates a random token the first time
+it starts and persists it to `state_dir()/daemon.token` (`~/.ralphus/
+daemon.token`; `0600` permissions on Unix — RAL-230 tracks the equivalent
+Windows ACL hardening as separate, not-yet-built follow-up work). A later
+restart reuses the same token rather than rotating it, so a client that
+already has a copy of the file keeps working across restarts. There is no
+login flow and no multi-user identity system here — this is one shared
+secret, appropriately scoped for a single-operator local tool (per-user
+attribution is tracked separately — see "Notes on future evolution" below).
+
+**How clients authenticate.**
+- The `ralphus` CLI and the librarian's `/api/*` proxy both read the same
+  token file automatically and attach the header on every request, so local
+  use needs no extra configuration.
+- A remote or non-browser caller (curl, a script on another machine) reads
+  the same file — or is handed the token out of band — and sends the header
+  itself. This is a plain HTTP header, not a browser-only/same-origin
+  mechanism, so it works identically for any HTTP client; this is the
+  explicit reason the mechanism is a standard `Authorization: Bearer` header
+  rather than a cookie or a CSRF-style same-origin check.
+- `ralphus-daemon stop` (`POST /api/daemon/shutdown`) authenticates the same
+  way — it is a route like any other, not a special case.
+
+**`/api/events` (the SSE stream) is not gated by the bearer token
+directly** — it bypasses `route()` entirely (see `run_http_loop` in
+`server.rs`), so the check above never runs for it. It has its own mechanism
+instead (RAL-222): see [`GET /api/events`](#get-apievents-ral-167) below.
+
+### CORS policy (RAL-220)
+
+Both the daemon and the librarian apply an explicit, config-driven CORS
+policy at their own HTTP boundary (independently — the librarian's proxy
+sits in front of the daemon API, so a browser hitting the librarian's port
+must be gated there too, not just at the daemon). A request carrying no
+`Origin` header (any non-browser caller — the CLI, `curl`, a remote-machine
+provider per RAL-185 — or a same-origin top-level navigation) is unaffected;
+CORS is a browser-only mechanism.
+
+A request that *does* carry an `Origin` header is checked against two
+allowances:
+
+1. **Default same-origin**: `Origin` matches the request's own `Host` header
+   (`http://<host>` or `https://<host>`) — so hitting either server directly
+   at its own address always works with zero configuration.
+2. **Configured allow-list**: `Origin` exactly matches an entry in
+   `[cors].allowed_origins` (`.ralphus.toml`/global config, a list field —
+   layers are unioned, global-first then per-project, de-duplicated). There
+   is deliberately no wildcard support.
+
+A mismatched `Origin` is **rejected outright** (`403 origin_not_allowed`) —
+not merely served without `Access-Control-*` headers. Omitting the headers
+alone only stops a browser from *reading* the response; a "simple"
+(no-preflight) cross-origin request — e.g. a `POST` whose `Content-Type` is
+set to `text/plain` even though the body is JSON — would still execute
+server-side. An allowed request gets back `Access-Control-Allow-Origin`
+(echoing the exact origin) and `Vary: Origin`; a preflight `OPTIONS` for an
+allowed origin additionally gets `Access-Control-Allow-Methods` and
+`Access-Control-Allow-Headers`.
+
+CORS is a browser-side control only — it does not gate non-browser callers
+(a script, another machine). Combined with the auth-token check above
+(RAL-219), CORS constrains what browsers will do while the token constrains
+what any caller is allowed to do.
+
+## Squad lifecycle
+
+A *squad* is one submitted TOML batch. Its state machine:
 
 ```
 Queued ─activate─▶ Pending ─(deps met, scheduler picks up)─▶ Running ─▶ Done
@@ -186,12 +276,12 @@ Queued ─activate─▶ Pending ─(deps met, scheduler picks up)─▶ Running
                                                                    └─▶ Failed
 ```
 
-**Decision (fixes an old-project bug):** `POST /api/runs` submits directly to
+**Decision (fixes an old-project bug):** `POST /api/squads` submits directly to
 **`Pending`** (schedulable immediately), not `Queued`. In the old project,
 submissions landed as `Queued` and silently never ran until a human clicked
 "activate" in the UI. `Queued` remains available as an explicit "hold" state for
-callers that want to stage a run without scheduling it (`?hold=true`), activated
-later via `POST /api/runs/{id}/activate`.
+callers that want to stage a squad without scheduling it (`?hold=true`), activated
+later via `POST /api/squads/{id}/activate`.
 
 ## Endpoints
 
@@ -203,17 +293,17 @@ Health/version probe. Never requires the DB to be writable.
 ```
 
 ### `POST /api/daemon/shutdown`
-Kill every process this daemon has spawned — every session, verify,
+Kill every process this daemon has spawned — every cell, proof,
 review/guardian merge, feedback chat, change-summary, and manual check
 subprocess it started, transitively — then exit the daemon process. This is
 what `ralphus-daemon stop [--port N] [--auto-cancel]` calls.
 
-Unconditionally, regardless of the request body: trips every in-flight run's
+Unconditionally, regardless of the request body: trips every in-flight squad's
 cooperative cancellation token (stops its subprocess within the runner's
 normal poll interval) and force-kills every `ralphus_`-prefixed tmux.exe
-process (covers both run sessions and guardian/review sessions, which share
+process (covers both squad cells and guardian/review sessions, which share
 that naming prefix). Anything left alive after that — e.g. a `command`-kind
-verify subprocess, which has no cooperative cancellation today — is still
+proof subprocess, which has no cooperative cancellation today — is still
 guaranteed to die: the daemon confines its whole process tree to a Windows
 Job Object at startup (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, see
 `daemon/src/jobobject.rs`), so terminating the daemon process itself takes
@@ -224,13 +314,13 @@ Request (all fields optional; an empty/absent body is equivalent to
 ```json
 { "auto_cancel": false }
 ```
-- `auto_cancel: false` (default) — DB state is left alone. Runs/guardians
+- `auto_cancel: false` (default) — DB state is left alone. Squads/guardians
   that were mid-flight stay `running`/`merging`/etc, so the existing
-  crash-recovery path (`Store::recover_orphaned_runs` /
+  crash-recovery path (`Store::recover_orphaned_squads` /
   `recover_orphaned_merges`, run at every `serve()` startup) resumes them
   automatically the next time `ralphus-daemon serve` starts.
-- `auto_cancel: true` — additionally cascade-cancels every non-terminal run
-  (same logic as [`POST /api/runs/{id}/cancel`](#post-apirunsidcancel)) and
+- `auto_cancel: true` — additionally cascade-cancels every non-terminal squad
+  (same logic as [`POST /api/squads/{id}/cancel`](#post-apisquadsidcancel)) and
   every cancellable guardian, so history reflects an intentional stop and
   nothing auto-resumes on the next start.
 
@@ -239,12 +329,12 @@ Response `200` (sent before the daemon actually exits):
 {
   "state": "stopping",
   "auto_cancel": false,
-  "cancelled_runs": [],
+  "cancelled_squads": [],
   "cancelled_guardians": []
 }
 ```
 
-### `POST /api/runs/validate`
+### `POST /api/squads/validate`
 Validate a TOML batch without persisting anything.
 
 Request:
@@ -260,7 +350,7 @@ Response (200 even when invalid — validity is in the body):
 }
 ```
 
-### `POST /api/runs`
+### `POST /api/squads`
 Validate (fail-closed) and submit a TOML batch.
 
 Request:
@@ -270,37 +360,45 @@ Request:
 `400` with the error envelope (`code: "validation_failed"`, `details` = the
 validation errors) if invalid. On success `201`:
 ```json
-{ "run_id": "run-000000000001", "state": "pending" }
+{ "squad_id": "squad-000000000001", "state": "pending" }
 ```
 
 ### `POST /api/projects`
 Register (or re-register, updating its fields) a project by name (RAL-100).
-Lets a task's session `cwd` use the placeholder `"ralphus:new-worktree/<branch>"`
-instead of a real filesystem path -- the owning task's `project` field names
-which registered project to materialize it under, and the scheduler
-materializes (or reuses) a git worktree for `<branch>` before the session runs.
-The placeholder parser treats everything after `ralphus:new-worktree/` as one
-literal branch name, slashes included. During materialization the daemon first
-validates that branch name with `git check-ref-format --branch`. If a local
-branch by that exact name already exists, it is reused. Otherwise, a
-slash-containing name like `origin/foo` is checked against the remote-tracking
-ref `refs/remotes/origin/foo`; when that ref exists, the daemon creates the new
-local branch from the remote-tracking branch and configures it to track it --
-a real, attached branch checkout, never a detached HEAD. When no such
-remote-tracking ref exists, the daemon falls back to creating a literal local
-branch named `origin/foo` from the project's current `HEAD` and logs a
-warning about that ambiguous fallback.
+Lets a task's cell `cwd` use the placeholder
+`"ralphus:new-worktree/<branch>?upstream=<upstream>"` instead of a real
+filesystem path -- the owning task's `project` field names which registered
+project to materialize it under, and the scheduler materializes (or reuses) a
+git worktree for `<branch>` before the cell runs. The trailing
+`?upstream=<upstream>` is REQUIRED (submit-time validation rejects a
+placeholder cwd without one) and names the branch `<branch>`'s worktree
+should track (`git branch --set-upstream-to`) -- a local branch (`?upstream=main`)
+or a remote-qualified one (`?upstream=origin/main`); it decides what a
+review's base resolves to and drives the resync-on-reuse behavior described
+below, rather than the daemon guessing from `HEAD` at materialization time.
+The placeholder parser treats everything between `ralphus:new-worktree/` and
+the first `?` as one literal branch name, slashes included. During
+materialization the daemon first validates that branch name with
+`git check-ref-format --branch`. If a local branch by that exact name already
+exists, it is reused. Otherwise, a slash-containing name like `origin/foo` is
+checked against the remote-tracking ref `refs/remotes/origin/foo`; when that
+ref exists, the daemon creates the new local branch from the remote-tracking
+branch -- a real, attached branch checkout, never a detached HEAD. When no
+such remote-tracking ref exists, the daemon falls back to creating a literal
+local branch named `origin/foo` from the project's current `HEAD` and logs a
+warning about that ambiguous fallback. Either way, the branch's tracking
+configuration comes from `?upstream=`, not from this fallback logic.
 
-A worktree whose branch tracks a remote is not frozen at whatever the remote
-held on first materialization: every later time that placeholder is resolved
-(i.e. on each new run submitted against it), the daemon fetches that remote
-branch and rebases the local branch onto it, so the worktree picks up new
-pushes over the life of the project. This is a rebase, not a hard reset --
-commits already made in that worktree are replayed on top of the fetched
-history rather than discarded. If the rebase can't complete cleanly (a real
-conflict, or otherwise-diverged local history), it is aborted and run
-resolution fails with an error naming the worktree, leaving it exactly as it
-was for a human to resolve by hand.
+A worktree whose `?upstream=` names a remote-tracking branch is not frozen at
+whatever the remote held on first materialization: every later time that
+placeholder is resolved (i.e. on each new squad submitted against it), the
+daemon fetches that remote branch and rebases the local branch onto it, so
+the worktree picks up new pushes over the life of the project. This is a
+rebase, not a hard reset -- commits already made in that worktree are
+replayed on top of the fetched history rather than discarded. If the rebase
+can't complete cleanly (a real conflict, or otherwise-diverged local
+history), it is aborted and squad resolution fails with an error naming the
+worktree, leaving it exactly as it was for a human to resolve by hand.
 
 Request:
 ```json
@@ -342,10 +440,60 @@ repo, without re-registering it. Runs the exact same checks as `POST
 ```
 `404` if no project is registered under that exact name.
 
+### `GET /api/agents`
+List the agents selectable for a project -- built-in backends plus whatever
+`.ralphus.toml` custom `[agent.profiles.*]` entries apply there (see the
+**agent profile** glossary entry). Backs the board's review-resolver
+dropdown; not review-specific, so any future agent picker can read from it
+too.
+
+Query params: `cwd` (required, a project/worktree path), `user` (optional --
+see `AgentAccess`/`UserContext` below; inert today, accepted so the wire
+contract doesn't need to change once real per-user auth exists).
+
+`default_agent` is the effective `[review].default_resolver_agent`
+(`.ralphus.toml`, global layered under `cwd`'s project config; unset resolves
+to `"ollama"`) -- the entry in `agents` whose `id` matches it is the one a
+review falls back to when it sets no resolver agent of its own. Not
+guaranteed to name an entry in `agents` if misconfigured -- `ralphus check
+health` flags that case.
+
+```json
+{ "agents": [
+  { "id": "claude-code", "kind": "builtin", "backend": "claude-code" },
+  { "id": "openrouter-deepseek", "kind": "profile", "backend": "claude-code" }
+], "default_agent": "ollama" }
+```
+
+### `GET /api/users`
+List every registered placeholder user (see the **User identity** glossary
+section -- this is not authentication; a name grants no permissions).
+
+```json
+{ "users": [ { "name": "colin", "created_at_ms": 0 } ] }
+```
+
+### `POST /api/users`
+Register a user by name. Idempotent (re-registering an existing name is a
+no-op).
+
+Request: `{ "name": "colin" }`. `400` if `name` is empty. Response `200`:
+```json
+{ "name": "colin" }
+```
+
+### `DELETE /api/users/{name}`
+Remove a registered user by exact name.
+
+```json
+{ "deleted": true }
+```
+`404` if no user is registered under that exact name.
+
 ### `POST /api/machines`
 Register (or re-register, updating its fields) a **machine provider** (RAL-185)
 — the program the daemon runs to reach machines under one scheme. Lets a task,
-session, verify step or review declare `machine = "<scheme>:<uri>"`; `<uri>` is
+cell, proof step or review declare `machine = "<scheme>:<uri>"`; `<uri>` is
 opaque and handed to the provider verbatim.
 
 Request:
@@ -365,7 +513,7 @@ placeholder and the RAL-188 entity URI). Response `201`:
 
 **Registration is deliberately not declarable in a task file.** A provider entry
 names a program the daemon will run, so a TOML that could both *name* and
-*define* one would make `POST /api/runs` equivalent to arbitrary code execution.
+*define* one would make `POST /api/squads` equivalent to arbitrary code execution.
 A task file may only ever reference an already-registered scheme.
 
 ### `GET /api/machines`
@@ -386,8 +534,8 @@ Deregister a provider. `404` if it was not registered. Response `200`:
 ```json
 { "deleted": true }
 ```
-Deliberately does **not** check whether any stored run still references the
-scheme: those runs resolved their machines at submit time, so a historical
+Deliberately does **not** check whether any stored squad still references the
+scheme: those squads resolved their machines at submit time, so a historical
 record should not block cleaning up the registry. A *new* submission naming a
 deregistered scheme fails at submit.
 
@@ -412,7 +560,7 @@ backs many independent workspaces (one per `uri`):
 { "machine": "incredibuild:A" }
 ```
 **Never called automatically by the daemon** — a workspace is retained after a
-run finishes exactly like a local worktree is, so this is an explicit,
+squad finishes exactly like a local worktree is, so this is an explicit,
 operator-initiated reclaim. `502 provider_error` on failure, with the
 provider's own reason verbatim; nothing is discarded on failure since the
 daemon keeps no record of the workspace to roll back (`provision` re-derives
@@ -433,45 +581,45 @@ Request (all fields optional):
 ```json
 { "states": ["done", "failed"], "keep_temporary": false }
 ```
-With no `states` filter, wipes everything — all runs (and their
-sessions/tasks/verifies/events) and all guardians (and their branches) — and
+With no `states` filter, wipes everything — all squads (and their
+cells/tasks/proofs/events) and all guardians (and their branches) — and
 resets the id sequences so ids restart at 1. A non-empty `states` list deletes
-only runs in those states (with their children) and leaves guardians and the id
+only squads in those states (with their children) and leaves guardians and the id
 sequences untouched. An unknown status is a `400`. Unless `keep_temporary` is
 true, on-disk review worktrees for deleted guardians are purged. Response `200`:
 ```json
-{ "runs_deleted": 3, "guardians_deleted": 1, "worktrees_purged": 1 }
+{ "squads_deleted": 3, "guardians_deleted": 1, "worktrees_purged": 1 }
 ```
 
-### `POST /api/runs/{id}/restart/preview`
-Dry-run preview of [`POST /api/runs/{id}/restart`](#post-apirunsidrestart)
+### `POST /api/squads/{id}/restart/preview`
+Dry-run preview of [`POST /api/squads/{id}/restart`](#post-apisquadsidrestart)
 (RAL-104): computes the exact same downstream-impact set the real restart
-would dirty — every session/task in the run, plus every run transitively
+would dirty — every cell/task in the squad, plus every squad transitively
 dependent on it — without mutating anything. The librarian shows this before
 the user confirms a restart, so the preview and the real restart can never
-drift out of sync (both call the same `Store::compute_run_restart_impact`).
+drift out of sync (both call the same `Store::compute_squad_restart_impact`).
 Response `200`:
 ```json
 {
-  "sessions": [{ "task_idx": 0, "idx": 0, "task_name": "build", "session_id": "work" }],
+  "cells": [{ "task_idx": 0, "idx": 0, "task_name": "build", "cell_id": "work" }],
   "tasks": [{ "idx": 0, "name": "build" }],
-  "dirtied_runs": [{ "id": "run-000000000002", "label": "downstream run" }]
+  "dirtied_squads": [{ "id": "squad-000000000002", "label": "downstream squad" }]
 }
 ```
 
-### `POST /api/runs/{id}/restart`
-Restart a whole run and cascade dirtiness downstream (RAL-19): the run and all
-its nodes reset to Pending, and every run that transitively depends on it is
-also reset to Pending so it re-runs once this run finishes again (cross-run
+### `POST /api/squads/{id}/restart`
+Restart a whole squad and cascade dirtiness downstream (RAL-19): the squad and all
+its nodes reset to Pending, and every squad that transitively depends on it is
+also reset to Pending so it re-runs once this squad finishes again (cross-squad
 gating holds each dependent until its upstreams are Done). Response `200`:
 ```json
-{ "state": "pending", "dirtied": ["run-000000000002", "run-000000000003"] }
+{ "state": "pending", "dirtied": ["squad-000000000002", "squad-000000000003"] }
 ```
 
-Every restart endpoint below (this one, session restart, task restart, and
-the two verify restarts) accepts an optional JSON body attaching a
+Every restart endpoint below (this one, cell restart, task restart, and
+the two proof restarts) accepts an optional JSON body attaching a
 human-authored context note to the restart (RAL-174), surfaced to the
-restarted session via the Ghost system (see `GET
+restarted cell via the Ghost system (see `GET
 /api/ghosts/{owner_uri}`'s `user_note` above):
 ```json
 { "note": "you were stopped midway through the migration; the schema change is already applied", "apply_to_all": false }
@@ -481,53 +629,53 @@ note" and the restart behaves exactly as it did before this field existed.
 `note` is trimmed and capped to `ghost::MAX_CONTENT_CHARS` (4000 chars).
 `apply_to_all` (default `false`) controls how far the note reaches: **off**
 writes it only onto the exact target(s) this restart directly targets (the
-whole run's sessions for a run restart, the one session for a session
-restart, the task's own sessions for a task restart, the owning session/task
-for a verify restart); **on** additionally writes it onto every session
-downstream of a target within the run's dependency graph — the same
+whole squad's cells for a squad restart, the one cell for a cell
+restart, the task's own cells for a task restart, the owning cell/task
+for a proof restart); **on** additionally writes it onto every cell
+downstream of a target within the squad's dependency graph — the same
 "children" the restart's own downstream-impact cascade already resets to
 Pending. The note itself never accumulates across restarts (it replaces
 whatever was there before); only the normal agent-authored ghost content
 keeps rolling up as usual.
 
-### `POST /api/runs/{id}/sessions/{task_idx}/{session_idx}/restart/preview`
+### `POST /api/squads/{id}/cells/{task_idx}/{cell_idx}/restart/preview`
 Dry-run preview of
-[`POST /api/runs/{id}/sessions/{task_idx}/{session_idx}/restart`](#post-apirunsidsessionstask_idxsession_idxrestart)
-(RAL-104): the target session plus every session downstream of it within the
-run, the tasks that own any of those sessions, and every run transitively
+[`POST /api/squads/{id}/cells/{task_idx}/{cell_idx}/restart`](#post-apisquadsidcellstask_idxcell_idxrestart)
+(RAL-104): the target cell plus every cell downstream of it within the
+squad, the tasks that own any of those cells, and every squad transitively
 dependent on this one — computed without mutating anything, same response
-shape as the run-level preview above. A non-integer index is a `400`.
+shape as the squad-level preview above. A non-integer index is a `400`.
 
-### `POST /api/runs/{id}/sessions/{task_idx}/{session_idx}/restart`
-Restart a single session: it and every session downstream of it within the run
-reset to Pending (upstream sessions stay Done and are skipped on re-run), the
-run goes back to Pending, and dependent runs are dirtied. Same response shape as
+### `POST /api/squads/{id}/cells/{task_idx}/{cell_idx}/restart`
+Restart a single cell: it and every cell downstream of it within the squad
+reset to Pending (upstream cells stay Done and are skipped on re-run), the
+squad goes back to Pending, and dependent squads are dirtied. Same response shape as
 above. A non-integer index is a `400`. Accepts the optional `note`/`apply_to_all`
-body documented under [`POST /api/runs/{id}/restart`](#post-apirunsidrestart)
-above (RAL-174) — here the exact target is this one session.
+body documented under [`POST /api/squads/{id}/restart`](#post-apisquadsidrestart)
+above (RAL-174) — here the exact target is this one cell.
 
-### `POST /api/runs/{id}/tasks/{task_idx}/restart/preview`
+### `POST /api/squads/{id}/tasks/{task_idx}/restart/preview`
 Dry-run preview of
-[`POST /api/runs/{id}/tasks/{task_idx}/restart`](#post-apirunsidtaskstirestart)
-(RAL-150): every session the task owns, plus every session downstream of any
-of them within the run, the tasks that own any of those sessions, and every
-run transitively dependent on this one — same response shape and computation
-philosophy as the session-level preview above (`Store::compute_task_restart_impact`).
+[`POST /api/squads/{id}/tasks/{task_idx}/restart`](#post-apisquadsidtaskstirestart)
+(RAL-150): every cell the task owns, plus every cell downstream of any
+of them within the squad, the tasks that own any of those cells, and every
+squad transitively dependent on this one — same response shape and computation
+philosophy as the cell-level preview above (`Store::compute_task_restart_impact`).
 A non-integer index is a `400`.
 
-### `POST /api/runs/{id}/tasks/{task_idx}/restart`
-Restart a whole task (RAL-150): every session it owns, plus every session
-downstream of any of them within the run, resets to Pending; the run and each
-affected task go back to Pending; dependent runs are dirtied. The
-task-granularity counterpart of the run/session restarts above — same response
+### `POST /api/squads/{id}/tasks/{task_idx}/restart`
+Restart a whole task (RAL-150): every cell it owns, plus every cell
+downstream of any of them within the squad, resets to Pending; the squad and each
+affected task go back to Pending; dependent squads are dirtied. The
+task-granularity counterpart of the squad/cell restarts above — same response
 shape. A non-integer index is a `400`; an unknown task index is a `404`.
 Accepts the optional `note`/`apply_to_all` body documented under
-[`POST /api/runs/{id}/restart`](#post-apirunsidrestart) above (RAL-174) — here
-the exact target is the task's own (directly-owned) sessions.
+[`POST /api/squads/{id}/restart`](#post-apisquadsidrestart) above (RAL-174) — here
+the exact target is the task's own (directly-owned) cells.
 
-### `POST /api/runs/{id}/env`
+### `POST /api/squads/{id}/env`
 Set (`set`) and/or remove (`unset`) persistent environment-variable overrides
-on a run (RAL-150). Body:
+on a squad (RAL-150). Body:
 ```json
 { "set": { "RALPHUS_RESOLVER_MODEL": "qwen3:8b" }, "unset": ["SOME_OLD_FLAG"] }
 ```
@@ -536,12 +684,17 @@ either map/list must be a valid environment-variable identifier
 (`[A-Za-z_][A-Za-z0-9_]*`) — checked with `crate::config::is_valid_env_key`,
 both to catch typos early and because
 `crate::tmux::build_command_line_with_env` relies on the same validation as a
-shell-injection backstop for the tmux-wrapped runner path. `set` entries win
-over `unset` when a key appears in both. Overrides are **persistent** (not a
+shell-injection backstop for the tmux-wrapped runner path. Every `set` value
+must also be free of control characters (`\n`, `\r`, ESC, NUL, ...) — checked
+with `crate::config::is_valid_env_value` (`400` otherwise) — since on Windows
+a cell's launch command is delivered via `send-keys` typed
+keystroke-by-keystroke into a live pty, where an embedded `\n` would act like
+pressing Enter mid-command (RAL-227). `set` entries win over `unset` when a
+key appears in both. Overrides are **persistent** (not a
 one-shot retry parameter): once set, a key stays applied to every
-session/verify-step subprocess this run spawns — across any number of future
+cell/proof-step subprocess this squad spawns — across any number of future
 retries/restarts — until explicitly unset. They do not themselves trigger a
-re-run; pair this with `.../retry`, `.../restart`, or a task/session/verify
+re-run; pair this with `.../retry`, `.../restart`, or a task/cell/proof
 restart to actually re-execute something under the new values (the CLI's
 `ralphus retry <selector> --environment KEY=VAL` does exactly that in one
 step). Response `200` is the resulting full override map:
@@ -551,55 +704,55 @@ step). Response `200` is the resulting full override map:
 Every change is also recorded to Cartographer with the changed key names in
 the clear but **values redacted unless the key is in the project's
 `[env_overrides].allowlist`** (`.ralphus.toml`) — see `EnvOverridesConfig` in
-`daemon/src/config.rs`. The run detail view (`GET /api/runs/{id}`,
-`RunView.env_overrides`) shows the raw, unredacted current values, since that
-view is scoped to whoever already has run-detail access rather than a shared
+`daemon/src/config.rs`. The squad detail view (`GET /api/squads/{id}`,
+`SquadView.env_overrides`) shows the raw, unredacted current values, since that
+view is scoped to whoever already has squad-detail access rather than a shared
 audit log.
 
-#### Hierarchical env overrides (task/session/verify layers)
+#### Hierarchical env overrides (task/cell/proof layers)
 
-Env overrides can also be set at task, session, and verify-step granularity,
+Env overrides can also be set at task, cell, and proof-step granularity,
 each overriding its parent scope's value for the same key:
 
 ```
-run  <  task  <  task.verify     <  that step        (a task's own verify steps)
-run  <  task  <  session  <  session.verify  <  that step
+squad  <  task  <  task.proof     <  that step        (a task's own proof steps)
+squad  <  task  <  cell  <  cell.proof  <  that step
 ```
 
-i.e. a session inherits the run's and its task's overrides but wins on a
-shared key; a session-scoped verify step additionally inherits+overrides
-whatever its owning session resolved to; and **one individual verify step**
-(RAL-191) wins over even the scope-wide verify layer. Same request/response
+i.e. a cell inherits the squad's and its task's overrides but wins on a
+shared key; a cell-scoped proof step additionally inherits+overrides
+whatever its owning cell resolved to; and **one individual proof step**
+(RAL-191) wins over even the scope-wide proof layer. Same request/response
 shape, same validation, persistence, and Cartographer-redaction rules as
-`POST /api/runs/{id}/env` above — only the scope and endpoint differ:
+`POST /api/squads/{id}/env` above — only the scope and endpoint differ:
 
 | Endpoint | Scope |
 |---|---|
-| `POST /api/runs/{id}/tasks/{ti}/env` | This task's own overrides — win over the run's, apply to every session under this task. |
-| `POST /api/runs/{id}/tasks/{ti}/verify/env` | This task's own (task-scoped) verify-step overrides — win over the task's own (and the run's), for *all* of this task's verify steps. |
-| `POST /api/runs/{id}/tasks/{ti}/verify/{vi}/env` | **One** task-scoped verify step's own overrides (RAL-191) — win over everything above. |
-| `POST /api/runs/{id}/sessions/{ti}/{si}/env` | This session's own overrides — win over its task's (and the run's). |
-| `POST /api/runs/{id}/sessions/{ti}/{si}/verify/env` | This session's own (session-scoped) verify-step overrides — win over the session's own (and its task's/run's), for *all* of this session's verify steps. |
-| `POST /api/runs/{id}/sessions/{ti}/{si}/verify/{vi}/env` | **One** session-scoped verify step's own overrides (RAL-191) — win over everything above. |
+| `POST /api/squads/{id}/tasks/{ti}/env` | This task's own overrides — win over the squad's, apply to every cell under this task. |
+| `POST /api/squads/{id}/tasks/{ti}/proof/env` | This task's own (task-scoped) proof-step overrides — win over the task's own (and the squad's), for *all* of this task's proof steps. |
+| `POST /api/squads/{id}/tasks/{ti}/proof/{vi}/env` | **One** task-scoped proof step's own overrides (RAL-191) — win over everything above. |
+| `POST /api/squads/{id}/cells/{ti}/{si}/env` | This cell's own overrides — win over its task's (and the squad's). |
+| `POST /api/squads/{id}/cells/{ti}/{si}/proof/env` | This cell's own (cell-scoped) proof-step overrides — win over the cell's own (and its task's/squad's), for *all* of this cell's proof steps. |
+| `POST /api/squads/{id}/cells/{ti}/{si}/proof/{vi}/env` | **One** cell-scoped proof step's own overrides (RAL-191) — win over everything above. |
 
-The per-step layer exists because `verify` is an array: two `[[task.verify]]`
+The per-step layer exists because `proof` is an array: two `[[task.proof]]`
 blocks setting the same key to different values must not collide, which a
 single scope-wide row cannot express.
 
-A non-integer task/session/verify index is a `400`; an unknown
-task/session/verify step is a `404`. The resolved map for each scope rides
-along in the corresponding `TaskView`/`SessionView`
-(`env_overrides`/`verify_env_overrides` fields) and, for the per-step layer,
-`VerifyView.env_overrides`, inside the existing `GET /api/runs/{id}` response —
+A non-integer task/cell/proof index is a `400`; an unknown
+task/cell/proof step is a `404`. The resolved map for each scope rides
+along in the corresponding `TaskView`/`CellView`
+(`env_overrides`/`proof_env_overrides` fields) and, for the per-step layer,
+`ProofView.env_overrides`, inside the existing `GET /api/squads/{id}` response —
 there are no separate GET routes for these.
 
 **TOML-declared environment (RAL-172, extended by RAL-191):** a
-`[[task]]`/`[[task.session]]`/`[[task.verify]]`/`[[task.session.verify]]`
+`[[task]]`/`[[task.cell]]`/`[[task.proof]]`/`[[task.cell.proof]]`
 block may set its own `environment` table (`environment = { KEY = "value" }`)
 right in the submitted TOML. `core::validate::validate_toml` enforces the same
 identifier rule as above (`[A-Za-z_][A-Za-z0-9_]*`) plus string-only values
-before the submission is ever accepted. At submit time (`Store::insert_run`)
-this seeds that task's/session's/step's own `env_overrides` row — the exact
+before the submission is ever accepted. At submit time (`Store::insert_squad`)
+this seeds that task's/cell's/step's own `env_overrides` row — the exact
 column the matching `POST .../env` endpoint writes to — so from then on a
 TOML-declared value is indistinguishable from one set later via the API,
 participates in the same precedence chain, and can be changed or unset the
@@ -607,9 +760,9 @@ same way.
 
 #### `POST /api/guardians/{id}/branches/{bid}/env` — review-worktree overrides
 
-A review worktree is assembled from a session's work, so by default it runs
-under **that session's resolved environment** (`run < task < session`): the
-conflict resolver, the dedicated final-verify pass, reviewer-feedback routing,
+A review worktree is assembled from a cell's work, so by default it runs
+under **that cell's resolved environment** (`squad < task < cell`): the
+conflict resolver, the dedicated final-proof pass, reviewer-feedback routing,
 and this branch's check gates are all spawned with it. Without that, an agent
 resolving conflicts would verify the code against a different environment than
 the one it was written under.
@@ -624,9 +777,9 @@ branch's own to begin with:
 
 | Field | Meaning |
 |---|---|
-| `set` | Override an inherited value, or add a variable the session never had. |
+| `set` | Override an inherited value, or add a variable the cell never had. |
 | `unset` | **Tombstone** — remove the inherited variable from this worktree's environment entirely. |
-| `clear` | Drop this branch's own entry, so the key goes back to inheriting the session's value. |
+| `clear` | Drop this branch's own entry, so the key goes back to inheriting the cell's value. |
 
 At least one of the three is required (`400` otherwise), every key must be a
 valid env-var identifier (`400` otherwise), and an unknown branch is a `404`.
@@ -635,12 +788,12 @@ given key wins deterministically.
 
 The response (and `BranchView.env_overrides` in `GET /api/guardians/{id}`) is a
 `{key: value|null}` map, where `null` is a tombstone. `BranchView` also carries
-`inherited_env` (what the source session resolves to, before this layer) and
+`inherited_env` (what the source cell resolves to, before this layer) and
 `resolved_env` (the effective environment the worktree actually runs under), so
 a client can show which keys are inherited, overridden, added, or unset without
 recomputing the merge.
 
-A branch with no source session — added manually, or whose session was deleted
+A branch with no source cell — added manually, or whose cell was deleted
 — inherits nothing; its own overrides are the whole environment, and a
 tombstone for a never-inherited key is a harmless no-op.
 
@@ -684,19 +837,19 @@ overridden environment-variable *value* anywhere (only key names and
 override/tombstone/inherited status) — see `DaemonClient._json_or_raise`'s
 redaction of every `/api/guardians...` response in `cli/src/ralphus/client.py`.
 
-### `POST /api/runs/{id}/add-dependency`
-Wire up a manual cross-run dependency after submission (RAL-105), e.g. from the
+### `POST /api/squads/{id}/add-dependency`
+Wire up a manual cross-squad dependency after submission (RAL-105), e.g. from the
 board's "Add Dependency" right-click menu. Body:
 ```json
-{ "target_id": "run-000000000001" }
+{ "target_id": "squad-000000000001" }
 ```
 Appends `target_id` to `id`'s `[[default]] depends_on` list — the same list
 `ralphus submit` populates from TOML — so it is picked up by the existing
-whole-run gating (`Store::list_ready`) with no new scheduling path: `id` will
+whole-squad gating (`Store::list_ready`) with no new scheduling path: `id` will
 not be scheduled until `target_id` reaches Done. `target_id` itself is not
 modified. A dependency that is already present is a no-op. Returns `200` with
-the updated run. A self-reference or a reference that would create a cycle in
-the cross-run dependency graph is a `409`; an unknown `id`/`target_id` is a
+the updated squad. A self-reference or a reference that would create a cycle in
+the cross-squad dependency graph is a `409`; an unknown `id`/`target_id` is a
 `404`; a malformed body is a `400`.
 
 ### `GET /api/guardians/{id}`
@@ -706,7 +859,7 @@ Each branch also carries `is_empty` (`bool`, RAL-190): `true` when the branch
 rebased cleanly but adds **no diff** over the branch beneath it in the stack.
 That almost always means its task never committed its work — the review would
 otherwise reach `in_review` looking entirely healthy while containing none of
-that task's changes, since verify steps check the *code*, not whether it was
+that task's changes, since proof steps check the *code*, not whether it was
 committed.
 
 This **fails the merge**: the branch's `merge_status` becomes `failed` and the
@@ -719,7 +872,7 @@ keeping it visible and re-enableable.
 `is_empty` is kept as its own field rather than folded into the failure so a
 client can say *why* the merge failed — the board renders it as an `⌀ empty`
 badge that takes precedence over the generic conflict badge, since the fix here
-is to go look at the task's session rather than at a diff.
+is to go look at the task's cell rather than at a diff.
 
 Each branch (`BranchView`) carries two rebase-progress fields (RAL-145):
 `rebase_commands_done` / `rebase_commands_total` (`i64`, both `null` unless
@@ -736,21 +889,21 @@ spurious `0`/`0`.
 
 `GuardianView` also carries this review's own agent cost (RAL-193) --
 conflict-resolution and verifier LLM calls made by the guardian merge
-machinery, deliberately excluding the cost of the tasks/sessions that fed
+machinery, deliberately excluding the cost of the tasks/cells that fed
 into the review: `maximum_budget_usd` (`f64|null`, from `[[review]]`'s
 `maximum_budget_usd`; `null` means no cap), `merge_attempt` (`i64`, bumped
 once per rebase/re-merge attempt), `attempt_tokens_in`/`attempt_tokens_out`/
 `attempt_cost_usd` (scoped to the current `merge_attempt` only), and
 `cumulative_tokens_in`/`cumulative_tokens_out`/`cumulative_cost_usd` (summed
 across every rebase/re-merge attempt this review has gone through -- the
-value `maximum_budget_usd` is enforced against). Unlike a session's
+value `maximum_budget_usd` is enforced against). Unlike a cell's
 `cost_usd` (see the cost-semantics note below), these guardian-level totals
 genuinely accumulate: they're computed by summing the `guardian_costs` table
 (one row per resolver/verifier call), not read off a single overwritten
 column, so no Cartographer-side aggregation is needed to see the full
 picture. Once `cumulative_cost_usd` exceeds `maximum_budget_usd`, the daemon
 stops making further resolver/verifier calls for this review and fails it --
-the same kill-switch behavior as a task/session `maximum_budget_usd` cap
+the same kill-switch behavior as a task/cell `maximum_budget_usd` cap
 (RAL-161), just enforced against the review's own cumulative spend rather
 than one subprocess's live cost.
 
@@ -903,7 +1056,7 @@ id (RAL-122), not its stack position. Computed on demand — runs `git diff
 --name-only --diff-filter=U` in the branch's worktree, the same call
 `guardian_merge::conflicted_files` already makes mid-rebase — rather than
 persisted, so it is not on the hot board path (same convention as `GET
-/api/runs/{id}/worktrees`):
+/api/squads/{id}/worktrees`):
 ```json
 { "files": ["src/foo.rs", "src/bar.rs"], "rebase_in_progress": true }
 ```
@@ -957,22 +1110,35 @@ Submit one or more PRs/MRs for a review (RAL-117). Body:
 ```
 Each item in `prs` is either **stacked** (`branch_id` set to one of the
 review's stacked branches' stable ids, RAL-122 — not a stack position, which
-changes under reorder) or **combined** (`branch_id` omitted/`null`, submitting
-the all-branches-in-one combined review worktree). `branch_alias`/`title`/
-`description` are all optional: `branch_alias` defaults to the feature branch's
-own name (stacked) or a sanitized form of the review's name (combined) — never
-the internal `guardian/guardian-<id>/...` ref. `title`/`description` default to
-an LLM-synthesized suggestion from the branch's commits, conforming to the
-target repo's PR template when one is found (`.github/PULL_REQUEST_TEMPLATE.md`
-or `.gitlab/merge_request_templates/Default.md`).
+changes under reorder) or a **whole-stack submission** (`branch_id`
+omitted/`null`): a PR for *every* enabled branch that doesn't already have an
+open one, each based on the branch below it — never a squashed
+all-branches-in-one PR. "Already have an open one" is checked against the
+forge's *live* state, not just the locally recorded row — a PR closed or
+merged outside ralphus (the GitHub/GitLab UI, `gh pr close`, ...) is detected
+and its branch gets a fresh PR instead of being silently skipped forever;
+the stale local row is corrected to match. `branch_alias`/`title`/`description` only apply to a
+stacked request (they don't make sense across N PRs at once, so they're
+ignored on a whole-stack request); `branch_alias` defaults to the feature
+branch's own name, never the internal `guardian/guardian-<id>/...` ref.
+`title`/`description` default to an LLM-synthesized suggestion from the
+branch's commits, conforming to the target repo's PR template when one is
+found (`.github/PULL_REQUEST_TEMPLATE.md` or
+`.gitlab/merge_request_templates/Default.md`).
 
 Runs in the background (`git push` + a forge API call are both networked);
 returns `202 {"status":"submitting"}` immediately. Poll `GET .../pull-requests`
-for the resulting rows. Stacked requests are pushed and opened **lowest
-position first** so each one's PR base is the previous one's already-pushed
-alias (`A→B`, `B→C`, `C→upstream`); a combined request always targets the
-review's own base branch. `404` if the guardian doesn't exist; `400` for an
-empty `prs` list.
+for the resulting rows. PRs are pushed and opened **lowest position first**
+so each one's PR base is the previous one's already-pushed alias (`A→B`,
+`B→C`, `C→upstream`), whether they arrived as one stacked request or as a
+whole-stack submission — the base-chain is seeded from every already-open PR
+on the review, not just the ones in the current request, so submitting one
+branch at a time (rather than the whole stack in one call) still chains
+correctly. On GitHub, a whole-stack submission also registers/grows a
+native PR stack (https://docs.github.com/en/rest/pulls/stacks) spanning every
+open PR on the review, best-effort — the chained-base PRs themselves are
+always correct regardless of whether that registration call succeeds.
+`404` if the guardian doesn't exist; `400` for an empty `prs` list.
 
 The resolved `branch_alias` (whether explicit or defaulted) is auto-suffixed
 (`-002`, `-003`, ...) when it collides with another PR already recorded for
@@ -1075,29 +1241,29 @@ documented in [`cli-reference.md`](cli-reference.md#the-ralphus-uri-scheme-ral-1
 — into the positional coordinates every other route on this page is built on.
 
 ```
-GET /api/resolve?uri=ralphus:/RUN[my run]/TASK[ral-178]/SESSION[work]?id=run-000000000151
+GET /api/resolve?uri=ralphus:/SQUAD[my squad]/TASK[ral-178]/CELL[work]?id=squad-000000000151
 ```
 
 **Why a query parameter and not a path.** The `/` *between* URI segments
 cannot sit in a REST path segment without percent-encoding as `%2F`, which
 HTTP stacks and proxies routinely normalize or reject. So the URI travels as
 a query value and this endpoint hands back coordinates; the positional routes
-(`/api/runs/{id}/sessions/{ti}/{si}/pane` and friends) are unchanged.
+(`/api/squads/{id}/cells/{ti}/{si}/pane` and friends) are unchanged.
 
 The `uri` value is read as **everything after `uri=` to the end of the query
 string**, because a ralphus URI legitimately contains `?` and `&`
-(`…?id=run-1&combined`). Percent-encoding the whole value works identically.
+(`…?id=squad-1&combined`). Percent-encoding the whole value works identically.
 No other query parameter may follow it.
 
 Response (`200`), with absent fields omitted:
 
 ```json
 {
-  "uri": "ralphus:/RUN[my run]/TASK[ral-178]/SESSION[work]?id=run-000000000151",
-  "kind": "session",
-  "run_id": "run-000000000151",
+  "uri": "ralphus:/SQUAD[my squad]/TASK[ral-178]/CELL[work]?id=squad-000000000151",
+  "kind": "cell",
+  "squad_id": "squad-000000000151",
   "task_idx": 0,
-  "session_idx": 0,
+  "cell_idx": 0,
   "combined": false
 }
 ```
@@ -1105,9 +1271,9 @@ Response (`200`), with absent fields omitted:
 | Field | Notes |
 |---|---|
 | `uri` | The **canonical** URI, rebuilt from the entity's *current* labels and always carrying `?id=`. Resolve a stale or renamed label and you get the fresh form back. |
-| `kind` | `run` \| `task` \| `session` \| `verify` \| `review` |
-| `run_id`, `task_idx`, `session_idx`, `verify_idx` | Positional coordinates for the run family. |
-| `verify_scope` | `task` or `session` — which scope the addressed verify step lives in. |
+| `kind` | `squad` \| `task` \| `cell` \| `proof` \| `review` |
+| `squad_id`, `task_idx`, `cell_idx`, `proof_idx` | Positional coordinates for the squad family. |
+| `proof_scope` | `task` or `cell` — which scope the addressed proof step lives in. |
 | `guardian_id`, `branch_id`, `branch` | Review family; `branch_*` only when `?worktree=` was given. `?worktree=` accepts the branch's label (its feature branch name), its stable `branch-...` id, or `~<position>`; the echoed canonical `uri` always uses the label. |
 | `combined` | The URI addressed the review's combined worktree (`?combined`) rather than one branch. |
 
@@ -1116,16 +1282,16 @@ Errors:
 | Status | Code | When |
 |---|---|---|
 | 400 | `bad_request` | No `?uri=` parameter. |
-| 400 | `bad_uri` | Malformed URI: unbalanced brackets, unknown segment type or query key, bad percent-escape, a segment sequence that addresses nothing, or `RUN[~N]`/`REVIEW[~N]` (neither has a stable position). |
-| 404 | `not_found` | The URI is well-formed but names no such run/review. |
+| 400 | `bad_uri` | Malformed URI: unbalanced brackets, unknown segment type or query key, bad percent-escape, a segment sequence that addresses nothing, or `SQUAD[~N]`/`REVIEW[~N]` (neither has a stable position). |
+| 404 | `not_found` | The URI is well-formed but names no such squad/review. |
 | 409 | `ambiguous_uri` | A label or name segment matches more than one candidate, or none. The message lists them; the caller disambiguates with `?id=`. Never silently resolved. |
 
 ### `GET /api/tasks`
-The full board state the librarian polls (every ~2s). Returns all runs with
-their tasks, sessions, and verify steps, plus daemon status. Accepts optional
-query params so the board and `ralphus run list` share one filter/sort
-implementation (`daemon/src/server.rs::filter_and_sort_runs`) instead of the
-board computing it in JS alone: `status` (comma-separated run states,
+The full board state the librarian polls (every ~2s). Returns all squads with
+their tasks, cells, and proof steps, plus daemon status. Accepts optional
+query params so the board and `ralphus squad list` share one filter/sort
+implementation (`daemon/src/server.rs::filter_and_sort_squads`) instead of the
+board computing it in JS alone: `status` (comma-separated squad states,
 case-insensitive), `name` (case-insensitive substring match on the label),
 `sort` (`name` sorts by label/id ascending; anything else, including absent,
 keeps the default newest-first order).
@@ -1133,9 +1299,9 @@ keeps the default newest-first order).
 ```json
 {
   "daemon": { "running": 1, "max_concurrent": 12, "running_reviews": [], "downtime_active": false },
-  "runs": [
+  "squads": [
     {
-      "id": "run-000000000001",
+      "id": "squad-000000000001",
       "label": null,
       "state": "running",
       "created_at_ms": 1783120106867,
@@ -1151,8 +1317,8 @@ keeps the default newest-first order).
           "soloed": false,
           "started_at_ms": 1783120107300,
           "finished_at_ms": null,
-          "sessions": [ { "id": "session-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "verify": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
-          "verify":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null } ]
+          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
+          "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null } ]
         }
       ]
     }
@@ -1164,26 +1330,26 @@ project filter facet always has real data to group by. It is the registered
 project name when the task's TOML sets `project` (used to resolve the
 `ralphus:new-worktree/<branch>` placeholder via `POST /api/projects` -- see
 above); otherwise it falls back to the basename of the task's first
-session's `cwd` (e.g. `cwd = "/home/me/myrepo"` -> `"myrepo"`), or the literal
-string `"unassigned"` when there's no session, no `cwd`, or the `cwd` has no
+cell's `cwd` (e.g. `cwd = "/home/me/myrepo"` -> `"myrepo"`), or the literal
+string `"unassigned"` when there's no cell, no `cwd`, or the `cwd` has no
 filename component (e.g. `"/"`). This fallback is display-only: it never
 writes back to the task's stored `project` value and has no effect on
 worktree-placeholder resolution, which still requires an explicit, registered
 `project`.
 
 Each `TaskView` also carries raw nullable `agent` and `model` fields: the
-task-level values submitted in TOML, before session inheritance is applied.
-These are distinct from each `SessionView`'s resolved `agent`/`model` fields;
-the board uses the raw task values to explain whether a session's displayed
-resolved value came from the task or was set explicitly on the session.
+task-level values submitted in TOML, before cell inheritance is applied.
+These are distinct from each `CellView`'s resolved `agent`/`model` fields;
+the board uses the raw task values to explain whether a cell's displayed
+resolved value came from the task or was set explicitly on the cell.
 
 `started_at_ms` (RAL-210) is epoch-ms local-machine time of the moment this
-session most recently transitioned to `running`; omitted from the JSON
+cell most recently transitioned to `running`; omitted from the JSON
 (rather than `null`) until it has started at least once. A restart
 overwrites it in place -- there is no separately-tracked first-start time.
 
 `tokens_in` / `tokens_out` / `cost_usd` are reported by whichever agent
-backend ran the session or verify step, and how complete they are depends on
+backend ran the cell or proof step, and how complete they are depends on
 that backend (RAL-187):
 
 - `cost_usd` is `0.0` whenever the backend reported **no dollar figure at
@@ -1194,36 +1360,36 @@ that backend (RAL-187):
   from a price table here, so a consumer never sees an invented number. The
   board renders a zero/absent figure as `N/A` rather than `$0.0000 USD` for
   exactly this reason.
-- Token counts update **while a session is still running**, not only at the
+- Token counts update **while a cell is still running**, not only at the
   end: CLI-agent backends forward a running total over the `RALPHUS_EVENT:`
   stderr channel as each agent turn completes, which the daemon persists to
-  the session row (see the Logging Policy in `AGENTS.md`). Granularity is
+  the cell row (see the Logging Policy in `AGENTS.md`). Granularity is
   therefore per completed turn — both counts read `0` until the first turn
-  finishes. Verify steps have no live channel; their counts appear once the
+  finishes. Proof steps have no live channel; their counts appear once the
   step completes.
-- A session that **fails mid-run** (cancelled, timed out, or its tmux pane
+- A cell that **fails mid-run** (cancelled, timed out, or its tmux pane
   died before the runner wrote a result) still reports the tokens it had
   already spent, carried over from the last live snapshot, rather than
   collapsing to `0`.
-- The values reflect the session's **current** run only. A restart overwrites
+- The values reflect the cell's **current** run only. A restart overwrites
   them rather than accumulating, so a lifetime total across attempts must be
   derived from Cartographer's event history instead.
 
-`created_at_ms` is when the run was submitted/queued. `started_at_ms` (on the
-run, each task, and each session) is when it first entered `running` — `null`
-until it does, and can differ from `created_at_ms` when a run sits `pending`/
+`created_at_ms` is when the squad was submitted/queued. `started_at_ms` (on the
+squad, each task, and each cell) is when it first entered `running` — `null`
+until it does, and can differ from `created_at_ms` when a squad sits `pending`/
 `queued` for a while before the scheduler claims it. `finished_at_ms` is when
 it last reached a terminal state (`done`/`failed`/`cancelled`) — `null` while
 still queued/pending/running. Together these back the Details Pane's "time
 running" (live elapsed while non-terminal, frozen `finished_at_ms -
-started_at_ms` once terminal) and "started at" (UTC) fields. A run/task/
-session that is restarted has these cleared back to `null` for the part(s)
-genuinely re-executing (see `Store::reset_run_to_pending`/`restart_session` in
+started_at_ms` once terminal) and "started at" (UTC) fields. A squad/task/
+cell that is restarted has these cleared back to `null` for the part(s)
+genuinely re-executing (see `Store::reset_squad_to_pending`/`restart_cell` in
 `daemon/src/store.rs`).
 
-Both *task*-level verify steps (`[[task.verify]]`, on `TaskView.verify`) and
-*session*-level verify steps (`[[task.session.verify]]`, on `SessionView.verify`)
-are exposed here, each in task/session declaration order. A verify entry carries:
+Both *task*-level proof steps (`[[task.proof]]`, on `TaskView.proof`) and
+*cell*-level proof steps (`[[task.cell.proof]]`, on `CellView.proof`)
+are exposed here, each in task/cell declaration order. A proof entry carries:
 
 - `id` — optional step id from TOML (e.g. `"fmt"`).
 - `kind` — one of `command` / `prompt` / `brain` / `approval`.
@@ -1232,43 +1398,43 @@ are exposed here, each in task/session declaration order. A verify entry carries
 - `spec` — the step definition: command text for `command` kind, prompt text for
   `prompt` / `brain` kind, or empty string for `approval`.
 - `system_prompt` — the read-only effective appended system prompt that the
-  agent actually received for this verify step, including ralphus-added hidden
-  instructions (verify mode, unattended execution, async retry policy, etc.).
+  agent actually received for this proof step, including ralphus-added hidden
+  instructions (proof mode, unattended execution, async retry policy, etc.).
   Omitted for `command` / `brain` / `approval` kinds, and may also be absent on
   historical rows created before August 15, 2026.
 - `model` — model override for `prompt`-kind steps; `null` when unset.
 
-`command` and `prompt` verify steps actually run (`pending` → `running` →
+`command` and `prompt` proof steps actually run (`pending` → `running` →
 `done`/`failed`); `brain`/`approval` steps are accepted but deferred and stay
 `pending` forever. A `prompt` step's `output` is the AI's final response
 text (used to derive its pass/fail verdict), not command stdout.
 
-Each run also carries an `env_overrides` field (RAL-150): the run's persistent
+Each squad also carries an `env_overrides` field (RAL-150): the squad's persistent
 environment-variable overrides, as raw unredacted `{key: value}` pairs (see
-[`POST /api/runs/{id}/env`](#post-apirunsidenv)). Omitted from the JSON
-entirely when empty — true for the vast majority of runs.
+[`POST /api/squads/{id}/env`](#post-apisquadsidenv)). Omitted from the JSON
+entirely when empty — true for the vast majority of squads.
 
 Each `TaskView` likewise carries `env_overrides` (this task's own overrides,
-set via `POST /api/runs/{id}/tasks/{ti}/env`) and `verify_env_overrides`
-(this task's own verify-step overrides, set via
-`POST /api/runs/{id}/tasks/{ti}/verify/env`); each `SessionView` carries the
-same pair scoped to the session (`POST /api/runs/{id}/sessions/{ti}/{si}/env`
-and `.../verify/env`) -- see
-[Hierarchical env overrides](#hierarchical-env-overrides-tasksessionverify-layers)
-above for how these merge with the run's. All four are raw unredacted
-`{key: value}` pairs, omitted from the JSON when empty, same as the run's.
+set via `POST /api/squads/{id}/tasks/{ti}/env`) and `proof_env_overrides`
+(this task's own proof-step overrides, set via
+`POST /api/squads/{id}/tasks/{ti}/proof/env`); each `CellView` carries the
+same pair scoped to the cell (`POST /api/squads/{id}/cells/{ti}/{si}/env`
+and `.../proof/env`) -- see
+[Hierarchical env overrides](#hierarchical-env-overrides-taskcellproof-layers)
+above for how these merge with the squad's. All four are raw unredacted
+`{key: value}` pairs, omitted from the JSON when empty, same as the squad's.
 
-For prompt-driven sessions, each `SessionView` may also carry `system_prompt`:
+For prompt-driven cells, each `CellView` may also carry `system_prompt`:
 the read-only effective appended system prompt the agent actually received,
 including ralphus-added hidden instructions (unattended execution, async retry
-policy, ghost handoff, and any stored session/subproject addendum). It is
-omitted for command sessions, and may also be absent on historical rows created
+policy, ghost handoff, and any stored cell/subproject addendum). It is
+omitted for command cells, and may also be absent on historical rows created
 before August 15, 2026.
 
 ### `GET /api/resources`
 Per-task OS resource usage for the board's Resources tab (RAL-11). One entry per
-*running* session that currently has a live `ralphus-runner` subprocess, with its
-CPU/RAM/GPU sampled and mapped back to the exact run/task/session. Sampling briefly
+*running* cell that currently has a live `ralphus-runner` subprocess, with its
+CPU/RAM/GPU sampled and mapped back to the exact squad/task/cell. Sampling briefly
 blocks (~200ms) to compute a CPU delta, so this is polled only while the Resources
 tab is open.
 
@@ -1276,12 +1442,12 @@ tab is open.
 {
   "resources": [
     {
-      "run_id": "run-000000000001",
-      "run_label": null,
+      "squad_id": "squad-000000000001",
+      "squad_label": null,
       "task_idx": 0,
       "task_name": "build",
-      "session_idx": 0,
-      "session_id": "session-0",
+      "cell_idx": 0,
+      "cell_id": "cell-0",
       "pid": 48213,
       "cpu_percent": 12.5,
       "mem_bytes": 104857600,
@@ -1297,143 +1463,161 @@ is `null` ("N/A" in the UI) whenever GPU metrics are unavailable (no `nvidia-smi
 no NVIDIA GPU, or nothing attributed to that PID) — `ralphus check health` warns
 when `nvidia-smi` is missing. CPU/RAM sampling uses no extra crates (`/proc` on
 Linux, PowerShell `Get-Process` on Windows); unsupported platforms report `null`.
-`task_idx`/`session_idx` are the board's navigation indices (the "Go to task"
-button jumps straight to that session).
+`task_idx`/`cell_idx` are the board's navigation indices (the "Go to task"
+button jumps straight to that cell).
 
-### `GET /api/runs/{id}`
-A single run's full detail (same shape as one element of `runs` above, plus the
+### `GET /api/config/live-view` (RAL-232)
+The Live View "Show Debug Messages" checkbox's config-driven default: the
+effective (global-under-project) `[live_view]` table from `.ralphus.toml`,
+following the same global-under-project layering as `[cartographer]`/
+`[terminal_logs]`/`[budget]` (`crate::config::load_live_view_config`).
+
+```json
+{ "show_debug_messages_default": false }
+```
+
+`show_debug_messages_default` (`[live_view]`'s only field so far) is `false`
+when unset — the board's Live View panes hide ralphus's own
+diagnostic/telemetry lines by default, showing only agent-produced output.
+The board fetches this once at page load to initialize each pane's checkbox;
+see ["Live View debug-line filtering"](#live-view-debug-line-filtering-ral-232)
+below for the full design, including why this is a rendering-only default
+that never touches what's persisted.
+
+### `GET /api/squads/{id}`
+A single squad's full detail (same shape as one element of `squads` above, plus the
 resolved definition fields shown in the details pane).
 
-### `GET /api/runs/{id}/graph`
-The run's internal session dependency graph (`ralphus graph <run_id>`), built
+### `GET /api/squads/{id}/graph`
+The squad's internal cell dependency graph (`ralphus graph <squad_id>`), built
 from the same `depends_on` resolution `daemon/src/plan.rs::plan()` uses for
-scheduling — nodes are sessions, not tasks, since the session is the
+scheduling — nodes are cells, not tasks, since the cell is the
 schedulable unit:
 ```json
 {
   "nodes": [
-    { "id": "t0s0", "task_idx": 0, "session_idx": 0, "task_name": "build", "session_id": "compile" }
+    { "id": "t0s0", "task_idx": 0, "cell_idx": 0, "task_name": "build", "cell_id": "compile" }
   ],
   "edges": [ { "from": "t0s0", "to": "t1s0" } ]
 }
 ```
-`edges[].from` must complete before `.to` may start. `404` if the run does not
+`edges[].from` must complete before `.to` may start. `404` if the squad does not
 exist; `500` (`code: "cycle"`) on a dependency cycle — should not happen for an
-already-submitted run (submission itself rejects cycles), but the underlying
+already-submitted squad (submission itself rejects cycles), but the underlying
 `plan()` call is fallible so this stays honest rather than unwrapping. Rendering
 (ASCII/DOT) happens entirely client-side; see `cli/src/ralphus/graphview.py`.
 
 ### `GET /api/graph`
-The cross-run `[[default]] depends_on` gating graph (`ralphus graph --global`):
-nodes are runs, edges are `[[default]]` references from one run to another.
-`?all=1` includes terminal (done/failed/cancelled) runs; by default only
-active (queued/pending/running) runs are included, and a dependency reference
-to an excluded/unresolvable run produces no edge (best-effort, same philosophy
-as within-run `depends_on` resolution). Shape:
+The cross-squad `[[default]] depends_on` gating graph (`ralphus graph --global`):
+nodes are squads, edges are `[[default]]` references from one squad to another.
+`?all=1` includes terminal (done/failed/cancelled) squads; by default only
+active (queued/pending/running) squads are included, and a dependency reference
+to an excluded/unresolvable squad produces no edge (best-effort, same philosophy
+as within-squad `depends_on` resolution). Shape:
 ```json
 {
-  "nodes": [ { "id": "run-000000000001", "label": null, "state": "pending" } ],
-  "edges": [ { "from": "run-000000000001", "to": "run-000000000002" } ]
+  "nodes": [ { "id": "squad-000000000001", "label": null, "state": "pending" } ],
+  "edges": [ { "from": "squad-000000000001", "to": "squad-000000000002" } ]
 }
 ```
 
-### `GET /api/runs/{id}/worktrees`
-Per-session git info for the detail pane's read-only rows (CCTL-148; `upstream`
-added later): the session's own worktree (`cwd`), its shared project root, and
-the upstream to display. Computed on demand (runs `git` per session), not on
+### `GET /api/squads/{id}/worktrees`
+Per-cell git info for the detail pane's read-only rows (CCTL-148; `upstream`
+added later): the cell's own worktree (`cwd`), its shared project root, and
+the upstream to display. Computed on demand (runs `git` per cell), not on
 the hot board path:
 ```json
 [
-  { "task_idx": 0, "session_idx": 0, "worktree": "C:/repo/.git/.ralphus_worktrees/feat", "project": "C:/repo", "upstream": "main" }
+  { "task_idx": 0, "cell_idx": 0, "worktree": "C:/repo/.git/.ralphus_worktrees/feat", "project": "C:/repo", "upstream": "main" }
 ]
 ```
 `project`/`upstream` are `null` when `cwd` is not inside a git worktree.
-`upstream` is one of two things, per the session's `upstream = "<<task:...>>"`
+`upstream` is one of two things, per the cell's `upstream = "<<task:...>>"`
 sentinel (RAL-50 branch-chaining):
-- **Sentinel set**: the *referenced* session's own worktree branch name (what
-  this session's branch is rebased onto before it runs) — `null` if that
+- **Sentinel set**: the *referenced* cell's own worktree branch name (what
+  this cell's branch is rebased onto before it runs) — `null` if that
   dependency hasn't materialized a worktree yet (never falls back to the
   tracking ref below in this case, to avoid showing a misleading value).
 - **No sentinel**: the worktree's own git upstream tracking branch (typically
   the non-worktree base branch it was forked from, e.g. `main`), or `null` if
   none is configured.
 
-See `daemon/src/reviews.rs::session_upstream_display`.
+See `daemon/src/reviews.rs::cell_upstream_display`.
 
-### `GET /api/runs/{id}/logs`
-The event timeline for a run: an ordered list of `{ ts, level, source, message }`
-plus per-session and per-verifier log references (drives the Logs modal tabs).
+### `GET /api/squads/{id}/logs`
+The event timeline for a squad: an ordered list of `{ ts, level, source, message }`
+plus per-cell and per-proof log references (drives the Logs modal tabs).
 
-### `POST /api/runs/{id}/activate`
-Move a held `Queued` run to `Pending`. Returns the new state.
+### `POST /api/squads/{id}/activate`
+Move a held `Queued` squad to `Pending`. Returns the new state.
 
-### `POST /api/runs/{id}/tasks/{ti}/solo`
-Solo a task within a run (RAL-157): while any task in the run is soloed, the
-scheduler only dispatches soloed tasks' not-yet-started sessions — every
-other task's sessions stay `pending` until un-soloed, even once the soloed
+### `POST /api/squads/{id}/tasks/{ti}/solo`
+Solo a task within a squad (RAL-157): while any task in the squad is soloed, the
+scheduler only dispatches soloed tasks' not-yet-started cells — every
+other task's cells stay `pending` until un-soloed, even once the soloed
 task itself finishes (a dependent task must not start racing ahead just
-because its soloed upstream completed). A session already `running` when a
-sibling gets soloed is left to finish on its own — there is no per-session
-interrupt in this codebase (cancellation is run-wide only), so pausing an
-in-flight session's task takes effect starting at that task's *next*
-session, not mid-session. Multiple tasks in the same run may be soloed at
+because its soloed upstream completed). A cell already `running` when a
+sibling gets soloed is left to finish on its own — there is no per-cell
+interrupt in this codebase (cancellation is squad-wide only), so pausing an
+in-flight cell's task takes effect starting at that task's *next*
+cell, not mid-cell. Multiple tasks in the same squad may be soloed at
 once; soloing one does not un-solo another. Idempotent. Solo state is
 sticky — it never auto-clears (not on the soloed task's own completion, not
-on a run restart); [`POST /api/runs/{id}/tasks/{ti}/unsolo`](#post-apirunsidtaskstiunsolo)
-is the only way to resume paused siblings. Returns the refreshed `RunView`
+on a squad restart); [`POST /api/squads/{id}/tasks/{ti}/unsolo`](#post-apisquadsidtaskstiunsolo)
+is the only way to resume paused siblings. Returns the refreshed `SquadView`
 (so `tasks[].soloed` reflects the change in the same round trip). An unknown
-run or task index is a `404`; a non-integer `{ti}` is a `400`.
+squad or task index is a `404`; a non-integer `{ti}` is a `400`.
 
-### `POST /api/runs/{id}/tasks/{ti}/unsolo`
+### `POST /api/squads/{id}/tasks/{ti}/unsolo`
 Un-solo a task (RAL-157) — the reverse of
-[`POST /api/runs/{id}/tasks/{ti}/solo`](#post-apirunsidtaskstisolo). Returns
-the refreshed `RunView`. Idempotent; same error responses as `solo`.
+[`POST /api/squads/{id}/tasks/{ti}/solo`](#post-apisquadsidtaskstisolo). Returns
+the refreshed `SquadView`. Idempotent; same error responses as `solo`.
 
-### `POST /api/runs/{id}/cancel/preview`
-Dry-run preview of [`POST /api/runs/{id}/cancel`](#post-apirunsidcancel)
+### `POST /api/squads/{id}/cancel/preview`
+Dry-run preview of [`POST /api/squads/{id}/cancel`](#post-apisquadsidcancel)
 (RAL-116): computes the exact same cascade-cancel impact set the real cancel
-would affect — this run plus every run transitively dependent on it — without
+would affect — this squad plus every squad transitively dependent on it — without
 mutating anything. The librarian shows this before the user confirms a
 cancel, so the preview and the real cancel can never drift out of sync (both
-call the same `Store::cancel_run`). Response `200`:
+call the same `Store::cancel_squad`). Response `200`:
 ```json
-{ "runs": [{ "id": "run-000000000001", "label": null }, { "id": "run-000000000002", "label": "downstream run" }] }
+{ "squads": [{ "id": "squad-000000000001", "label": null }, { "id": "squad-000000000002", "label": "downstream squad" }] }
 ```
 An unknown `id` is a `404`.
 
-### `POST /api/runs/{id}/cancel`
-Cancel a run **and every run transitively dependent on it** (RAL-116).
-Always available and idempotent regardless of the run's current state — even
-an already-terminal run (`done`/`failed`/already `cancelled`) is
+### `POST /api/squads/{id}/cancel`
+Cancel a squad **and every squad transitively dependent on it** (RAL-116).
+Always available and idempotent regardless of the squad's current state — even
+an already-terminal squad (`done`/`failed`/already `cancelled`) is
 (re-)cancelled, so it can never be picked up again by another trigger (a
-restart, cross-run gating, etc). Kills any in-flight task/session/verify
+restart, cross-squad gating, etc). Kills any in-flight task/cell/proof
 subprocess via the same cooperative cancellation used mid-run (best-effort
-termination). `POST /api/runs/{id}/set-status` with `{"kind":"run","state":"cancelled"}`
+termination). `POST /api/squads/{id}/set-status` with `{"kind":"squad","state":"cancelled"}`
 routes through this exact same cascading cancel — not a separate DB-only flip
 — so both entry points have identical effect. Response `200`:
 ```json
-{ "state": "cancelled", "cancelled": ["run-000000000001", "run-000000000002"] }
+{ "state": "cancelled", "cancelled": ["squad-000000000001", "squad-000000000002"] }
 ```
 An unknown `id` is a `404`.
 
 ### `GET /api/cartographer`
 The global Cartographer log (RAL-98): every structured event in the system —
-task/session lifecycle, verify starts/results, status transitions, Guardian
+task/cell lifecycle, proof starts/results, status transitions, Guardian
 review lifecycle events — as one filterable, paginated, sortable table. This
 is the same view used both for "show me everything" and for "show me this
-one run/session/guardian's history"; the latter is just this endpoint with a
-`run_id`/`session_id`/`guardian_id` filter applied (it replaces the old
-per-run "events" sub-tab that used to be backed by `GET /api/runs/{id}/logs`).
+one squad/cell/guardian's history"; the latter is just this endpoint with a
+`squad_id`/`cell_id`/`guardian_id` filter applied (it replaces the old
+per-squad "events" sub-tab that used to be backed by `GET /api/squads/{id}/logs`).
 
-Query params (all optional): `source`, `scope`, `level`, `run_id`,
-`guardian_id`, `session_id`, `task` (exact match on task name, RAL-155),
+Query params (all optional): `source`, `scope`, `level`, `squad_id`,
+`guardian_id`, `cell_id`, `task` (exact match on task name, RAL-155),
 `q` (substring match on message), `since_ms`, `until_ms`, `limit` (default
 100, max 1000), `offset`, `sort` (`asc`/`desc`, default `desc` — newest
 first) — plus `entity` (RAL-155): a single-string [entity URI](#entity-uris-ral-155)
-that addresses a run/task/session/verify/guardian uniformly, resolved into
-the equivalent `run_id`/`task`/`session_id`/`guardian_id` filter fields
-server-side (`task_idx`/`session_idx` are translated to the task's
-name/session's id via a store lookup, since those are what the columns
+that addresses a squad/task/cell/proof/guardian uniformly, resolved into
+the equivalent `squad_id`/`task`/`cell_id`/`guardian_id` filter fields
+server-side (`task_idx`/`cell_idx` are translated to the task's
+name/cell's id via a store lookup, since those are what the columns
 above actually store). `entity` composes with the other filter fields —
 an explicit field always wins over one `entity` would have derived, since
 it's the more specific ask. A malformed `entity` string is a `400`.
@@ -1446,11 +1630,11 @@ it's the more specific ask. A malformed `entity` string is a `400`.
       "at_ms": 1732300000000,
       "level": "info",
       "source": "scheduler",
-      "message": "run run-000000000001 claimed → running",
-      "scope": "run",
-      "run_id": "run-000000000001",
+      "message": "squad squad-000000000001 claimed → running",
+      "scope": "squad",
+      "squad_id": "squad-000000000001",
       "guardian_id": null,
-      "session_id": null,
+      "cell_id": null,
       "task": null,
       "log_path": null,
       "payload": {}
@@ -1474,16 +1658,43 @@ every 10 minutes by the scheduler.
 One Cartographer row's full detail, by its `id`. `404` if it does not exist
 (e.g. already pruned).
 
+### `POST /api/events/ticket` (RAL-222)
+Mints a short-lived (30s), single-use ticket gating [`GET
+/api/events`](#get-apievents-ral-167) below. Gated by the ordinary bearer
+token like any other route (it's dispatched through `route()`, not
+`run_http_loop`'s SSE special-case). Response:
+
+```json
+{ "ticket": "<64-char hex string>" }
+```
+
 ### `GET /api/events` (RAL-167)
 A long-lived Server-Sent Events (SSE) stream: the daemon's primary push
 mechanism for `board.html`, replacing its old fixed-interval polling. One
 event is emitted for every [`GET /api/cartographer`](#get-apicartographer) row
-written — i.e. every task/run/session/guardian/queue state change, verify
+written — i.e. every task/squad/cell/guardian/queue state change, proof
 start/result, and Guardian review lifecycle event already flowing through
 Cartographer — so this endpoint has no separate instrumentation of its own to
 keep in sync. The queue view is a derived, filtered projection over
-run/task state, so a `run`-kind event also implies "the queue may have
+squad/task state, so a `squad`-kind event also implies "the queue may have
 changed."
+
+**Auth (RAL-222).** This endpoint can't carry the bearer token directly — it's
+opened by the browser's `EventSource`, which cannot set custom request
+headers, and a long-lived credential in a URL query string would leak into
+access logs, proxy logs, and browser history. Instead it requires
+`?ticket=<nonce>`, a short-lived single-use ticket minted via the bearer-gated
+`POST /api/events/ticket` above; the ticket is consumed (and can never be
+replayed) the moment a connection is accepted. A missing, unknown, expired, or
+already-used ticket gets a `401` before any SSE data is written — the same
+error envelope as every other route (`{"error":{"code":"unauthorized",
+"message":"missing or invalid events ticket"}}`). Like the bearer token
+itself, this check is skipped entirely when the daemon has no token
+configured (`Daemon::new`/`serve_with`, used by tests). `board.html` fetches a
+ticket immediately before opening each `EventSource` connection (including on
+reconnect, since a dropped connection's ticket is already spent) and the
+librarian's proxy (`proxy_events_stream`) relays the browser's `?ticket=...`
+straight through — the daemon is the only party that mints or validates them.
 
 Each event's `data:` payload is exactly one Cartographer row (same shape as
 `GET /api/cartographer`'s `rows[]` entries above); its SSE `event:` name is
@@ -1492,8 +1703,8 @@ one of three kinds, derived from which entity references the row carries:
 | `event:` name | When |
 |---|---|
 | `guardian` | The row carries a `guardian_id` — a review changed (branches, chat, checks, merge/rebase state, ...). |
-| `run` | The row carries a `run_id` but no `guardian_id` — a run/task/session (and, by extension, the queue view) changed. |
-| `other` | Neither — still Cartographer-worthy, but not scoped to one run or guardian (e.g. daemon-wide startup recovery events). |
+| `squad` | The row carries a `squad_id` but no `guardian_id` — a squad/task/cell (and, by extension, the queue view) changed. |
+| `other` | Neither — still Cartographer-worthy, but not scoped to one squad or guardian (e.g. daemon-wide startup recovery events). |
 
 A connection with nothing to report for 15s receives an SSE comment line
 (`: heartbeat`) instead, so idle proxies/browsers don't decide it's dead. The
@@ -1509,7 +1720,7 @@ the daemon — `board.html`'s own 60s reconciliation poll (a `tick()` fallback,
 not the primary path) covers any resulting gap.
 
 ### Entity URIs (RAL-155)
-A single-string, index-based way to address any run/task/session/verify/
+A single-string, index-based way to address any squad/task/cell/proof/
 guardian entity — shared, cross-cutting infrastructure used as the
 `GET /api/cartographer` `entity=` filter above, and mirrored in the CLI
 (`ralphus.entity_uri`, bridging the CLI's human-typed, name-or-index
@@ -1518,40 +1729,40 @@ guardian entity — shared, cross-cutting infrastructure used as the
 authoritative grammar the other two mirror). Grammar:
 
 ```text
-run:<run_id>
-task:<run_id>:<task_idx>
-session:<run_id>:<task_idx>:<session_idx>
-verify:<run_id>:<task_idx>:<verify_scope>:<session_idx>:<verify_idx>
+squad:<squad_id>
+task:<squad_id>:<task_idx>
+cell:<squad_id>:<task_idx>:<cell_idx>
+proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>
 guardian:<guardian_id>
 ```
 
-`task_idx`/`session_idx`/`verify_idx` are the same 0-based indices the HTTP
-routes already use (`/api/runs/{id}/sessions/{ti}/{si}/...`). `verify_scope`
-is `"task"` or `"session"`; `session_idx` is `-1` for a task-scope verify.
-Examples: `task:run-000000000001:0`, `session:run-000000000001:0:1`,
-`verify:run-000000000001:0:session:1:0`, `guardian:guardian-000000000001`.
+`task_idx`/`cell_idx`/`proof_idx` are the same 0-based indices the HTTP
+routes already use (`/api/squads/{id}/cells/{ti}/{si}/...`). `proof_scope`
+is `"task"` or `"cell"`; `cell_idx` is `-1` for a task-scope proof.
+Examples: `task:squad-000000000001:0`, `cell:squad-000000000001:0:1`,
+`proof:squad-000000000001:0:cell:1:0`, `guardian:guardian-000000000001`.
 
-### `GET /api/runs/{id}/timeline`
+### `GET /api/squads/{id}/timeline`
 Generates and returns the merged, chronological "uber-log-viewer" for a
-whole run (RAL-155): every Run/Task/Session/Verify state transition and
-every other Cartographer event scoped to the run, plus terminal-log excerpts
+whole squad (RAL-155): every Squad/Task/Cell/Proof state transition and
+every other Cartographer event scoped to the squad, plus terminal-log excerpts
 inlined from any `log_path`-carrying rows, sorted by `(at_ms, id)` ascending
 and rendered as one plain-text narrative. As a side effect, the rendered
 text is (best-effort) written to a temp file on the daemon's host — a fresh
 generation on every call, not a persistent export (RAL-155 Q5) — at a fixed
-per-run path under the OS temp directory. `404` if the run doesn't exist.
+per-squad path under the OS temp directory. `404` if the squad doesn't exist.
 
 ```json
 {
   "meta": {
-    "run_id": "run-000000000001",
+    "squad_id": "squad-000000000001",
     "generated_at_ms": 1732300005000,
     "start_ms": 1732300000000,
     "end_ms": 1732300004000,
     "event_count": 37,
     "terminal_log_count": 3,
     "task_count": 2,
-    "session_count": 4,
+    "cell_count": 4,
     "truncated": false,
     "gaps_possible": false
   },
@@ -1560,55 +1771,55 @@ per-run path under the OS temp directory. `404` if the run doesn't exist.
       "at_ms": 1732300000000,
       "level": "info",
       "source": "submit",
-      "scope": "run",
+      "scope": "squad",
       "task": null,
-      "session_id": null,
-      "message": "run inserted",
+      "cell_id": null,
+      "message": "squad inserted",
       "log_path": null,
       "log_excerpt": null
     }
   ],
-  "text": "=== ralphus uber-log timeline: run run-000000000001 ===\n...",
-  "file_path": "C:\\Users\\...\\Temp\\ralphus-timeline-run-000000000001.log"
+  "text": "=== ralphus uber-log timeline: squad squad-000000000001 ===\n...",
+  "file_path": "C:\\Users\\...\\Temp\\ralphus-timeline-squad-000000000001.log"
 }
 ```
 
 `event_count` is capped at a conservative default (2000 rows) per
-generation — `truncated: true` means the run has more history than fit.
-`gaps_possible: true` means the run's own inaugural `"run inserted"`
+generation — `truncated: true` means the squad has more history than fit.
+`gaps_possible: true` means the squad's own inaugural `"squad inserted"`
 Cartographer row is missing from the returned rows, which reliably indicates
-Cartographer's retention pruning has already removed some of this run's
+Cartographer's retention pruning has already removed some of this squad's
 earliest history — this endpoint is best-effort (RAL-155 Q6), with no
 obligation to reconstruct pruned history. The board's "⏱ Timeline" button
 (next to "📄 Logs") calls this same endpoint and renders `text` in a modal.
 
 ### `GET /api/ghosts/{owner_uri}`
 Fetch one "ghost" (RAL-136) — a short, best-effort handoff note a task
-session or Guardian review worktree published for whoever picks up dependent
+cell or Guardian review worktree published for whoever picks up dependent
 work next (open questions, places it struggled, things it noticed but didn't
 fix; deliberately **not** a changelog of what's already recoverable from `git
-log`). `owner_uri` is the publisher's stable id: `session:{run_id}:{task_idx}:
-{session_idx}` for a task session, `review:{guardian_id}:{branch_id}` (or
+log`). `owner_uri` is the publisher's stable id: `cell:{squad_id}:{task_idx}:
+{cell_idx}` for a task cell, `review:{guardian_id}:{branch_id}` (or
 `review:{guardian_id}:combined`) for a review worktree. There is at most one
-ghost row per owner — a session/review that publishes again merges onto its
+ghost row per owner — a cell/review that publishes again merges onto its
 existing note rather than adding a second row. `404` if that owner has never
 published one.
 
 Content isn't only the agent's own self-report: when the daemon can determine
-the ground-truth pass/fail of a scope's verify/check step(s), it folds an
+the ground-truth pass/fail of a scope's proof/check step(s), it folds an
 advisory note onto the same ghost (RAL-152), e.g. "the prior run's 2/2
-verify/check step(s) passed -- you internally validated that the code works.
+proof/check step(s) passed -- you internally validated that the code works.
 ... re-test/re-verify the existing work first rather than assuming it's
 broken." This is phrased as a hint, not a guarantee — it can go stale (e.g. a
 rebase or conflict resolution since it was written) — and applies wherever a
-ghost is written: task session restarts, verify-only restarts, and Guardian
+ghost is written: task cell restarts, proof-only restarts, and Guardian
 resolver restarts.
 
 ```json
 {
-  "owner_uri": "session:run-000000000001:0:0",
-  "kind": "session",
-  "run_id": "run-000000000001",
+  "owner_uri": "cell:squad-000000000001:0:0",
+  "kind": "cell",
+  "squad_id": "squad-000000000001",
   "guardian_id": null,
   "content": "Left the retry loop untuned -- the 3rd flaky test case needs a longer backoff.",
   "user_note": "you were stopped midway through the migration; the schema change is already applied",
@@ -1620,9 +1831,9 @@ resolver restarts.
 
 `revision` is an opaque, VCS-agnostic marker (currently a git commit sha when
 the publishing worktree is a git repo, `null` otherwise) for best-effort
-staleness reasoning — nothing re-validates it automatically. A session's own
+staleness reasoning — nothing re-validates it automatically. A cell's own
 prior ghost, and its direct dependencies' ghosts (one level up in the task
-graph only), are already injected into its prompt automatically at session
+graph only), are already injected into its prompt automatically at cell
 start; this endpoint is for explicit lookups beyond that (tooling, the CLI,
 one review branch checking another's notes).
 
@@ -1632,28 +1843,28 @@ documented on the restart endpoints below. Unlike `content`, it is *not*
 merged/accumulated on repeated writes: each restart's note replaces whatever
 was there before, while `content` keeps rolling up as usual. `null` when no
 one has ever attached a restart note. When present, it's injected into the
-restarted session's prompt as its own distinct line at the very bottom of the
+restarted cell's prompt as its own distinct line at the very bottom of the
 prior-context block (after every agent-authored note, never interleaved with
 it).
 
 ### `POST /api/ghosts/copy`
 Explicitly copy `source_uri`'s ghost onto `target_uri`, independent of the
-dependency graph (e.g. seeding a brand-new task session with a prior
+dependency graph (e.g. seeding a brand-new task cell with a prior
 investigation's findings). Merges onto whatever `target_uri` already has,
 same as any other ghost write.
 
 ```json
-{ "source_uri": "session:run-000000000001:0:0", "target_uri": "session:run-000000000002:1:0" }
+{ "source_uri": "cell:squad-000000000001:0:0", "target_uri": "cell:squad-000000000002:1:0" }
 ```
 
-`target_uri`'s prefix (`session:`/`review:`) determines the copy's owner
+`target_uri`'s prefix (`cell:`/`review:`) determines the copy's owner
 kind — only the two URIs are needed, not every column of the target row.
-`400` if `target_uri` doesn't parse as a `session:`/`review:` URI; `404` if
+`400` if `target_uri` doesn't parse as a `cell:`/`review:` URI; `404` if
 `source_uri` has no ghost to copy. Response `200` is the resulting `GhostView`
 (same shape as [`GET /api/ghosts/{owner_uri}`](#get-apighostsowner_uri)).
 
 ### `ralphus history`/`ralphus listen` (RAL-140) — no new daemon endpoints
-`ralphus history <session|verify ID> [--live]` and `ralphus listen <ID>
+`ralphus history <cell|proof ID> [--live]` and `ralphus listen <ID>
 --until <status>` are CLI-only compositions over the endpoints already
 documented above; RAL-140 deliberately adds no new daemon routes or storage
 tables of its own:
@@ -1661,7 +1872,7 @@ tables of its own:
 - **`ralphus history <ID>` (no `--live`)** — a one-shot, non-blocking
   snapshot. If the id's tmux session is currently live, this is the same
   `.../pane` content the board's "Show Live View" reads (see `GET
-  .../sessions/{ti}/{si}/pane` / `GET .../verifies/{ti}/{scope}/{si}/{vi}/pane`
+  .../cells/{ti}/{si}/pane` / `GET .../proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane`
   above). Once the tmux session is gone, `.../pane` itself may still return a
   persisted last-pane-content snapshot (RAL-102 follow-up —
   `crate::tmux::write_pane_snapshot`/`read_pane_snapshot`, a read-only
@@ -1669,36 +1880,36 @@ tables of its own:
   `ralphus history` prefers a more stable, curated record over a raw
   transcript replay — it falls back to whatever was already durably
   persisted for that entity by mechanisms that predate this ticket:
-  - A **session**'s fallback is its RAL-136 ghost — `GET
-    /api/ghosts/session:{run_id}:{task_idx}:{session_idx}` (see above). A
+  - A **cell**'s fallback is its RAL-136 ghost — `GET
+    /api/ghosts/cell:{squad_id}:{task_idx}:{cell_idx}` (see above). A
     `404` (no ghost ever published) is rendered as "no history recorded yet",
     not an error.
-  - A **verify** step's fallback is its already-stored `output` text (part of
-    a run's `GET /api/runs/{id}` response since long before this ticket) —
-    ghosts have no per-verify granularity, so there is nothing new to add
+  - A **proof** step's fallback is its already-stored `output` text (part of
+    a squad's `GET /api/squads/{id}` response since long before this ticket) —
+    ghosts have no per-proof granularity, so there is nothing new to add
     here either.
 - **`ralphus history <ID> --live`** — blocks and tails the live `.../pane`
   endpoint every second, diffing each poll against a small cursor
   (`length` + a short trailing-content fingerprint) the CLI persists to
   `~/.ralphus/history_cursors/` so a restarted CLI process resumes from where
   it left off instead of re-printing already-seen output, and so multiple
-  independent watchers of the same session never share (or clobber) a read
+  independent watchers of the same cell never share (or clobber) a read
   position. Fails immediately with a clear error if nothing is currently
   live for the id (`--wait-until-valid [SECONDS]` opts into waiting instead).
-  Once the pane goes inactive, the session/verify's ghost/output (see above)
+  Once the pane goes inactive, the cell/proof's ghost/output (see above)
   is printed as one final, separately labelled block — it's a short curated
   note, not a continuation of the raw tmux transcript just tailed, so it is
   never diffed against the tailing cursor.
 - **`ralphus listen <ID> --until <status>`** — polls the existing `GET
-  /api/runs/{id}` (for a run/task/session/verify selector) or `GET
+  /api/squads/{id}` (for a squad/task/cell/proof selector) or `GET
   /api/guardians/{id}` (for a review/review-worktree selector) endpoint once
   a second until the resolved entity's status equals the caller-supplied
   `--until` value, then exits. No log/tmux content is involved.
 
 ### Live View liveness signal (RAL-170)
 
-Every `GET .../pane` response (`GET .../sessions/{ti}/{si}/pane`, `GET
-.../verifies/{ti}/{scope}/{si}/{vi}/pane`, `GET
+Every `GET .../pane` response (`GET .../cells/{ti}/{si}/pane`, `GET
+.../proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane`, `GET
 .../guardians/{id}/branches/{branch_id}/pane`, `GET
 .../guardians/{id}/manual-checks/pane`) carries a `last_activity_ms` field
 alongside `active`/`content`:
@@ -1724,7 +1935,7 @@ forward `RALPHUS_EVENT:` marker lines) — RAL-170 piggybacks on that existing
 poll, storing the timestamp as an in-process `Store` field
 (`Store::note_live_activity`/`live_activity_ms`/`clear_live_activity`,
 `daemon/src/store.rs`) keyed by the same deterministic `crate::tmux::session_name`
-used for task sessions, verify steps, and Guardian resolver/manual-check
+used for task cells, proof steps, and Guardian resolver/manual-check
 sessions alike. Two consequences of that choice:
 
 - **Always fresh when read.** Because tracking never depends on a Live View
@@ -1751,10 +1962,50 @@ interval that drives event forwarding), the next step would be debouncing
 the insert further (e.g. only update if the value has advanced by more than
 some threshold), not switching to persistent storage.
 
+### Live View debug-line filtering (RAL-232)
+
+Every tmux-wrapped cell/proof/resolver runs its `ralphus-runner` subprocess
+directly inside the pane the board's Live View reads, so the pane's raw text
+interleaves the agent's own output with ralphus's own diagnostic/telemetry
+lines: the `ralphus [TYPE] message ...` convention
+([`.agent/logging-policy.md`](../.agent/logging-policy.md)'s log-format table),
+`RALPHUS_EVENT:` Cartographer markers (`runner/src/cartographer.rs`), and the
+`RALPHUS_TMUX_DONE` tmux-completion sentinel (`daemon/src/runner.rs`). A
+per-pane "Show Debug Messages" checkbox lets a viewer choose whether to see
+those lines or just the agent's.
+
+**This is a rendering-only concern — nothing about capture or persistence
+changes.** `GET .../pane` (`capture_pane_reply`) always returns the full,
+unfiltered pane content, exactly as before RAL-232; so do the persisted
+last-pane-content snapshot and every durable terminal-log attempt file
+(`crate::terminal_log`) and Cartographer row. The filtering
+(`stripDebugLines`/`isRalphusDebugLine`) happens entirely in
+`librarian/assets/board.html`, applied only to the text already rendered in
+a peek box:
+
+- The checkbox's *default* state comes from
+  [`GET /api/config/live-view`](#get-apiconfiglive-view-ral-232) — `false`
+  (agent-only) unless overridden by `[live_view].show_debug_messages_default`
+  in `.ralphus.toml`.
+- A viewer can override that default per-pane for the rest of the browser
+  session by toggling the checkbox; this is never sent back to the daemon.
+- Line classification is intentionally conservative: a line only counts as
+  ralphus's own if one of the markers above starts the (trimmed) line, not
+  merely appears in it — otherwise an agent reading or grepping ralphus's own
+  source (which contains these strings verbatim) would have its own tool
+  output misclassified, the same false-positive class
+  `daemon/src/runner.rs::pane_shows_done_sentinel` already guards against for
+  the completion sentinel specifically. This means the classifier can miss a
+  ralphus line that doesn't match one of these prefixes (e.g. a future log
+  convention) — see `test/debug-strip.test.mjs` for the classifier's exact
+  coverage.
+
 ## Notes on future evolution
 
-- Auth/identity and per-user attribution are **not** in this draft; when
-  multi-user hardening begins, an `Authorization` header + a `submitted_by`
-  field on runs are the expected additions (see `FOLLOW.local.md` #3).
+- Single-secret bearer-token auth landed in RAL-219 (see
+  ["Authentication"](#authentication-ral-219) above). Per-user identity and
+  attribution are still **not** in this draft; when multi-user hardening
+  begins, a `submitted_by` field on squads (keyed off something richer than one
+  shared token) is the expected addition (see `FOLLOW.local.md` #3).
 - Live updates are poll-based for now (librarian polls `GET /api/tasks`); an SSE
   or WebSocket channel is a later optimization.

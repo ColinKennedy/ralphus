@@ -1,9 +1,9 @@
-//! Ghost memory store (RAL-136): an ephemeral, queryable record a task session
+//! Ghost memory store (RAL-136): an ephemeral, queryable record a task cell
 //! or review worktree publishes so downstream work doesn't have to re-derive
 //! it from scratch.
 //!
 //! A ghost is **not** a changelog — anything recoverable from `git log`/the
-//! diff is already cheap to get. The point is to capture what a session
+//! diff is already cheap to get. The point is to capture what a cell
 //! learned that the diff alone can't show: where it struggled, issues it
 //! noticed but didn't fix, open questions for whoever picks up dependent
 //! work next.
@@ -12,18 +12,18 @@
 //!   (schema created in `store.rs`). Mirrors how `pr.rs`/`guardian.rs` add
 //!   `Store` methods from their own module rather than `store.rs` itself.
 //! - **Keying**: one row per owner, addressed by a stable `owner_uri` —
-//!   [`session_uri`] for a task session (`run_id`/`task_idx`/`session_idx`),
+//!   [`cell_uri`] for a task cell (`squad_id`/`task_idx`/`cell_idx`),
 //!   [`review_uri`] for a review worktree (`guardian_id`/optional branch).
-//!   Both task sessions and review worktrees live in the same table since a
-//!   session's dependency-graph lookup (one level up — see
-//!   `scheduler.rs::run_session_worker`) and a review's explicit publish both
+//!   Both task cells and review worktrees live in the same table since a
+//!   cell's dependency-graph lookup (one level up — see
+//!   `scheduler.rs::run_cell_worker`) and a review's explicit publish both
 //!   go through the exact same [`Store::upsert_ghost`]/[`Store::get_ghost`]
 //!   pair; keeping them in one table is what lets a ghost be copied between
 //!   the two kinds (`Store::copy_ghost`) without a cross-database join.
 //! - **One row per owner, merged on rewrite**: writing a ghost for a URI that
 //!   already has one does not append a second row — [`merge_content`] folds
 //!   the new text onto the old one (capped, keeping the most recent content)
-//!   so a restarted session's ghost is always the single rolled-up record for
+//!   so a restarted cell's ghost is always the single rolled-up record for
 //!   that owner.
 //! - **Staleness**: best-effort only, never re-validated. `revision` is an
 //!   opaque, VCS-agnostic marker (currently a git commit sha when the owner's
@@ -43,19 +43,19 @@ use crate::store::{Result, Store, now_ms};
 pub const MAX_CONTENT_CHARS: usize = 4000;
 
 /// A ghost's owner kind.
-pub const KIND_SESSION: &str = "session";
+pub const KIND_CELL: &str = "cell";
 /// A ghost's owner kind.
 pub const KIND_REVIEW: &str = "review";
 
 /// One row of the `ghosts` table, as returned to API/internal consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct GhostView {
-    /// Stable identifier of the session/review that wrote this ghost.
+    /// Stable identifier of the cell/review that wrote this ghost.
     pub owner_uri: String,
-    /// `"session"` or `"review"`.
+    /// `"cell"` or `"review"`.
     pub kind: String,
-    /// Owning run id, for a `"session"` ghost (cascade-deleted with the run).
-    pub run_id: Option<String>,
+    /// Owning squad id, for a `"cell"` ghost (cascade-deleted with the squad).
+    pub squad_id: Option<String>,
     /// Owning guardian id, for a `"review"` ghost (cascade-deleted with the
     /// guardian).
     pub guardian_id: Option<String>,
@@ -78,7 +78,7 @@ pub struct GhostView {
 struct GhostRow {
     owner_uri: String,
     kind: String,
-    run_id: Option<String>,
+    squad_id: Option<String>,
     guardian_id: Option<String>,
     content: String,
     user_note: Option<String>,
@@ -92,7 +92,7 @@ impl From<GhostRow> for GhostView {
         Self {
             owner_uri: r.owner_uri,
             kind: r.kind,
-            run_id: r.run_id,
+            squad_id: r.squad_id,
             guardian_id: r.guardian_id,
             content: r.content,
             user_note: r.user_note,
@@ -103,13 +103,13 @@ impl From<GhostRow> for GhostView {
     }
 }
 
-const GHOST_COLUMNS: &str = "owner_uri, kind, run_id, guardian_id, content, user_note, revision, created_at_ms, updated_at_ms";
+const GHOST_COLUMNS: &str = "owner_uri, kind, squad_id, guardian_id, content, user_note, revision, created_at_ms, updated_at_ms";
 
 fn map_ghost_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GhostRow> {
     Ok(GhostRow {
         owner_uri: r.get(0)?,
         kind: r.get(1)?,
-        run_id: r.get(2)?,
+        squad_id: r.get(2)?,
         guardian_id: r.get(3)?,
         content: r.get(4)?,
         user_note: r.get(5)?,
@@ -119,10 +119,10 @@ fn map_ghost_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GhostRow> {
     })
 }
 
-/// The stable owner URI for a task session's ghost.
+/// The stable owner URI for a task cell's ghost.
 #[must_use]
-pub fn session_uri(run_id: &str, task_idx: i64, session_idx: i64) -> String {
-    format!("session:{run_id}:{task_idx}:{session_idx}")
+pub fn cell_uri(squad_id: &str, task_idx: i64, cell_idx: i64) -> String {
+    format!("cell:{squad_id}:{task_idx}:{cell_idx}")
 }
 
 /// The stable owner URI for a review worktree's ghost. `branch_id` is the
@@ -136,20 +136,20 @@ pub fn review_uri(guardian_id: &str, branch_id: Option<&str>) -> String {
     }
 }
 
-/// Parse an owner URI (as produced by [`session_uri`]/[`review_uri`]) back
-/// into `(kind, run_id, guardian_id)`. Used by callers that only have the
+/// Parse an owner URI (as produced by [`cell_uri`]/[`review_uri`]) back
+/// into `(kind, squad_id, guardian_id)`. Used by callers that only have the
 /// target URI in hand -- e.g. the `POST /api/ghosts/copy` HTTP handler --
 /// rather than the individual components used to build it. `None` for a URI
-/// that doesn't start with a recognised `session:`/`review:` prefix, or whose
+/// that doesn't start with a recognised `cell:`/`review:` prefix, or whose
 /// id component is empty.
 #[must_use]
 pub fn parse_owner_uri(uri: &str) -> Option<(&'static str, Option<&str>, Option<&str>)> {
-    if let Some(rest) = uri.strip_prefix("session:") {
-        let run_id = rest.split(':').next()?;
-        if run_id.is_empty() {
+    if let Some(rest) = uri.strip_prefix("cell:") {
+        let squad_id = rest.split(':').next()?;
+        if squad_id.is_empty() {
             return None;
         }
-        Some((KIND_SESSION, Some(run_id), None))
+        Some((KIND_CELL, Some(squad_id), None))
     } else if let Some(rest) = uri.strip_prefix("review:") {
         let guardian_id = rest.split(':').next()?;
         if guardian_id.is_empty() {
@@ -209,9 +209,9 @@ pub fn current_revision(cwd: &str) -> Option<String> {
 }
 
 /// Advisory ghost note describing the *daemon-observed* (ground-truth, not
-/// self-reported) outcome of a scope's verify/check steps (RAL-152). Callers
+/// self-reported) outcome of a scope's proof/check steps (RAL-152). Callers
 /// fold this onto the owning ghost with [`Store::upsert_ghost`] independent
-/// of whatever the agent itself self-reported, so a restarted session/resolver
+/// of whatever the agent itself self-reported, so a restarted cell/resolver
 /// gets a reliable signal even when the agent didn't report one -- or
 /// didn't report one honestly. Phrased as a hint, not a guarantee: staleness
 /// (module docs) applies just as much to a daemon-observed outcome as to a
@@ -222,20 +222,20 @@ pub fn current_revision(cwd: &str) -> Option<String> {
 /// should skip writing a note entirely when no step actually ran, rather than
 /// calling this with `total == 0`.
 #[must_use]
-pub fn verify_outcome_note(passed: usize, total: usize) -> String {
-    debug_assert!(total > 0, "verify_outcome_note called with no steps run");
+pub fn proof_outcome_note(passed: usize, total: usize) -> String {
+    debug_assert!(total > 0, "proof_outcome_note called with no steps run");
     debug_assert!(passed <= total, "passed count exceeds total");
     if passed == total {
         format!(
-            "Daemon note (ground truth, not self-reported): the prior run's {passed}/{total} \
-             verify/check step(s) passed -- you internally validated that the code works. This \
+            "Daemon note (ground truth, not self-reported): the prior squad's {passed}/{total} \
+             proof/check step(s) passed -- you internally validated that the code works. This \
              can go stale (e.g. a rebase or conflict resolution since this was written), so \
              re-test/re-verify the existing work first rather than assuming it's broken and \
              redoing it from scratch."
         )
     } else {
         format!(
-            "Daemon note (ground truth, not self-reported): the prior run's verify/check step(s) \
+            "Daemon note (ground truth, not self-reported): the prior squad's proof/check step(s) \
              did NOT all pass ({passed}/{total} passed) -- the existing work was not fully \
              validated. Investigate and fix the failure(s) before trusting or building further on \
              top of this code."
@@ -243,13 +243,13 @@ pub fn verify_outcome_note(passed: usize, total: usize) -> String {
     }
 }
 
-/// Build the context block to prepend to a session's prompt from its own
+/// Build the context block to prepend to a cell's prompt from its own
 /// prior ghost (if any) and its direct dependencies' ghosts, labelled
-/// `"<task>/<session>"`. Returns `None` when there is nothing to inject, so
+/// `"<task>/<cell>"`. Returns `None` when there is nothing to inject, so
 /// callers can leave the prompt untouched rather than prepending an empty
 /// (but visually noisy) block.
 ///
-/// When the target session's own ghost carries a human-authored restart note
+/// When the target cell's own ghost carries a human-authored restart note
 /// (RAL-174), it is appended as its own distinct line at the very bottom of
 /// the block -- after every agent-authored note, never interleaved with it
 /// (Q1/Q2 of the ticket's interview).
@@ -270,12 +270,12 @@ pub fn format_context_block(
         "--- Prior context (best-effort notes from earlier work; not verified against the current files) ---\n",
     );
     if own_content_present {
-        out.push_str("Your own notes from a previous attempt at this session:\n");
+        out.push_str("Your own notes from a previous attempt at this cell:\n");
         out.push_str(&own.expect("checked above").content);
         out.push('\n');
     }
     for (label, g) in parents {
-        out.push_str(&format!("Notes from dependency session '{label}':\n"));
+        out.push_str(&format!("Notes from dependency cell '{label}':\n"));
         out.push_str(&g.content);
         out.push('\n');
     }
@@ -299,7 +299,7 @@ impl Store {
         &self,
         owner_uri: &str,
         kind: &str,
-        run_id: Option<&str>,
+        squad_id: Option<&str>,
         guardian_id: Option<&str>,
         new_content: &str,
         revision: Option<&str>,
@@ -315,13 +315,13 @@ impl Store {
         let merged = merge_content(existing.as_deref(), new_content);
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO ghosts(owner_uri, kind, run_id, guardian_id, content, revision, created_at_ms, updated_at_ms)
+            "INSERT INTO ghosts(owner_uri, kind, squad_id, guardian_id, content, revision, created_at_ms, updated_at_ms)
              VALUES (?,?,?,?,?,?,?,?)
              ON CONFLICT(owner_uri) DO UPDATE SET
                 content=excluded.content,
                 revision=excluded.revision,
                 updated_at_ms=excluded.updated_at_ms",
-            params![owner_uri, kind, run_id, guardian_id, merged, revision, now, now],
+            params![owner_uri, kind, squad_id, guardian_id, merged, revision, now, now],
         )?;
         self.get_ghost(owner_uri).map(|g| g.expect("just written"))
     }
@@ -336,18 +336,18 @@ impl Store {
         &self,
         owner_uri: &str,
         kind: &str,
-        run_id: Option<&str>,
+        squad_id: Option<&str>,
         guardian_id: Option<&str>,
         note: &str,
     ) -> Result<GhostView> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO ghosts(owner_uri, kind, run_id, guardian_id, content, user_note, created_at_ms, updated_at_ms)
+            "INSERT INTO ghosts(owner_uri, kind, squad_id, guardian_id, content, user_note, created_at_ms, updated_at_ms)
              VALUES (?,?,?,?,'',?,?,?)
              ON CONFLICT(owner_uri) DO UPDATE SET
                 user_note=excluded.user_note,
                 updated_at_ms=excluded.updated_at_ms",
-            params![owner_uri, kind, run_id, guardian_id, note, now, now],
+            params![owner_uri, kind, squad_id, guardian_id, note, now, now],
         )?;
         self.get_ghost(owner_uri).map(|g| g.expect("just written"))
     }
@@ -375,7 +375,7 @@ impl Store {
         source_uri: &str,
         target_uri: &str,
         target_kind: &str,
-        target_run_id: Option<&str>,
+        target_squad_id: Option<&str>,
         target_guardian_id: Option<&str>,
     ) -> Result<GhostView> {
         let source = self
@@ -384,7 +384,7 @@ impl Store {
         self.upsert_ghost(
             target_uri,
             target_kind,
-            target_run_id,
+            target_squad_id,
             target_guardian_id,
             &source.content,
             source.revision.as_deref(),
@@ -397,9 +397,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_uri_is_stable_and_scoped_to_run() {
-        assert_eq!(session_uri("run-1", 0, 2), "session:run-1:0:2");
-        assert_ne!(session_uri("run-1", 0, 2), session_uri("run-2", 0, 2));
+    fn cell_uri_is_stable_and_scoped_to_squad() {
+        assert_eq!(cell_uri("squad-1", 0, 2), "cell:squad-1:0:2");
+        assert_ne!(cell_uri("squad-1", 0, 2), cell_uri("squad-2", 0, 2));
     }
 
     #[test]
@@ -412,11 +412,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_owner_uri_session_extracts_run_id() {
-        let uri = session_uri("run-1", 3, 1);
+    fn parse_owner_uri_cell_extracts_squad_id() {
+        let uri = cell_uri("squad-1", 3, 1);
         assert_eq!(
             parse_owner_uri(&uri),
-            Some((KIND_SESSION, Some("run-1"), None))
+            Some((KIND_CELL, Some("squad-1"), None))
         );
     }
 
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn parse_owner_uri_rejects_unknown_prefix_or_empty_id() {
         assert_eq!(parse_owner_uri("bogus:foo"), None);
-        assert_eq!(parse_owner_uri("session:"), None);
+        assert_eq!(parse_owner_uri("cell:"), None);
         assert_eq!(parse_owner_uri("review:"), None);
     }
 
@@ -493,11 +493,11 @@ mod tests {
         Store::open_in_memory().unwrap()
     }
 
-    /// Insert a minimal `runs` row so ghosts can carry a real `run_id` FK.
-    fn seed_run(s: &Store, id: &str) {
+    /// Insert a minimal `squads` row so ghosts can carry a real `squad_id` FK.
+    fn seed_squad(s: &Store, id: &str) {
         s.conn
             .execute(
-                "INSERT INTO runs(id, state, created_at_ms, updated_at_ms) VALUES (?,'pending',0,0)",
+                "INSERT INTO squads(id, state, created_at_ms, updated_at_ms) VALUES (?,'pending',0,0)",
                 params![id],
             )
             .unwrap();
@@ -518,13 +518,13 @@ mod tests {
     #[test]
     fn upsert_then_get_round_trips() {
         let s = store();
-        seed_run(&s, "run-1");
-        let uri = session_uri("run-1", 0, 0);
+        seed_squad(&s, "squad-1");
+        let uri = cell_uri("squad-1", 0, 0);
         let g = s
             .upsert_ghost(
                 &uri,
-                KIND_SESSION,
-                Some("run-1"),
+                KIND_CELL,
+                Some("squad-1"),
                 None,
                 "first note",
                 Some("abc123"),
@@ -539,18 +539,18 @@ mod tests {
     #[test]
     fn get_ghost_missing_uri_is_none() {
         let s = store();
-        assert!(s.get_ghost("session:nope:0:0").unwrap().is_none());
+        assert!(s.get_ghost("cell:nope:0:0").unwrap().is_none());
     }
 
     #[test]
     fn second_upsert_merges_rather_than_inserting_a_second_row() {
         let s = store();
-        seed_run(&s, "run-1");
-        let uri = session_uri("run-1", 0, 0);
-        s.upsert_ghost(&uri, KIND_SESSION, Some("run-1"), None, "first note", None)
+        seed_squad(&s, "squad-1");
+        let uri = cell_uri("squad-1", 0, 0);
+        s.upsert_ghost(&uri, KIND_CELL, Some("squad-1"), None, "first note", None)
             .unwrap();
         let g = s
-            .upsert_ghost(&uri, KIND_SESSION, Some("run-1"), None, "second note", None)
+            .upsert_ghost(&uri, KIND_CELL, Some("squad-1"), None, "second note", None)
             .unwrap();
         assert_eq!(g.content, "first note\n---\nsecond note");
         let count: i64 = s
@@ -563,21 +563,21 @@ mod tests {
     #[test]
     fn copy_ghost_seeds_another_owner_independent_of_the_graph() {
         let s = store();
-        seed_run(&s, "run-1");
-        seed_run(&s, "run-2");
-        let src = session_uri("run-1", 0, 0);
-        let dst = session_uri("run-2", 3, 1);
+        seed_squad(&s, "squad-1");
+        seed_squad(&s, "squad-2");
+        let src = cell_uri("squad-1", 0, 0);
+        let dst = cell_uri("squad-2", 3, 1);
         s.upsert_ghost(
             &src,
-            KIND_SESSION,
-            Some("run-1"),
+            KIND_CELL,
+            Some("squad-1"),
             None,
             "handoff note",
             Some("sha1"),
         )
         .unwrap();
         let copied = s
-            .copy_ghost(&src, &dst, KIND_SESSION, Some("run-2"), None)
+            .copy_ghost(&src, &dst, KIND_CELL, Some("squad-2"), None)
             .unwrap();
         assert_eq!(copied.content, "handoff note");
         assert_eq!(copied.revision.as_deref(), Some("sha1"));
@@ -588,13 +588,13 @@ mod tests {
     #[test]
     fn copy_ghost_missing_source_is_not_found() {
         let s = store();
-        seed_run(&s, "run-1");
+        seed_squad(&s, "squad-1");
         let err = s
             .copy_ghost(
-                "session:nope:0:0",
-                &session_uri("run-1", 0, 0),
-                KIND_SESSION,
-                Some("run-1"),
+                "cell:nope:0:0",
+                &cell_uri("squad-1", 0, 0),
+                KIND_CELL,
+                Some("squad-1"),
                 None,
             )
             .unwrap_err();
@@ -617,14 +617,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(g.guardian_id.as_deref(), Some("guardian-1"));
-        assert_eq!(g.run_id, None);
+        assert_eq!(g.squad_id, None);
     }
 
     fn ghost_view(content: &str) -> GhostView {
         GhostView {
-            owner_uri: "session:run-1:0:0".to_string(),
-            kind: KIND_SESSION.to_string(),
-            run_id: Some("run-1".to_string()),
+            owner_uri: "cell:squad-1:0:0".to_string(),
+            kind: KIND_CELL.to_string(),
+            squad_id: Some("squad-1".to_string()),
             guardian_id: None,
             content: content.to_string(),
             user_note: None,
@@ -635,24 +635,24 @@ mod tests {
     }
 
     #[test]
-    fn verify_outcome_note_all_passed_signals_validated() {
-        let note = verify_outcome_note(2, 2);
+    fn proof_outcome_note_all_passed_signals_validated() {
+        let note = proof_outcome_note(2, 2);
         assert!(note.contains("2/2"));
         assert!(note.contains("internally validated"));
         assert!(note.contains("re-test/re-verify"));
     }
 
     #[test]
-    fn verify_outcome_note_partial_pass_signals_not_validated() {
-        let note = verify_outcome_note(1, 2);
+    fn proof_outcome_note_partial_pass_signals_not_validated() {
+        let note = proof_outcome_note(1, 2);
         assert!(note.contains("1/2 passed"));
         assert!(note.contains("did NOT all pass"));
         assert!(!note.contains("internally validated"));
     }
 
     #[test]
-    fn verify_outcome_note_all_failed_signals_not_validated() {
-        let note = verify_outcome_note(0, 1);
+    fn proof_outcome_note_all_failed_signals_not_validated() {
+        let note = proof_outcome_note(0, 1);
         assert!(note.contains("0/1 passed"));
         assert!(note.contains("did NOT all pass"));
     }
@@ -680,19 +680,19 @@ mod tests {
         let own = ghost_view("own note");
         let block = format_context_block(Some(&own), &[]).unwrap();
         assert!(block.contains("own note"));
-        assert!(!block.contains("dependency session"));
+        assert!(!block.contains("dependency cell"));
     }
 
     #[test]
     fn set_ghost_user_note_creates_a_row_with_empty_content() {
         let s = store();
-        seed_run(&s, "run-1");
-        let uri = session_uri("run-1", 0, 0);
+        seed_squad(&s, "squad-1");
+        let uri = cell_uri("squad-1", 0, 0);
         let g = s
             .set_ghost_user_note(
                 &uri,
-                KIND_SESSION,
-                Some("run-1"),
+                KIND_CELL,
+                Some("squad-1"),
                 None,
                 "pick up where you left off",
             )
@@ -704,21 +704,15 @@ mod tests {
     #[test]
     fn set_ghost_user_note_replaces_rather_than_accumulates() {
         let s = store();
-        seed_run(&s, "run-1");
-        let uri = session_uri("run-1", 0, 0);
-        s.set_ghost_user_note(
-            &uri,
-            KIND_SESSION,
-            Some("run-1"),
-            None,
-            "first restart note",
-        )
-        .unwrap();
+        seed_squad(&s, "squad-1");
+        let uri = cell_uri("squad-1", 0, 0);
+        s.set_ghost_user_note(&uri, KIND_CELL, Some("squad-1"), None, "first restart note")
+            .unwrap();
         let g = s
             .set_ghost_user_note(
                 &uri,
-                KIND_SESSION,
-                Some("run-1"),
+                KIND_CELL,
+                Some("squad-1"),
                 None,
                 "second restart note",
             )
@@ -730,18 +724,12 @@ mod tests {
     #[test]
     fn set_ghost_user_note_does_not_disturb_existing_agent_content() {
         let s = store();
-        seed_run(&s, "run-1");
-        let uri = session_uri("run-1", 0, 0);
-        s.upsert_ghost(&uri, KIND_SESSION, Some("run-1"), None, "agent note", None)
+        seed_squad(&s, "squad-1");
+        let uri = cell_uri("squad-1", 0, 0);
+        s.upsert_ghost(&uri, KIND_CELL, Some("squad-1"), None, "agent note", None)
             .unwrap();
         let g = s
-            .set_ghost_user_note(
-                &uri,
-                KIND_SESSION,
-                Some("run-1"),
-                None,
-                "human restart note",
-            )
+            .set_ghost_user_note(&uri, KIND_CELL, Some("squad-1"), None, "human restart note")
             .unwrap();
         assert_eq!(g.content, "agent note");
         assert_eq!(g.user_note.as_deref(), Some("human restart note"));
@@ -751,8 +739,8 @@ mod tests {
         let g2 = s
             .upsert_ghost(
                 &uri,
-                KIND_SESSION,
-                Some("run-1"),
+                KIND_CELL,
+                Some("squad-1"),
                 None,
                 "second agent note",
                 None,

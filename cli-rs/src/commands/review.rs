@@ -8,8 +8,8 @@
 //!
 //! - [`ReviewBranchCommand::Terminal`] / [`ReviewChecksCommand::Terminal`]
 //!   print the local resume command instead of calling the daemon's
-//!   terminal-spawning endpoint, exactly like `session.rs`'s
-//!   `SessionCommand::Terminal` -- the daemon's `open-terminal` endpoints
+//!   terminal-spawning endpoint, exactly like `cell.rs`'s
+//!   `CellCommand::Terminal` -- the daemon's `open-terminal` endpoints
 //!   spawn a GUI terminal on the *daemon's own host*, which is meaningless
 //!   for a headless CLI.
 //!
@@ -86,7 +86,7 @@ pub enum ReviewCommand {
         resolver_model: Option<String>,
         base_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
-        verify_scope: Option<String>,
+        proof_scope: Option<String>,
         skip_auto_clean: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
@@ -259,7 +259,7 @@ pub enum ReviewChatCommand {
 pub fn parse(args: &[String]) -> ReviewCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewCommand::Help,
         Some("list") => {
             let status = scanner.take_value("--status").ok().flatten();
             let pr_ready = scanner.take_bool("--pr-ready");
@@ -317,7 +317,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
             let base_branch = scanner.take_value("--base-branch").ok().flatten();
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
-            let verify_scope = scanner.take_value("--verify-scope").ok().flatten();
+            let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
@@ -328,7 +328,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 resolver_model,
                 base_branch,
                 auto_pr_feedback,
-                verify_scope,
+                proof_scope,
                 skip_auto_clean,
             })
         }
@@ -486,7 +486,7 @@ fn parse_kv_list(raw: &[String]) -> Result<Vec<(String, String)>, UsageError> {
 fn parse_base(args: &[String]) -> ReviewBaseCommand {
     let scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewBaseCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewBaseCommand::Help,
         Some("list") => {
             with_selector_base(scanner, |selector| ReviewBaseCommand::List { selector })
         }
@@ -519,7 +519,7 @@ fn with_selector_base(
 fn parse_pr(args: &[String]) -> ReviewPrCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewPrCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewPrCommand::Help,
         Some("submit") => {
             let position = match scanner.take_parsed::<i64>("--position") {
                 Ok(v) => v,
@@ -619,7 +619,7 @@ fn with_selector_pr(
 fn parse_branch(args: &[String]) -> ReviewBranchCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewBranchCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewBranchCommand::Help,
         Some("enable") => {
             with_selector_branch(scanner, |selector| ReviewBranchCommand::Enable { selector })
         }
@@ -653,8 +653,8 @@ fn with_selector_branch(
 }
 
 /// Shared `--mode open|readonly` (default `open`) parsing for `review branch
-/// terminal`/`review checks terminal`, mirroring `session.rs`'s
-/// `SessionCommand::Terminal` flag.
+/// terminal`/`review checks terminal`, mirroring `cell.rs`'s
+/// `CellCommand::Terminal` flag.
 fn parse_terminal_mode(scanner: &mut Scanner) -> Result<String, String> {
     match scanner.take_value("--mode").ok().flatten() {
         Some(m) if m == "open" || m == "readonly" => Ok(m),
@@ -668,7 +668,7 @@ fn parse_terminal_mode(scanner: &mut Scanner) -> Result<String, String> {
 fn parse_checks(args: &[String]) -> ReviewChecksCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewChecksCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewChecksCommand::Help,
         Some("list") => {
             with_selector_checks(scanner, |selector| ReviewChecksCommand::List { selector })
         }
@@ -733,7 +733,7 @@ fn with_selector_checks(
 fn parse_action(args: &[String]) -> ReviewActionCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewActionCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewActionCommand::Help,
         Some("list") => {
             with_selector_action(scanner, |selector| ReviewActionCommand::List { selector })
         }
@@ -778,7 +778,7 @@ fn with_selector_action(
 fn parse_chat(args: &[String]) -> ReviewChatCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => ReviewChatCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewChatCommand::Help,
         Some("send") => {
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
@@ -943,13 +943,13 @@ fn parse_environment_flags(
 
 /// Appended to a resumed agent's context in `--mode readonly` (mirrors
 /// Python's `_READONLY_RESUME_INSTRUCTIONS`, duplicated here the same way
-/// `session.rs` duplicates it -- see that module's `agent_resume_command`
+/// `cell.rs` duplicates it -- see that module's `agent_resume_command`
 /// doc comment for why there is no single shared implementation).
 const READONLY_RESUME_INSTRUCTIONS: &str = "You are in read-only mode. You may only read files. Do NOT write, \
 edit, delete, commit, or push anything.";
 
 /// Builds the local CLI command that resumes `agent_session_id`; see
-/// `session.rs::agent_resume_command` (identical logic, kept as its own copy
+/// `cell.rs::agent_resume_command` (identical logic, kept as its own copy
 /// per-module -- Python's own `_agent_resume_command` is likewise a
 /// hand-mirrored duplicate with no shared boundary to call into).
 fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str) -> Vec<String> {
@@ -1081,9 +1081,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
     match cmd {
         ReviewCommand::Help => {
             println!(
-                "ralphus review <list|show|logs|status|worktrees|create|rename|cancel|delete|settings|\
-                 build-env|manual-checks-env|squash|add-branch|reorder|merge|restart-merge|force-start|\
-                 approve|feedback|dismiss-reenable|move-branch|base|pr|branch|checks|action|chat>"
+                "{}",
+                crate::help_map::command_help(&["review"]).expect("review help exists")
             );
             0
         }
@@ -1206,7 +1205,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             resolver_model,
             base_branch,
             auto_pr_feedback,
-            verify_scope,
+            proof_scope,
             skip_auto_clean,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
@@ -1218,8 +1217,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 resolver_model: resolver_model.as_deref(),
                 base_branch: base_branch.as_deref(),
                 auto_pr_feedback,
-                verify_scope: verify_scope.as_deref(),
-                verify_skip_auto_clean: skip_auto_clean,
+                proof_scope: proof_scope.as_deref(),
+                proof_skip_auto_clean: skip_auto_clean,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -1476,7 +1475,11 @@ fn dispatch_guardian_env(
 fn dispatch_base(cmd: ReviewBaseCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
         ReviewBaseCommand::Help => {
-            println!("ralphus review base <list|set>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "base"])
+                    .expect("review base help exists")
+            );
             0
         }
         ReviewBaseCommand::UsageError(m) => {
@@ -1513,7 +1516,10 @@ fn dispatch_base(cmd: ReviewBaseCommand, opts: &GlobalOpts, client: &DaemonClien
 fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
         ReviewPrCommand::Help => {
-            println!("ralphus review pr <submit|list|show|find|update|comments|pull-feedback>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "pr"]).expect("review pr help exists")
+            );
             0
         }
         ReviewPrCommand::UsageError(m) => {
@@ -1626,7 +1632,11 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
 fn dispatch_branch(cmd: ReviewBranchCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
         ReviewBranchCommand::Help => {
-            println!("ralphus review branch <enable|disable|terminal>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "branch"])
+                    .expect("review branch help exists")
+            );
             0
         }
         ReviewBranchCommand::UsageError(m) => {
@@ -1743,7 +1753,11 @@ fn dispatch_branch_terminal(
 fn dispatch_checks(cmd: ReviewChecksCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
         ReviewChecksCommand::Help => {
-            println!("ralphus review checks <list|run|terminal>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "checks"])
+                    .expect("review checks help exists")
+            );
             0
         }
         ReviewChecksCommand::UsageError(m) => {
@@ -1948,7 +1962,11 @@ fn dispatch_checks_terminal(
 fn dispatch_action(cmd: ReviewActionCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
         ReviewActionCommand::Help => {
-            println!("ralphus review action <list|run>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "action"])
+                    .expect("review action help exists")
+            );
             0
         }
         ReviewActionCommand::UsageError(m) => {
@@ -2074,7 +2092,11 @@ fn dispatch_action_run(
 fn dispatch_chat(cmd: ReviewChatCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
         ReviewChatCommand::Help => {
-            println!("ralphus review chat <send|show|fork>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "chat"])
+                    .expect("review chat help exists")
+            );
             0
         }
         ReviewChatCommand::UsageError(m) => {
@@ -2131,8 +2153,8 @@ fn render_review_list(guardians: &Value) {
 #[allow(clippy::too_many_lines)] // One flat field-by-field kv render, mirroring `_cmd_review_show`'s own `_render`; splitting it up would just scatter one view across artificial helper fns.
 fn render_review_detail(g: &Value) {
     let mp = &g["merge_progress"];
-    let verify_scope = g["verify_scope"].as_str();
-    let verify_skip_auto_clean = g["verify_skip_auto_clean"].as_bool();
+    let proof_scope = g["proof_scope"].as_str();
+    let proof_skip_auto_clean = g["proof_skip_auto_clean"].as_bool();
     let mut rows: Vec<(&str, String)> = Vec::new();
     if let Some(uri) = g["uri"].as_str() {
         rows.push(("uri", uri.to_string()));
@@ -2203,29 +2225,29 @@ fn render_review_detail(g: &Value) {
             .to_string(),
     ));
     rows.push((
-        "verify_scope",
-        match verify_scope {
+        "proof_scope",
+        match proof_scope {
             Some(v) if !v.is_empty() => format!("{v} (explicit)"),
             _ => "(inherited from project default)".to_string(),
         },
     ));
     rows.push((
-        "effective_verify_scope",
-        g["effective_verify_scope"]
+        "effective_proof_scope",
+        g["effective_proof_scope"]
             .as_str()
             .unwrap_or_default()
             .to_string(),
     ));
     rows.push((
-        "verify_skip_auto_clean",
-        match verify_skip_auto_clean {
+        "proof_skip_auto_clean",
+        match proof_skip_auto_clean {
             Some(v) => format!("{v} (explicit)"),
             None => "(inherited from project default)".to_string(),
         },
     ));
     rows.push((
-        "effective_verify_skip_auto_clean",
-        g["effective_verify_skip_auto_clean"].to_string(),
+        "effective_proof_skip_auto_clean",
+        g["effective_proof_skip_auto_clean"].to_string(),
     ));
     rows.push((
         "skip_auto_build",
@@ -2357,8 +2379,8 @@ fn render_review_worktrees(g: &Value) {
     let rows: Vec<Vec<String>> = branches
         .iter()
         .map(|b| {
-            let source = match b["source_run_id"].as_str() {
-                Some(r) => format!("{r}/{}/{}", b["source_task_idx"], b["source_session_idx"]),
+            let source = match b["source_squad_id"].as_str() {
+                Some(r) => format!("{r}/{}/{}", b["source_task_idx"], b["source_cell_idx"]),
                 None => "-".to_string(),
             };
             vec![
@@ -2541,20 +2563,20 @@ mod tests {
             "g1",
             "--skip-auto-build",
             "--no-skip-worktrees",
-            "--verify-scope",
+            "--proof-scope",
             "each_branch",
         ])) {
             ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
                 skip_worktrees,
-                verify_scope,
+                proof_scope,
                 ..
             } => {
                 assert_eq!(selector, "g1");
                 assert_eq!(skip_auto_build, Some(true));
                 assert_eq!(skip_worktrees, Some(false));
-                assert_eq!(verify_scope.as_deref(), Some("each_branch"));
+                assert_eq!(proof_scope.as_deref(), Some("each_branch"));
             }
             other => panic!("unexpected: {other:?}"),
         }

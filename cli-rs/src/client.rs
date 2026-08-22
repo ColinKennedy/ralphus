@@ -4,6 +4,7 @@
 //! which fold errors into [`DaemonError`] and (RAL-203) redact guardian
 //! env-var values before returning a successful response.
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -69,20 +70,32 @@ impl DaemonClient {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
+    /// Attach `Authorization: Bearer <token>` when a token is available, so
+    /// the daemon's RAL-219 auth gate doesn't reject every request. Mirrors
+    /// `librarian/src/server.rs::daemon_token()`/`proxy()`.
+    fn authorize(&self, req: ureq::Request) -> ureq::Request {
+        match daemon_token() {
+            Some(token) => req.set("Authorization", &format!("Bearer {token}")),
+            None => req,
+        }
+    }
+
     fn get(&self, path: &str) -> Result<Value, DaemonError> {
-        let req = ureq::get(&self.url(path)).timeout(self.timeout);
+        let req = self.authorize(ureq::get(&self.url(path)).timeout(self.timeout));
         self.finish(path, req.call())
     }
 
     fn delete(&self, path: &str) -> Result<Value, DaemonError> {
-        let req = ureq::delete(&self.url(path)).timeout(self.timeout);
+        let req = self.authorize(ureq::delete(&self.url(path)).timeout(self.timeout));
         self.finish(path, req.call())
     }
 
     fn post(&self, path: &str, payload: Option<Value>) -> Result<Value, DaemonError> {
-        let req = ureq::post(&self.url(path))
-            .timeout(self.timeout)
-            .set("content-type", "application/json");
+        let req = self.authorize(
+            ureq::post(&self.url(path))
+                .timeout(self.timeout)
+                .set("content-type", "application/json"),
+        );
         let body = payload.unwrap_or_else(|| json!({}));
         self.finish(path, req.send_string(&body.to_string()))
     }
@@ -123,6 +136,24 @@ impl DaemonClient {
         }
         Ok(value)
     }
+}
+
+/// Read the daemon's bearer token (RAL-219). `$RALPHUS_DAEMON_TOKEN`, when
+/// set, wins over the token file -- useful for a remote/non-local daemon
+/// where the CLI has no filesystem access to `state_dir()/daemon.token`.
+/// Otherwise reads the same file the daemon itself generates/persists at
+/// startup, mirroring `librarian/src/server.rs::daemon_token()`.
+fn daemon_token() -> Option<String> {
+    if let Ok(token) = std::env::var("RALPHUS_DAEMON_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    std::fs::read_to_string(ralphus_core::daemon_token_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn extract_error_message(body: &Value) -> Option<String> {
@@ -224,7 +255,7 @@ impl DaemonClient {
     }
 
     pub fn validate(&self, toml_text: &str) -> Result<Value, DaemonError> {
-        self.post("/api/runs/validate", Some(json!({"toml": toml_text})))
+        self.post("/api/squads/validate", Some(json!({"toml": toml_text})))
     }
 
     pub fn submit(
@@ -235,10 +266,10 @@ impl DaemonClient {
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"toml": toml_text, "hold": hold});
         set_if_some(&mut body, "label", label.map(str::to_string));
-        self.post("/api/runs", Some(body))
+        self.post("/api/squads", Some(body))
     }
 
-    // ---- board / runs ----------------------------------------------------
+    // ---- board / squads ----------------------------------------------------
 
     pub fn tasks(
         &self,
@@ -254,12 +285,12 @@ impl DaemonClient {
         self.get(&format!("/api/tasks{qs}"))
     }
 
-    pub fn run(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/runs/{run_id}"))
+    pub fn squad(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/squads/{squad_id}"))
     }
 
-    pub fn cancel(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.post(&format!("/api/runs/{run_id}/cancel"), None)
+    pub fn cancel(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/squads/{squad_id}/cancel"), None)
     }
 
     pub fn queue(&self) -> Result<Value, DaemonError> {
@@ -285,20 +316,20 @@ impl DaemonClient {
     #[allow(clippy::too_many_arguments)]
     pub fn set_status(
         &self,
-        run_id: &str,
+        squad_id: &str,
         state: &str,
         kind: &str,
         task_idx: i64,
-        session_idx: i64,
-        verify_idx: i64,
-        verify_scope: &str,
+        cell_idx: i64,
+        proof_idx: i64,
+        proof_scope: &str,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/set-status"),
+            &format!("/api/squads/{squad_id}/set-status"),
             Some(json!({
                 "state": state, "kind": kind, "task_idx": task_idx,
-                "session_idx": session_idx, "verify_idx": verify_idx,
-                "verify_scope": verify_scope,
+                "cell_idx": cell_idx, "proof_idx": proof_idx,
+                "proof_scope": proof_scope,
             })),
         )
     }
@@ -322,6 +353,24 @@ impl DaemonClient {
 
     pub fn get_project(&self, name: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/projects/{name}"))
+    }
+
+    /// Agent-profile health, evaluated inside the daemon process so
+    /// `from_env`/`executable` resolution reflects the daemon's own
+    /// environment/PATH rather than the CLI's -- see
+    /// `ralphus_daemon::agent_profiles::check_profiles_health`.
+    pub fn health_agent_profiles(&self, cwd: &Path) -> Result<Value, DaemonError> {
+        let qs = query_string(&[("cwd", Some(cwd.to_string_lossy().into_owned()))]);
+        self.get(&format!("/api/health/agent-profiles{qs}"))
+    }
+
+    /// Agents selectable for `cwd` -- built-in backends plus configured
+    /// `.ralphus.toml` agent profiles -- plus the effective
+    /// `[review].default_resolver_agent`. Backs the board's review-resolver
+    /// dropdown and `ralphus check health`'s default-resolver-agent check.
+    pub fn list_agents(&self, cwd: &Path) -> Result<Value, DaemonError> {
+        let qs = query_string(&[("cwd", Some(cwd.to_string_lossy().into_owned()))]);
+        self.get(&format!("/api/agents{qs}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -373,8 +422,8 @@ impl DaemonClient {
         self.post("/api/clear", Some(body))
     }
 
-    pub fn run_graph(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/runs/{run_id}/graph"))
+    pub fn squad_graph(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/squads/{squad_id}/graph"))
     }
 
     pub fn global_graph(&self, include_terminal: bool) -> Result<Value, DaemonError> {
@@ -386,16 +435,16 @@ impl DaemonClient {
         self.get("/api/resources")
     }
 
-    pub fn run_worktrees(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/runs/{run_id}/worktrees"))
+    pub fn squad_worktrees(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/squads/{squad_id}/worktrees"))
     }
 
-    pub fn run_logs(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/runs/{run_id}/logs"))
+    pub fn squad_logs(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/squads/{squad_id}/logs"))
     }
 
-    pub fn run_timeline(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/runs/{run_id}/timeline"))
+    pub fn squad_timeline(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/squads/{squad_id}/timeline"))
     }
 
     /// `docs/daemon-api.md`'s `GET /api/cartographer` -- all filters optional.
@@ -405,9 +454,9 @@ impl DaemonClient {
             ("source", filters.source.map(str::to_string)),
             ("scope", filters.scope.map(str::to_string)),
             ("level", filters.level.map(str::to_string)),
-            ("run_id", filters.run_id.map(str::to_string)),
+            ("squad_id", filters.squad_id.map(str::to_string)),
             ("guardian_id", filters.guardian_id.map(str::to_string)),
-            ("session_id", filters.session_id.map(str::to_string)),
+            ("cell_id", filters.cell_id.map(str::to_string)),
             ("task", filters.task.map(str::to_string)),
             ("entity", filters.entity.map(str::to_string)),
             ("q", filters.q.map(str::to_string)),
@@ -420,48 +469,82 @@ impl DaemonClient {
         self.get(&format!("/api/cartographer{qs}"))
     }
 
-    pub fn activate_run(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.post(&format!("/api/runs/{run_id}/activate"), None)
+    // ---- mailbox (RAL-241) ---------------------------------------------
+
+    /// `POST /api/mailbox/register` -- returns `{"client_id": "..."}`.
+    pub fn mailbox_register(&self) -> Result<Value, DaemonError> {
+        self.post("/api/mailbox/register", None)
     }
 
-    pub fn retry_run(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.post(&format!("/api/runs/{run_id}/retry"), None)
+    /// `GET /api/mailbox/{client_id}/messages` -- `priority` filters to one
+    /// of `urgent`/`high`/`normal`.
+    pub fn mailbox_messages(
+        &self,
+        client_id: &str,
+        unread_only: bool,
+        priority: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let qs = query_string(&[
+            ("unread", unread_only.then(|| "true".to_string())),
+            ("priority", priority.map(str::to_string)),
+        ]);
+        self.get(&format!("/api/mailbox/{client_id}/messages{qs}"))
     }
 
-    pub fn restart_run(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.post(&format!("/api/runs/{run_id}/restart"), None)
+    /// `POST /api/mailbox/{client_id}/drain` -- `message_ids: None` drains
+    /// every currently unread message; `Some(ids)` drains exactly those.
+    pub fn mailbox_drain(
+        &self,
+        client_id: &str,
+        message_ids: Option<&[String]>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({});
+        set_if_some(&mut body, "message_ids", message_ids.map(|ids| json!(ids)));
+        self.post(&format!("/api/mailbox/{client_id}/drain"), Some(body))
     }
 
-    pub fn add_dependency(&self, run_id: &str, target_id: &str) -> Result<Value, DaemonError> {
+    pub fn activate_squad(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/squads/{squad_id}/activate"), None)
+    }
+
+    pub fn retry_squad(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/squads/{squad_id}/retry"), None)
+    }
+
+    pub fn restart_squad(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/squads/{squad_id}/restart"), None)
+    }
+
+    pub fn add_dependency(&self, squad_id: &str, target_id: &str) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/add-dependency"),
+            &format!("/api/squads/{squad_id}/add-dependency"),
             Some(json!({"target_id": target_id})),
         )
     }
 
-    pub fn session_pane(
+    pub fn cell_pane(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         lines: i64,
     ) -> Result<Value, DaemonError> {
         self.get(&format!(
-            "/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/pane?lines={lines}"
+            "/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/pane?lines={lines}"
         ))
     }
 
-    pub fn verify_pane(
+    pub fn proof_pane(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         scope: &str,
-        session_idx: i64,
-        verify_idx: i64,
+        cell_idx: i64,
+        proof_idx: i64,
         lines: i64,
     ) -> Result<Value, DaemonError> {
         self.get(&format!(
-            "/api/runs/{run_id}/verifies/{task_idx}/{scope}/{session_idx}/{verify_idx}/pane?lines={lines}"
+            "/api/squads/{squad_id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane?lines={lines}"
         ))
     }
 
@@ -469,48 +552,48 @@ impl DaemonClient {
         self.get(&format!("/api/ghosts/{}", urlencode(owner_uri)))
     }
 
-    pub fn restart_session(
+    pub fn restart_cell(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/restart"),
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/restart"),
             None,
         )
     }
 
-    pub fn restart_session_verify(
+    pub fn restart_cell_proof(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
-        verify_idx: i64,
+        cell_idx: i64,
+        proof_idx: i64,
     ) -> Result<Value, DaemonError> {
         self.post(
             &format!(
-                "/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/verify/{verify_idx}/restart"
+                "/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/proof/{proof_idx}/restart"
             ),
             None,
         )
     }
 
-    pub fn restart_task_verify(
+    pub fn restart_task_proof(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        verify_idx: i64,
+        proof_idx: i64,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/tasks/{task_idx}/verify/{verify_idx}/restart"),
+            &format!("/api/squads/{squad_id}/tasks/{task_idx}/proof/{proof_idx}/restart"),
             None,
         )
     }
 
-    pub fn restart_task(&self, run_id: &str, task_idx: i64) -> Result<Value, DaemonError> {
+    pub fn restart_task(&self, squad_id: &str, task_idx: i64) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/tasks/{task_idx}/restart"),
+            &format!("/api/squads/{squad_id}/tasks/{task_idx}/restart"),
             None,
         )
     }
@@ -524,116 +607,114 @@ impl DaemonClient {
         body
     }
 
-    pub fn set_run_env(
+    pub fn set_squad_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/env"),
+            &format!("/api/squads/{squad_id}/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
     pub fn set_task_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/tasks/{task_idx}/env"),
+            &format!("/api/squads/{squad_id}/tasks/{task_idx}/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
-    pub fn set_task_verify_env(
+    pub fn set_task_proof_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/tasks/{task_idx}/verify/env"),
+            &format!("/api/squads/{squad_id}/tasks/{task_idx}/proof/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
-    pub fn set_session_env(
+    pub fn set_cell_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/env"),
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
-    pub fn set_session_verify_env(
+    pub fn set_cell_proof_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/verify/env"),
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/proof/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
-    pub fn set_task_verify_step_env(
+    pub fn set_task_proof_step_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        verify_idx: i64,
+        proof_idx: i64,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/tasks/{task_idx}/verify/{verify_idx}/env"),
+            &format!("/api/squads/{squad_id}/tasks/{task_idx}/proof/{proof_idx}/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_session_verify_step_env(
+    pub fn set_cell_proof_step_env(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
-        verify_idx: i64,
+        cell_idx: i64,
+        proof_idx: i64,
         set_vars: Option<&Value>,
         unset_vars: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!(
-                "/api/runs/{run_id}/sessions/{task_idx}/{session_idx}/verify/{verify_idx}/env"
-            ),
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/proof/{proof_idx}/env"),
             Some(Self::env_payload(set_vars, unset_vars)),
         )
     }
 
     // ---- edit / delete -------------------------------------------------
 
-    pub fn edit_run(&self, run_id: &str, label: &str) -> Result<Value, DaemonError> {
+    pub fn edit_squad(&self, squad_id: &str, label: &str) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/runs/{run_id}/edit"),
-            Some(json!({"kind": "run", "label": label})),
+            &format!("/api/squads/{squad_id}/edit"),
+            Some(json!({"kind": "squad", "label": label})),
         )
     }
 
     pub fn edit_task(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
         name: Option<&str>,
         project: Option<&str>,
@@ -641,32 +722,32 @@ impl DaemonClient {
         let mut body = json!({"kind": "task", "task_idx": task_idx});
         set_if_some(&mut body, "name", name.map(str::to_string));
         set_if_some(&mut body, "project", project.map(str::to_string));
-        self.post(&format!("/api/runs/{run_id}/edit"), Some(body))
+        self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn edit_session(
+    pub fn edit_cell(
         &self,
-        run_id: &str,
+        squad_id: &str,
         task_idx: i64,
-        session_idx: i64,
+        cell_idx: i64,
         cwd: Option<&str>,
         agent: Option<&str>,
         model: Option<&str>,
         prompt: Option<&str>,
         command: Option<&str>,
     ) -> Result<Value, DaemonError> {
-        let mut body = json!({"kind": "session", "task_idx": task_idx, "session_idx": session_idx});
+        let mut body = json!({"kind": "cell", "task_idx": task_idx, "cell_idx": cell_idx});
         set_if_some(&mut body, "cwd", cwd.map(str::to_string));
         set_if_some(&mut body, "agent", agent.map(str::to_string));
         set_if_some(&mut body, "model", model.map(str::to_string));
         set_if_some(&mut body, "prompt", prompt.map(str::to_string));
         set_if_some(&mut body, "command", command.map(str::to_string));
-        self.post(&format!("/api/runs/{run_id}/edit"), Some(body))
+        self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
     }
 
-    pub fn delete_run(&self, run_id: &str) -> Result<Value, DaemonError> {
-        self.delete(&format!("/api/runs/{run_id}"))
+    pub fn delete_squad(&self, squad_id: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/squads/{squad_id}"))
     }
 
     // ---- guardians (reviews) -------------------------------------------
@@ -806,13 +887,13 @@ impl DaemonClient {
         set_if_some(&mut body, "auto_pr_feedback", settings.auto_pr_feedback);
         set_if_some(
             &mut body,
-            "verify_scope",
-            settings.verify_scope.map(str::to_string),
+            "proof_scope",
+            settings.proof_scope.map(str::to_string),
         );
         set_if_some(
             &mut body,
-            "verify_skip_auto_clean",
-            settings.verify_skip_auto_clean,
+            "proof_skip_auto_clean",
+            settings.proof_skip_auto_clean,
         );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
@@ -1014,9 +1095,9 @@ pub struct CartographerFilters<'a> {
     pub source: Option<&'a str>,
     pub scope: Option<&'a str>,
     pub level: Option<&'a str>,
-    pub run_id: Option<&'a str>,
+    pub squad_id: Option<&'a str>,
     pub guardian_id: Option<&'a str>,
-    pub session_id: Option<&'a str>,
+    pub cell_id: Option<&'a str>,
     pub task: Option<&'a str>,
     pub entity: Option<&'a str>,
     pub q: Option<&'a str>,
@@ -1033,9 +1114,9 @@ impl Default for CartographerFilters<'_> {
             source: None,
             scope: None,
             level: None,
-            run_id: None,
+            squad_id: None,
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             entity: None,
             q: None,
@@ -1058,8 +1139,8 @@ pub struct GuardianSettings<'a> {
     pub resolver_model: Option<&'a str>,
     pub base_branch: Option<&'a str>,
     pub auto_pr_feedback: Option<bool>,
-    pub verify_scope: Option<&'a str>,
-    pub verify_skip_auto_clean: Option<bool>,
+    pub proof_scope: Option<&'a str>,
+    pub proof_skip_auto_clean: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1142,13 +1223,13 @@ mod tests {
         let server = TestServer::start(|_req| {
             (
                 404,
-                r#"{"error":{"code":"not_found","message":"no such run"}}"#.to_string(),
+                r#"{"error":{"code":"not_found","message":"no such squad"}}"#.to_string(),
             )
         });
         let client = DaemonClient::new(server.url());
-        let err = client.run("missing").unwrap_err();
+        let err = client.squad("missing").unwrap_err();
         assert_eq!(err.status_code, Some(404));
-        assert_eq!(err.message, "no such run");
+        assert_eq!(err.message, "no such squad");
     }
 
     #[test]
@@ -1182,7 +1263,7 @@ mod tests {
         let server =
             TestServer::start(|_req| (200, r#"{"combined_env":{"SECRET":"abc123"}}"#.to_string()));
         let client = DaemonClient::new(server.url());
-        let result = client.run("r1").unwrap();
+        let result = client.squad("r1").unwrap();
         assert_eq!(result["combined_env"]["SECRET"], "abc123");
     }
 

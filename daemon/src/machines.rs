@@ -1,6 +1,6 @@
 //! Machine provider registry (RAL-185).
 //!
-//! A task/session/verify/review may declare `machine = "<scheme>:<uri>"`. The
+//! A task/cell/proof/review may declare `machine = "<scheme>:<uri>"`. The
 //! daemon never interprets `<uri>` — it looks `<scheme>` up in this registry to
 //! find a registered **provider program**, and hands the uri to it verbatim.
 //! `<scheme>` is a provider name like `incredibuild`; `<uri>` is whatever that
@@ -43,7 +43,7 @@ pub const BUILTIN_SCHEMES: &[&str] = &[LOCAL_SCHEME];
 ///
 /// `ralphus` carries two unrelated meanings already — the worktree placeholder
 /// (`ralphus:new-worktree/<branch>`) and the RAL-188 entity URI
-/// (`ralphus:/RUN[...]`). Letting someone register it as a *third* thing would
+/// (`ralphus:/SQUAD[...]`). Letting someone register it as a *third* thing would
 /// make `machine = "ralphus:..."` genuinely ambiguous to read, so registration
 /// is refused up front rather than resolved into one of the three by accident.
 pub const RESERVED_SCHEMES: &[&str] = &["ralphus"];
@@ -235,9 +235,9 @@ impl Store {
             source: "store",
             message: "machine provider registered",
             scope: Some("machine"),
-            run_id: None,
+            squad_id: None,
             guardian_id: None,
-            session_id: None,
+            cell_id: None,
             task: None,
             log_path: None,
             payload: serde_json::json!({
@@ -310,9 +310,9 @@ impl Store {
 
     /// Remove a provider. Returns whether a row was deleted.
     ///
-    /// Deliberately does **not** check whether any stored run still references
-    /// the scheme: those runs already resolved their machines when they were
-    /// submitted, and a historical run's record should not block cleaning up
+    /// Deliberately does **not** check whether any stored squad still references
+    /// the scheme: those squads already resolved their machines when they were
+    /// submitted, and a historical squad's record should not block cleaning up
     /// the registry. A *new* submission naming a deregistered scheme fails at
     /// submit with [`ResolveError::UnknownScheme`].
     ///
@@ -397,12 +397,12 @@ impl Store {
     }
 }
 
-/// A persisted async `exec` handle for one in-flight remote session
+/// A persisted async `exec` handle for one in-flight remote cell
 /// (RAL-201), reconciled against on daemon startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteExecHandle {
-    pub run_id: String,
-    pub session_id: String,
+    pub squad_id: String,
+    pub cell_id: String,
     pub scheme: String,
     pub uri: String,
     pub handle: String,
@@ -412,41 +412,41 @@ impl Store {
     /// Record the opaque handle a provider returned for an async `exec`, so a
     /// daemon restart can reconcile it (see [`Self::all_remote_exec_handles`])
     /// instead of silently orphaning whatever is still running remotely.
-    /// Upserts on `(run_id, session_id)` — a session only ever has one
+    /// Upserts on `(squad_id, cell_id)` — a cell only ever has one
     /// in-flight handle at a time.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn save_remote_exec_handle(
         &self,
-        run_id: &str,
-        session_id: &str,
+        squad_id: &str,
+        cell_id: &str,
         scheme: &str,
         uri: &str,
         handle: &str,
     ) -> StoreResult<()> {
         self.conn.execute(
-            "INSERT INTO remote_exec_handles(run_id, session_id, scheme, uri, handle, created_at_ms)
+            "INSERT INTO remote_exec_handles(squad_id, cell_id, scheme, uri, handle, created_at_ms)
              VALUES(?,?,?,?,?,?)
-             ON CONFLICT(run_id, session_id) DO UPDATE SET
+             ON CONFLICT(squad_id, cell_id) DO UPDATE SET
                 scheme=excluded.scheme, uri=excluded.uri, handle=excluded.handle,
                 created_at_ms=excluded.created_at_ms",
-            rusqlite::params![run_id, session_id, scheme, uri, handle, now_ms()],
+            rusqlite::params![squad_id, cell_id, scheme, uri, handle, now_ms()],
         )?;
         Ok(())
     }
 
-    /// Clear a session's persisted handle once its `exec` has finished (by any
+    /// Clear a cell's persisted handle once its `exec` has finished (by any
     /// outcome — done, failed, cancelled, timed out, cost-exceeded) or a
     /// restart has already reconciled it. Not finding one is not an error —
     /// every caller here is cleaning up and may race a concurrent clear.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn clear_remote_exec_handle(&self, run_id: &str, session_id: &str) -> StoreResult<()> {
+    pub fn clear_remote_exec_handle(&self, squad_id: &str, cell_id: &str) -> StoreResult<()> {
         self.conn.execute(
-            "DELETE FROM remote_exec_handles WHERE run_id = ? AND session_id = ?",
-            rusqlite::params![run_id, session_id],
+            "DELETE FROM remote_exec_handles WHERE squad_id = ? AND cell_id = ?",
+            rusqlite::params![squad_id, cell_id],
         )?;
         Ok(())
     }
@@ -458,12 +458,12 @@ impl Store {
     pub fn all_remote_exec_handles(&self) -> StoreResult<Vec<RemoteExecHandle>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT run_id, session_id, scheme, uri, handle FROM remote_exec_handles")?;
+            .prepare("SELECT squad_id, cell_id, scheme, uri, handle FROM remote_exec_handles")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(RemoteExecHandle {
-                    run_id: r.get(0)?,
-                    session_id: r.get(1)?,
+                    squad_id: r.get(0)?,
+                    cell_id: r.get(1)?,
                     scheme: r.get(2)?,
                     uri: r.get(3)?,
                     handle: r.get(4)?,

@@ -13,6 +13,7 @@ use crate::selector::{self, ResolvedSelector, SelectorError};
 
 #[derive(Debug, Clone)]
 pub enum QueueCommand {
+    Help,
     List {
         all: bool,
     },
@@ -36,6 +37,7 @@ pub fn parse(args: &[String]) -> QueueCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
         None => QueueCommand::List { all: false },
+        Some("help" | "--help" | "-h") => QueueCommand::Help,
         Some("list") => {
             let all = scanner.take_bool("--all");
             QueueCommand::List { all }
@@ -87,6 +89,13 @@ fn parse_set_position(mut scanner: Scanner) -> Result<QueueCommand, String> {
 pub fn dispatch(cmd: QueueCommand, opts: &GlobalOpts) -> i32 {
     let client = opts.client();
     match cmd {
+        QueueCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["queue"]).expect("queue help exists")
+            );
+            0
+        }
         QueueCommand::UsageError(m) => {
             println!("usage error: {m}");
             2
@@ -115,13 +124,13 @@ pub fn dispatch(cmd: QueueCommand, opts: &GlobalOpts) -> i32 {
         QueueCommand::SetStatus { path, state } => run_and_report(opts, None, || {
             let parsed = resolve_queue_path(&client, &path)?;
             let result = client.set_status(
-                &parsed.run_id,
+                &parsed.squad_id,
                 &state,
                 &parsed.kind,
                 parsed.task_idx,
-                parsed.session_idx,
-                parsed.verify_idx,
-                &parsed.verify_scope,
+                parsed.cell_idx,
+                parsed.proof_idx,
+                &parsed.proof_scope,
             )?;
             emit(opts, &result, |_| println!("set {path} -> {state}"));
             Ok(())
@@ -133,61 +142,62 @@ pub fn dispatch(cmd: QueueCommand, opts: &GlobalOpts) -> i32 {
 /// TypedDict (`_parse_queue_path`/`_resolve_queue_path`).
 struct PathParts {
     kind: String,
-    run_id: String,
+    squad_id: String,
     task_idx: i64,
-    session_idx: i64,
-    verify_idx: i64,
-    verify_scope: String,
+    cell_idx: i64,
+    proof_idx: i64,
+    proof_scope: String,
 }
 
-/// Parses a queue item path (`run`, `run/t<ti>/s<si>`, `run/t<ti>/s<si>/v<vi>`,
-/// or `run/t<ti>/tv<vi>`) into set-status fields -- ports Python's
-/// `_parse_queue_path` (mirrors the daemon's own grammar for this shape).
+/// Parses a queue item path (`squad`, `squad/t<ti>/s<si>`,
+/// `squad/t<ti>/s<si>/v<vi>`, or `squad/t<ti>/tv<vi>`) into set-status
+/// fields -- ports Python's `_parse_queue_path` (mirrors the daemon's own
+/// grammar for this shape).
 fn parse_queue_path(path: &str) -> Option<PathParts> {
     let segs: Vec<&str> = path.split('/').collect();
     match segs.as_slice() {
-        [run] => Some(PathParts {
-            kind: "run".to_string(),
-            run_id: (*run).to_string(),
+        [squad] => Some(PathParts {
+            kind: "squad".to_string(),
+            squad_id: (*squad).to_string(),
             task_idx: 0,
-            session_idx: -1,
-            verify_idx: -1,
-            verify_scope: String::new(),
+            cell_idx: -1,
+            proof_idx: -1,
+            proof_scope: String::new(),
         }),
-        [run, t, s] => {
+        [squad, t, s] => {
             let ti = t.strip_prefix('t')?.parse::<i64>().ok()?;
             if let Some(vi) = s.strip_prefix("tv") {
                 Some(PathParts {
-                    kind: "verify".to_string(),
-                    run_id: (*run).to_string(),
+                    kind: "proof".to_string(),
+                    squad_id: (*squad).to_string(),
                     task_idx: ti,
-                    session_idx: -1,
-                    verify_idx: vi.parse::<i64>().ok()?,
-                    verify_scope: "task".to_string(),
+                    cell_idx: -1,
+                    proof_idx: vi.parse::<i64>().ok()?,
+                    proof_scope: "task".to_string(),
                 })
             } else {
                 let si = s.strip_prefix('s')?.parse::<i64>().ok()?;
                 Some(PathParts {
-                    kind: "session".to_string(),
-                    run_id: (*run).to_string(),
+                    kind: "cell".to_string(),
+                    squad_id: (*squad).to_string(),
                     task_idx: ti,
-                    session_idx: si,
-                    verify_idx: -1,
-                    verify_scope: String::new(),
+                    cell_idx: si,
+                    proof_idx: -1,
+                    proof_scope: String::new(),
                 })
             }
         }
-        [run, t, s, v] => {
+        [squad, t, s, v] => {
             let ti = t.strip_prefix('t')?.parse::<i64>().ok()?;
             let si = s.strip_prefix('s')?.parse::<i64>().ok()?;
             let vi = v.strip_prefix('v')?.parse::<i64>().ok()?;
             Some(PathParts {
-                kind: "verify".to_string(),
-                run_id: (*run).to_string(),
+                kind: "proof".to_string(),
+                squad_id: (*squad).to_string(),
                 task_idx: ti,
-                session_idx: si,
-                verify_idx: vi,
-                verify_scope: "session".to_string(),
+                cell_idx: si,
+                proof_idx: vi,
+                proof_scope: "cell".to_string(),
             })
         }
         _ => None,
@@ -198,14 +208,14 @@ fn parse_queue_path(path: &str) -> Option<PathParts> {
 /// set-status fields, ports Python's `_resolve_queue_path`.
 fn resolve_queue_path(client: &DaemonClient, path: &str) -> Result<PathParts, CommandError> {
     if ralphus_core::uri::looks_like_uri(path) {
-        let resolved = selector::resolve_run_selector(client, path)?;
+        let resolved = selector::resolve_squad_selector(client, path)?;
         return Ok(PathParts {
             kind: resolved.kind,
-            run_id: resolved.run_id,
+            squad_id: resolved.squad_id,
             task_idx: resolved.task_idx,
-            session_idx: resolved.session_idx,
-            verify_idx: resolved.verify_idx,
-            verify_scope: resolved.verify_scope,
+            cell_idx: resolved.cell_idx,
+            proof_idx: resolved.proof_idx,
+            proof_scope: resolved.proof_scope,
         });
     }
     parse_queue_path(path)
@@ -214,25 +224,25 @@ fn resolve_queue_path(client: &DaemonClient, path: &str) -> Result<PathParts, Co
 
 /// Renders a resolved selector as the daemon's own queue-item path -- ports
 /// Python's `_queue_path_for`. A task has no queue item of its own (only its
-/// sessions/verify steps do), so that case is an error rather than a silently
+/// cells/proof steps do), so that case is an error rather than a silently
 /// wrong path.
 fn queue_path_for(resolved: &ResolvedSelector) -> Result<String, SelectorError> {
     match resolved.kind.as_str() {
-        "run" => Ok(resolved.run_id.clone()),
-        "session" => Ok(format!(
+        "squad" => Ok(resolved.squad_id.clone()),
+        "cell" => Ok(format!(
             "{}/t{}/s{}",
-            resolved.run_id, resolved.task_idx, resolved.session_idx
+            resolved.squad_id, resolved.task_idx, resolved.cell_idx
         )),
-        "verify" if resolved.verify_scope == "task" => Ok(format!(
+        "proof" if resolved.proof_scope == "task" => Ok(format!(
             "{}/t{}/tv{}",
-            resolved.run_id, resolved.task_idx, resolved.verify_idx
+            resolved.squad_id, resolved.task_idx, resolved.proof_idx
         )),
-        "verify" => Ok(format!(
+        "proof" => Ok(format!(
             "{}/t{}/s{}/v{}",
-            resolved.run_id, resolved.task_idx, resolved.session_idx, resolved.verify_idx
+            resolved.squad_id, resolved.task_idx, resolved.cell_idx, resolved.proof_idx
         )),
         other => Err(SelectorError(format!(
-            "a task has no queue item of its own -- address one of its sessions or verify steps \
+            "a task has no queue item of its own -- address one of its cells or proof steps \
              instead (got a {other} selector)"
         ))),
     }
@@ -249,7 +259,7 @@ fn normalize_queue_paths(
         .iter()
         .map(|p| {
             if ralphus_core::uri::looks_like_uri(p) {
-                let resolved = selector::resolve_run_selector(client, p)?;
+                let resolved = selector::resolve_squad_selector(client, p)?;
                 Ok(queue_path_for(&resolved)?)
             } else {
                 Ok(p.clone())
@@ -337,9 +347,9 @@ mod tests {
 
     #[test]
     fn parses_reorder_paths() {
-        match parse(&v(&["reorder", "run-1/t0/s1", "run-1/t0/s2"])) {
+        match parse(&v(&["reorder", "squad-1/t0/s1", "squad-1/t0/s2"])) {
             QueueCommand::Reorder { paths } => {
-                assert_eq!(paths, v(&["run-1/t0/s1", "run-1/t0/s2"]));
+                assert_eq!(paths, v(&["squad-1/t0/s1", "squad-1/t0/s2"]));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -352,13 +362,13 @@ mod tests {
 
     #[test]
     fn parses_set_position_with_to_and_relative() {
-        match parse(&v(&["set-position", "run-1", "--to", "3", "--relative"])) {
+        match parse(&v(&["set-position", "squad-1", "--to", "3", "--relative"])) {
             QueueCommand::SetPosition {
                 paths,
                 to,
                 relative,
             } => {
-                assert_eq!(paths, v(&["run-1"]));
+                assert_eq!(paths, v(&["squad-1"]));
                 assert_eq!(to, 3);
                 assert!(relative);
             }
@@ -369,16 +379,16 @@ mod tests {
     #[test]
     fn set_position_requires_to_flag() {
         matches!(
-            parse(&v(&["set-position", "run-1"])),
+            parse(&v(&["set-position", "squad-1"])),
             QueueCommand::UsageError(_)
         );
     }
 
     #[test]
     fn parses_set_status_positional_pair() {
-        match parse(&v(&["set-status", "run-1/t0/s1", "ignored"])) {
+        match parse(&v(&["set-status", "squad-1/t0/s1", "ignored"])) {
             QueueCommand::SetStatus { path, state } => {
-                assert_eq!(path, "run-1/t0/s1");
+                assert_eq!(path, "squad-1/t0/s1");
                 assert_eq!(state, "ignored");
             }
             other => panic!("unexpected: {other:?}"),
@@ -388,7 +398,7 @@ mod tests {
     #[test]
     fn set_status_requires_both_positionals() {
         matches!(
-            parse(&v(&["set-status", "run-1"])),
+            parse(&v(&["set-status", "squad-1"])),
             QueueCommand::UsageError(_)
         );
     }
@@ -399,66 +409,66 @@ mod tests {
     }
 
     #[test]
-    fn parse_queue_path_bare_run() {
-        let parts = parse_queue_path("run-1").unwrap();
-        assert_eq!(parts.kind, "run");
-        assert_eq!(parts.run_id, "run-1");
+    fn parse_queue_path_bare_squad() {
+        let parts = parse_queue_path("squad-1").unwrap();
+        assert_eq!(parts.kind, "squad");
+        assert_eq!(parts.squad_id, "squad-1");
         assert_eq!(parts.task_idx, 0);
-        assert_eq!(parts.session_idx, -1);
+        assert_eq!(parts.cell_idx, -1);
     }
 
     #[test]
-    fn parse_queue_path_session() {
-        let parts = parse_queue_path("run-1/t0/s2").unwrap();
-        assert_eq!(parts.kind, "session");
+    fn parse_queue_path_cell() {
+        let parts = parse_queue_path("squad-1/t0/s2").unwrap();
+        assert_eq!(parts.kind, "cell");
         assert_eq!(parts.task_idx, 0);
-        assert_eq!(parts.session_idx, 2);
+        assert_eq!(parts.cell_idx, 2);
     }
 
     #[test]
-    fn parse_queue_path_task_verify() {
-        let parts = parse_queue_path("run-1/t0/tv3").unwrap();
-        assert_eq!(parts.kind, "verify");
-        assert_eq!(parts.verify_scope, "task");
-        assert_eq!(parts.verify_idx, 3);
+    fn parse_queue_path_task_proof() {
+        let parts = parse_queue_path("squad-1/t0/tv3").unwrap();
+        assert_eq!(parts.kind, "proof");
+        assert_eq!(parts.proof_scope, "task");
+        assert_eq!(parts.proof_idx, 3);
     }
 
     #[test]
-    fn parse_queue_path_session_verify() {
-        let parts = parse_queue_path("run-1/t0/s2/v3").unwrap();
-        assert_eq!(parts.kind, "verify");
-        assert_eq!(parts.verify_scope, "session");
-        assert_eq!(parts.session_idx, 2);
-        assert_eq!(parts.verify_idx, 3);
+    fn parse_queue_path_cell_proof() {
+        let parts = parse_queue_path("squad-1/t0/s2/v3").unwrap();
+        assert_eq!(parts.kind, "proof");
+        assert_eq!(parts.proof_scope, "cell");
+        assert_eq!(parts.cell_idx, 2);
+        assert_eq!(parts.proof_idx, 3);
     }
 
     #[test]
     fn parse_queue_path_rejects_malformed() {
-        assert!(parse_queue_path("run-1/bad/s2").is_none());
+        assert!(parse_queue_path("squad-1/bad/s2").is_none());
     }
 
     #[test]
-    fn queue_path_for_run() {
+    fn queue_path_for_squad() {
         let resolved = ResolvedSelector {
-            kind: "run".to_string(),
-            run_id: "run-1".to_string(),
+            kind: "squad".to_string(),
+            squad_id: "squad-1".to_string(),
             task_idx: 0,
-            session_idx: -1,
-            verify_idx: -1,
-            verify_scope: String::new(),
+            cell_idx: -1,
+            proof_idx: -1,
+            proof_scope: String::new(),
         };
-        assert_eq!(queue_path_for(&resolved).unwrap(), "run-1");
+        assert_eq!(queue_path_for(&resolved).unwrap(), "squad-1");
     }
 
     #[test]
     fn queue_path_for_task_errors() {
         let resolved = ResolvedSelector {
             kind: "task".to_string(),
-            run_id: "run-1".to_string(),
+            squad_id: "squad-1".to_string(),
             task_idx: 0,
-            session_idx: -1,
-            verify_idx: -1,
-            verify_scope: String::new(),
+            cell_idx: -1,
+            proof_idx: -1,
+            proof_scope: String::new(),
         };
         assert!(queue_path_for(&resolved).is_err());
     }

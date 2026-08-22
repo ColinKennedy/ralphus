@@ -1,9 +1,9 @@
 //! Derive per-project Guardian reviews from top-level `[[review]]` blocks.
 //!
-//! At submit time, sessions that opt in to a review (via `review = "<id>"` on the
-//! session) are grouped by the *project* their worktree belongs to (its shared
+//! At submit time, cells that opt in to a review (via `review = "<id>"` on the
+//! cell) are grouped by the *project* their worktree belongs to (its shared
 //! git dir, so linked worktrees of one repo collapse together). Each project
-//! becomes one guardian, whose branch list is the sessions' worktree branches in
+//! becomes one guardian, whose branch list is the cells' worktree branches in
 //! topological order. The base branch is always the worktree's upstream tracking
 //! branch — a hard error if the worktree has none.
 
@@ -16,7 +16,7 @@ use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key
 
 use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
-use crate::store::{SessionRow, Store, TaskRow};
+use crate::store::{CellRow, Store, TaskRow};
 use crate::vcs::{GitOps, GitVcs};
 
 /// A submit-time review preflight / derivation failure (surfaced to the client).
@@ -51,9 +51,9 @@ fn git(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
     GitVcs.run(dir, args).map(|s| s.trim().to_string())
 }
 
-/// The project root for a session `cwd`, or `None` when it is not inside a git
+/// The project root for a cell `cwd`, or `None` when it is not inside a git
 /// worktree. Used by the API to show the project (shared root) as a field
-/// distinct from the worktree (the session's own working copy) — see CCTL-148.
+/// distinct from the worktree (the cell's own working copy) — see CCTL-148.
 #[must_use]
 pub fn project_root_of(cwd: &str) -> Option<String> {
     worktree_project(Path::new(cwd))
@@ -77,8 +77,8 @@ fn worktree_project(cwd: &Path) -> std::result::Result<PathBuf, String> {
 /// The literal top-level directory of the git worktree containing `cwd` (RAL-159).
 /// Unlike [`worktree_project`] — which collapses every linked worktree of a
 /// repository to one shared project root, so different branches of the same
-/// repo match each other — this resolves the specific worktree: a session at a
-/// nested subfolder `cwd` still matches another session at that worktree's own
+/// repo match each other — this resolves the specific worktree: a cell at a
+/// nested subfolder `cwd` still matches another cell at that worktree's own
 /// root, but two different linked worktrees of the same repo do not match.
 fn worktree_root(cwd: &Path) -> std::result::Result<PathBuf, String> {
     let top = git(cwd, &["rev-parse", "--show-toplevel"])?;
@@ -107,7 +107,7 @@ pub(crate) fn same_git_repo(cwd_a: &Path, cwd_b: &Path) -> bool {
 /// Rebase the current branch in `cwd` onto `target_branch`.
 ///
 /// Uncommitted changes are stashed beforehand and restored after so a dirty
-/// worktree (e.g. a session restarted mid-flight) doesn't block the rebase.
+/// worktree (e.g. a cell restarted mid-flight) doesn't block the rebase.
 /// On failure the rebase is aborted automatically so the worktree is left
 /// clean. The error string describes which git step failed and why.
 pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Result<(), String> {
@@ -162,14 +162,14 @@ pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, Strin
     .map_err(|_| "no upstream".to_string())
 }
 
-/// The read-only "upstream" value to show for a session's git worktree in the
+/// The read-only "upstream" value to show for a cell's git worktree in the
 /// board's detail pane. Two cases, per the RAL-50 branch-chaining sentinel:
 ///
-/// - The session declares `upstream = "<<task:...>>"`: the displayed upstream
-///   is the *referenced* session's own worktree branch name (what this
-///   session's branch gets rebased onto before it runs) — not a plain
+/// - The cell declares `upstream = "<<task:...>>"`: the displayed upstream
+///   is the *referenced* cell's own worktree branch name (what this
+///   cell's branch gets rebased onto before it runs) — not a plain
 ///   tracking-ref lookup, since that sentinel is the authoritative source of
-///   truth for what this session's branch is chained onto.
+///   truth for what this cell's branch is chained onto.
 /// - No sentinel: falls back to the worktree's own git upstream tracking
 ///   branch (typically the non-worktree base branch it was forked from, e.g.
 ///   `main`).
@@ -180,9 +180,9 @@ pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, Strin
 /// guessing, mirroring the fail-closed/best-effort tolerance used by
 /// [`crate::scheduler`]'s own upstream-rebase resolution.
 #[must_use]
-pub(crate) fn session_upstream_display(
+pub(crate) fn cell_upstream_display(
     cwd: Option<&str>,
-    rows: &[SessionRow],
+    rows: &[CellRow],
     task_idx: i64,
     idx: i64,
 ) -> Option<String> {
@@ -191,18 +191,18 @@ pub(crate) fn session_upstream_display(
     let row = rows.iter().find(|r| r.task_idx == task_idx && r.idx == idx);
     if let Some(sentinel) = row.and_then(|r| r.upstream.as_deref()) {
         let ref_str = ralphus_core::schema::parse_upstream_task_ref(sentinel)?;
-        let (task_name, session_id_filter) = ref_str
+        let (task_name, cell_id_filter) = ref_str
             .split_once('/')
             .map_or((ref_str, None), |(t, s)| (t, Some(s)));
         let dep = rows.iter().find(|r| {
-            r.task_name == task_name && session_id_filter.is_none_or(|sid| r.session_id == sid)
+            r.task_name == task_name && cell_id_filter.is_none_or(|cid| r.cell_id == cid)
         })?;
         return worktree_branch(Path::new(dep.cwd.as_deref()?)).ok();
     }
     worktree_upstream(Path::new(cwd)).ok()
 }
 
-/// One session's contribution to a review.
+/// One cell's contribution to a review.
 struct Membership {
     project: PathBuf,
     branch: String,
@@ -222,16 +222,14 @@ struct Membership {
     maximum_budget_usd: Option<f64>,
 }
 
-/// Build the planner's session/task rows straight from the task file (same order
-/// insertion uses), alongside each session's cwd and declared review opt-in.
-type SessionReviewInfo<'a> = Vec<(Option<String>, Option<&'a str>)>;
+/// Build the planner's cell/task rows straight from the task file (same order
+/// insertion uses), alongside each cell's cwd and declared review opt-in.
+type CellReviewInfo<'a> = Vec<(Option<String>, Option<&'a str>)>;
 
-fn rows_from_file<'a>(
-    file: &'a TaskFile,
-) -> (Vec<SessionRow>, Vec<TaskRow>, SessionReviewInfo<'a>) {
-    let mut sessions = Vec::new();
+fn rows_from_file<'a>(file: &'a TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInfo<'a>) {
+    let mut cells = Vec::new();
     let mut tasks = Vec::new();
-    let mut sess_info: SessionReviewInfo = Vec::new();
+    let mut cell_info: CellReviewInfo = Vec::new();
     for (t_idx, task) in file.task.iter().enumerate() {
         let ti = i64::try_from(t_idx).unwrap_or(0);
         tasks.push(TaskRow {
@@ -241,13 +239,13 @@ fn rows_from_file<'a>(
             depends_on: task.depends_on.clone(),
             soloed: false,
         });
-        for (s_idx, s) in task.session.iter().enumerate() {
-            let sid = s.id.clone().unwrap_or_else(|| format!("session-{s_idx}"));
-            sessions.push(SessionRow {
+        for (s_idx, s) in task.cell.iter().enumerate() {
+            let sid = s.id.clone().unwrap_or_else(|| format!("cell-{s_idx}"));
+            cells.push(CellRow {
                 task_idx: ti,
                 idx: i64::try_from(s_idx).unwrap_or(0),
                 task_name: task.name.clone(),
-                session_id: sid,
+                cell_id: sid,
                 cwd: s.cwd.clone(),
                 subprojects: s.subprojects.clone(),
                 prompt: s.prompt.clone(),
@@ -261,13 +259,13 @@ fn rows_from_file<'a>(
                 budget_tokens: None,
                 maximum_budget_usd: None,
                 upstream: s.upstream.clone(),
-                machine: ralphus_core::schema::resolve_session_machine(task, s),
+                machine: ralphus_core::schema::resolve_cell_machine(task, s),
             });
-            // Collect the session's cwd and its optional review opt-in id.
-            sess_info.push((s.cwd.clone(), s.review.as_deref()));
+            // Collect the cell's cwd and its optional review opt-in id.
+            cell_info.push((s.cwd.clone(), s.review.as_deref()));
         }
     }
-    (sessions, tasks, sess_info)
+    (cells, tasks, cell_info)
 }
 
 /// Convert `[[review.action]]` entries into `GuardianCheck` values for storage.
@@ -286,44 +284,48 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                     name: i.name.clone(),
                     message: i.message.clone(),
                     default: i.default.clone(),
+                    // `[[review.action.input]]` (core schema) doesn't declare
+                    // a type today (RAL-221) -- every TOML-authored action
+                    // input stays unconstrained `String` until that's added.
+                    r#type: crate::guardian::CheckInputType::String,
                 })
                 .collect(),
         })
         .collect()
 }
 
-/// What a remote session contributes to a review, derived without touching the
+/// What a remote cell contributes to a review, derived without touching the
 /// filesystem (RAL-185 Phase 3b).
 ///
-/// A session that ran on another machine keeps its worktree there, so
+/// A cell that ran on another machine keeps its worktree there, so
 /// `worktree_branch` / `worktree_upstream` / `worktree_project` cannot answer
 /// for it — this host has no view of that directory. Every piece is instead
-/// recoverable from what was already declared: the branch from the session's
+/// recoverable from what was already declared: the branch from the cell's
 /// `ralphus:new-worktree/<branch>` cwd, and the project root from the owning
 /// task's registered `project`. The base is the one thing with no declarative
 /// source, which is why `[[review]] base` exists.
 ///
-/// `None` for a local session, which keeps the original inference path.
+/// `None` for a local cell, which keeps the original inference path.
 struct RemoteDerivation {
-    session_id: String,
+    cell_id: String,
     machine: String,
     branch: String,
     project_root: String,
 }
 
-/// Build a [`RemoteDerivation`] for `session`, or `None` when it ran locally.
+/// Build a [`RemoteDerivation`] for `cell`, or `None` when it ran locally.
 ///
 /// Each missing piece is its own error rather than a fall-through to the local
-/// inference path: that path runs git against the session's `cwd`, which for a
-/// remote session names a directory on another host — producing an opaque
+/// inference path: that path runs git against the cell's `cwd`, which for a
+/// remote cell names a directory on another host — producing an opaque
 /// "directory name is invalid" instead of saying what is actually wrong.
-fn remote_session_derivation(
+fn remote_cell_derivation(
     store: &Store,
-    session: &SessionRow,
+    cell: &CellRow,
     raw_cwd: Option<&str>,
     task: Option<&TaskRow>,
 ) -> std::result::Result<Option<RemoteDerivation>, ReviewError> {
-    let Some(machine) = session
+    let Some(machine) = cell
         .machine
         .as_deref()
         .map(str::trim)
@@ -345,14 +347,14 @@ fn remote_session_derivation(
         .map(str::to_string)
         .ok_or_else(|| {
             ReviewError::new(format!(
-                "session \"{}\" runs on machine \"{machine}\" and opts into a review, so its                  branch must be knowable without reading that machine's filesystem. Give it a                  cwd of the form \"ralphus:new-worktree/<branch>\" instead of a literal path.",
-                session.session_id
+                "cell \"{}\" runs on machine \"{machine}\" and opts into a review, so its                  branch must be knowable without reading that machine's filesystem. Give it a                  cwd of the form \"ralphus:new-worktree/<branch>\" instead of a literal path.",
+                cell.cell_id
             ))
         })?;
     let project_name = task.and_then(|t| t.project.as_deref()).ok_or_else(|| {
         ReviewError::new(format!(
-            "session \"{}\" runs on machine \"{machine}\" and opts into a review, so its              project cannot be discovered from its worktree. Set 'project' on its task.",
-            session.session_id
+            "cell \"{}\" runs on machine \"{machine}\" and opts into a review, so its              project cannot be discovered from its worktree. Set 'project' on its task.",
+            cell.cell_id
         ))
     })?;
     let project_root = store
@@ -362,12 +364,12 @@ fn remote_session_derivation(
         .map(|p| p.path)
         .ok_or_else(|| {
             ReviewError::new(format!(
-                "session \"{}\" references unregistered project \"{project_name}\"",
-                session.session_id
+                "cell \"{}\" references unregistered project \"{project_name}\"",
+                cell.cell_id
             ))
         })?;
     Ok(Some(RemoteDerivation {
-        session_id: session.session_id.clone(),
+        cell_id: cell.cell_id.clone(),
         machine: machine.to_string(),
         branch,
         project_root,
@@ -375,39 +377,39 @@ fn remote_session_derivation(
 }
 
 /// Preflight and materialize the reviews declared in `file` as guardians tagged
-/// with `run_id`. Returns the created guardian ids (empty when no session
+/// with `squad_id`. Returns the created guardian ids (empty when no cell
 /// declares a review). Any git/worktree problem is a hard error.
 ///
 /// # Errors
-/// Returns [`ReviewError`] when a review session has no cwd, its cwd is not a git
+/// Returns [`ReviewError`] when a review cell has no cwd, its cwd is not a git
 /// worktree, or the worktree has no upstream tracking branch.
 pub fn derive_reviews(
     store: &Store,
-    run_id: &str,
+    squad_id: &str,
     file: &TaskFile,
 ) -> std::result::Result<Vec<String>, ReviewError> {
     if file.review.is_empty() {
         return Ok(Vec::new());
     }
-    let (mut sessions, tasks, sess_info) = rows_from_file(file);
+    let (mut cells, tasks, cell_info) = rows_from_file(file);
 
-    // Check early: are there any sessions that opt into any review?
-    if sess_info.iter().all(|(_, rev_id)| rev_id.is_none()) {
+    // Check early: are there any cells that opt into any review?
+    if cell_info.iter().all(|(_, rev_id)| rev_id.is_none()) {
         return Ok(Vec::new());
     }
 
-    // A review-opted-in session's `cwd` may still be an unmaterialized
+    // A review-opted-in cell's `cwd` may still be an unmaterialized
     // `ralphus:new-worktree/<branch>` placeholder (RAL-100): normally the
-    // scheduler only resolves those when the run is claimed to execute, but
+    // scheduler only resolves those when the squad is claimed to execute, but
     // this preflight needs a real worktree path *now* to run git against it.
-    // Resolving here (persisted via `Store::set_session_cwd`, same as the
-    // scheduler's resolution) means a restarted run never re-resolves it.
-    crate::worktrees::resolve_placeholders(store, run_id, &mut sessions, &tasks, &Context::new())
+    // Resolving here (persisted via `Store::set_cell_cwd`, same as the
+    // scheduler's resolution) means a restarted squad never re-resolves it.
+    crate::worktrees::resolve_placeholders(store, squad_id, &mut cells, &tasks, &Context::new())
         .map_err(ReviewError::new)?;
 
-    // Topological rank per session position (for branch ordering).
-    let execution = plan::plan(&sessions, &tasks).map_err(ReviewError::new)?;
-    let mut rank = vec![0usize; sessions.len()];
+    // Topological rank per cell position (for branch ordering).
+    let execution = plan::plan(&cells, &tasks).map_err(ReviewError::new)?;
+    let mut rank = vec![0usize; cells.len()];
     for (r, &pos) in execution.order.iter().enumerate() {
         rank[pos] = r;
     }
@@ -420,26 +422,26 @@ pub fn derive_reviews(
         .collect();
 
     // RAL-159: the worktree root and assigned branch of every explicitly
-    // review-linked session, so a second pass below can attach sessions that
+    // review-linked cell, so a second pass below can attach cells that
     // merely share that worktree (e.g. a nested cwd subfolder) but declared no
     // `review = "<id>"` of their own.
     let mut explicit_roots: Vec<(PathBuf, String)> = Vec::new();
 
     // Task rows indexed for the remote-derivation lookup below, which needs the
-    // owning task's `project` (a remote session's project grouping cannot come
+    // owning task's `project` (a remote cell's project grouping cannot come
     // from its worktree, since that lives on another machine).
     let tasks_by_idx: BTreeMap<i64, Option<&TaskRow>> =
         tasks.iter().map(|t| (t.idx, Some(t))).collect();
 
     let mut memberships: Vec<Membership> = Vec::new();
-    for (pos, (_, rev_id_opt)) in sess_info.iter().enumerate() {
+    for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
-        // Use the (now-resolved) cwd from `sessions`, not the raw placeholder
-        // string captured in `sess_info` before `resolve_placeholders` ran above.
-        let cwd = sessions[pos]
+        // Use the (now-resolved) cwd from `cells`, not the raw placeholder
+        // string captured in `cell_info` before `resolve_placeholders` ran above.
+        let cwd = cells[pos]
             .cwd
             .as_deref()
-            .ok_or_else(|| ReviewError::new("a session declaring a review has no cwd"))?;
+            .ok_or_else(|| ReviewError::new("a cell declaring a review has no cwd"))?;
         let cwd_path = Path::new(cwd);
         let declared_base = review_map
             .get(rev_id)
@@ -447,25 +449,25 @@ pub fn derive_reviews(
             .and_then(|r| r.base.clone())
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
-        // RAL-185: a session that ran on another machine keeps its worktree
+        // RAL-185: a cell that ran on another machine keeps its worktree
         // there, so none of the filesystem reads below can answer for it.
         // Everything needed is already known declaratively instead: the branch
         // from its `ralphus:new-worktree/<branch>` cwd, the base from the
         // review's own `base`, and the project from the owning task.
-        let remote = remote_session_derivation(
+        let remote = remote_cell_derivation(
             store,
-            &sessions[pos],
-            sess_info[pos].0.as_deref(),
-            tasks_by_idx.get(&sessions[pos].task_idx).copied().flatten(),
+            &cells[pos],
+            cell_info[pos].0.as_deref(),
+            tasks_by_idx.get(&cells[pos].task_idx).copied().flatten(),
         )?;
         let (project, branch, base) = if let Some(rd) = &remote {
             let base = declared_base.clone().ok_or_else(|| {
                 ReviewError::new(format!(
-                    "review \"{rev_id}\" is fed by session \"{}\" running on machine \"{}\", so \
+                    "review \"{rev_id}\" is fed by cell \"{}\" running on machine \"{}\", so \
                      its base branch cannot be read from that worktree's git upstream — this \
                      daemon cannot see another machine's filesystem. Declare it explicitly on \
                      the review: [[review]] base = \"main\".",
-                    rd.session_id, rd.machine
+                    rd.cell_id, rd.machine
                 ))
             })?;
             (PathBuf::from(&rd.project_root), rd.branch.clone(), base)
@@ -489,13 +491,13 @@ pub fn derive_reviews(
             };
             (project, branch, base)
         };
-        // Record this session's review branch so the board can link the session
+        // Record this cell's review branch so the board can link the cell
         // back to its review(s) (RAL-17).
-        let srow = &sessions[pos];
+        let crow = &cells[pos];
         store
-            .set_session_review_branch(run_id, srow.task_idx, srow.idx, &branch)
+            .set_cell_review_branch(squad_id, crow.task_idx, crow.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        // Only meaningful for a local worktree: a remote session's cwd names a
+        // Only meaningful for a local worktree: a remote cell's cwd names a
         // directory this host cannot stat, and its project grouping already
         // came from the owning task above.
         if remote.is_none() {
@@ -534,31 +536,31 @@ pub fn derive_reviews(
         return Ok(Vec::new());
     }
 
-    // RAL-159: sessions that share a worktree with an explicitly review-linked
-    // session -- e.g. one at the worktree root, another at a nested cwd
+    // RAL-159: cells that share a worktree with an explicitly review-linked
+    // cell -- e.g. one at the worktree root, another at a nested cwd
     // subfolder -- implicitly belong to that same branch's review too, even
     // without their own `review = "<id>"`: they can commit to the exact same
     // branch, since a worktree checks out exactly one branch at a time. This
-    // makes the readiness gate (`Store::mark_ready_branches_with_done_sessions`)
-    // wait for them, and surfaces them in the session's "in reviews" list
-    // (RAL-17) via the same `sessions.review_branch` join used for explicit
+    // makes the readiness gate (`Store::mark_ready_branches_with_done_cells`)
+    // wait for them, and surfaces them in the cell's "in reviews" list
+    // (RAL-17) via the same `cells.review_branch` join used for explicit
     // members -- no separate UI/query path needed. Matched by literal
     // worktree root, not mere project identity, so a sibling *linked*
     // worktree of the same repo (a different branch) does not cross-match.
-    for (pos, (_, rev_id_opt)) in sess_info.iter().enumerate() {
+    for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
         if rev_id_opt.is_some() {
             continue; // already handled explicitly above
         }
-        let Some(cwd) = sessions[pos].cwd.as_deref() else {
+        let Some(cwd) = cells[pos].cwd.as_deref() else {
             continue;
         };
         let Ok(root) = worktree_root(Path::new(cwd)) else {
             continue;
         };
         if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
-            let srow = &sessions[pos];
+            let crow = &cells[pos];
             store
-                .set_session_review_branch(run_id, srow.task_idx, srow.idx, branch)
+                .set_cell_review_branch(squad_id, crow.task_idx, crow.idx, branch)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
         }
     }
@@ -613,7 +615,7 @@ pub fn derive_reviews(
             suggested
         };
         let gid = store
-            .create_guardian_for_run(&name, &base, project, Some(run_id))
+            .create_guardian_for_squad(&name, &base, project, Some(squad_id))
             .map_err(|e| ReviewError::new(e.to_string()))?;
         apply_skip_worktrees(store, &gid, project)?;
         apply_resolver(store, &gid, &members)?;
@@ -649,7 +651,7 @@ pub fn derive_reviews(
             .find(|m| !m.name.is_empty())
             .map_or_else(|| key.clone(), |m| m.name.clone());
         let gid = store
-            .create_guardian_keyed(&name, &base, &project, Some(run_id), Some(key))
+            .create_guardian_keyed(&name, &base, &project, Some(squad_id), Some(key))
             .map_err(|e| ReviewError::new(e.to_string()))?;
         // Apply skip_worktrees for every distinct project in the group.
         let distinct_projects: Vec<String> = {
@@ -843,7 +845,7 @@ mod tests {
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "work"]);
 
-        // Simulate a session that stalled mid-flight: committed work + dirty file.
+        // Simulate a cell that stalled mid-flight: committed work + dirty file.
         std::fs::write(root.join("in_progress.txt"), "half done\n").unwrap();
 
         let result = rebase_onto(&root, "upstream");
@@ -910,17 +912,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── session_upstream_display ─────────────────────────────────────────────
+    // ── cell_upstream_display ─────────────────────────────────────────────
 
-    use super::session_upstream_display;
-    use crate::store::SessionRow;
+    use super::cell_upstream_display;
+    use crate::store::CellRow;
 
-    fn row(task_idx: i64, task_name: &str, session_id: &str, cwd: Option<&Path>) -> SessionRow {
-        SessionRow {
+    fn row(task_idx: i64, task_name: &str, cell_id: &str, cwd: Option<&Path>) -> CellRow {
+        CellRow {
             task_idx,
             idx: 0,
             task_name: task_name.to_string(),
-            session_id: session_id.to_string(),
+            cell_id: cell_id.to_string(),
             cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
             subprojects: vec![],
             prompt: None,
@@ -943,7 +945,7 @@ mod tests {
         let dir = temp_repo(); // created but never `git init`'d
         let rows = [row(0, "t", "s", Some(&dir))];
         assert_eq!(
-            session_upstream_display(rows[0].cwd.as_deref(), &rows, 0, 0),
+            cell_upstream_display(rows[0].cwd.as_deref(), &rows, 0, 0),
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -961,7 +963,7 @@ mod tests {
 
         let rows = [row(0, "t", "s", Some(&root))];
         assert_eq!(
-            session_upstream_display(rows[0].cwd.as_deref(), &rows, 0, 0),
+            cell_upstream_display(rows[0].cwd.as_deref(), &rows, 0, 0),
             Some("main".to_string())
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1007,7 +1009,7 @@ mod tests {
         let rows = [dep_row, work_row];
 
         assert_eq!(
-            session_upstream_display(rows[1].cwd.as_deref(), &rows, 1, 0),
+            cell_upstream_display(rows[1].cwd.as_deref(), &rows, 1, 0),
             Some("dep-branch".to_string())
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1028,7 +1030,7 @@ mod tests {
         let rows = [dep_row, work_row];
 
         assert_eq!(
-            session_upstream_display(rows[1].cwd.as_deref(), &rows, 1, 0),
+            cell_upstream_display(rows[1].cwd.as_deref(), &rows, 1, 0),
             None,
             "must not fall back to the tracking ref when a chained dependency is declared but unresolved"
         );

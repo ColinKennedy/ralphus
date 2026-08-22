@@ -18,6 +18,7 @@ const DEFAULT_PROGRAM: &str = "codex";
 
 pub struct CodexBackend {
     pub keep_temporary_files: bool,
+    pub program_override: Option<String>,
 }
 
 impl ModelBackend for CodexBackend {
@@ -27,8 +28,9 @@ impl ModelBackend for CodexBackend {
         workspace: &Workspace,
         options: &RunOptions<'_>,
     ) -> Result<BackendOutcome, BackendError> {
-        let program =
-            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string());
+        let program = self.program_override.clone().unwrap_or_else(|| {
+            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
+        });
         let compound = crate::cli_agent_common::is_compound_command(&program);
 
         // `-c developer_instructions=...` must precede `exec` -- Codex's own

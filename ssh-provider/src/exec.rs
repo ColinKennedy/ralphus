@@ -1,4 +1,4 @@
-//! The `exec` verb: sync source to the remote host, run one session there
+//! The `exec` verb: sync source to the remote host, run one cell there
 //! synchronously, and return its result (RAL-200).
 //!
 //! Scope is deliberately narrow -- see the crate root docs. `exec` always
@@ -6,7 +6,7 @@
 //! needs to poll `status`/`stream`/`cancel` for this provider; it simply
 //! blocks until the remote `ralphus-runner` finishes.
 //!
-//! ## Why the local `cwd` from the session spec isn't used remotely as-is
+//! ## Why the local `cwd` from the cell spec isn't used remotely as-is
 //!
 //! The daemon hands this provider the same [`crate::config`]-independent
 //! `RunnerSpec` JSON it would send a local runner, `cwd` included -- but that
@@ -65,7 +65,7 @@ impl EffectiveConfig {
 
 /// Run `exec`: parse `uri`, sync `spec_json`'s `cwd` to the remote host, run
 /// the remote `ralphus-runner` against the rewritten spec, and return its
-/// `SessionResult` JSON.
+/// `CellResult` JSON.
 ///
 /// `RALPHUS_EVENT:` lines (including `llm-invoke` usage events) seen on the
 /// remote invocation's stderr are forwarded verbatim to *this process's own*
@@ -76,22 +76,22 @@ impl EffectiveConfig {
 ///
 /// # Errors
 /// Returns an actionable message on any transport, sync, or protocol
-/// failure. Never returns `Err` for a session that ran and merely failed --
+/// failure. Never returns `Err` for a cell that ran and merely failed --
 /// that comes back as `Ok(json with status: "failed")`, per the contract's
 /// distinction between an infrastructure failure and a normal task outcome.
 pub fn run(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Value, String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
 
     let spec: Value = serde_json::from_str(spec_json)
-        .map_err(|e| format!("could not parse the session spec on stdin: {e}"))?;
+        .map_err(|e| format!("could not parse the cell spec on stdin: {e}"))?;
     let Value::Object(mut spec_obj) = spec else {
-        return Err("the session spec on stdin must be a JSON object".to_string());
+        return Err("the cell spec on stdin must be a JSON object".to_string());
     };
     let local_dir = spec_obj
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "the session spec's \"cwd\" field must be a non-empty string".to_string())?
+        .ok_or_else(|| "the cell spec's \"cwd\" field must be a non-empty string".to_string())?
         .to_string();
 
     let remote_dir = config::remote_workspace_dir(&config.remote_base, &local_dir);
@@ -100,13 +100,13 @@ pub fn run(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Value
 
     spec_obj.insert("cwd".to_string(), Value::String(remote_dir.clone()));
     // Never meaningful to the remote runner (it ignores unknown keys anyway,
-    // `SessionSpec.from_json` reads named fields only) -- dropped so a remote
+    // `CellSpec.from_json` reads named fields only) -- dropped so a remote
     // machine value referencing itself can never even look plausible.
     spec_obj.remove("machine");
     let remote_spec_json = serde_json::to_string(&Value::Object(spec_obj))
-        .map_err(|e| format!("could not re-serialize the rewritten session spec: {e}"))?;
+        .map_err(|e| format!("could not re-serialize the rewritten cell spec: {e}"))?;
 
-    run_remote_session(&target, &remote_dir, &remote_spec_json, config)
+    run_remote_cell(&target, &remote_dir, &remote_spec_json, config)
 }
 
 /// Sync `local_dir`'s contents onto `target:remote_dir`, choosing the
@@ -240,14 +240,14 @@ fn sync_via_tar_ssh(
 }
 
 /// SSH to `target`, pipe `remote_spec_json` into the remote `ralphus-runner`,
-/// and return its parsed `SessionResult` JSON.
+/// and return its parsed `CellResult` JSON.
 ///
 /// The remote command deliberately still `cd`s into `remote_dir` before
 /// invoking the runner even though `cwd` is also carried in the spec itself
 /// -- cheap, and keeps the remote process's own working directory sane for
 /// anything (a relative-path tool invocation, a core dump) that might assume
 /// it, beyond what the spec's `cwd` field alone covers.
-fn run_remote_session(
+fn run_remote_cell(
     target: &SshTarget,
     remote_dir: &str,
     remote_spec_json: &str,
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn a_spec_missing_cwd_fails_with_an_actionable_message() {
-        let err = run("alice@host", r#"{"run_id":"r1"}"#, &config()).unwrap_err();
+        let err = run("alice@host", r#"{"squad_id":"r1"}"#, &config()).unwrap_err();
         assert!(err.contains("cwd"), "{err}");
     }
 

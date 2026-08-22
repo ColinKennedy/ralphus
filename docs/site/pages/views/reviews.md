@@ -1,6 +1,6 @@
 # Reviews
 
-A Guardian review takes the branches produced by a run's tasks and stacks
+A Guardian review takes the branches produced by a squad's tasks and stacks
 them into a single rebased review branch — resolving merge conflicts with an
 agent, running your declared check gates, and giving you a chat channel to
 request changes before anything is approved. The Reviews tab is where you

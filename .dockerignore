@@ -1,0 +1,15 @@
+# Keeps the container-mode build context (docker/Dockerfile, RAL-225) small
+# and avoids baking host build artifacts into the image.
+target/
+dist/
+.git/
+cli/.venv/
+cli/**/__pycache__/
+cli/.mypy_cache/
+cli/.ruff_cache/
+cli/.pytest_cache/
+node_modules/
+.lint-tmp/
+bench_data/
+docs/site/site/
+*.local.md

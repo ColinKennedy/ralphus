@@ -20,6 +20,12 @@
 //! `resolve_remote` usable for kind/repo detection even when no token is
 //! configured yet. Future work reusing forge auth should follow this same
 //! env-var convention rather than inventing a new mechanism.
+//!
+//! If the env var isn't set, [`resolve_cli_token`] falls back to asking the
+//! forge's own CLI (`gh auth token` / `glab auth status --show-token`) for a
+//! token already cached from a prior interactive login.
+//!
+//! TODO: Replace with real user-service authentication once RAL-245 is complete.
 
 use std::path::Path;
 
@@ -107,6 +113,14 @@ pub struct CreatedPr {
     pub number: i64,
     /// Web URL a human can open.
     pub url: String,
+}
+
+/// A registered GitHub-native PR stack (`GET/POST .../stacks`) — GitHub only,
+/// see [`ForgeClient::create_stack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedStack {
+    /// Repo-scoped stack number, not a global id.
+    pub number: i64,
 }
 
 /// A resolved connection to one forge repository: enough to create PRs, list
@@ -249,6 +263,67 @@ impl ForgeClient {
         }
     }
 
+    /// Fetch a PR/MR's *live* state from the forge, normalized to ralphus's
+    /// own `"open"`/`"merged"`/`"closed"` convention
+    /// ([`PullRequestView::state`]) -- so a PR closed or merged outside
+    /// ralphus (the GitHub/GitLab UI, `gh pr close`, ...) can be detected
+    /// instead of trusting a locally-recorded `state` that may be stale
+    /// forever (RAL-190+: without this, a review whose PR was closed
+    /// externally looks "already submitted" and a fresh "submit stack" call
+    /// silently does nothing). Logs the outbound call (start/done/error) via
+    /// `rlog!`.
+    pub fn get_pull_request_state(&self, number: i64) -> Result<String, String> {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] get pr state start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.get_pull_request_state_inner(number);
+        match &result {
+            Ok(state) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] get pr state done kind={} repo={} number={number} state={state}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] get pr state failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn get_pull_request_state_inner(&self, number: i64) -> Result<String, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let resp = get(ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json"))?;
+                if resp["merged"].as_bool().unwrap_or(false) {
+                    return Ok("merged".to_string());
+                }
+                Ok(resp["state"].as_str().unwrap_or("open").to_string())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                Ok(match resp["state"].as_str().unwrap_or("opened") {
+                    "opened" => "open".to_string(),
+                    other => other.to_string(),
+                })
+            }
+        }
+    }
+
     /// Retarget an already-open PR/MR's base/target branch (RAL-190: keeps a
     /// stacked PR's base in sync after its review is reordered). Best-effort
     /// from the caller's point of view -- callers should log-and-continue on
@@ -304,6 +379,113 @@ impl ForgeClient {
                 Ok(())
             }
         }
+    }
+
+    /// Register an ordered (bottom-to-top) list of already-created PR numbers
+    /// as a GitHub-native PR stack
+    /// (`POST /repos/{owner}/{repo}/stacks`, see
+    /// https://docs.github.com/en/rest/pulls/stacks) so GitHub's own UI shows
+    /// them as a linked stack. Each PR's base ref must already match the
+    /// previous PR's head ref -- exactly the chained-base invariant
+    /// [`crate::pr::submit_pull_requests`] already maintains, so this call
+    /// just groups PRs that already form a valid chain; it does not create or
+    /// modify any PR itself. GitLab has no equivalent concept: returns
+    /// `Ok(None)` as a documented no-op rather than an error. Logs the
+    /// outbound call (start/done/error) via `rlog!`.
+    pub fn create_stack(&self, pr_numbers: &[i64]) -> Result<Option<CreatedStack>, String> {
+        if self.kind != ForgeKind::GitHub {
+            return Ok(None);
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] create stack start kind={} repo={} pull_requests={pr_numbers:?}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.create_stack_inner(pr_numbers);
+        match &result {
+            Ok(stack) => crate::rlog!(
+                INFO,
+                "ralphus [forge] create stack done kind={} repo={} number={}",
+                self.kind.as_str(),
+                self.repo_path,
+                stack.number
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] create stack failed kind={} repo={}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result.map(Some)
+    }
+
+    fn create_stack_inner(&self, pr_numbers: &[i64]) -> Result<CreatedStack, String> {
+        let token = self.require_token()?;
+        let url = format!("{}/repos/{}/stacks", self.api_base, self.repo_path);
+        let payload = serde_json::json!({ "pull_requests": pr_numbers });
+        let resp = send(
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            &payload,
+        )?;
+        let number = resp["number"]
+            .as_i64()
+            .ok_or_else(|| format!("unexpected GitHub stack response shape: {resp}"))?;
+        Ok(CreatedStack { number })
+    }
+
+    /// Append newly-created PR numbers (bottom-to-top) onto the top of an
+    /// already-registered GitHub PR stack
+    /// (`POST /repos/{owner}/{repo}/stacks/{stack_number}/add`) -- the first
+    /// of `pr_numbers` must base onto the stack's current top PR's head ref.
+    /// GitLab has no equivalent concept: returns `Ok(())` as a documented
+    /// no-op rather than an error. Logs the outbound call (start/done/error)
+    /// via `rlog!`.
+    pub fn add_to_stack(&self, stack_number: i64, pr_numbers: &[i64]) -> Result<(), String> {
+        if self.kind != ForgeKind::GitHub {
+            return Ok(());
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] add to stack start kind={} repo={} stack={stack_number} pull_requests={pr_numbers:?}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.add_to_stack_inner(stack_number, pr_numbers);
+        match &result {
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] add to stack done kind={} repo={} stack={stack_number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] add to stack failed kind={} repo={} stack={stack_number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn add_to_stack_inner(&self, stack_number: i64, pr_numbers: &[i64]) -> Result<(), String> {
+        let token = self.require_token()?;
+        let url = format!(
+            "{}/repos/{}/stacks/{stack_number}/add",
+            self.api_base, self.repo_path
+        );
+        let payload = serde_json::json!({ "pull_requests": pr_numbers });
+        send(
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            &payload,
+        )?;
+        Ok(())
     }
 
     /// List human-authored comments on a PR/MR, oldest first. GitLab's
@@ -554,6 +736,76 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
     Some((host.to_string(), path.to_string()))
 }
 
+/// Fallback token resolution when `[forge].token_env` (or its default,
+/// `RALPHUS_GITHUB_TOKEN`/`RALPHUS_GITLAB_TOKEN`) isn't set in the daemon's
+/// own environment: ask the forge's own CLI for a token it already has
+/// cached from a prior interactive `gh auth login` / `glab auth login` on
+/// this machine. Best-effort only — returns `None` on any failure (CLI not
+/// installed, not logged in, unexpected output shape) and callers should
+/// treat that exactly like "no token configured" rather than surfacing a
+/// separate error. Only usable when the daemon process runs on the same
+/// machine as that CLI login; a remote/CI daemon still needs the env var.
+///
+/// TODO: Replace with real user-service authentication once RAL-245 is complete.
+fn resolve_cli_token(kind: ForgeKind, host: &str) -> Option<String> {
+    match kind {
+        ForgeKind::GitHub => {
+            let mut cmd = std::process::Command::new("gh");
+            cmd.arg("auth").arg("token");
+            if !host.eq_ignore_ascii_case("github.com") {
+                cmd.arg("--hostname").arg(host);
+            }
+            let output = cmd.output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let token = String::from_utf8(output.stdout).ok()?;
+            let token = token.trim();
+            if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            }
+        }
+        ForgeKind::GitLab => {
+            // glab has no single-purpose "print the token" command like `gh
+            // auth token`; `auth status --show-token` is the closest thing,
+            // and it writes to stderr.
+            let output = std::process::Command::new("glab")
+                .arg("auth")
+                .arg("status")
+                .arg("--hostname")
+                .arg(host)
+                .arg("--show-token")
+                .output()
+                .ok()?;
+            let combined = [output.stdout, output.stderr].concat();
+            let text = String::from_utf8(combined).ok()?;
+            extract_glab_token(&text)
+        }
+    }
+}
+
+/// Extracts the token from `glab auth status --show-token`'s combined
+/// stdout+stderr text. The line carrying it varies by how the token is
+/// stored: a plain "Token: <value>" line for a config-file-stored token, but
+/// "✓ Token found in operating system keyring: <value>" when it's in the OS
+/// keyring (the default on Windows/macOS) -- so this looks for any line
+/// mentioning "Token" and takes whatever follows its *last* colon, rather
+/// than anchoring on one exact prefix (a Windows-keyring login previously
+/// fell through to "no token configured" because the "Token:" prefix match
+/// never fired on that line's actual wording).
+fn extract_glab_token(text: &str) -> Option<String> {
+    let token = text.lines().find_map(|line| {
+        if !line.contains("Token") {
+            return None;
+        }
+        line.rsplit_once(':')
+            .map(|(_, rest)| rest.trim().to_string())
+    })?;
+    (!token.is_empty()).then_some(token)
+}
+
 /// Resolve the effective forge client for a git repository at `root`,
 /// combining the layered [`ForgeConfig`] (explicit overrides) with
 /// autodetection from `git remote get-url <remote>` (host → kind, path →
@@ -601,7 +853,19 @@ fn resolve_remote_inner(root: &Path, cfg: &ForgeConfig) -> Result<ForgeClient, S
         .token_env
         .clone()
         .unwrap_or_else(|| kind.default_token_env().to_string());
-    let token = std::env::var(&token_env).ok();
+    // Env var wins when set; otherwise fall back to the forge CLI's own
+    // cached login (see `resolve_cli_token`'s doc comment for scope/limits).
+    // TODO: Replace with real user-service authentication once RAL-245 is complete.
+    let token = std::env::var(&token_env)
+        .ok()
+        .or_else(|| resolve_cli_token(kind, &host));
+    if token.is_some() && std::env::var(&token_env).is_err() {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] resolved token via CLI fallback kind={} host={host}",
+            kind.as_str()
+        );
+    }
 
     let repo_path = match kind {
         ForgeKind::GitHub => path,
@@ -753,5 +1017,174 @@ mod tests {
         );
         let err = client.update_pull_request_base(1, "main").unwrap_err();
         assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn extract_glab_token_handles_a_plain_token_line() {
+        let text = "gitlab.com\n  Logged in to gitlab.com as colin\n  Token: glpat-abc123\n";
+        assert_eq!(extract_glab_token(text), Some("glpat-abc123".to_string()));
+    }
+
+    #[test]
+    fn extract_glab_token_handles_an_os_keyring_token_line() {
+        // Real `glab auth status --show-token` output on Windows/macOS,
+        // where the token is stored in the OS keyring rather than a plain
+        // config file -- the bug this regression-tests: the old parser only
+        // matched a literal "Token:" prefix and never fired on this wording.
+        let text = "gitlab.com\n  \u{2713} Logged in to gitlab.com as colin (keyring)\n  \u{2713} Token found in operating system keyring: glpat-REDACTED-EXAMPLE-TOKEN0000000000\n";
+        assert_eq!(
+            extract_glab_token(text),
+            Some("glpat-REDACTED-EXAMPLE-TOKEN0000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_glab_token_is_none_without_a_token_line() {
+        let text =
+            "gitlab.com\n  Not logged in to gitlab.com. Use `glab auth login` to authenticate.\n";
+        assert_eq!(extract_glab_token(text), None);
+    }
+
+    #[test]
+    fn get_pull_request_state_reports_closed() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/3");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": false}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_state(3).unwrap(), "closed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_state_reports_merged_over_closed() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_state(3).unwrap(), "merged");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_state_normalizes_gitlab_opened() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "opened"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_state(9).unwrap(), "open");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_stack_sends_ordered_pull_request_numbers() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/stacks");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["pull_requests"], serde_json::json!([3, 6, 7]));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"number": 42}"#).with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let stack = client.create_stack(&[3, 6, 7]).unwrap().unwrap();
+        assert_eq!(stack.number, 42);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_stack_is_a_no_op_for_gitlab() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.com/api/v4".to_string(),
+            "group%2Fproj".to_string(),
+            None,
+        );
+        assert_eq!(client.create_stack(&[1, 2]).unwrap(), None);
+    }
+
+    #[test]
+    fn add_to_stack_sends_new_pull_request_numbers() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42/add");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["pull_requests"], serde_json::json!([9]));
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.add_to_stack(42, &[9]).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn add_to_stack_is_a_no_op_for_gitlab() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.com/api/v4".to_string(),
+            "group%2Fproj".to_string(),
+            None,
+        );
+        assert!(client.add_to_stack(1, &[2]).is_ok());
     }
 }

@@ -1,8 +1,8 @@
 //! Structured event emission over the `RALPHUS_EVENT:` stderr marker, ported
 //! from `cli/src/ralphus/runner/cartographer.py`. The runner has no direct
 //! database access (it's a subprocess, possibly on a remote machine via a
-//! machine provider) and stdout is reserved for the `SessionSpec`/
-//! `SessionResult` JSON contract, so structured events piggyback on stderr
+//! machine provider) and stdout is reserved for the `CellSpec`/
+//! `CellResult` JSON contract, so structured events piggyback on stderr
 //! behind this marker -- `daemon/src/runner.rs` already reads the child's
 //! stderr line-by-line looking for exactly this prefix (`EVENT_MARKER`) and
 //! forwards matches into Cartographer. Kept as its own stderr hop rather than
@@ -15,8 +15,8 @@ const EVENT_MARKER: &str = "RALPHUS_EVENT: ";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EventContext<'a> {
-    pub run_id: Option<&'a str>,
-    pub session_id: Option<&'a str>,
+    pub squad_id: Option<&'a str>,
+    pub cell_id: Option<&'a str>,
     pub task: Option<&'a str>,
 }
 
@@ -36,11 +36,11 @@ pub fn emit(
         "payload": payload,
     });
     if let Some(o) = body.as_object_mut() {
-        if let Some(run_id) = ctx.run_id {
-            o.insert("run_id".to_string(), json!(run_id));
+        if let Some(squad_id) = ctx.squad_id {
+            o.insert("squad_id".to_string(), json!(squad_id));
         }
-        if let Some(session_id) = ctx.session_id {
-            o.insert("session_id".to_string(), json!(session_id));
+        if let Some(cell_id) = ctx.cell_id {
+            o.insert("cell_id".to_string(), json!(cell_id));
         }
         if let Some(task) = ctx.task {
             o.insert("task".to_string(), json!(task));

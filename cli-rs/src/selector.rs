@@ -1,14 +1,14 @@
 //! Selector grammar: a single, path-shaped way to address any
-//! run/task/session/verify or review/branch entity from the CLI. Ported from
-//! `cli/src/ralphus/selector.py`. Parsing (`parse_run_selector`/
+//! squad/task/cell/proof or review/branch entity from the CLI. Ported from
+//! `cli/src/ralphus/selector.py`. Parsing (`parse_squad_selector`/
 //! `parse_guardian_selector`) never touches the network; resolution
-//! (`resolve_run_selector`/`resolve_guardian_selector`) fetches the owning
-//! run/guardian view once and matches name segments against it.
+//! (`resolve_squad_selector`/`resolve_guardian_selector`) fetches the owning
+//! squad/guardian view once and matches name segments against it.
 //!
 //! Reuses `ralphus_core::uri` for the RAL-188 URI grammar itself (that
 //! crate already carries the parser as the Rust twin of `cli/src/ralphus/
 //! uri.py`) -- this module owns *resolution* (URI/legacy selector ->
-//! `task_idx`/`session_idx`/`verify_idx`, branch ids), same split as Python.
+//! `task_idx`/`cell_idx`/`proof_idx`, branch ids), same split as Python.
 
 use ralphus_core::uri::{self, INDEX_SIGIL_TOKEN, RalphusUri, Segment};
 use serde_json::Value;
@@ -32,38 +32,38 @@ impl From<uri::UriError> for SelectorError {
     }
 }
 
-// ---- run/task/session/verify selectors ---------------------------------
+// ---- squad/task/cell/proof selectors ---------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RawRunSelector {
-    pub run_id: String,
+pub struct RawSquadSelector {
+    pub squad_id: String,
     pub task: Option<String>,
-    pub session: Option<String>,
-    pub verify_scope: Option<String>,
-    pub verify: Option<String>,
-    pub run_label: Option<String>,
+    pub cell: Option<String>,
+    pub proof_scope: Option<String>,
+    pub proof: Option<String>,
+    pub squad_label: Option<String>,
     pub uri_form: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSelector {
     pub kind: String,
-    pub run_id: String,
+    pub squad_id: String,
     pub task_idx: i64,
-    pub session_idx: i64,
-    pub verify_idx: i64,
-    pub verify_scope: String,
+    pub cell_idx: i64,
+    pub proof_idx: i64,
+    pub proof_scope: String,
 }
 
 impl ResolvedSelector {
-    fn run(run_id: String) -> Self {
+    fn squad(squad_id: String) -> Self {
         Self {
-            kind: "run".to_string(),
-            run_id,
+            kind: "squad".to_string(),
+            squad_id,
             task_idx: 0,
-            session_idx: -1,
-            verify_idx: -1,
-            verify_scope: String::new(),
+            cell_idx: -1,
+            proof_idx: -1,
+            proof_scope: String::new(),
         }
     }
 }
@@ -75,82 +75,84 @@ fn segment_token(segment: &Segment) -> String {
     }
 }
 
-fn run_selector_from_uri(parsed: &RalphusUri, raw: &str) -> Result<RawRunSelector, SelectorError> {
-    if parsed.kinds().first() != Some(&"RUN") {
+fn squad_selector_from_uri(
+    parsed: &RalphusUri,
+    raw: &str,
+) -> Result<RawSquadSelector, SelectorError> {
+    if parsed.kinds().first() != Some(&"SQUAD") {
         return Err(SelectorError(format!(
-            "'{raw}' addresses a review, not a run/task/session/verify"
+            "'{raw}' addresses a review, not a squad/task/cell/proof"
         )));
     }
-    let run_seg = parsed
-        .segment("RUN")
-        .ok_or_else(|| SelectorError(format!("'{raw}': missing RUN segment")))?;
-    if run_seg.index.is_some() {
+    let squad_seg = parsed
+        .segment("SQUAD")
+        .ok_or_else(|| SelectorError(format!("'{raw}': missing SQUAD segment")))?;
+    if squad_seg.index.is_some() {
         return Err(SelectorError(format!(
-            "'{raw}': RUN[{INDEX_SIGIL_TOKEN}N] is not addressable -- a run has no stable \
-             position. Use its label or id (and ideally '?id=<run id>')."
+            "'{raw}': SQUAD[{INDEX_SIGIL_TOKEN}N] is not addressable -- a squad has no stable \
+             position. Use its label or id (and ideally '?id=<squad id>')."
         )));
     }
     let task = parsed.segment("TASK");
-    let session = parsed.segment("SESSION");
-    let verify = parsed.segment("VERIFY");
-    Ok(RawRunSelector {
-        run_id: parsed.id().unwrap_or("").to_string(),
-        run_label: run_seg.name.clone(),
+    let cell = parsed.segment("CELL");
+    let proof = parsed.segment("PROOF");
+    Ok(RawSquadSelector {
+        squad_id: parsed.id().unwrap_or("").to_string(),
+        squad_label: squad_seg.name.clone(),
         uri_form: true,
         task: task.map(segment_token),
-        session: session.map(segment_token),
-        verify_scope: verify
-            .map(|_| if session.is_some() { "session" } else { "task" }.to_string()),
-        verify: verify.map(segment_token),
+        cell: cell.map(segment_token),
+        proof_scope: proof.map(|_| if cell.is_some() { "cell" } else { "task" }.to_string()),
+        proof: proof.map(segment_token),
     })
 }
 
-pub fn parse_run_selector(raw: &str) -> Result<RawRunSelector, SelectorError> {
+pub fn parse_squad_selector(raw: &str) -> Result<RawSquadSelector, SelectorError> {
     if uri::looks_like_uri(raw) {
         let parsed = uri::parse_uri(raw)?;
-        return run_selector_from_uri(&parsed, raw);
+        return squad_selector_from_uri(&parsed, raw);
     }
 
     let segs: Vec<&str> = raw.split('/').filter(|s| !s.is_empty()).collect();
-    let Some((run_id, rest)) = segs.split_first() else {
+    let Some((squad_id, rest)) = segs.split_first() else {
         return Err(SelectorError("empty selector".to_string()));
     };
-    let run_id = (*run_id).to_string();
+    let squad_id = (*squad_id).to_string();
     match rest {
-        [] => Ok(RawRunSelector {
-            run_id,
+        [] => Ok(RawSquadSelector {
+            squad_id,
             ..Default::default()
         }),
-        [task] => Ok(RawRunSelector {
-            run_id,
+        [task] => Ok(RawSquadSelector {
+            squad_id,
             task: Some((*task).to_string()),
             ..Default::default()
         }),
-        [task, "verify"] => {
+        [task, "proof"] => {
             let _ = task;
             Err(SelectorError(format!(
-                "'{raw}': 'verify' needs an index, e.g. .../verify/0"
+                "'{raw}': 'proof' needs an index, e.g. .../proof/0"
             )))
         }
-        [task, session] => Ok(RawRunSelector {
-            run_id,
+        [task, cell] => Ok(RawSquadSelector {
+            squad_id,
             task: Some((*task).to_string()),
-            session: Some((*session).to_string()),
+            cell: Some((*cell).to_string()),
             ..Default::default()
         }),
-        [task, "verify", idx] => Ok(RawRunSelector {
-            run_id,
+        [task, "proof", idx] => Ok(RawSquadSelector {
+            squad_id,
             task: Some((*task).to_string()),
-            verify_scope: Some("task".to_string()),
-            verify: Some((*idx).to_string()),
+            proof_scope: Some("task".to_string()),
+            proof: Some((*idx).to_string()),
             ..Default::default()
         }),
-        [task, session, "verify", idx] => Ok(RawRunSelector {
-            run_id,
+        [task, cell, "proof", idx] => Ok(RawSquadSelector {
+            squad_id,
             task: Some((*task).to_string()),
-            session: Some((*session).to_string()),
-            verify_scope: Some("session".to_string()),
-            verify: Some((*idx).to_string()),
+            cell: Some((*cell).to_string()),
+            proof_scope: Some("cell".to_string()),
+            proof: Some((*idx).to_string()),
             ..Default::default()
         }),
         _ => Err(SelectorError(format!("cannot parse selector '{raw}'"))),
@@ -240,60 +242,63 @@ fn resolve_index(
     Ok(matches[0] as i64)
 }
 
-fn verify_candidates(steps: &[Value]) -> Vec<String> {
+fn proof_candidates(steps: &[Value]) -> Vec<String> {
     steps
         .iter()
         .map(|s| s["id"].as_str().unwrap_or("").to_string())
         .collect()
 }
 
-fn lookup_run_id(client: &DaemonClient, parsed: &RawRunSelector) -> Result<String, SelectorError> {
-    let Some(label) = parsed.run_label.as_deref().filter(|l| !l.is_empty()) else {
-        return Err(SelectorError("selector does not name a run".to_string()));
+fn lookup_squad_id(
+    client: &DaemonClient,
+    parsed: &RawSquadSelector,
+) -> Result<String, SelectorError> {
+    let Some(label) = parsed.squad_label.as_deref().filter(|l| !l.is_empty()) else {
+        return Err(SelectorError("selector does not name a squad".to_string()));
     };
     let tasks_view = client
         .tasks(None, None, None)
         .map_err(|e| SelectorError(e.to_string()))?;
-    let runs = tasks_view["runs"].as_array().cloned().unwrap_or_default();
-    let matches: Vec<&Value> = runs
+    let squads = tasks_view["squads"].as_array().cloned().unwrap_or_default();
+    let matches: Vec<&Value> = squads
         .iter()
-        .filter(|r| r["label"].as_str() == Some(label) || r["id"].as_str() == Some(label))
+        .filter(|s| s["label"].as_str() == Some(label) || s["id"].as_str() == Some(label))
         .collect();
     match matches.as_slice() {
-        [] => Err(SelectorError(format!("no run labelled '{label}'"))),
+        [] => Err(SelectorError(format!("no squad labelled '{label}'"))),
         [one] => Ok(one["id"].as_str().unwrap_or_default().to_string()),
         many => {
             let ids = many
                 .iter()
-                .filter_map(|r| r["id"].as_str())
+                .filter_map(|s| s["id"].as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(SelectorError(format!(
-                "'{label}' matches {} runs ({ids}) -- add '?id=<run id>' to say which one",
+                "'{label}' matches {} squads ({ids}) -- add '?id=<squad id>' to say which one",
                 many.len()
             )))
         }
     }
 }
 
-pub fn resolve_run_selector(
+pub fn resolve_squad_selector(
     client: &DaemonClient,
     raw: &str,
 ) -> Result<ResolvedSelector, SelectorError> {
-    let parsed = parse_run_selector(raw)?;
-    let run_id = if parsed.run_id.is_empty() {
-        lookup_run_id(client, &parsed)?
+    let parsed = parse_squad_selector(raw)?;
+    let squad_id = if parsed.squad_id.is_empty() {
+        lookup_squad_id(client, &parsed)?
     } else {
-        parsed.run_id.clone()
+        parsed.squad_id.clone()
     };
     let Some(task_raw) = &parsed.task else {
-        return Ok(ResolvedSelector::run(run_id));
+        return Ok(ResolvedSelector::squad(squad_id));
     };
 
-    let run = client
-        .run(&run_id)
+    let squad = client
+        .squad(&squad_id)
         .map_err(|e| SelectorError(e.to_string()))?;
-    let tasks = run["tasks"].as_array().cloned().unwrap_or_default();
+    let tasks = squad["tasks"].as_array().cloned().unwrap_or_default();
     let task_names: Vec<String> = tasks
         .iter()
         .map(|t| t["name"].as_str().unwrap_or("").to_string())
@@ -301,76 +306,76 @@ pub fn resolve_run_selector(
     let task_idx = resolve_index(task_raw, &task_names, "task", parsed.uri_form)?;
     let task = &tasks[task_idx as usize];
 
-    if parsed.verify_scope.as_deref() == Some("task") {
-        let verify_raw = parsed.verify.as_deref().unwrap_or_default();
-        let steps = task["verify"].as_array().cloned().unwrap_or_default();
-        let verify_idx = resolve_index(
-            verify_raw,
-            &verify_candidates(&steps),
-            "task verify",
+    if parsed.proof_scope.as_deref() == Some("task") {
+        let proof_raw = parsed.proof.as_deref().unwrap_or_default();
+        let steps = task["proof"].as_array().cloned().unwrap_or_default();
+        let proof_idx = resolve_index(
+            proof_raw,
+            &proof_candidates(&steps),
+            "task proof",
             parsed.uri_form,
         )?;
         return Ok(ResolvedSelector {
-            kind: "verify".to_string(),
-            run_id,
+            kind: "proof".to_string(),
+            squad_id,
             task_idx,
-            session_idx: -1,
-            verify_idx,
-            verify_scope: "task".to_string(),
+            cell_idx: -1,
+            proof_idx,
+            proof_scope: "task".to_string(),
         });
     }
 
-    let Some(session_raw) = &parsed.session else {
+    let Some(cell_raw) = &parsed.cell else {
         return Ok(ResolvedSelector {
             kind: "task".to_string(),
-            run_id,
+            squad_id,
             task_idx,
-            session_idx: -1,
-            verify_idx: -1,
-            verify_scope: String::new(),
+            cell_idx: -1,
+            proof_idx: -1,
+            proof_scope: String::new(),
         });
     };
 
-    let sessions = task["sessions"].as_array().cloned().unwrap_or_default();
-    let session_names: Vec<String> = sessions
+    let cells = task["cells"].as_array().cloned().unwrap_or_default();
+    let cell_names: Vec<String> = cells
         .iter()
-        .map(|s| {
-            s["name"]
+        .map(|c| {
+            c["name"]
                 .as_str()
-                .or_else(|| s["id"].as_str())
+                .or_else(|| c["id"].as_str())
                 .unwrap_or("")
                 .to_string()
         })
         .collect();
-    let session_idx = resolve_index(session_raw, &session_names, "session", parsed.uri_form)?;
+    let cell_idx = resolve_index(cell_raw, &cell_names, "cell", parsed.uri_form)?;
 
-    if parsed.verify_scope.as_deref() == Some("session") {
-        let verify_raw = parsed.verify.as_deref().unwrap_or_default();
-        let session = &sessions[session_idx as usize];
-        let steps = session["verify"].as_array().cloned().unwrap_or_default();
-        let verify_idx = resolve_index(
-            verify_raw,
-            &verify_candidates(&steps),
-            "session verify",
+    if parsed.proof_scope.as_deref() == Some("cell") {
+        let proof_raw = parsed.proof.as_deref().unwrap_or_default();
+        let cell = &cells[cell_idx as usize];
+        let steps = cell["proof"].as_array().cloned().unwrap_or_default();
+        let proof_idx = resolve_index(
+            proof_raw,
+            &proof_candidates(&steps),
+            "cell proof",
             parsed.uri_form,
         )?;
         return Ok(ResolvedSelector {
-            kind: "verify".to_string(),
-            run_id,
+            kind: "proof".to_string(),
+            squad_id,
             task_idx,
-            session_idx,
-            verify_idx,
-            verify_scope: "session".to_string(),
+            cell_idx,
+            proof_idx,
+            proof_scope: "cell".to_string(),
         });
     }
 
     Ok(ResolvedSelector {
-        kind: "session".to_string(),
-        run_id,
+        kind: "cell".to_string(),
+        squad_id,
         task_idx,
-        session_idx,
-        verify_idx: -1,
-        verify_scope: String::new(),
+        cell_idx,
+        proof_idx: -1,
+        proof_scope: String::new(),
     })
 }
 
@@ -624,23 +629,26 @@ impl Addr {
 }
 
 /// Renders the canonical ralphus URI for whatever `resolved` addresses
-/// inside `run` (a `/api/runs/{id}` view).
+/// inside `squad` (a `/api/squads/{id}` view).
 #[must_use]
-pub fn run_view_uri(run: &Value, resolved: &ResolvedSelector) -> String {
-    let run_id = run["id"].as_str().unwrap_or(&resolved.run_id).to_string();
-    let label_raw = run["label"]
+pub fn squad_view_uri(squad: &Value, resolved: &ResolvedSelector) -> String {
+    let squad_id = squad["id"]
+        .as_str()
+        .unwrap_or(&resolved.squad_id)
+        .to_string();
+    let label_raw = squad["label"]
         .as_str()
         .filter(|l| !l.is_empty())
-        .unwrap_or(&run_id);
+        .unwrap_or(&squad_id);
 
-    let mut segments = vec![Segment::named("RUN", label_raw.to_string())];
-    let mut query: Vec<(String, Option<String>)> = vec![("id".to_string(), Some(run_id.clone()))];
+    let mut segments = vec![Segment::named("SQUAD", label_raw.to_string())];
+    let mut query: Vec<(String, Option<String>)> = vec![("id".to_string(), Some(squad_id.clone()))];
 
-    if resolved.kind == "run" {
+    if resolved.kind == "squad" {
         return RalphusUri { segments, query }.to_string();
     }
 
-    let tasks = run["tasks"].as_array().cloned().unwrap_or_default();
+    let tasks = squad["tasks"].as_array().cloned().unwrap_or_default();
     let task_view = tasks
         .get(resolved.task_idx as usize)
         .cloned()
@@ -649,33 +657,27 @@ pub fn run_view_uri(run: &Value, resolved: &ResolvedSelector) -> String {
     segments.push(task_addr.segment("TASK"));
 
     let mut steps: Vec<Value> = Vec::new();
-    if resolved.verify_scope == "task" {
-        steps = task_view["verify"].as_array().cloned().unwrap_or_default();
+    if resolved.proof_scope == "task" {
+        steps = task_view["proof"].as_array().cloned().unwrap_or_default();
     } else {
-        let sessions = task_view["sessions"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if resolved.session_idx >= 0 && (resolved.session_idx as usize) < sessions.len() {
-            let session_view = &sessions[resolved.session_idx as usize];
-            let name = session_view["name"]
+        let cells = task_view["cells"].as_array().cloned().unwrap_or_default();
+        if resolved.cell_idx >= 0 && (resolved.cell_idx as usize) < cells.len() {
+            let cell_view = &cells[resolved.cell_idx as usize];
+            let name = cell_view["name"]
                 .as_str()
-                .or_else(|| session_view["id"].as_str());
-            segments.push(Addr::from_name_or_index(name, resolved.session_idx).segment("SESSION"));
-            steps = session_view["verify"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+                .or_else(|| cell_view["id"].as_str());
+            segments.push(Addr::from_name_or_index(name, resolved.cell_idx).segment("CELL"));
+            steps = cell_view["proof"].as_array().cloned().unwrap_or_default();
         }
     }
 
-    if resolved.kind == "verify" {
+    if resolved.kind == "proof" {
         let step = steps
-            .get(resolved.verify_idx as usize)
+            .get(resolved.proof_idx as usize)
             .cloned()
             .unwrap_or(Value::Null);
         segments.push(
-            Addr::from_name_or_index(step["id"].as_str(), resolved.verify_idx).segment("VERIFY"),
+            Addr::from_name_or_index(step["id"].as_str(), resolved.proof_idx).segment("PROOF"),
         );
     }
 
@@ -718,50 +720,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_run_selector_legacy_bare_run() {
-        let sel = parse_run_selector("run-123").unwrap();
-        assert_eq!(sel.run_id, "run-123");
+    fn parse_squad_selector_legacy_bare_squad() {
+        let sel = parse_squad_selector("squad-123").unwrap();
+        assert_eq!(sel.squad_id, "squad-123");
         assert_eq!(sel.task, None);
     }
 
     #[test]
-    fn parse_run_selector_legacy_task_and_session() {
-        let sel = parse_run_selector("run-123/0/1").unwrap();
+    fn parse_squad_selector_legacy_task_and_cell() {
+        let sel = parse_squad_selector("squad-123/0/1").unwrap();
         assert_eq!(sel.task.as_deref(), Some("0"));
-        assert_eq!(sel.session.as_deref(), Some("1"));
+        assert_eq!(sel.cell.as_deref(), Some("1"));
     }
 
     #[test]
-    fn parse_run_selector_legacy_task_verify() {
-        let sel = parse_run_selector("run-123/0/verify/2").unwrap();
-        assert_eq!(sel.verify_scope.as_deref(), Some("task"));
-        assert_eq!(sel.verify.as_deref(), Some("2"));
+    fn parse_squad_selector_legacy_task_proof() {
+        let sel = parse_squad_selector("squad-123/0/proof/2").unwrap();
+        assert_eq!(sel.proof_scope.as_deref(), Some("task"));
+        assert_eq!(sel.proof.as_deref(), Some("2"));
     }
 
     #[test]
-    fn parse_run_selector_legacy_session_verify() {
-        let sel = parse_run_selector("run-123/0/1/verify/2").unwrap();
-        assert_eq!(sel.verify_scope.as_deref(), Some("session"));
-        assert_eq!(sel.session.as_deref(), Some("1"));
+    fn parse_squad_selector_legacy_cell_proof() {
+        let sel = parse_squad_selector("squad-123/0/1/proof/2").unwrap();
+        assert_eq!(sel.proof_scope.as_deref(), Some("cell"));
+        assert_eq!(sel.cell.as_deref(), Some("1"));
     }
 
     #[test]
-    fn parse_run_selector_rejects_bare_verify_no_index() {
-        assert!(parse_run_selector("run-123/0/verify").is_err());
+    fn parse_squad_selector_rejects_bare_proof_no_index() {
+        assert!(parse_squad_selector("squad-123/0/proof").is_err());
     }
 
     #[test]
-    fn parse_run_selector_uri_form() {
+    fn parse_squad_selector_uri_form() {
         let sel =
-            parse_run_selector("ralphus:/RUN[my run]/TASK[build]?id=run-000000000151").unwrap();
+            parse_squad_selector("ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000151")
+                .unwrap();
         assert!(sel.uri_form);
-        assert_eq!(sel.run_id, "run-000000000151");
+        assert_eq!(sel.squad_id, "squad-000000000151");
         assert_eq!(sel.task.as_deref(), Some("build"));
     }
 
     #[test]
-    fn parse_run_selector_uri_rejects_positional_run() {
-        let err = parse_run_selector("ralphus:/RUN[~0]").unwrap_err();
+    fn parse_squad_selector_uri_rejects_positional_squad() {
+        let err = parse_squad_selector("ralphus:/SQUAD[~0]").unwrap_err();
         assert!(err.0.contains("not addressable"));
     }
 
@@ -821,11 +824,11 @@ mod tests {
     }
 
     #[test]
-    fn run_view_uri_renders_run_only() {
-        let run = serde_json::json!({"id": "run-1", "label": "my run"});
-        let resolved = ResolvedSelector::run("run-1".to_string());
-        let out = run_view_uri(&run, &resolved);
-        assert_eq!(out, "ralphus:/RUN[my run]?id=run-1");
+    fn squad_view_uri_renders_squad_only() {
+        let squad = serde_json::json!({"id": "squad-1", "label": "my squad"});
+        let resolved = ResolvedSelector::squad("squad-1".to_string());
+        let out = squad_view_uri(&squad, &resolved);
+        assert_eq!(out, "ralphus:/SQUAD[my squad]?id=squad-1");
     }
 
     #[test]

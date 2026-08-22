@@ -1,0 +1,19 @@
+# RAL-241 manual-verification repro: a task engineered to fail outright.
+#
+# The cell below runs `exit 1` -- an immediate, deterministic nonzero exit --
+# so the daemon's scheduler (daemon/src/scheduler.rs::run_cell_worker) marks
+# the cell `Failed` right away and, per RAL-241, broadcasts an `urgent`
+# mailbox message referencing this squad/task/cell.
+#
+# Usage:
+#   ralphus submit examples/mailbox/repro-fail.toml
+#   ralphus mailbox check
+#   # (or, from a `ralphus quick-start watcher claude-code`/`codex` session,
+#   # just wait for its next turn-boundary `ralphus mailbox check` to surface it)
+
+[[task]]
+name = "mailbox-repro-fail"
+
+[[task.cell]]
+cwd = "."
+command = "exit 1"

@@ -1,5 +1,5 @@
 //! `ralphus task <subcommand>`, ported from `cli/src/ralphus/__main__.py`'s
-//! `task` group (show/set-status/restart-verify/edit). `task show-tutor` is
+//! `task` group (show/set-status/restart-proof/edit). `task show-tutor` is
 //! intentionally not ported here -- it is a plain, argument-free reprint of
 //! the Task TOML schema reference (`_cmd_show_tutor` -> `print(TASK_TUTOR)`),
 //! already available from the top-level `ralphus tutor` command
@@ -13,7 +13,7 @@ use crate::args::GlobalOpts;
 use crate::client::DaemonClient;
 use crate::commands::{CommandError, emit, run_and_report};
 use crate::flags::Scanner;
-use crate::selector::{ResolvedSelector, SelectorError, resolve_run_selector, run_view_uri};
+use crate::selector::{ResolvedSelector, SelectorError, resolve_squad_selector, squad_view_uri};
 
 #[derive(Debug, Clone)]
 pub enum TaskCommand {
@@ -25,7 +25,7 @@ pub enum TaskCommand {
         selector: String,
         state: String,
     },
-    RestartVerify {
+    RestartProof {
         selector: String,
         from: i64,
     },
@@ -41,7 +41,7 @@ pub enum TaskCommand {
 pub fn parse(args: &[String]) -> TaskCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None => TaskCommand::Help,
+        None | Some("help" | "--help" | "-h") => TaskCommand::Help,
         Some("show") => with_selector(scanner, |selector| TaskCommand::Show { selector }),
         Some("set-status") => {
             let rest = scanner.remaining();
@@ -53,13 +53,13 @@ pub fn parse(args: &[String]) -> TaskCommand {
                 _ => TaskCommand::UsageError("set-status requires <selector> <state>".to_string()),
             }
         }
-        Some("restart-verify") => match scanner.take_parsed::<i64>("--from") {
-            Ok(Some(from)) => with_selector(scanner, |selector| TaskCommand::RestartVerify {
+        Some("restart-proof") => match scanner.take_parsed::<i64>("--from") {
+            Ok(Some(from)) => with_selector(scanner, |selector| TaskCommand::RestartProof {
                 selector,
                 from,
             }),
             Ok(None) => {
-                TaskCommand::UsageError("restart-verify requires --from <index>".to_string())
+                TaskCommand::UsageError("restart-proof requires --from <index>".to_string())
             }
             Err(e) => TaskCommand::UsageError(e.0),
         },
@@ -93,7 +93,7 @@ fn resolve_scoped(
     selector: &str,
     want_kind: &str,
 ) -> Result<ResolvedSelector, CommandError> {
-    let resolved = resolve_run_selector(client, selector)?;
+    let resolved = resolve_squad_selector(client, selector)?;
     if resolved.kind != want_kind {
         return Err(CommandError::Selector(SelectorError(format!(
             "'{selector}' is a {} selector, not a {want_kind}",
@@ -118,7 +118,10 @@ pub fn dispatch(cmd: TaskCommand, opts: &GlobalOpts) -> i32 {
     let client = opts.client();
     match cmd {
         TaskCommand::Help => {
-            println!("ralphus task <show|set-status|restart-verify|edit>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["task"]).expect("task help exists")
+            );
             0
         }
         TaskCommand::UsageError(m) => {
@@ -127,16 +130,16 @@ pub fn dispatch(cmd: TaskCommand, opts: &GlobalOpts) -> i32 {
         }
         TaskCommand::Show { selector } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "task")?;
-            let run = client.run(&resolved.run_id)?;
-            let uri = run_view_uri(&run, &resolved);
-            let task = with_uri(run["tasks"][resolved.task_idx as usize].clone(), uri);
+            let squad = client.squad(&resolved.squad_id)?;
+            let uri = squad_view_uri(&squad, &resolved);
+            let task = with_uri(squad["tasks"][resolved.task_idx as usize].clone(), uri);
             emit(opts, &task, render_task_detail);
             Ok(())
         }),
         TaskCommand::SetStatus { selector, state } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "task")?;
             let result = client.set_status(
-                &resolved.run_id,
+                &resolved.squad_id,
                 &state,
                 "task",
                 resolved.task_idx,
@@ -147,9 +150,9 @@ pub fn dispatch(cmd: TaskCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, |_| println!("{selector} -> {state}"));
             Ok(())
         }),
-        TaskCommand::RestartVerify { selector, from } => run_and_report(opts, None, || {
+        TaskCommand::RestartProof { selector, from } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "task")?;
-            let result = client.restart_task_verify(&resolved.run_id, resolved.task_idx, from)?;
+            let result = client.restart_task_proof(&resolved.squad_id, resolved.task_idx, from)?;
             emit(opts, &result, render_dirtied);
             Ok(())
         }),
@@ -160,7 +163,7 @@ pub fn dispatch(cmd: TaskCommand, opts: &GlobalOpts) -> i32 {
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "task")?;
             let result = client.edit_task(
-                &resolved.run_id,
+                &resolved.squad_id,
                 resolved.task_idx,
                 name.as_deref(),
                 project.as_deref(),
@@ -192,15 +195,15 @@ fn render_task_detail(t: &Value) {
         ("state", t["state"].as_str().unwrap_or_default().to_string()),
         ("depends_on", depends_on),
     ]);
-    for (vi, v) in t["verify"].as_array().into_iter().flatten().enumerate() {
-        println!("  verify/{vi}  {}  {}", v["kind"], v["state"]);
+    for (vi, v) in t["proof"].as_array().into_iter().flatten().enumerate() {
+        println!("  proof/{vi}  {}  {}", v["kind"], v["state"]);
     }
-    for (si, s) in t["sessions"].as_array().into_iter().flatten().enumerate() {
+    for (si, s) in t["cells"].as_array().into_iter().flatten().enumerate() {
         let name = s["name"]
             .as_str()
             .or_else(|| s["id"].as_str())
             .unwrap_or_default();
-        println!("  [{si}] session {name}  {}", s["state"]);
+        println!("  [{si}] cell {name}  {}", s["state"]);
     }
 }
 
@@ -208,7 +211,7 @@ fn render_dirtied(result: &Value) {
     println!("state: {}", result["state"]);
     let dirtied = result["dirtied"].as_array().cloned().unwrap_or_default();
     if !dirtied.is_empty() {
-        println!("dirtied downstream runs:");
+        println!("dirtied downstream squads:");
         for d in &dirtied {
             println!("  {d}");
         }
@@ -225,17 +228,17 @@ mod tests {
 
     #[test]
     fn parses_show_with_selector() {
-        match parse(&v(&["show", "run-1/build"])) {
-            TaskCommand::Show { selector } => assert_eq!(selector, "run-1/build"),
+        match parse(&v(&["show", "squad-1/build"])) {
+            TaskCommand::Show { selector } => assert_eq!(selector, "squad-1/build"),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
     fn parses_set_status_positional_pair() {
-        match parse(&v(&["set-status", "run-1/build", "done"])) {
+        match parse(&v(&["set-status", "squad-1/build", "done"])) {
             TaskCommand::SetStatus { selector, state } => {
-                assert_eq!(selector, "run-1/build");
+                assert_eq!(selector, "squad-1/build");
                 assert_eq!(state, "done");
             }
             other => panic!("unexpected: {other:?}"),
@@ -243,10 +246,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_restart_verify_with_from_flag() {
-        match parse(&v(&["restart-verify", "run-1/build", "--from", "2"])) {
-            TaskCommand::RestartVerify { selector, from } => {
-                assert_eq!(selector, "run-1/build");
+    fn parses_restart_proof_with_from_flag() {
+        match parse(&v(&["restart-proof", "squad-1/build", "--from", "2"])) {
+            TaskCommand::RestartProof { selector, from } => {
+                assert_eq!(selector, "squad-1/build");
                 assert_eq!(from, 2);
             }
             other => panic!("unexpected: {other:?}"),
@@ -254,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn restart_verify_requires_from_flag() {
+    fn restart_proof_requires_from_flag() {
         matches!(
-            parse(&v(&["restart-verify", "run-1/build"])),
+            parse(&v(&["restart-proof", "squad-1/build"])),
             TaskCommand::UsageError(_)
         );
     }
@@ -265,7 +268,7 @@ mod tests {
     fn parses_edit_with_optional_flags() {
         match parse(&v(&[
             "edit",
-            "run-1/build",
+            "squad-1/build",
             "--name",
             "new-name",
             "--project",
@@ -276,7 +279,7 @@ mod tests {
                 name,
                 project,
             } => {
-                assert_eq!(selector, "run-1/build");
+                assert_eq!(selector, "squad-1/build");
                 assert_eq!(name.as_deref(), Some("new-name"));
                 assert_eq!(project.as_deref(), Some("proj"));
             }

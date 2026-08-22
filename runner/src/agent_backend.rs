@@ -14,7 +14,7 @@ use crate::tools::Workspace;
 const SYSTEM_PROMPT: &str = "You are a headless coding agent. Accomplish the user's task by calling the provided tools (read_file, write_file, run_bash), operating only within the workspace. Do the minimum necessary, then reply with a one-line summary.";
 
 pub struct AgentBackend {
-    /// The agent name as it appears in `SessionSpec.agent` (`"claude"`,
+    /// The agent name as it appears in `CellSpec.agent` (`"claude"`,
     /// `"anthropic"`, or `"ollama"`) -- resolved to a provider per-call via
     /// [`providers::resolve`], same as Python's `_build_model`.
     pub agent: String,

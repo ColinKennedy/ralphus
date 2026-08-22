@@ -12,17 +12,18 @@
 #![allow(clippy::print_stdout)] // This module's stdout IS the CLI's product.
 
 pub mod agent;
+pub mod cell;
 pub mod machine;
+pub mod mailbox;
 pub mod misc;
 pub mod project;
+pub mod proof;
 pub mod queue;
 pub mod quick_start;
 pub mod review;
-pub mod run;
-pub mod session;
 pub mod show;
+pub mod squad;
 pub mod task;
-pub mod verify;
 
 use serde_json::Value;
 
@@ -133,17 +134,18 @@ pub fn emit(opts: &GlobalOpts, data: &Value, human: impl FnOnce(&Value)) {
 #[derive(Debug)]
 pub enum Command {
     Help,
+    License,
     Validate {
         files: Vec<String>,
     },
     Submit(misc::SubmitArgs),
     Status {
-        run_id: Option<String>,
+        squad_id: Option<String>,
         concurrency: bool,
     },
     Resources,
     Graph {
-        run_id: Option<String>,
+        squad_id: Option<String>,
         dot: bool,
         all: bool,
     },
@@ -153,7 +155,7 @@ pub enum Command {
     },
     Cartographer(misc::CartographerArgs),
     History {
-        run_id: String,
+        selector: String,
     },
     Listen {
         selector: String,
@@ -161,7 +163,7 @@ pub enum Command {
         timeout: Option<f64>,
     },
     RetryRun {
-        run_id: String,
+        squad_id: String,
     },
     Clear(misc::ClearArgs),
     Check(misc::CheckArgs),
@@ -169,8 +171,8 @@ pub enum Command {
     Configuration,
     Task(task::TaskCommand),
     TutorShow,
-    Session(session::SessionCommand),
-    Verify(verify::VerifyCommand),
+    Cell(cell::CellCommand),
+    Proof(proof::ProofCommand),
     Review(review::ReviewCommand),
     Queue(queue::QueueCommand),
     /// `ralphus initialize git [--path P]`: enables git rerere+autoupdate in
@@ -183,7 +185,8 @@ pub enum Command {
     Machine(machine::MachineCommand),
     Agent(agent::AgentCommand),
     Show(show::ShowCommand),
-    Run(run::RunCommand),
+    Squad(squad::SquadCommand),
+    Mailbox(mailbox::MailboxCommand),
     QuickStart(quick_start::QuickStartCommand),
     UsageError(String),
 }
@@ -196,6 +199,7 @@ pub fn parse_args(args: &[String]) -> Command {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => Command::Help,
+        Some("license") => Command::License,
         Some("validate") => Command::Validate {
             files: scanner.remaining(),
         },
@@ -203,7 +207,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("status") => {
             let concurrency = scanner.take_bool("--concurrency");
             Command::Status {
-                run_id: scanner.remaining().into_iter().next(),
+                squad_id: scanner.remaining().into_iter().next(),
                 concurrency,
             }
         }
@@ -212,7 +216,7 @@ pub fn parse_args(args: &[String]) -> Command {
             let dot = scanner.take_bool("--dot");
             let all = scanner.take_bool("--all");
             Command::Graph {
-                run_id: scanner.remaining().into_iter().next(),
+                squad_id: scanner.remaining().into_iter().next(),
                 dot,
                 all,
             }
@@ -228,9 +232,13 @@ pub fn parse_args(args: &[String]) -> Command {
             }
         }
         Some("cartographer") => misc::parse_cartographer(&mut scanner),
-        Some("history") => with_run_id(scanner, |run_id| Command::History { run_id }),
+        Some("history") => with_positional_arg(scanner, "selector", |selector| Command::History {
+            selector,
+        }),
         Some("listen") => misc::parse_listen(&mut scanner),
-        Some("retry") => with_run_id(scanner, |run_id| Command::RetryRun { run_id }),
+        Some("retry") => with_positional_arg(scanner, "squad_id", |squad_id| Command::RetryRun {
+            squad_id,
+        }),
         Some("clear") => misc::parse_clear(&mut scanner),
         Some("check") => misc::parse_check(&mut scanner),
         Some("completion") => Command::Completion,
@@ -248,24 +256,29 @@ pub fn parse_args(args: &[String]) -> Command {
             }
         }
         Some("task") => Command::Task(task::parse(&scanner.remaining())),
-        Some("session") => Command::Session(session::parse(&scanner.remaining())),
-        Some("verify") => Command::Verify(verify::parse(&scanner.remaining())),
+        Some("cell") => Command::Cell(cell::parse(&scanner.remaining())),
+        Some("proof") => Command::Proof(proof::parse(&scanner.remaining())),
         Some("review") => Command::Review(review::parse(&scanner.remaining())),
         Some("queue") => Command::Queue(queue::parse(&scanner.remaining())),
         Some("project") => Command::Project(project::parse(&scanner.remaining())),
         Some("machine") => Command::Machine(machine::parse(&scanner.remaining())),
         Some("agent") => Command::Agent(agent::parse(&scanner.remaining())),
         Some("show") => Command::Show(show::parse(&scanner.remaining())),
-        Some("run") => Command::Run(run::parse(&scanner.remaining())),
+        Some("squad") => Command::Squad(squad::parse(&scanner.remaining())),
+        Some("mailbox") => Command::Mailbox(mailbox::parse(&scanner.remaining())),
         Some("quick-start") => Command::QuickStart(quick_start::parse(&scanner.remaining())),
         Some(other) => Command::UsageError(format!("unknown command: {other}")),
     }
 }
 
-fn with_run_id(scanner: Scanner, make: impl FnOnce(String) -> Command) -> Command {
+fn with_positional_arg(
+    scanner: Scanner,
+    label: &str,
+    make: impl FnOnce(String) -> Command,
+) -> Command {
     match scanner.remaining().into_iter().next() {
-        Some(run_id) => make(run_id),
-        None => Command::UsageError("missing required <run_id> argument".to_string()),
+        Some(value) => make(value),
+        None => Command::UsageError(format!("missing required <{label}> argument")),
     }
 }
 
@@ -277,6 +290,10 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
             println!("{}", usage());
             0
         }
+        Command::License => {
+            print!("{}", ralphus_core::license::embedded_license());
+            0
+        }
         Command::UsageError(m) => {
             println!("usage error: {m}");
             2
@@ -284,20 +301,20 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Validate { files } => misc::cmd_validate(opts, &files),
         Command::Submit(args) => misc::cmd_submit(opts, args),
         Command::Status {
-            run_id,
+            squad_id,
             concurrency,
-        } => misc::cmd_status(opts, run_id, concurrency),
+        } => misc::cmd_status(opts, squad_id, concurrency),
         Command::Resources => misc::cmd_resources(opts),
-        Command::Graph { run_id, dot, all } => misc::cmd_graph(opts, run_id, dot, all),
+        Command::Graph { squad_id, dot, all } => misc::cmd_graph(opts, squad_id, dot, all),
         Command::Get { uri, field } => misc::cmd_get(opts, &uri, field.as_deref()),
         Command::Cartographer(args) => misc::cmd_cartographer(opts, args),
-        Command::History { run_id } => misc::cmd_history(opts, &run_id),
+        Command::History { selector } => misc::cmd_history(opts, &selector),
         Command::Listen {
             selector,
             until,
             timeout,
         } => misc::cmd_listen(opts, &selector, &until, timeout),
-        Command::RetryRun { run_id } => misc::cmd_retry(opts, &run_id),
+        Command::RetryRun { squad_id } => misc::cmd_retry(opts, &squad_id),
         Command::Clear(args) => misc::cmd_clear(opts, args),
         Command::Check(args) => misc::cmd_check(opts, args),
         Command::Completion => misc::cmd_completion(),
@@ -307,8 +324,8 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
             0
         }
         Command::Task(c) => task::dispatch(c, opts),
-        Command::Session(c) => session::dispatch(c, opts),
-        Command::Verify(c) => verify::dispatch(c, opts),
+        Command::Cell(c) => cell::dispatch(c, opts),
+        Command::Proof(c) => proof::dispatch(c, opts),
         Command::Review(c) => review::dispatch(c, opts),
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
@@ -316,14 +333,15 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),
         Command::Show(c) => show::dispatch(c, opts),
-        Command::Run(c) => run::dispatch(c, opts),
-        Command::QuickStart(c) => quick_start::dispatch(c),
+        Command::Squad(c) => squad::dispatch(c, opts),
+        Command::Mailbox(c) => mailbox::dispatch(c, opts),
+        Command::QuickStart(c) => quick_start::dispatch(c, opts),
     }
 }
 
 #[must_use]
 pub fn usage() -> String {
-    "ralphus -- see docs/cli-reference.md for the full subcommand list.\nUSAGE:\n    ralphus <COMMAND> [ARGS...]\n".to_string()
+    crate::help_map::command_help(&[]).expect("root help exists")
 }
 
 #[cfg(test)]
@@ -353,10 +371,15 @@ mod tests {
     }
 
     #[test]
-    fn history_requires_run_id() {
+    fn license_is_a_top_level_command() {
+        matches!(parse_args(&v(&["license"])), Command::License);
+    }
+
+    #[test]
+    fn history_requires_selector() {
         matches!(parse_args(&v(&["history"])), Command::UsageError(_));
         matches!(
-            parse_args(&v(&["history", "run-1"])),
+            parse_args(&v(&["history", "squad-1"])),
             Command::History { .. }
         );
     }

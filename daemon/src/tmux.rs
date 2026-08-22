@@ -346,6 +346,16 @@ pub fn read_pane_snapshot(session_name: &str) -> Option<String> {
     read_pane_snapshot_in(&pane_snapshot_dir(), session_name)
 }
 
+/// Strip genuinely empty trailing rows from a raw `capture-pane` result —
+/// see [`Tmux::capture_pane`]'s doc comment for why they show up at all.
+/// Trims trailing newlines/carriage-returns/spaces/tabs off the end of the
+/// whole string (equivalent to dropping trailing blank lines one at a time),
+/// leaving interior blank lines — genuine output the agent printed — and the
+/// last real line's own content untouched.
+fn trim_trailing_blank_pane_lines(raw: &str) -> String {
+    raw.trim_end_matches(['\n', '\r', ' ', '\t']).to_string()
+}
+
 /// Quote `arg` for the shell that will type/receive it: PowerShell
 /// single-quote escaping on Windows (session start commands are delivered via
 /// `send-keys` into a PowerShell pane there — see [`Tmux::new_detached_session_with_command`]),
@@ -673,10 +683,22 @@ impl Tmux {
     /// Capture the last `lines` lines of `name`'s pane content, without
     /// attaching (mirrors gastown's `gt peek` / `CapturePane`).
     ///
+    /// `capture-pane -S <start>` with no `-E` (end) argument captures up to
+    /// the bottom of the pane's current on-screen view, not the last line of
+    /// real output — for a session whose output is shorter than the pane's
+    /// height (`-y 50`, see [`Self::new_detached_session_with_command`]),
+    /// that means genuinely empty trailing rows come back as part of the
+    /// content (confirmed against this project's psmux build: a 3-line pane
+    /// capture inside a 24-row pane returned 21 trailing blank lines).
+    /// [`trim_trailing_blank_pane_lines`] strips that padding so every
+    /// consumer (the live-view JSON, terminal-log persistence, the
+    /// done-sentinel poll) sees exactly the real transcript, RAL-237.
+    ///
     /// # Errors
     /// Returns an error if the session does not exist or tmux fails.
     pub fn capture_pane(&self, name: &str, lines: u32) -> Result<String, TmuxError> {
         self.run(&["capture-pane", "-p", "-t", name, "-S", &format!("-{lines}")])
+            .map(|raw| trim_trailing_blank_pane_lines(&raw))
     }
 
     /// Kill `name` if it exists. Idempotent: a session that's already gone is
@@ -749,30 +771,52 @@ impl Tmux {
 /// dispatched (as [`reap_orphaned_sessions_at_startup`] does) -- never
 /// psmux's own internal `__warm__` pool, whose claim protocol this project
 /// doesn't own or fully understand.
+///
+/// RAL-234: this used to shell out to `powershell -Command "Get-CimInstance
+/// Win32_Process ..."` per call -- exactly the pattern
+/// [`find_server_pid_windows`] used to follow too, and was already replaced
+/// there (see that function's doc comment for the measured before/after
+/// numbers: PowerShell's own .NET startup cost, worse still under concurrent
+/// subprocess load). This call in particular sits on the daemon-startup
+/// critical path (`reap_orphaned_sessions_at_startup` runs synchronously
+/// after the port is bound but before the daemon starts accepting/processing
+/// requests), so its cost was confirmed as the dominant contributor to
+/// "first page load after daemon start is slow" -- startup timing
+/// instrumentation (`server.rs::serve`'s `startup` note) attributes the bulk
+/// of the pre-serving delay to `tmux_reap_ms`. Reads the process table
+/// directly via `sysinfo` (no subprocess) instead, the same fix for the same
+/// reason.
 fn force_kill_tmux_processes(needle: &str) -> usize {
-    if !cfg!(target_os = "windows") {
-        return 0;
+    #[cfg(target_os = "windows")]
+    {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        // `cmd()` is empty by default under `sysinfo` -- fetching a process's
+        // command line is comparatively expensive, so it's opt-in via this
+        // refresh-kind flag, same as `find_server_pid_windows`.
+        let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+        let mut killed = 0;
+        for proc in sys.processes().values() {
+            if !proc.name().eq_ignore_ascii_case("tmux.exe") {
+                continue;
+            }
+            let cmd = proc
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if cmd.contains(needle) && cmd.contains("server") && proc.kill() {
+                killed += 1;
+            }
+        }
+        killed
     }
-    // `needle` is always either `tmux::session_name`'s output (already
-    // sanitized to `[a-zA-Z0-9_-]`) or the literal `"ralphus_"` prefix --
-    // safe to interpolate into the PowerShell literal below, same
-    // reasoning as `find_server_pid`'s identical pattern.
-    let script = format!(
-        "$procs = Get-CimInstance Win32_Process -Filter \"Name='tmux.exe'\" -ErrorAction SilentlyContinue | \
-         Where-Object {{ $_.CommandLine -like '*{needle}*' -and $_.CommandLine -like '*server*' }}; \
-         $procs | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}; \
-         $procs.Count"
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .stdin(Stdio::null())
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        _ => 0,
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = needle;
+        0
     }
 }
 
@@ -1192,6 +1236,37 @@ mod tests {
     }
 
     #[test]
+    fn trim_trailing_blank_pane_lines_strips_padding_rows() {
+        assert_eq!(
+            trim_trailing_blank_pane_lines("line1\nline2\nline3\n\n\n\n\n"),
+            "line1\nline2\nline3"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_blank_pane_lines_leaves_a_full_pane_unchanged() {
+        // No blank tail (content spans the whole pane height) -- only the
+        // single natural trailing newline is dropped, no real content lost.
+        assert_eq!(
+            trim_trailing_blank_pane_lines("line1\nline2\nline3\n"),
+            "line1\nline2\nline3"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_blank_pane_lines_preserves_interior_blank_lines() {
+        assert_eq!(
+            trim_trailing_blank_pane_lines("line1\n\nline2\n\n\n"),
+            "line1\n\nline2"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_blank_pane_lines_all_blank_becomes_empty() {
+        assert_eq!(trim_trailing_blank_pane_lines("\n\n\n\n"), "");
+    }
+
+    #[test]
     fn pane_snapshot_different_sessions_do_not_collide() {
         let dir = TempSnapshotDir::new("distinct");
         write_pane_snapshot_in(&dir.0, "session-a", "a's output");
@@ -1302,6 +1377,55 @@ mod tests {
     }
 
     #[test]
+    fn live_tmux_capture_pane_has_no_trailing_blank_lines_for_short_output() {
+        // RAL-237: a session whose real output is far shorter than the
+        // pane's height (`-y 50`) must not come back with genuine trailing
+        // blank rows -- that's what made the Live View's jump-to-latest
+        // button scroll past the real content into empty space.
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "shortoutput");
+        let _ = tmux.kill_session(&name);
+
+        let cwd = std::env::temp_dir();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let command = build_command_line("echo", &["ral237-marker".to_string()]);
+        tmux.new_detached_session_with_command(&name, &cwd_str, &command)
+            .unwrap();
+
+        let mut captured = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(200));
+            captured = tmux.capture_pane(&name, 50).unwrap_or_default();
+            if captured.contains("ral237-marker") {
+                break;
+            }
+        }
+        assert!(
+            captured.contains("ral237-marker"),
+            "expected captured pane to contain the echoed marker, got: {captured:?}"
+        );
+        assert!(
+            !captured.ends_with('\n') && !captured.ends_with("\n\n"),
+            "expected no trailing blank lines after the real content, got: {captured:?}"
+        );
+        let lines: Vec<&str> = captured.lines().collect();
+        let last = *lines.last().expect("captured pane has at least one line");
+        assert!(
+            !last.trim().is_empty(),
+            "last captured line should be real content, not blank padding: {captured:?}"
+        );
+
+        tmux.kill_session(&name).unwrap();
+    }
+
+    #[test]
     fn live_tmux_has_session_false_for_unknown_name() {
         if !tmux_on_path() {
             println!("SKIP: tmux not found on PATH");
@@ -1309,5 +1433,72 @@ mod tests {
         }
         let tmux = Tmux::resolve().unwrap();
         assert!(!tmux.has_session("definitely-not-a-real-ralphus-session-xyz"));
+    }
+
+    /// RAL-227: proves *why* `crate::config::is_valid_env_value` rejects a
+    /// `\n`-carrying env-override value at the HTTP boundary
+    /// (`daemon/src/server.rs`, before the value ever reaches
+    /// [`build_command_line_with_env`]), by deliberately bypassing that
+    /// check here and sending the resulting unsanitized command line down
+    /// the real Windows delivery path -- `send-keys` typed into a live pty
+    /// (see [`Tmux::new_detached_session_with_command`]'s doc comment).
+    /// `quote_for_shell`'s escaping does not neutralize an embedded literal
+    /// newline: it submits everything typed so far as an incomplete
+    /// PowerShell statement (observed: the pane lands in a `>>` open-quote
+    /// continuation prompt) instead of running the intended command, so the
+    /// expected marker never appears. This is the live, empirical
+    /// confirmation that the boundary check closes a real gap, not an
+    /// assumed one.
+    #[test]
+    fn live_tmux_send_keys_embedded_newline_in_env_value_corrupts_the_command() {
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        if !cfg!(target_os = "windows") {
+            println!("SKIP: exercises the Windows send-keys delivery path only");
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let malicious_value = "first\necho SPLIT-MARKER";
+        assert!(
+            !crate::config::is_valid_env_value(malicious_value),
+            "the boundary check must reject an embedded-newline value"
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("INJECTED".to_string(), malicious_value.to_string());
+        let command = build_command_line_with_env("echo", &["intended-marker".to_string()], &env);
+        assert!(
+            command.contains('\n'),
+            "expected the raw newline to survive quoting: {command:?}"
+        );
+
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "newline-injection");
+        let _ = tmux.kill_session(&name);
+        let cwd = std::env::temp_dir();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        tmux.new_detached_session_with_command(&name, &cwd_str, &command)
+            .unwrap();
+
+        let mut seen = String::new();
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_millis(200));
+            seen = tmux.capture_pane(&name, 50).unwrap_or_default();
+            if seen.contains("intended-marker") {
+                break;
+            }
+        }
+        tmux.kill_session(&name).unwrap();
+
+        assert!(
+            !seen.contains("intended-marker"),
+            "expected the embedded newline to prevent the intended command \
+             from completing, but it ran anyway: {seen:?}"
+        );
     }
 }

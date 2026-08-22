@@ -26,7 +26,7 @@ pub enum ShowCommand {
 #[must_use]
 pub fn parse(args: &[String]) -> ShowCommand {
     match args.first().map(String::as_str) {
-        None => ShowCommand::Help,
+        None | Some("help" | "--help" | "-h") => ShowCommand::Help,
         Some("help-map") => ShowCommand::HelpMap,
         Some(other) => ShowCommand::UsageError(format!("unknown show subcommand: {other}")),
     }
@@ -36,7 +36,10 @@ pub fn parse(args: &[String]) -> ShowCommand {
 pub fn dispatch(cmd: ShowCommand, _opts: &GlobalOpts) -> i32 {
     match cmd {
         ShowCommand::Help => {
-            println!("ralphus show <help-map>");
+            println!(
+                "{}",
+                crate::help_map::command_help(&["show"]).expect("show help exists")
+            );
             0
         }
         ShowCommand::HelpMap => {
