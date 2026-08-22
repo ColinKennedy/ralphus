@@ -54,7 +54,9 @@ uv sync --dev
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uvx privata src
+uv run privata src
+uv run privata tests
+uv run deadcode src tests
 uv run pytest
 ```
 

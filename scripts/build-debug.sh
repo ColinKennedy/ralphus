@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # build-debug.sh -- the FAST counterpart to build-release.sh.
-# Fast local dev loop -- NO PyInstaller, NO dist/. Runs the whole stack from
-# source so iterating on the GUI (librarian/assets/board.html) is quick:
+# Fast local dev loop -- NO dist/. Runs the whole stack from source so
+# iterating on the GUI (librarian/assets/board.html) is quick:
 #
-#   * daemon + librarian   -> cargo debug builds (incremental; seconds)
-#   * runner               -> the venv script via uv (RALPHUS_RUNNER_CMD),
-#                             so a GUI/daemon edit NEVER rebuilds the heavy
-#                             standalone runner exe.
+#   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
+#                                            seconds each; all four are Rust)
+#
+# All four binaries are Rust -- there is no Python venv sync step. `cli/`
+# still exists for `docsgen/` (Playwright screenshots, dev-only, never
+# shipped).
 #
 # Loop: edit board.html -> re-run this script -> refresh the browser.
 # Ctrl-C stops both processes. For a distributable standalone build (slow),
@@ -66,25 +68,22 @@ fi
 # and runs its own binaries instead of the main checkout's.
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-# 1. Runner: use the venv script (fast; no bundling). Sync the runner extra so
-#    native model agents work; this is a near-no-op once the venv is warm.
-echo "== syncing runner venv (uv) =="
-( cd "$root/cli" && uv sync --extra runner >/dev/null )
-runner="$root/cli/.venv/Scripts/ralphus-runner.exe"   # Windows
-[ -f "$runner" ] || runner="$root/cli/.venv/bin/ralphus-runner"  # POSIX
-export RALPHUS_RUNNER_CMD="$runner"
-
-# 2. Build the Rust bins in debug (fast incremental rebuild picks up board.html).
-echo "== cargo build (debug) daemon + librarian =="
-cargo build -p ralphus-daemon -p ralphus-librarian --manifest-path "$root/Cargo.toml"
+# 1. Build all four Rust bins in debug (fast incremental rebuild picks up
+#    board.html and any CLI/runner source edit alike).
+echo "== cargo build (debug) daemon + librarian + runner + cli =="
+cargo build -p ralphus-daemon -p ralphus-librarian -p ralphus-runner -p ralphus-cli --manifest-path "$root/Cargo.toml"
 
 ext=""; [ -f "$root/target/debug/ralphus-daemon.exe" ] && ext=".exe"
+
+# 2. Point RALPHUS_RUNNER_CMD at the just-built debug runner exe.
+export RALPHUS_RUNNER_CMD="$root/target/debug/ralphus-runner${ext}"
 
 # 3. Daemon in the background, librarian in the foreground. Ctrl-C (or the
 #    librarian exiting) tears the daemon down too.
 export RALPHUS_DAEMON_URL="http://127.0.0.1:${daemon_port}"
 echo "== starting stack =="
 echo "   runner    -> $RALPHUS_RUNNER_CMD"
+echo "   cli       -> $root/target/debug/ralphus${ext} (not started; run it yourself, e.g. 'ralphus status')"
 echo "   daemon    -> $RALPHUS_DAEMON_URL"
 echo "   db        -> ${db_path:-<default: ~/.ralphus/tasks.db>}"
 echo "   librarian -> http://127.0.0.1:${librarian_port}"

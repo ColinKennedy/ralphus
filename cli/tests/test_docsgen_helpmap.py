@@ -8,8 +8,6 @@ import pytest
 
 import ralphus.docsgen.helpmap_docs as helpmap_docs
 
-pytestmark = pytest.mark.no_bench  # calls the real (~seconds) generate() via main()
-
 
 def test_begin_end_markers_are_present_in_cli_reference() -> None:
     text = helpmap_docs.CLI_REFERENCE.read_text(encoding="utf-8")

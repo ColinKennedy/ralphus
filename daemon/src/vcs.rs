@@ -14,12 +14,20 @@
 //! reach provisioning fine and fall over the moment a review touched it — the
 //! worst place to discover the assumption.
 //!
-//! **Scope is deliberately narrow.** This is not an abstraction over all of
-//! git. `crate::guardian_merge`'s stacked rebase remains git-specific and
-//! unapologetically so — rebasing is not a concept every VCS shares, and
-//! pretending otherwise would produce a worse abstraction than none. What lives
-//! here is only the handful of operations a *non-git* project could plausibly
-//! implement differently and still participate.
+//! **Every git invocation in the daemon lives here — none scattered across
+//! `guardian_merge`/`reviews`/`server`.** [`Vcs`] itself covers only the
+//! content questions a non-git backend could plausibly answer differently
+//! ("does this branch add anything?", "is this path a checkout?"). Rebasing,
+//! worktree creation and staging are not concepts every VCS shares, so
+//! carving them out of the abstraction entirely — the original design here —
+//! silently let raw `git` calls leak back out to the call sites this module
+//! exists to centralize. [`GitOps`] is the fix: a git-specific *bridge*
+//! layered on top of [`Vcs`] that gives `crate::guardian_merge`'s stacked
+//! rebase and `crate::reviews`'s preflight one narrow, raw-command escape
+//! hatch (`GitOps::run`) so their git-only mechanics still route through this
+//! module — and only this module ever spawns a `git` subprocess — without
+//! forcing a hypothetical non-git adapter to implement rebase semantics it
+//! has no way to express.
 
 use std::path::Path;
 use std::process::Command;
@@ -62,16 +70,55 @@ pub trait Vcs: Send + Sync {
     /// # Errors
     /// When the branch does not resolve.
     fn revision_of(&self, root: &Path, branch: &str) -> Result<String, String>;
+
+    /// Whether `root` is a valid checkout of this adapter's VCS kind.
+    ///
+    /// Used at project-registration time (`server.rs`'s `validate_project_location`)
+    /// to reject a path before the daemon ever tries a content operation
+    /// against it. `false` covers both "not a checkout at all" and "the check
+    /// itself could not be answered" — either way, the path is not usable.
+    fn is_repository(&self, root: &Path) -> bool;
+}
+
+/// Git-specific operations with no cross-VCS equivalent: worktree creation,
+/// rebase, and staging are concepts specific to git's model, not something
+/// every VCS shares. Layered on [`Vcs`] as a bridge — see the module doc —
+/// rather than folded into it, so a hypothetical non-git adapter is never
+/// forced to implement rebase semantics it has no way to express.
+pub trait GitOps: Vcs {
+    /// Run an arbitrary git subcommand in `root`, returning stdout on success.
+    ///
+    /// `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR` are forced to `true` so operations
+    /// like `rebase --continue` never block waiting on an interactive editor.
+    /// This is the one raw-command escape hatch for git-only mechanics
+    /// (rebase, worktree, staging) that have no typed method on [`Vcs`] —
+    /// `crate::guardian_merge` and `crate::reviews` route every such
+    /// invocation through it instead of spawning `git` themselves.
+    ///
+    /// # Errors
+    /// The command's own failure message (`git <args> failed: <stderr>`), or
+    /// a message describing why git could not be spawned at all.
+    fn run(&self, root: &Path, args: &[&str]) -> Result<String, String>;
 }
 
 /// The git adapter — the only kind implemented today.
 pub struct GitVcs;
 
 impl GitVcs {
-    fn run(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    /// Spawn `git` in `root`, returning the raw process output.
+    ///
+    /// The single place this module (and, transitively, the whole daemon)
+    /// spawns a `git` subprocess — see the module doc.
+    fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
         Command::new("git")
             .args(args)
             .current_dir(root)
+            // Harmless for the read-only callers in this impl block, and
+            // required by `GitOps::run`'s callers (rebase --continue etc.) —
+            // shared here rather than duplicated so there is only one spawn
+            // site to audit.
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true")
             .output()
             .map_err(|e| format!("could not run git: {e}"))
     }
@@ -83,7 +130,7 @@ impl Vcs for GitVcs {
     }
 
     fn differs(&self, root: &Path, base: &str, head: &str) -> Result<bool, String> {
-        let out = Self::run(root, &["diff", "--quiet", base, head])?;
+        let out = Self::exec_raw(root, &["diff", "--quiet", base, head])?;
         match out.status.code() {
             // `git diff --quiet` is an exit-code predicate: 0 = identical,
             // 1 = differs. Anything else is git failing to answer at all.
@@ -101,7 +148,7 @@ impl Vcs for GitVcs {
         // `+` forces the update, so a force-push on the producing machine is
         // honoured rather than rejected as a non-fast-forward.
         let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
-        let out = Self::run(root, &["fetch", remote, &refspec])?;
+        let out = Self::exec_raw(root, &["fetch", remote, &refspec])?;
         if out.status.success() {
             return Ok(());
         }
@@ -109,11 +156,32 @@ impl Vcs for GitVcs {
     }
 
     fn revision_of(&self, root: &Path, branch: &str) -> Result<String, String> {
-        let out = Self::run(root, &["rev-parse", "--verify", branch])?;
+        let out = Self::exec_raw(root, &["rev-parse", "--verify", branch])?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    fn is_repository(&self, root: &Path) -> bool {
+        Self::exec_raw(root, &["rev-parse", "--is-inside-work-tree"])
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+}
+
+impl GitOps for GitVcs {
+    fn run(&self, root: &Path, args: &[&str]) -> Result<String, String> {
+        let out = Self::exec_raw(root, args)?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
         }
     }
 }
@@ -196,6 +264,74 @@ mod tests {
             panic!("must refuse an unknown kind rather than falling back to git");
         };
         assert!(err.contains("perforce"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_repository_distinguishes_a_checkout_from_a_plain_directory() {
+        let dir = std::env::temp_dir().join("ral213-vcs-is-repo");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            !GitVcs.is_repository(&dir),
+            "a plain directory is not a git repository"
+        );
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(GitVcs.is_repository(&dir), "git init makes it a checkout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_ops_run_returns_stdout_and_a_readable_error_on_failure() {
+        let dir = std::env::temp_dir().join("ral213-vcs-gitops-run");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&dir)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        for args in [
+            ["add", "."].as_slice(),
+            [
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "x",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .expect("git setup")
+                    .success()
+            );
+        }
+        let out = GitVcs.run(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(out.expect("run succeeds").trim(), "main");
+
+        let err = GitVcs
+            .run(&dir, &["rev-parse", "--verify", "does-not-exist"])
+            .expect_err("unknown ref must fail");
+        assert!(err.starts_with("git rev-parse"), "{err}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

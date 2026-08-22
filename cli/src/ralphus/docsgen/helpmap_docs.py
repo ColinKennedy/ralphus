@@ -1,10 +1,13 @@
 """Regenerate the machine-readable help-map block in docs/cli-reference.md (RAL-110).
 
-`ralphus.helpmap.generate()` recursively renders the CLI's full command
-surface by actually invoking `--verbose --help` at every level (see that
-module). This script replaces the fenced block between `BEGIN_MARKER`/
-`END_MARKER` in docs/cli-reference.md with a freshly generated tree, so the
-doc can never silently drift from what `--help` really prints.
+The CLI is now Rust (`cli-rs/`, binary `ralphus`) rather than the Python
+`ralphus.__main__`/`ralphus.helpmap` this script originally called into
+in-process. Rather than re-deriving the tree-walk logic a second time here,
+`generate()` shells out to the real, compiled `ralphus show help-map`
+binary and takes its tree verbatim -- the binary is the single source of
+truth for its own command surface, so this doc can never silently drift
+from what the actual CLI prints, exactly as before, just via a subprocess
+boundary instead of a Python import.
 
 Runnable standalone (regenerates the file in place) or with ``--check``
 (drift detection for CI: exits 1 without writing if the file would change).
@@ -13,18 +16,53 @@ Runnable standalone (regenerates the file in place) or with ``--check``
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
-from pathlib import Path
 
-from ralphus.helpmap import generate
+from ralphus.docsgen.binaries import REPO_ROOT, find_ralphus_binary
 
-__all__ = ["BEGIN_MARKER", "CLI_REFERENCE", "END_MARKER", "REPO_ROOT", "main", "render_block"]
+__all__ = [
+    "BEGIN_MARKER",
+    "CLI_REFERENCE",
+    "END_MARKER",
+    "REPO_ROOT",
+    "find_ralphus_binary",
+    "generate",
+    "main",
+    "render_block",
+]
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
 CLI_REFERENCE = REPO_ROOT / "docs" / "cli-reference.md"
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED HELP-MAP (RAL-110) -->"
 END_MARKER = "<!-- END GENERATED HELP-MAP (RAL-110) -->"
+
+# The line the tree itself always starts with (`ralphus show help-map`
+# prints six guidance-note paragraphs first, then the tree) -- used to trim
+# the notes off, since this doc's fenced block only ever embedded the bare
+# tree (`ralphus.helpmap.generate()`'s old return value), not the notes.
+_TREE_START = "- ralphus "
+
+
+def generate() -> str:
+    """The full alphabetized, indented help-map tree, as one string.
+
+    Runs the real `ralphus show help-map` and strips its six leading
+    guidance-note paragraphs, keeping only the tree -- matching the old
+    in-process `ralphus.helpmap.generate()`'s return value (tree only, no
+    trailing newline), since that's what this module's fenced doc block has
+    always embedded.
+    """
+    binary = find_ralphus_binary()
+    result = subprocess.run(
+        [str(binary), "show", "help-map"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout
+    start = output.index(_TREE_START)
+    return output[start:].rstrip("\n")
 
 
 def _log(message: str) -> None:

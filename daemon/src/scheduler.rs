@@ -24,9 +24,21 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often to check reviews for a base-branch shift and auto-rebuild them.
 pub const REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often to sweep for guardians whose debounced final change-summary
+/// regen request (RAL-208) has gone quiet long enough to fire the LLM call.
+/// Finer-grained than [`REVIEW_MAINT_INTERVAL`] since it's checked against
+/// `guardian_merge::FINAL_SUMMARY_DEBOUNCE_MS`, a much shorter window.
+pub const SUMMARY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// How often to enforce Cartographer's retention caps (RAL-98). Pruning is
 /// cheap (indexed deletes) so a coarse interval is fine.
 pub const CARTOGRAPHER_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How often to enforce the durable terminal-log retention caps (RAL-154).
+/// Same cadence as [`CARTOGRAPHER_PRUNE_INTERVAL`] — a filesystem walk over a
+/// bounded `max_files` cap is cheap enough that a coarse interval is fine
+/// here too.
+pub const TERMINAL_LOG_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// A dependency-free counting semaphore that bounds how many sessions execute
 /// at once. One instance is shared across every run's worker threads, so the
@@ -108,7 +120,9 @@ pub fn run_loop(
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
 ) {
     let mut last_maintenance = std::time::Instant::now();
+    let mut last_summary_sweep = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
+    let mut last_terminal_log_prune = std::time::Instant::now();
     // Recovery: restart merges that were interrupted by a daemon shutdown.
     // Guardians stuck in `merging` have no live background thread; reset them to
     // `collecting` so `claim_guardian_merge` can claim them again.
@@ -122,7 +136,7 @@ pub fn run_loop(
             }
             ids
         };
-        start_reviews(&store, ids, &sem);
+        start_reviews(&store, ids, &sem, &cancellations);
     }
     // Recovery: start collecting guardians whose contributing sessions are all
     // Done. This handles the case where the daemon was restarted after the run
@@ -136,13 +150,17 @@ pub fn run_loop(
             }
             ids
         };
-        start_reviews(&store, ids, &sem);
+        start_reviews(&store, ids, &sem, &cancellations);
     }
     loop {
         tick(&store, &runner, &sem, &cancellations, &summary_queue);
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
-            crate::guardian_merge::review_maintenance(&store, &sem);
+            crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
             last_maintenance = std::time::Instant::now();
+        }
+        if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
+            crate::guardian_merge::sweep_pending_summaries(&store, &sem);
+            last_summary_sweep = std::time::Instant::now();
         }
         if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();
@@ -167,6 +185,27 @@ pub fn run_loop(
             }
             drop(guard);
             last_prune = std::time::Instant::now();
+        }
+        if last_terminal_log_prune.elapsed() >= TERMINAL_LOG_PRUNE_INTERVAL {
+            let cfg = crate::config::load_terminal_log_config();
+            // Filesystem walk, deliberately done without holding the store
+            // lock (unlike `cartographer_prune`, which is itself the DB
+            // operation) — only briefly re-acquired below to emit the
+            // breadcrumb note.
+            let deleted = crate::terminal_log::prune(cfg.retention_days(), cfg.max_files());
+            if deleted > 0 {
+                let guard = store.lock().expect("store mutex poisoned");
+                crate::cartographer::Note::new("scheduler").emit(
+                    &guard,
+                    format!("terminal-log pruned {deleted} attempt file(s)"),
+                    serde_json::json!({
+                        "deleted": deleted,
+                        "retention_days": cfg.retention_days(),
+                        "max_files": cfg.max_files(),
+                    }),
+                );
+            }
+            last_terminal_log_prune = std::time::Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -210,6 +249,7 @@ pub fn tick(
                 &token,
                 &sem,
                 &summary_queue,
+                &cancellations,
             );
             cancellations.remove(&run_id);
         });
@@ -258,6 +298,7 @@ fn claim_ready(store: &Arc<Mutex<Store>>, cancellations: &Cancellations) -> Vec<
                 guardian_id: None,
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({}),
             });
             claimed.push(run_id);
@@ -294,7 +335,15 @@ where
 pub fn execute_run(store: &Arc<Mutex<Store>>, runner: &dyn Runner, run_id: &str) {
     let sem = Arc::new(Semaphore::new(crate::DEFAULT_MAX_CONCURRENT));
     with_standalone_summary_queue(store, |queue| {
-        execute_run_inner(store, runner, run_id, &CancelToken::never(), &sem, queue);
+        execute_run_inner(
+            store,
+            runner,
+            run_id,
+            &CancelToken::never(),
+            &sem,
+            queue,
+            &Cancellations::new(),
+        );
     });
 }
 
@@ -305,15 +354,22 @@ pub fn execute_run(store: &Arc<Mutex<Store>>, runner: &dyn Runner, run_id: &str)
 ///
 /// Owns a private [`Semaphore`]; the scheduler's [`tick`] uses the concurrent
 /// path directly with the *shared* global semaphore instead.
+///
+/// RAL-213: `cancellations` is the daemon-wide registry a task-completion
+/// -triggered guardian merge (via `try_start_ready_reviews_for_task`) registers
+/// its own `guardian:{id}` token into, so such a merge is stoppable through the
+/// same registry a settings change/`cancel_and_merge` looks up -- not just the
+/// caller's own `cancel` token, which only covers this run's own sessions.
 pub fn execute_run_with(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
     run_id: &str,
     cancel: &CancelToken,
+    cancellations: &Cancellations,
 ) {
     let sem = Arc::new(Semaphore::new(crate::DEFAULT_MAX_CONCURRENT));
     with_standalone_summary_queue(store, |queue| {
-        execute_run_inner(store, runner, run_id, cancel, &sem, queue);
+        execute_run_inner(store, runner, run_id, cancel, &sem, queue, cancellations);
     });
 }
 
@@ -362,6 +418,7 @@ struct Progress {
 /// `sem` only while doing real work — so the number of sessions running at once
 /// is bounded globally (the task-level concurrency cap). After every session is
 /// terminal, task-level verifies and finalization run exactly as before.
+#[allow(clippy::too_many_arguments)]
 fn execute_run_inner(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
@@ -369,6 +426,7 @@ fn execute_run_inner(
     cancel: &CancelToken,
     sem: &Arc<Semaphore>,
     summary_queue: &Arc<crate::summary_worker::SummaryQueue>,
+    cancellations: &Cancellations,
 ) {
     let trace_context = store
         .lock()
@@ -478,6 +536,7 @@ fn execute_run_inner(
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"sessions": sessions.len(), "tasks": tasks.len()}),
         });
     }
@@ -875,6 +934,7 @@ fn execute_run_inner(
                     guardian_id: None,
                     session_id: Some(&row.session_id),
                     task: Some(&row.task_name),
+                    log_path: None,
                     payload: serde_json::json!({}),
                 });
             }
@@ -913,6 +973,7 @@ fn execute_run_inner(
                         sem,
                         summary_queue,
                         trace_ref,
+                        cancellations,
                     );
                 });
             }
@@ -1089,6 +1150,7 @@ fn run_session_worker(
             guardian_id: None,
             session_id: Some(&row.session_id),
             task: Some(&row.task_name),
+            log_path: None,
             payload: serde_json::json!({
                 "agent": row.agent,
                 "model": row.model,
@@ -1105,6 +1167,7 @@ fn run_session_worker(
         let _ = guard.set_session_state(run_id, row.task_idx, row.idx, NodeState::Running);
         let _ = guard.set_task_state(run_id, row.task_idx, NodeState::Running);
     }
+    capture_task_baseline_if_needed(store, run_id, row);
 
     // Resolve handoff placeholders against completed upstream summaries.
     let summaries = progress
@@ -1183,6 +1246,7 @@ fn run_session_worker(
                 guardian_id: None,
                 session_id: Some(&row.session_id),
                 task: Some(&row.task_name),
+                log_path: None,
                 payload: serde_json::json!({"error": rebase_err}),
             });
         }
@@ -1230,6 +1294,7 @@ fn run_session_worker(
             guardian_id: None,
             session_id: Some(&row.session_id),
             task: Some(&row.task_name),
+            log_path: None,
             payload: serde_json::json!({
                 "status": result.status,
                 "tokens_in": result.tokens_in,
@@ -1431,6 +1496,110 @@ fn run_verify_only_worker(
     }
 }
 
+/// Capture a git-backed task's RAL-156 baseline commit sha the first time any
+/// of its sessions reaches `Running` (a no-op once one is already set — see
+/// [`Store::set_task_baseline_commit`]). Skipped entirely for a task whose
+/// `project` isn't registered as git, or that has no `cwd`, so the common
+/// non-git-backed task never pays for a `git` subprocess call. The `git`
+/// subprocess itself runs outside the store lock, matching this module's
+/// "subprocess waits happen outside the store lock" rule.
+fn capture_task_baseline_if_needed(
+    store: &Arc<Mutex<Store>>,
+    run_id: &str,
+    row: &crate::store::SessionRow,
+) {
+    let Some(cwd) = row.cwd.as_deref() else {
+        return;
+    };
+    let is_git = {
+        let guard = store.lock().expect("store mutex poisoned");
+        let Ok(Some(info)) = guard.task_commit_guard_info(run_id, row.task_idx) else {
+            return;
+        };
+        if info.baseline_commit_sha.is_some() {
+            return;
+        }
+        info.project
+            .as_deref()
+            .and_then(|name| guard.get_project(name).ok().flatten())
+            .is_some_and(|p| p.vcs == "git")
+    };
+    if !is_git {
+        return;
+    }
+    if let Some(sha) = crate::verify::git_head_sha(cwd) {
+        let guard = store.lock().expect("store mutex poisoned");
+        let _ = guard.set_task_baseline_commit(run_id, row.task_idx, &sha);
+    }
+}
+
+/// The RAL-156 no-new-commits-since-baseline guard: for a git-backed task
+/// (per [`Store::task_commit_guard_info`]'s registered `project`) that hasn't
+/// opted out via `no_commit_required`, fails closed unless at least one of
+/// the task's sessions moved its `cwd`'s `HEAD` past the captured baseline.
+/// Returns `true` (pass) whenever the guard doesn't apply — not git-backed,
+/// opted out, or the `(run_id, task_idx)` row can't be found. On failure,
+/// logs both the `verify`-typed `rlog!` line and a matching Cartographer
+/// event per the Logging Policy. `git` subprocess calls run outside the store
+/// lock, matching this module's "subprocess waits happen outside the store
+/// lock" rule.
+fn check_task_no_commits_guard(
+    store: &Arc<Mutex<Store>>,
+    run_id: &str,
+    task_idx: i64,
+    task_name: &str,
+    sessions: &[crate::store::SessionRow],
+) -> bool {
+    let (info, is_git) = {
+        let guard = store.lock().expect("store mutex poisoned");
+        let Ok(Some(info)) = guard.task_commit_guard_info(run_id, task_idx) else {
+            return true;
+        };
+        let is_git = info
+            .project
+            .as_deref()
+            .and_then(|name| guard.get_project(name).ok().flatten())
+            .is_some_and(|p| p.vcs == "git");
+        (info, is_git)
+    };
+    if info.no_commit_required || !is_git {
+        return true;
+    }
+    let cwds: Vec<&str> = sessions
+        .iter()
+        .filter(|s| s.task_idx == task_idx)
+        .filter_map(|s| s.cwd.as_deref())
+        .collect();
+    let has_commit = info
+        .baseline_commit_sha
+        .as_deref()
+        .is_some_and(|baseline| crate::verify::any_cwd_has_new_commit(&cwds, baseline));
+    if has_commit {
+        return true;
+    }
+    crate::rlog!(
+        WARNING,
+        "ralphus [verify] task {run_id}/{task_name} failed: marked done with zero new commits since baseline"
+    );
+    let guard = store.lock().expect("store mutex poisoned");
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::WARNING,
+        source: "verify",
+        message: "task failed: no commits since baseline",
+        scope: Some("task"),
+        run_id: Some(run_id),
+        guardian_id: None,
+        session_id: None,
+        task: Some(task_name),
+        log_path: None,
+        payload: serde_json::json!({
+            "baseline_commit_sha": info.baseline_commit_sha,
+            "sessions_checked": cwds.len(),
+        }),
+    });
+    false
+}
+
 /// Finalize a single task once all its sessions are terminal: run its
 /// task-level verify steps (skipped if any session already failed) in the
 /// task's first session's working directory and resolved backend, then flip the
@@ -1452,6 +1621,7 @@ fn run_task_finalizer(
     sem: &Arc<Semaphore>,
     summary_queue: &Arc<crate::summary_worker::SummaryQueue>,
     trace_context: Option<&str>,
+    cancellations: &Cancellations,
 ) {
     let cx = otel::context_from_traceparent(trace_context);
     let _span = otel::start_span("scheduler.task_finalize", &cx, SpanKind::Internal);
@@ -1546,6 +1716,29 @@ fn run_task_finalizer(
         }
         drop(_permit);
     }
+    if cancel.is_cancelled() {
+        return;
+    }
+    // RAL-156: for a git-backed task, deterministically fail it here if none
+    // of its sessions produced a commit since the task started — the same
+    // unconditional finalizer-side guard as the task-level verifies above,
+    // not a TOML-configured verify kind, and not run by the manual
+    // `set_status → Done` override (RAL-74 intentionally bypasses it).
+    if !failed {
+        let task_name = sessions
+            .iter()
+            .find(|s| s.task_idx == task_idx)
+            .map(|s| s.task_name.clone())
+            .unwrap_or_default();
+        if !check_task_no_commits_guard(store, run_id, task_idx, &task_name, sessions) {
+            failed = true;
+            progress
+                .lock()
+                .expect("progress mutex poisoned")
+                .failed
+                .insert(task_idx);
+        }
+    }
     // A cancellation abandons the task without a terminal write: the store has
     // already flipped its non-terminal nodes to `cancelled`.
     if cancel.is_cancelled() {
@@ -1581,7 +1774,15 @@ fn run_task_finalizer(
     // Guard dropped above; now check per-task review readiness without holding
     // the lock.
     if did_write && state == NodeState::Done {
-        try_start_ready_reviews_for_task(store, run_id, sessions, task_idx, sem, summary_queue);
+        try_start_ready_reviews_for_task(
+            store,
+            run_id,
+            sessions,
+            task_idx,
+            sem,
+            summary_queue,
+            cancellations,
+        );
     }
 }
 
@@ -1596,7 +1797,16 @@ fn run_task_finalizer(
 /// Each spawned merge worker acquires a slot from `sem` before calling
 /// `run_merge`, so review merges count against the same global concurrency cap
 /// as sessions and task-level verifies.
-fn start_reviews(store: &Arc<Mutex<Store>>, guardian_ids: Vec<String>, sem: &Arc<Semaphore>) {
+///
+/// RAL-213: registers/removes a `guardian:{id}`-keyed cancel token around the
+/// merge, same as `guardian_merge::start_merge`, so a settings change made
+/// while one of these guardians is merging can stop it.
+fn start_reviews(
+    store: &Arc<Mutex<Store>>,
+    guardian_ids: Vec<String>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+) {
     for gid in guardian_ids {
         crate::rlog!(INFO, "ralphus [scheduler] review {gid} starting merge");
         {
@@ -1610,11 +1820,13 @@ fn start_reviews(store: &Arc<Mutex<Store>>, guardian_ids: Vec<String>, sem: &Arc
                 guardian_id: Some(&gid),
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({}),
             });
         }
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
+        let cancellations = cancellations.clone();
         std::thread::spawn(move || {
             // Atomically claim the merge: the first caller to win the
             // collecting→merging transition proceeds; others bail out.
@@ -1625,9 +1837,20 @@ fn start_reviews(store: &Arc<Mutex<Store>>, guardian_ids: Vec<String>, sem: &Arc
                 .unwrap_or(false);
             if claimed {
                 let _permit = sem.acquire();
-                let runner: Arc<dyn Runner> =
+                // RAL-201: wrapped in `MachineRouter` (matching every
+                // `server.rs` guardian-merge entry point via
+                // `guardian_agent_runner`) so a review's resolver/summary/
+                // etc agent invocations dispatch to its assigned machine
+                // instead of always the daemon's own host.
+                let local: Arc<dyn Runner> =
                     Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)));
-                crate::guardian_merge::run_merge(&store, runner.as_ref(), &gid);
+                let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
+                    local,
+                    Arc::clone(&store),
+                ));
+                let token = cancellations.register(&format!("guardian:{gid}"));
+                crate::guardian_merge::run_merge_cancellable(&store, runner.as_ref(), &gid, &token);
+                cancellations.remove(&format!("guardian:{gid}"));
             }
         });
     }
@@ -1665,6 +1888,7 @@ fn guardian_blocking_tasks(sessions: &[crate::store::SessionRow], git_root: &str
 /// guardian collects), and if all of the guardian's blocking tasks (those with
 /// sessions under the guardian's `git_root`) are now Done, kick off that
 /// guardian's merge immediately — without waiting for the whole run to finish.
+#[allow(clippy::too_many_arguments)]
 fn try_start_ready_reviews_for_task(
     store: &Arc<Mutex<Store>>,
     run_id: &str,
@@ -1672,6 +1896,7 @@ fn try_start_ready_reviews_for_task(
     completed_task_idx: i64,
     sem: &Arc<Semaphore>,
     summary_queue: &Arc<crate::summary_worker::SummaryQueue>,
+    cancellations: &Cancellations,
 ) {
     let guardian_ids = {
         let guard = store.lock().expect("store mutex poisoned");
@@ -1738,7 +1963,13 @@ fn try_start_ready_reviews_for_task(
             ready.push(gid.clone());
         }
     }
-    start_reviews(store, ready, sem);
+    // RAL-213: the real daemon-wide registry, threaded all the way down from
+    // `execute_run_inner`/`execute_run_with`/`tick`, so a merge started by a
+    // task finishing (the most common way a review starts) is stoppable
+    // through the same `guardian:{id}` key a settings-change/cancel-and-restart
+    // looks up -- not a throwaway registry `restart_guardian_merge` could
+    // never see into.
+    start_reviews(store, ready, sem, cancellations);
 }
 
 /// Mark every task and the run failed — used when the run cannot even be
@@ -1768,6 +1999,7 @@ fn finalize_all_failed(
         guardian_id: None,
         session_id: None,
         task: None,
+        log_path: None,
         payload: serde_json::json!({"reason": reason}),
     });
     for task in tasks {
@@ -1919,6 +2151,7 @@ fn run_verifies(
                         guardian_id: None,
                         session_id: None,
                         task: Some(task_name),
+                        log_path: None,
                         payload: serde_json::json!({
                             "task_idx": task_idx,
                             "verify_scope": scope,
@@ -1985,6 +2218,7 @@ fn run_verifies(
                         guardian_id: None,
                         session_id: None,
                         task: Some(task_name),
+                        log_path: None,
                         payload: serde_json::json!({
                             "task_idx": task_idx,
                             "verify_scope": scope,
@@ -2108,6 +2342,7 @@ fn run_verifies(
                 guardian_id: None,
                 session_id: Some(&verify_key),
                 task: Some(task_name),
+                log_path: None,
                 payload: serde_json::json!({
                     "verify_scope": scope,
                     "task_idx": task_idx,
@@ -2571,7 +2806,11 @@ mod tests {
                 token.clone(),
                 id.clone(),
             );
-            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+            std::thread::spawn(move || {
+                // RAL-213: a fresh, private registry -- these tests only exercise
+                // run-level cancellation via `token`, not a guardian-merge restart.
+                execute_run_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
         };
 
         // Wait until the session is in flight, then cancel as the API does.
@@ -2666,7 +2905,11 @@ mod tests {
                 token.clone(),
                 id.clone(),
             );
-            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+            std::thread::spawn(move || {
+                // RAL-213: a fresh, private registry -- these tests only exercise
+                // run-level cancellation via `token`, not a guardian-merge restart.
+                execute_run_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
         };
 
         // Wait for task a's first failure to be recorded in the store, and for
@@ -2832,7 +3075,11 @@ mod tests {
                 token.clone(),
                 id.clone(),
             );
-            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+            std::thread::spawn(move || {
+                // RAL-213: a fresh, private registry -- these tests only exercise
+                // run-level cancellation via `token`, not a guardian-merge restart.
+                execute_run_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
         };
 
         // Wait for the verify's first (failing) attempt to land and for "b"
@@ -3714,7 +3961,11 @@ mod tests {
                 token.clone(),
                 id.clone(),
             );
-            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+            std::thread::spawn(move || {
+                // RAL-213: a fresh, private registry -- these tests only exercise
+                // run-level cancellation via `token`, not a guardian-merge restart.
+                execute_run_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
         };
 
         // Wait until task "a"'s session is genuinely in flight AND independent
@@ -3815,7 +4066,11 @@ mod tests {
                 token.clone(),
                 id.clone(),
             );
-            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+            std::thread::spawn(move || {
+                // RAL-213: a fresh, private registry -- these tests only exercise
+                // run-level cancellation via `token`, not a guardian-merge restart.
+                execute_run_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
         };
         wait_until("session 'a' running", || blocking.load(Ordering::SeqCst));
         store.lock().unwrap().cancel(&id).unwrap();
@@ -3881,7 +4136,11 @@ mod tests {
                 token.clone(),
                 id.clone(),
             );
-            std::thread::spawn(move || execute_run_with(&store, runner.as_ref(), &id, &token))
+            std::thread::spawn(move || {
+                // RAL-213: a fresh, private registry -- these tests only exercise
+                // run-level cancellation via `token`, not a guardian-merge restart.
+                execute_run_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
         };
         wait_until("task 'a' running", || blocking.load(Ordering::SeqCst));
         store.lock().unwrap().cancel(&id).unwrap();
@@ -4284,7 +4543,9 @@ mod tests {
     #[test]
     fn execute_run_resolves_worktree_placeholder_cwd() {
         let repo = wt_test_repo("resolve");
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat-a\"\ncommand=\"do-thing\"\n";
+        // no_commit_required: this test is about worktree materialization, not
+        // the RAL-156 commit guard, and FakeRunner never actually commits.
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat-a\"\ncommand=\"do-thing\"\n";
         let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
@@ -4305,7 +4566,7 @@ mod tests {
             cwd, "ralphus:new-worktree/feat-a",
             "placeholder must be rewritten"
         );
-        let expected = repo.join(".git").join(".ralphus_worktrees").join("feat-a");
+        let expected = crate::worktrees::worktree_dir(&repo, "feat-a");
         assert_eq!(Path::new(&cwd), expected);
         assert!(expected.join(".git").exists());
     }
@@ -4313,7 +4574,9 @@ mod tests {
     #[test]
     fn execute_run_dedups_placeholder_across_two_sessions() {
         let repo = wt_test_repo("dedupe");
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+        // no_commit_required: this test is about worktree deduplication, not
+        // the RAL-156 commit guard, and FakeRunner never actually commits.
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n\
              [[task.session]]\nid=\"a\"\ncwd=\"ralphus:new-worktree/shared\"\ncommand=\"do-a\"\n\
              [[task.session]]\nid=\"b\"\ncwd=\"ralphus:new-worktree/shared\"\ncommand=\"do-b\"\n";
         let mut store = Store::open_in_memory().unwrap();
@@ -4348,7 +4611,10 @@ mod tests {
     #[test]
     fn execute_run_restart_reuses_already_materialized_worktree() {
         let repo = wt_test_repo("restart");
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat-b\"\ncommand=\"do-thing\"\n";
+        // no_commit_required: this test is about worktree reuse across a
+        // restart, not the RAL-156 commit guard, and FakeRunner never
+        // actually commits.
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.session]]\ncwd=\"ralphus:new-worktree/feat-b\"\ncommand=\"do-thing\"\n";
         let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
@@ -4386,6 +4652,167 @@ mod tests {
             list.matches("worktree ").count(),
             2,
             "restart must not duplicate the worktree: {list}"
+        );
+    }
+
+    // ── RAL-156: no-new-commits-since-baseline guard ─────────────────────────
+
+    /// A `Runner` that actually commits a file change in `spec.cwd`, standing
+    /// in for an agent session that really did the work (unlike `FakeRunner`,
+    /// which never touches the filesystem).
+    struct CommittingRunner;
+
+    impl Runner for CommittingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            let git = |args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&spec.cwd)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .expect("git");
+                assert!(status.success(), "git {args:?} failed in {}", spec.cwd);
+            };
+            std::fs::write(Path::new(&spec.cwd).join("new.txt"), "x\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-m", "session work"]);
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: "ok".to_string(),
+                error: None,
+                verified: spec.verify.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    #[test]
+    fn git_backed_task_with_zero_commits_fails() {
+        let repo = wt_test_repo("no-commits");
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.session]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_run(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        // FakeRunner never touches the filesystem, so no commit is made.
+        execute_run(&store, &FakeRunner { fail_on: None }, &id);
+
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Failed,
+            "a git-backed task with zero new commits must fail"
+        );
+    }
+
+    #[test]
+    fn git_backed_task_with_a_commit_passes() {
+        let repo = wt_test_repo("with-commit");
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.session]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_run(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        execute_run(&store, &CommittingRunner, &id);
+
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done,
+            "a session that actually committed must satisfy the guard"
+        );
+    }
+
+    #[test]
+    fn no_commit_required_opts_out_of_the_guard() {
+        let repo = wt_test_repo("opt-out");
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.session]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_run(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        execute_run(&store, &FakeRunner { fail_on: None }, &id);
+
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done,
+            "no_commit_required must bypass the guard even with zero commits"
+        );
+    }
+
+    #[test]
+    fn non_git_backed_task_with_zero_commits_passes() {
+        // No `project` field at all -- the task isn't git-backed (RAL-156 Q1),
+        // so the guard must never run, regardless of the plain cwd's contents.
+        let toml = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\".\"\ncommand=\"do-thing\"\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let file = toml::from_str(toml).unwrap();
+        let id = store.insert_run(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        execute_run(&store, &FakeRunner { fail_on: None }, &id);
+
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done,
+            "a non-git-backed task must never be subject to the guard"
+        );
+    }
+
+    #[test]
+    fn registered_but_non_git_project_is_not_subject_to_the_guard() {
+        let dir = std::env::temp_dir().join(format!(
+            "ral156-nonvcs-{}-{}",
+            std::process::id(),
+            TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.session]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            dir.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        // A project registered with a non-"git" vcs (only "git" is
+        // implemented today, but the store doesn't enforce that at
+        // registration time) must not be treated as git-backed.
+        store
+            .register_project("proj", "", &dir.to_string_lossy(), "none")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_run(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        execute_run(&store, &FakeRunner { fail_on: None }, &id);
+
+        assert_eq!(
+            store.lock().unwrap().run_state(&id).unwrap(),
+            RunState::Done
         );
     }
 }

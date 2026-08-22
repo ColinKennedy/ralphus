@@ -46,6 +46,12 @@ pub struct CartographerRow {
     pub session_id: Option<String>,
     /// Owning task name, if any.
     pub task: Option<String>,
+    /// Path to an on-disk log file this event references (RAL-155), e.g. a
+    /// durable terminal-log attempt file (`crate::terminal_log`). The row
+    /// carries the *path*, never the file's content — a consumer (like
+    /// `crate::timeline`) reads it separately when it needs to inline the
+    /// content.
+    pub log_path: Option<String>,
     /// Arbitrary structured detail, as a raw JSON string (already validated
     /// JSON — parsed lazily by consumers, not re-parsed here).
     pub payload: serde_json::Value,
@@ -66,7 +72,9 @@ pub struct CartographerFilter {
     pub guardian_id: Option<String>,
     /// Exact-match session id.
     pub session_id: Option<String>,
-    /// Exact-match owning task name.
+    /// Exact-match task name (RAL-155 Q2). Populated on rows whose emitter
+    /// knew the owning task's name at emit time (most session/verify-scoped
+    /// events do; run-level `Store::log_event`-derived transitions do not).
     pub task: Option<String>,
     /// Substring match against the message (case-insensitive).
     pub q: Option<String>,
@@ -121,6 +129,7 @@ pub struct Note<'a> {
     guardian_id: Option<&'a str>,
     session_id: Option<&'a str>,
     task: Option<&'a str>,
+    log_path: Option<&'a str>,
 }
 
 impl<'a> Note<'a> {
@@ -136,6 +145,7 @@ impl<'a> Note<'a> {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
         }
     }
 
@@ -181,6 +191,15 @@ impl<'a> Note<'a> {
         self
     }
 
+    /// Attach the path to an on-disk log file this event references (RAL-155),
+    /// e.g. a durable terminal-log attempt file. Carries the path only, never
+    /// the file's content — see [`CartographerRow::log_path`].
+    #[must_use]
+    pub fn log_path(mut self, log_path: &'a str) -> Self {
+        self.log_path = Some(log_path);
+        self
+    }
+
     /// Write the human-readable log line (`ralphus [source] message`) to the
     /// active log sink and persist the structured record to Cartographer.
     /// Failures to persist are swallowed (a missing structured record must
@@ -197,6 +216,7 @@ impl<'a> Note<'a> {
             guardian_id: self.guardian_id,
             session_id: self.session_id,
             task: self.task,
+            log_path: self.log_path,
             payload,
         });
     }
@@ -213,6 +233,7 @@ pub struct CartographerEntry<'a> {
     pub guardian_id: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub task: Option<&'a str>,
+    pub log_path: Option<&'a str>,
     pub payload: serde_json::Value,
 }
 
@@ -241,8 +262,8 @@ impl Store {
     pub fn cartographer_log(&self, entry: CartographerEntry<'_>) -> Result<()> {
         let at_ms = now_ms();
         self.conn.execute(
-            "INSERT INTO cartographer_events(at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, payload)
-             VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO cartographer_events(at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, log_path, payload)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 at_ms,
                 level_str(entry.level),
@@ -253,6 +274,7 @@ impl Store {
                 entry.guardian_id,
                 entry.session_id,
                 entry.task,
+                entry.log_path,
                 entry.payload.to_string(),
             ],
         )?;
@@ -267,6 +289,7 @@ impl Store {
             guardian_id: entry.guardian_id.map(str::to_string),
             session_id: entry.session_id.map(str::to_string),
             task: entry.task.map(str::to_string),
+            log_path: entry.log_path.map(str::to_string),
             payload: entry.payload,
         });
         Ok(())
@@ -325,7 +348,7 @@ impl Store {
         let limit = filter.limit.clamp(1, 1000);
         let offset = filter.offset.max(0);
         let sql = format!(
-            "SELECT id, at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, payload
+            "SELECT id, at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, log_path, payload
              FROM cartographer_events {where_sql}
              ORDER BY at_ms {order}, id {order}
              LIMIT {limit} OFFSET {offset}"
@@ -334,7 +357,7 @@ impl Store {
         let param_refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(AsRef::as_ref).collect();
         let rows = stmt
             .query_map(param_refs.as_slice(), |r| {
-                let payload_str: String = r.get(10)?;
+                let payload_str: String = r.get(11)?;
                 Ok(CartographerRow {
                     id: r.get(0)?,
                     at_ms: r.get(1)?,
@@ -346,6 +369,7 @@ impl Store {
                     guardian_id: r.get(7)?,
                     session_id: r.get(8)?,
                     task: r.get(9)?,
+                    log_path: r.get(10)?,
                     payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                 })
             })?
@@ -389,11 +413,11 @@ impl Store {
     pub fn cartographer_get(&self, id: i64) -> Result<Option<CartographerRow>> {
         self.conn
             .query_row(
-                "SELECT id, at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, payload
+                "SELECT id, at_ms, level, source, message, scope, run_id, guardian_id, session_id, task, log_path, payload
                  FROM cartographer_events WHERE id = ?",
                 params![id],
                 |r| {
-                    let payload_str: String = r.get(10)?;
+                    let payload_str: String = r.get(11)?;
                     Ok(CartographerRow {
                         id: r.get(0)?,
                         at_ms: r.get(1)?,
@@ -405,6 +429,7 @@ impl Store {
                         guardian_id: r.get(7)?,
                         session_id: r.get(8)?,
                         task: r.get(9)?,
+                        log_path: r.get(10)?,
                         payload: serde_json::from_str(&payload_str)
                             .unwrap_or(serde_json::Value::Null),
                     })
@@ -436,6 +461,49 @@ mod tests {
         assert_eq!(page.rows[0].source, "scheduler");
         assert_eq!(page.rows[0].run_id.as_deref(), Some("run-1"));
         assert_eq!(page.rows[0].payload, serde_json::json!({"foo": "bar"}));
+    }
+
+    #[test]
+    fn log_path_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        Note::new("runner")
+            .run("run-1")
+            .log_path("/tmp/terminal_logs/sess-a/0000.log")
+            .emit(
+                &store,
+                "terminal log attempt written",
+                serde_json::json!({}),
+            );
+
+        let page = store
+            .cartographer_query(&CartographerFilter::recent(10))
+            .unwrap();
+        assert_eq!(
+            page.rows[0].log_path.as_deref(),
+            Some("/tmp/terminal_logs/sess-a/0000.log")
+        );
+    }
+
+    #[test]
+    fn filters_by_task() {
+        let store = Store::open_in_memory().unwrap();
+        Note::new("scheduler")
+            .run("run-1")
+            .task("build")
+            .emit(&store, "a", serde_json::json!({}));
+        Note::new("scheduler")
+            .run("run-1")
+            .task("test")
+            .emit(&store, "b", serde_json::json!({}));
+
+        let filter = CartographerFilter {
+            task: Some("build".to_string()),
+            limit: 10,
+            ..Default::default()
+        };
+        let page = store.cartographer_query(&filter).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].message, "a");
     }
 
     #[test]

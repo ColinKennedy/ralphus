@@ -793,6 +793,19 @@ name = "ralphus-bench-types"
 version = "0.1.0"
 
 [[package]]
+name = "ralphus-cli"
+version = "0.1.0"
+dependencies = [
+ "ralphus-core",
+ "ralphus-runner",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
 name = "ralphus-core"
 version = "0.1.0"
 dependencies = [
@@ -848,6 +861,28 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "ureq",
+]
+
+[[package]]
+name = "ralphus-runner"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
+name = "ralphus-ssh-provider"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

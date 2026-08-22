@@ -1,0 +1,452 @@
+//! RAL-155: the unified, chronological "uber-log-viewer" for a whole Run.
+//!
+//! Merges everything Cartographer already knows about a run — state
+//! transitions (`Store::set_run_state`/`set_task_state`/`set_session_state`/
+//! `set_verify_state` all already emit Cartographer rows, see
+//! `AGENTS.md`'s Logging Policy) and every other Cartographer event scoped to
+//! it — with the durable per-attempt terminal-log content referenced by
+//! `crate::terminal_log`-writing rows (see [`crate::cartographer::Note::log_path`]),
+//! into one time-ordered narrative. "Task-Run" in the ticket's title turned
+//! out to mean the whole Run (all its tasks/sessions/verifies), not a
+//! separate entity — see the ticket's Q1.
+//!
+//! **Ordering / tie-break rule** (the ticket's Risk #1): entries sort by
+//! `(at_ms, id)` ascending — Cartographer's own primary key, which is
+//! monotonically increasing insertion order — so two rows sharing a
+//! millisecond still sort deterministically and in emission order. A
+//! terminal-log excerpt is anchored at its owning Cartographer row's `at_ms`
+//! (when the attempt file was last written), not reconstructed line-by-line —
+//! tmux pane captures carry no reliable per-line timestamps, so this is a
+//! documented, deliberate approximation rather than an attempt at more
+//! precision than the data supports.
+//!
+//! **Pruning gaps** (Risk #3): `Store::insert_run` always logs a `"run
+//! inserted"` Cartographer row synchronously at submit time, so its absence
+//! from a run's returned rows is a reliable signal that Cartographer's
+//! retention pruning (`cartographer_prune`) has already removed some of this
+//! run's earlier history. [`RunTimelineMeta::gaps_possible`] surfaces that
+//! rather than silently presenting a partial timeline as complete (Q6:
+//! best-effort, no obligation to reconstruct pruned history).
+//!
+//! **Volume caps** (Risk #2 / Q4: no known event-volume scale, so use
+//! conservative defaults): [`MAX_EVENTS`] bounds how many Cartographer rows
+//! one timeline pulls in, and [`MAX_LOG_EXCERPT_LINES`] bounds how much of
+//! each referenced terminal-log file is inlined, so one long-running or
+//! multi-session run can't produce an unusably large merged file.
+//!
+//! The generated file is a temp artifact (Q5), rewritten on every call under
+//! a fixed per-run path in the OS temp directory — never intended to persist
+//! long-term.
+
+use serde::Serialize;
+
+use crate::cartographer::CartographerFilter;
+use crate::store::{Result, Store};
+
+/// Conservative cap on how many Cartographer rows one timeline pulls in.
+/// `crate::cartographer::cartographer_query` itself clamps a single page to
+/// 1000, so this is paginated internally (see [`build_run_timeline`]).
+const MAX_EVENTS: i64 = 2000;
+/// Page size for the internal pagination loop.
+const PAGE_SIZE: i64 = 500;
+/// How much of a referenced terminal-log file to inline per entry (the tail —
+/// most recent output — same convention as `crate::terminal_log::write_attempt`).
+const MAX_LOG_EXCERPT_LINES: usize = 200;
+
+/// Metadata describing one generated timeline (RAL-155 AC: "structured JSON
+/// ... including relevant metadata (run id, task id, time range, source
+/// counts)").
+#[derive(Debug, Clone, Serialize)]
+pub struct RunTimelineMeta {
+    pub run_id: String,
+    /// When this timeline was generated (Unix epoch milliseconds).
+    pub generated_at_ms: i64,
+    /// Earliest entry's `at_ms`, if any.
+    pub start_ms: Option<i64>,
+    /// Latest entry's `at_ms`, if any.
+    pub end_ms: Option<i64>,
+    /// Total Cartographer rows included (after the [`MAX_EVENTS`] cap).
+    pub event_count: i64,
+    /// How many of those rows reference a terminal-log file.
+    pub terminal_log_count: i64,
+    /// Task count from the run's current structure (not derived from the
+    /// possibly-pruned event history).
+    pub task_count: i64,
+    /// Session count from the run's current structure.
+    pub session_count: i64,
+    /// `true` if [`MAX_EVENTS`] was hit — the timeline is a prefix, not the
+    /// full history.
+    pub truncated: bool,
+    /// `true` if the run's own `"run inserted"` inaugural Cartographer row is
+    /// missing from the returned rows, meaning retention pruning has already
+    /// removed some of this run's earlier history (best-effort, Q6).
+    pub gaps_possible: bool,
+}
+
+/// One entry in the merged timeline.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunTimelineEntry {
+    pub at_ms: i64,
+    pub level: String,
+    pub source: String,
+    pub scope: Option<String>,
+    pub task: Option<String>,
+    pub session_id: Option<String>,
+    pub message: String,
+    /// Path to a referenced terminal-log file, if this entry has one.
+    pub log_path: Option<String>,
+    /// The tail of that file's content (bounded by [`MAX_LOG_EXCERPT_LINES`]),
+    /// inlined here so a consumer doesn't need a second round-trip. `None`
+    /// when `log_path` is `None`, or the file was unreadable (already pruned,
+    /// moved, etc. — best-effort).
+    pub log_excerpt: Option<String>,
+}
+
+/// A generated, merged chronological view of one run.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunTimeline {
+    pub meta: RunTimelineMeta,
+    pub entries: Vec<RunTimelineEntry>,
+    /// The same content as `entries`, rendered as plain text — identical to
+    /// what was written to `file_path`.
+    pub text: String,
+    /// Where the rendered text was (best-effort) written on disk, so the
+    /// board's "generate to file, then display" button has something to
+    /// point at. A temp artifact (RAL-155 Q5) — not guaranteed to persist.
+    pub file_path: String,
+}
+
+/// Build the merged, chronological timeline for `run_id`. `NotFound` if the
+/// run doesn't exist (mirrors every other run-scoped `Store` accessor).
+pub fn build_run_timeline(store: &Store, run_id: &str) -> Result<RunTimeline> {
+    let run = store.get_run(run_id)?;
+    let session_count: i64 = run.tasks.iter().map(|t| t.sessions.len() as i64).sum();
+
+    let mut rows = Vec::new();
+    let mut offset = 0i64;
+    let total = loop {
+        let filter = CartographerFilter {
+            run_id: Some(run_id.to_string()),
+            limit: PAGE_SIZE,
+            offset,
+            ascending: true,
+            ..CartographerFilter::default()
+        };
+        let page = store.cartographer_query(&filter)?;
+        let total = page.total;
+        let got = page.rows.len() as i64;
+        rows.extend(page.rows);
+        offset += PAGE_SIZE;
+        if got < PAGE_SIZE || rows.len() as i64 >= MAX_EVENTS || offset >= total {
+            break total;
+        }
+    };
+    let gaps_possible = !rows.iter().any(|r| r.message == "run inserted");
+    let truncated = (rows.len() as i64) < total;
+    rows.truncate(MAX_EVENTS as usize);
+
+    let terminal_log_count = rows.iter().filter(|r| r.log_path.is_some()).count() as i64;
+    let start_ms = rows.first().map(|r| r.at_ms);
+    let end_ms = rows.last().map(|r| r.at_ms);
+
+    let entries: Vec<RunTimelineEntry> = rows
+        .into_iter()
+        .map(|r| {
+            let log_excerpt = r.log_path.as_deref().and_then(read_log_excerpt);
+            RunTimelineEntry {
+                at_ms: r.at_ms,
+                level: r.level,
+                source: r.source,
+                scope: r.scope,
+                task: r.task,
+                session_id: r.session_id,
+                message: r.message,
+                log_path: r.log_path,
+                log_excerpt,
+            }
+        })
+        .collect();
+
+    let generated_at_ms = crate::store::now_ms();
+    let meta = RunTimelineMeta {
+        run_id: run_id.to_string(),
+        generated_at_ms,
+        start_ms,
+        end_ms,
+        event_count: entries.len() as i64,
+        terminal_log_count,
+        task_count: run.tasks.len() as i64,
+        session_count,
+        truncated,
+        gaps_possible,
+    };
+
+    let text = render_text(&meta, &entries);
+    let file_path = write_temp_file(run_id, &text);
+
+    Ok(RunTimeline {
+        meta,
+        entries,
+        text,
+        file_path,
+    })
+}
+
+/// Read the tail of a referenced terminal-log file, or `None` if it's
+/// unreadable (already pruned, moved, permissions — best-effort, never an
+/// error).
+fn read_log_excerpt(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(crate::runner::tail_lines(&content, MAX_LOG_EXCERPT_LINES))
+}
+
+fn render_text(meta: &RunTimelineMeta, entries: &[RunTimelineEntry]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "=== ralphus uber-log timeline: run {} ===\n",
+        meta.run_id
+    ));
+    out.push_str(&format!(
+        "generated={} events={} (truncated={}) terminal_logs={} tasks={} sessions={}\n",
+        format_ts(meta.generated_at_ms),
+        meta.event_count,
+        meta.truncated,
+        meta.terminal_log_count,
+        meta.task_count,
+        meta.session_count,
+    ));
+    if meta.gaps_possible {
+        out.push_str(
+            "NOTE: this run's earliest Cartographer history appears to have been pruned \
+             (retention_days/max_rows) — this timeline is best-effort, not guaranteed complete.\n",
+        );
+    }
+    out.push('\n');
+    for entry in entries {
+        out.push_str(&render_entry(entry));
+        out.push('\n');
+    }
+    out
+}
+
+fn render_entry(entry: &RunTimelineEntry) -> String {
+    let mut ctx = Vec::new();
+    if let Some(scope) = &entry.scope {
+        ctx.push(format!("scope={scope}"));
+    }
+    if let Some(task) = &entry.task {
+        ctx.push(format!("task={task}"));
+    }
+    if let Some(sid) = &entry.session_id {
+        ctx.push(format!("session={sid}"));
+    }
+    let ctx_str = if ctx.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", ctx.join(" "))
+    };
+    let mut out = format!(
+        "[{}] {:<7} {:<12} {}{}",
+        format_ts(entry.at_ms),
+        entry.level.to_uppercase(),
+        entry.source,
+        entry.message,
+        ctx_str,
+    );
+    if let Some(excerpt) = &entry.log_excerpt {
+        if let Some(path) = &entry.log_path {
+            out.push_str(&format!("\n    (terminal log: {path})"));
+        }
+        for line in excerpt.lines() {
+            out.push_str("\n    | ");
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn format_ts(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| at_ms.to_string())
+}
+
+/// Write the rendered timeline to a fixed, per-run path in the OS temp
+/// directory (RAL-155 Q5: a temp artifact, rewritten on every generation, not
+/// required to persist long-term). Best-effort: a write failure is logged but
+/// never fails the request — the caller still gets `text`/`entries` back.
+///
+/// Writes to a unique-per-call sibling path first and renames it into place,
+/// rather than writing `path` directly — `std::fs::write` is not atomic, so
+/// two overlapping generations for the same run (e.g. two quick "Timeline"
+/// clicks) could otherwise interleave and leave a reader observing a torn or
+/// empty file. Rename is atomic on both POSIX and Windows.
+fn write_temp_file(run_id: &str, text: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!("ralphus-timeline-{run_id}.log"));
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = std::env::temp_dir().join(format!(
+        "ralphus-timeline-{run_id}.{}.{unique}.tmp",
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::write(&tmp_path, text).and_then(|()| std::fs::rename(&tmp_path, &path))
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        crate::rlog!(
+            WARNING,
+            "ralphus [timeline] could not write {}: {e}",
+            path.display()
+        );
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Every `Store::open_in_memory()` used in tests starts its run-id sequence
+/// over from `run-000000000001`, so two tests that each seed a fresh store
+/// collide on the exact same `write_temp_file` OS path when cargo runs them
+/// concurrently (the default). Any test that calls `build_run_timeline` --
+/// here or in `server.rs`'s matching route test -- must hold this lock for
+/// its duration so those writes (and any read-back of the resulting file)
+/// never interleave with one another.
+#[cfg(test)]
+pub(crate) static TIMELINE_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cartographer::Note;
+
+    const SAMPLE: &str = r#"
+[[task]]
+name = "build"
+[[task.session]]
+id = "worker"
+cwd = "/repo"
+prompt = "make it build"
+"#;
+
+    fn seeded_run() -> (Store, String) {
+        let mut store = Store::open_in_memory().unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(SAMPLE).expect("valid toml");
+        let run_id = store.insert_run(&file, None, false).unwrap();
+        (store, run_id)
+    }
+
+    #[test]
+    fn unknown_run_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(build_run_timeline(&store, "nope").is_err());
+    }
+
+    #[test]
+    fn includes_the_run_inserted_event_and_reports_no_gaps() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let (store, run_id) = seeded_run();
+        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        assert!(!timeline.meta.gaps_possible);
+        assert!(timeline.entries.iter().any(|e| e.message == "run inserted"));
+        assert_eq!(timeline.meta.task_count, 1);
+        assert_eq!(timeline.meta.session_count, 1);
+        assert!(timeline.text.contains(&run_id));
+    }
+
+    #[test]
+    fn detects_pruning_gaps_when_the_inaugural_event_is_missing() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let (store, run_id) = seeded_run();
+        // Simulate retention pruning having removed the earliest row.
+        store.cartographer_prune(0, 0).ok(); // no-op caps, seed more first
+        Note::new("scheduler")
+            .run(&run_id)
+            .emit(&store, "later event", serde_json::json!({}));
+        // Prune down to just the newest row.
+        store.cartographer_prune(0, 1).unwrap();
+        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        assert!(timeline.meta.gaps_possible);
+    }
+
+    #[test]
+    fn inlines_terminal_log_excerpt_from_log_path() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let (store, run_id) = seeded_run();
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-timeline-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("attempt.log");
+        std::fs::write(&log_file, "hello from the pane\nsecond line").unwrap();
+
+        Note::new("runner")
+            .run(&run_id)
+            .scope("terminal_log")
+            .log_path(log_file.to_str().unwrap())
+            .emit(
+                &store,
+                "terminal log attempt written",
+                serde_json::json!({}),
+            );
+
+        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let entry = timeline
+            .entries
+            .iter()
+            .find(|e| e.log_path.as_deref() == Some(log_file.to_str().unwrap()))
+            .expect("terminal_log entry present");
+        assert_eq!(
+            entry.log_excerpt.as_deref(),
+            Some("hello from the pane\nsecond line")
+        );
+        assert!(timeline.text.contains("hello from the pane"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_log_file_is_best_effort_none() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let (store, run_id) = seeded_run();
+        Note::new("runner")
+            .run(&run_id)
+            .scope("terminal_log")
+            .log_path("/does/not/exist.log")
+            .emit(
+                &store,
+                "terminal log attempt written",
+                serde_json::json!({}),
+            );
+
+        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let entry = timeline
+            .entries
+            .iter()
+            .find(|e| e.log_path.as_deref() == Some("/does/not/exist.log"))
+            .expect("terminal_log entry present");
+        assert_eq!(entry.log_excerpt, None);
+    }
+
+    #[test]
+    fn writes_a_temp_file_containing_the_rendered_text() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let (store, run_id) = seeded_run();
+        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let on_disk = std::fs::read_to_string(&timeline.file_path).unwrap();
+        assert_eq!(on_disk, timeline.text);
+    }
+
+    #[test]
+    fn entries_are_sorted_ascending_by_at_ms_then_id() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let (store, run_id) = seeded_run();
+        for i in 0..5 {
+            Note::new("scheduler").run(&run_id).emit(
+                &store,
+                format!("event {i}"),
+                serde_json::json!({}),
+            );
+        }
+        let timeline = build_run_timeline(&store, &run_id).unwrap();
+        let at_ms: Vec<i64> = timeline.entries.iter().map(|e| e.at_ms).collect();
+        let mut sorted = at_ms.clone();
+        sorted.sort_unstable();
+        assert_eq!(at_ms, sorted);
+    }
+}

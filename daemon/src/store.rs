@@ -166,6 +166,14 @@ impl NodeState {
     pub fn satisfies_dependents(self) -> bool {
         matches!(self, Self::Done | Self::Ignored)
     }
+
+    /// Whether this is a terminal state (no further transitions expected).
+    /// `ignored` is deliberately NOT terminal — it is reversible back to
+    /// `pending`, mirroring [`RunState::is_terminal`].
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
 }
 
 // ── Read views (serialized straight to the API) ──────────────────────────────
@@ -286,6 +294,12 @@ pub struct SessionView {
     /// [`Store::resolve_session_verify_env_overrides`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub verify_env_overrides: BTreeMap<String, String>,
+    /// When this session first entered `running` (Unix epoch milliseconds).
+    /// `None` until it starts. Details-pane "started at" / "time running".
+    pub started_at_ms: Option<i64>,
+    /// When this session last reached a terminal state (Unix epoch
+    /// milliseconds). `None` while pending/running.
+    pub finished_at_ms: Option<i64>,
 }
 
 /// A task as shown in the board.
@@ -331,6 +345,12 @@ pub struct TaskView {
     /// the run, the scheduler only dispatches soloed tasks' sessions; every
     /// other task's sessions stay paused (Pending) until un-soloed.
     pub soloed: bool,
+    /// When this task first entered `running` (Unix epoch milliseconds).
+    /// `None` until it starts. Details-pane "started at" / "time running".
+    pub started_at_ms: Option<i64>,
+    /// When this task last reached a terminal state (Unix epoch
+    /// milliseconds). `None` while pending/running.
+    pub finished_at_ms: Option<i64>,
 }
 
 /// A lightweight reference to a review (guardian) derived from a run.
@@ -376,8 +396,15 @@ pub struct RunView {
     /// to `pending` but the run's worker is still busy with unrelated
     /// sibling sessions.
     pub state: String,
-    /// Creation time (Unix epoch milliseconds).
+    /// Creation time (Unix epoch milliseconds) — when the run was submitted/
+    /// queued, which can differ from when it actually started executing.
     pub created_at_ms: i64,
+    /// When this run first entered `running` (Unix epoch milliseconds).
+    /// `None` until it starts. Details-pane "started at" / "time running".
+    pub started_at_ms: Option<i64>,
+    /// When this run last reached a terminal state (Unix epoch
+    /// milliseconds). `None` while queued/pending/running.
+    pub finished_at_ms: Option<i64>,
     /// The tasks in the run.
     pub tasks: Vec<TaskView>,
     /// Reviews (guardians) derived from this run.
@@ -440,6 +467,10 @@ pub struct ClearOutcome {
     /// per project root — so the caller can purge all on-disk review worktrees.
     /// Multi-project guardians produce multiple entries with the same guardian_id.
     pub guardian_roots: Vec<(String, String)>,
+    /// Ids of every run actually deleted (RAL-154) — so the caller can purge
+    /// each one's durable, on-disk terminal logs, mirroring the single-run
+    /// `delete_run` endpoint's cleanup.
+    pub run_ids: Vec<String>,
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -459,6 +490,27 @@ pub struct Store {
     /// `run_via_tmux` call returns, so this stays bounded by the number of
     /// *currently running* tmux-wrapped sessions, not lifetime history.
     live_activity: HashMap<String, i64>,
+    /// RAL-208: per-guardian debounce bookkeeping for the LLM-authored final
+    /// change summary, keyed by guardian id. In-memory only, like
+    /// `live_activity` above — losing this across a daemon restart just means
+    /// the next enabled-branch-set change regenerates the summary once more
+    /// than strictly necessary, not a correctness issue. See
+    /// `guardian_merge::queue_final_summary_regen`/`sweep_pending_summaries`.
+    guardian_summary_debounce: HashMap<String, GuardianSummaryDebounce>,
+}
+
+/// RAL-208: see [`Store::guardian_summary_debounce`].
+#[derive(Debug, Default, Clone)]
+struct GuardianSummaryDebounce {
+    /// The enabled-branch signature the current LLM-authored `change_summary`
+    /// was generated from. `None` until the first final summary is produced.
+    generated_signature: Option<String>,
+    /// A signature awaiting generation, and when it was last (re)requested.
+    /// Each new request overwrites both fields — that's what implements the
+    /// trailing debounce: the "quiet period" clock restarts on every
+    /// enable/disable toggle instead of accumulating separate pending jobs.
+    pending_signature: Option<String>,
+    pending_requested_at_ms: Option<i64>,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -500,6 +552,7 @@ impl Store {
             conn,
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
         };
         store.init_schema()?;
         Ok(store)
@@ -512,6 +565,7 @@ impl Store {
             conn,
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
         };
         store.init_schema()?;
         Ok(store)
@@ -539,7 +593,9 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 trace_context TEXT,
-                env_overrides TEXT NOT NULL DEFAULT '{}'
+                env_overrides TEXT NOT NULL DEFAULT '{}',
+                started_at_ms  INTEGER,
+                finished_at_ms INTEGER
             );
             CREATE TABLE IF NOT EXISTS tasks (
                 run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -551,6 +607,10 @@ impl Store {
                 state      TEXT NOT NULL,
                 depends_on TEXT NOT NULL DEFAULT '[]',
                 queue_rank REAL,
+                started_at_ms  INTEGER,
+                finished_at_ms INTEGER,
+                no_commit_required INTEGER NOT NULL DEFAULT 0,
+                baseline_commit_sha TEXT,
                 PRIMARY KEY (run_id, idx)
             );
             CREATE TABLE IF NOT EXISTS sessions (
@@ -581,6 +641,8 @@ impl Store {
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
+                started_at_ms  INTEGER,
+                finished_at_ms INTEGER,
                 PRIMARY KEY (run_id, task_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS verifies (
@@ -651,6 +713,28 @@ impl Store {
                 env_overrides       TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (guardian_id, position)
             );
+            -- RAL-193: per-call cost line items for a guardian's own
+            -- conflict-resolution and verifier LLM calls (guardian_merge.rs),
+            -- which previously were logged at best and otherwise discarded.
+            -- `attempt` mirrors `guardians.merge_attempt` at call time, so a
+            -- single merge attempt's total and the cumulative total across
+            -- every rebase/re-merge attempt are both derivable by
+            -- filtering/summing this table. `branch_id` is the stable
+            -- per-branch id (`guardian_branches.id`) for a call scoped to one
+            -- stacked branch, NULL for a review-wide call (chat, combined
+            -- final verify).
+            CREATE TABLE IF NOT EXISTS guardian_costs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                branch_id     TEXT,
+                attempt       INTEGER NOT NULL,
+                kind          TEXT NOT NULL,
+                tokens_in     INTEGER NOT NULL DEFAULT 0,
+                tokens_out    INTEGER NOT NULL DEFAULT 0,
+                cost_usd      REAL NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_guardian_costs_guardian ON guardian_costs(guardian_id);
             CREATE TABLE IF NOT EXISTS events (
                 seq         INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id      TEXT,
@@ -681,6 +765,7 @@ impl Store {
                 guardian_id TEXT,
                 session_id  TEXT,
                 task        TEXT,
+                log_path    TEXT,
                 payload     TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_carto_at ON cartographer_events(at_ms);
@@ -721,6 +806,23 @@ impl Store {
                 -- spawned per command. Opt-in; a provider that does not is used
                 -- exactly as before.
                 supports_channel INTEGER NOT NULL DEFAULT 0
+            );
+            -- RAL-201: the opaque `handle` a machine provider returned for an
+            -- in-flight async `exec` (docs/machine-providers.md), so a daemon
+            -- restart can reconcile it instead of silently orphaning whatever
+            -- was still running remotely. `provision` re-derives the same
+            -- workspace deterministically on restart, but an `exec` handle has
+            -- no such idempotent re-derivation -- without this row, the only
+            -- record that remote work is in flight lived in a Rust
+            -- `Instant`/loop on a thread that a restart just killed.
+            CREATE TABLE IF NOT EXISTS remote_exec_handles (
+                run_id        TEXT NOT NULL,
+                session_id    TEXT NOT NULL,
+                scheme        TEXT NOT NULL,
+                uri           TEXT NOT NULL,
+                handle        TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (run_id, session_id)
             );
             -- RAL-117: a durable, mutable mapping from a guardian's worktree(s) to
             -- the pull request(s) submitted for it. `branch_id` is NULL for a
@@ -964,6 +1066,26 @@ impl Store {
             // overwritten on every restart instead of merged/accumulated --
             // see `ghost::Store::set_ghost_user_note`.
             "ALTER TABLE ghosts ADD COLUMN user_note TEXT",
+            // RAL-210: when a session last transitioned to `running`, so the
+            // board can show session start time. Overwritten on every restart
+            // (see `set_session_state`) rather than kept as a first-start-only
+            // value, per the ticket's decision that only the most recent
+            // running-transition matters.
+            "ALTER TABLE sessions ADD COLUMN started_at_ms INTEGER",
+            // RAL-190: the commit sha last pushed to `branch_alias` on the
+            // remote, so a later sync check can tell "remote moved since we
+            // last touched it" (a reviewer pushed to the PR branch) apart from
+            // "remote still matches what we pushed" (safe to force-push again).
+            // NULL for a PR row created before this column existed, or one
+            // whose push has not completed yet -- both fall back to a
+            // merge-base computation instead of a recorded baseline.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN last_pushed_sha TEXT",
+            // RAL-156: opt-out from the automatic no-new-commits-since-baseline
+            // guard the finalizer runs for git-backed tasks, and the baseline
+            // commit sha captured at task start (first session to reach
+            // Running) that guard compares each session's cwd HEAD against.
+            "ALTER TABLE tasks ADD COLUMN no_commit_required INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN baseline_commit_sha TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1034,9 +1156,59 @@ impl Store {
             // where `null` is a tombstone meaning "remove this inherited key
             // entirely" -- see `Store::resolve_guardian_branch_env`.
             "ALTER TABLE guardian_branches ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-203: the combined review worktree has no upstream task
+            // session of its own to inherit an environment from, so the
+            // finalize-time build/check-gate step against it instead borrows
+            // the last enabled branch's own resolved environment
+            // (`guardian::combined_env_from_branches`) -- this column layers
+            // the review's own build-step overrides on top of that.
+            // Same `{key: value|null}` shape as `guardian_branches.env_overrides`.
+            "ALTER TABLE guardians ADD COLUMN build_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-203: same shape and baseline, for the manual-checks step
+            // (the LLM-suggested commands run via `ralphus review checks
+            // run` / the board's "Run all"). Independent of
+            // `build_env_overrides` -- setting one never affects the other.
+            "ALTER TABLE guardians ADD COLUMN manual_checks_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-193: this review's own USD spend cap (from `[[review]]`'s
+            // `maximum_budget_usd`), enforced against the cumulative sum of
+            // `guardian_costs` the same way a task/session cap is enforced
+            // against a live `cost_usd` (RAL-161).
+            "ALTER TABLE guardians ADD COLUMN maximum_budget_usd REAL",
+            // RAL-193: incrementing counter bumped once per merge/rebase
+            // attempt, so cost line items in `guardian_costs` can be
+            // attributed to the attempt that produced them.
+            "ALTER TABLE guardians ADD COLUMN merge_attempt INTEGER NOT NULL DEFAULT 0",
+            // Details-pane "time running" / "started at" (UTC): when a run/task/
+            // session first entered `running` and when it last reached a terminal
+            // state. NULL until reached. Distinct from `created_at_ms`
+            // (submission/queue time), which can differ from actual execution
+            // start. See `Store::set_run_state`/`set_task_state`/
+            // `set_session_state`/`record_session_result` for where these are
+            // stamped, and the restart/reset paths that clear them for entities
+            // being genuinely re-executed. `sessions.started_at_ms` is already
+            // added by the RAL-210 migration above, so only `finished_at_ms`
+            // is needed for `sessions` here.
+            "ALTER TABLE runs ADD COLUMN started_at_ms INTEGER",
+            "ALTER TABLE runs ADD COLUMN finished_at_ms INTEGER",
+            "ALTER TABLE tasks ADD COLUMN started_at_ms INTEGER",
+            "ALTER TABLE tasks ADD COLUMN finished_at_ms INTEGER",
+            "ALTER TABLE sessions ADD COLUMN finished_at_ms INTEGER",
+            // RAL-155: path to an on-disk log file a Cartographer row
+            // references (e.g. a RAL-154 durable terminal-log attempt file),
+            // carried by path rather than embedding the file's content — see
+            // `crate::cartographer::CartographerRow::log_path`.
+            "ALTER TABLE cartographer_events ADD COLUMN log_path TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
+        // RAL-155: task-scoped Cartographer filtering (`?task=`, and the
+        // `entity=task:...` addressing scheme) needs this to not degrade into
+        // a full-table scan as `cartographer_events` grows. Created after the
+        // ALTER-TABLE migrations above, same reasoning as `idx_sessions_review_branch`.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_carto_task ON cartographer_events(task)",
+            [],
+        );
         // RAL-121: `hydrate_guardian` looks up each branch's most recent session
         // by `review_branch` (set once, at submit time, by
         // `reviews::derive_reviews` -> `set_session_review_branch`; RAL-118's
@@ -1230,7 +1402,7 @@ impl Store {
         for (t_idx, task) in file.task.iter().enumerate() {
             let t_idx_i = i64::try_from(t_idx).unwrap_or(0);
             tx.execute(
-                "INSERT INTO tasks(run_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks(run_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     run_id,
                     t_idx_i,
@@ -1247,6 +1419,7 @@ impl Store {
                     // write to (RAL-150) -- from here on the two are
                     // indistinguishable.
                     to_json_map(&task.environment),
+                    task.no_commit_required,
                 ],
             )?;
 
@@ -1363,6 +1536,7 @@ impl Store {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"state": state.as_str(), "tasks": file.task.len()}),
         });
         Ok(())
@@ -1378,6 +1552,22 @@ impl Store {
         scope: &str,
         reference: Option<&str>,
         message: &str,
+    ) -> Result<()> {
+        self.log_event_with_task(run_id, guardian_id, scope, reference, message, None)
+    }
+
+    /// [`Store::log_event`], plus a task name for callers that already know
+    /// it (RAL-155 Q2: task-scoped Cartographer filtering needs the `task`
+    /// column populated on task/session state transitions, not just on the
+    /// scheduler/runner's own session-execution events).
+    pub fn log_event_with_task(
+        &self,
+        run_id: Option<&str>,
+        guardian_id: Option<&str>,
+        scope: &str,
+        reference: Option<&str>,
+        message: &str,
+        task: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO events(run_id, guardian_id, scope, ref, message, at_ms)
@@ -1395,7 +1585,8 @@ impl Store {
             run_id,
             guardian_id,
             session_id: None,
-            task: None,
+            task,
+            log_path: None,
             payload: reference.map_or(serde_json::json!({}), |r| serde_json::json!({"ref": r})),
         });
         Ok(())
@@ -1445,12 +1636,30 @@ impl Store {
         RunState::parse(&s).ok_or(StoreError::NotFound)
     }
 
-    /// Set a run's state.
+    /// Set a run's state. Also stamps `started_at_ms` (once, the first time the
+    /// run enters `running`) and `finished_at_ms` (every time it enters a
+    /// terminal state, so a re-finish after a verify-only restart reflects the
+    /// latest completion) — see the "Details-pane" migration comment in
+    /// `init_schema` for the field semantics.
     pub fn set_run_state(&self, id: &str, state: RunState) -> Result<()> {
         let old = self.run_state(id).map(|s| s.as_str()).unwrap_or("unknown");
+        let now = now_ms();
+        let entering_running = i64::from(state == RunState::Running);
+        let entering_terminal = i64::from(state.is_terminal());
         let n = self.conn.execute(
-            "UPDATE runs SET state=?, updated_at_ms=? WHERE id=?",
-            params![state.as_str(), now_ms(), id],
+            "UPDATE runs SET state=?, updated_at_ms=?,
+                 started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+             WHERE id=?",
+            params![
+                state.as_str(),
+                now,
+                entering_running,
+                now,
+                entering_terminal,
+                now,
+                id
+            ],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -1617,7 +1826,11 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Set a session's state.
+    /// Set a session's state. Also stamps `started_at_ms` (once, the first
+    /// time the session enters `running`) and `finished_at_ms` (every time it
+    /// enters a terminal state, so a re-finish after a verify-only restart
+    /// reflects the latest completion) — see [`Store::set_run_state`]'s doc
+    /// comment for the shared semantics.
     pub fn set_session_state(
         &self,
         run_id: &str,
@@ -1636,53 +1849,94 @@ impl Store {
             .ok()
             .flatten()
             .unwrap_or_else(|| "unknown".to_string());
+        let now = now_ms();
+        let entering_running = i64::from(state == NodeState::Running);
+        let entering_terminal = i64::from(state.is_terminal());
         self.conn.execute(
-            "UPDATE sessions SET state=? WHERE run_id=? AND task_idx=? AND idx=?",
-            params![state.as_str(), run_id, task_idx, idx],
+            "UPDATE sessions SET state=?,
+                 started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+             WHERE run_id=? AND task_idx=? AND idx=?",
+            params![
+                state.as_str(),
+                entering_running,
+                now,
+                entering_terminal,
+                now,
+                run_id,
+                task_idx,
+                idx
+            ],
         )?;
         crate::rlog!(
             DEBUG,
             "ralphus [state] session {run_id}/t{task_idx}/s{idx} {old} → {}",
             state.as_str()
         );
-        let _ = self.log_event(
+        // RAL-155 Q2: populate Cartographer's `task` column on session
+        // transitions too, not just `log_event`'s legacy free-text `ref`, so
+        // task-scoped filtering (and the uber-log-viewer) surfaces these.
+        // Best-effort: a session whose owning task was deleted mid-flight
+        // (shouldn't happen — cascade-deleted together) just logs with no task.
+        let task_name = self.task_name_at(run_id, task_idx).ok().flatten();
+        let _ = self.log_event_with_task(
             Some(run_id),
             None,
             "session",
             Some(&format!("t{task_idx}/s{idx}")),
             &format!("session → {}", state.as_str()),
+            task_name.as_deref(),
         );
         Ok(())
     }
 
-    /// Set a task node's state.
+    /// Set a task node's state. Also stamps `started_at_ms`/`finished_at_ms` —
+    /// see [`Store::set_run_state`]'s doc comment for the shared semantics.
     pub fn set_task_state(&self, run_id: &str, task_idx: i64, state: NodeState) -> Result<()> {
-        let old = self
+        let row = self
             .conn
             .query_row(
-                "SELECT state FROM tasks WHERE run_id=? AND idx=?",
+                "SELECT state, name FROM tasks WHERE run_id=? AND idx=?",
                 params![run_id, task_idx],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()
             .ok()
-            .flatten()
-            .unwrap_or_else(|| "unknown".to_string());
+            .flatten();
+        let old = row
+            .as_ref()
+            .map_or_else(|| "unknown".to_string(), |(s, _)| s.clone());
+        let task_name = row.map(|(_, name)| name);
+        let now = now_ms();
+        let entering_running = i64::from(state == NodeState::Running);
+        let entering_terminal = i64::from(state.is_terminal());
         self.conn.execute(
-            "UPDATE tasks SET state=? WHERE run_id=? AND idx=?",
-            params![state.as_str(), run_id, task_idx],
+            "UPDATE tasks SET state=?,
+                 started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+             WHERE run_id=? AND idx=?",
+            params![
+                state.as_str(),
+                entering_running,
+                now,
+                entering_terminal,
+                now,
+                run_id,
+                task_idx
+            ],
         )?;
         crate::rlog!(
             INFO,
             "ralphus [state] task {run_id}/t{task_idx} {old} → {}",
             state.as_str()
         );
-        let _ = self.log_event(
+        let _ = self.log_event_with_task(
             Some(run_id),
             None,
             "task",
             Some(&format!("t{task_idx}")),
             &format!("task → {}", state.as_str()),
+            task_name.as_deref(),
         );
         Ok(())
     }
@@ -1790,6 +2044,41 @@ impl Store {
         Ok(raw.and_then(|s| NodeState::parse(&s)))
     }
 
+    /// The task name at `(run_id, task_idx)`, or `None` if no such task
+    /// exists. Used to translate an [`crate::entity_uri::EntityUri::Task`]
+    /// (addressed by index, like every other entity URI) into Cartographer's
+    /// `task` column, which stores the task's *name* (RAL-155 Q2).
+    pub fn task_name_at(&self, run_id: &str, task_idx: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The session id (`sid`) at `(run_id, task_idx, session_idx)`, or `None`
+    /// if no such session exists. Used the same way as [`Store::task_name_at`]
+    /// to translate an index-addressed [`crate::entity_uri::EntityUri::Session`]
+    /// into Cartographer's `session_id` column.
+    pub fn session_sid_at(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+        session_idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sid FROM sessions WHERE run_id=? AND task_idx=? AND idx=?",
+                params![run_id, task_idx, session_idx],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Whether any session-scope verify step for `(task_idx, session_idx)` at
     /// index >= `from_idx` is currently `Running`. Verify steps within one
     /// scope run sequentially, so at most one can be, but this checks
@@ -1833,7 +2122,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, label, state, created_at_ms, env_overrides FROM runs WHERE id=?",
+                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM runs WHERE id=?",
                 params![id],
                 |r| {
                     Ok((
@@ -1841,13 +2130,23 @@ impl Store {
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        self.build_run_view(row.0, row.1, row.2, row.3, from_json_map(&row.4))
+        self.build_run_view(
+            row.0,
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            row.5,
+            from_json_map(&row.6),
+        )
     }
 
     /// Fetch all runs, newest first.
@@ -1856,7 +2155,7 @@ impl Store {
         // deterministically. Run ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, state, created_at_ms, env_overrides FROM runs ORDER BY created_at_ms DESC, id DESC",
+            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM runs ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -1865,13 +2164,15 @@ impl Store {
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, label, state, ts, env)| {
-                self.build_run_view(id, label, state, ts, from_json_map(&env))
+            .map(|(id, label, state, ts, started, finished, env)| {
+                self.build_run_view(id, label, state, ts, started, finished, from_json_map(&env))
             })
             .collect()
     }
@@ -1919,16 +2220,19 @@ impl Store {
         Ok(GlobalGraph { nodes, edges })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_run_view(
         &self,
         id: String,
         label: Option<String>,
         state: String,
         created_at_ms: i64,
+        started_at_ms: Option<i64>,
+        finished_at_ms: Option<i64>,
         env_overrides: BTreeMap<String, String>,
     ) -> Result<RunView> {
         let mut tstmt = self.conn.prepare(
-            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, verify_env_overrides, soloed
+            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, verify_env_overrides, soloed, started_at_ms, finished_at_ms
              FROM tasks WHERE run_id=? ORDER BY idx",
         )?;
         let task_rows = tstmt
@@ -1944,6 +2248,8 @@ impl Store {
                     r.get::<_, String>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, bool>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1951,14 +2257,39 @@ impl Store {
         // Map each guardian branch of this run back to its review, so a session
         // whose review branch is in a guardian's stack lists that review (RAL-17).
         let review_by_branch = self.reviews_by_branch(&id)?;
+        // Fetch every verify step and session belonging to this run in one
+        // statement each (grouped in memory below), rather than one query per
+        // task/session as before -- a run with hundreds of tasks turned that
+        // into thousands of individual SQL statements, all serialized under
+        // the daemon's single store lock, which is what made `GET /api/tasks`
+        // slow enough to stall restart/status-flip requests queued behind it.
+        let verifies_by_scope = self.verifies_by_scope(&id)?;
+        let mut sessions_by_task =
+            self.sessions_by_task(&id, &review_by_branch, &verifies_by_scope)?;
         let mut tasks = Vec::with_capacity(task_rows.len());
-        for (t_idx, name, project, agent, model, tstate, deps, task_env, task_verify_env, soloed) in
-            task_rows
+        for (
+            t_idx,
+            name,
+            project,
+            agent,
+            model,
+            tstate,
+            deps,
+            task_env,
+            task_verify_env,
+            soloed,
+            t_started,
+            t_finished,
+        ) in task_rows
         {
-            let sessions = self.sessions_for(&id, t_idx, &review_by_branch)?;
+            let sessions = sessions_by_task.remove(&t_idx).unwrap_or_default();
             let project = project.unwrap_or_else(|| {
                 fallback_project_identifier(sessions.first().and_then(|s| s.cwd.as_deref()))
             });
+            let verify = verifies_by_scope
+                .get(&(t_idx, "task".to_string(), -1))
+                .cloned()
+                .unwrap_or_default();
             tasks.push(TaskView {
                 name,
                 project,
@@ -1966,11 +2297,13 @@ impl Store {
                 model,
                 state: tstate,
                 sessions,
-                verify: self.verifies_for(&id, t_idx, "task", -1)?,
+                verify,
                 depends_on: from_json(&deps),
                 env_overrides: from_json_map(&task_env),
                 verify_env_overrides: from_json_map(&task_verify_env),
                 soloed,
+                started_at_ms: t_started,
+                finished_at_ms: t_finished,
             });
         }
 
@@ -1981,6 +2314,8 @@ impl Store {
             label,
             state,
             created_at_ms,
+            started_at_ms,
+            finished_at_ms,
             tasks,
             reviews,
             env_overrides,
@@ -2005,57 +2340,69 @@ impl Store {
         Ok(rows)
     }
 
-    fn sessions_for(
+    /// All sessions belonging to `run_id`, fetched in one statement and
+    /// grouped by `task_idx` — the bulk counterpart to a per-task session
+    /// query. `verifies_by_scope` must already hold this run's verify steps
+    /// (see [`Self::verifies_by_scope`]) so each session's own verify list
+    /// can be attached without a further per-session query.
+    fn sessions_by_task(
         &self,
         run_id: &str,
-        task_idx: i64,
         review_by_branch: &HashMap<String, Vec<RunReviewRef>>,
-    ) -> Result<Vec<SessionView>> {
-        // Fetch the session rows first (dropping the statement), then attach each
-        // session's own verify steps — `verifies_for` re-borrows `self.conn`.
-        let mut rows: Vec<(i64, SessionView)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, verify_env_overrides
-                 FROM sessions WHERE run_id=? AND task_idx=? ORDER BY idx",
-            )?;
-            stmt.query_map(params![run_id, task_idx], |r| {
-                let review_branch: Option<String> = r.get(15)?;
+        verifies_by_scope: &HashMap<(i64, String, i64), Vec<VerifyView>>,
+    ) -> Result<HashMap<i64, Vec<SessionView>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, verify_env_overrides, started_at_ms, finished_at_ms
+             FROM sessions WHERE run_id=? ORDER BY task_idx, idx",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                let task_idx: i64 = r.get(0)?;
+                let idx: i64 = r.get(1)?;
+                let review_branch: Option<String> = r.get(16)?;
                 let reviews = review_branch
                     .and_then(|b| review_by_branch.get(&b).cloned())
                     .unwrap_or_default();
                 Ok((
-                    r.get::<_, i64>(0)?,
+                    task_idx,
+                    idx,
                     SessionView {
-                        id: r.get::<_, String>(1)?,
-                        name: r.get::<_, Option<String>>(2)?,
-                        cwd: r.get::<_, Option<String>>(3)?,
-                        agent: r.get::<_, String>(4)?,
-                        model: r.get::<_, Option<String>>(5)?,
-                        state: r.get::<_, String>(6)?,
-                        tokens_in: r.get::<_, i64>(7)?,
-                        tokens_out: r.get::<_, i64>(8)?,
-                        cost_usd: r.get::<_, f64>(9)?,
-                        error: r.get::<_, Option<String>>(10)?,
-                        prompt: r.get::<_, Option<String>>(11)?,
-                        command: r.get::<_, Option<String>>(12)?,
-                        system_prompt: r.get::<_, Option<String>>(13)?,
-                        depends_on: from_json(&r.get::<_, String>(14)?),
+                        id: r.get::<_, String>(2)?,
+                        name: r.get::<_, Option<String>>(3)?,
+                        cwd: r.get::<_, Option<String>>(4)?,
+                        agent: r.get::<_, String>(5)?,
+                        model: r.get::<_, Option<String>>(6)?,
+                        state: r.get::<_, String>(7)?,
+                        tokens_in: r.get::<_, i64>(8)?,
+                        tokens_out: r.get::<_, i64>(9)?,
+                        cost_usd: r.get::<_, f64>(10)?,
+                        error: r.get::<_, Option<String>>(11)?,
+                        prompt: r.get::<_, Option<String>>(12)?,
+                        command: r.get::<_, Option<String>>(13)?,
+                        system_prompt: r.get::<_, Option<String>>(14)?,
+                        depends_on: from_json(&r.get::<_, String>(15)?),
                         verify: Vec::new(),
                         reviews,
-                        agent_session_id: r.get::<_, Option<String>>(16)?,
-                        maximum_budget_usd: r.get::<_, Option<f64>>(17)?,
-                        env_overrides: from_json_map(&r.get::<_, String>(18)?),
-                        verify_env_overrides: from_json_map(&r.get::<_, String>(19)?),
+                        agent_session_id: r.get::<_, Option<String>>(17)?,
+                        maximum_budget_usd: r.get::<_, Option<f64>>(18)?,
+                        env_overrides: from_json_map(&r.get::<_, String>(19)?),
+                        verify_env_overrides: from_json_map(&r.get::<_, String>(20)?),
+                        started_at_ms: r.get::<_, Option<i64>>(21)?,
+                        finished_at_ms: r.get::<_, Option<i64>>(22)?,
                     },
                 ))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for (idx, session) in rows.iter_mut() {
-            session.verify = self.verifies_for(run_id, task_idx, "session", *idx)?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut map: HashMap<i64, Vec<SessionView>> = HashMap::new();
+        for (task_idx, idx, mut session) in rows {
+            session.verify = verifies_by_scope
+                .get(&(task_idx, "session".to_string(), idx))
+                .cloned()
+                .unwrap_or_default();
             session.state = effective_session_state(&session.state, &session.verify);
+            map.entry(task_idx).or_default().push(session);
         }
-        Ok(rows.into_iter().map(|(_, session)| session).collect())
+        Ok(map)
     }
 
     /// Map each of this run's session branches back to the reviews containing
@@ -2093,6 +2440,53 @@ impl Store {
         let mut map: HashMap<String, Vec<RunReviewRef>> = HashMap::new();
         for (branch, rref) in rows {
             map.entry(branch).or_default().push(rref);
+        }
+        Ok(map)
+    }
+
+    /// All verify steps belonging to `run_id`, fetched in one statement and
+    /// grouped by `(task_idx, scope, session_idx)` — the same key
+    /// [`Self::verifies_for`] filters on, but for the whole run at once.
+    /// Used by `build_run_view` so listing a run's board view costs a
+    /// constant number of queries regardless of how many tasks/sessions it
+    /// has, instead of one query per task/session.
+    fn verifies_by_scope(
+        &self,
+        run_id: &str,
+    ) -> Result<HashMap<(i64, String, i64), Vec<VerifyView>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, scope, session_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM verifies
+             WHERE run_id=? ORDER BY task_idx, scope, session_idx, idx",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    VerifyView {
+                        id: r.get::<_, Option<String>>(3)?,
+                        kind: r.get::<_, String>(4)?,
+                        state: r.get::<_, String>(5)?,
+                        output: r.get::<_, Option<String>>(6)?,
+                        spec: r.get::<_, String>(7)?,
+                        system_prompt: r.get::<_, Option<String>>(8)?,
+                        model: r.get::<_, Option<String>>(9)?,
+                        agent: r.get::<_, String>(10)?,
+                        agent_session_id: r.get::<_, Option<String>>(11)?,
+                        tokens_in: r.get::<_, i64>(12)?,
+                        tokens_out: r.get::<_, i64>(13)?,
+                        cost_usd: r.get::<_, f64>(14)?,
+                        env_overrides: from_json_map(&r.get::<_, String>(15)?),
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut map: HashMap<(i64, String, i64), Vec<VerifyView>> = HashMap::new();
+        for (task_idx, scope, session_idx, v) in rows {
+            map.entry((task_idx, scope, session_idx))
+                .or_default()
+                .push(v);
         }
         Ok(map)
     }
@@ -2158,6 +2552,7 @@ impl Store {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"name": name, "path": path, "vcs": vcs}),
         });
         Ok(())
@@ -2578,6 +2973,23 @@ pub struct TaskRow {
     pub soloed: bool,
 }
 
+/// What the finalizer's no-new-commits-since-baseline guard (RAL-156) needs
+/// to decide whether a task passes: its registered project (to check
+/// git-ness), its `no_commit_required` opt-out, and the baseline commit sha
+/// captured at task start. See [`Store::task_commit_guard_info`].
+#[derive(Debug, Clone)]
+pub struct TaskCommitGuardInfo {
+    /// Registered project name, if any. `None` means the task isn't
+    /// git-backed (RAL-156 Q1) and the guard never runs.
+    pub project: Option<String>,
+    /// Opts the task out of the guard entirely (RAL-156 Q4).
+    pub no_commit_required: bool,
+    /// The task-scoped baseline commit sha captured at task start, or `None`
+    /// if no session has captured one yet (e.g. no session has started, or
+    /// none could resolve a `HEAD`).
+    pub baseline_commit_sha: Option<String>,
+}
+
 /// The full set of entities a restart would dirty (RAL-104): sessions/tasks
 /// reset to Pending within the target run, and other runs — transitively
 /// dependent on it — that get dirtied too. Computed once by
@@ -2692,6 +3104,41 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Fetch what the RAL-156 no-new-commits guard needs for one task.
+    /// `Ok(None)` when the `(run_id, task_idx)` pair doesn't exist.
+    pub fn task_commit_guard_info(
+        &self,
+        run_id: &str,
+        task_idx: i64,
+    ) -> Result<Option<TaskCommitGuardInfo>> {
+        self.conn
+            .query_row(
+                "SELECT project, no_commit_required, baseline_commit_sha FROM tasks WHERE run_id=? AND idx=?",
+                params![run_id, task_idx],
+                |r| {
+                    Ok(TaskCommitGuardInfo {
+                        project: r.get(0)?,
+                        no_commit_required: r.get::<_, i64>(1)? != 0,
+                        baseline_commit_sha: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Capture a task's RAL-156 baseline commit sha, the first time only:
+    /// a no-op if this task already has one (`baseline_commit_sha IS NULL` in
+    /// the WHERE clause), so whichever of the task's sessions reaches
+    /// `Running` first wins and later sessions never clobber it.
+    pub fn set_task_baseline_commit(&self, run_id: &str, task_idx: i64, sha: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET baseline_commit_sha=?1 WHERE run_id=?2 AND idx=?3 AND baseline_commit_sha IS NULL",
+            params![sha, run_id, task_idx],
+        )?;
+        Ok(())
     }
 
     /// The cross-run dependency references declared in the run's `[[default]]`.
@@ -2880,6 +3327,8 @@ impl Store {
             "ralphus [state] verify {run_id}/t{task_idx}/{scope}/#{idx} {old} → {}",
             state.as_str()
         );
+        // RAL-155 Q2: same reasoning as `set_task_state`/`set_session_state`.
+        let task_name = self.task_name_at(run_id, task_idx).ok().flatten();
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::DEBUG,
             source: "store",
@@ -2888,7 +3337,8 @@ impl Store {
             run_id: Some(run_id),
             guardian_id: None,
             session_id: None,
-            task: None,
+            task: task_name.as_deref(),
+            log_path: None,
             payload: serde_json::json!({
                 "task_idx": task_idx,
                 "verify_scope": scope,
@@ -3421,17 +3871,24 @@ impl Store {
     /// applied after an edit, so the run re-executes with the new values. A
     /// currently-running worker's final state write is skipped (see the
     /// scheduler), so this effectively stops in-flight work.
+    ///
+    /// Also clears `started_at_ms`/`finished_at_ms` on the run and its tasks
+    /// and sessions: this is a genuine fresh re-execution, so the old start
+    /// time must not linger (it would otherwise survive the `COALESCE` in
+    /// [`Store::set_run_state`]/[`Store::set_task_state`]/
+    /// [`Store::set_session_state`] and make the Details Pane show an
+    /// inflated elapsed duration once it starts running again).
     pub fn reset_run_to_pending(&self, run_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
+            "UPDATE runs SET state='pending', updated_at_ms=?, started_at_ms=NULL, finished_at_ms=NULL WHERE id=?",
             params![now_ms(), run_id],
         )?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending' WHERE run_id=?",
+            "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=?",
             params![run_id],
         )?;
         self.conn.execute(
-            "UPDATE sessions SET state='pending', error=NULL WHERE run_id=?",
+            "UPDATE sessions SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=?",
             params![run_id],
         )?;
         self.conn.execute(
@@ -3471,6 +3928,7 @@ impl Store {
                 guardian_id: None,
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({}),
             });
             self.conn.execute(
@@ -3796,12 +4254,18 @@ impl Store {
     /// Pending, and dirty every run that depends on this one (RAL-19). Upstream
     /// sessions stay Done and are skipped on re-run. Returns the dirtied
     /// dependent run ids.
+    ///
+    /// Clears `started_at_ms`/`finished_at_ms` on the restarted sessions and
+    /// their owning tasks (genuinely re-executing — see
+    /// [`Store::reset_run_to_pending`]'s doc comment), but deliberately leaves
+    /// the run's own `started_at_ms` alone: the run as a whole already started
+    /// earlier and other, unaffected sessions may still be `Done`.
     pub fn restart_session(&self, run_id: &str, task_idx: i64, idx: i64) -> Result<Vec<String>> {
         let impact = self.compute_session_restart_impact(run_id, task_idx, idx)?;
 
         for s in &impact.sessions {
             self.conn.execute(
-                "UPDATE sessions SET state='pending', error=NULL WHERE run_id=? AND task_idx=? AND idx=?",
+                "UPDATE sessions SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=? AND task_idx=? AND idx=?",
                 params![run_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
@@ -3811,7 +4275,7 @@ impl Store {
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending' WHERE run_id=? AND idx=?",
+                "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE run_id=? AND idx=?",
                 params![run_id, t.idx],
             )?;
             self.conn.execute(
@@ -3820,7 +4284,7 @@ impl Store {
             )?;
         }
         self.conn.execute(
-            "UPDATE runs SET state='pending', updated_at_ms=? WHERE id=?",
+            "UPDATE runs SET state='pending', updated_at_ms=?, finished_at_ms=NULL WHERE id=?",
             params![now_ms(), run_id],
         )?;
         let _ = self.log_event(
@@ -4138,6 +4602,11 @@ impl Store {
                     g.projects.into_iter().map(move |p| (id.clone(), p))
                 })
                 .collect();
+            let run_ids: Vec<String> = {
+                let mut stmt = self.conn.prepare("SELECT id FROM runs")?;
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
             let tx = self.conn.transaction()?;
             tx.execute("DELETE FROM events", [])?;
             tx.execute("DELETE FROM verifies", [])?;
@@ -4148,6 +4617,7 @@ impl Store {
             tx.execute("DELETE FROM guardian_branches", [])?;
             tx.execute("DELETE FROM guardian_messages", [])?;
             tx.execute("DELETE FROM guardian_input_resolutions", [])?;
+            tx.execute("DELETE FROM guardian_costs", [])?;
             let guardians_deleted = tx.execute("DELETE FROM guardians", [])?;
             // Reset id sequences so the next run/guardian id restarts at 1.
             tx.execute(
@@ -4159,6 +4629,7 @@ impl Store {
                 runs_deleted,
                 guardians_deleted,
                 guardian_roots,
+                run_ids,
             });
         }
         // Filtered: delete only runs whose state matches, plus their children.
@@ -4187,6 +4658,7 @@ impl Store {
             runs_deleted: ids.len(),
             guardians_deleted: 0,
             guardian_roots: Vec::new(),
+            run_ids: ids,
         })
     }
 
@@ -4229,6 +4701,12 @@ impl Store {
     /// a failed dependency), and a same-state re-write (the blocked-by-
     /// failed-dependency path calls [`Self::set_session_state`] directly
     /// before also calling this for the other outcome fields).
+    ///
+    /// Also stamps `finished_at_ms` when `outcome.state` is terminal — this is
+    /// the primary path by which a session's real completion is recorded (see
+    /// [`Store::set_run_state`]'s doc comment for the shared timestamp
+    /// semantics); `started_at_ms` is not touched here since a session only
+    /// ever reaches this function after already having been marked `running`.
     pub fn record_session_result(
         &self,
         run_id: &str,
@@ -4236,8 +4714,10 @@ impl Store {
         idx: i64,
         outcome: &SessionOutcome,
     ) -> Result<()> {
+        let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE sessions SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, agent_session_id=COALESCE(?, agent_session_id)
+            "UPDATE sessions SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE run_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 outcome.state.as_str(),
@@ -4246,6 +4726,8 @@ impl Store {
                 outcome.cost_usd,
                 outcome.error.as_deref(),
                 outcome.agent_session_id.as_deref(),
+                entering_terminal,
+                now_ms(),
                 run_id,
                 task_idx,
                 idx,
@@ -4447,6 +4929,64 @@ impl Store {
     /// cleared) is not an error.
     pub fn clear_live_activity(&mut self, session_name: &str) {
         self.live_activity.remove(session_name);
+    }
+
+    /// RAL-208: request that guardian `id`'s LLM-authored final change
+    /// summary be (re)generated for the given enabled-branch `signature`. A
+    /// no-op if `signature` already matches the signature the *current*
+    /// summary was generated from — nothing about the branch set actually
+    /// changed, so there is nothing to regenerate (this is what keeps a
+    /// restack triggered by feedback, a manual push, or a base-branch shift
+    /// from re-firing the LLM: none of those change which branches are
+    /// enabled). Otherwise (re)starts this guardian's debounce clock; see
+    /// [`Self::take_due_final_summary_requests`].
+    pub fn request_final_summary(&mut self, id: &str, signature: &str, now_ms: i64) {
+        let d = self
+            .guardian_summary_debounce
+            .entry(id.to_string())
+            .or_default();
+        if d.generated_signature.as_deref() == Some(signature) {
+            return;
+        }
+        d.pending_signature = Some(signature.to_string());
+        d.pending_requested_at_ms = Some(now_ms);
+    }
+
+    /// RAL-208: atomically claim every guardian whose pending
+    /// [`Self::request_final_summary`] has gone `debounce_ms` without a
+    /// newer request — i.e. its "quiet period" has elapsed — clearing their
+    /// pending state so a concurrent duplicate sweep finds nothing left to
+    /// claim. Returns `(guardian_id, signature)` pairs for the caller to
+    /// actually generate (a background call, well outside this lock).
+    pub fn take_due_final_summary_requests(
+        &mut self,
+        now_ms: i64,
+        debounce_ms: i64,
+    ) -> Vec<(String, String)> {
+        let mut due = Vec::new();
+        for (id, d) in &mut self.guardian_summary_debounce {
+            let Some(requested_at) = d.pending_requested_at_ms else {
+                continue;
+            };
+            if now_ms.saturating_sub(requested_at) >= debounce_ms {
+                if let Some(sig) = d.pending_signature.take() {
+                    due.push((id.clone(), sig));
+                }
+                d.pending_requested_at_ms = None;
+            }
+        }
+        due
+    }
+
+    /// RAL-208: record that guardian `id`'s change summary now reflects
+    /// `signature`, so a later request for the same signature is recognized
+    /// as already-satisfied (see [`Self::request_final_summary`]).
+    pub fn mark_final_summary_generated(&mut self, id: &str, signature: &str) {
+        let d = self
+            .guardian_summary_debounce
+            .entry(id.to_string())
+            .or_default();
+        d.generated_signature = Some(signature.to_string());
     }
 
     /// Fetch a task's first (lowest-`idx`) session's cwd — the cwd a
@@ -5017,6 +5557,7 @@ impl Store {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"items": ordered.len()}),
         });
         Ok(ordered)
@@ -5050,6 +5591,7 @@ impl Store {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({
                 "n": selected.len(),
                 "position": position,
@@ -5432,6 +5974,7 @@ command = "cargo test"
             conn,
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
         };
         store
             .init_schema()
@@ -5521,6 +6064,7 @@ command = "cargo test"
             conn,
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
         };
         store
             .init_schema()
@@ -5631,7 +6175,9 @@ system_prompt = "Do NOT commit and do NOT push under any circumstances."
 system_prompt_position = "append"
 "#;
         let mut store = Store::open_in_memory().unwrap();
-        let id = store.insert_run(&parse(src), Some("system prompt"), false).unwrap();
+        let id = store
+            .insert_run(&parse(src), Some("system prompt"), false)
+            .unwrap();
 
         let run = store.get_run(&id).unwrap();
         let session = &run.tasks[0].sessions[0];
@@ -5705,6 +6251,29 @@ name = "empty"
         );
         assert_eq!(fallback_project_identifier(Some("/")), "unassigned");
         assert_eq!(fallback_project_identifier(None), "unassigned");
+    }
+
+    #[test]
+    fn task_name_at_resolves_index_to_name() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(
+            store.task_name_at(&id, 0).unwrap().as_deref(),
+            Some("build")
+        );
+        assert_eq!(store.task_name_at(&id, 99).unwrap(), None);
+        assert_eq!(store.task_name_at("nope", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn session_sid_at_resolves_index_to_sid() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(
+            store.session_sid_at(&id, 0, 0).unwrap().as_deref(),
+            Some("worker")
+        );
+        assert_eq!(store.session_sid_at(&id, 0, 99).unwrap(), None);
     }
 
     #[test]
@@ -7294,6 +7863,213 @@ command = "y"
     }
 
     #[test]
+    fn run_state_stamps_started_and_finished_at() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(run.started_at_ms.is_none());
+        assert!(run.finished_at_ms.is_none());
+
+        store.set_run_state(&id, RunState::Running).unwrap();
+        let run = store.get_run(&id).unwrap();
+        let started = run.started_at_ms.expect("started_at_ms set on running");
+        assert!(run.finished_at_ms.is_none());
+
+        store.set_run_state(&id, RunState::Done).unwrap();
+        let run = store.get_run(&id).unwrap();
+        // started_at_ms is untouched by the terminal transition.
+        assert_eq!(run.started_at_ms, Some(started));
+        assert!(run.finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn run_state_started_at_is_not_overwritten_by_re_entering_running() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        store.set_run_state(&id, RunState::Running).unwrap();
+        let first_started = store.get_run(&id).unwrap().started_at_ms.unwrap();
+
+        // A run doesn't normally re-enter `running` without a restart in
+        // between, but the setter must be idempotent regardless.
+        store.set_run_state(&id, RunState::Running).unwrap();
+        assert_eq!(
+            store.get_run(&id).unwrap().started_at_ms,
+            Some(first_started)
+        );
+    }
+
+    #[test]
+    fn old_timestamps_do_not_make_running_work_look_unhealthy() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_run(&parse(SAMPLE), Some("slow"), false)
+            .unwrap();
+        store.set_run_state(&id, RunState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store
+            .set_session_state(&id, 0, 0, NodeState::Running)
+            .unwrap();
+
+        // Simulate a legitimately long-running task entirely by rewriting the
+        // persisted clocks, rather than by waiting in real time.
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET created_at_ms=0, updated_at_ms=0 WHERE id=?",
+                params![id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE events SET at_ms=0 WHERE run_id=?", params![id])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE cartographer_events SET at_ms=0 WHERE run_id=?",
+                params![id],
+            )
+            .unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        assert_eq!(run.created_at_ms, 0);
+        assert_eq!(run.state, "running");
+        assert_eq!(run.tasks[0].state, "running");
+        assert_eq!(run.tasks[0].sessions[0].state, "running");
+        assert!(run.tasks[0].sessions[0].error.is_none());
+
+        let events = store.events_for_run(&id, 100).unwrap();
+        assert!(
+            !events.is_empty(),
+            "running work should still have event history"
+        );
+        assert!(events.iter().all(|e| e.at_ms == 0));
+
+        let carto = store
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                run_id: Some(id.clone()),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            carto.total > 0,
+            "running work should still surface in Cartographer"
+        );
+        assert!(carto.rows.iter().all(|row| row.at_ms == 0));
+        assert!(
+            carto.rows.iter().any(|row| row.message.contains("running")),
+            "the synthetic age must not erase the underlying running transition"
+        );
+    }
+
+    #[test]
+    fn task_and_session_state_stamp_timestamps() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store
+            .set_session_state(&id, 0, 0, NodeState::Running)
+            .unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(run.tasks[0].started_at_ms.is_some());
+        assert!(run.tasks[0].finished_at_ms.is_none());
+        assert!(run.tasks[0].sessions[0].started_at_ms.is_some());
+        assert!(run.tasks[0].sessions[0].finished_at_ms.is_none());
+
+        store.set_task_state(&id, 0, NodeState::Done).unwrap();
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(run.tasks[0].finished_at_ms.is_some());
+        assert!(run.tasks[0].sessions[0].finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn record_session_result_stamps_finished_at() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        store
+            .set_session_state(&id, 0, 0, NodeState::Running)
+            .unwrap();
+
+        store
+            .record_session_result(
+                &id,
+                0,
+                0,
+                &SessionOutcome {
+                    state: NodeState::Done,
+                    tokens_in: 1,
+                    tokens_out: 2,
+                    cost_usd: 0.0,
+                    error: None,
+                    agent_session_id: None,
+                },
+            )
+            .unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(run.tasks[0].sessions[0].started_at_ms.is_some());
+        assert!(run.tasks[0].sessions[0].finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn restart_run_clears_started_and_finished_at() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        store.set_run_state(&id, RunState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store
+            .set_session_state(&id, 0, 0, NodeState::Running)
+            .unwrap();
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_task_state(&id, 0, NodeState::Done).unwrap();
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        let run = store.get_run(&id).unwrap();
+        assert!(run.started_at_ms.is_some());
+        assert!(run.finished_at_ms.is_some());
+
+        store.restart_run(&id).unwrap();
+        let run = store.get_run(&id).unwrap();
+        assert!(run.started_at_ms.is_none());
+        assert!(run.finished_at_ms.is_none());
+        assert!(run.tasks[0].started_at_ms.is_none());
+        assert!(run.tasks[0].finished_at_ms.is_none());
+        assert!(run.tasks[0].sessions[0].started_at_ms.is_none());
+        assert!(run.tasks[0].sessions[0].finished_at_ms.is_none());
+    }
+
+    #[test]
+    fn restart_session_clears_its_own_timestamps_but_not_the_runs_started_at() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
+        store.set_run_state(&id, RunState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store
+            .set_session_state(&id, 0, 0, NodeState::Running)
+            .unwrap();
+        store.set_session_state(&id, 0, 0, NodeState::Done).unwrap();
+        store.set_task_state(&id, 0, NodeState::Done).unwrap();
+        store.set_run_state(&id, RunState::Done).unwrap();
+
+        let run_started = store.get_run(&id).unwrap().started_at_ms.unwrap();
+
+        store.restart_session(&id, 0, 0).unwrap();
+        let run = store.get_run(&id).unwrap();
+        // The overall run already started earlier and isn't restarting from
+        // scratch, so its own started_at_ms survives...
+        assert_eq!(run.started_at_ms, Some(run_started));
+        // ...but it's no longer finished, and the restarted session/task
+        // genuinely are starting over.
+        assert!(run.finished_at_ms.is_none());
+        assert!(run.tasks[0].started_at_ms.is_none());
+        assert!(run.tasks[0].finished_at_ms.is_none());
+        assert!(run.tasks[0].sessions[0].started_at_ms.is_none());
+        assert!(run.tasks[0].sessions[0].finished_at_ms.is_none());
+    }
+
+    #[test]
     fn restart_session_verify_keeps_session_done_but_resets_its_verifies() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store.insert_run(&parse(SAMPLE), None, false).unwrap();
@@ -7964,6 +8740,87 @@ command = "check-c"
         assert_eq!(
             run.tasks[0].sessions[0].cwd.as_deref(),
             Some("C:/repos/ralphus/.git/.ralphus_worktrees/feat")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RAL-208 — debounced final change-summary regen requests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_final_summary_is_noop_when_signature_already_generated() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.mark_final_summary_generated("g1", "sig-a");
+        // A rebuild that didn't change the enabled-branch set (a feedback
+        // restack, a manual-push rebase, a base-branch shift) requests the
+        // same signature again -- this must not queue anything.
+        store.request_final_summary("g1", "sig-a", 1_000);
+        assert!(
+            store
+                .take_due_final_summary_requests(1_000 + 60_000, 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn request_final_summary_queues_when_signature_differs_from_generated() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.mark_final_summary_generated("g1", "sig-a");
+        store.request_final_summary("g1", "sig-b", 1_000);
+        let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
+        assert_eq!(due, vec![("g1".to_string(), "sig-b".to_string())]);
+    }
+
+    #[test]
+    fn take_due_final_summary_requests_respects_debounce_window() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.request_final_summary("g1", "sig-a", 1_000);
+        // Not due yet -- the quiet period hasn't elapsed.
+        assert!(
+            store
+                .take_due_final_summary_requests(1_000 + 2_000, 5_000)
+                .is_empty()
+        );
+        // Due once the full debounce window has elapsed.
+        let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
+        assert_eq!(due, vec![("g1".to_string(), "sig-a".to_string())]);
+    }
+
+    #[test]
+    fn repeated_requests_restart_the_debounce_clock_and_only_the_latest_signature_survives() {
+        let mut store = Store::open_in_memory().unwrap();
+        // Simulates rapid enable/disable toggling: each toggle rebuilds and
+        // requests a different enabled-branch signature before the previous
+        // request's debounce window has elapsed.
+        store.request_final_summary("g1", "sig-a", 0);
+        store.request_final_summary("g1", "sig-b", 1_000);
+        store.request_final_summary("g1", "sig-c", 2_000);
+        // 5s after the FIRST request, but only 3s after the last -- still
+        // not due, proving the clock restarted rather than accumulating from
+        // the first request.
+        assert!(
+            store
+                .take_due_final_summary_requests(5_000, 5_000)
+                .is_empty()
+        );
+        // 5s after the last request, only the final signature is due -- the
+        // intermediate toggles never fired their own LLM call.
+        let due = store.take_due_final_summary_requests(2_000 + 5_000, 5_000);
+        assert_eq!(due, vec![("g1".to_string(), "sig-c".to_string())]);
+    }
+
+    #[test]
+    fn take_due_final_summary_requests_clears_pending_so_it_is_claimed_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.request_final_summary("g1", "sig-a", 0);
+        let first = store.take_due_final_summary_requests(10_000, 5_000);
+        assert_eq!(first, vec![("g1".to_string(), "sig-a".to_string())]);
+        // A concurrent/subsequent sweep at the same instant finds nothing
+        // left to claim for this guardian.
+        assert!(
+            store
+                .take_due_final_summary_requests(10_000, 5_000)
+                .is_empty()
         );
     }
 }

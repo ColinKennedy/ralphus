@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancelToken;
 use crate::machines::{PROTOCOL_VERSION, ResolvedMachine};
-use crate::runner::{EVENT_MARKER, Runner, RunnerResult, RunnerSpec};
+use crate::runner::{EVENT_MARKER, LiveUsage, Runner, RunnerResult, RunnerSpec};
 use crate::store::Store;
 
 /// The `exec` verb: run one session/verify in a provisioned workspace.
@@ -71,6 +71,13 @@ pub const VERB_STREAM: &str = "stream";
 
 /// The `cancel` verb: stop the work behind an `exec` handle.
 pub const VERB_CANCEL: &str = "cancel";
+
+/// The `cleanup` verb: tear a provisioned workspace down (RAL-201).
+///
+/// Never called automatically — see [`ProviderRunner::cleanup`]'s doc for the
+/// retention policy. Documented in `docs/machine-providers.md`'s verb table
+/// since RAL-185 Phase 1, but had no daemon-side dispatch until now.
+pub const VERB_CLEANUP: &str = "cleanup";
 
 /// How often an async `exec` handle is polled for status/output.
 ///
@@ -216,6 +223,13 @@ pub struct ProviderRunner {
     /// local run — without this a remote session is invisible to Cartographer
     /// and, worse, its live cost cap silently stops being enforced.
     cartographer: Option<Arc<Mutex<Store>>>,
+    /// The most recent `llm-invoke` usage snapshot seen on any invocation's
+    /// stderr (RAL-161/RAL-201), so [`Self::poll_to_completion`] can enforce
+    /// `maximum_budget_usd` the same way [`crate::runner::SubprocessRunner`]
+    /// does locally. Shared via `Arc` because each provider invocation reads
+    /// its stderr on its own short-lived thread (see [`Self::invoke_with`]),
+    /// not the thread that later checks the cap.
+    live_usage: Arc<Mutex<Option<LiveUsage>>>,
 }
 
 impl ProviderRunner {
@@ -234,6 +248,7 @@ impl ProviderRunner {
             uri: uri.into(),
             supports_channel: false,
             cartographer: None,
+            live_usage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -311,17 +326,28 @@ impl ProviderRunner {
             let run_id = spec.run_id.clone();
             let session_id = spec.session_id.clone();
             let task = spec.task.clone();
+            let live_usage = Arc::clone(&self.live_usage);
             std::thread::spawn(move || {
                 let mut tail = String::new();
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
-                        crate::runner::forward_runner_event(
+                        let fwd = crate::runner::forward_runner_event(
                             cartographer.as_ref(),
                             &run_id,
                             &session_id,
                             &task,
                             json,
                         );
+                        // RAL-161/RAL-201: keep the latest snapshot so a
+                        // caller polling this handle can enforce
+                        // `maximum_budget_usd` the same way a local session
+                        // does -- without this a remote session's live cost
+                        // cap is silently unenforced (usage still lands in
+                        // the DB via `forward_runner_event`, but nothing acts
+                        // on it mid-run).
+                        if let Some(usage) = fwd.live_usage {
+                            *live_usage.lock().expect("poisoned") = Some(usage);
+                        }
                     } else {
                         // Keep a bounded tail purely so a provider that dies
                         // without valid JSON can still explain itself.
@@ -386,6 +412,34 @@ impl ProviderRunner {
     }
 }
 
+impl ProviderRunner {
+    /// Emit a Cartographer record for a lifecycle event on this provider, when
+    /// a store handle is attached (see [`Self::with_cartographer`]). A no-op
+    /// in a test/context that never wired one, matching every other
+    /// best-effort Cartographer call site in this codebase.
+    fn note(
+        &self,
+        spec: &RunnerSpec,
+        level: crate::logging::LogLevel,
+        message: &str,
+        payload: serde_json::Value,
+    ) {
+        let Some(store) = &self.cartographer else {
+            return;
+        };
+        let Ok(guard) = store.lock() else {
+            return;
+        };
+        crate::cartographer::Note::new("remote")
+            .level(level)
+            .scope("session")
+            .run(&spec.run_id)
+            .session(&spec.session_id)
+            .task(&spec.task)
+            .emit(&guard, message, payload);
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -418,6 +472,20 @@ impl ProviderRunner {
                     self.scheme
                 )
             })
+    }
+
+    /// Stop the work behind an async `exec` handle, without polling it to
+    /// completion first (RAL-201). Used by
+    /// [`reconcile_remote_exec_handles`] to stop a stale attempt on a
+    /// provider after a daemon restart -- unlike [`Self::exec`]'s own
+    /// cancel-on-drop inside `poll_to_completion`, this is a one-shot call
+    /// with no owning poll loop.
+    ///
+    /// # Errors
+    /// The provider's own refusal reason, verbatim.
+    pub fn cancel_handle(&self, handle: &str, spec: &RunnerSpec) -> Result<(), String> {
+        self.invoke_handle(VERB_CANCEL, handle, None, spec)
+            .map(|_| ())
     }
 }
 
@@ -464,17 +532,79 @@ impl ProviderRunner {
                     );
                 }
                 crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                self.note(
+                    spec,
+                    crate::logging::LogLevel::INFO,
+                    "remote session cancelled",
+                    serde_json::json!({"handle": handle, "scheme": self.scheme}),
+                );
                 return RunnerResult::failure("cancelled");
             }
             if let Some(budget) = budget {
                 if started.elapsed() >= budget {
                     let _ = self.invoke_handle(VERB_CANCEL, handle, None, spec);
                     crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                    self.note(
+                        spec,
+                        crate::logging::LogLevel::WARNING,
+                        "remote session timed out",
+                        serde_json::json!({
+                            "handle": handle,
+                            "scheme": self.scheme,
+                            "timeout_sec": budget.as_secs(),
+                        }),
+                    );
                     return RunnerResult::failure(format!(
                         "timed out after {}s on machine provider {:?}",
                         budget.as_secs(),
                         self.scheme
                     ));
+                }
+            }
+            // RAL-161/RAL-201: mirror `SubprocessRunner`'s live cost-cap kill.
+            // `live_usage` is populated by the stderr-reading thread of every
+            // `invoke_with` call this handle has made so far (see
+            // `Self::invoke_with`) -- without this check a remote session's
+            // `maximum_budget_usd` is silently unenforced, even though the
+            // usage itself is still persisted to the DB.
+            if let Some(cap) = spec.maximum_budget_usd {
+                let usage = self
+                    .live_usage
+                    .lock()
+                    .expect("poisoned")
+                    .unwrap_or_default();
+                if usage.cost_usd > cap {
+                    if let Err(e) = self.invoke_handle(VERB_CANCEL, handle, None, spec) {
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [remote] provider {} could not cancel over-budget handle {handle}: {e}",
+                            self.scheme
+                        );
+                    }
+                    crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [remote] cost ${:.4} exceeded maximum_budget_usd cap ${cap:.4} on machine provider {:?}, cancelling handle {handle}",
+                        usage.cost_usd,
+                        self.scheme
+                    );
+                    self.note(
+                        spec,
+                        crate::logging::LogLevel::WARNING,
+                        "remote session cost cap exceeded",
+                        serde_json::json!({
+                            "handle": handle,
+                            "scheme": self.scheme,
+                            "cost_usd": usage.cost_usd,
+                            "cap": cap,
+                        }),
+                    );
+                    return RunnerResult::cost_exceeded(
+                        usage.tokens_in,
+                        usage.tokens_out,
+                        usage.cost_usd,
+                        cap,
+                    );
                 }
             }
             // Pump output first so a session that finishes between polls still
@@ -546,7 +676,33 @@ impl ProviderRunner {
             return result;
         }
         match resp.handle.filter(|h| !h.trim().is_empty()) {
-            Some(handle) => self.poll_to_completion(&handle, spec, cancel),
+            Some(handle) => {
+                // RAL-201: persist the handle before polling so a daemon
+                // restart mid-poll can reconcile it (`reconcile_remote_exec_handles`)
+                // instead of silently leaving this work running unattended on
+                // the provider while the daemon starts a fresh attempt from
+                // scratch. Best-effort: a store failure here must not block
+                // dispatch, the same way every other Cartographer write in
+                // this module is best-effort.
+                if let Some(store) = &self.cartographer {
+                    if let Ok(guard) = store.lock() {
+                        let _ = guard.save_remote_exec_handle(
+                            &spec.run_id,
+                            &spec.session_id,
+                            &self.scheme,
+                            &self.uri,
+                            &handle,
+                        );
+                    }
+                }
+                let result = self.poll_to_completion(&handle, spec, cancel);
+                if let Some(store) = &self.cartographer {
+                    if let Ok(guard) = store.lock() {
+                        let _ = guard.clear_remote_exec_handle(&spec.run_id, &spec.session_id);
+                    }
+                }
+                result
+            }
             None => RunnerResult::failure(format!(
                 "machine provider {:?} accepted the exec but returned neither a \"result\" object nor a \"handle\"",
                 self.scheme
@@ -570,6 +726,36 @@ impl ProviderRunner {
     pub fn ping(&self, spec: &RunnerSpec) -> Result<Option<String>, String> {
         let resp = self.invoke(VERB_PING, "", spec)?;
         Ok(resp.detail)
+    }
+}
+
+impl ProviderRunner {
+    /// Tear a provisioned workspace down (RAL-201).
+    ///
+    /// **Never called automatically.** Local worktrees (`worktrees.rs`,
+    /// `ensure_worktree`) are never auto-deleted either — a session's
+    /// workspace stays on disk after it finishes so a human can inspect it,
+    /// and remote workspaces keep that same property rather than being
+    /// reclaimed the moment a run ends. `cleanup` exists so an operator can
+    /// explicitly reclaim a workspace once they are actually done with it
+    /// (`POST /api/machines/cleanup`, `ralphus machine cleanup`), not as a
+    /// lifecycle hook the daemon invokes on its own.
+    ///
+    /// **Retention policy on failure: nothing is discarded.** This call does
+    /// not touch any daemon-side record of the workspace — there is none to
+    /// touch (`provision` is idempotent and re-derives the same workspace
+    /// from `run_id`/`session_id`/the placeholder branch every time, see
+    /// [`Self::provision`]) — so a failed cleanup simply leaves the remote
+    /// workspace exactly as it was, and the error is returned to the caller
+    /// verbatim rather than swallowed. A human can inspect why cleanup
+    /// failed (permissions, a still-running process holding the directory
+    /// open, a dead machine) and retry, instead of the daemon silently
+    /// giving up and forgetting the workspace ever existed.
+    ///
+    /// # Errors
+    /// The provider's own refusal reason, verbatim.
+    pub fn cleanup(&self, spec: &RunnerSpec) -> Result<(), String> {
+        self.invoke(VERB_CLEANUP, "", spec).map(|_| ())
     }
 }
 
@@ -733,6 +919,88 @@ pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<Provid
         ProviderRunner::new(provider.program, provider.args, scheme, uri)
             .with_channel(supports_channel),
     ))
+}
+
+/// Reconcile persisted remote `exec` handles against a fresh daemon start
+/// (RAL-201). Call once at `serve()` startup, immediately alongside
+/// [`Store::recover_orphaned_runs`] — both rest on the same invariant
+/// ("nothing is executing yet, so any `running` row/persisted handle is
+/// orphaned"), so they belong together, not one without the other.
+///
+/// A session that was mid-poll when the daemon died has no in-process record
+/// surviving the crash — only the row `ProviderRunner::exec` wrote before
+/// entering its poll loop. `recover_orphaned_runs` has already reset that
+/// session to `Pending`, so the scheduler will re-provision and re-`exec` it
+/// as a brand new attempt; this function's job is to stop the *old* attempt
+/// on the provider first, so a restart never leaves two copies of the same
+/// work running remotely at once.
+///
+/// Best-effort throughout: a provider that cannot be reached, no longer
+/// exists, or refuses the cancel is logged and the row is cleared anyway —
+/// there is nothing else productive to do with a handle whose owning session
+/// no longer considers itself running, and leaving a stale row behind would
+/// just make the next restart re-cancel the same (by then meaningless)
+/// handle forever.
+pub fn reconcile_remote_exec_handles(store: &Store) {
+    let handles = match store.all_remote_exec_handles() {
+        Ok(h) => h,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [recovery] could not read remote exec handles: {e}"
+            );
+            return;
+        }
+    };
+    for h in &handles {
+        let machine = format!("{}:{}", h.scheme, h.uri);
+        let outcome = match provider_from_store(store, &machine) {
+            Ok(Some(provider)) => {
+                let spec = crate::runner::RunnerSpec::for_command_verify(
+                    &h.run_id,
+                    &h.session_id,
+                    &machine,
+                    ".",
+                    "",
+                    "claude",
+                    Some(30),
+                );
+                provider.cancel_handle(&h.handle, &spec)
+            }
+            Ok(None) => Err(format!("machine {machine:?} unexpectedly resolved local")),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &outcome {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] could not cancel stale remote handle {} for run={} \
+                 session={} on machine {machine:?}: {e}",
+                h.handle,
+                h.run_id,
+                h.session_id
+            );
+        }
+        crate::cartographer::Note::new("recovery")
+            .level(if outcome.is_ok() {
+                crate::logging::LogLevel::WARNING
+            } else {
+                crate::logging::LogLevel::ERROR
+            })
+            .scope("session")
+            .run(&h.run_id)
+            .session(&h.session_id)
+            .emit(
+                store,
+                "stale remote exec handle reconciled on startup",
+                serde_json::json!({
+                    "machine": machine,
+                    "handle": h.handle,
+                    "cancelled_ok": outcome.is_ok(),
+                    "error": outcome.err(),
+                }),
+            );
+        let _ = store.clear_remote_exec_handle(&h.run_id, &h.session_id);
+    }
 }
 
 /// Routes each spec to the local runner or a machine provider, based on the
@@ -1225,6 +1493,102 @@ mod tests {
     }
 
     #[test]
+    fn an_async_handle_is_cleared_from_the_store_once_the_session_finishes() {
+        // RAL-201: the persisted handle exists so a daemon restart mid-poll
+        // can reconcile it -- once the session actually finishes normally
+        // there is nothing left to reconcile, so the row must not linger.
+        let script = fake_async_provider(
+            "async-clear",
+            &[
+                ("exec", r#"{"ok":true,"protocol_version":1,"handle":"h1"}"#),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"done","result":{"status":"done","summary":"ok"}}"#,
+                ),
+            ],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        let (router, _local) = router(Arc::clone(&s));
+        let r = router.run(&spec(Some("ib:A")));
+        assert_eq!(r.status, "done", "{r:?}");
+        assert!(
+            s.lock()
+                .unwrap()
+                .all_remote_exec_handles()
+                .unwrap()
+                .is_empty(),
+            "the handle row must be cleared once the session finishes"
+        );
+    }
+
+    #[test]
+    fn reconcile_cancels_a_stale_handle_and_clears_its_row() {
+        // RAL-201: simulates a daemon restart mid-poll -- a handle row
+        // survives in the DB (no in-process poll loop does, since that died
+        // with the old process) and `reconcile_remote_exec_handles` must
+        // stop the old attempt on the provider before the scheduler starts a
+        // fresh one, so a restart never leaves two copies of the same work
+        // running remotely at once.
+        let script = fake_async_provider(
+            "async-reconcile",
+            &[("cancel", r#"{"ok":true,"protocol_version":1}"#)],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        s.lock()
+            .unwrap()
+            .save_remote_exec_handle("run-1", "s0", "ib", "A", "stale-handle")
+            .unwrap();
+
+        reconcile_remote_exec_handles(&s.lock().unwrap());
+
+        assert!(
+            s.lock()
+                .unwrap()
+                .all_remote_exec_handles()
+                .unwrap()
+                .is_empty(),
+            "the stale row must be cleared after reconciliation"
+        );
+        let page = s
+            .lock()
+            .unwrap()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                run_id: Some("run-1".to_string()),
+                ..crate::cartographer::CartographerFilter::recent(50)
+            })
+            .unwrap();
+        assert!(
+            page.rows
+                .iter()
+                .any(|row| row.message.contains("reconciled")),
+            "reconciliation must leave a Cartographer record; got {:?}",
+            page.rows.iter().map(|r| &r.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reconcile_of_an_unregistered_provider_still_clears_the_row() {
+        // The provider that owned this handle may itself have been
+        // deregistered between the crash and the restart -- reconciliation
+        // must not leave the row stuck forever in that case.
+        let s = store();
+        s.lock()
+            .unwrap()
+            .save_remote_exec_handle("run-1", "s0", "ghostscheme", "A", "h1")
+            .unwrap();
+        reconcile_remote_exec_handles(&s.lock().unwrap());
+        assert!(
+            s.lock()
+                .unwrap()
+                .all_remote_exec_handles()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_streamed_remote_session_is_readable_through_the_existing_live_view_snapshot() {
         // Reusing the pane-snapshot file the board already reads means remote
         // Live View needs no UI change at all.
@@ -1308,6 +1672,61 @@ mod tests {
         let r = router.run_cancellable(&spec(Some("ib:A")), &cancel);
         assert_eq!(r.status, "failed");
         assert_eq!(r.error.as_deref(), Some("cancelled"), "{r:?}");
+    }
+
+    #[test]
+    fn a_remote_session_over_its_cost_cap_is_cancelled_mid_poll() {
+        // RAL-201: mirrors `SubprocessRunner`'s live cost-cap kill (RAL-161).
+        // Without tracking `llm-invoke` usage across `status`/`stream` polls,
+        // a remote session's `maximum_budget_usd` was silently unenforced
+        // even though the usage itself still reached the DB via
+        // `forward_runner_event` -- this asserts the in-flight kill itself,
+        // not just that the usage was recorded.
+        let dir = std::env::temp_dir().join(format!("ral185-rrcost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("cost.py");
+        std::fs::write(
+            &py,
+            [
+                "import sys, json",
+                "verb = sys.argv[1]",
+                "if verb == 'exec':",
+                "    print(json.dumps({'ok': True, 'protocol_version': 1, 'handle': 'h1'}))",
+                "elif verb == 'status':",
+                "    event = json.dumps({'source': 'llm-invoke', 'message': 'usage', \
+                 'payload': {'cost_usd': 5.0, 'tokens_in': 10, 'tokens_out': 20}})",
+                "    print('RALPHUS_EVENT: ' + event, file=sys.stderr)",
+                "    print(json.dumps({'ok': True, 'protocol_version': 1, 'state': 'running'}))",
+                "elif verb == 'stream':",
+                "    print(json.dumps({'ok': True, 'protocol_version': 1, 'output': '', 'next': 0}))",
+                "elif verb == 'cancel':",
+                "    print(json.dumps({'ok': True, 'protocol_version': 1}))",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        // `with_cartographer` is required here, not just cosmetic: the
+        // stderr-reading thread's `RALPHUS_EVENT:` parsing is a no-op
+        // without a store to persist to (see `forward_runner_event`), so
+        // `live_usage` would never populate and this test would hang
+        // forever waiting for a cap trip that can't happen -- exactly what
+        // `MachineRouter::provider_for` always wires up in production.
+        let provider =
+            ProviderRunner::new("python", vec![py.to_string_lossy().into_owned()], "ct", "A")
+                .with_cartographer(Arc::new(Mutex::new(Store::open_in_memory().unwrap())));
+        let mut over_budget = spec(Some("ct:A"));
+        over_budget.maximum_budget_usd = Some(1.0);
+        let r = provider.run(&over_budget);
+        assert_eq!(r.status, "failed", "{r:?}");
+        assert!(
+            r.error.as_deref().unwrap_or_default().contains("cost"),
+            "{r:?}"
+        );
+        assert_eq!(r.tokens_in, 10);
+        assert_eq!(r.tokens_out, 20);
+        assert!((r.cost_usd - 5.0).abs() < f64::EPSILON, "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1442,5 +1861,110 @@ mod tests {
         assert_eq!(r.status, "failed");
         let err = r.error.unwrap_or_default();
         assert!(err.contains("ib"), "error must name the provider: {err}");
+    }
+
+    #[test]
+    fn cleanup_dispatches_the_cleanup_verb_and_reports_provider_failure() {
+        let ok = fake_provider("cleanup-ok", r#"{"ok":true,"protocol_version":1}"#, &[]);
+        let provider = ProviderRunner::new(ok.to_string_lossy().into_owned(), vec![], "ct", "A");
+        provider
+            .cleanup(&spec(Some("ct:A")))
+            .expect("a provider replying ok:true must succeed");
+
+        let fail = fake_provider(
+            "cleanup-fail",
+            r#"{"ok":false,"protocol_version":1,"error":"workspace busy"}"#,
+            &[],
+        );
+        let failing = ProviderRunner::new(fail.to_string_lossy().into_owned(), vec![], "ct", "B");
+        let err = failing
+            .cleanup(&spec(Some("ct:B")))
+            .expect_err("a provider replying ok:false must surface its reason");
+        // RAL-201: retention-on-failure -- the caller must see the provider's
+        // own reason verbatim, not a swallowed/generic failure, since nothing
+        // on the daemon side tracks the workspace to retry against.
+        assert!(err.contains("workspace busy"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_is_generic_across_two_independently_configured_providers() {
+        // RAL-201: the core design requirement is genericity -- one TOML
+        // shape, any provider, with zero daemon-side branching on which
+        // scheme is in play. Register two schemes with distinct executables,
+        // distinct response shapes (one synchronous, one an async
+        // handle-based provider), and distinct behavior, then dispatch the
+        // full exec/status/stream/cancel/cleanup verb set to both through the
+        // exact same `MachineRouter`/`ProviderRunner` code path (provision is
+        // covered separately by
+        // `worktrees::tests::the_same_placeholder_on_two_machines_resolves_to_two_workspaces`)
+        // and confirm each gets its own correct, independent answer.
+        let sync_script = fake_provider(
+            "generic-sync",
+            r#"{"ok":true,"protocol_version":1,"result":{"status":"done","tokens_in":1,"tokens_out":2,"cost_usd":0.1,"summary":"from sync provider"}}"#,
+            &[],
+        );
+        let async_script = fake_async_provider(
+            "generic-async",
+            &[
+                (
+                    "exec",
+                    r#"{"ok":true,"protocol_version":1,"handle":"h-generic"}"#,
+                ),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"done","result":{"status":"done","tokens_in":5,"tokens_out":6,"cost_usd":0.2,"summary":"from async provider"}}"#,
+                ),
+                (
+                    "stream",
+                    r#"{"ok":true,"protocol_version":1,"output":"","next":0}"#,
+                ),
+                ("cancel", r#"{"ok":true,"protocol_version":1}"#),
+                ("cleanup", r#"{"ok":true,"protocol_version":1}"#),
+            ],
+        );
+
+        let s = store();
+        register(&s, "syncscheme", &sync_script);
+        register(&s, "asyncscheme", &async_script);
+        let (router, local) = router(s);
+
+        let sync_result = router.run(&spec(Some("syncscheme:X")));
+        let async_result = router.run(&spec(Some("asyncscheme:Y")));
+
+        assert_eq!(sync_result.summary, "from sync provider");
+        assert_eq!(sync_result.tokens_in, 1);
+        assert_eq!(async_result.summary, "from async provider");
+        assert_eq!(async_result.tokens_in, 5);
+        // Neither dispatch fell through to the local runner -- genericity
+        // means the router resolved each purely from the registry, with no
+        // code path anywhere that special-cases "syncscheme" or
+        // "asyncscheme" by name.
+        assert!(local.seen.lock().unwrap().is_empty());
+
+        // cancel and cleanup are handle-scoped/no-payload verbs that `run()`
+        // never exercises above -- dispatch both through the same
+        // `MachineRouter::provider_for` resolution path `route()` uses
+        // internally, so this is the real registry lookup, not a
+        // hand-built `ProviderRunner`.
+        let sync_provider = router
+            .provider_for("syncscheme:X")
+            .expect("syncscheme must resolve without error")
+            .expect("syncscheme must resolve to a provider, not local");
+        let async_provider = router
+            .provider_for("asyncscheme:Y")
+            .expect("asyncscheme must resolve without error")
+            .expect("asyncscheme must resolve to a provider, not local");
+        sync_provider
+            .cancel_handle("irrelevant-handle", &spec(Some("syncscheme:X")))
+            .expect("sync provider's cancel must dispatch generically");
+        async_provider
+            .cancel_handle("h-generic", &spec(Some("asyncscheme:Y")))
+            .expect("async provider's cancel must dispatch generically");
+        sync_provider
+            .cleanup(&spec(Some("syncscheme:X")))
+            .expect("sync provider's cleanup must dispatch generically");
+        async_provider
+            .cleanup(&spec(Some("asyncscheme:Y")))
+            .expect("async provider's cleanup must dispatch generically");
     }
 }

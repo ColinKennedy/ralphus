@@ -10,6 +10,9 @@ _script_dir="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$(git -C "$_script_dir" rev-parse --path-format=absolute --git-common-dir)")"
 unset _script_dir
 
+echo "== building ralphus-librarian (debug) =="
+( cd "$root" && cargo build -p ralphus-librarian )
+
 echo "== syncing docs venv (uv) =="
 ( cd "$root/cli" && uv sync --extra docs >/dev/null )
 

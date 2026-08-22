@@ -1,13 +1,15 @@
 @echo off
 setlocal enabledelayedexpansion
 rem build-debug.cmd -- the FAST counterpart to build-release.cmd (mirrors build-debug.sh).
-rem Fast local dev loop -- NO PyInstaller, NO dist\. Runs the whole stack from
-rem source so iterating on the GUI (librarian\assets\board.html) is quick:
+rem Fast local dev loop -- NO dist\. Runs the whole stack from source so
+rem iterating on the GUI (librarian\assets\board.html) is quick:
 rem
-rem   * daemon + librarian   -> cargo debug builds (incremental; seconds)
-rem   * runner               -> the venv script via uv (RALPHUS_RUNNER_CMD),
-rem                             so a GUI/daemon edit NEVER rebuilds the heavy
-rem                             standalone runner exe.
+rem   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
+rem                                            seconds each; all four are Rust)
+rem
+rem All four binaries are Rust -- there is no Python venv sync step. `cli\`
+rem still exists for `docsgen\` (Playwright screenshots, dev-only, never
+rem shipped).
 rem
 rem Loop: edit board.html -> re-run this script -> refresh the browser.
 rem Ctrl-C stops both processes. For a distributable standalone build (slow),
@@ -70,19 +72,14 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
     set "db_path=%USERPROFILE%\.ralphus\tasks-%daemon_port%.db"
 )
 
-rem 1. Runner: use the venv script (fast; no bundling). Sync the runner extra so
-rem    native model agents work; this is a near-no-op once the venv is warm.
-echo == syncing runner venv (uv) ==
-pushd "%root%\cli"
-uv sync --extra runner >nul
-if errorlevel 1 (popd & exit /b 1)
-popd
-set "RALPHUS_RUNNER_CMD=%root%\cli\.venv\Scripts\ralphus-runner.exe"
-
-rem 2. Build the Rust bins in debug (fast incremental rebuild picks up board.html).
-echo == cargo build (debug) daemon + librarian ==
-cargo build -p ralphus-daemon -p ralphus-librarian --manifest-path "%root%\Cargo.toml"
+rem 1. Build all four Rust bins in debug (fast incremental rebuild picks up
+rem    board.html and any CLI/runner source edit alike).
+echo == cargo build (debug) daemon + librarian + runner + cli ==
+cargo build -p ralphus-daemon -p ralphus-librarian -p ralphus-runner -p ralphus-cli --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
+
+rem 2. Point RALPHUS_RUNNER_CMD at the just-built debug runner exe.
+set "RALPHUS_RUNNER_CMD=%root%\target\debug\ralphus-runner.exe"
 
 rem 3. Daemon in the background, librarian in the foreground. Ctrl-C (or the
 rem    librarian exiting) tears the daemon down too. The daemon is launched via
@@ -92,6 +89,7 @@ rem    the box, so a second side-by-side instance (different ports) survives.
 set "RALPHUS_DAEMON_URL=http://127.0.0.1:%daemon_port%"
 echo == starting stack ==
 echo    runner    -^> %RALPHUS_RUNNER_CMD%
+echo    cli       -^> %root%\target\debug\ralphus.exe (not started; run it yourself, e.g. "ralphus status")
 echo    daemon    -^> %RALPHUS_DAEMON_URL%
 if "%db_path%"=="" (
     echo    db        -^> ^<default: %%USERPROFILE%%\.ralphus\tasks.db^>

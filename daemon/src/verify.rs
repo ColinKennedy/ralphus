@@ -85,6 +85,39 @@ pub fn run_command_verify_capture(
     result
 }
 
+/// Resolve the current `HEAD` commit sha of `cwd`, or `None` if `cwd` isn't a
+/// git working tree, has no commits yet, or `git` isn't available. Used by the
+/// finalizer's no-new-commits guard (RAL-156): to capture a git-backed task's
+/// baseline at session start, and to compare each session's `cwd` against it
+/// at finalize time.
+#[must_use]
+pub fn git_head_sha(cwd: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Whether any of `cwds` has moved its `HEAD` past `baseline` (RAL-156): the
+/// deterministic "did this task produce at least one commit" check the
+/// finalizer runs for git-backed tasks, in place of trusting the agent's own
+/// self-report. Fails closed per-`cwd` — one whose `HEAD` can't be resolved
+/// (bad path, not a git repo, no commits) counts as "no new commit" for that
+/// session, never as a pass.
+#[must_use]
+pub fn any_cwd_has_new_commit(cwds: &[&str], baseline: &str) -> bool {
+    cwds.iter()
+        .any(|cwd| git_head_sha(cwd).is_some_and(|head| head != baseline))
+}
+
 /// Cap captured output so a runaway verifier can't bloat the DB / UI.
 fn truncate_output(s: &str) -> String {
     const MAX: usize = 16 * 1024;
@@ -150,5 +183,115 @@ mod tests {
         assert!(out.ends_with("…(truncated)"));
         // Small output is returned verbatim.
         assert_eq!(truncate_output("short"), "short");
+    }
+
+    // ── RAL-156: no-new-commits guard helpers ────────────────────────────────
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_N: AtomicU32 = AtomicU32::new(0);
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let n = TEST_N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ral156-verify-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir tmp_dir");
+        dir
+    }
+
+    fn g(root: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("git");
+        assert!(
+            status.success(),
+            "git {args:?} in {} failed",
+            root.display()
+        );
+    }
+
+    /// A fresh repo with one commit on `main`.
+    fn init_repo(tag: &str) -> std::path::PathBuf {
+        let repo = tmp_dir(tag);
+        g(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "base"]);
+        repo
+    }
+
+    #[test]
+    fn git_head_sha_resolves_in_a_real_repo() {
+        let repo = init_repo("head");
+        let sha = git_head_sha(&repo.to_string_lossy()).expect("HEAD sha");
+        assert_eq!(sha.len(), 40, "expected a full sha: {sha:?}");
+    }
+
+    #[test]
+    fn git_head_sha_none_for_non_repo() {
+        let dir = tmp_dir("not-a-repo");
+        assert!(git_head_sha(&dir.to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn git_head_sha_none_for_bad_cwd() {
+        assert!(git_head_sha("/no/such/dir/ralphus-xyz").is_none());
+    }
+
+    #[test]
+    fn any_cwd_has_new_commit_false_when_head_unchanged() {
+        let repo = init_repo("unchanged");
+        let baseline = git_head_sha(&repo.to_string_lossy()).expect("HEAD sha");
+        let cwd = repo.to_string_lossy().to_string();
+        assert!(!any_cwd_has_new_commit(&[&cwd], &baseline));
+    }
+
+    #[test]
+    fn any_cwd_has_new_commit_true_after_a_commit() {
+        let repo = init_repo("changed");
+        let baseline = git_head_sha(&repo.to_string_lossy()).expect("HEAD sha");
+        std::fs::write(repo.join("more.txt"), "more\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "more"]);
+        let cwd = repo.to_string_lossy().to_string();
+        assert!(any_cwd_has_new_commit(&[&cwd], &baseline));
+    }
+
+    #[test]
+    fn any_cwd_has_new_commit_true_when_any_of_several_changed() {
+        // Two sessions of the same task: the first's cwd never moved past the
+        // baseline; the second's got an extra commit on top -- standing in for
+        // "this session made progress since the task started." (Deliberately
+        // *not* two independent single-commit repos: with identical tree,
+        // message, and author/committer env, two repos created in the same
+        // second can hash to the same commit sha, making the "changed" repo
+        // indistinguishable from the baseline by fluke.)
+        let unchanged = init_repo("multi-unchanged");
+        let baseline = git_head_sha(&unchanged.to_string_lossy()).expect("HEAD sha");
+        let changed = init_repo("multi-changed");
+        std::fs::write(changed.join("more.txt"), "more\n").unwrap();
+        g(&changed, &["add", "."]);
+        g(&changed, &["commit", "-m", "more"]);
+        let unchanged_cwd = unchanged.to_string_lossy().to_string();
+        let changed_cwd = changed.to_string_lossy().to_string();
+        assert!(any_cwd_has_new_commit(
+            &[&unchanged_cwd, &changed_cwd],
+            &baseline
+        ));
+    }
+
+    #[test]
+    fn any_cwd_has_new_commit_false_when_no_cwd_resolves() {
+        assert!(!any_cwd_has_new_commit(
+            &["/no/such/dir/ralphus-xyz"],
+            "deadbeef"
+        ));
     }
 }

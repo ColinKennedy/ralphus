@@ -1,8 +1,10 @@
 //! Placeholder `cwd` resolution + git worktree materialization (RAL-100).
 //!
 //! A session `cwd` of the form `ralphus:new-worktree/<branch>` names a branch
-//! to check out in a dedicated worktree under `.git/.ralphus_worktrees/<branch>`,
-//! rather than a real filesystem path. The project to materialize it under is
+//! to check out in a dedicated worktree under `.git/.ralphus/w/<short>`
+//! (`<short>` is a truncated form of `branch`; see `crate::short_paths`. Git
+//! branch names are never shortened, only this directory name), rather than a
+//! real filesystem path. The project to materialize it under is
 //! NOT embedded in the `cwd` string -- it's the owning task's `project` field
 //! (required whenever any of its sessions uses this placeholder).
 //! [`resolve_placeholders`] resolves every placeholder among a run's sessions
@@ -24,30 +26,180 @@ use crate::guardian_merge::git;
 use crate::otel;
 use crate::store::{SessionRow, Store, TaskRow};
 
-/// The on-disk worktree directory for `branch` under a project's `root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchMaterialization {
+    ExistingLocal,
+    NewFromRemote {
+        remote_ref: String,
+    },
+    NewFromHead {
+        base: Option<String>,
+        warning: Option<String>,
+    },
+}
+
+/// The on-disk worktree directory for `branch` under a project's `root`:
+/// `.git/.ralphus/w/<short>`, `<short>` a truncated form of `branch` (see
+/// `crate::short_paths`) so a deeply nested `root` still fits inside
+/// Windows' `MAX_PATH`; the git branch itself keeps its full name.
 #[must_use]
 pub fn worktree_dir(root: &Path, branch: &str) -> PathBuf {
-    root.join(".git").join(".ralphus_worktrees").join(branch)
+    crate::short_paths::ralphus_root(root)
+        .join("w")
+        .join(crate::short_paths::short_name(branch))
+}
+
+/// The OS path-length budget a worktree checkout is held to. Windows'
+/// `MAX_PATH` is 260 characters; other platforms' limits are high enough in
+/// practice that enforcing it there too would only produce false failures.
+fn path_budget_limit() -> usize {
+    if cfg!(windows) { 260 } else { usize::MAX }
+}
+
+/// Preflight (RAL-211): before checking anything out, measure whether the
+/// worktree directory plus the deepest tracked path in `git_ref` would
+/// overflow `limit`, and fail with the arithmetic spelled out rather than
+/// letting git fail deep inside `worktree add` with an opaque `Filename too
+/// long`. Callers pass [`path_budget_limit`]; taken as a plain parameter here
+/// (rather than read directly) so this is testable without depending on the
+/// host OS.
+///
+/// Reads the tree from the object database (`git ls-tree`, not `ls-files`,
+/// which would describe the current checkout rather than the tree about to be
+/// materialized) -- no checkout, no network.
+fn preflight_worktree_budget(
+    root: &Path,
+    wt: &Path,
+    git_ref: &str,
+    limit: usize,
+) -> Result<(), String> {
+    if limit == usize::MAX {
+        return Ok(());
+    }
+    let listing = git(root, &["ls-tree", "-r", "-z", "--name-only", git_ref]).map_err(|e| {
+        format!("could not measure \"{git_ref}\" for a worktree path preflight check: {e}")
+    })?;
+    crate::short_paths::check_worktree_path_budget(wt, &listing, limit)
+}
+
+fn validate_branch_name(root: &Path, branch: &str) -> Result<(), String> {
+    git(root, &["check-ref-format", "--branch", branch]).map(|_| ())
+}
+
+fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterialization, String> {
+    validate_branch_name(root, branch)?;
+    let branch_ref = format!("refs/heads/{branch}");
+    if git(root, &["rev-parse", "--verify", &branch_ref]).is_ok() {
+        return Ok(BranchMaterialization::ExistingLocal);
+    }
+    if branch.contains('/') {
+        let remote_ref = format!("refs/remotes/{branch}");
+        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
+            return Ok(BranchMaterialization::NewFromRemote { remote_ref });
+        }
+    }
+    let base = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
+    let warning = branch.contains('/').then(|| {
+        format!(
+            "placeholder branch \"{branch}\" looks like <remote>/<branch>, but \
+             refs/remotes/{branch} does not exist in {}. Reusing or creating a \
+             literal local branch named \"{branch}\" instead.",
+            root.display()
+        )
+    });
+    Ok(BranchMaterialization::NewFromHead { base, warning })
+}
+
+/// If `wt`'s checked-out branch tracks a remote (its `@{upstream}` resolves
+/// to a ref under `refs/remotes/...`), fetch that remote branch and rebase
+/// `wt`'s local branch onto the freshly fetched commit — so a worktree
+/// materialized from a `ralphus:new-worktree/<remote>/<branch>` placeholder
+/// picks up new pushes to that remote branch on every resolution, rather than
+/// freezing forever at whatever the remote-tracking ref held at first
+/// materialization (the [`ensure_worktree`] reuse path never touched it
+/// before this).
+///
+/// A no-op for a branch with no upstream, or whose upstream is a local branch
+/// (e.g. the `NewFromHead` case's `--set-upstream-to <base>`) — only a
+/// genuinely remote-tracked branch is resynced.
+///
+/// A rebase, deliberately not a hard reset: any commits already made in this
+/// worktree (by a prior agent session, or by hand) are replayed on top of the
+/// updated remote history rather than discarded. If the rebase can't
+/// complete cleanly — a real conflict, or local history that has diverged
+/// from the remote in an unresolvable way — it is aborted and the worktree is
+/// left exactly as it was before this call; resolving that is left to a
+/// human, not attempted here.
+fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
+    let Ok(upstream) = git(wt, &["rev-parse", "--symbolic-full-name", "@{upstream}"]) else {
+        return Ok(());
+    };
+    let upstream = upstream.trim();
+    let Some(rest) = upstream.strip_prefix("refs/remotes/") else {
+        return Ok(());
+    };
+    let Some((remote, remote_branch)) = rest.split_once('/') else {
+        return Ok(());
+    };
+    let refspec = format!("{remote_branch}:{upstream}");
+    git(wt, &["fetch", remote, &refspec]).map_err(|e| {
+        format!(
+            "could not fetch \"{remote}\" branch \"{remote_branch}\" to resync {}: {e}",
+            wt.display()
+        )
+    })?;
+    if git(wt, &["rebase", upstream]).is_err() {
+        let _ = git(wt, &["rebase", "--abort"]);
+        return Err(format!(
+            "could not rebase {} onto updated \"{upstream}\" -- it likely has local commits \
+             that conflict with new commits on the remote; resolve manually in that worktree \
+             (e.g. run `git rebase {upstream}` there and fix conflicts) and rerun",
+            wt.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Create (or reuse) a git worktree for `branch` under `root`, returning its
 /// path.
 ///
-/// Restart-safe: if `<root>/.git/.ralphus_worktrees/<branch>/.git` already
-/// exists, the directory is assumed to be a previously materialized worktree
-/// and is reused as-is rather than recreated (or erroring because the branch
-/// or directory already exists).
+/// Restart-safe: if the worktree directory's `.git` already exists, the
+/// directory is assumed to be a previously materialized worktree and is
+/// reused rather than recreated (or erroring because the branch or directory
+/// already exists) — except that a branch tracking a remote is first resynced
+/// to that remote; see [`resync_remote_tracking_branch`].
 ///
-/// When `branch` doesn't exist yet, the new branch is forked from `root`'s
-/// current `HEAD` and its upstream tracking is set to that branch (best
-/// effort). `derive_reviews` (reviews.rs) requires an upstream tracking
-/// branch on every review-opted-in session's branch to determine the review's
-/// base — without this, a `ralphus:new-worktree/...` placeholder combined
-/// with `review = ...` would always fail preflight, since `git worktree add
-/// -b` alone never configures one.
+/// Branch names are first validated through `git check-ref-format --branch`,
+/// so the daemon inherits git's exact acceptance rules instead of trying to
+/// mirror them (including rejecting path-traversal shapes like `../foo`
+/// before any path join or filesystem write happens).
+///
+/// If no local branch by that literal name exists but a remote-tracking ref
+/// `refs/remotes/<branch>` does, the new local branch is created from that
+/// remote-tracking ref and configured to track it — a real, attached branch
+/// checkout (never a detached HEAD), so ordinary git operations (commit,
+/// diff, `@{upstream}`) behave normally inside it. It does not stay frozen at
+/// whatever the remote held at creation time: every later call to
+/// `ensure_worktree` for the same worktree resyncs it to the remote (see
+/// [`resync_remote_tracking_branch`]), so a review worktree keeps up with
+/// pushes to that remote branch over the life of the project. Otherwise the
+/// branch name is treated literally — slashes included — and a new local
+/// branch is forked from `root`'s current `HEAD`; when that literal name
+/// *looks* like `<remote>/<branch>` but no matching remote-tracking ref
+/// exists, a warning is emitted so the fallback is explicit rather than
+/// silently guessed.
+///
+/// A branch created from local `HEAD` has its upstream tracking set to that
+/// branch (best effort). `derive_reviews` (reviews.rs) requires an upstream
+/// tracking branch on every review-opted-in session's branch to determine the
+/// review's base — without this, a `ralphus:new-worktree/...` placeholder
+/// combined with `review = ...` would always fail preflight, since
+/// `git worktree add -b` alone never configures one.
 pub fn ensure_worktree(root: &Path, branch: &str) -> Result<PathBuf, String> {
+    let materialization = branch_materialization(root, branch)?;
     let wt = worktree_dir(root, branch);
     if wt.join(".git").exists() {
+        resync_remote_tracking_branch(&wt)?;
         return Ok(wt);
     }
     if let Some(parent) = wt.parent() {
@@ -55,22 +207,42 @@ pub fn ensure_worktree(root: &Path, branch: &str) -> Result<PathBuf, String> {
             .map_err(|e| format!("could not create worktree parent directory: {e}"))?;
     }
     let wt_str = wt.to_string_lossy().to_string();
-    let branch_ref = format!("refs/heads/{branch}");
-    let branch_exists = git(root, &["rev-parse", "--verify", &branch_ref]).is_ok();
-    if branch_exists {
-        git(root, &["worktree", "add", &wt_str, branch])?;
-    } else {
-        let base = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
-        git(root, &["worktree", "add", "-b", branch, &wt_str])?;
-        if let Some(base) = base
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty() && *b != "HEAD")
-        {
-            // Best-effort: a detached HEAD or other oddity in `root` just means
-            // no upstream gets set, and the review preflight's own error message
-            // already tells the user how to configure one manually.
-            let _ = git(&wt, &["branch", "--set-upstream-to", base]);
+    match materialization {
+        BranchMaterialization::ExistingLocal => {
+            preflight_worktree_budget(root, &wt, branch, path_budget_limit())?;
+            git(root, &["worktree", "add", &wt_str, branch])?;
+        }
+        BranchMaterialization::NewFromRemote { remote_ref } => {
+            preflight_worktree_budget(root, &wt, &remote_ref, path_budget_limit())?;
+            git(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "--track",
+                    "-b",
+                    branch,
+                    &wt_str,
+                    &remote_ref,
+                ],
+            )?;
+        }
+        BranchMaterialization::NewFromHead { base, warning } => {
+            if let Some(warning) = warning {
+                crate::rlog!(WARNING, "ralphus [scheduler] {warning}");
+            }
+            preflight_worktree_budget(root, &wt, "HEAD", path_budget_limit())?;
+            git(root, &["worktree", "add", "-b", branch, &wt_str])?;
+            if let Some(base) = base
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty() && *b != "HEAD")
+            {
+                // Best-effort: a detached HEAD or other oddity in `root` just means
+                // no upstream gets set, and the review preflight's own error message
+                // already tells the user how to configure one manually.
+                let _ = git(&wt, &["branch", "--set-upstream-to", base]);
+            }
         }
     }
     Ok(wt)
@@ -170,9 +342,33 @@ fn provision_remote(
         session_id: session.session_id.clone(),
     };
     let spec = crate::runner::RunnerSpec::from_row(run_id, session);
-    provider
+    let result = provider
         .provision(&req, &spec)
-        .map_err(|e| format!("session '{}': {e}", session.session_id))
+        .map_err(|e| format!("session '{}': {e}", session.session_id));
+    // RAL-201: `provision` had no Cartographer coverage at all -- a failure
+    // was only visible via the caller's generic "worktree placeholder
+    // resolution failed" `rlog!` line, and success left no record whatsoever.
+    crate::cartographer::Note::new("worktrees")
+        .level(if result.is_ok() {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        })
+        .scope("session")
+        .run(run_id)
+        .session(&session.session_id)
+        .emit(
+            store,
+            "machine provision",
+            serde_json::json!({
+                "machine": machine,
+                "branch": branch,
+                "ok": result.is_ok(),
+                "workspace": result.as_ref().ok(),
+                "error": result.as_ref().err(),
+            }),
+        );
+    result
 }
 
 /// Resolve every placeholder `cwd` (`ralphus:new-worktree/<branch>`) among
@@ -355,6 +551,61 @@ mod tests {
         repo
     }
 
+    fn init_repo_with_remote_branch(tag: &str, branch: &str) -> (PathBuf, String) {
+        let base = tmp_dir(tag);
+        let remote = base.join("remote.git");
+        let (_, remote_branch) = branch
+            .split_once('/')
+            .expect("remote-qualified branch placeholder");
+        g(
+            &base,
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        g(&seed, &["init", "-b", "main"]);
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-m", "base"]);
+        g(
+            &seed,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        g(&seed, &["push", "-u", "origin", "main"]);
+
+        g(&seed, &["checkout", "-b", remote_branch]);
+        std::fs::write(seed.join("remote-only.txt"), format!("{branch}\n")).unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-m", "remote branch"]);
+        let branch_sha = git(&seed, &["rev-parse", "HEAD"])
+            .expect("branch sha")
+            .trim()
+            .to_string();
+        g(&seed, &["push", "-u", "origin", remote_branch]);
+
+        let clone = base.join("clone");
+        g(
+            &base,
+            &[
+                "clone",
+                remote.to_str().expect("remote path"),
+                clone.to_str().expect("clone path"),
+            ],
+        );
+        (clone, branch_sha)
+    }
+
     fn session_row(task_idx: i64, idx: i64, session_id: &str, cwd: Option<&str>) -> SessionRow {
         SessionRow {
             task_idx,
@@ -428,6 +679,33 @@ mod tests {
     }
 
     #[test]
+    fn preflight_worktree_budget_fails_fast_with_the_arithmetic_spelled_out() {
+        // The limit is passed explicitly rather than read from the host OS
+        // (see `path_budget_limit`), so this is deterministic on every
+        // platform CI runs on.
+        let repo = init_repo("preflight-tight");
+        let err = preflight_worktree_budget(&repo, Path::new("/short/wt"), "HEAD", 5)
+            .expect_err("must fail when the budget is obviously too tight");
+        assert!(err.contains("5-character"), "{err}");
+    }
+
+    #[test]
+    fn preflight_worktree_budget_passes_with_a_generous_limit() {
+        let repo = init_repo("preflight-loose");
+        preflight_worktree_budget(&repo, Path::new("/short/wt"), "HEAD", 4096)
+            .expect("must pass with a generous budget");
+    }
+
+    #[test]
+    fn preflight_worktree_budget_is_a_noop_when_the_limit_is_max() {
+        // The non-Windows branch of `path_budget_limit` -- never measures,
+        // never fails, regardless of how deep the tree is.
+        let repo = init_repo("preflight-unlimited");
+        preflight_worktree_budget(&repo, Path::new("/short/wt"), "HEAD", usize::MAX)
+            .expect("usize::MAX must always pass");
+    }
+
+    #[test]
     fn ensure_worktree_attaches_to_pre_existing_branch() {
         let repo = init_repo("existing-branch");
         g(&repo, &["branch", "already-here"]);
@@ -437,6 +715,184 @@ mod tests {
                 .unwrap()
                 .trim(),
             "already-here"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_uses_the_new_short_layout_and_ignores_old_layout_leftovers() {
+        // An old-layout `.ralphus_worktrees/<branch>` directory left over
+        // from before RAL-211 must not confuse or block a fresh
+        // materialization under the `.ralphus/w/<short>` layout -- old-layout
+        // state is simply left alone.
+        let repo = init_repo("old-layout-coexist");
+        let old_dir = repo
+            .join(".git")
+            .join(".ralphus_worktrees")
+            .join("feature-long-name");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("leftover.txt"), "abandoned\n").unwrap();
+
+        let wt = ensure_worktree(&repo, "feature-long-name").expect("materialize");
+        assert_eq!(wt, worktree_dir(&repo, "feature-long-name"));
+        assert!(
+            wt.to_string_lossy().contains(".ralphus")
+                && !wt.to_string_lossy().contains(".ralphus_worktrees"),
+            "must use the new layout, not the old one: {}",
+            wt.display()
+        );
+        assert!(wt.join(".git").exists());
+        // The old leftover must still be untouched -- no migration/purge.
+        assert!(old_dir.join("leftover.txt").exists());
+    }
+
+    #[test]
+    fn ensure_worktree_bootstraps_a_remote_tracking_branch_when_it_exists() {
+        let (repo, remote_sha) = init_repo_with_remote_branch("remote-branch", "origin/foo");
+        let wt = ensure_worktree(&repo, "origin/foo").expect("materialize from remote");
+        assert_eq!(wt, worktree_dir(&repo, "origin/foo"));
+        assert!(
+            wt.join("remote-only.txt").exists(),
+            "the remote branch's content must be present in the worktree"
+        );
+        assert_eq!(
+            git(&wt, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "origin/foo"
+        );
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), remote_sha);
+        assert_eq!(
+            git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )
+            .unwrap()
+            .trim(),
+            "remotes/origin/foo"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_resyncs_a_remote_tracking_branch_to_new_pushes() {
+        let (repo, first_sha) = init_repo_with_remote_branch("resync-new-push", "origin/foo");
+        let wt = ensure_worktree(&repo, "origin/foo").expect("first materialize");
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), first_sha);
+
+        // Simulate a new push to the remote branch, from the seed clone that
+        // pushed the original commit.
+        let seed = repo.parent().unwrap().join("seed");
+        std::fs::write(seed.join("remote-only.txt"), "origin/foo v2\n").unwrap();
+        g(&seed, &["commit", "-am", "second remote commit"]);
+        let second_sha = git(&seed, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        g(&seed, &["push", "origin", "foo"]);
+
+        // Re-resolving the same (already materialized) worktree must pick up
+        // the new remote commit, not stay frozen at the first-materialize SHA.
+        let wt2 = ensure_worktree(&repo, "origin/foo").expect("resync on reuse");
+        assert_eq!(wt2, wt);
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), second_sha);
+    }
+
+    #[test]
+    fn ensure_worktree_rebases_local_commits_onto_the_resynced_remote_instead_of_discarding_them() {
+        let (repo, _first_sha) = init_repo_with_remote_branch("resync-rebase-local", "origin/bar");
+        let wt = ensure_worktree(&repo, "origin/bar").expect("first materialize");
+
+        // A prior agent session committed local work directly in the worktree.
+        std::fs::write(wt.join("local-work.txt"), "agent work\n").unwrap();
+        g(&wt, &["add", "."]);
+        g(&wt, &["commit", "-m", "local agent commit"]);
+
+        // A new, unrelated commit lands on the remote branch.
+        let seed = repo.parent().unwrap().join("seed");
+        std::fs::write(seed.join("remote-only.txt"), "origin/bar v2\n").unwrap();
+        g(&seed, &["commit", "-am", "second remote commit"]);
+        g(&seed, &["push", "origin", "bar"]);
+
+        ensure_worktree(&repo, "origin/bar").expect("resync via rebase");
+
+        assert!(
+            wt.join("local-work.txt").exists(),
+            "the local commit must survive the resync, replayed on top of the new remote commit \
+             rather than discarded by a hard reset"
+        );
+        assert_eq!(
+            git(&wt, &["log", "--format=%s", "-1"]).unwrap().trim(),
+            "local agent commit",
+            "the local commit must remain the tip after being rebased forward"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_aborts_and_errors_when_the_resync_rebase_conflicts() {
+        let (repo, _first_sha) = init_repo_with_remote_branch("resync-conflict", "origin/baz");
+        let wt = ensure_worktree(&repo, "origin/baz").expect("first materialize");
+
+        // A local commit that edits the same file the remote is about to change.
+        std::fs::write(wt.join("remote-only.txt"), "local edit\n").unwrap();
+        g(&wt, &["commit", "-am", "local conflicting edit"]);
+
+        let seed = repo.parent().unwrap().join("seed");
+        std::fs::write(seed.join("remote-only.txt"), "remote edit\n").unwrap();
+        g(&seed, &["commit", "-am", "conflicting remote edit"]);
+        g(&seed, &["push", "origin", "baz"]);
+
+        let err = ensure_worktree(&repo, "origin/baz").expect_err("conflicting rebase must fail");
+        assert!(err.contains("rebase"), "{err}");
+
+        // A failed resync must leave the worktree attached to its branch, not
+        // mid-rebase (detached) -- i.e. the abort actually ran.
+        assert_eq!(
+            git(&wt, &["symbolic-ref", "--short", "HEAD"])
+                .expect("worktree must not be left mid-rebase")
+                .trim(),
+            "origin/baz"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_warns_and_falls_back_to_a_literal_local_slash_branch() {
+        let repo = init_repo("literal-slash-branch");
+        let plan = branch_materialization(&repo, "alternative/foo").expect("plan");
+        assert_eq!(
+            plan,
+            BranchMaterialization::NewFromHead {
+                base: Some("main\n".to_string()),
+                warning: Some(format!(
+                    "placeholder branch \"alternative/foo\" looks like <remote>/<branch>, but \
+             refs/remotes/alternative/foo does not exist in {}. Reusing or creating a \
+             literal local branch named \"alternative/foo\" instead.",
+                    repo.display()
+                ),),
+            }
+        );
+
+        let wt = ensure_worktree(&repo, "alternative/foo").expect("materialize");
+        assert_eq!(wt, worktree_dir(&repo, "alternative/foo"));
+        assert_eq!(
+            git(&wt, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "alternative/foo"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_rejects_invalid_branch_names_before_path_joining() {
+        let repo = init_repo("invalid-branch");
+        let err = ensure_worktree(&repo, "../escape").expect_err("invalid branch must fail");
+        assert!(err.contains("check-ref-format"), "{err}");
+        assert!(
+            !repo.join(".git").join(".ralphus").exists(),
+            "no worktree directory tree may be created for an invalid branch name"
         );
     }
 

@@ -171,6 +171,7 @@ const TASK_KEYS: &[&str] = &[
     "timeout_minutes",
     "depends_on",
     "environment",
+    "no_commit_required",
     "session",
     "verify",
 ];
@@ -198,7 +199,16 @@ const SESSION_KEYS: &[&str] = &[
     "review",
     "upstream",
 ];
-const REVIEW_KEYS: &[&str] = &["id", "name", "agent", "model", "machine", "base", "action"];
+const REVIEW_KEYS: &[&str] = &[
+    "id",
+    "name",
+    "agent",
+    "model",
+    "machine",
+    "base",
+    "action",
+    "maximum_budget_usd",
+];
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
 const VERIFY_KEYS: &[&str] = &[
@@ -443,6 +453,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
         check_environment(ctx, table, &path, header);
+        check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
 
         let task_agent = table.get("agent").and_then(toml::Value::as_str);
         let task_project = table.get("project").and_then(toml::Value::as_str);
@@ -849,6 +860,8 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "model", Ty::Str, &rpath, header);
         check_type(ctx, table, "base", Ty::Str, &rpath, header);
         check_machine(ctx, table, &rpath, header);
+        check_type(ctx, table, "maximum_budget_usd", Ty::Float, &rpath, header);
+        check_positive_number(ctx, table, "maximum_budget_usd", &rpath, header);
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -1425,6 +1438,26 @@ command = "cargo build"
     }
 
     #[test]
+    fn no_commit_required_accepted_as_bool() {
+        let src = "[[task]]\nname=\"t\"\nno_commit_required=true\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn no_commit_required_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\nno_commit_required=\"yes\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(
+                |e| e.kind == ErrorKind::WrongType && e.message.contains("no_commit_required")
+            ),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn priority_accepted_on_task_and_session() {
         let src = "[[task]]\nname=\"t\"\npriority=2\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\npriority=0\n";
         let r = validate_toml(src);
@@ -1499,6 +1532,41 @@ command = "cargo build"
     #[test]
     fn maximum_budget_usd_negative_rejected() {
         let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nmaximum_budget_usd=-1.0\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("maximum_budget_usd")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── RAL-193: [[review]] maximum_budget_usd ───────────────────────────
+
+    #[test]
+    fn review_maximum_budget_usd_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=10.0\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_maximum_budget_usd_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=\"lots\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
+                && e.message.contains("maximum_budget_usd")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_maximum_budget_usd_zero_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.session]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=0.0\n";
         let r = validate_toml(src);
         assert!(
             r.errors

@@ -26,7 +26,7 @@ where one exists.
 | POST | `/api/daemon/shutdown` | [Kill every spawned process and exit](#post-apidaemonshutdown) (`ralphus-daemon stop`) |
 | GET | `/api/tasks` | [Board state](#get-apitasks); `?status=&name=&sort=` filter/sort |
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
-| GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated |
+| GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated; `?entity=` accepts an [entity URI](#entity-uris-ral-155) |
 | GET | `/api/cartographer/{id}` | [One event's full detail](#get-apicartographerid) |
 | GET | `/api/events` | [SSE push stream](#get-apievents-ral-167) — one event per Cartographer write (RAL-167) |
 | GET | `/api/graph` | [Cross-run gating graph](#get-apigraph); `?all=1` includes terminal runs |
@@ -46,6 +46,7 @@ where one exists.
 | GET | `/api/runs/{id}` | [One run's full detail](#get-apirunsid) |
 | GET | `/api/runs/{id}/worktrees` | [Per-session worktree/project/upstream](#get-apirunsidworktrees) |
 | GET | `/api/runs/{id}/logs` | [State-transition audit log](#get-apirunsidlogs) |
+| GET | `/api/runs/{id}/timeline` | [Merged, chronological uber-log-viewer](#get-apirunsidtimeline) for the whole run (RAL-155) |
 | GET | `/api/runs/{id}/graph` | [Internal session dependency graph](#get-apirunsidgraph) |
 | POST | `/api/runs/{id}/activate` | [Queued → Pending](#post-apirunsidactivate) |
 | POST | `/api/runs/{id}/cancel/preview` | [Dry-run preview](#post-apirunsidcancelpreview) of a cascading cancel's impact |
@@ -156,6 +157,8 @@ produced no pane output.
 | POST | `/api/pull-requests/{pr_id}` | [Mutate the PR mapping](#post-apipull-requestspr_id) (number/url/alias/state) |
 | GET | `/api/pull-requests/{pr_id}/comments` | [Live-query the forge](#get-apipull-requestspr_idcomments) for this PR's comments |
 | POST | `/api/pull-requests/{pr_id}/action-feedback` | [Pull un-actioned feedback](#post-apipull-requestspr_idaction-feedback) into the worktree |
+| GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
+| POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
 
 ## Conventions
 
@@ -276,6 +279,28 @@ Lets a task's session `cwd` use the placeholder `"ralphus:new-worktree/<branch>"
 instead of a real filesystem path -- the owning task's `project` field names
 which registered project to materialize it under, and the scheduler
 materializes (or reuses) a git worktree for `<branch>` before the session runs.
+The placeholder parser treats everything after `ralphus:new-worktree/` as one
+literal branch name, slashes included. During materialization the daemon first
+validates that branch name with `git check-ref-format --branch`. If a local
+branch by that exact name already exists, it is reused. Otherwise, a
+slash-containing name like `origin/foo` is checked against the remote-tracking
+ref `refs/remotes/origin/foo`; when that ref exists, the daemon creates the new
+local branch from the remote-tracking branch and configures it to track it --
+a real, attached branch checkout, never a detached HEAD. When no such
+remote-tracking ref exists, the daemon falls back to creating a literal local
+branch named `origin/foo` from the project's current `HEAD` and logs a
+warning about that ambiguous fallback.
+
+A worktree whose branch tracks a remote is not frozen at whatever the remote
+held on first materialization: every later time that placeholder is resolved
+(i.e. on each new run submitted against it), the daemon fetches that remote
+branch and rebases the local branch onto it, so the worktree picks up new
+pushes over the life of the project. This is a rebase, not a hard reset --
+commits already made in that worktree are replayed on top of the fetched
+history rather than discarded. If the rebase can't complete cleanly (a real
+conflict, or otherwise-diverged local history), it is aborted and run
+resolution fails with an error naming the worktree, leaving it exactly as it
+was for a human to resolve by hand.
 
 Request:
 ```json
@@ -331,9 +356,9 @@ Request:
 `protocol_version` defaults to the version this daemon implements; a provider
 registered against a different one is refused at dispatch rather than invoked.
 `400` if `scheme` is empty, unusable as a machine scheme (it must be at least
-two characters — a bare drive letter like `C:` is a path, not a machine), a
-built-in (`local`, `ralphus-daemon`), or reserved (`ralphus`, which already
-means the worktree placeholder and the RAL-188 entity URI). Response `201`:
+two characters — a bare drive letter like `C:` is a path, not a machine), the
+built-in `local`, or reserved (`ralphus`, which already means the worktree
+placeholder and the RAL-188 entity URI). Response `201`:
 ```json
 { "scheme": "incredibuild" }
 ```
@@ -349,7 +374,7 @@ registry row (so a client doesn't render them as missing).
 
 ```json
 { "machines": [ { "scheme": "incredibuild", "description": "...", "program": "/opt/ib.sh", "args": [], "protocol_version": 1, "created_at_ms": 0 } ],
-  "builtin": ["local", "ralphus-daemon"] }
+  "builtin": ["local"] }
 ```
 
 ### `GET /api/machines/{scheme}`
@@ -365,6 +390,38 @@ Deliberately does **not** check whether any stored run still references the
 scheme: those runs resolved their machines at submit time, so a historical
 record should not block cleaning up the registry. A *new* submission naming a
 deregistered scheme fails at submit.
+
+### `POST /api/machines/{scheme}/check`
+Probe one provider for reachability (RAL-185 Q3) by invoking its `ping` verb.
+Explicit and on-demand only — never polled, since a probe spawns the provider
+program and a board refreshing every couple of seconds would turn that into
+steady load on a build farm. The result is persisted (`last_check_ms` /
+`last_check_ok` / `last_check_note` on the provider row) so the Machines tab
+shows the last known answer with its timestamp rather than implying live
+truth. The built-in `local` scheme always reports reachable without spawning
+anything. Response `200`:
+```json
+{ "ok": true, "note": "loopback provider on windows, uri='probe'" }
+```
+
+### `POST /api/machines/cleanup`
+Tear down one provisioned workspace (RAL-201) by invoking its `cleanup` verb.
+Body names the **full** `machine` value, not just a scheme, since one provider
+backs many independent workspaces (one per `uri`):
+```json
+{ "machine": "incredibuild:A" }
+```
+**Never called automatically by the daemon** — a workspace is retained after a
+run finishes exactly like a local worktree is, so this is an explicit,
+operator-initiated reclaim. `502 provider_error` on failure, with the
+provider's own reason verbatim; nothing is discarded on failure since the
+daemon keeps no record of the workspace to roll back (`provision` re-derives
+it deterministically every time). `400` if `machine` resolves to `local`
+(there is nothing to clean up) or names an unregistered/unresolvable machine.
+Response `200`:
+```json
+{ "ok": true }
+```
 
 See [`docs/machine-providers.md`](machine-providers.md) for the provider
 contract (verbs, JSON envelope, versioning) and the publishing model.
@@ -587,16 +644,45 @@ A branch with no source session — added manually, or whose session was deleted
 — inherits nothing; its own overrides are the whole environment, and a
 tombstone for a never-inherited key is a harmless no-op.
 
-The **combined** review worktree (the guardian-level chat/triage agent) spans
-every enabled branch at once, so it uses the union of their resolved
-environments in stack order (lowest `position` first) — a key two branches both
-set resolves to the one stacked on top, matching the precedence the rebase
-gives their code. Disabled branches are excluded, since their commits are not
-in the combined worktree either.
+The **combined** review worktree spans every enabled branch at once, rebased
+onto the last one in stack order, so anything that runs against it — the
+guardian-level chat/triage agent, the finalize-time build/check-gate step, and
+the manual-checks step (see below) — uses the last enabled branch's own
+resolved environment (highest `position`) instead of one earlier branch's or a
+merge of all of them: that branch's code is what's actually checked out at the
+worktree's tip. Disabled branches are never candidates, since their commits
+are not in the combined worktree either. This is exposed on `GuardianView` as
+`combined_env` (`{key: value}`, no per-key provenance — it's already a plain
+resolved environment, not an overridable layer itself).
 
 **Remote caveat:** a check gate running on a remote machine still runs without
 these overrides — `remote_runner::RunRequest` has no env field, so rather than
 half-applying them the remote path is left exactly as it was.
+
+#### `POST /api/guardians/{id}/build-env` / `.../manual-checks-env` — combined-worktree step overrides (RAL-203)
+
+Two more three-operation (`set`/`unset`/`clear`) layers, same request/response
+shape and validation as the branch-env endpoint above, each independently
+shadowing the guardian-level `combined_env` baseline described above:
+
+| Endpoint | Governs |
+|---|---|
+| `POST /api/guardians/{id}/build-env` | The finalize-time build/check-gate step run against the combined worktree (`final_checks` in `guardian_merge.rs`) — explicit `checks`, the project's `.ralphus.toml [review] auto_build`, or an AI-inferred build command. |
+| `POST /api/guardians/{id}/manual-checks-env` | The manual-checks step: the LLM-suggested commands run via `ralphus review checks run` or the board's "Run all" (`guardian_run_manual_commands` in `server.rs`), and `[[review.action]]` hints, which share the same execution path. |
+
+Setting one never affects the other — a build-only override does not leak into
+manual-checks, and vice versa. The response is the same `{key: value|null}`
+raw-override-layer shape as branch env; the resolved, effective environment
+for each step rides along on `GuardianView` as `build_env_overrides`/
+`build_env` and `manual_checks_env_overrides`/`manual_checks_env`
+respectively — `build_env`/`manual_checks_env` are `combined_env` with that
+section's own overrides applied, mirroring `BranchView.resolved_env`.
+
+**CLI:** `ralphus review build-env <selector> --set KEY=VAL --unset KEY --clear
+KEY` and the `manual-checks-env` equivalent. The CLI never prints a resolved or
+overridden environment-variable *value* anywhere (only key names and
+override/tombstone/inherited status) — see `DaemonClient._json_or_raise`'s
+redaction of every `/api/guardians...` response in `cli/src/ralphus/client.py`.
 
 ### `POST /api/runs/{id}/add-dependency`
 Wire up a manual cross-run dependency after submission (RAL-105), e.g. from the
@@ -648,11 +734,39 @@ paused/running there — a transient gap right after `--continue`/`--skip`
 (files briefly absent) also reads as `null`/`null` rather than a stale or
 spurious `0`/`0`.
 
+`GuardianView` also carries this review's own agent cost (RAL-193) --
+conflict-resolution and verifier LLM calls made by the guardian merge
+machinery, deliberately excluding the cost of the tasks/sessions that fed
+into the review: `maximum_budget_usd` (`f64|null`, from `[[review]]`'s
+`maximum_budget_usd`; `null` means no cap), `merge_attempt` (`i64`, bumped
+once per rebase/re-merge attempt), `attempt_tokens_in`/`attempt_tokens_out`/
+`attempt_cost_usd` (scoped to the current `merge_attempt` only), and
+`cumulative_tokens_in`/`cumulative_tokens_out`/`cumulative_cost_usd` (summed
+across every rebase/re-merge attempt this review has gone through -- the
+value `maximum_budget_usd` is enforced against). Unlike a session's
+`cost_usd` (see the cost-semantics note below), these guardian-level totals
+genuinely accumulate: they're computed by summing the `guardian_costs` table
+(one row per resolver/verifier call), not read off a single overwritten
+column, so no Cartographer-side aggregation is needed to see the full
+picture. Once `cumulative_cost_usd` exceeds `maximum_budget_usd`, the daemon
+stops making further resolver/verifier calls for this review and fails it --
+the same kill-switch behavior as a task/session `maximum_budget_usd` cap
+(RAL-161), just enforced against the review's own cumulative spend rather
+than one subprocess's live cost.
+
 ### `POST /api/guardians/{id}/settings`
 Update per-review opt-out/override settings — only the fields present in the
 body are changed, everything else is left as-is. Returns the updated
 `GuardianView`. Most fields are documented by their name alone (see
 `GuardianSettingsBody` in `daemon/src/server.rs` for the exhaustive list).
+
+RAL-213: if the review is currently `merging`, the settings write also stops
+the in-flight merge and starts a fresh one (the same safe cancel → wait →
+reset → restart sequence `cancel_and_merge` uses), so the new setting takes
+effect on this build rather than only the next one. This is best-effort — a
+restart hiccup is logged, not surfaced as an error, since the settings write
+itself has already succeeded by that point. The returned `GuardianView`
+reflects the fresh `merging` status when this fires.
 
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered
@@ -860,6 +974,21 @@ alias (`A→B`, `B→C`, `C→upstream`); a combined request always targets the
 review's own base branch. `404` if the guardian doesn't exist; `400` for an
 empty `prs` list.
 
+The resolved `branch_alias` (whether explicit or defaulted) is auto-suffixed
+(`-002`, `-003`, ...) when it collides with another PR already recorded for
+the same `(forge, repo)` (RAL-190) — a resubmission of the *same* branch is
+exempt and keeps reusing its own prior alias. This makes a review worktree
+branch reusable directly as its own PR branch (the common case: an explicit
+`branch_alias` equal to the worktree's underlying branch name) without
+worrying about a name clash with an unrelated review.
+
+Reordering a review's branches (`POST .../branches/reorder` or `.../arrange`)
+retargets every affected stacked PR's base in the background: each PR's base
+becomes the alias of the nearest-preceding enabled branch that has its own
+open PR (or the review's own base branch, if none precedes it). The local
+`base_ref` record always updates; the forge PR's base is best-effort PATCHed
+too (`GET .../pull-requests` reflects the recorded state either way).
+
 ### `GET /api/pull-requests`
 Look up the ralphus PR row for a given forge PR/MR (the PR → worktree
 direction), query params `forge` (`github`|`gitlab`), `repo` (URL-encoded), and
@@ -896,7 +1025,43 @@ topmost enabled stacked branch (the combined worktree itself is read-only).
 Once applied, the resulting branch is pushed back to the remote under this
 PR's recorded alias so the open PR/MR reflects the fix. Runs in the background;
 returns `202 {"status":"actioning_feedback"}` immediately. `404` if the PR
-doesn't exist.
+doesn't exist. Refuses (`4xx`, via the same guard `pull-from-pr` exists to
+resolve — see below) rather than force-pushing over a PR branch that has
+commits the review worktree doesn't, e.g. a reviewer pushed a fix directly to
+the open PR branch instead of leaving a comment (RAL-190).
+
+### `GET /api/pull-requests/{pr_id}/sync-status`
+Live drift check between the PR's remote `branch_alias` branch and its owning
+review worktree (RAL-190) — fetches the remote branch and compares tips via
+`git merge-base --is-ancestor` in both directions:
+```json
+{
+  "remote_sha": "abc123...",
+  "local_sha": "def456...",
+  "last_pushed_sha": "abc123...",
+  "in_sync": false,
+  "pr_ahead": true,
+  "worktree_ahead": false
+}
+```
+`pr_ahead` means the PR branch has commits the review worktree doesn't (a
+reviewer pushed directly to it — the board should offer "Pull PR commits");
+`worktree_ahead` means the reverse (the review worktree has commits not yet
+reflected on the PR branch, e.g. right after resolving feedback — the board
+should offer "Push to PR", which submitting/action-feedback already do
+automatically). Both can be `false` and `in_sync` `true` when they match
+exactly. `502` if the guardian/PR can't be resolved.
+
+### `POST /api/pull-requests/{pr_id}/pull-from-pr`
+Fetch the PR branch's commits and rebase them into the owning review
+worktree — resolving conflicts through the same agent path a normal stacked
+rebase uses — then push the merged result back to the remote and restack
+every branch downstream of it in the stack (RAL-190; mirrors the existing
+"manual push detected" restack, now for a *remote* push). A PR submitted from
+the combined worktree routes to the topmost enabled stacked branch, the same
+convention `action-feedback` uses. Runs in the background; returns
+`202 {"status":"pulling_pr_commits"}` immediately. `404` if the PR doesn't
+exist.
 
 **Auth (RAL-117 Q8):** forge API tokens are read from an environment variable,
 never from a config file or the database. See `crate::forge` module docs (and
@@ -974,6 +1139,8 @@ keeps the default newest-first order).
       "label": null,
       "state": "running",
       "created_at_ms": 1783120106867,
+      "started_at_ms": 1783120107200,
+      "finished_at_ms": null,
       "tasks": [
         {
           "name": "build",
@@ -982,7 +1149,9 @@ keeps the default newest-first order).
           "model": null,
           "state": "running",
           "soloed": false,
-          "sessions": [ { "id": "session-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "verify": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
+          "started_at_ms": 1783120107300,
+          "finished_at_ms": null,
+          "sessions": [ { "id": "session-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "verify": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
           "verify":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null } ]
         }
       ]
@@ -1007,6 +1176,11 @@ task-level values submitted in TOML, before session inheritance is applied.
 These are distinct from each `SessionView`'s resolved `agent`/`model` fields;
 the board uses the raw task values to explain whether a session's displayed
 resolved value came from the task or was set explicitly on the session.
+
+`started_at_ms` (RAL-210) is epoch-ms local-machine time of the moment this
+session most recently transitioned to `running`; omitted from the JSON
+(rather than `null`) until it has started at least once. A restart
+overwrites it in place -- there is no separately-tracked first-start time.
 
 `tokens_in` / `tokens_out` / `cost_usd` are reported by whichever agent
 backend ran the session or verify step, and how complete they are depends on
@@ -1034,6 +1208,18 @@ that backend (RAL-187):
 - The values reflect the session's **current** run only. A restart overwrites
   them rather than accumulating, so a lifetime total across attempts must be
   derived from Cartographer's event history instead.
+
+`created_at_ms` is when the run was submitted/queued. `started_at_ms` (on the
+run, each task, and each session) is when it first entered `running` — `null`
+until it does, and can differ from `created_at_ms` when a run sits `pending`/
+`queued` for a while before the scheduler claims it. `finished_at_ms` is when
+it last reached a terminal state (`done`/`failed`/`cancelled`) — `null` while
+still queued/pending/running. Together these back the Details Pane's "time
+running" (live elapsed while non-terminal, frozen `finished_at_ms -
+started_at_ms` once terminal) and "started at" (UTC) fields. A run/task/
+session that is restarted has these cleared back to `null` for the part(s)
+genuinely re-executing (see `Store::reset_run_to_pending`/`restart_session` in
+`daemon/src/store.rs`).
 
 Both *task*-level verify steps (`[[task.verify]]`, on `TaskView.verify`) and
 *session*-level verify steps (`[[task.session.verify]]`, on `SessionView.verify`)
@@ -1240,9 +1426,17 @@ one run/session/guardian's history"; the latter is just this endpoint with a
 per-run "events" sub-tab that used to be backed by `GET /api/runs/{id}/logs`).
 
 Query params (all optional): `source`, `scope`, `level`, `run_id`,
-`guardian_id`, `session_id`, `q` (substring match on message), `since_ms`,
-`until_ms`, `limit` (default 100, max 1000), `offset`, `sort` (`asc`/`desc`,
-default `desc` — newest first).
+`guardian_id`, `session_id`, `task` (exact match on task name, RAL-155),
+`q` (substring match on message), `since_ms`, `until_ms`, `limit` (default
+100, max 1000), `offset`, `sort` (`asc`/`desc`, default `desc` — newest
+first) — plus `entity` (RAL-155): a single-string [entity URI](#entity-uris-ral-155)
+that addresses a run/task/session/verify/guardian uniformly, resolved into
+the equivalent `run_id`/`task`/`session_id`/`guardian_id` filter fields
+server-side (`task_idx`/`session_idx` are translated to the task's
+name/session's id via a store lookup, since those are what the columns
+above actually store). `entity` composes with the other filter fields —
+an explicit field always wins over one `entity` would have derived, since
+it's the more specific ask. A malformed `entity` string is a `400`.
 
 ```json
 {
@@ -1258,12 +1452,18 @@ default `desc` — newest first).
       "guardian_id": null,
       "session_id": null,
       "task": null,
+      "log_path": null,
       "payload": {}
     }
   ],
   "total": 128
 }
 ```
+
+`log_path` (RAL-155) is set on rows that reference an on-disk log file — e.g.
+a durable terminal-log attempt file (`crate::terminal_log`, RAL-154) — rather
+than embedding that file's content in the row itself. `null` for every other
+event.
 
 Retention is enforced by two independently configurable caps under
 `[cartographer]` in `.ralphus.toml` (`retention_days`, default 30;
@@ -1307,6 +1507,80 @@ history/backfill), and a slow/stalled client's channel (bounded, capacity
 256) silently drops events past that bound rather than blocking the rest of
 the daemon — `board.html`'s own 60s reconciliation poll (a `tick()` fallback,
 not the primary path) covers any resulting gap.
+
+### Entity URIs (RAL-155)
+A single-string, index-based way to address any run/task/session/verify/
+guardian entity — shared, cross-cutting infrastructure used as the
+`GET /api/cartographer` `entity=` filter above, and mirrored in the CLI
+(`ralphus.entity_uri`, bridging the CLI's human-typed, name-or-index
+`ralphus.selector` grammar into this wire format via
+`from_resolved_selector`) and the daemon (`daemon/src/entity_uri.rs`, the
+authoritative grammar the other two mirror). Grammar:
+
+```text
+run:<run_id>
+task:<run_id>:<task_idx>
+session:<run_id>:<task_idx>:<session_idx>
+verify:<run_id>:<task_idx>:<verify_scope>:<session_idx>:<verify_idx>
+guardian:<guardian_id>
+```
+
+`task_idx`/`session_idx`/`verify_idx` are the same 0-based indices the HTTP
+routes already use (`/api/runs/{id}/sessions/{ti}/{si}/...`). `verify_scope`
+is `"task"` or `"session"`; `session_idx` is `-1` for a task-scope verify.
+Examples: `task:run-000000000001:0`, `session:run-000000000001:0:1`,
+`verify:run-000000000001:0:session:1:0`, `guardian:guardian-000000000001`.
+
+### `GET /api/runs/{id}/timeline`
+Generates and returns the merged, chronological "uber-log-viewer" for a
+whole run (RAL-155): every Run/Task/Session/Verify state transition and
+every other Cartographer event scoped to the run, plus terminal-log excerpts
+inlined from any `log_path`-carrying rows, sorted by `(at_ms, id)` ascending
+and rendered as one plain-text narrative. As a side effect, the rendered
+text is (best-effort) written to a temp file on the daemon's host — a fresh
+generation on every call, not a persistent export (RAL-155 Q5) — at a fixed
+per-run path under the OS temp directory. `404` if the run doesn't exist.
+
+```json
+{
+  "meta": {
+    "run_id": "run-000000000001",
+    "generated_at_ms": 1732300005000,
+    "start_ms": 1732300000000,
+    "end_ms": 1732300004000,
+    "event_count": 37,
+    "terminal_log_count": 3,
+    "task_count": 2,
+    "session_count": 4,
+    "truncated": false,
+    "gaps_possible": false
+  },
+  "entries": [
+    {
+      "at_ms": 1732300000000,
+      "level": "info",
+      "source": "submit",
+      "scope": "run",
+      "task": null,
+      "session_id": null,
+      "message": "run inserted",
+      "log_path": null,
+      "log_excerpt": null
+    }
+  ],
+  "text": "=== ralphus uber-log timeline: run run-000000000001 ===\n...",
+  "file_path": "C:\\Users\\...\\Temp\\ralphus-timeline-run-000000000001.log"
+}
+```
+
+`event_count` is capped at a conservative default (2000 rows) per
+generation — `truncated: true` means the run has more history than fit.
+`gaps_possible: true` means the run's own inaugural `"run inserted"`
+Cartographer row is missing from the returned rows, which reliably indicates
+Cartographer's retention pruning has already removed some of this run's
+earliest history — this endpoint is best-effort (RAL-155 Q6), with no
+obligation to reconstruct pruned history. The board's "⏱ Timeline" button
+(next to "📄 Logs") calls this same endpoint and renders `text` in a modal.
 
 ### `GET /api/ghosts/{owner_uri}`
 Fetch one "ghost" (RAL-136) — a short, best-effort handoff note a task

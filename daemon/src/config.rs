@@ -261,6 +261,94 @@ impl BudgetConfig {
     }
 }
 
+/// Terminal-log retention configuration (`[terminal_logs]` table, RAL-154).
+/// Governs the durable, per-attempt tmux pane transcripts persisted by
+/// `crate::terminal_log` (see that module's doc comment) — independent of
+/// [`CartographerConfig`], which only governs the separate structured
+/// `cartographer_events` table.
+///
+/// Three independently configurable knobs, all `None` meaning unset (so a
+/// lower layer can supply it): [`max_lines_per_attempt`](Self::max_lines_per_attempt)
+/// bounds a single attempt's log file size; `retention_days` and `max_files`
+/// bound the total on-disk footprint over time, mirroring
+/// [`CartographerConfig`]'s two-cap retention model (either condition
+/// triggers pruning).
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalLogConfig {
+    /// Max lines kept per attempt's log file (the tail is kept, oldest lines
+    /// dropped). Must be `>= 1` — an explicit `0` or negative value is
+    /// treated as unset (falls back to the default) rather than failing
+    /// loudly, matching this file's "malformed config never blocks" rule.
+    #[serde(default)]
+    pub max_lines_per_attempt: Option<i64>,
+    #[serde(default)]
+    pub retention_days: Option<i64>,
+    #[serde(default)]
+    pub max_files: Option<i64>,
+}
+
+impl TerminalLogConfig {
+    /// Max lines kept per attempt's log file. Defaults to 4000. A configured
+    /// value `< 1` is treated as unset, per this struct's doc comment.
+    #[must_use]
+    pub fn max_lines_per_attempt(&self) -> usize {
+        match self.max_lines_per_attempt {
+            Some(n) if n >= 1 => n as usize,
+            _ => 4000,
+        }
+    }
+
+    /// Attempt log files older than this many days are pruned. Defaults to 30
+    /// (same default as [`CartographerConfig::retention_days`]).
+    #[must_use]
+    pub fn retention_days(&self) -> i64 {
+        self.retention_days.unwrap_or(30)
+    }
+
+    /// Once the total number of persisted attempt log files exceeds this
+    /// count, the oldest excess files are pruned. Defaults to 2000 — a
+    /// single frequently-reattached session can otherwise grow unboundedly
+    /// (the risk this ticket calls out), so this cap applies across every
+    /// session's files, not per-session.
+    #[must_use]
+    pub fn max_files(&self) -> i64 {
+        self.max_files.unwrap_or(2000)
+    }
+}
+
+/// Parse a `TerminalLogConfig` from the given TOML text; the default (4000
+/// lines / 30 days / 2000 files) when the `[terminal_logs]` table is absent.
+#[must_use]
+pub fn terminal_log_from_toml_str(s: &str) -> TerminalLogConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .terminal_logs
+        .unwrap_or_default()
+}
+
+/// Load the effective terminal-log config by layering the global config file
+/// under the nearest per-project `.ralphus.toml` (per-project scalars win),
+/// following the same pattern as [`load_cartographer_config`].
+#[must_use]
+pub fn load_terminal_log_config() -> TerminalLogConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| terminal_log_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| terminal_log_from_toml_str(&s))
+        .unwrap_or_default();
+    TerminalLogConfig {
+        max_lines_per_attempt: local.max_lines_per_attempt.or(global.max_lines_per_attempt),
+        retention_days: local.retention_days.or(global.retention_days),
+        max_files: local.max_files.or(global.max_files),
+    }
+}
+
 /// Forge routing configuration (`[forge]` table, RAL-117). Lets a project pin
 /// which forge (GitHub/GitLab) and remote to submit PRs against, instead of
 /// relying purely on `git remote get-url` autodetection. `None` fields fall
@@ -363,6 +451,8 @@ struct ConfigFile {
     daemon: Option<DaemonConfig>,
     #[serde(default)]
     cartographer: Option<CartographerConfig>,
+    #[serde(default)]
+    terminal_logs: Option<TerminalLogConfig>,
     #[serde(default)]
     forge: Option<ForgeConfig>,
     #[serde(default)]
@@ -863,6 +953,56 @@ mod tests {
     fn budget_malformed_toml_is_default() {
         let c = budget_from_toml_str("not = = valid");
         assert_eq!(c.poll_interval(), Duration::from_millis(200));
+    }
+
+    // ── TerminalLogConfig (RAL-154) ───────────────────────────────────────
+
+    #[test]
+    fn terminal_log_defaults_when_absent() {
+        let c = terminal_log_from_toml_str("");
+        assert_eq!(c.max_lines_per_attempt(), 4000);
+        assert_eq!(c.retention_days(), 30);
+        assert_eq!(c.max_files(), 2000);
+    }
+
+    #[test]
+    fn terminal_log_parses_explicit_values() {
+        let c = terminal_log_from_toml_str(
+            "[terminal_logs]\nmax_lines_per_attempt = 500\nretention_days = 7\nmax_files = 100\n",
+        );
+        assert_eq!(c.max_lines_per_attempt(), 500);
+        assert_eq!(c.retention_days(), 7);
+        assert_eq!(c.max_files(), 100);
+    }
+
+    #[test]
+    fn terminal_log_partial_table_falls_back_per_field() {
+        let c = terminal_log_from_toml_str("[terminal_logs]\nretention_days = 7\n");
+        assert_eq!(c.max_lines_per_attempt(), 4000);
+        assert_eq!(c.retention_days(), 7);
+        assert_eq!(c.max_files(), 2000);
+    }
+
+    #[test]
+    fn terminal_log_malformed_toml_is_default() {
+        let c = terminal_log_from_toml_str("not = = valid");
+        assert_eq!(c.max_lines_per_attempt(), 4000);
+        assert_eq!(c.retention_days(), 30);
+        assert_eq!(c.max_files(), 2000);
+    }
+
+    #[test]
+    fn terminal_log_max_lines_below_one_falls_back_to_default() {
+        let zero = terminal_log_from_toml_str("[terminal_logs]\nmax_lines_per_attempt = 0\n");
+        assert_eq!(zero.max_lines_per_attempt(), 4000);
+        let negative = terminal_log_from_toml_str("[terminal_logs]\nmax_lines_per_attempt = -5\n");
+        assert_eq!(negative.max_lines_per_attempt(), 4000);
+    }
+
+    #[test]
+    fn terminal_log_max_lines_of_one_is_valid() {
+        let c = terminal_log_from_toml_str("[terminal_logs]\nmax_lines_per_attempt = 1\n");
+        assert_eq!(c.max_lines_per_attempt(), 1);
     }
 
     // ── Downtime windows (RAL-122) ────────────────────────────────────────

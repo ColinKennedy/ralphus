@@ -150,6 +150,7 @@ mod tests {
             guardian_id: guardian_id.map(str::to_string),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({}),
         }
     }

@@ -43,6 +43,8 @@ role in the table below, then use it.
 | `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
 | `--stale` | `#db6d28` | *(shared)* | semantic (Live View: no fresh pane output for a while from a still-running session, RAL-170) |
 | `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that contributes no changes — fails the review, RAL-190) |
+| `--drift` | `#f0883e` | *(shared)* | semantic (a submitted PR's remote branch and its review worktree have diverged, RAL-190) |
+| `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -111,6 +113,17 @@ real `ignored` status.
 Use it only for "this branch contains nothing," not as a general warning or
 general failure color.
 
+### PR/worktree drift — `--drift` only (RAL-190)
+The Reviews panel's PR section uses `--drift` for exactly one case: a
+submitted PR's remote branch and its owning review worktree have diverged —
+most often a reviewer pushed a fix directly to the open PR branch instead of
+leaving a comment. Distinct from `--ignored` (reserved for the real `ignored`
+status) and from `--warn` (reserved for Cartographer log severity); `--drift`
+exists only because no existing role fit this new concept. It is informational
+rather than an error — the fix is one click ("Pull PR commits"), not a
+failure requiring investigation, so it deliberately does not reuse
+`--failed`/`--danger` red either.
+
 ### Log severity — Cartographer only (RAL-98)
 Cartographer's event table (the global log, a run's Logs "events" tab, and a
 review's Logs button) colors rows by `level`, a concept distinct from entity
@@ -150,6 +163,17 @@ running, or done), so it can't reuse a status color; it also isn't a user
 *selection* (`--accent`), a dependency-driven move (`--teal`), or a caution
 (`--ignored`) — `--solo` exists only because no existing role fit this new
 concept (see "Adding a new UI element" below).
+
+### Possibly-incomplete data — `--incomplete` only (RAL-155)
+The uber-log-viewer (a run's "Timeline" button/modal) flags two best-effort
+conditions with `--incomplete`: `gaps_possible` (Cartographer's retention
+pruning has already removed some of this run's earliest history) and
+`truncated` (the run generated more events than the conservative
+per-generation cap). Both are "this data may not be the full picture," not a
+caution about an action the user is about to take (`--ignored`), a log
+severity (`--warn`, Cartographer-display-only), or an unverified-review state
+(`--unverified`) — `--incomplete` exists only because no existing role fit
+this new concept (see "Adding a new UI element" below).
 
 ### Read-only field indicator — `--muted` (no new color)
 A detail-pane field that is purely derived/computed and can never be edited
@@ -194,7 +218,7 @@ disabled state, warning, or status.
   overrides only the chrome colors (`--bg`, `--panel`, `--panel-2`, `--border`,
   `--text`, `--muted`, `--accent`).
 - Status and semantic hues (`--running`, `--done`, `--failed`, `--pending`,
-  `--queued`, `--cancelled`, `--ignored`, `--teal`, `--danger`) are **shared** —
+  `--queued`, `--cancelled`, `--ignored`, `--teal`, `--danger`, `--incomplete`) are **shared** —
   they read acceptably on both backgrounds, so they are defined once.
 - When you add a new color: if it must differ between themes, add it to `:root`
   **and** to the `[data-theme="light"]` block. If a single hue works on both

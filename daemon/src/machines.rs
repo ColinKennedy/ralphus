@@ -239,6 +239,7 @@ impl Store {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({
                 "scheme": scheme,
                 "program": program,
@@ -396,6 +397,83 @@ impl Store {
     }
 }
 
+/// A persisted async `exec` handle for one in-flight remote session
+/// (RAL-201), reconciled against on daemon startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteExecHandle {
+    pub run_id: String,
+    pub session_id: String,
+    pub scheme: String,
+    pub uri: String,
+    pub handle: String,
+}
+
+impl Store {
+    /// Record the opaque handle a provider returned for an async `exec`, so a
+    /// daemon restart can reconcile it (see [`Self::all_remote_exec_handles`])
+    /// instead of silently orphaning whatever is still running remotely.
+    /// Upserts on `(run_id, session_id)` — a session only ever has one
+    /// in-flight handle at a time.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn save_remote_exec_handle(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        scheme: &str,
+        uri: &str,
+        handle: &str,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO remote_exec_handles(run_id, session_id, scheme, uri, handle, created_at_ms)
+             VALUES(?,?,?,?,?,?)
+             ON CONFLICT(run_id, session_id) DO UPDATE SET
+                scheme=excluded.scheme, uri=excluded.uri, handle=excluded.handle,
+                created_at_ms=excluded.created_at_ms",
+            rusqlite::params![run_id, session_id, scheme, uri, handle, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Clear a session's persisted handle once its `exec` has finished (by any
+    /// outcome — done, failed, cancelled, timed out, cost-exceeded) or a
+    /// restart has already reconciled it. Not finding one is not an error —
+    /// every caller here is cleaning up and may race a concurrent clear.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn clear_remote_exec_handle(&self, run_id: &str, session_id: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "DELETE FROM remote_exec_handles WHERE run_id = ? AND session_id = ?",
+            rusqlite::params![run_id, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every persisted remote `exec` handle, for startup reconciliation.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn all_remote_exec_handles(&self) -> StoreResult<Vec<RemoteExecHandle>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT run_id, session_id, scheme, uri, handle FROM remote_exec_handles")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RemoteExecHandle {
+                    run_id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    scheme: r.get(2)?,
+                    uri: r.get(3)?,
+                    handle: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +612,58 @@ mod tests {
             s.resolve_machine(Some("ib:A")),
             Err(ResolveError::UnknownScheme { .. })
         ));
+    }
+
+    /// RAL-200: the ssh machine provider registers under the plain "ssh"
+    /// scheme through this same generic mechanism -- no new daemon-side
+    /// plumbing needed. This pins that "ssh" collides with neither the
+    /// built-in `local` scheme nor the `ralphus` reserved word, and that
+    /// re-registering it (e.g. after a path change or a version bump)
+    /// upserts cleanly rather than duplicating, exactly like every other
+    /// provider.
+    #[test]
+    fn the_ssh_scheme_is_registrable_and_re_registration_upserts() {
+        assert!(
+            !is_unregistrable_scheme("ssh"),
+            "\"ssh\" must not collide with a built-in or reserved scheme"
+        );
+        let s = store();
+        s.register_machine_provider(
+            "ssh",
+            "reaches any host already reachable via ssh (RAL-200)",
+            "/opt/ralphus/ralphus-ssh-provider",
+            &[],
+            PROTOCOL_VERSION,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            s.resolve_machine(Some("ssh:alice@build-box")).unwrap(),
+            ResolvedMachine::Provider {
+                scheme: "ssh".to_string(),
+                uri: "alice@build-box".to_string(),
+            }
+        );
+
+        // Re-registering (e.g. a path change after a release) upserts.
+        s.register_machine_provider(
+            "ssh",
+            "reaches any host already reachable via ssh (RAL-200)",
+            "/opt/ralphus/v2/ralphus-ssh-provider",
+            &[],
+            PROTOCOL_VERSION,
+            false,
+        )
+        .unwrap();
+        let all = s.list_machine_providers().unwrap();
+        assert_eq!(
+            all.iter().filter(|p| p.scheme == "ssh").count(),
+            1,
+            "re-registering \"ssh\" must upsert, not duplicate"
+        );
+        assert_eq!(
+            s.get_machine_provider("ssh").unwrap().unwrap().program,
+            "/opt/ralphus/v2/ralphus-ssh-provider"
+        );
     }
 }

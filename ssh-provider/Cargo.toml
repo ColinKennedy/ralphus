@@ -1,0 +1,22 @@
+[package]
+name = "ralphus-ssh-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Machine provider (RAL-185) that runs sessions over plain SSH -- reaches any host you already have SSH access to, no agent to install (RAL-200)."
+
+[[bin]]
+name = "ralphus-ssh-provider"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_ssh_provider"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

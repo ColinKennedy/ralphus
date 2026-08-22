@@ -46,11 +46,15 @@ struct RunnerEvent {
 
 /// Live token/cost usage extracted from an `llm-invoke` event's payload
 /// (RAL-161), mirroring the existing `agent_session_id` capture.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct LiveUsage {
-    tokens_in: i64,
-    tokens_out: i64,
-    cost_usd: f64,
+///
+/// `pub(crate)` (not private): [`crate::remote_runner::ProviderRunner`] needs
+/// this too, to drive the same live cost-cap kill for a remote session that
+/// [`SubprocessRunner`] already does locally.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct LiveUsage {
+    pub(crate) tokens_in: i64,
+    pub(crate) tokens_out: i64,
+    pub(crate) cost_usd: f64,
 }
 
 /// What [`forward_runner_event`] learned from one event, for the caller's own
@@ -59,8 +63,8 @@ struct LiveUsage {
 /// (for the cost-cap kill check).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ForwardedEvent {
-    agent_session_id: Option<String>,
-    live_usage: Option<LiveUsage>,
+    pub(crate) agent_session_id: Option<String>,
+    pub(crate) live_usage: Option<LiveUsage>,
 }
 
 /// The JSON spec sent to the runner on stdin (mirrors Python `SessionSpec`).
@@ -735,6 +739,9 @@ impl SubprocessRunner {
         let session_name = crate::tmux::session_name(&spec.run_id, &spec.task, &spec.session_id);
         let spec_path = io_dir.join(format!("{session_name}.spec.json"));
         let result_path = io_dir.join(format!("{session_name}.result.json"));
+        // Loaded once per session run (not per attempt/poll) — RAL-154.
+        let terminal_log_max_lines =
+            crate::config::load_terminal_log_config().max_lines_per_attempt();
 
         // Shared across every attempt: the overall wall-clock budget must not
         // reset on a reattach, and the agent_session_id captured live on one
@@ -785,6 +792,8 @@ impl SubprocessRunner {
                 &started,
                 deadline,
                 &mut resumable_agent_session_id,
+                attempt,
+                terminal_log_max_lines,
             );
 
             if !session_died_unexpectedly {
@@ -912,6 +921,8 @@ impl SubprocessRunner {
         started: &Instant,
         deadline: Option<Duration>,
         resumable_agent_session_id: &mut Option<String>,
+        attempt: u32,
+        terminal_log_max_lines: usize,
     ) -> (RunnerResult, bool) {
         // A stale file from a prior crashed/killed attempt of the same
         // (run_id, task, session_id) must never be mistaken for this
@@ -952,10 +963,6 @@ impl SubprocessRunner {
         // this (run_id, task, session_id) slot without killing it first would
         // otherwise collide with that existing session (`new-session` errors
         // on a duplicate name), failing this attempt immediately.
-        //
-        // Known caveat (not yet implemented — see TMUX.local.md): this
-        // discards the prior session's pane content without saving it beyond
-        // whatever this attempt's `last_pane` already captured.
         if tmux.has_session(session_name) {
             crate::rlog!(
                 WARNING,
@@ -963,6 +970,32 @@ impl SubprocessRunner {
                 attempt_spec.run_id,
                 attempt_spec.session_id,
             );
+            // RAL-154: on a reattach, this stale session is the prior
+            // attempt's own pane, possibly still producing output after that
+            // attempt's own final capture (e.g. the pane flickered
+            // unreachable long enough to trip `MISSING_SESSION_STRIKE_LIMIT`
+            // and get treated as dead, but never actually died — see
+            // PSMUX_CRASH_NOTES.local.md). Grab one last capture and fold it
+            // into that outgoing attempt's durable log *before* killing it,
+            // so this content is never silently discarded — previously the
+            // prior attempt's log only ever reflected whatever `last_pane`
+            // held as of its own last successful poll. Not meaningful for the
+            // very first attempt (`attempt == 0`): a stale session found
+            // there belongs to no attempt this call has ever tracked (most
+            // likely a leftover from a crashed daemon's earlier lifetime),
+            // and the incoming fresh attempt 0 would immediately overwrite
+            // any salvage written to that same slot anyway.
+            if attempt > 0 {
+                if let Ok(content) = tmux.capture_pane(session_name, 10_000) {
+                    crate::terminal_log::write_attempt(
+                        session_name,
+                        attempt - 1,
+                        &content,
+                        terminal_log_max_lines,
+                    );
+                    self.emit_terminal_log_note(attempt_spec, session_name, attempt - 1);
+                }
+            }
             let _ = tmux.kill_session(session_name);
         }
         if let Err(e) =
@@ -1163,6 +1196,17 @@ impl SubprocessRunner {
         // Unconditional: written for every outcome (done, failed, cancelled,
         // timed out), overwriting whatever an earlier attempt left behind.
         crate::tmux::write_pane_snapshot(session_name, last_pane.as_deref().unwrap_or(""));
+        // RAL-154: also persist it as *this attempt's own* durable, never-
+        // overwritten record (unlike the single-slot snapshot above, which
+        // the next attempt/reattach will replace) — so a restarted session's
+        // full multi-attempt history stays individually accessible.
+        crate::terminal_log::write_attempt(
+            session_name,
+            attempt,
+            last_pane.as_deref().unwrap_or(""),
+            terminal_log_max_lines,
+        );
+        self.emit_terminal_log_note(attempt_spec, session_name, attempt);
 
         // Only worth the (bounded) wait on a failure -- a clean completion
         // doesn't need the "was this a crash?" diagnostic. If the tracked
@@ -1247,6 +1291,30 @@ impl SubprocessRunner {
         };
         let Ok(mut guard) = store.lock() else { return };
         guard.clear_live_activity(session_name);
+    }
+
+    /// Emit a Cartographer note recording that a durable terminal-log attempt
+    /// file was (re)written (RAL-154's `crate::terminal_log::write_attempt`),
+    /// carrying the file's path so RAL-155's uber-log-viewer
+    /// (`crate::timeline`) can find and inline it without a separate lookup
+    /// mechanism — see [`crate::cartographer::CartographerRow::log_path`].
+    fn emit_terminal_log_note(&self, spec: &RunnerSpec, session_name: &str, attempt: u32) {
+        let Some(store) = &self.cartographer else {
+            return;
+        };
+        let Ok(guard) = store.lock() else { return };
+        let path = crate::terminal_log::attempt_path(session_name, attempt);
+        crate::cartographer::Note::new("runner")
+            .run(&spec.run_id)
+            .session(&spec.session_id)
+            .task(&spec.task)
+            .scope("terminal_log")
+            .log_path(&path.to_string_lossy())
+            .emit(
+                &guard,
+                format!("terminal log attempt {attempt} written ({session_name})"),
+                serde_json::json!({"session_name": session_name, "attempt": attempt}),
+            );
     }
 
     /// Emit a Cartographer breadcrumb for the tmux auto-reattach retry (see
@@ -1425,6 +1493,7 @@ pub(crate) fn forward_runner_event(
         guardian_id: None,
         session_id: Some(event.session_id.as_deref().unwrap_or(session_id)),
         task: Some(event.task.as_deref().unwrap_or(task)),
+        log_path: None,
         payload: event.payload,
     });
     ForwardedEvent {

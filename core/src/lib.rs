@@ -4,6 +4,7 @@
 //! unit-tested quickly and reused across the Rust executables. Heavier concerns
 //! (HTTP, SQLite, process spawning) live in the `daemon` and `librarian` crates.
 
+pub mod agent_resume;
 mod bench_demo;
 pub mod schema;
 pub mod uri;

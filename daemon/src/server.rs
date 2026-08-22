@@ -25,6 +25,7 @@ use crate::runner::{Runner, SubprocessRunner};
 use crate::scheduler::Semaphore;
 use crate::store::{NodeState, RunState, Store, StoreError};
 use crate::summary_worker::SummaryQueue;
+use crate::vcs;
 
 /// The running daemon: its store handle plus configuration.
 pub struct Daemon {
@@ -323,6 +324,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("GET", ["api", "machines", scheme]) => get_machine(daemon, scheme),
         ("DELETE", ["api", "machines", scheme]) => deregister_machine(daemon, scheme),
         ("POST", ["api", "machines", scheme, "check"]) => check_machine(daemon, scheme),
+        ("POST", ["api", "machines", "cleanup"]) => cleanup_machine(daemon, body),
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "cartographer"]) => cartographer_query(daemon, query),
         ("GET", ["api", "cartographer", id]) => cartographer_get(daemon, id),
@@ -339,6 +341,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("GET", ["api", "runs", id]) => get_run(daemon, id),
         ("GET", ["api", "runs", id, "worktrees"]) => run_worktrees(daemon, id),
         ("GET", ["api", "runs", id, "logs"]) => run_logs(daemon, id),
+        ("GET", ["api", "runs", id, "timeline"]) => run_timeline(daemon, id),
         ("GET", ["api", "runs", id, "graph"]) => run_graph(daemon, id),
         ("POST", ["api", "runs", id, "activate"]) => activate(daemon, id),
         ("POST", ["api", "runs", id, "cancel", "preview"]) => cancel_run_preview(daemon, id),
@@ -407,6 +410,31 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             session_pane(daemon, id, ti, si, query)
         }
         (
+            "GET",
+            [
+                "api",
+                "runs",
+                id,
+                "sessions",
+                ti,
+                si,
+                "terminal-log-attempts",
+            ],
+        ) => session_terminal_log_attempts(daemon, id, ti, si),
+        (
+            "GET",
+            [
+                "api",
+                "runs",
+                id,
+                "sessions",
+                ti,
+                si,
+                "terminal-log-attempts",
+                attempt,
+            ],
+        ) => session_terminal_log_attempt(daemon, id, ti, si, attempt),
+        (
             "POST",
             [
                 "api",
@@ -434,6 +462,43 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
                 "pane",
             ],
         ) => verify_pane(daemon, id, task_idx, scope, session_idx, verify_idx, query),
+        (
+            "GET",
+            [
+                "api",
+                "runs",
+                id,
+                "verifies",
+                task_idx,
+                scope,
+                session_idx,
+                verify_idx,
+                "terminal-log-attempts",
+            ],
+        ) => verify_terminal_log_attempts(daemon, id, task_idx, scope, session_idx, verify_idx),
+        (
+            "GET",
+            [
+                "api",
+                "runs",
+                id,
+                "verifies",
+                task_idx,
+                scope,
+                session_idx,
+                verify_idx,
+                "terminal-log-attempts",
+                attempt,
+            ],
+        ) => verify_terminal_log_attempt(
+            daemon,
+            id,
+            task_idx,
+            scope,
+            session_idx,
+            verify_idx,
+            attempt,
+        ),
         ("DELETE", ["api", "runs", id]) => delete_run(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
         ("POST", ["api", "guardians"]) => guardian_create(daemon, body),
@@ -487,18 +552,66 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "guardians", id, "branches", branch_id, "env"]) => {
             set_guardian_branch_env(daemon, id, branch_id, body)
         }
+        ("POST", ["api", "guardians", id, "build-env"]) => set_guardian_build_env(daemon, id, body),
+        ("POST", ["api", "guardians", id, "manual-checks-env"]) => {
+            set_guardian_manual_checks_env(daemon, id, body)
+        }
         ("GET", ["api", "guardians", id, "branches", branch_id, "pane"]) => {
             guardian_branch_pane(daemon, id, branch_id, query)
         }
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
         }
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
+                "terminal-log-attempts",
+            ],
+        ) => guardian_branch_terminal_log_attempts(daemon, id, branch_id),
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
+                "terminal-log-attempts",
+                attempt,
+            ],
+        ) => guardian_branch_terminal_log_attempt(daemon, id, branch_id, attempt),
         ("POST", ["api", "guardians", id, "manual-checks", "open-terminal"]) => {
             open_guardian_manual_checks_terminal(daemon, id, query)
         }
         ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
             guardian_manual_checks_pane(daemon, id, query)
         }
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "manual-checks",
+                "terminal-log-attempts",
+            ],
+        ) => guardian_manual_checks_terminal_log_attempts(daemon, id),
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "manual-checks",
+                "terminal-log-attempts",
+                attempt,
+            ],
+        ) => guardian_manual_checks_terminal_log_attempt(daemon, id, attempt),
         ("POST", ["api", "guardians", id, "merge"]) => guardian_merge(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
@@ -525,6 +638,8 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "pull-requests", pr_id, "action-feedback"]) => {
             pr_action_feedback(daemon, pr_id)
         }
+        ("GET", ["api", "pull-requests", pr_id, "sync-status"]) => pr_sync_status(daemon, pr_id),
+        ("POST", ["api", "pull-requests", pr_id, "pull-from-pr"]) => pr_pull_from_pr(daemon, pr_id),
         _ => error(
             404,
             "not_found",
@@ -953,26 +1068,24 @@ fn validate_machines_registered(
 /// Shared by `register_project` (validate-then-write) and the read-only
 /// `GET /api/projects/{name}/validate` endpoint (validate-only, RAL-101) so
 /// the two can never drift on what counts as a valid project location.
-fn validate_project_location(path: &str, vcs: &str) -> Result<(), String> {
-    if vcs != "git" {
-        return Err(format!(
-            "unsupported vcs kind \"{vcs}\" (only \"git\" is implemented)"
-        ));
-    }
+fn validate_project_location(path: &str, kind: &str) -> Result<(), String> {
+    let adapter = vcs::for_kind(kind).ok_or_else(|| {
+        format!(
+            "unsupported vcs kind \"{kind}\" (only \"{}\" is implemented)",
+            vcs::DEFAULT_KIND
+        )
+    })?;
     let dir = Path::new(path);
     if !dir.is_dir() {
         return Err(format!(
             "path \"{path}\" does not exist or is not a directory"
         ));
     }
-    let is_repo = std::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !is_repo {
-        return Err(format!("path \"{path}\" is not a git repository"));
+    // Routed through the VCS adapter (RAL-213) rather than a raw `git`
+    // invocation, so a project registered with a different `vcs` kind is
+    // checked by that kind's own adapter instead of assuming git.
+    if !adapter.is_repository(dir) {
+        return Err(format!("path \"{path}\" is not a {kind} repository"));
     }
     Ok(())
 }
@@ -1095,8 +1208,107 @@ fn check_machine(daemon: &Daemon, scheme: &str) -> Reply {
     {
         let store = daemon.lock();
         let _ = store.record_machine_check(scheme, ok, note.as_deref());
+        // RAL-201: `ping` previously only wrote to `machine_providers`'
+        // reachability columns -- no Cartographer record at all, so a probe
+        // never showed up in the queryable event log.
+        crate::cartographer::Note::new("remote")
+            .level(if ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            })
+            .scope("machine")
+            .emit(
+                &store,
+                "machine ping",
+                serde_json::json!({"scheme": scheme, "ok": ok, "note": note}),
+            );
     }
     json(200, &serde_json::json!({"ok": ok, "note": note}))
+}
+
+#[derive(Deserialize)]
+struct CleanupMachineBody {
+    /// Full `<scheme>:<uri>` value naming the workspace to tear down -- not
+    /// just a scheme, since a provider may back many independent workspaces
+    /// (one per `uri`) and `cleanup` operates on exactly one of them.
+    machine: String,
+}
+
+/// `POST /api/machines/cleanup`: tear down one provisioned workspace
+/// (RAL-201). Body `{"machine": "<scheme>:<uri>"}`.
+///
+/// **Never invoked automatically** — see [`crate::remote_runner::ProviderRunner::cleanup`]'s
+/// doc for the retention-on-failure policy this mirrors. This is the explicit,
+/// operator-initiated action an admin takes once they are actually done with a
+/// workspace, the same way nobody automatically deletes a local
+/// `.git/.ralphus_worktrees/<branch>` directory either.
+fn cleanup_machine(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<CleanupMachineBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {\"machine\": \"...\"}",
+            vec![],
+        );
+    };
+    let machine = req.machine.trim();
+    let provider = {
+        let store = daemon.lock();
+        match crate::remote_runner::provider_from_store(&store, machine) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return error(
+                    400,
+                    "invalid_value",
+                    "\"local\" has no workspace to clean up -- cleanup only applies to a \
+                     registered machine provider",
+                    vec![],
+                );
+            }
+            Err(e) => return error(400, "invalid_value", &e, vec![]),
+        }
+    };
+    let spec = crate::runner::RunnerSpec::for_command_verify(
+        "machine-cleanup",
+        "machine-cleanup",
+        machine,
+        ".",
+        "",
+        "claude",
+        Some(60),
+    );
+    let result = provider.cleanup(&spec);
+    let guard = daemon.lock();
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: if result.is_ok() {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        },
+        source: "remote",
+        message: "machine cleanup",
+        scope: Some("machine"),
+        run_id: None,
+        guardian_id: None,
+        session_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({
+            "machine": machine,
+            "ok": result.is_ok(),
+            "error": result.as_ref().err(),
+        }),
+    });
+    match result {
+        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        // RAL-201: the workspace is left exactly as it was on failure -- there
+        // is no daemon-side record of it to roll back or discard (`provision`
+        // re-derives the same workspace deterministically every time), so the
+        // only responsibility here is surfacing the real reason rather than
+        // swallowing it.
+        Err(e) => error(502, "provider_error", &e, vec![]),
+    }
 }
 
 /// `GET /api/machines`: every registered provider plus the built-in schemes.
@@ -1854,8 +2066,17 @@ fn guardian_logs(daemon: &Daemon, id: &str) -> Reply {
 /// filter applied, not a separate implementation.
 ///
 /// Query params: `source`, `scope`, `level`, `run_id`, `guardian_id`,
-/// `session_id`, `q` (substring match on message), `since_ms`, `until_ms`,
-/// `limit` (default 100, max 1000), `offset`, `sort` (`asc`/`desc`, default `desc`).
+/// `session_id`, `task`, `q` (substring match on message), `since_ms`,
+/// `until_ms`, `limit` (default 100, max 1000), `offset`, `sort` (`asc`/`desc`,
+/// default `desc`) — plus `entity`, a single-string URI (RAL-155, see
+/// `crate::entity_uri`) that addresses a run/task/session/verify/guardian
+/// uniformly. `entity` is resolved into the equivalent `run_id`/`task`/
+/// `session_id`/`guardian_id` filter fields (via `Store::task_name_at`/
+/// `session_sid_at`, since Cartographer's `task`/`session_id` columns store
+/// the task's *name*/session's *sid*, not the index an entity URI addresses
+/// by) and composes with any of those fields also given explicitly — an
+/// explicit field always wins if both are present and disagree, since it's
+/// the more specific ask.
 fn cartographer_query(daemon: &Daemon, query: &str) -> Reply {
     let limit = query_param(query, "limit")
         .and_then(|s| s.parse::<i64>().ok())
@@ -1863,7 +2084,7 @@ fn cartographer_query(daemon: &Daemon, query: &str) -> Reply {
     let offset = query_param(query, "offset")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    let filter = crate::cartographer::CartographerFilter {
+    let mut filter = crate::cartographer::CartographerFilter {
         source: query_filter(query, "source"),
         scope: query_filter(query, "scope"),
         level: query_filter(query, "level"),
@@ -1878,8 +2099,85 @@ fn cartographer_query(daemon: &Daemon, query: &str) -> Reply {
         offset,
         ascending: query_param(query, "sort") == Some("asc"),
     };
-    match daemon.lock().cartographer_query(&filter) {
+    let guard = daemon.lock();
+    if let Some(entity) = query_filter(query, "entity") {
+        let Some(parsed) = crate::entity_uri::parse(&entity) else {
+            return error(400, "bad_request", "invalid entity uri", vec![]);
+        };
+        if let Err(e) = apply_entity_filter(&guard, &mut filter, &parsed) {
+            return store_error(&e);
+        }
+    }
+    match guard.cartographer_query(&filter) {
         Ok(page) => json(200, &page),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Fold an [`crate::entity_uri::EntityUri`]'s addressing coordinates into a
+/// [`crate::cartographer::CartographerFilter`] in place, resolving the
+/// index-addressed task/session down to the name/sid Cartographer's columns
+/// actually store. Only overwrites a field the caller didn't already set
+/// explicitly (see `cartographer_query`'s doc comment).
+fn apply_entity_filter(
+    store: &Store,
+    filter: &mut crate::cartographer::CartographerFilter,
+    entity: &crate::entity_uri::EntityUri,
+) -> crate::store::Result<()> {
+    use crate::entity_uri::EntityUri;
+    if let Some(run_id) = entity.run_id() {
+        filter.run_id.get_or_insert_with(|| run_id.to_string());
+    }
+    match entity {
+        EntityUri::Run { .. } => {}
+        EntityUri::Task { run_id, task_idx }
+        | EntityUri::Verify {
+            run_id, task_idx, ..
+        } => {
+            if filter.task.is_none() {
+                filter.task = store.task_name_at(run_id, *task_idx)?;
+            }
+            if let EntityUri::Verify {
+                run_id,
+                task_idx,
+                session_idx,
+                ..
+            } = entity
+            {
+                if filter.session_id.is_none() && *session_idx >= 0 {
+                    filter.session_id = store.session_sid_at(run_id, *task_idx, *session_idx)?;
+                }
+            }
+        }
+        EntityUri::Session {
+            run_id,
+            task_idx,
+            session_idx,
+        } => {
+            if filter.task.is_none() {
+                filter.task = store.task_name_at(run_id, *task_idx)?;
+            }
+            if filter.session_id.is_none() {
+                filter.session_id = store.session_sid_at(run_id, *task_idx, *session_idx)?;
+            }
+        }
+        EntityUri::Guardian { guardian_id } => {
+            filter
+                .guardian_id
+                .get_or_insert_with(|| guardian_id.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Generate and return the merged, chronological "uber-log-viewer" timeline
+/// for a whole run (RAL-155). A side effect of every call: the rendered text
+/// is (best-effort) written to a temp file — see `crate::timeline::RunTimeline::file_path`
+/// — so the board's "generate to file, then display" button and this JSON
+/// response come from the exact same generation, not two separate code paths.
+fn run_timeline(daemon: &Daemon, id: &str) -> Reply {
+    match crate::timeline::build_run_timeline(&daemon.lock(), id) {
+        Ok(timeline) => json(200, &timeline),
         Err(e) => store_error(&e),
     }
 }
@@ -2218,6 +2516,7 @@ fn set_run_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
         guardian_id: None,
         session_id: None,
         task: None,
+        log_path: None,
         payload: serde_json::json!({"set": redacted_set, "unset": req.unset}),
     });
     json(200, &result)
@@ -2295,6 +2594,7 @@ fn set_env_overrides(
         guardian_id: None,
         session_id,
         task,
+        log_path: None,
         payload: serde_json::json!({"set": redacted_set, "unset": req.unset}),
     });
     json(200, &result)
@@ -2461,18 +2761,20 @@ fn set_session_verify_step_env(
     )
 }
 
-/// Body for `POST /api/guardians/{id}/branches/{bid}/env` (RAL-191). Unlike
-/// the run/task/session layers this one has three operations, because a review
-/// branch's values are *inherited* from its source session rather than being
-/// the branch's own to begin with:
+/// Body for `POST /api/guardians/{id}/branches/{bid}/env` (RAL-191) and the
+/// guardian-level `POST /api/guardians/{id}/build-env` /
+/// `.../manual-checks-env` endpoints (RAL-203). Unlike the run/task/session
+/// layers this one has three operations, because these values are *inherited*
+/// (from a source session, or from the combined worktree's branch union)
+/// rather than being the target's own to begin with:
 ///
 /// - `set` — override an inherited value (or add a new variable).
-/// - `unset` — tombstone: remove the inherited variable from the review
-///   worktree's environment entirely.
-/// - `clear` — drop the branch's own entry, so the key goes back to inheriting
-///   whatever the source session resolves to.
+/// - `unset` — tombstone: remove the inherited variable from the effective
+///   environment entirely.
+/// - `clear` — drop this layer's own entry, so the key goes back to
+///   inheriting whatever the layer below resolves to.
 #[derive(Deserialize)]
-struct BranchEnvOverridesBody {
+struct InheritedEnvOverridesBody {
     #[serde(default)]
     set: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -2490,7 +2792,7 @@ struct BranchEnvOverridesBody {
 /// pass, feedback routing, and check gates. Mirrors [`set_env_overrides`]'s
 /// key validation and allowlist-redacted Cartographer logging.
 fn set_guardian_branch_env(daemon: &Daemon, id: &str, branch_id: &str, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<BranchEnvOverridesBody>(body) else {
+    let Ok(req) = serde_json::from_str::<InheritedEnvOverridesBody>(body) else {
         return error(400, "bad_request", "invalid env body", vec![]);
     };
     if req.set.is_empty() && req.unset.is_empty() && req.clear.is_empty() {
@@ -2545,6 +2847,7 @@ fn set_guardian_branch_env(daemon: &Daemon, id: &str, branch_id: &str, body: &st
         guardian_id: Some(id),
         session_id: None,
         task: Some(branch_id),
+        log_path: None,
         payload: serde_json::json!({
             "set": redacted_set,
             "unset": req.unset,
@@ -2552,6 +2855,130 @@ fn set_guardian_branch_env(daemon: &Daemon, id: &str, branch_id: &str, body: &st
         }),
     });
     json(200, &result)
+}
+
+/// Which guardian-level env-override layer [`set_guardian_scoped_env`]
+/// targets (RAL-203): the finalize-time build/check-gate step run against
+/// the combined worktree, or the manual-checks step (the LLM-suggested
+/// commands run via `ralphus review checks run` / the board's "Run all").
+/// The two are independent -- mutating one never touches the other.
+#[derive(Clone, Copy)]
+enum GuardianEnvSection {
+    Build,
+    ManualChecks,
+}
+
+impl GuardianEnvSection {
+    fn cartographer_scope(self) -> &'static str {
+        match self {
+            Self::Build => "guardian-build-env",
+            Self::ManualChecks => "guardian-manual-checks-env",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::ManualChecks => "manual-checks",
+        }
+    }
+}
+
+/// Set/unset/clear this review's own environment-variable overrides for
+/// `section` (RAL-203) -- the finalize-time build/check-gate step or the
+/// manual-checks step, whichever `section` names. Both are layered on top of
+/// `combined_env` (the last enabled branch's own resolved environment),
+/// which the combined worktree borrows in place of a source session of its
+/// own. Shares [`InheritedEnvOverridesBody`]'s
+/// `set`/`unset`/`clear` shape and [`set_guardian_branch_env`]'s key
+/// validation and allowlist-redacted Cartographer logging.
+fn set_guardian_scoped_env(
+    daemon: &Daemon,
+    id: &str,
+    body: &str,
+    section: GuardianEnvSection,
+) -> Reply {
+    let Ok(req) = serde_json::from_str::<InheritedEnvOverridesBody>(body) else {
+        return error(400, "bad_request", "invalid env body", vec![]);
+    };
+    if req.set.is_empty() && req.unset.is_empty() && req.clear.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "at least one of `set`/`unset`/`clear` is required",
+            vec![],
+        );
+    }
+    for key in req
+        .set
+        .keys()
+        .chain(req.unset.iter())
+        .chain(req.clear.iter())
+    {
+        if !crate::config::is_valid_env_key(key) {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid environment variable name: {key:?}"),
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    let result = match section {
+        GuardianEnvSection::Build => {
+            store.set_guardian_build_env_overrides(id, &req.set, &req.unset, &req.clear)
+        }
+        GuardianEnvSection::ManualChecks => {
+            store.set_guardian_manual_checks_env_overrides(id, &req.set, &req.unset, &req.clear)
+        }
+    };
+    let result = match result {
+        Ok(m) => m,
+        Err(e) => return store_error(&e),
+    };
+    let allow = crate::config::load_env_overrides_config();
+    let redacted_set: serde_json::Map<String, serde_json::Value> = req
+        .set
+        .iter()
+        .map(|(k, v)| {
+            let shown = if allow.is_allowed(k) {
+                v.clone()
+            } else {
+                "<redacted>".to_string()
+            };
+            (k.clone(), serde_json::Value::String(shown))
+        })
+        .collect();
+    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "server",
+        message: "review env overrides changed",
+        scope: Some(section.cartographer_scope()),
+        run_id: None,
+        guardian_id: Some(id),
+        session_id: None,
+        task: Some(section.label()),
+        log_path: None,
+        payload: serde_json::json!({
+            "set": redacted_set,
+            "unset": req.unset,
+            "clear": req.clear,
+        }),
+    });
+    json(200, &result)
+}
+
+/// `POST /api/guardians/{id}/build-env` (RAL-203) -- see
+/// [`set_guardian_scoped_env`].
+fn set_guardian_build_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    set_guardian_scoped_env(daemon, id, body, GuardianEnvSection::Build)
+}
+
+/// `POST /api/guardians/{id}/manual-checks-env` (RAL-203) -- see
+/// [`set_guardian_scoped_env`].
+fn set_guardian_manual_checks_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    set_guardian_scoped_env(daemon, id, body, GuardianEnvSection::ManualChecks)
 }
 
 #[derive(Serialize)]
@@ -3160,6 +3587,75 @@ fn capture_pane_reply(
     }
 }
 
+/// List of persisted terminal-log attempts for a tmux session, for the
+/// board's "historical attempts" picker (RAL-154).
+#[derive(Serialize)]
+struct TerminalLogAttemptsResponse {
+    attempts: Vec<crate::terminal_log::AttemptMeta>,
+}
+
+/// List every durably-persisted terminal-log attempt for the tmux session
+/// keyed by `(run_id, task, session_id)` (see `crate::tmux::session_name`),
+/// ascending by attempt number. Empty (never an error) when the session never
+/// ran under tmux, or no attempt has finished writing its log yet. Shared by
+/// every "Open Terminal Log" context (task session, verify step, guardian
+/// branch resolver, guardian manual-checks) the same way [`capture_pane_reply`]
+/// already is.
+fn terminal_log_attempts_reply(run_id: &str, task: &str, session_id: &str) -> Reply {
+    let name = crate::tmux::session_name(run_id, task, session_id);
+    json(
+        200,
+        &TerminalLogAttemptsResponse {
+            attempts: crate::terminal_log::list_attempts(&name),
+        },
+    )
+}
+
+/// Raw content of one historical terminal-log attempt (RAL-154), readable
+/// outside the GUI just as easily as the underlying file
+/// (`crate::terminal_log::read_attempt`) is.
+#[derive(Serialize)]
+struct TerminalLogAttemptContentResponse {
+    attempt: u32,
+    content: String,
+}
+
+/// Content of one persisted terminal-log attempt for the tmux session keyed
+/// by `(run_id, task, session_id)`. `404` when that attempt was never
+/// written, or has since been pruned/deleted (`crate::terminal_log::prune`,
+/// or the owning run/guardian's deletion).
+fn terminal_log_attempt_content_reply(
+    run_id: &str,
+    task: &str,
+    session_id: &str,
+    attempt: &str,
+) -> Reply {
+    let Ok(attempt_n) = attempt.parse::<u32>() else {
+        return error(
+            400,
+            "bad_request",
+            "attempt must be a non-negative integer",
+            vec![],
+        );
+    };
+    let name = crate::tmux::session_name(run_id, task, session_id);
+    match crate::terminal_log::read_attempt(&name, attempt_n) {
+        Some(content) => json(
+            200,
+            &TerminalLogAttemptContentResponse {
+                attempt: attempt_n,
+                content,
+            },
+        ),
+        None => error(
+            404,
+            "not_found",
+            "no terminal log recorded for that attempt",
+            vec![],
+        ),
+    }
+}
+
 /// Open an interactive terminal attached to the tmux session keyed by
 /// `(run_id, task, session_id)` — the "open terminal" button (RAL-102). When
 /// the session is currently live, attaches to it directly. Otherwise
@@ -3180,7 +3676,7 @@ fn attach_tmux_terminal(run_id: &str, task: &str, session_id: &str) -> Reply {
     let program = tmux.program().to_string();
     let mut args: Vec<String> = tmux.prefix_args().to_vec();
     args.extend(["attach-session".to_string(), "-t".to_string(), name]);
-    match spawn_in_terminal(None, &program, &args) {
+    match spawn_in_terminal(None, &program, &args, &std::collections::BTreeMap::new()) {
         Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
         Err(msg) => error(500, "terminal_error", &msg, vec![]),
     }
@@ -3450,6 +3946,56 @@ fn session_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> R
     capture_pane_reply(daemon, id, &task, &session_id, query)
 }
 
+/// List a task session's persisted historical terminal-log attempts (RAL-154)
+/// — the board's "Open Terminal Log" button uses this to list attempts beyond
+/// just the current live one.
+fn session_terminal_log_attempts(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (Ok(task_idx), Ok(session_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session index must be integers",
+            vec![],
+        );
+    };
+    let session_id = match daemon.lock().get_session_id(id, task_idx, session_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let task = match daemon.lock().get_task_name(id, task_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    terminal_log_attempts_reply(id, &task, &session_id)
+}
+
+/// Content of one of a task session's historical terminal-log attempts (RAL-154).
+fn session_terminal_log_attempt(
+    daemon: &Daemon,
+    id: &str,
+    ti: &str,
+    si: &str,
+    attempt: &str,
+) -> Reply {
+    let (Ok(task_idx), Ok(session_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session index must be integers",
+            vec![],
+        );
+    };
+    let session_id = match daemon.lock().get_session_id(id, task_idx, session_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let task = match daemon.lock().get_task_name(id, task_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    terminal_log_attempt_content_reply(id, &task, &session_id, attempt)
+}
+
 /// The `(run_id, session_id)` pair a `prompt`-kind verify step's tmux session
 /// is keyed by — mirrors exactly how `scheduler.rs::run_verifies` builds the
 /// `RunnerSpec` for the same verify step (`run_id` is the owning run;
@@ -3568,6 +4114,80 @@ fn verify_pane(
     capture_pane_reply(daemon, &run_id, &task, &session_id, query)
 }
 
+/// List a `prompt`-kind verify step's persisted historical terminal-log
+/// attempts (RAL-154).
+fn verify_terminal_log_attempts(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    session_idx: &str,
+    verify_idx: &str,
+) -> Reply {
+    let (Ok(task_idx_n), Ok(session_idx_n), Ok(_verify_idx_n)) = (
+        task_idx.parse::<i64>(),
+        session_idx.parse::<i64>(),
+        verify_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session/verify index must be integers",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon
+        .lock()
+        .verify_specs(id, task_idx_n, scope, session_idx_n)
+    {
+        return store_error(&e);
+    }
+    let task = match daemon.lock().get_task_name(id, task_idx_n) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let (run_id, session_id) = verify_tmux_keys(id, scope, verify_idx);
+    terminal_log_attempts_reply(&run_id, &task, &session_id)
+}
+
+/// Content of one of a `prompt`-kind verify step's historical terminal-log
+/// attempts (RAL-154).
+#[allow(clippy::too_many_arguments)]
+fn verify_terminal_log_attempt(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    session_idx: &str,
+    verify_idx: &str,
+    attempt: &str,
+) -> Reply {
+    let (Ok(task_idx_n), Ok(session_idx_n), Ok(_verify_idx_n)) = (
+        task_idx.parse::<i64>(),
+        session_idx.parse::<i64>(),
+        verify_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/session/verify index must be integers",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon
+        .lock()
+        .verify_specs(id, task_idx_n, scope, session_idx_n)
+    {
+        return store_error(&e);
+    }
+    let task = match daemon.lock().get_task_name(id, task_idx_n) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let (run_id, session_id) = verify_tmux_keys(id, scope, verify_idx);
+    terminal_log_attempt_content_reply(&run_id, &task, &session_id, attempt)
+}
+
 /// Open a terminal for a review branch.
 ///
 /// `mode` (query param):
@@ -3613,7 +4233,12 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
             "-Command".to_string(),
             format!("Set-Location -LiteralPath '{safe_path}'"),
         ];
-        return match spawn_in_terminal(None, &shell_cmd, &shell_args) {
+        return match spawn_in_terminal(
+            None,
+            &shell_cmd,
+            &shell_args,
+            &std::collections::BTreeMap::new(),
+        ) {
             Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
             Err(msg) => error(500, "terminal_error", &msg, vec![]),
         };
@@ -3655,11 +4280,12 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
 
     // open: attach to the conflict-resolver's tmux session (RAL-102). Keyed the
     // same way `guardian_merge.rs::resolve_conflicts_with_agent` builds its
-    // `RunnerSpec` for this exact branch position -- the tmux session name is
-    // ephemeral internal naming (not persistent addressing), so it is still
-    // resolved to the branch's current numeric position here. RAL-149: while
-    // the branch is `verify_pending`, the live session is the dedicated
-    // final-verify call, not the fix pass -- attach to that one instead.
+    // `RunnerSpec` for this exact branch -- RAL-192: the tmux session name is
+    // derived from the branch's stable id (not its mutable stack position),
+    // so it stays resolvable here even after a later reorder/add/remove.
+    // RAL-149: while the branch is `verify_pending`, the live session is the
+    // dedicated final-verify call, not the fix pass -- attach to that one
+    // instead.
     let (task, session_id) = match resolver_task_and_session_id(daemon, id, branch_id) {
         Ok(v) => v,
         Err(e) => return e,
@@ -3667,11 +4293,12 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
     attach_tmux_terminal(&format!("guardian-{id}"), task, &session_id)
 }
 
-/// The `(task, session_id)` pair addressing a review branch's currently-live
-/// conflict-resolver tmux session (RAL-102, extended for RAL-149's fix/verify
-/// split) -- shared by [`open_guardian_branch_terminal`] (attach) and
-/// [`guardian_branch_pane`] (read-only peek) so the two never drift on which
-/// call's session they resolve to.
+/// The `(task, session_id)` pair addressing a review branch's conflict-resolver
+/// tmux session -- live or historical (RAL-102, extended for RAL-149's
+/// fix/verify split and RAL-192's stable-id keying) -- shared by
+/// [`open_guardian_branch_terminal`] (attach) and [`guardian_branch_pane`]
+/// (read-only peek) so the two never drift on which call's session they
+/// resolve to.
 fn resolver_task_and_session_id(
     daemon: &Daemon,
     id: &str,
@@ -3687,12 +4314,12 @@ fn resolver_task_and_session_id(
     Ok(if b.merge_status == "verify_pending" {
         (
             crate::guardian_merge::RESOLVER_VERIFY_TASK,
-            format!("resolver-verify-{}", b.position),
+            format!("resolver-verify-{}", b.id),
         )
     } else {
         (
             crate::guardian_merge::RESOLVER_TASK,
-            format!("resolver-{}", b.position),
+            format!("resolver-{}", b.id),
         )
     })
 }
@@ -3710,35 +4337,12 @@ fn resolver_task_and_session_id(
 /// prompts are bypassed unconditionally, matching each backend's own
 /// headless invocation, so the resumed conversation doesn't immediately
 /// stall on a prompt the human has to notice and click through.
-/// The PowerShell `-Command` string that resumes `session_id` via `program`
-/// (single-quoted/escaped for embedding) -- split out from `open_agent_terminal`
-/// so the exact command line is unit-testable without actually spawning a
-/// terminal.
-fn resume_agent_command(program: &str, session_id: &str) -> String {
-    let safe_program = program.replace('\'', "''");
-    let safe_session = session_id.replace('\'', "''");
-    format!("& '{safe_program}' --resume '{safe_session}' --dangerously-skip-permissions")
-}
-
-/// The Codex analog of [`resume_agent_command`] -- Codex resumes via a
-/// subcommand (`exec resume <id>`), not a flag, and its permission-bypass
-/// flag is spelled differently (see `codex_backend.py`'s module docstring).
-fn resume_codex_agent_command(program: &str, session_id: &str) -> String {
-    let safe_program = program.replace('\'', "''");
-    let safe_session = session_id.replace('\'', "''");
-    format!(
-        "& '{safe_program}' exec resume '{safe_session}' --dangerously-bypass-approvals-and-sandbox"
-    )
-}
-
-/// True when `agent` identifies a Codex-family backend (`codex`/`codex-cli`).
-/// Anything else -- including `claude-code`/`claude-cli`, `None` (an older
-/// row from before the `agent` column was threaded through this lookup), or
-/// any other string -- resumes via the Claude Code CLI, preserving this
-/// function's pre-Codex-support behavior for every case it used to handle.
-fn is_codex_agent(agent: Option<&str>) -> bool {
-    matches!(agent, Some("codex" | "codex-cli"))
-}
+// Shared with `cli-rs`'s session/review-terminal commands, so both sides
+// build the exact same resume command line -- see `ralphus_core::agent_resume`
+// for the logic and its tests.
+use ralphus_core::agent_resume::{
+    is_codex_agent, resume_agent_command, resume_codex_agent_command,
+};
 
 fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
     let Some(session_id) = agent_session_id else {
@@ -3756,10 +4360,11 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
     // instead of a semicolon `wt.exe` can't pass through to the agent (see
     // `spawn_in_terminal`'s doc comment).
     let command = if is_codex_agent(agent) {
-        // Mirrors `RALPHUS_CODEX_CMD` in `codex_backend.py` — the same
+        // Mirrors `RALPHUS_CODEX_COMMAND` in `codex_backend.py` — the same
         // override point resolves both the headless run and this resumed
         // one to the same binary.
-        let program = std::env::var("RALPHUS_CODEX_CMD").unwrap_or_else(|_| "codex".to_string());
+        let program =
+            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
         resume_codex_agent_command(&program, session_id)
     } else {
         // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
@@ -3775,7 +4380,12 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
         "-Command".to_string(),
         command,
     ];
-    match spawn_in_terminal(Some(cwd), &shell_cmd, &shell_args) {
+    match spawn_in_terminal(
+        Some(cwd),
+        &shell_cmd,
+        &shell_args,
+        &std::collections::BTreeMap::new(),
+    ) {
         Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
         Err(msg) => error(500, "terminal_error", &msg, vec![]),
     }
@@ -3785,11 +4395,14 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
 /// session, for the auto-refreshing "read-only terminal" peek view in the
 /// Review tab (RAL-102).
 fn guardian_branch_pane(daemon: &Daemon, id: &str, branch_id: &str, query: &str) -> Reply {
-    // The tmux session name is ephemeral internal naming keyed on the branch's
-    // current numeric position (see `open_guardian_branch_terminal`), so resolve
-    // it from the addressed branch_id. RAL-149: `resolver_task_and_session_id`
-    // also picks the dedicated final-verify session while the branch is
-    // `verify_pending`, so this peek view tracks whichever call is actually live.
+    // RAL-192: the tmux session name is keyed on the branch's stable id (see
+    // `resolver_task_and_session_id`), so it resolves correctly here even if
+    // the branch's stack position has since changed -- including falling
+    // back to the persisted historical snapshot (`inactive_pane_reply`, via
+    // `capture_pane_reply`) once the live session is gone. RAL-149:
+    // `resolver_task_and_session_id` also picks the dedicated final-verify
+    // session while the branch is `verify_pending`, so this peek view tracks
+    // whichever call is actually live.
     let (task, session_id) = match resolver_task_and_session_id(daemon, id, branch_id) {
         Ok(v) => v,
         Err(e) => return e,
@@ -3864,6 +4477,52 @@ fn guardian_branch_conflicts(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
     )
 }
 
+/// List a review branch's conflict-resolver's persisted historical
+/// terminal-log attempts (RAL-154).
+fn guardian_branch_terminal_log_attempts(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    let position = match daemon.lock().guardian_branches(id) {
+        Ok(branches) => match branches.iter().find(|b| b.id == branch_id) {
+            Some(b) => b.position,
+            None => return error(404, "not_found", "no such branch", vec![]),
+        },
+        Err(e) => return store_error(&e),
+    };
+    terminal_log_attempts_reply(
+        &format!("guardian-{id}"),
+        crate::guardian_merge::RESOLVER_TASK,
+        &format!("resolver-{position}"),
+    )
+}
+
+/// Content of one of a review branch's conflict-resolver's historical
+/// terminal-log attempts (RAL-154).
+fn guardian_branch_terminal_log_attempt(
+    daemon: &Daemon,
+    id: &str,
+    branch_id: &str,
+    attempt: &str,
+) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    let position = match daemon.lock().guardian_branches(id) {
+        Ok(branches) => match branches.iter().find(|b| b.id == branch_id) {
+            Some(b) => b.position,
+            None => return error(404, "not_found", "no such branch", vec![]),
+        },
+        Err(e) => return store_error(&e),
+    };
+    terminal_log_attempt_content_reply(
+        &format!("guardian-{id}"),
+        crate::guardian_merge::RESOLVER_TASK,
+        &format!("resolver-{position}"),
+        attempt,
+    )
+}
+
 /// Open a terminal for a review's manual-checks generation pass (RAL-88
 /// follow-up). `mode` (query param) mirrors `open_guardian_branch_terminal`'s:
 /// - `"open"` (default) — attach to the generation run's live tmux session;
@@ -3908,6 +4567,33 @@ fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply 
     )
 }
 
+/// List a review's manual-checks generation pass's persisted historical
+/// terminal-log attempts (RAL-154).
+fn guardian_manual_checks_terminal_log_attempts(daemon: &Daemon, id: &str) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    terminal_log_attempts_reply(
+        &format!("guardian-{id}"),
+        crate::guardian_merge::MANUAL_COMMANDS_TASK,
+        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
+    )
+}
+
+/// Content of one of a review's manual-checks generation pass's historical
+/// terminal-log attempts (RAL-154).
+fn guardian_manual_checks_terminal_log_attempt(daemon: &Daemon, id: &str, attempt: &str) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    terminal_log_attempt_content_reply(
+        &format!("guardian-{id}"),
+        crate::guardian_merge::MANUAL_COMMANDS_TASK,
+        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
+        attempt,
+    )
+}
+
 /// Launch the given program+args in a new interactive terminal window,
 /// optionally starting in `cwd`.
 ///
@@ -3929,11 +4615,19 @@ fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply 
 /// wt tab. Passing `cwd` here lets it go through wt's own `-d`/
 /// `--startingDirectory` flag (and `Command::current_dir` for the
 /// `CREATE_NEW_CONSOLE` fallback) instead, so no semicolon is ever needed.
+///
+/// `env` (RAL-203) is applied on top of the daemon's own inherited
+/// environment via `Command::envs` -- both the `wt.exe` and PowerShell-console
+/// fallback paths spawn the actual command as a *child* of the process this
+/// starts, so variables set here propagate down to it either way. Empty for
+/// callers with nothing to add (e.g. attaching to an already-running tmux
+/// session, whose environment was fixed at spawn time).
 #[cfg(target_os = "windows")]
 fn spawn_in_terminal(
     cwd: Option<&str>,
     program: &str,
     args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
 ) -> std::result::Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
@@ -3953,7 +4647,7 @@ fn spawn_in_terminal(
     if let Some(dir) = cwd {
         wt_cmd.args(["-d", dir]);
     }
-    if wt_cmd.arg("--").args(&all).spawn().is_ok() {
+    if wt_cmd.envs(env).arg("--").args(&all).spawn().is_ok() {
         return Ok(());
     }
 
@@ -3969,6 +4663,7 @@ fn spawn_in_terminal(
         console_cmd.current_dir(dir);
     }
     console_cmd
+        .envs(env)
         .creation_flags(CREATE_NEW_CONSOLE)
         .args(["-NoExit", "-NoProfile", "-Command", &ps_cmd])
         .spawn()
@@ -3981,6 +4676,7 @@ fn spawn_in_terminal(
     _cwd: Option<&str>,
     _program: &str,
     _args: &[String],
+    _env: &std::collections::BTreeMap<String, String>,
 ) -> std::result::Result<(), String> {
     Err("terminal launching is only supported on Windows".to_string())
 }
@@ -4178,6 +4874,7 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({
                 "auto_cancel": req.auto_cancel,
                 "tmux_killed": tmux_killed,
@@ -4911,7 +5608,14 @@ fn queue_set_position(daemon: &Daemon, body: &str) -> Reply {
 /// Delete a run and all of its child rows.
 fn delete_run(daemon: &Daemon, id: &str) -> Reply {
     match daemon.lock().delete_run(id) {
-        Ok(()) => json(200, &StateResponse { state: "deleted" }),
+        Ok(()) => {
+            // RAL-154: a deleted run's durable terminal logs must not outlive
+            // the run itself — same `ralphus_<run_id>_` prefix scoping
+            // `kill_run_tmux_sessions` already uses to find its live tmux
+            // sessions.
+            crate::terminal_log::delete_with_prefix(&format!("ralphus_{id}_"));
+            json(200, &StateResponse { state: "deleted" })
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -4974,6 +5678,17 @@ fn clear_all(daemon: &Daemon, body: &str) -> Reply {
         Ok(o) => o,
         Err(e) => return store_error(&e),
     };
+    // RAL-154: same per-entity cleanup `delete_run`/`guardian_delete` do,
+    // applied to every run/guardian this bulk clear actually removed.
+    for run_id in &outcome.run_ids {
+        crate::terminal_log::delete_with_prefix(&format!("ralphus_{run_id}_"));
+    }
+    let mut seen_guardians = std::collections::HashSet::new();
+    for (gid, _) in &outcome.guardian_roots {
+        if seen_guardians.insert(gid.clone()) {
+            crate::terminal_log::delete_with_prefix(&format!("ralphus_guardian-{gid}_"));
+        }
+    }
     let mut worktrees_purged = 0;
     if !req.keep_temporary {
         for (gid, root) in &outcome.guardian_roots {
@@ -5218,7 +5933,32 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    match store.get_guardian(id) {
+    // RAL-213: every setting above is a plain DB column write that a running
+    // merge never re-reads mid-flight -- restart it now so the new setting
+    // actually takes effect on this build instead of only the next one.
+    // Best-effort, same convention as `apply_restart_note`: the settings
+    // writes above have already succeeded and must not be undone by a
+    // restart hiccup, so a failure here is logged, not surfaced to the caller.
+    let status = store.get_guardian(id).map(|g| g.status).ok();
+    drop(store);
+    if status.as_deref() == Some("merging") {
+        let runner = guardian_agent_runner(daemon);
+        let restarted = crate::guardian_merge::restart_guardian_merge(
+            daemon.store_handle(),
+            daemon.cancellations_handle(),
+            runner,
+            id,
+            daemon.semaphore_handle(),
+        );
+        if restarted.status >= 400 {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} settings-triggered merge restart failed: {}",
+                restarted.body
+            );
+        }
+    }
+    match daemon.lock().get_guardian(id) {
         Ok(g) => json(200, &g),
         Err(e) => store_error(&e),
     }
@@ -5389,6 +6129,24 @@ fn pr_action_feedback(daemon: &Daemon, pr_id: &str) -> Reply {
     crate::pr::start_action_pr_feedback(daemon.store_handle(), runner, pr_id)
 }
 
+/// Live drift check between this PR's remote branch and its owning review
+/// worktree (RAL-190) — see [`crate::pr::PrSyncStatus`].
+fn pr_sync_status(daemon: &Daemon, pr_id: &str) -> Reply {
+    match crate::pr::compute_sync_status(&daemon.store_handle(), pr_id) {
+        Ok(status) => json(200, &status),
+        Err(e) => error(502, "forge_error", &e, vec![]),
+    }
+}
+
+/// Kick off pulling the PR branch's fetched commits into its owning review
+/// worktree in the background (RAL-190's "Pull PR commits" button) — see
+/// [`crate::pr::pull_pr_commits`].
+fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
+    let runner: Arc<dyn Runner> =
+        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    crate::pr::start_pull_pr_commits(daemon.store_handle(), runner, pr_id)
+}
+
 #[derive(Deserialize)]
 struct SquashBody {
     /// The git project root to toggle. Must be one of the review's projects.
@@ -5457,6 +6215,10 @@ fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
                     crate::guardian_merge::purge_worktrees(&daemon.store_handle(), root, id);
                 }
             }
+            // RAL-154: same scoping as `kill_guardian_tmux_sessions` — a
+            // deleted guardian's durable terminal logs (resolver/manual-checks
+            // sessions) must not outlive it.
+            crate::terminal_log::delete_with_prefix(&format!("ralphus_guardian-{id}_"));
             json(200, &StateResponse { state: "deleted" })
         }
         Err(e) => store_error(&e),
@@ -5487,10 +6249,37 @@ fn guardian_reorder(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    match store.get_guardian(id) {
+    let result = match store.get_guardian(id) {
         Ok(g) => json(200, &g),
-        Err(e) => store_error(&e),
-    }
+        Err(e) => return store_error(&e),
+    };
+    drop(store);
+    // RAL-190: a reorder can change which branch precedes a stacked PR, so
+    // its forge base needs to follow -- backgrounded since it makes network
+    // calls (see pr::resync_pr_bases's doc comment).
+    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
+    result
+}
+
+/// The runner for a guardian review's own agent invocations -- the merge's
+/// conflict resolver, verify-instruction synthesis, summary/manual-commands
+/// generation, chat triage, feedback and "set it for me" input resolution
+/// (RAL-201).
+///
+/// Wrapped in [`crate::remote_runner::MachineRouter`] rather than handed the
+/// bare local runner directly: every `RunnerSpec` these call sites build
+/// carries the review's actual `machine` (see the RAL-201 fixes in
+/// `guardian_merge.rs`), and without this router that field had nowhere to
+/// go -- a bare [`SubprocessRunner`] ignores it and always runs locally. A
+/// local review pays nothing extra: `MachineRouter`'s local path is the same
+/// `SubprocessRunner::run` call this always was.
+fn guardian_agent_runner(daemon: &Daemon) -> Arc<dyn Runner> {
+    let local: Arc<dyn Runner> =
+        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    Arc::new(crate::remote_runner::MachineRouter::new(
+        local,
+        daemon.store_handle(),
+    ))
 }
 
 /// Atomically apply a new branch order/enabled arrangement and kick off the
@@ -5518,9 +6307,16 @@ fn guardian_arrange(daemon: &Daemon, id: &str, body: &str) -> Reply {
             }
         }
     }
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+    // RAL-190: see the identical call in `guardian_reorder`.
+    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
+    let runner = guardian_agent_runner(daemon);
+    crate::guardian_merge::start_merge(
+        daemon.store_handle(),
+        runner,
+        id,
+        daemon.semaphore_handle(),
+        daemon.cancellations_handle(),
+    )
 }
 
 fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
@@ -5607,9 +6403,13 @@ fn build_check_command_line(
 /// Run one or all LLM-generated manual review commands as fire-and-forget
 /// terminal subprocesses (RAL-27). Body `{ "index": N, "inputs": {...},
 /// "run_cleanup": bool }` runs command N only; no body (or `{}`) runs all
-/// commands. Opens each in a new terminal window. `inputs` (RAL-164)
-/// substitutes named `{name}` placeholders and, when non-empty, is persisted
-/// as the new default for those inputs on this guardian.
+/// commands. Opens each in a new terminal window, under this review's
+/// `manual_checks_env` (RAL-203) -- the union of every enabled branch's own
+/// resolved environment, with this review's manual-checks-step overrides
+/// applied on top, so the "Run all" launcher exercises the same variables
+/// the code was written and reviewed under. `inputs` (RAL-164) substitutes
+/// named `{name}` placeholders and, when non-empty, is persisted as the new
+/// default for those inputs on this guardian.
 fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply {
     #[derive(Deserialize, Default)]
     struct Body {
@@ -5656,7 +6456,12 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         else {
             continue;
         };
-        if let Err(e) = spawn_in_terminal(None, "cmd", &["/K".to_string(), full_cmd]) {
+        if let Err(e) = spawn_in_terminal(
+            None,
+            "cmd",
+            &["/K".to_string(), full_cmd],
+            &g.manual_checks_env,
+        ) {
             errors.push(e);
         }
     }
@@ -5709,13 +6514,20 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     };
 
-    // Same reasoning as guardian_run_manual_commands: prefer the built
-    // review worktree over the original repo root.
+    // Same reasoning as guardian_run_manual_commands, including the RAL-203
+    // manual-checks environment -- action hints run in the same combined
+    // worktree via the same terminal-spawning mechanism, so they inherit it
+    // too: prefer the built review worktree over the original repo root.
     let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
     if let Some(full_cmd) =
         build_check_command_line(&cwd, &hint, &req.inputs, &g.input_values, req.run_cleanup)
     {
-        let result = spawn_in_terminal(None, "cmd", &["/K".to_string(), full_cmd]);
+        let result = spawn_in_terminal(
+            None,
+            "cmd",
+            &["/K".to_string(), full_cmd],
+            &g.manual_checks_env,
+        );
         if !req.inputs.is_empty() {
             let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
         }
@@ -5751,8 +6563,7 @@ fn guardian_resolve_input(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         );
     };
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_resolve_input(
         daemon.store_handle(),
         runner,
@@ -5813,9 +6624,14 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
             Err(e) => store_error(&e),
         };
     }
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+    let runner = guardian_agent_runner(daemon);
+    crate::guardian_merge::start_merge(
+        daemon.store_handle(),
+        runner,
+        id,
+        daemon.semaphore_handle(),
+        daemon.cancellations_handle(),
+    )
 }
 
 /// Force-start a collecting review (RAL-69): disable all enabled branches whose
@@ -5839,9 +6655,14 @@ fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
         return store_error(&e);
     }
     drop(store);
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+    let runner = guardian_agent_runner(daemon);
+    crate::guardian_merge::start_merge(
+        daemon.store_handle(),
+        runner,
+        id,
+        daemon.semaphore_handle(),
+        daemon.cancellations_handle(),
+    )
 }
 
 /// Permanently dismiss the "can re-enable" notification for a branch (RAL-69).
@@ -5912,14 +6733,14 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
     // branch's commits (see `guardian_merge::purge_worktrees`).
     crate::guardian_merge::purge_worktrees(&daemon.store_handle(), &source_git_root, id);
 
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner = guardian_agent_runner(daemon);
     if source_remaining > 0 {
         let _ = crate::guardian_merge::start_merge(
             daemon.store_handle(),
             Arc::clone(&runner),
             id,
             daemon.semaphore_handle(),
+            daemon.cancellations_handle(),
         );
     }
     crate::guardian_merge::start_merge(
@@ -5927,25 +6748,40 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
         runner,
         &to_guardian_id,
         daemon.semaphore_handle(),
+        daemon.cancellations_handle(),
     )
 }
 
 fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+    let runner = guardian_agent_runner(daemon);
+    crate::guardian_merge::start_merge(
+        daemon.store_handle(),
+        runner,
+        id,
+        daemon.semaphore_handle(),
+        daemon.cancellations_handle(),
+    )
 }
 
 /// Cancel an in-progress rebase (status `merging` or `in_review`) and
-/// immediately start a fresh one. The in-flight background thread is
-/// superseded: its eventual status writes will be overwritten by the new run.
+/// immediately start a fresh one.
+///
+/// RAL-213: routed through [`crate::guardian_merge::restart_guardian_merge`],
+/// which actually stops the in-flight merge worker (cancel + bounded wait)
+/// before resetting state and starting the new one -- this used to just reset
+/// the DB status and spawn a second merge thread without stopping the first,
+/// which raced on the same worktree paths/branch names/carry refs the two
+/// threads shared (RAL-213's second bug: `cancel_and_merge` was already
+/// unsafe before this fix).
 fn guardian_cancel_and_merge(daemon: &Daemon, id: &str) -> Reply {
-    if let Err(e) = daemon.lock().reset_guardian_to_collecting(id) {
-        return store_error(&e);
-    }
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::guardian_merge::start_merge(daemon.store_handle(), runner, id, daemon.semaphore_handle())
+    let runner = guardian_agent_runner(daemon);
+    crate::guardian_merge::restart_guardian_merge(
+        daemon.store_handle(),
+        daemon.cancellations_handle(),
+        runner,
+        id,
+        daemon.semaphore_handle(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -5961,8 +6797,7 @@ fn guardian_feedback(daemon: &Daemon, id: &str, branch_id: &str, body: &str) -> 
     if req.feedback.trim().is_empty() {
         return error(400, "bad_request", "feedback must not be empty", vec![]);
     }
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_feedback(
         daemon.store_handle(),
         runner,
@@ -6002,8 +6837,7 @@ fn guardian_chat(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if req.text.trim().is_empty() {
         return error(400, "bad_request", "message text must not be empty", vec![]);
     }
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text, req.image)
 }
 
@@ -6044,14 +6878,14 @@ fn guardian_chat_fork(daemon: &Daemon, id: &str, body: &str) -> Reply {
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"seq": req.seq}),
         });
     }
     if let Err(e) = daemon.lock().delete_guardian_messages_from_seq(id, req.seq) {
         return store_error(&e);
     }
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text, req.image)
 }
 
@@ -6098,12 +6932,18 @@ pub fn serve<A: ToSocketAddrs>(
                 guardian_id: None,
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({"run_ids": ids}),
             });
         }
         Ok(_) => {}
         Err(e) => crate::rlog!(ERROR, "ralphus [recovery] run recovery failed: {e}"),
     }
+    // RAL-201: reconcile any remote `exec` handle left behind by the crash
+    // `recover_orphaned_runs` just reset above -- same "nothing is executing
+    // yet" invariant, so it belongs immediately alongside it rather than
+    // deferred to first use.
+    crate::remote_runner::reconcile_remote_exec_handles(&store);
     // RAL-48: guardians stuck in `merging` after an unclean shutdown have no
     // background thread; reset them to `merge_failed` so the user can retry.
     match store.recover_orphaned_merges() {
@@ -6123,6 +6963,7 @@ pub fn serve<A: ToSocketAddrs>(
                 guardian_id: None,
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({"guardian_ids": ids}),
             });
         }
@@ -6153,6 +6994,7 @@ pub fn serve<A: ToSocketAddrs>(
                 guardian_id: None,
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({"pairs": pairs}),
             });
         }
@@ -6188,6 +7030,7 @@ pub fn serve<A: ToSocketAddrs>(
             guardian_id: None,
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"count": reaped}),
         });
     }
@@ -7586,6 +8429,82 @@ machine=\"incredibuild:B\"
         );
     }
 
+    #[test]
+    fn cartographer_endpoint_filters_by_task() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        d.lock()
+            .set_task_state("run-000000000001", 0, NodeState::Done)
+            .unwrap();
+        let r = route(&d, "GET", "/api/cartographer?task=t", "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("task → done"));
+
+        let r_missing = route(&d, "GET", "/api/cartographer?task=nope", "");
+        assert_eq!(r_missing.status, 200);
+        assert!(r_missing.body.contains("\"total\":0"));
+    }
+
+    #[test]
+    fn cartographer_endpoint_entity_filter_resolves_task_uri_to_task_name() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        d.lock()
+            .set_task_state("run-000000000001", 0, NodeState::Done)
+            .unwrap();
+        let r = route(
+            &d,
+            "GET",
+            "/api/cartographer?entity=task:run-000000000001:0",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("task → done"));
+    }
+
+    #[test]
+    fn cartographer_endpoint_entity_filter_run_scopes_by_run_id_only() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "GET",
+            "/api/cartographer?entity=run:run-000000000001",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("run-000000000001"));
+        assert!(!r.body.contains("run-000000000002"));
+    }
+
+    #[test]
+    fn cartographer_endpoint_entity_filter_bad_uri_is_400() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/cartographer?entity=bogus", "");
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn cartographer_endpoint_explicit_run_id_wins_over_entity() {
+        // An explicit `run_id=` should not be clobbered by a same-request
+        // `entity=` naming a different run -- the more specific,
+        // explicitly-given field always wins (see `apply_entity_filter`'s
+        // doc comment).
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD)); // run-1
+        route(&d, "POST", "/api/runs", &submit_body(GOOD)); // run-2
+        let r = route(
+            &d,
+            "GET",
+            "/api/cartographer?run_id=run-000000000002&entity=run:run-000000000001",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("run-000000000002"));
+        assert!(!r.body.contains("run-000000000001"));
+    }
+
     // ── Ghost memory (RAL-136) ───────────────────────────────────────────────
 
     #[test]
@@ -7680,6 +8599,35 @@ machine=\"incredibuild:B\"
     }
 
     #[test]
+    fn run_timeline_route_returns_merged_view_with_metadata() {
+        // See `timeline::TIMELINE_FILE_TEST_LOCK`: every fresh in-memory store's
+        // first run is "run-000000000001", so this and `timeline.rs`'s own
+        // tests would otherwise race on the same OS temp-file path.
+        let _guard = crate::timeline::TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        d.lock()
+            .set_run_state("run-000000000001", RunState::Done)
+            .unwrap();
+        let r = route(&d, "GET", "/api/runs/run-000000000001/timeline", "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"run_id\":\"run-000000000001\""));
+        assert!(r.body.contains("\"entries\":["));
+        assert!(r.body.contains("\"text\":"));
+        assert!(r.body.contains("\"file_path\":"));
+        assert!(r.body.contains("run → done"));
+    }
+
+    #[test]
+    fn run_timeline_missing_run_is_404() {
+        let d = daemon();
+        assert_eq!(
+            route(&d, "GET", "/api/runs/run-999/timeline", "").status,
+            404
+        );
+    }
+
+    #[test]
     fn guardian_logs_records_status() {
         let d = daemon();
         let body =
@@ -7762,6 +8710,48 @@ machine=\"incredibuild:B\"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"files\":[]"));
         assert!(r.body.contains("\"rebase_in_progress\":false"));
+    }
+
+    #[test]
+    fn resolver_task_and_session_id_is_stable_across_reorder() {
+        // RAL-192: the historical-record lookup must keep resolving to the
+        // SAME session after branches are reordered, since it recomputes the
+        // session id fresh on every call rather than caching what it saw when
+        // the resolver actually ran (see `write_pane_snapshot`'s key).
+        // Before the fix, the session id was keyed on the branch's mutable
+        // stack `position`, so a reorder silently pointed this lookup at a
+        // different branch's session -- guaranteed a miss for the branch that
+        // moved.
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "a").unwrap();
+        d.lock().add_guardian_branch(&id, "b").unwrap();
+        d.lock().add_guardian_branch(&id, "c").unwrap();
+        let branches = d.lock().guardian_branches(&id).unwrap();
+        let branch_id_a = branches[0].id.clone();
+        assert_eq!(branches[0].branch, "a");
+
+        let before = resolver_task_and_session_id(&d, &id, &branch_id_a).unwrap();
+
+        d.lock()
+            .reorder_guardian_branches(&id, &["c".into(), "a".into(), "b".into()])
+            .unwrap();
+        let reordered = d.lock().guardian_branches(&id).unwrap();
+        assert_eq!(
+            reordered
+                .iter()
+                .find(|b| b.id == branch_id_a)
+                .unwrap()
+                .position,
+            1,
+            "branch a's position must actually have moved for this test to be meaningful"
+        );
+
+        let after = resolver_task_and_session_id(&d, &id, &branch_id_a).unwrap();
+        assert_eq!(
+            before, after,
+            "session id for branch a must not change on reorder"
+        );
     }
 
     #[test]
@@ -7962,6 +8952,95 @@ machine=\"incredibuild:B\"
     fn delete_missing_run_is_404() {
         let d = daemon();
         assert_eq!(route(&d, "DELETE", "/api/runs/run-999", "").status, 404);
+    }
+
+    #[test]
+    fn session_terminal_log_attempts_route_lists_and_reads_attempts() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = "run-000000000001";
+
+        // Nothing persisted yet — an empty list, not an error.
+        let list = route(
+            &d,
+            "GET",
+            &format!("/api/runs/{run_id}/sessions/0/0/terminal-log-attempts"),
+            "",
+        );
+        assert_eq!(list.status, 200);
+        assert!(list.body.contains("\"attempts\":[]"), "{}", list.body);
+
+        // A non-existent attempt on a session with no attempts at all is 404.
+        let missing = route(
+            &d,
+            "GET",
+            &format!("/api/runs/{run_id}/sessions/0/0/terminal-log-attempts/0"),
+            "",
+        );
+        assert_eq!(missing.status, 404);
+
+        // Seed a couple of attempts the same way `SubprocessRunner::run_via_tmux_attempt`
+        // would persist them, keyed by the same deterministic session name.
+        let task = d.lock().get_task_name(run_id, 0).unwrap();
+        let session_id = d.lock().get_session_id(run_id, 0, 0).unwrap();
+        let name = crate::tmux::session_name(run_id, &task, &session_id);
+        crate::terminal_log::write_attempt(&name, 0, "first attempt output", 100);
+        crate::terminal_log::write_attempt(&name, 1, "second attempt output", 100);
+
+        let list = route(
+            &d,
+            "GET",
+            &format!("/api/runs/{run_id}/sessions/0/0/terminal-log-attempts"),
+            "",
+        );
+        assert_eq!(list.status, 200);
+        assert!(list.body.contains("\"attempt\":0"), "{}", list.body);
+        assert!(list.body.contains("\"attempt\":1"), "{}", list.body);
+
+        let attempt0 = route(
+            &d,
+            "GET",
+            &format!("/api/runs/{run_id}/sessions/0/0/terminal-log-attempts/0"),
+            "",
+        );
+        assert_eq!(attempt0.status, 200);
+        assert!(attempt0.body.contains("first attempt output"));
+
+        let attempt1 = route(
+            &d,
+            "GET",
+            &format!("/api/runs/{run_id}/sessions/0/0/terminal-log-attempts/1"),
+            "",
+        );
+        assert_eq!(attempt1.status, 200);
+        assert!(attempt1.body.contains("second attempt output"));
+
+        let attempt_missing = route(
+            &d,
+            "GET",
+            &format!("/api/runs/{run_id}/sessions/0/0/terminal-log-attempts/9"),
+            "",
+        );
+        assert_eq!(attempt_missing.status, 404);
+
+        crate::terminal_log::delete_for_session(&name);
+    }
+
+    #[test]
+    fn deleting_a_run_deletes_its_terminal_logs() {
+        let d = daemon();
+        route(&d, "POST", "/api/runs", &submit_body(GOOD));
+        let run_id = "run-000000000001";
+        let task = d.lock().get_task_name(run_id, 0).unwrap();
+        let session_id = d.lock().get_session_id(run_id, 0, 0).unwrap();
+        let name = crate::tmux::session_name(run_id, &task, &session_id);
+        crate::terminal_log::write_attempt(&name, 0, "will be deleted", 100);
+        assert!(!crate::terminal_log::list_attempts(&name).is_empty());
+
+        let del = route(&d, "DELETE", &format!("/api/runs/{run_id}"), "");
+        assert_eq!(del.status, 200);
+
+        assert!(crate::terminal_log::list_attempts(&name).is_empty());
     }
 
     #[test]
@@ -9184,7 +10263,13 @@ command = "true"
                 // Mirrors what `scheduler::tick` does for a claimed run: register
                 // a token in the shared registry before executing, remove it after.
                 let token = cancellations.register(&run_id);
-                crate::scheduler::execute_run_with(&store, runner.as_ref(), &run_id, &token);
+                crate::scheduler::execute_run_with(
+                    &store,
+                    runner.as_ref(),
+                    &run_id,
+                    &token,
+                    &cancellations,
+                );
                 cancellations.remove(&run_id);
             })
         };
@@ -9548,6 +10633,27 @@ command = "true"
             route(&d, "GET", &format!("/api/guardians/{gid}"), "").status,
             404
         );
+    }
+
+    #[test]
+    fn deleting_a_guardian_deletes_its_terminal_logs() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        let name = crate::tmux::session_name(
+            &format!("guardian-{gid}"),
+            crate::guardian_merge::RESOLVER_TASK,
+            "resolver-0",
+        );
+        crate::terminal_log::write_attempt(&name, 0, "resolver output", 100);
+        assert!(!crate::terminal_log::list_attempts(&name).is_empty());
+
+        let del = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(del.status, 200);
+
+        assert!(crate::terminal_log::list_attempts(&name).is_empty());
     }
 
     #[test]
@@ -10126,6 +11232,89 @@ command = "true"
         // environment is just the override -- the tombstone drops out.
         assert_eq!(g["branches"][0]["resolved_env"]["A"], "x");
         assert!(g["branches"][0]["resolved_env"].get("B").is_none());
+    }
+
+    #[test]
+    fn set_build_env_requires_set_unset_or_clear() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            store.create_guardian("r", "main", "/repo").unwrap()
+        };
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/build-env"), "{}");
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_manual_checks_env_rejects_an_invalid_variable_name() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            store.create_guardian("r", "main", "/repo").unwrap()
+        };
+        let body = serde_json::json!({"set": {"BAD-KEY": "x"}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/manual-checks-env"),
+            &body,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn set_build_env_missing_guardian_is_404() {
+        let d = daemon();
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        let r = route(&d, "POST", "/api/guardians/guardian-nope/build-env", &body);
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn build_and_manual_checks_env_round_trip_independently_onto_the_view() {
+        // RAL-203: the finalize-time build/check-gate step and the
+        // manual-checks step each get their own override layer, exposed on
+        // the guardian view as `build_env`/`manual_checks_env`
+        // (`build_env_overrides`/`manual_checks_env_overrides` for the raw
+        // layer) -- setting one must never affect the other.
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            store.create_guardian("r", "main", "/repo").unwrap()
+        };
+
+        let build_body = serde_json::json!({"set": {"A": "build-value"}, "unset": ["B"]});
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/build-env"),
+            &build_body.to_string(),
+        );
+        assert_eq!(r.status, 200);
+        let result: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(result["A"], "build-value");
+        assert!(result["B"].is_null(), "a tombstone serializes as null");
+
+        let manual_body = serde_json::json!({"set": {"A": "manual-value"}});
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/manual-checks-env"),
+            &manual_body.to_string(),
+        );
+        assert_eq!(r.status, 200);
+
+        let g = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        let g: serde_json::Value = serde_json::from_str(&g.body).unwrap();
+        assert_eq!(g["build_env_overrides"]["A"], "build-value");
+        assert!(g["build_env_overrides"]["B"].is_null());
+        assert_eq!(g["build_env"]["A"], "build-value");
+        assert!(g["build_env"].get("B").is_none());
+        assert_eq!(g["manual_checks_env_overrides"]["A"], "manual-value");
+        assert_eq!(g["manual_checks_env"]["A"], "manual-value");
+        // No branches at all here, so `combined_env` (the shared baseline) is
+        // empty -- neither section's own override leaked into it.
+        assert!(g["combined_env"].as_object().unwrap().is_empty());
     }
 
     #[test]

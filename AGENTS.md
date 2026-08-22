@@ -14,19 +14,33 @@ Working docs (all git-ignored via the global `*.local.md` rule — they are loca
 
 ## Architecture
 
-Eight Rust workspace members plus a Python project. The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
+Eleven Rust workspace members; `cli/` is a Python project kept only for `docsgen/` (doc screenshot generation, dev-only, never shipped — see "The Rust CLI/runner port" below) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML graphs — see "RAL-94 benchmark harness" below). The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
 
 | Component | Path | Language | Role |
 |---|---|---|---|
-| `ralphus-core` | `core/` | Rust lib | Task-file schema + validator + shared types. Dependency-light, heavily unit-tested. |
+| `ralphus-core` | `core/` | Rust lib | Task-file schema + validator + shared types (incl. `agent_resume`, `uri`). Dependency-light, heavily unit-tested. |
 | `ralphus-daemon` | `daemon/` | Rust bin+lib | SQLite store (WAL), HTTP API, scheduler; spawns the runner per session. |
 | `ralphus-librarian` | `librarian/` | Rust bin+lib | Web board; serves static HTML and proxies `/api/*` GETs to the daemon. |
+| `ralphus-cli` | `cli-rs/` | Rust bin (`ralphus`) | The CLI: validate/submit/status/run/task/session/verify/review/queue/project/machine/agent/show/check/quick-start/... — a thin HTTP client over the daemon's API, ~105 leaf subcommands (see "The Rust CLI/runner port" below). |
+| `ralphus-runner` | `runner/` | Rust bin+lib | The session runner: executes one `SessionSpec` (command/prompt/verify), reports a `SessionResult`. Spawned per-session by the daemon over the same stdin/stdout JSON contract the old Python runner used. |
 | `ralphus-auth` | `auth/` | Rust lib | Ed25519 license verification (no-op without `--features secure-dist`). |
 | `ralphus-keygen` | `keygen/` | Rust bin | Author-only tool: generate keypair + sign licenses. Never shipped to users. |
+| `ralphus-ssh-provider` | `ssh-provider/` | Rust bin+lib | Machine provider (RAL-185) reaching any host already SSH-accessible; `exec` verb only (RAL-200), see `docs/machine-providers.md`. |
 | `ralphus-bench-types` | `bench-types/` | Rust lib | `BenchMeta` only — kept dependency-free to avoid a cyclic dependency between bench-tagged crates and the harness (RAL-94). |
 | `ralphus-bench-macros` | `bench-macros/` | Rust proc-macro | `#[ralphus_bench(patience = N)]` attribute (RAL-94). |
 | `ralphus-bench-harness` | `bench-harness/` | Rust lib+bin | Durable-minimum loop, stats/git/storage, `ralphus-bench-rs` opt-in entry point (RAL-94). |
-| `ralphus` / `ralphus-runner` | `cli/` | Python + pydantic-ai | CLI (validate/submit/status/author) and the session runner. |
+
+### The Rust CLI/runner port
+
+`ralphus` (the CLI) and `ralphus-runner` were originally Python + pydantic-ai (see the git-ignored `PYTHON_DEPRECATION.local.md` audit for the full history/rationale). Both are now native Rust (`cli-rs/`, `runner/`), and `dist/` is 100% Rust — no PyInstaller, no bundled interpreter, no `_internal/` directory to keep beside an exe. The daemon<->runner wire contract (`SessionSpec`/`SessionResult` JSON on stdin/stdout, `RALPHUS_EVENT:`/`RALPHUS_VERIFY:` stderr markers) is byte-for-byte unchanged; only the language producing/consuming it changed.
+
+- `runner/src/` mirrors the old `cli/src/ralphus/runner/` module-for-module: `spec.rs` (wire contract), `tools.rs` (workspace-confined file/shell tools), `backend.rs` (the `ModelBackend` trait), `claude_code_backend.rs`/`codex_backend.rs`/`harness_backend.rs` (external-CLI-agent + generic-harness backends), `agent_backend.rs` + `llm_client.rs` + `providers.rs` (the hand-rolled Anthropic Messages API / Ollama OpenAI-compatible client and tool-calling loop — the one genuinely new piece; neither Python original used any pydantic *validation* feature, just provider selection and, for the runner, a tool loop), `execute.rs` (system-prompt composition, still-working retry loop, verdict/ghost marker parsing), `shellcmd.rs` (parent-shell detection + quoting, now using the `sysinfo` crate uniformly instead of separate Windows-ctypes/Linux-`/proc` code paths), `cli_agent_common.rs`, `otel.rs`, `cartographer.rs`, `config.rs`.
+- `cli-rs/src/` mirrors `cli/src/ralphus/`: `client.rs` (`DaemonClient`, all 77 methods, including the RAL-203 guardian-env redaction chokepoint), `selector.rs` (run/guardian selector grammar + resolution), `entity_uri.rs`, `config.rs`, `agents.rs`, `output.rs`, `tutor.rs`, `graphview.rs`, `health.rs`, and `commands/` (one module per top-level subcommand group: `run.rs`, `task.rs`, `session.rs`, `verify.rs`, `review.rs` — the largest, ~45 leaf commands — `queue.rs`, `project.rs`, `machine.rs`, `agent.rs`, `show.rs`, `misc.rs` for everything else). Follows `daemon/src/lib.rs`'s existing hand-rolled `Command` enum + `parse_args` convention (no `clap` anywhere in this workspace) rather than introducing a new dependency.
+- **Known, disclosed gap**: `ralphus author` (the agentic TOML-authoring loop) was deliberately not ported and has no command in `cli-rs` at all. Its Python implementation (`cli/src/ralphus/author/`) has since been deleted outright too — `ralphus author` does not exist in either language. Every other subcommand, including `quick-start` (manager/reviewer × claude-code/codex launch, system-prompt composition, `--read-only` mode, `--append-system-prompt-file` merging) and `show help-map`, is a full 1:1 functional port.
+- `cli-rs/src/commands/quick_start.rs` does **not** use tmux/psmux — despite the "interactive" framing, it is a plain foreground `std::process::Command::status()` spawn inheriting this process's own stdio; the spawned `claude`/`codex` process becomes the user's terminal session directly. That mechanism is unrelated to the tmux/psmux machinery `daemon/src/runner.rs`/`daemon/src/tmux.rs` use for tracking a *scheduled task's* session.
+- `runner/src/shellcmd.rs` is reused by `cli-rs` (a normal crate dependency) rather than duplicated, since both need "detect the parent shell and quote a compound command for it" for the same reason (`quick-start --command` / the CLI-agent backends' `RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND` handling).
+- `core/src/agent_resume.rs` holds the one shared implementation (`is_codex_agent`/`resume_agent_command`/`resume_codex_agent_command`) of the command line that resumes a CLI-agent conversation, imported by both `daemon/src/server.rs` and `cli-rs`'s session/review-terminal commands.
+- Test coverage: unit tests throughout both crates (~307 total: 253 in `ralphus-cli`, 54 in `ralphus-runner`) plus `cli-rs/tests/cli_integration.rs` (spawns the real compiled `ralphus` binary against a throwaway local fake-daemon server and asserts on stdout/exit code). This is *not* a line-for-line port of the original Python suite's test lines — the counts don't match 1:1 per module, though every module that still exists on the Python side (none do, for the CLI/runner) has been brought to real functional parity, not just line-count parity.
 
 Data flow: `ralphus submit x.toml` → daemon validates + ingests into SQLite (state **Pending**) → scheduler claims it (up to `max_concurrent`), spawns a worker thread → the worker runs each session by invoking `ralphus-runner` (JSON `SessionSpec` on stdin → `SessionResult` on stdout) → command verifies run → task/run states finalized → librarian polls `/api/tasks` and renders it.
 
@@ -43,14 +57,15 @@ Key module map:
 - `daemon/src/guardian_merge.rs` — stacked linear rebase in a worktree, agent conflict resolution.
 - `daemon/src/reviews.rs` — review derivation (per-guardian, per-branch merge status).
 - `daemon/src/config.rs` — layered config (global + per-project `.ralphus.toml`).
-- `daemon/src/cartographer.rs` — Cartographer: the unified, structured, cross-system event log (`Note`/`CartographerEntry` builders, filtered/paginated query, retention pruning). See "Logging Policy (RAL-79, RAL-98)" below.
+- `daemon/src/cartographer.rs` — Cartographer: the unified, structured, cross-system event log (`Note`/`CartographerEntry` builders, filtered/paginated query incl. `task`/`entity` filters, retention pruning). Rows can carry a `log_path` (RAL-155) pointing at an on-disk log file — e.g. a terminal-log attempt — instead of embedding its content. See "Logging Policy (RAL-79, RAL-98)" below.
 - `daemon/src/logging.rs` — the `rlog!` file/stderr sink (RAL-83) that every Cartographer [`Note::emit`] call also writes through.
+- `daemon/src/terminal_log.rs` — durable, per-attempt tmux pane transcript capture (RAL-154): flat files under `state_dir()/terminal_logs/<session_name>/<NNNN>.log`, one per tmux attempt (initial run + each `SubprocessRunner::run_via_tmux` reattach), so a restarted/reattached session's full history stays individually readable after the pane dies or the daemon restarts — independent of `crate::tmux`'s single-slot `write_pane_snapshot`/`read_pane_snapshot`, but referenced (by path, via `attempt_path`) from a Cartographer row every time an attempt is (re)written — see `runner.rs::emit_terminal_log_note`. Config: `[terminal_logs]` in `.ralphus.toml` (`max_lines_per_attempt`, `retention_days`, `max_files` — see `docs/daemon-api.md`).
+- `daemon/src/entity_uri.rs` — RAL-155: the single-string, index-based `EntityUri` grammar (`run:`/`task:`/`session:`/`verify:`/`guardian:`) that addresses any run/task/session/verify/guardian uniformly; parsed server-side from `GET /api/cartographer`'s `entity=` query param and mirrored in the CLI (`cli-rs/src/entity_uri.rs`).
+- `daemon/src/timeline.rs` — RAL-155: `build_run_timeline` merges a whole run's Cartographer rows (state transitions + everything else, already unified — see `cartographer.rs` above) with inlined terminal-log excerpts into one chronological narrative, sorted `(at_ms, id)` ascending. Backs `GET /api/runs/{id}/timeline` and the board's "⏱ Timeline" button.
 - `auth/src/lib.rs` — Ed25519 license check (`check_license()`; compiles away without `secure-dist`).
 - `keygen/src/main.rs` — keypair generation + license signing CLI.
-- `cli/src/ralphus/runner/` — `spec.py` (wire contract), `tools.py` (workspace-confined file/shell tools), `execute.py`, `backend.py` (Protocol), `pydantic_backend.py` (native agent), `harness_backend.py` + `claude_code_backend.py` + `codex_backend.py` (external CLI agents; `cli_agent_common.py` holds the prompt-file/live-session helpers shared by the two CLI-agent backends), `__main__.py`.
-- `cli/src/ralphus/client.py` + `__main__.py` — CLI over the daemon API.
-- `cli/src/ralphus/author/` — `core.py` (orchestration loop), `agent.py` (pydantic-ai TOML generator).
-- `cli/src/ralphus/bench/` — RAL-94 Python benchmark harness: `durable_min.py`, `stats.py`, `gitinfo.py`, `storage.py`, `pytest_plugin.py` (`--ralphus-bench` opt-in), `graphs.py` (SVG + standalone HTML generation).
+- `cli/src/ralphus/docsgen/` — `shots.py` (Playwright scenario driver), `stub_server.py` (deterministic `/api/*` JSON stub), `librarian_server.py` (spawns the real, compiled `ralphus-librarian` binary against that stub), `fixtures.py` (canned response data), `lint.py` (screenshot-coverage check), `helpmap_docs.py` (regenerates `docs/cli-reference.md`'s help-map block from `ralphus show help-map`), `binaries.py` (locates the compiled `ralphus`/`ralphus-librarian` exes).
+- `cli/src/ralphus/bench/` — renders the Rust bench harness's stored timing data as SVG/HTML graphs: `storage.py` (record read/write), `gitinfo.py`, `stats.py`, `graphs.py`. Does not run or time anything itself — see "RAL-94 benchmark harness" below.
 - `core/src/bench_demo.rs` — reference example of the RAL-94 Rust `#[ralphus_bench]` opt-in pattern; see the "RAL-94 benchmark harness" section below.
 - `librarian/assets/board.html` — the entire dark-theme UI (plain HTML + inline JS, embedded via `include_str!`).
 
@@ -69,7 +84,9 @@ uv sync --dev
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy                         # strict; covers src + tests
-uvx privata src                     # module-privacy linter; declare intended public API in __all__
+uv run privata src                  # module-privacy linter for production code
+uv run privata tests                # module-privacy linter for pytest support modules
+uv run deadcode src tests           # unreferenced code linter; configured in cli/pyproject.toml
 uv run pytest                       # run one: uv run pytest -k name
 
 # Bench patience comment lint (from repo root, stdlib-only, no uv sync needed)
@@ -210,7 +227,7 @@ string-wiring pattern actually used in this codebase). Run it with
 that calls out to a live Ollama model must be gated off from the normal
 `cargo test` / `uv run pytest` run, the same way every existing Ollama test
 already is: `#[ignore]` in Rust (see `daemon/tests/`), `pytest.mark.ollama`
-in Python (see `cli/pyproject.toml`'s `addopts = -m "not ollama"`). Don't add
+in Python (see `cli/pyproject.toml`'s `addopts = "-p pytester -m 'not ollama'"`). Don't add
 a new Ollama-backed test that runs unconditionally — CI and the normal dev
 loop must never depend on a local model being up. Keep the same
 runtime guard too (skip/return early with a clear message if Ollama isn't
@@ -243,22 +260,23 @@ Each still carries its own runtime guard too (prints `SKIP` and returns early) i
 
 ### Backend — Python tests
 
+The old Python CLI/runner (and its whole test suite) is gone — `cli/` now
+holds only `docsgen/` (doc screenshot generation) and a trimmed `bench/`
+(SVG/HTML graph rendering for the Rust bench harness's data; see "RAL-94
+benchmark harness" below), neither of which needs live external services.
+CLI/runner work belongs in `cli-rs/`/`runner/` and their own Rust test suites
+(see "Testing" entries for `ralphus-cli`/`ralphus-runner` elsewhere in this
+file), not here.
+
 `cd cli && uv run pytest`. Key test files:
 
 | File | Covers |
 |---|---|
-| `test_runner.py` | Session spec parsing, workspace tools, fake backend (17 tests) |
-| `test_client.py` | `DaemonClient` with mock `httpx` transport (8 tests) |
-| `test_author.py` | `ralphus author`: intent parsing, token budget, validate loop, dry-run (78 tests) |
-| `test_harness_backend.py` | Harness backend (external tool as stand-in) |
-| `test_claude_code_backend.py` | Claude Code harness integration |
-| `test_codex_backend.py` | Codex CLI harness integration (command construction, no real CLI) |
-| `test_codex_integration.py` | End-to-end Codex prompt/verify session (skips without a real `codex` CLI + `OPENAI_API_KEY`) |
-| `test_ollama_integration.py` | End-to-end Ollama prompt → write file (skips if Ollama down) |
-| `test_verify_ollama_integration.py` | Prompt-kind verify with Ollama (same skip idiom) |
-| `test_author_ollama_integration.py` | `ralphus author` with qwen3:8b (same skip idiom) |
-
-**Ollama-marked tests (`pytest.mark.ollama`) are deselected by default** — `[tool.pytest.ini_options] addopts` in `cli/pyproject.toml` sets `-m "not ollama"`, so a plain `uv run pytest` never runs them, mirroring the Rust `#[ignore]` gate above. Run them explicitly with `uv run --extra runner pytest -m ollama` (add `-k <name>` to narrow to one file/test). Each still carries its own runtime guard (`pytest.skip("Ollama is not running")`) if Ollama isn't reachable, so an explicit `-m ollama` run degrades gracefully too.
+| `test_docsgen_helpmap.py` | `helpmap_docs.py`'s marker splice + drift-check logic, and a real (non-mocked) call into the compiled `ralphus show help-map` |
+| `test_bench_storage.py` | Bench record read/write, filename hashing |
+| `test_bench_graphs.py` | SVG/HTML rendering from stored records |
+| `test_bench_gitinfo.py` | Git commit/dirty-state detection |
+| `test_bench_stats.py` | Stats-bundle computation (mean/median/stddev/IQR/outliers) |
 
 ### Frontend — board.html
 
@@ -314,7 +332,7 @@ cargo test -p ralphus-daemon scheduler::
 cargo test -p ralphus-core validate::
 
 # Run a single Python test by name
-cd cli && uv run pytest -k test_author_dry_run -s
+cd cli && uv run pytest -k test_render_test_svg_includes_commit_labels -s
 
 # Build and run the keygen tool (author-only; not distributed)
 cargo run -p ralphus-keygen -- generate
@@ -326,140 +344,80 @@ cargo build --release --features ralphus-daemon/secure-dist,ralphus-librarian/se
 
 ## RAL-94 benchmark harness
 
-A custom, **opt-in** benchmark harness durably times every test in the repo, one
-commit at a time, so per-test timing regressions are visible per commit instead
-of only "the whole suite got slow" after the fact. It is never run as part of
-normal `pytest` / `cargo test` — it is a separate, explicit invocation:
+A custom, **opt-in** benchmark harness durably times every `#[ralphus_bench]`-
+tagged Rust test, one commit at a time, so per-test timing regressions are
+visible per commit instead of only "the whole suite got slow" after the fact.
+It is never run as part of normal `cargo test` — it is a separate, explicit
+invocation, split across two independent steps:
 
 ```bash
-# Python: benchmarks every collected pytest test
-cd cli && uv run ralphus-bench-py
-
-# Rust: benchmarks every #[ralphus_bench]-tagged test
+# Generate data: benchmarks every #[ralphus_bench]-tagged test, writes JSON
 cargo run -p ralphus-bench-harness --bin ralphus-bench-rs
 
 # Regenerate the SVG + HTML graphs from already-stored data (no test execution)
-cd cli && uv run ralphus-bench-graph --lang all
+cd cli && uv run ralphus-bench-graph --lang rust
 ```
 
-These are two separate steps, not one command: `ralphus-bench-py` /
-`ralphus-bench-rs` only *run tests and write JSON* to `bench_data/` — they
-never touch the SVGs/HTML. `ralphus-bench-graph` only *reads* already-stored
-JSON and (re)renders graphs — it never executes a test. Graph rendering is
-one shared command for both languages (`--lang all` by default), even though
-data generation is per-language. After running a data-generation command you
-must re-run `ralphus-bench-graph` to see updated graphs — it is not triggered
+`ralphus-bench-rs` only *runs tests and writes JSON* to `bench_data/rust/` —
+it never touches the SVGs/HTML. `ralphus-bench-graph` (a small standalone
+Python tool, `cli/src/ralphus/bench/` — kept specifically for this, stdlib-
+only) only *reads* already-stored JSON and (re)renders graphs — it never
+executes a test. After running the data-generation command you must re-run
+`ralphus-bench-graph` to see updated graphs — it is not triggered
 automatically. See [`docs/bench-harness.md`](docs/bench-harness.md) for the
 full developer walkthrough.
 
-Both ecosystems implement the same "durable minimum" stopping rule: run the
-test once, in-process; if it beat the best duration seen so far, remember it
-and reset `patience`; otherwise decrement `patience`; stop at `patience == 0`.
-Every raw sample is kept and reduced to a full stats bundle (`max`, `mean`,
-`median`, `stddev`, `iqr`, Tukey `outliers`) alongside `durable_min`. Results
-accumulate one record per commit per test, stored under `bench_data/python/`
-and `bench_data/rust/` respectively (never intermixed) — see
-`cli/src/ralphus/bench/storage.py` and `bench-harness/src/storage.rs`. Test-name-
-derived filename stems are hashed (not embedded verbatim) once they run long,
-since Windows' `MAX_PATH` is 260 chars and parametrized pytest names can blow
-past a safe budget on their own.
+Implements the "durable minimum" stopping rule: run the test once, in-process;
+if it beat the best duration seen so far, remember it and reset `patience`;
+otherwise decrement `patience`; stop at `patience == 0`. Every raw sample is
+kept and reduced to a full stats bundle (`max`, `mean`, `median`, `stddev`,
+`iqr`, Tukey `outliers`) alongside `durable_min`. Results accumulate one
+record per commit per test under `bench_data/rust/` — see
+`bench-harness/src/storage.rs`. Test-name-derived filename stems are hashed
+(not embedded verbatim) once they run long, since Windows' `MAX_PATH` is 260
+chars and a test's full path can blow past a safe budget on its own.
 
-A skipped test (pytest `skip`/`skipif` marker, or a mid-test `pytest.skip()`)
-is recorded explicitly — a `skipped` entry alongside `records` in that test's
-JSON file — rather than simply being absent; graph rendering only ever reads
-`.records`, so a skip is surfaced as a count (e.g. in a title/legend) and never
-plotted as a trend-line point. Rust has no equivalent today: a crate's
-hand-maintained `ralphus_bench_tests()` collector simply omits a test it
-doesn't want benchmarked, which is already an intentional per-test opt-in
-decision rather than a runtime skip.
+A skipped test is recorded explicitly — a `skipped` entry alongside `records`
+in that test's JSON file — rather than simply being absent; graph rendering
+only ever reads `.records`, so a skip is surfaced as a count and never
+plotted as a trend-line point. There's no runtime equivalent for this today:
+a crate's hand-maintained `ralphus_bench_tests()` collector simply omits a
+test it doesn't want benchmarked, which is already an intentional per-test
+opt-in decision rather than a runtime skip.
 
-Any Python test that calls out to a live LLM (e.g. `test_ollama_integration.py`,
-`test_verify_ollama_integration.py`, `test_author_ollama_integration.py`) is
-tagged `pytestmark = pytest.mark.ollama` and fully deselected by
-`ralphus.bench.pytest_plugin.pytest_collection_modifyitems` whenever
-`--ralphus-bench` is active — not run once untimed, not recorded as
-`skipped`, just excluded outright. Its duration would reflect model
-inference/network latency rather than this repo's own performance, so it
-isn't meaningful timing-regression data; a plain (non-bench) `pytest` run is
-unaffected — the marker is inert without `--ralphus-bench`. Rust has no
-equivalent today since none of its `#[ralphus_bench]`-tagged tests call a
-live model.
-
-`run_durable_min` calls a test's body **at least twice** in-process, always,
-regardless of `patience` — the first call establishes the initial best, so
-`patience` only governs how many *subsequent* non-improving calls it takes to
-stop. This is invisible for a pure computation, but it breaks any test that
-hits a real socket with a real timeout (its measured duration is network/OS
-latency, not this repo's performance — a refused-connection test observed at
-~4s/call ballooned to 75s total) or whose setup/assertions assume
-exactly-once execution against fixture state that persists across those
-repeated calls — an accumulating JSON file, a `pytester` sandbox, a `git
-commit` with nothing new to commit the second time. `test_health.py` (every
-test probes a real, refused daemon/Ollama socket) and several
-`test_bench_pytest_plugin.py` integration tests (fixed `pytester` sandbox,
-exact accumulated-count assertions) hit this. Where the fix was cheap — a
-fresh `tmp_path_factory.mktemp(...)` per call instead of a fixed `tmp_path`,
-an idempotent `_git_init` — the test was made tolerant of repeat invocation
-instead. Where it wasn't (a `pytester` sandbox can't easily be made fresh
-per call from inside the test body), the test is tagged
-`pytestmark = pytest.mark.no_bench` or `@pytest.mark.no_bench`, deselected
-by the same collection hook as `ollama`. Use `no_bench` for this general
-"not safe/meaningful to invoke repeatedly" case; reserve `ollama` for the
-specific "calls a live LLM" case.
-
-`ralphus-bench-graph` writes a standalone HTML page a developer opens directly
-— `bench_data/index.html` — not raw `.svg` files and not part of `board.html`
-or the public docs site. It links to a per-language landing page
-(`bench_data/<language>/index.html`), which links to a per-file/module page
-(`bench_data/<language>/.../index.html`) that embeds that group's summary,
-multiline, and per-test SVGs via `<img>`.
-
-**Python achieves true universal inclusion** — `ralphus.bench.pytest_plugin`
-hooks `pytest_pyfunc_call` and takes over every collected test's invocation
-the moment `--ralphus-bench` is passed, so no per-test annotation is needed
-to participate.
-
-**Rust falls back to explicit per-test opt-in**, per this ticket's own
-documented escape hatch. The reason isn't laziness: `cargo test`'s implicit
-lib-unittest target (the one that runs `#[cfg(test)] mod tests` inline in
-`src/`) is the thing that executes the vast majority of this repo's Rust
-tests, and Cargo gives no way to swap out or disable that target's harness —
-`harness = false` only applies to a `[[test]]` entry pointing at a file under
-`tests/`, not to the implicit inline-unittest target. There is therefore no
-way for an external `ralphus-bench-rs` binary to reach into an ordinary
-`#[test]` function and re-invoke it in-process, repeatedly, without either
-linker-level magic (rejected: this workspace forbids `unsafe_code`, and most
-such tricks require it) or moving every test out of `#[cfg(test)] mod tests`
-(rejected: too large and risky a mechanical migration to do blind). Instead:
-a crate opts a test in with `#[ralphus_bench(patience = N)]` (see
-`ralphus-bench-macros`), which expands to the original function, a
-separately-named `#[test]`-tagged wrapper that calls it once (so it keeps
-running under plain `cargo test` too), and a `const BenchMeta` describing it.
-The crate then hand-maintains a `pub fn ralphus_bench_tests() -> Vec<BenchMeta>`
-collector (see `core/src/bench_demo.rs` for the reference example) that
-`ralphus-bench-rs` calls into. Adding a crate's tests to the Rust harness is
-therefore a deliberate, visible, per-test action — exactly the fallback this
-ticket calls for when universal inclusion "proves untenable."
+`cargo test`'s implicit lib-unittest target (the one that runs
+`#[cfg(test)] mod tests` inline in `src/`) is the thing that executes the
+vast majority of this repo's Rust tests, and Cargo gives no way to swap out
+or disable that target's harness — `harness = false` only applies to a
+`[[test]]` entry pointing at a file under `tests/`, not to the implicit
+inline-unittest target. There is therefore no way for an external
+`ralphus-bench-rs` binary to reach into an ordinary `#[test]` function and
+re-invoke it in-process, repeatedly, without either linker-level magic
+(rejected: this workspace forbids `unsafe_code`) or moving every test out of
+`#[cfg(test)] mod tests` (rejected: too large and risky a mechanical
+migration to do blind). Instead: a crate opts a test in with
+`#[ralphus_bench(patience = N)]` (see `ralphus-bench-macros`), which expands
+to the original function, a separately-named `#[test]`-tagged wrapper that
+calls it once (so it keeps running under plain `cargo test` too), and a
+`const BenchMeta` describing it. The crate then hand-maintains a
+`pub fn ralphus_bench_tests() -> Vec<BenchMeta>` collector (see
+`core/src/bench_demo.rs` for the reference example) that `ralphus-bench-rs`
+calls into. Adding a crate's tests to the harness is therefore a deliberate,
+visible, per-test action.
 
 **Authoring rule — patience.** Every time you add a benchmarked test
-(Python `@pytest.mark.ralphus_bench(...)` or Rust `#[ralphus_bench(...)]`),
-deliberately consider whether the default patience (10) is appropriate for
-that test. If you explicitly set a patience value — even if it happens to
-equal the default — the line must carry a trailing inline comment explaining
-why, e.g.:
-
-```python
-@pytest.mark.ralphus_bench(patience=1)  # low: hits Ollama, each call is slow/expensive — bail after one non-improving run
-def test_ollama_backed_thing(): ...
-```
+(`#[ralphus_bench(...)]`), deliberately consider whether the default patience
+(10) is appropriate for that test. If you explicitly set a patience value —
+even if it happens to equal the default — the line must carry a trailing
+inline comment explaining why, e.g.:
 
 ```rust
 #[ralphus_bench(patience = 3)] // low: validating an empty file is trivial and deterministic — few improving runs needed to find its floor
 fn validate_toml_rejects_empty_file() { ... }
 ```
 
-Tests using the implicit default (no `patience=` argument, or no
-`#[ralphus_bench]` argument at all) need no comment.
+Tests using the implicit default (no `#[ralphus_bench]` argument at all) need
+no comment.
 
 ## OpenTelemetry tracing (RAL-96)
 
@@ -467,14 +425,13 @@ A user action (a `board.html` button click) → librarian → daemon → schedul
 → `ralphus-runner` subprocess is traced end-to-end as one OpenTelemetry
 trace, viewable as a flame/waterfall graph. Entirely opt-in — every exporter
 is a no-op unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so the default dev
-loop is unaffected. Rust spans use the `opentelemetry`/`opentelemetry_sdk`
-crates' manual span API directly (not the `tracing` crate — see the Logging
-Policy below); Python uses the official `opentelemetry-sdk`; the browser
-hand-rolls the W3C `traceparent` format (no `opentelemetry-js`, since
-`board.html` has no build step). A local Collector + Jaeger stack for viewing
-traces lives in `otel/docker-compose.yml`. See
-[`docs/otel-tracing.md`](docs/otel-tracing.md) for the full design and how to
-run it.
+loop is unaffected. Rust spans (every hop above, including the runner) use
+the `opentelemetry`/`opentelemetry_sdk` crates' manual span API directly (not
+the `tracing` crate — see the Logging Policy below); the browser hand-rolls
+the W3C `traceparent` format (no `opentelemetry-js`, since `board.html` has
+no build step). A local Collector + Jaeger stack for viewing traces lives in
+`otel/docker-compose.yml`. See [`docs/otel-tracing.md`](docs/otel-tracing.md)
+for the full design and how to run it.
 
 ## Running it
 
@@ -485,9 +442,9 @@ Two build scripts, two purposes (both in `scripts/`):
 | `scripts/build-debug.sh` | seconds (incremental) | runs from source, no `dist/` | iterate — esp. the GUI |
 | `scripts/build-release.sh` | minutes | four standalone exes in `dist/` | package / distribute |
 
-**Fast dev loop — `bash scripts/build-debug.sh`.** Debug-builds the daemon + librarian with `cargo` (incremental, ~seconds) and points `RALPHUS_RUNNER_CMD` at the **venv runner** (`cli/.venv/Scripts/ralphus-runner.exe`) via `uv sync --extra runner` — so it never rebuilds the heavy bundled runner exe. It boots the daemon (`127.0.0.1:7890`) in the background and the librarian board (`127.0.0.1:7474`) in the foreground; **Ctrl-C stops both**.
+**Fast dev loop — `bash scripts/build-debug.sh`.** Debug-builds all four binaries (daemon, librarian, runner, CLI) with `cargo` (incremental, ~seconds each) and points `RALPHUS_RUNNER_CMD` at the just-built debug `ralphus-runner` exe. It boots the daemon (`127.0.0.1:7890`) in the background and the librarian board (`127.0.0.1:7474`) in the foreground; **Ctrl-C stops both**. Invoke the CLI yourself from another shell, e.g. `target/debug/ralphus status`.
 
-**Release build — `bash scripts/build-release.sh`.** Builds copyable standalone binaries into `dist/`: `ralphus-daemon`, `ralphus-librarian`, `ralphus` (CLI), and `ralphus-runner` (PyInstaller one-file bundling the pydantic-ai tree — this is the slow part). Stop any running daemon/librarian first: they lock their own `dist/` exes and the copy step will fail with "Device or resource busy".
+**Release build — `bash scripts/build-release.sh`.** Builds copyable standalone binaries into `dist/`: `ralphus-daemon`, `ralphus-librarian`, `ralphus` (CLI), `ralphus-runner` — all four are a single `cargo build --release` now, no PyInstaller step. Stop any running daemon/librarian/CLI/runner first: they lock their own `dist/` exes and the copy step will fail with "Device or resource busy".
 
 **Testing ralphus using ralphus (multi-instance dev stacks, RAL-164).** `ralphus-daemon serve` accepts `--db <path>` alongside `--port`, and `build-debug.sh`/`.cmd` accept a matching `--db-path`. To keep your regular ralphus instance open while exercising a change in another git worktree, give that worktree's stack its own port *and* its own DB explicitly:
 
@@ -506,35 +463,24 @@ Run the pieces directly:
 ```bash
 ralphus-daemon serve                          # HTTP API on 127.0.0.1:7890 (+ scheduler)
 ralphus-librarian serve [--port 7474]         # web board; RALPHUS_DAEMON_URL points it at the daemon
-cd cli && uv run ralphus submit task.toml     # or: validate / status / author
-.\dist\ralphus\ralphus.exe submit task.toml    # Windows release build (one-dir layout)
+ralphus submit task.toml                      # or: validate / status / review / ...
 ```
 
-`scripts/build-release.cmd` (Windows) builds all four standalone executables into `.\dist`: the two Rust bins via `cargo build --release`, and `ralphus.exe` / `ralphus-runner.exe` via **PyInstaller one-DIR**. Both Python builds run against a venv synced with `uv sync --extra runner` — that sync installs ~90 packages and makes the build take minutes.
+`scripts/build-release.cmd` (Windows) builds all four standalone executables into `.\dist` via a single `cargo build --release -p ralphus-daemon -p ralphus-librarian -p ralphus-cli -p ralphus-runner`.
 
-**`dist/` layout — the two Python apps are directories, not bare exes:**
+**`dist/` layout — four standalone exes, no sibling directories:**
 
 ```
 dist/
-  ralphus-daemon.exe                      # Rust, standalone
-  ralphus-librarian.exe                   # Rust, standalone
-  ralphus/ralphus.exe                     # + _internal/  (must stay together)
-  ralphus-runner/ralphus-runner.exe       # + _internal/  (must stay together)
+  ralphus-daemon.exe
+  ralphus-librarian.exe
+  ralphus.exe
+  ralphus-runner.exe
 ```
 
-Each PyInstaller exe **must stay beside its sibling `_internal/` directory** —
-copying the `.exe` out on its own breaks it. Put `dist/ralphus` on PATH for the
-CLI, and point `RALPHUS_RUNNER_CMD` at the full path to
-`dist/ralphus-runner/ralphus-runner.exe` (or add that directory to PATH too).
+Put `dist/` on PATH to get the `ralphus` CLI and have `RALPHUS_RUNNER_CMD` resolve `ralphus-runner` automatically, or point `RALPHUS_RUNNER_CMD` at the full path to `dist/ralphus-runner.exe` explicitly.
 
-These were `--onefile` until 2026-08-16. A onefile exe self-extracts to
-`%TEMP%\_MEIxxxxxx` and re-executes itself, and its bootloader's cache
-validation failed with `Security validation failure: parent process has
-different executable!` on two machines when launched from a sandboxed /
-reparenting tool layer — while the Rust binaries beside it, from the same zip,
-never did. `--onedir` has no bootloader extraction step, so that failure mode
-cannot occur; see `PERMISSIONS_ISSUE.local.md` and the header comment in
-`scripts/build-release.cmd`.
+**History (pre rust-port):** the CLI and runner used to be PyInstaller `--onedir` bundles (`dist/ralphus/ralphus.exe` + `_internal/`, `dist/ralphus-runner/ralphus-runner.exe` + `_internal/`), which themselves replaced an earlier `--onefile` build after its bootloader's cache validation failed with `Security validation failure: parent process has different executable!` on two machines launched from a sandboxed/reparenting tool layer (see `PERMISSIONS_ISSUE.local.md`). None of that applies anymore — see "The Rust CLI/runner port" above.
 
 ## Cryptography / Secure Distribution
 
@@ -580,8 +526,7 @@ Re-keying: delete `ralphus-private.key`, run `generate` again, commit the new `a
 ## Gotchas learned the hard way
 
 - **Session `cwd` must be a real path for the OS the daemon runs on.** On Windows, an MSYS/Git-Bash `/tmp/...` path will not resolve in native-Windows Python — use a Windows path. `cwd` is mandatory and validated.
-- **Runner command**: the daemon spawns `RALPHUS_RUNNER_CMD` (default `ralphus-runner`). In dev, point it at the venv script, e.g. `cli/.venv/Scripts/ralphus-runner.exe` — that's an editable install, so source edits under `cli/src/ralphus/runner/` take effect immediately with no build step. `dist/ralphus-runner/ralphus-runner.exe` (built by `scripts/build-release.cmd`) is a frozen PyInstaller snapshot; only rebuild it when something changed since the last one. Note the one-dir layout — it lives in its own directory beside an `_internal/` folder and cannot be moved out on its own.
-- **pydantic-ai is the optional `runner` extra**, not a dev dependency. CI does not install it; `pydantic_backend.py` is imported lazily and a mypy override keeps strict checking green without it.
+- **Runner command**: the daemon spawns `RALPHUS_RUNNER_CMD` (default `ralphus-runner`). In dev, `scripts/build-debug.sh`/`.cmd` build it with `cargo` and point `RALPHUS_RUNNER_CMD` at the fresh `target/debug/ralphus-runner` exe — a normal incremental Rust rebuild, no venv, no editable install. `dist/ralphus-runner.exe` (built by `scripts/build-release.cmd`) is a standalone release exe; only rebuild it when something changed since the last one.
 - **The full review flow has a live-Ollama integration test** — `daemon/tests/reviews_derive.rs::full_flow_validate_submit_run_and_ollama_resolves_conflict`. It **skips** unless Ollama is up on `127.0.0.1:11434`, the resolver model (`RALPHUS_RESOLVER_MODEL`, default `qwen3:8b`) is pulled, and a `ralphus-runner` is found.
 - **Monorepo integration test** — `daemon/tests/monorepo.rs` has three always-run pipeline tests and one live-Ollama test, `#[ignore]`d by default. Run the live test with `cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture`.
 - **Model selection** is per-session in TOML: `agent = "ollama"` + `model = "qwen3:8b"` for local; `agent = "claude"` (default) uses Anthropic (needs `ANTHROPIC_API_KEY`).
@@ -591,9 +536,9 @@ Re-keying: delete `ralphus-private.key`, run `generate` again, commit the new `a
 - **`keygen` is never shipped.** It is not in the release build scripts and should not be added. It is a workspace member only so `cargo build --all` can catch compile errors in CI.
 - **A tmux-wrapped session's pane can vanish mid-run with no clean explanation** on the Windows tmux-alternative this project targets (`psmux`) — see the gitignored `PSMUX_CRASH_NOTES.local.md` if present for background. `SubprocessRunner::run_via_tmux` (`daemon/src/runner.rs`) mitigates this: once a `claude-code`/`codex` session's `agent_session_id` has been captured live (from the `stream-json` init event or Codex's `thread.started` event, forwarded over the `RALPHUS_EVENT:` marker), a pane that goes unreachable for `MISSING_SESSION_STRIKE_LIMIT` consecutive polls triggers a bounded auto-reattach (`claude -p --resume <id>` or `codex exec resume <id>`, up to `SubprocessRunner::MAX_REATTACH_ATTEMPTS` times) in a fresh tmux session under the *same* deterministic name — so the board's "Show Live View"/"Open Terminal Log" buttons transparently start working again with no UI-side change. The overall `timeout_sec` budget is shared across every attempt, never reset by a reattach. Every stage (session lost / reattach attempt / giving up) is logged via both `rlog!` and a `tmux-reattach`-scoped Cartographer note carrying attempt/elapsed/reason/last-error, so a real occurrence is fully diagnosable from Cartographer alone. Only exercised for `agent = "claude-code"`/`"claude-cli"`/`"codex"`/`"codex-cli"`; other agents still fail outright on a lost pane, exactly as before.
 
-## Built (Phases 0–5 + authoring)
+## Built (Phases 0–5)
 
-Task pipeline (submit → schedule → run via native pydantic-ai *or* harness backend → command/prompt verify → board); dependency-graph scheduling + `{handoff:...}`; cross-run gating; Guardian reviews (stacked **rebase** merge in a worktree — each branch rebased onto the prior against one snapshotted base commit, agent conflict resolution, check gates, auto-rebuild when the base branch shifts, feedback chat, Reviews UI); `ralphus` CLI (validate/submit/status/check health); `ralphus author` (agentic TOML generation with intent parsing, token budgeting, review gating); harness backend (external agents like `claude-code`, `aider`); standalone release builds; secure-distribution licensing (`ralphus-auth` + `ralphus-keygen`). See `PLAN.local.md` for per-item detail.
+Task pipeline (submit → schedule → run via native agent *or* harness backend → command/prompt verify → board); dependency-graph scheduling + `{handoff:...}`; cross-run gating; Guardian reviews (stacked **rebase** merge in a worktree — each branch rebased onto the prior against one snapshotted base commit, agent conflict resolution, check gates, auto-rebuild when the base branch shifts, feedback chat, Reviews UI); `ralphus` CLI (validate/submit/status/check health/review/...); harness backend (external agents like `claude-code`, `codex`); standalone release builds; secure-distribution licensing (`ralphus-auth` + `ralphus-keygen`). `ralphus author` (agentic TOML generation) was built during this phase but has since been retired entirely — see "The Rust CLI/runner port" above. See `PLAN.local.md` for per-item detail.
 
 ## What is NOT built yet (see PLAN.local.md)
 
@@ -620,6 +565,12 @@ items.push(`<div data-tip="Cancel this run — stops all running sessions." oncl
 ```
 
 **Do not use the native `title` attribute** for new tooltips — it renders with browser default styling and ignores the dark theme. The `title` attribute can remain on existing splitter elements (they already use `data-tip`) but should not be added to new elements.
+
+## Read-Only Quick-Start Safety List (RAL-194)
+
+Each `HelpNode` in `cli-rs/src/help_map.rs`'s command tree (`ROOT` and its children) carries a `read_only_safe: bool` field — the allowlist a `--read-only` quick-start session (manager/reviewer) is told it may call. It drives the `(read-only-safe)` tag shown in the injected help-map (see `READ_ONLY_NOTE` in that same file) and the model is instructed to only invoke tagged commands while mutating ones stay off-limits.
+
+**Whenever you add a new `ralphus` CLI subcommand, decide whether it is safe to run under `--read-only`, and if so, set its `HelpNode`'s `read_only_safe` to `true`.** A command belongs on the list only if it performs no mutation under *any* of its own flags — it queries the daemon or local files and prints, never writes (a command that only prints an action for a human to run themselves, like `review checks run`, still counts as non-mutating). Everything else — including any new `set-status`/`restart`/`edit`/`create`/`delete`/`cancel`/`merge`/`approve`/`feedback`/`register`/`remove`/`git`, `submit`, or `clear`-shaped command — must be left `false` (unsafe-by-default). Don't default to leaving a new command off the list out of habit; make the call explicitly, the same way the Bench Patience rule below asks you to deliberately decide on `patience` for every new benchmarked test.
 
 ## Vocabulary
 
@@ -744,10 +695,10 @@ not on whether `tracing` appears in its tree.
 | `runner` | `daemon/src/runner.rs` | Subprocess spawned (pid/run/session/agent/model/timeout), cancelled, timed out, result parsed (status/tokens/cost) |
 | `spec` | `daemon/src/runner.rs` | System-prompt synthesis: which case applied (user-supplied / addendum / combined), lengths |
 | `verify` | `daemon/src/verify.rs` | Command verify starting (cwd/command) and completed (passed) |
-| `llm` | `cli/src/ralphus/runner/execute.py` | Session/verify start (run/session/agent/model/prompt_len/prompt_hash), system-prompt applied (len/position), done (tokens/cost), error — all at the execute layer |
-| `llm-invoke` | `cli/src/ralphus/runner/pydantic_backend.py` | Actual `agent.run_sync` start (prompt_len/hash), done (elapsed/tokens), error — at the model API call layer |
-| `runner` | `cli/src/ralphus/runner/__main__.py` | Runner invoked (run/session/agent/model/verify) |
-| `cli` | `cli/src/ralphus/__main__.py` | CLI subcommand invoked with its parsed args |
+| `llm` | `runner/src/execute.rs` | Session/verify start (run/session/agent/model/prompt_len/prompt_hash), system-prompt applied (len/position), done (tokens/cost) or error — at the execute layer |
+| `llm-invoke` | `runner/src/agent_backend.rs` | The actual model API call (via `llm_client::run_agent`) start (agent/model/prompt_len/hash), done (elapsed/tokens), or error — at the model API call layer |
+| `runner` | `runner/src/main.rs` | Runner invoked (run/session/agent/model/verify) |
+| `cli` | `cli-rs/src/main.rs` | CLI subcommand invoked with its parsed `Command` |
 
 **Required events** — any new code path that touches these must emit the corresponding log line, and — per the Cartographer amendment above — a matching structured record wherever a `Store` is reachable:
 - All entity state transitions (run, task, session, verify)
@@ -760,27 +711,27 @@ not on whether `tracing` appears in its tree.
 ## Bench Patience Comment Rule (RAL-94 / RAL-95)
 
 `ralphus_bench` is the patience-annotation mechanism (RAL-94) for marking a
-test's expected runtime budget — `@pytest.mark.ralphus_bench(patience=...)` in
-Python, `#[ralphus_bench(patience = ...)]` in Rust. The authoring rule has two
-halves:
+Rust test's expected runtime budget — `#[ralphus_bench(patience = ...)]`.
+The authoring rule has two halves:
 
 1. **Deliberately consider patience** whenever you add or touch a test.
    Don't default to leaving it unset out of habit — decide whether the test
    needs a non-default patience budget.
 2. **Comment whenever a value is explicitly set.** If you write
-   `patience=...` / `patience = ...`, that line must carry a justification
-   comment (`#` in Python, `//` in Rust) explaining *why* that budget is
-   needed (e.g. spins up a subprocess, hits a real Ollama model, rebuilds a
-   worktree) — either as a trailing comment on the same line, or as a
-   comment on the line immediately above.
+   `patience = ...`, that line must carry a justification comment (`//`)
+   explaining *why* that budget is needed (e.g. spins up a subprocess, hits
+   a real Ollama model, rebuilds a worktree) — either as a trailing comment
+   on the same line, or as a comment on the line immediately above.
 
 Only the second half is mechanically checkable — "did you think about it" is
 a review-time discipline, not something a script can verify. That's what
 `scripts/check_bench_patience_comments.py` enforces: it scans every tracked
-`*.py` file for `@pytest.mark.ralphus_bench(patience=...)` and every tracked
-`*.rs` file for `#[ralphus_bench(patience = ...)]`, and fails if a match
-lacks a same-line trailing comment or a comment on the line above. It's
-stdlib-only (no `uv sync` needed) and runs as its own CI job
+`*.rs` file for `#[ralphus_bench(patience = ...)]` (and, harmlessly, every
+tracked `*.py` file for the now-retired Python equivalent — no `*.py` file
+carries that pattern anymore since the Python side of RAL-94 was reduced to
+`cli/src/ralphus/bench/`'s graph renderer, which never times any test), and
+fails if a match lacks a same-line trailing comment or a comment on the line
+above. It's stdlib-only (no `uv sync` needed) and runs as its own CI job
 (`bench-patience`) on every PR:
 
 ```bash

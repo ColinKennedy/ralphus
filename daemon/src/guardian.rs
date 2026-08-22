@@ -197,6 +197,27 @@ pub(crate) fn apply_branch_env(
     out
 }
 
+/// The resolved environment of the last *enabled* branch in the stack
+/// (RAL-203, highest `position`) -- the combined worktree's tip is that
+/// branch's code rebased on top of everything beneath it, so its own
+/// environment is the one actually in effect there. Disabled branches are
+/// never candidates: their commits are not in the combined worktree.
+///
+/// This is the shared "last worktree in the branch chain" baseline both
+/// [`GuardianView::build_env`] and [`GuardianView::manual_checks_env`]
+/// layer their own section-specific overrides on top of -- the combined
+/// worktree has no upstream task session of its own to inherit from, so it
+/// borrows this instead.
+#[must_use]
+pub(crate) fn combined_env_from_branches(branches: &[BranchView]) -> BTreeMap<String, String> {
+    branches
+        .iter()
+        .filter(|b| b.enabled)
+        .max_by_key(|b| b.position)
+        .map(|b| b.resolved_env.clone())
+        .unwrap_or_default()
+}
+
 /// A branch row in a guardian, for display.
 #[derive(Debug, Clone, Serialize)]
 pub struct BranchView {
@@ -483,11 +504,13 @@ pub struct GuardianView {
     pub merge_progress: MergeProgress,
     /// `change_summary` display state (RAL-103): `"ready"` (has content --
     /// either a preliminary git-log summary or the LLM-authored final one) or
-    /// `"waiting"` (no branch has reached `Ready` yet). Summary computation is
-    /// synchronous and never intentionally cleared mid-rebuild (see
-    /// `recompute_preliminary_summary`/`generate_summary` in
-    /// `guardian_merge.rs`), so there is no meaningful in-between "generating"
-    /// state to report here.
+    /// `"waiting"` (no branch has reached `Ready` yet). `change_summary` is
+    /// never intentionally cleared mid-rebuild (see
+    /// `recompute_preliminary_summary`/`generate_final_summary` in
+    /// `guardian_merge.rs`) -- the final summary's regeneration is debounced
+    /// and asynchronous (RAL-208), but the last-computed value (preliminary or
+    /// final) stays visible throughout, so there is no meaningful in-between
+    /// "generating" state to report here.
     pub summary_state: &'static str,
     /// `manual_commands` display state (RAL-103): `"ready"` (commands are
     /// available), `"generating"` (every enabled branch has finished rebasing
@@ -496,6 +519,63 @@ pub struct GuardianView {
     /// fully rebuilds), or `"waiting"` (branches are still being collected or
     /// rebased, so generation has not started).
     pub checks_state: &'static str,
+    /// RAL-203: this review's own environment-variable overrides for the
+    /// finalize-time build/check-gate step (`final_checks`, run against the
+    /// combined worktree) -- not yet merged with [`Self::combined_env`].
+    /// `Some(v)` overrides an inherited value, `None` is a tombstone. Set via
+    /// `POST /api/guardians/{id}/build-env`. Independent of
+    /// [`Self::manual_checks_env_overrides`] -- setting one never affects
+    /// the other.
+    pub build_env_overrides: BTreeMap<String, Option<String>>,
+    /// RAL-203: this review's own environment-variable overrides for the
+    /// manual-checks step -- the LLM-suggested commands run via `ralphus
+    /// review checks run`/the board's "Run all". Set via
+    /// `POST /api/guardians/{id}/manual-checks-env`.
+    pub manual_checks_env_overrides: BTreeMap<String, Option<String>>,
+    /// RAL-203: the environment the combined worktree inherits by default --
+    /// the last enabled branch's own [`BranchView::resolved_env`] (see
+    /// [`combined_env_from_branches`]). This is the shared baseline
+    /// [`Self::build_env`] and [`Self::manual_checks_env`] each layer their
+    /// own overrides on top of.
+    pub combined_env: BTreeMap<String, String>,
+    /// RAL-203: the effective environment the finalize-time build/check-gate
+    /// step runs under -- [`Self::combined_env`] with
+    /// [`Self::build_env_overrides`] applied.
+    pub build_env: BTreeMap<String, String>,
+    /// RAL-203: the effective environment the manual-checks step runs under
+    /// -- [`Self::combined_env`] with [`Self::manual_checks_env_overrides`]
+    /// applied.
+    pub manual_checks_env: BTreeMap<String, String>,
+    /// RAL-193: this review's own USD spend cap (from `[[review]]`'s
+    /// `maximum_budget_usd`), enforced against [`Self::cumulative_cost_usd`].
+    /// `None` means no cap.
+    pub maximum_budget_usd: Option<f64>,
+    /// RAL-193: current merge-attempt counter, bumped once per rebase/re-merge
+    /// (`guardian_merge::run_merge`). [`Self::attempt_tokens_in`]/
+    /// [`Self::attempt_tokens_out`]/[`Self::attempt_cost_usd`] are scoped to
+    /// this attempt.
+    pub merge_attempt: i64,
+    /// RAL-193: input tokens spent on this review's own conflict-resolution
+    /// and verifier agent calls during the current merge attempt only --
+    /// excludes the tasks/sessions that fed into the review.
+    pub attempt_tokens_in: i64,
+    /// RAL-193: output tokens, current merge attempt only. See
+    /// [`Self::attempt_tokens_in`].
+    pub attempt_tokens_out: i64,
+    /// RAL-193: USD cost, current merge attempt only. See
+    /// [`Self::attempt_tokens_in`].
+    pub attempt_cost_usd: f64,
+    /// RAL-193: input tokens spent on this review's own conflict-resolution
+    /// and verifier agent calls, cumulative across every rebase/re-merge
+    /// attempt this review has gone through.
+    pub cumulative_tokens_in: i64,
+    /// RAL-193: output tokens, cumulative across every attempt. See
+    /// [`Self::cumulative_tokens_in`].
+    pub cumulative_tokens_out: i64,
+    /// RAL-193: USD cost, cumulative across every attempt -- the value
+    /// [`Self::maximum_budget_usd`] is enforced against. See
+    /// [`Self::cumulative_tokens_in`].
+    pub cumulative_cost_usd: f64,
 }
 
 /// Aggregated merge progress across a guardian's branches, ported from
@@ -691,6 +771,7 @@ impl Store {
                 guardian_id: Some(id),
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({}),
             });
         }
@@ -1329,6 +1410,144 @@ impl Store {
         } else {
             Ok(())
         }
+    }
+
+    /// Set this review's own USD spend cap (RAL-193), from the top-level
+    /// `[[review]]` block's `maximum_budget_usd`. Enforced by the guardian
+    /// merge machinery against the cumulative sum of [`Self::guardian_cost_total`]
+    /// the same way a task/session cap is enforced against a live `cost_usd`
+    /// (RAL-161). `None` means no cap.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_maximum_budget_usd(&self, id: &str, cap: Option<f64>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET maximum_budget_usd=?, updated_at_ms=? WHERE id=?",
+            params![cap, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// This review's own USD spend cap (RAL-193), a lightweight single-column
+    /// read for the merge engine's per-call budget check -- avoids paying for
+    /// a full [`Self::get_guardian`] hydration on every resolver/verifier call.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn guardian_maximum_budget_usd(&self, id: &str) -> Result<Option<f64>> {
+        self.conn
+            .query_row(
+                "SELECT maximum_budget_usd FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Bump this review's merge-attempt counter and return the new value
+    /// (RAL-193). Called once at the top of a merge/rebase attempt
+    /// (`guardian_merge::run_merge`) so every cost line item recorded
+    /// during that attempt can be attributed to it, and a per-attempt cost
+    /// total can be told apart from the cumulative total.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn bump_guardian_merge_attempt(&self, id: &str) -> Result<i64> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET merge_attempt = merge_attempt + 1, updated_at_ms=? WHERE id=?",
+            params![crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(self.conn.query_row(
+            "SELECT merge_attempt FROM guardians WHERE id=?",
+            params![id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// This guardian's current merge-attempt counter (RAL-193), for
+    /// attributing a cost line item recorded outside `run_merge`'s own call
+    /// (e.g. a standalone chat/feedback call) to whichever attempt is/was
+    /// current.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn guardian_current_attempt(&self, id: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT merge_attempt FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Record one guardian LLM call's cost as a line item (RAL-193) --
+    /// conflict resolution, verification, chat, feedback, summary
+    /// generation, etc. `branch_id` is the stable per-branch id
+    /// (`guardian_branches.id`) when the call is scoped to one stacked
+    /// branch, `None` for a review-wide call (chat, combined final verify).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_guardian_cost(
+        &self,
+        guardian_id: &str,
+        branch_id: Option<&str>,
+        attempt: i64,
+        kind: &str,
+        tokens_in: i64,
+        tokens_out: i64,
+        cost_usd: f64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_costs (guardian_id, branch_id, attempt, kind, tokens_in, tokens_out, cost_usd, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                guardian_id,
+                branch_id,
+                attempt,
+                kind,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+                crate::store::now_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sum every recorded cost line item for one guardian (RAL-193) --
+    /// `(tokens_in, tokens_out, cost_usd)` cumulative across every
+    /// rebase/re-merge attempt.
+    pub fn guardian_cost_total(&self, guardian_id: &str) -> Result<(i64, i64, f64)> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COALESCE(SUM(cost_usd),0)
+             FROM guardian_costs WHERE guardian_id=?",
+            params![guardian_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+
+    /// Sum cost line items for one guardian scoped to a single merge
+    /// attempt (RAL-193) -- `(tokens_in, tokens_out, cost_usd)`.
+    pub fn guardian_cost_total_for_attempt(
+        &self,
+        guardian_id: &str,
+        attempt: i64,
+    ) -> Result<(i64, i64, f64)> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COALESCE(SUM(cost_usd),0)
+             FROM guardian_costs WHERE guardian_id=? AND attempt=?",
+            params![guardian_id, attempt],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
     }
 
     /// Set the review source type (`git` or a future placeholder type).
@@ -2057,6 +2276,112 @@ impl Store {
         Ok(apply_branch_env(&inherited, &overrides))
     }
 
+    /// This review's own environment-variable overrides for the
+    /// finalize-time build/check-gate step (RAL-203), not yet merged with
+    /// [`GuardianView::combined_env`]. `Some(v)` is an override, `None` is a
+    /// tombstone -- see [`GuardianView::build_env_overrides`].
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn get_guardian_build_env_overrides(
+        &self,
+        guardian_id: &str,
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT build_env_overrides FROM guardians WHERE id=?",
+                params![guardian_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(branch_env_from_json(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Mutate this review's build-step environment overrides (RAL-203),
+    /// returning the resulting map. Same three-operation `set`/`unset`/`clear`
+    /// semantics as [`Self::set_guardian_branch_env_overrides`], applied in
+    /// order so the last one named for a given key wins deterministically.
+    /// Independent of [`Self::set_guardian_manual_checks_env_overrides`] --
+    /// mutating one never touches the other.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_build_env_overrides(
+        &self,
+        guardian_id: &str,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+        clear: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let mut current = self.get_guardian_build_env_overrides(guardian_id)?;
+        for key in clear {
+            current.remove(key);
+        }
+        for key in unset {
+            current.insert(key.clone(), None);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), Some(v.clone()));
+        }
+        self.conn.execute(
+            "UPDATE guardians SET build_env_overrides=? WHERE id=?",
+            params![branch_env_to_json(&current), guardian_id],
+        )?;
+        Ok(current)
+    }
+
+    /// This review's own environment-variable overrides for the
+    /// manual-checks step (RAL-203) -- see
+    /// [`GuardianView::manual_checks_env_overrides`].
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn get_guardian_manual_checks_env_overrides(
+        &self,
+        guardian_id: &str,
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT manual_checks_env_overrides FROM guardians WHERE id=?",
+                params![guardian_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(branch_env_from_json(&raw.ok_or(StoreError::NotFound)?))
+    }
+
+    /// Mutate this review's manual-checks-step environment overrides
+    /// (RAL-203). See [`Self::set_guardian_build_env_overrides`] for the
+    /// operation semantics; independent of that build-step layer.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_manual_checks_env_overrides(
+        &self,
+        guardian_id: &str,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+        clear: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let mut current = self.get_guardian_manual_checks_env_overrides(guardian_id)?;
+        for key in clear {
+            current.remove(key);
+        }
+        for key in unset {
+            current.insert(key.clone(), None);
+        }
+        for (k, v) in set {
+            current.insert(k.clone(), Some(v.clone()));
+        }
+        self.conn.execute(
+            "UPDATE guardians SET manual_checks_env_overrides=? WHERE id=?",
+            params![branch_env_to_json(&current), guardian_id],
+        )?;
+        Ok(current)
+    }
+
     /// Permanently dismiss the "can re-enable" notification for a branch (RAL-69).
     /// Idempotent — unknown branch ids are silently ignored.
     pub fn dismiss_branch_reenable(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
@@ -2129,7 +2454,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -2142,7 +2467,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, run_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, verify_scope, verify_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -2191,6 +2516,10 @@ impl Store {
             verify_scope: r.get(35)?,
             verify_skip_auto_clean: r.get::<_, Option<i64>>(36)?.map(|v| v != 0),
             machine: r.get(37)?,
+            build_env_overrides: r.get(38)?,
+            manual_checks_env_overrides: r.get(39)?,
+            maximum_budget_usd: r.get(40)?,
+            merge_attempt: r.get(41)?,
         })
     }
 
@@ -2372,6 +2701,20 @@ impl Store {
         };
         let input_resolutions = self.guardian_input_resolutions(&row.id)?;
 
+        // RAL-203: the combined worktree has no upstream task session of its
+        // own to inherit an environment from (unlike a per-branch worktree,
+        // which borrows its source session's), so the build/check-gate and
+        // manual-checks steps against it instead borrow the union of every
+        // enabled branch's own resolved environment -- computed now that
+        // `branches` above has each one's `resolved_env` filled in.
+        let combined_env = combined_env_from_branches(&branches);
+        let build_env_overrides =
+            branch_env_from_json(row.build_env_overrides.as_deref().unwrap_or("{}"));
+        let manual_checks_env_overrides =
+            branch_env_from_json(row.manual_checks_env_overrides.as_deref().unwrap_or("{}"));
+        let build_env = apply_branch_env(&combined_env, &build_env_overrides);
+        let manual_checks_env = apply_branch_env(&combined_env, &manual_checks_env_overrides);
+
         // RAL-168: resolve this review's own Verify-scope override (if any)
         // against the project-level `.ralphus.toml [review] verify_scope`
         // default -- so the UI can show the effective value as the dropdown's
@@ -2388,6 +2731,18 @@ impl Store {
         let effective_verify_skip_auto_clean = row
             .verify_skip_auto_clean
             .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
+
+        // RAL-193: this review's own agent cost -- conflict resolution and
+        // verifier calls made by the guardian merge machinery -- scoped to
+        // the current merge attempt and cumulatively across every
+        // rebase/re-merge attempt. Deliberately excludes the cost of the
+        // tasks/sessions that fed into the review (per the RAL-193 user
+        // decision), which is why this sums `guardian_costs` rather than
+        // joining `sessions`.
+        let (attempt_tokens_in, attempt_tokens_out, attempt_cost_usd) =
+            self.guardian_cost_total_for_attempt(&row.id, row.merge_attempt)?;
+        let (cumulative_tokens_in, cumulative_tokens_out, cumulative_cost_usd) =
+            self.guardian_cost_total(&row.id)?;
 
         Ok(GuardianView {
             id: row.id,
@@ -2441,6 +2796,19 @@ impl Store {
             merge_progress,
             summary_state,
             checks_state,
+            build_env_overrides,
+            manual_checks_env_overrides,
+            combined_env,
+            build_env,
+            manual_checks_env,
+            maximum_budget_usd: row.maximum_budget_usd,
+            merge_attempt: row.merge_attempt,
+            attempt_tokens_in,
+            attempt_tokens_out,
+            attempt_cost_usd,
+            cumulative_tokens_in,
+            cumulative_tokens_out,
+            cumulative_cost_usd,
         })
     }
 
@@ -2672,6 +3040,16 @@ struct GuardianRow {
     verify_skip_auto_clean: Option<bool>,
     /// RAL-185: the machine this review runs on. NULL means the daemon's host.
     machine: Option<String>,
+    /// RAL-203: this review's own env overrides for the finalize-time
+    /// build/check-gate step. Same `{key: value|null}` shape as
+    /// `guardian_branches.env_overrides`.
+    build_env_overrides: Option<String>,
+    /// RAL-203: this review's own env overrides for the manual-checks step.
+    manual_checks_env_overrides: Option<String>,
+    /// RAL-193: this review's own USD spend cap. `None` means no cap.
+    maximum_budget_usd: Option<f64>,
+    /// RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
+    merge_attempt: i64,
 }
 
 #[cfg(test)]
@@ -2998,6 +3376,159 @@ mod tests {
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         assert!(matches!(
             store.get_guardian_branch_env_overrides(&id, "branch-nope"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    // ── RAL-203: combined-worktree env inheritance for the build/check-gate
+    // and manual-checks steps, with independent per-section overrides ──────
+
+    #[test]
+    fn combined_worktree_steps_inherit_the_last_branch_env_by_default() {
+        // The core of RAL-203: the combined worktree has no source session of
+        // its own, so both the build/check-gate step and the manual-checks
+        // step borrow `combined_env` (the last enabled branch's resolved
+        // env) by default, with no overrides of their own yet.
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, _bid) = guardian_with_env_source_session(&mut store);
+
+        let g = store.get_guardian(&id).unwrap();
+        for env in [&g.combined_env, &g.build_env, &g.manual_checks_env] {
+            assert_eq!(env.get("SHARED").map(String::as_str), Some("from-session"));
+            assert_eq!(env.get("TASK_ONLY").map(String::as_str), Some("1"));
+            assert_eq!(env.get("SESSION_ONLY").map(String::as_str), Some("2"));
+        }
+        assert!(g.build_env_overrides.is_empty());
+        assert!(g.manual_checks_env_overrides.is_empty());
+    }
+
+    #[test]
+    fn a_build_only_override_does_not_leak_into_manual_checks_or_combined_env() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, _bid) = guardian_with_env_source_session(&mut store);
+
+        let mut set = BTreeMap::new();
+        set.insert("SHARED".to_string(), "from-build-override".to_string());
+        store
+            .set_guardian_build_env_overrides(&id, &set, &[], &[])
+            .unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.build_env.get("SHARED").map(String::as_str),
+            Some("from-build-override")
+        );
+        // Independent of the build layer: manual-checks and the shared
+        // combined baseline are both untouched.
+        assert_eq!(
+            g.manual_checks_env.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+        assert_eq!(
+            g.combined_env.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+    }
+
+    #[test]
+    fn a_manual_checks_only_override_does_not_leak_into_build_or_combined_env() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, _bid) = guardian_with_env_source_session(&mut store);
+
+        let mut set = BTreeMap::new();
+        set.insert("SHARED".to_string(), "from-manual-override".to_string());
+        store
+            .set_guardian_manual_checks_env_overrides(&id, &set, &[], &[])
+            .unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.manual_checks_env.get("SHARED").map(String::as_str),
+            Some("from-manual-override")
+        );
+        assert_eq!(
+            g.build_env.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+        assert_eq!(
+            g.combined_env.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+    }
+
+    #[test]
+    fn build_and_manual_checks_overrides_apply_independently_and_differently() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (id, _bid) = guardian_with_env_source_session(&mut store);
+
+        let mut build_set = BTreeMap::new();
+        build_set.insert("SHARED".to_string(), "build-value".to_string());
+        store
+            .set_guardian_build_env_overrides(&id, &build_set, &[], &[])
+            .unwrap();
+
+        let mut manual_set = BTreeMap::new();
+        manual_set.insert("SHARED".to_string(), "manual-value".to_string());
+        // Also tombstone a key only for manual-checks -- proves the tombstone
+        // is scoped to this layer, not the shared combined_env.
+        store
+            .set_guardian_manual_checks_env_overrides(
+                &id,
+                &manual_set,
+                &["TASK_ONLY".to_string()],
+                &[],
+            )
+            .unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.build_env.get("SHARED").map(String::as_str),
+            Some("build-value")
+        );
+        assert_eq!(
+            g.manual_checks_env.get("SHARED").map(String::as_str),
+            Some("manual-value")
+        );
+        assert_eq!(
+            g.build_env.get("TASK_ONLY").map(String::as_str),
+            Some("1"),
+            "the manual-checks tombstone must not affect the build layer"
+        );
+        assert!(
+            !g.manual_checks_env.contains_key("TASK_ONLY"),
+            "manual-checks own tombstone should remove the inherited key"
+        );
+        assert_eq!(
+            g.combined_env.get("SHARED").map(String::as_str),
+            Some("from-session"),
+            "the shared branch-union baseline is never mutated by either section's overrides"
+        );
+
+        // `clear` on one section restores inheritance for that section only.
+        store
+            .set_guardian_build_env_overrides(&id, &BTreeMap::new(), &[], &["SHARED".to_string()])
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.build_env.get("SHARED").map(String::as_str),
+            Some("from-session")
+        );
+        assert_eq!(
+            g.manual_checks_env.get("SHARED").map(String::as_str),
+            Some("manual-value"),
+            "clearing the build override must not touch manual-checks' own override"
+        );
+    }
+
+    #[test]
+    fn build_and_manual_checks_env_overrides_for_an_unknown_guardian_are_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.get_guardian_build_env_overrides("guardian-nope"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get_guardian_manual_checks_env_overrides("guardian-nope"),
             Err(StoreError::NotFound)
         ));
     }
@@ -4083,5 +4614,104 @@ mod tests {
         assert!(g.branches[1].worktree.is_none());
         // pending stays pending.
         assert_eq!(g.branches[2].merge_status, "pending");
+    }
+
+    // ── RAL-193: guardian cost tracking ──────────────────────────────────
+
+    #[test]
+    fn guardian_cost_defaults_to_none_and_zero() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.maximum_budget_usd, None);
+        assert_eq!(g.merge_attempt, 0);
+        assert_eq!(g.attempt_tokens_in, 0);
+        assert_eq!(g.attempt_tokens_out, 0);
+        assert_eq!(g.attempt_cost_usd, 0.0);
+        assert_eq!(g.cumulative_tokens_in, 0);
+        assert_eq!(g.cumulative_tokens_out, 0);
+        assert_eq!(g.cumulative_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn set_guardian_maximum_budget_usd_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_maximum_budget_usd(&id, Some(2.5))
+            .unwrap();
+        assert_eq!(store.guardian_maximum_budget_usd(&id).unwrap(), Some(2.5));
+        assert_eq!(
+            store.get_guardian(&id).unwrap().maximum_budget_usd,
+            Some(2.5)
+        );
+        store.set_guardian_maximum_budget_usd(&id, None).unwrap();
+        assert_eq!(store.guardian_maximum_budget_usd(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn bump_guardian_merge_attempt_increments_and_current_attempt_reads_it() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert_eq!(store.guardian_current_attempt(&id).unwrap(), 0);
+        assert_eq!(store.bump_guardian_merge_attempt(&id).unwrap(), 1);
+        assert_eq!(store.guardian_current_attempt(&id).unwrap(), 1);
+        assert_eq!(store.bump_guardian_merge_attempt(&id).unwrap(), 2);
+        assert_eq!(store.guardian_current_attempt(&id).unwrap(), 2);
+    }
+
+    #[test]
+    fn record_guardian_cost_sums_per_attempt_and_cumulative() {
+        // Two calls in attempt 1, one call in attempt 2 -- per-attempt totals
+        // must only reflect their own attempt, cumulative must sum all three.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+
+        let attempt1 = store.bump_guardian_merge_attempt(&id).unwrap();
+        store
+            .record_guardian_cost(&id, Some(&bid), attempt1, "resolve_conflict", 100, 50, 0.01)
+            .unwrap();
+        store
+            .record_guardian_cost(&id, Some(&bid), attempt1, "verify", 30, 10, 0.002)
+            .unwrap();
+        let attempt2 = store.bump_guardian_merge_attempt(&id).unwrap();
+        store
+            .record_guardian_cost(&id, Some(&bid), attempt2, "resolve_conflict", 200, 80, 0.02)
+            .unwrap();
+
+        let (in1, out1, cost1) = store
+            .guardian_cost_total_for_attempt(&id, attempt1)
+            .unwrap();
+        assert_eq!((in1, out1), (130, 60));
+        assert!((cost1 - 0.012).abs() < 1e-9);
+
+        let (in2, out2, cost2) = store
+            .guardian_cost_total_for_attempt(&id, attempt2)
+            .unwrap();
+        assert_eq!((in2, out2), (200, 80));
+        assert!((cost2 - 0.02).abs() < 1e-9);
+
+        let (in_all, out_all, cost_all) = store.guardian_cost_total(&id).unwrap();
+        assert_eq!((in_all, out_all), (330, 140));
+        assert!((cost_all - 0.032).abs() < 1e-9);
+
+        // GuardianView surfaces the current attempt's total plus cumulative.
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.merge_attempt, attempt2);
+        assert_eq!(g.attempt_tokens_in, 200);
+        assert_eq!(g.attempt_tokens_out, 80);
+        assert_eq!(g.cumulative_tokens_in, 330);
+        assert_eq!(g.cumulative_tokens_out, 140);
+    }
+
+    #[test]
+    fn guardian_cost_total_for_unknown_guardian_is_zero() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            store.guardian_cost_total("guardian-nope").unwrap(),
+            (0, 0, 0.0)
+        );
     }
 }

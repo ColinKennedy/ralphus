@@ -4,14 +4,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ralphus_core::schema::TaskFile;
+use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::guardian::GuardianCheck;
 use ralphus_daemon::guardian_merge::{
-    purge_worktrees, rebase_command_progress, rebase_on_manual_push, rebuild_on_base_shift,
-    reopen_straggler, run_chat, run_feedback, run_merge,
+    pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
+    rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_chat, run_feedback,
+    run_merge, start_merge,
 };
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
@@ -821,6 +824,124 @@ fn skip_worktree_checks_does_not_affect_auto_build() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Regression: `skip_worktree_checks` must suppress the dedicated
+// `run_final_verify` call itself, not just the quality-bar instructions
+// handed to it (RAL-110 vs RAL-168/RAL-149 were previously independent
+// axes). Exercises both `VerifyGate` call sites in one pass:
+// feature/x rebases cleanly onto main but contributes real changes
+// (`allows_for_clean_branch`), and feature/y then conflicts against it and is
+// resolved by the fake agent (`allows_after_conflict`).
+#[test]
+fn skip_worktree_checks_suppresses_final_verify() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let guardian_id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("skip-checks", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        g.set_guardian_skip_worktree_checks(&id, true).unwrap();
+        id
+    };
+
+    struct MarkerStrippingRunner {
+        specs: Arc<Mutex<Vec<RunnerSpec>>>,
+    }
+    impl Runner for MarkerStrippingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.specs.lock().unwrap().push(spec.clone());
+            let cwd = PathBuf::from(&spec.cwd);
+            if let Ok(entries) = std::fs::read_dir(&cwd) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if content.contains("<<<<<<<") {
+                                let cleaned: String = content
+                                    .lines()
+                                    .filter(|l| {
+                                        !l.starts_with("<<<<<<<")
+                                            && !l.starts_with("=======")
+                                            && !l.starts_with(">>>>>>>")
+                                    })
+                                    .map(|l| format!("{l}\n"))
+                                    .collect();
+                                let _ = std::fs::write(&path, cleaned);
+                            }
+                        }
+                    }
+                }
+            }
+            RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: "resolved".into(),
+                error: None,
+                verified: spec.verify.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<RunnerSpec>>> = Arc::new(Mutex::new(Vec::new()));
+    let runner = MarkerStrippingRunner {
+        specs: captured.clone(),
+    };
+
+    run_merge(&store, &runner, &guardian_id);
+
+    let view = store.lock().unwrap().get_guardian(&guardian_id).unwrap();
+    assert_eq!(view.status, "in_review", "merge failed: {:?}", view.detail);
+    let x = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/x")
+        .expect("feature/x branch view");
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .expect("feature/y branch view");
+    // Neither branch's final status reflects a verify call having run.
+    assert_eq!(
+        x.merge_status, "done",
+        "feature/x (clean rebase, real changes) must skip final-verify entirely"
+    );
+    assert_eq!(
+        y.merge_status, "conflict_resolved",
+        "feature/y (agent-resolved conflict) must skip final-verify entirely"
+    );
+
+    let specs = captured.lock().unwrap();
+    assert!(
+        specs.iter().all(|s| s.task != "resolve-verify"),
+        "skip_worktree_checks must suppress the dedicated final-verify call, \
+         but a resolve-verify spec was issued: {specs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // Regression (the reported bug): a feature branch stacked ON TOP of an earlier
 // one (so it contains the earlier branch's commit) must keep its OWN commit and
 // not collapse to a no-op. The old range cherry-pick halted on the shared,
@@ -991,7 +1112,7 @@ fn base_branch_shift_triggers_rebuild() {
     git(&root, &["commit", "-m", "base moves forward"]);
 
     let sem = Semaphore::new(4);
-    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem);
+    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
     assert!(rebuilt, "a base-branch shift should trigger a rebuild");
 
     let after = store.lock().unwrap().get_guardian(&id).unwrap();
@@ -1012,7 +1133,7 @@ fn base_branch_shift_triggers_rebuild() {
 
     // A second sweep with the base unchanged is a no-op.
     assert!(
-        !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem),
+        !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
         "no rebuild when base is unchanged"
     );
 
@@ -1114,7 +1235,7 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
     // periodic sweep) must detect the done-but-pending branch, reopen the
     // guardian, and rebuild the stack to pick it up.
     let sem = Semaphore::new(4);
-    let reopened = reopen_straggler(&store, &NoopRunner, &id, &sem);
+    let reopened = reopen_straggler(&store, &NoopRunner, &id, &sem, &CancelToken::never());
     assert!(reopened, "a ready straggler branch must trigger a reopen");
 
     let healed = store.lock().unwrap().get_guardian(&id).unwrap();
@@ -1133,7 +1254,7 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
 
     // A second sweep with nothing new pending is a no-op.
     assert!(
-        !reopen_straggler(&store, &NoopRunner, &id, &sem),
+        !reopen_straggler(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
         "no reopen when there is no ready straggler"
     );
 
@@ -1213,7 +1334,7 @@ fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
     // and the guardian would end merge_failed — caught by the assertion below.
     let sem = Semaphore::new(4);
     assert!(
-        rebuild_on_base_shift(&store, &NoopRunner, &id, &sem),
+        rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
         "the second base shift should trigger a rebuild"
     );
 
@@ -1303,7 +1424,13 @@ fn carry_forward_refs_are_cleaned_up_when_a_rebuild_fails() {
     git(&root, &["commit", "-m", "base moves"]);
 
     let sem = Semaphore::new(4);
-    assert!(rebuild_on_base_shift(&store, &NoopRunner, &id, &sem));
+    assert!(rebuild_on_base_shift(
+        &store,
+        &NoopRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
     assert_eq!(
         store.lock().unwrap().get_guardian(&id).unwrap().status,
         "merge_failed"
@@ -2195,7 +2322,7 @@ fn rebase_succeeds_when_worktree_has_untracked_file_introduced_by_new_base() {
     // The rebuild must succeed — not fail with "untracked files would be
     // overwritten".
     let sem = Semaphore::new(4);
-    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem);
+    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
     assert!(rebuilt, "base shift should trigger rebuild");
 
     let after = store.lock().unwrap().get_guardian(&id).unwrap();
@@ -3291,6 +3418,424 @@ fn generate_summary_live_ollama_produces_one_bullet_per_branch() {
     assert!(
         summary.contains("RAL-201") && summary.contains("RAL-202"),
         "each bullet should be labelled with its branch's ticket id: {summary:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// RAL-190: PR bidirectional sync -- pulling reviewer-pushed PR commits back
+// into the review worktree.
+// ---------------------------------------------------------------------------
+
+/// A reviewer pushing a fix directly to the open PR branch (rather than
+/// leaving a comment) must flow back into the review worktree, and the
+/// downstream branch in the stack must be restacked on top of it -- the same
+/// guarantee `rebase_on_manual_push` gives for a *local* manual push, now for
+/// the *remote* PR branch.
+#[test]
+fn pull_pr_commits_rebases_reviewer_pushed_commits_and_restacks_downstream() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("review", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(before.status, "in_review", "detail: {:?}", before.detail);
+    let branch_a = before
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/a")
+        .unwrap();
+    let branch_a_id = branch_a.id.clone();
+    let review_a = branch_a.review_branch.clone().expect("branch a built");
+    let last_synced_sha = git(&root, &["rev-parse", &review_a]).trim().to_string();
+
+    // A bare "remote" and the PR branch pushed to it, exactly as
+    // `pr::submit_pull_requests` would.
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    let remote = remote_dir.to_str().unwrap();
+    git(
+        &root,
+        &["push", remote, &format!("{review_a}:refs/heads/pr-a")],
+    );
+
+    // A reviewer pushes a fix straight to the open PR branch.
+    let reviewer_clone = temp_repo();
+    let _ = std::fs::remove_dir_all(&reviewer_clone);
+    git(
+        reviewer_clone.parent().unwrap(),
+        &[
+            "clone",
+            remote,
+            reviewer_clone.file_name().unwrap().to_str().unwrap(),
+        ],
+    );
+    git(&reviewer_clone, &["checkout", "pr-a"]);
+    write(&reviewer_clone, "reviewer.txt", "fixed by reviewer\n");
+    git(&reviewer_clone, &["add", "."]);
+    git(&reviewer_clone, &["commit", "-m", "reviewer fix"]);
+    git(&reviewer_clone, &["push", "origin", "pr-a"]);
+
+    let pulled = pull_pr_commits(
+        &store,
+        &NoopRunner,
+        &id,
+        &branch_a_id,
+        remote,
+        "pr-a",
+        Some(&last_synced_sha),
+    )
+    .expect("pull_pr_commits should succeed");
+    assert!(pulled, "reviewer's commit should have been pulled");
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+    let a2 = after.branches.iter().find(|b| b.id == branch_a_id).unwrap();
+    let review_a2 = a2.review_branch.clone().unwrap();
+    let a_files = git(&root, &["ls-tree", "-r", "--name-only", &review_a2]);
+    assert!(
+        a_files.contains("reviewer.txt"),
+        "branch a's review branch should carry the reviewer's fix: {a_files}"
+    );
+
+    // Downstream branch b was restacked on top of a's new tip, so it still
+    // carries a's content (including the reviewer's fix) plus its own.
+    let b = after
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/b")
+        .unwrap();
+    assert_eq!(b.merge_status, "done", "detail: {:?}", b.detail);
+    let review_b = b.review_branch.clone().expect("branch b restacked");
+    let b_files = git(&root, &["ls-tree", "-r", "--name-only", &review_b]);
+    assert!(
+        b_files.contains("reviewer.txt") && b_files.contains("a.txt") && b_files.contains("b.txt"),
+        "branch b should be restacked on top of a's new content: {b_files}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+    let _ = std::fs::remove_dir_all(&reviewer_clone);
+}
+
+/// Nothing to pull when the PR branch's tip is already contained in the
+/// review worktree's history (no reviewer push happened).
+#[test]
+fn pull_pr_commits_is_a_noop_when_already_up_to_date() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("review", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let g = store.lock().unwrap().get_guardian(&id).unwrap();
+    let branch_a = g.branches.iter().find(|b| b.branch == "feature/a").unwrap();
+    let branch_a_id = branch_a.id.clone();
+    let review_a = branch_a.review_branch.clone().unwrap();
+
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    let remote = remote_dir.to_str().unwrap();
+    git(
+        &root,
+        &["push", remote, &format!("{review_a}:refs/heads/pr-a")],
+    );
+    let synced = git(&root, &["rev-parse", &review_a]).trim().to_string();
+
+    let pulled = pull_pr_commits(
+        &store,
+        &NoopRunner,
+        &id,
+        &branch_a_id,
+        remote,
+        "pr-a",
+        Some(&synced),
+    )
+    .expect("pull_pr_commits should succeed");
+    assert!(!pulled, "nothing new on the PR branch to pull");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-213: a guardian-settings change made while a merge is in flight must
+/// actually stop the stale merge (not just flip a DB column underneath it)
+/// and restart it, and the restarted attempt must pick up the new setting.
+///
+/// `feature/x` rebases cleanly; `feature/y` (stacked on top of `x`) conflicts
+/// on the same line, routing it through `resolve_conflicts_with_agent`. The
+/// fake runner blocks on the very first "resolve" call — standing in for a
+/// long-running fix pass, the same way `scheduler.rs`'s own `BlockingRunner`
+/// test stands in for a long-running session — so the test can deterministically
+/// catch the merge stuck mid-resolve, flip a setting, and drive the restart
+/// through [`restart_guardian_merge`] (the same function `guardian_settings`'s
+/// HTTP handler now calls for this exact purpose). Every subsequent "resolve"
+/// call behaves like the plain marker-stripping runner used elsewhere in this
+/// file, so the restarted attempt actually completes.
+///
+/// `verify_scope` (not `skip_worktree_checks` — that setting only trims the
+/// resolver's quality-bar note, it does not gate whether the dedicated
+/// "resolve-verify" call runs at all) is the setting flipped mid-flight here,
+/// to "nothing": the first (stuck) attempt never gets far enough to invoke
+/// "resolve-verify" for `feature/y` at all (it is still blocked resolving
+/// markers), so the only way this test's "no resolve-verify call ever ran"
+/// assertion can pass is if the *restarted* attempt actually observed the new
+/// setting rather than the "each_branch" default it started with.
+#[test]
+fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("cancellable merge", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        // RAL-168: keep the clean branch (feature/x) out of the picture so the
+        // only "resolve-verify" call this test could ever observe is the one
+        // gated behind feature/y's conflict resolution -- see the doc comment.
+        g.set_guardian_verify_skip_auto_clean(&id, Some(true))
+            .unwrap();
+        id
+    };
+
+    struct BlockingThenResolvingRunner {
+        resolve_started: Arc<AtomicBool>,
+        resolve_calls: Arc<AtomicU32>,
+        specs: Arc<Mutex<Vec<RunnerSpec>>>,
+    }
+    impl Runner for BlockingThenResolvingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            self.specs.lock().unwrap().push(spec.clone());
+            if spec.task == "resolve" {
+                let n = self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First-ever resolve call: stand in for a long-running fix
+                    // pass by blocking until the test's restart cancels it.
+                    self.resolve_started.store(true, Ordering::SeqCst);
+                    for _ in 0..1000 {
+                        if cancel.is_cancelled() {
+                            return RunnerResult::failure("cancelled");
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return RunnerResult::failure("blocking runner was never cancelled");
+                }
+                // Restarted attempt's resolve call: strip conflict markers for
+                // real, mirroring `MarkerStrippingRunner`.
+                let cwd = PathBuf::from(&spec.cwd);
+                if let Ok(entries) = std::fs::read_dir(&cwd) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if content.contains("<<<<<<<") {
+                                    let cleaned: String = content
+                                        .lines()
+                                        .filter(|l| {
+                                            !l.starts_with("<<<<<<<")
+                                                && !l.starts_with("=======")
+                                                && !l.starts_with(">>>>>>>")
+                                        })
+                                        .map(|l| format!("{l}\n"))
+                                        .collect();
+                                    let _ = std::fs::write(&path, cleaned);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: "resolved".into(),
+                error: None,
+                verified: spec.verify.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    let resolve_started = Arc::new(AtomicBool::new(false));
+    let resolve_calls = Arc::new(AtomicU32::new(0));
+    let specs: Arc<Mutex<Vec<RunnerSpec>>> = Arc::new(Mutex::new(Vec::new()));
+    let runner: Arc<dyn Runner> = Arc::new(BlockingThenResolvingRunner {
+        resolve_started: Arc::clone(&resolve_started),
+        resolve_calls: Arc::clone(&resolve_calls),
+        specs: Arc::clone(&specs),
+    });
+
+    let cancellations = Cancellations::new();
+    let sem = Arc::new(Semaphore::new(4));
+
+    // Kick off the merge exactly the way `POST /api/guardians/{id}/merge` does.
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+        cancellations.clone(),
+    );
+    assert_eq!(reply.status, 202);
+
+    // Wait until the merge is genuinely stuck mid-resolve (not just "started").
+    for _ in 0..2000 {
+        if resolve_started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        resolve_started.load(Ordering::SeqCst),
+        "merge never reached the blocking resolve call"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "merging"
+    );
+
+    // The settings change: turn Verify off entirely, then trigger the same
+    // restart path `guardian_settings`'s HTTP handler now calls whenever a
+    // setting is changed while `status == "merging"`.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_verify_scope(&id, Some("nothing"))
+        .unwrap();
+    let restart_reply = restart_guardian_merge(
+        Arc::clone(&store),
+        cancellations.clone(),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+    );
+    assert_eq!(
+        restart_reply.status, 202,
+        "restart must be accepted: {}",
+        restart_reply.body
+    );
+
+    let mut status = String::new();
+    for _ in 0..2000 {
+        status = store.lock().unwrap().get_guardian(&id).unwrap().status;
+        if status == "in_review" || status == "merge_failed" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        status, "in_review",
+        "the restarted merge must reach in_review"
+    );
+
+    // (a) The merge actually restarted: a second "resolve" pass ran (the first
+    // was the stuck one this test cancelled).
+    assert!(
+        resolve_calls.load(Ordering::SeqCst) >= 2,
+        "resolve must have been invoked again after the restart, got {} call(s)",
+        resolve_calls.load(Ordering::SeqCst)
+    );
+
+    // (b) Every branch ends in a clean, consistent terminal status -- not
+    // stuck `in_progress`/`verify_pending` from the cancelled first attempt.
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    for b in &view.branches {
+        assert!(
+            matches!(b.merge_status.as_str(), "done" | "conflict_resolved"),
+            "branch {} left in non-terminal status {:?}",
+            b.branch,
+            b.merge_status
+        );
+    }
+
+    // (c) No orphaned/broken worktree entries: every path `git worktree list`
+    // still knows about actually exists on disk.
+    let wt_list = git(&root, &["worktree", "list", "--porcelain"]);
+    for line in wt_list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            assert!(
+                Path::new(path).exists(),
+                "worktree list references a missing path: {path}"
+            );
+        }
+    }
+
+    // (d) The NEW setting (verify_scope = "nothing") took effect on the
+    // restarted attempt: `resolve-verify` never ran at all -- see this test's
+    // doc comment for why that's proof the restarted pass, not the original
+    // "each_branch" one, is what resolved feature/y's conflict.
+    let has_resolve_verify = specs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s.task == "resolve-verify");
+    assert!(
+        !has_resolve_verify,
+        "resolve-verify must not run once verify_scope is \"nothing\" on the restarted attempt"
     );
 
     let _ = std::fs::remove_dir_all(&root);

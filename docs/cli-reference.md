@@ -6,6 +6,12 @@ endpoints. See `CLI_PARITY_PLAN.local.md` for the design history.
 
 ## Global flags
 
+General rule: a global flag is declared on the root parser, not on any
+subcommand's own parser, so it must come **before** the subcommand name, e.g.
+`ralphus --daemon-url http://127.0.0.1:7890 status`, not
+`ralphus status --daemon-url http://127.0.0.1:7890`. `--json` is the one
+exception — see below.
+
 - `--daemon-url URL` — base URL of the daemon (default `http://127.0.0.1:7890`,
   or `$RALPHUS_DAEMON_URL`).
 - `$RALPHUS_DAEMON_TIMEOUT` — per-request HTTP timeout in seconds (default `60`).
@@ -14,10 +20,12 @@ endpoints. See `CLI_PARITY_PLAN.local.md` for the design history.
   review derivation, so a busy daemon can take longer than a health check to
   respond. No CLI flag yet — env var only.
 - `--json` — emit the raw daemon JSON instead of human-readable text. Works on
-  every subcommand that reads or mutates daemon state. Like every flag in this
-  section, it's declared on the root parser, not on any subcommand's own
-  parser — it must come **before** the subcommand name, not after:
-  `ralphus --json status`, not `ralphus status --json`.
+  every subcommand that reads or mutates daemon state, and — unlike every
+  other global flag — in **either position**: both `ralphus --json status`
+  and `ralphus status --json` work identically (RAL-214). It's still declared
+  on the root parser only; `main()` strips a literal `--json` token out of
+  the argument list wherever it appears before handing the rest to argparse,
+  rather than requiring it to precede the subcommand.
 - `--version` — print the CLI version and exit.
 
 ## Exit codes
@@ -203,7 +211,7 @@ aborts the remaining batch).
 
 | Command | What |
 |---|---|
-| `review list [--status]` | List reviews |
+| `review list [--status] [--pr-ready]` | List reviews (`--pr-ready`: only fully-rebased `in_review`/`approved` reviews with no failed branches — the candidates `review pr submit` cares about) |
 | `review show <selector>` | Review detail, incl. `ready`/`merge_progress`/`summary_state` |
 | `review logs <selector>` | State-transition audit log |
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
@@ -309,14 +317,14 @@ system prompt — the full help-map (same tree `show help-map` prints) plus the
   any subcommand to be recognized, which is why this quick-start launches
   the bare interactive TUI rather than `codex exec`. The `codex` launch
   command resolves, in order: `--command` (this invocation only), then
-  `$RALPHUS_CODEX_CMD`, then the bare `codex` on PATH.
+  `$RALPHUS_CODEX_COMMAND`, then the bare `codex` on PATH.
 
 Common to both:
 
 - Args after a literal `--` are forwarded verbatim to the underlying
   harness, e.g. `ralphus quick-start manager claude-code -- --mode auto` or
   `ralphus quick-start manager codex -- --model gpt-5-codex`.
-- `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_CMD` are the same env vars the
+- `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND` are the same env vars the
   `claude-code`/`codex` agent backends use
   (`ralphus.runner.claude_code_backend`/`ralphus.runner.codex_backend`) —
   one name per harness, everywhere that harness's executable is resolved.
@@ -437,123 +445,135 @@ frequently-polled reads (`status`, `get`, ...) and tight edit-loop commands
 an AI agent — `show help-map`, every `quick-start manager|reviewer
 ...`'s injected system prompt, `ralphus-help-map`'s own stdout — it's preceded by
 `ralphus.helpmap`'s note block, including `SUBAGENT_NOTE` (what the tag
-means), `PROJECT_LOOKUP_NOTE`, `SUBMIT_VALIDATE_NOTE`, `SUBMIT_REVIEW_NOTE`,
-and `JSON_NOTE`. `SUBAGENT_NOTE` specifically explains the tag: invoke that
-command from inside a subagent (e.g. Claude Code's Task tool) rather than
-directly in the driving agent's main context.
+means), `READ_ONLY_NOTE`, `PROJECT_LOOKUP_NOTE`, `SUBMIT_VALIDATE_NOTE`,
+`SUBMIT_REVIEW_NOTE`, and `JSON_NOTE`. `SUBAGENT_NOTE` specifically explains
+the tag: invoke that command from inside a subagent (e.g. Claude Code's Task
+tool) rather than directly in the driving agent's main context.
+
+A second, non-mutating subset of commands (`ralphus.helpmap._READ_ONLY_SAFE_PATHS`)
+carries a `(read-only-safe)` tag — these are the commands a `quick-start
+manager --read-only` / `quick-start reviewer --read-only` session may still
+use; see `READ_ONLY_NOTE`.
 
 <!-- BEGIN GENERATED HELP-MAP (RAL-110) -->
 ```
-- ralphus --daemon-url [str] --json --version  {Submit and manage autonomous agent tasks against the ralphus daemon.}
+- ralphus --daemon-url [url] --json  {Submit and manage autonomous agent tasks against the ralphus daemon.}
     - agent  {Inspect agent backends ralphus can run.}
-        - list  {List supported agent backends and the models each is allowed to run.}
+        - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
+    - cartographer --ascending --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --run [str] --scope [str] --session [str] --source [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - check  {System and environment checks.}
-        - health --enable-developer-checks (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama).}
-    - clear --all --keep-temporary --status [str] --yes (subagent)  {Delete tasks and reviews from the daemon.}
-    - completion shell [bash]  {Print a shell tab-completion script.}
-    - configuration  {Configuration inspection.}
-        - show --no-local  {Show sourced .ralphus.toml files and resolved values.}
-    - get selector [str] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
-    - graph run_id [str, optional] --all --format [ascii|dot] --global  {Render the task-order dependency graph.}
-    - history selector [str] --live --wait-until-valid [float, optional]  {Show a session/verify step's tmux history, or tail it live (RAL-140).}
+        - (read-only-safe) health --enable-developer-checks (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama).}
+    - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
+    - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
+    - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
+    - (read-only-safe) get selector [str] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
+    - (read-only-safe) graph run_id [str, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
+    - (read-only-safe) history selector [str]  {Show a session/verify step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
-    - listen selector [str] --timeout [float] --until [str]  {Block until a run/task/session/verify/review/review-worktree reaches a status (RAL-140).}
-    - machine  {Register and inspect machine providers remote work runs on (RAL-185).}
-        - get scheme [str]  {Show one registered machine provider by exact scheme.}
-        - list  {List every registered machine provider, plus built-in schemes.}
-        - register --arg [str, repeatable] --channel --description [str] --program [str] --scheme [str]  {Register a provider program a task's 'machine' field can reference.}
+    - (read-only-safe) listen selector [str] --timeout [seconds] --until [status]  {Block until a run/task/session/verify/review/review-worktree reaches a status.}
+    - machine  {Register and inspect machine providers remote work runs on.}
+        - cleanup machine [str]  {Tear down one provisioned workspace on a machine provider (RAL-201).}
+        - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
+        - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}
+        - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
-    - project  {Register and inspect projects known to the daemon (RAL-100).}
-        - get name [str]  {Show one registered project's details by exact name.}
-        - git --description [str] --name [str] --path [path]  {Register a git repository as a project the daemon can resolve placeholder session cwds against.}
-        - list --short  {List every project registered with the daemon.}
+    - project  {Register and inspect projects known to the daemon.}
+        - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
+        - git --description [text] --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder session cwds against.}
+        - (read-only-safe) list --short  {List every project registered with the daemon.}
     - queue  {Inspect and reorder the run queue by priority.}
-        - list --all  {List queued work items (ready-to-run by default).}
-        - reorder paths [str, one or more]  {Set the queue order to the given item paths (dependency-repaired).}
-        - set-position paths [str, one or more] --relative --to [int]  {Move item(s) to an absolute index or a relative offset.}
+        - (read-only-safe) list --all  {List queued work items (ready-to-run by default).}
+        - reorder paths [str...]  {Set the queue order to the given item paths (dependency-repaired).}
+        - set-position paths [str...] --relative --to [integer]  {Move item(s) to an absolute index or a relative offset.}
         - set-status path [str] state [str]  {Set a run/task/session/verify status (e.g. ignored) by item path or run id.}
-    - resources  {Show per-task resource usage (CPU/RAM/GPU).}
-    - retry selector [str] --env-file [path] --environment [str, repeatable] --unset-environment [str, repeatable]  {Re-run a run/task/session/verify step, optionally overriding environment variables (RAL-150).}
+    - (read-only-safe) resources  {Show per-task resource usage (CPU/RAM/GPU).}
+    - retry run_id [str]  {Re-run a run from scratch (reset to pending). (Rust port: run-level only; Python's per-selector --environment/--env-file overrides are not yet ported.)}
     - review (subagent)  {Inspect and act on reviews (guardians).}
         - action  {User-declared [[review.action]] test/action hints.}
-            - list selector [str]  {List the action hints.}
-            - run selector [str] --index [int] --input [str, repeatable]  {Print the command + cwd for a command-kind action hint.}
+            - (read-only-safe) list selector [str]  {List the action hints.}
+            - (read-only-safe) run selector [str] --index [integer] --input [name=value...]  {Print the command + cwd for a command-kind action hint.}
         - add-branch selector [str] branch [str]  {Add a branch to a review.}
         - approve selector [str]  {Approve a review that is in_review.}
         - base  {Inspect/change a review's base branch.}
-            - list selector [str]  {List candidate base branches.}
+            - (read-only-safe) list selector [str]  {List candidate base branches.}
             - set selector [str] branch [str]  {Change the base branch.}
         - branch  {Enable/disable one review branch.}
             - disable selector [str]  {Disable a branch and kick off the rebase.}
             - enable selector [str]  {Enable a branch and kick off the rebase.}
+            - terminal selector [str] --mode [open|readonly]  {Print the command to resume a branch's conflict-resolver conversation locally.}
+        - build-env selector [str] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's build/check-gate step environment overrides.}
         - cancel selector [str]  {Cancel a review.}
         - chat  {The review's global feedback thread.}
-            - fork selector [str] text [str] --seq [int]  {Fork the thread at a message, replacing it with new text.}
+            - fork selector [str] text [str] --seq [integer]  {Fork the thread at a message, replacing it with new text.}
             - send selector [str] text [str]  {Post a message.}
-            - show selector [str]  {Show the thread.}
+            - (read-only-safe) show selector [str]  {Show the thread.}
         - checks  {LLM-synthesized manual review-verification commands.}
-            - list selector [str]  {List the manual checks.}
-            - run selector [str] --all --index [int, repeatable] --input [str, repeatable]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
-        - create name [str] base_branch [str] git_root [str] --checks [str] --review-type [str] --skip-auto-build --skip-worktree-checks --skip-worktrees  {Create a new review.}
+            - (read-only-safe) list selector [str]  {List the manual checks.}
+            - (read-only-safe) run selector [str] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
+            - terminal selector [str] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
+        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-auto-build --skip-worktree-checks --skip-worktrees  {Create a new review.}
         - delete selector [str] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
         - feedback selector [str] text [str]  {Post feedback on one branch, triggering a resolver re-attempt.}
         - force-start selector [str]  {Disable not-yet-done branches and merge immediately (only while collecting).}
-        - list --status [str]  {List reviews.}
-        - logs selector [str]  {Show a review's state-transition audit log.}
+        - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
+        - (read-only-safe) logs selector [str]  {Show a review's state-transition audit log.}
+        - manual-checks-env selector [str] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}
         - merge selector [str]  {Start (or continue) the stacked rebase.}
-        - move-branch selector [str] to_review [str]  {Move a branch to another review (RAL-118), then rebuild both.}
-        - pr  {Submit/query pull requests for a review (RAL-117).}
-            - comments pr_id [str]  {List a PR's comments/notes.}
-            - find forge [github|gitlab] repo [str] pr_number [int]  {Look up the ralphus PR row for a forge PR/MR number.}
-            - list selector [str]  {List PRs submitted for a review.}
+        - move-branch selector [str] to_review [str]  {Move a branch to another review, then rebuild both.}
+        - pr  {Submit/query pull requests for a review.}
+            - (read-only-safe) comments pr_id [str]  {List a PR's comments/notes.}
+            - (read-only-safe) find forge [github|gitlab] repo [str] pr_number [integer]  {Look up the ralphus PR row for a forge PR/MR number.}
+            - (read-only-safe) list selector [str]  {List PRs submitted for a review.}
             - pull-feedback pr_id [str]  {Action a PR's un-actioned feedback into the owning review worktree.}
-            - show pr_id [str]  {Show one PR row.}
-            - submit selector [str] --alias [str] --combined --description [str] --position [int] --title [str]  {Submit a PR/MR for one stacked branch or the combined worktree.}
-            - update pr_id [str] --branch-alias [str] --pr-number [int] --pr-url [str] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
+            - (read-only-safe) show pr_id [str]  {Show one PR row.}
+            - submit selector [str] --alias [name] --combined --description [text] --position [integer] --title [text]  {Submit a PR/MR for one stacked branch or the combined worktree.}
+            - update pr_id [str] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
         - rename selector [str] name [str]  {Rename a review.}
-        - reorder selector [str] order [str] --disable [str] --enable [str]  {Set the branch order and kick off the rebase.}
+        - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [str] --auto-pr-feedback, --no-auto-pr-feedback --base-branch [str] --resolver-agent [str] --resolver-model [str] --skip-auto-build, --no-skip-auto-build --skip-worktree-checks, --no-skip-worktree-checks --skip-worktrees, --no-skip-worktrees  {Update per-review opt-out settings.}
-        - show selector [str]  {Show a single review's detail.}
-        - status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
-        - worktrees selector [str]  {The worktrees/branches this review consumes.}
+        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-worktree-checks/--no-skip-worktree-checks --skip-worktrees/--no-skip-worktrees --verify-scope [each_branch|final_branch|nothing]  {Update per-review opt-out settings.}
+        - (read-only-safe) show selector [str]  {Show a single review's detail.}
+        - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
+        - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
+        - (read-only-safe) worktrees selector [str]  {The worktrees/branches this review consumes.}
     - run  {Inspect and act on runs.}
         - activate run_id [str]  {Promote a held (queued) run to pending.}
         - cancel run_id [str]  {Cancel a run.}
         - delete run_id [str] --yes  {Permanently delete a run.}
-        - edit run_id [str] --label [str]  {Edit a run's fields.}
-        - list --name [str] --sort [date|name] --status [str]  {List runs.}
-        - logs run_id [str]  {Show a run's state-transition audit log.}
+        - edit run_id [str] --label [text]  {Edit a run's fields.}
+        - (read-only-safe) list --name [substring] --sort [date|name] --status [states]  {List runs.}
+        - (read-only-safe) logs run_id [str]  {Show a run's state-transition audit log.}
         - rename run_id [str] label [str]  {Rename a run's label.}
         - restart run_id [str]  {Restart a whole run, dirtying every run that depends on it.}
         - retry run_id [str]  {Re-run with the same parameters (reset to pending).}
         - set-status run_id [str] state [str]  {Manually override a run's status.}
-        - show run_id [str]  {Show a single run's detail.}
+        - (read-only-safe) show run_id [str]  {Show a single run's detail.}
+        - timeline run_id [str] --write [path]  {Generate the merged, chronological uber-log-viewer timeline for a run (RAL-155).}
     - session  {Inspect and act on sessions.}
-        - edit selector [str] --agent [str] --command [str] --cwd [str] --model [str] --prompt [str]  {Edit a session's fields.}
+        - edit selector [str] --agent [name] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a session's fields.}
         - restart selector [str]  {Restart a session (and its downstream), dirtying dependent runs.}
-        - restart-verify selector [str] --from [int]  {Restart a session's verify steps from an index onwards.}
-        - reviews selector [str]  {The reviews this session's branch participates in.}
+        - restart-verify selector [str] --from [index]  {Restart a session's verify steps from an index onwards.}
+        - (read-only-safe) reviews selector [str]  {The reviews this session's branch participates in.}
         - set-status selector [str] state [str]  {Manually override a session's status.}
-        - show selector [str]  {Show a single session's detail.}
-        - terminal selector [str] --mode [open|readonly]  {Print the command to resume a session's conversation locally.}
-        - worktree selector [str]  {Show the worktree/project a session is using.}
+        - (read-only-safe) show selector [str]  {Show a single session's detail.}
+        - (read-only-safe) terminal selector [str] --mode [open|readonly]  {Print the command to resume a session's conversation locally.}
+        - (read-only-safe) worktree selector [str]  {Show the worktree/project a session is using.}
     - show  {Print machine-readable views of ralphus itself.}
-        - help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent) (RAL-110).}
-    - status run_id [str, optional] --concurrency  {Show run status from the daemon.}
-    - submit file [str, one or more] --activate --hold --label [str] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
+        - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}
+    - (read-only-safe) status run_id [str, optional] --concurrency  {Show run status from the daemon.}
+    - submit file [str...] --activate --hold --label [text] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
-        - edit selector [str] --name [str] --project [str]  {Edit a task node's name/project.}
-        - restart-verify selector [str] --from [int]  {Restart a task's verify steps from an index onwards.}
+        - edit selector [str] --name [name] --project [name]  {Edit a task node's name/project.}
+        - restart-verify selector [str] --from [index]  {Restart a task's verify steps from an index onwards.}
         - set-status selector [str] state [str]  {Manually override a task's status.}
-        - show selector [str]  {Show a single task node's detail.}
-        - show-tutor  {Print the Task TOML schema reference and worked examples.}
-    - validate file [path, one or more]  {Validate one or more task TOML files.}
+        - (read-only-safe) show selector [str]  {Show a single task node's detail.}
+    - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
+    - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
     - verify  {Inspect and act on verify steps.}
         - restart selector [str]  {Restart this verify step (and any later ones in its scope).}
         - set-status selector [str] state [str]  {Manually override a verify step's status.}
-        - show selector [str]  {Show a single verify step's detail.}
+        - (read-only-safe) show selector [str]  {Show a single verify step's detail.}
 ```
 <!-- END GENERATED HELP-MAP (RAL-110) -->

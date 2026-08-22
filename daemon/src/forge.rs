@@ -249,6 +249,63 @@ impl ForgeClient {
         }
     }
 
+    /// Retarget an already-open PR/MR's base/target branch (RAL-190: keeps a
+    /// stacked PR's base in sync after its review is reordered). Best-effort
+    /// from the caller's point of view -- callers should log-and-continue on
+    /// error rather than aborting a whole reorder over one forge call, since
+    /// the local `base_ref` record is updated regardless. Logs the outbound
+    /// call (start/done/error) via `rlog!`.
+    pub fn update_pull_request_base(&self, number: i64, new_base: &str) -> Result<(), String> {
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] update pr base start kind={} repo={} number={number} new_base={new_base}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.update_pull_request_base_inner(number, new_base);
+        match &result {
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] update pr base done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] update pr base failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn update_pull_request_base_inner(&self, number: i64, new_base: &str) -> Result<(), String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({ "base": new_base });
+                send(
+                    ureq::patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "target_branch": new_base });
+                send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
     /// List human-authored comments on a PR/MR, oldest first. GitLab's
     /// system-generated notes (label changes, etc.) are filtered out since
     /// they are never actionable feedback. Logs the outbound call
@@ -641,6 +698,60 @@ mod tests {
             None,
         );
         let err = client.require_token().unwrap_err();
+        assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn update_pull_request_base_sends_github_patch() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.update_pull_request_base(7, "main").unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_pull_request_base_sends_gitlab_put() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Put);
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        client.update_pull_request_base(9, "main").unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_pull_request_base_requires_token() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "https://api.github.com".to_string(),
+            "acme/widget".to_string(),
+            None,
+        );
+        let err = client.update_pull_request_base(1, "main").unwrap_err();
         assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
     }
 }

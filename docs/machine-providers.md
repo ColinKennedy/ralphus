@@ -16,9 +16,17 @@ means — a build-farm slot, a hostname, a URL, a container tag — is entirely 
 provider's business.
 
 > **Status:** implemented — registry, `machine` syntax, validation, remote
-> session/verify execution, `provision`, `stream` (Live View), and `cancel`.
-> Guardian reviews still run on the daemon's own host, so a remote session may
-> not opt into one yet (rejected at submit). See `REMOTE.local.md` Phase 3.
+> session/verify execution, and every documented verb (`provision`, `exec`,
+> `status`, `stream`, `cancel`, `run`, `read-file`, `write-file`,
+> `remove-path`, `ping`, `channel`, `cleanup`), each dispatched genericly
+> through the same registry with no daemon-side branching on scheme. Guardian
+> reviews now dispatch to a remote review's assigned machine too (RAL-185
+> Phase 3/RAL-201) — the merge worktree, stacked rebase, conflict-resolution
+> agent, chat/feedback/summary agent invocations, and check gates all route
+> through the review's machine. See `REMOTE.local.md` for the full phase
+> history and its "Known limitations" section for what still runs local-only
+> even on a remote review (build-config resolution, the empty-branch VCS
+> check, and a couple of local-fs reads around rebase-state detection).
 
 ## The `machine` value
 
@@ -128,25 +136,81 @@ On failure:
 
 ### Verbs
 
-| Verb | Flags | Purpose |
-|---|---|---|
-| `provision` | `--uri` | Ensure a workspace exists; reply with `{"workspace": "<abs path on this machine>"}`. Must be idempotent — a re-run after a daemon restart reuses the existing workspace. |
-| `exec` | `--uri` | Run one session/verify. Reply with **either** `{"result": {...}}` (ran synchronously) **or** `{"handle": "..."}` (started asynchronously). |
-| `status` | `--uri --handle` | For an async handle: `{"state": "running"}`, or `{"state": "done"\|"failed", "result": {...}}`. |
-| `stream` | `--uri --handle [--since N]` | `{"output": "...", "next": N}` — output since the cursor. Optional; omitting it costs Live View, not execution. |
-| `cancel` | `--uri --handle` | Stop the work behind a handle. |
-| `run` | `--uri` | Run one VCS command in a workspace. Request on stdin: `{"cwd": "...", "program": "git", "args": ["rev-parse", "HEAD"]}`. Reply `{"exit_code": 0, "stdout": "..."}`. |
-| `ping` | `--uri` | Confirm the machine is reachable and ready, doing no work. Reply `{"ok": true, "detail": "..."}`. Called on demand from the board's Machines tab, never polled. |
-| `channel` | `--uri` | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
-| `cleanup` | `--uri` | Tear the workspace down. |
+Every request/response struct named below is defined in
+`daemon/src/remote_runner.rs` (line numbers as of RAL-201; search the file for
+the struct name if they've since drifted — each carries `#[derive(Serialize)]`
+or `#[derive(Deserialize)]` matching the direction it's used in).
+
+| Verb | Flags | Request struct | Purpose |
+|---|---|---|---|
+| `provision` | `--uri` | [`ProvisionRequest`](../daemon/src/remote_runner.rs) (`project: String`, `source: WorkspaceSource { kind, url?, branch? }`, `run_id: String`, `session_id: String`) | Ensure a workspace exists; reply `{"workspace": "<abs path on this machine>"}`. Must be idempotent — a re-run after a daemon restart reuses the existing workspace (no daemon-side handle backs this; see "Restart safety" below). |
+| `exec` | `--uri` | The full session spec (`RunnerSpec` in `daemon/src/runner.rs`: `run_id`, `task`, `session_id`, `cwd`, `prompt`/`command`, `agent`, `model`, `system_prompt`, `timeout_sec`, `budget_tokens`, `maximum_budget_usd`, `verify`, `trace_context`, `env_overrides`, ...) | Run one session/verify. Reply with **either** `{"result": {...}}` (ran synchronously) **or** `{"handle": "..."}` (started asynchronously). `result`'s shape is `RunnerResult` (`daemon/src/runner.rs`): `status` (`"done"`/`"failed"`), `tokens_in`, `tokens_out`, `cost_usd`, `summary`, `error?`, `verified?`, `agent_session_id?`, `ghost?`. |
+| `status` | `--uri --handle` | none | For an async handle: `{"state": "running"}`, or `{"state": "done"\|"failed", "result": {...}}` (`result` is the same `RunnerResult` shape as `exec`). |
+| `stream` | `--uri --handle [--since N]` | none | `{"output": "...", "next": N}` — output since the cursor. Optional; omitting it costs Live View, not execution. |
+| `cancel` | `--uri --handle` | none | Stop the work behind a handle. Reply is the standard `{"ok": true, "protocol_version": 1}` envelope — no extra fields. |
+| `run` | `--uri` | [`RunRequest`](../daemon/src/remote_runner.rs) (`cwd: String`, `program: String`, `args: Vec<String>`) | Run one VCS command in a workspace. Reply `{"exit_code": 0, "stdout": "..."}`. |
+| `read-file` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: false`) | Return a file's contents. Reply `{"stdout": "<file content>"}`. A missing/unreadable file is **not** an error at the daemon layer — callers treat it as "absent" — but the provider still replies however it normally would (`ok: false` is fine; the daemon maps any failure to "absent"). |
+| `write-file` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: "<text to write>"`, `recursive: false`) | Write `content` to `path`, creating parent directories as needed. Reply is the standard envelope. |
+| `remove-path` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: bool`) | Delete a file, or a directory tree when `recursive` is `true`. A path that does not exist is success, not an error. |
+| `ping` | `--uri` | none | Confirm the machine is reachable and ready, doing no work. Reply `{"ok": true, "detail": "..."}`. Called on demand from the board's Machines tab, never polled. |
+| `channel` | `--uri` | newline-delimited `RunRequest`s | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
+| `cleanup` | `--uri` | none | Tear the workspace down (see "The `cleanup` verb and its retention policy" below). |
 
 The session spec arrives on stdin for `exec`; the provision request arrives on
-stdin for `provision`. Handle-scoped verbs take no stdin payload.
+stdin for `provision`; the file/run requests above arrive on stdin for their
+own verb. Handle-scoped verbs (`status`/`stream`/`cancel`) and `ping`/`cleanup`
+take no stdin payload.
 
 **Synchronous vs async `exec`.** A provider that can only block returns
 `result` and is done — no `status`/`stream`/`cancel` needed. A provider that
 returns a `handle` gets live output and mid-run cancellation, at the cost of
 implementing three more verbs. Both are first-class; pick per provider.
+
+### The `cleanup` verb and its retention policy
+
+`cleanup` tears a provisioned workspace down. It is **never called
+automatically** by the daemon — a local session's worktree
+(`.git/.ralphus_worktrees/<branch>`) is never auto-deleted either, so a remote
+workspace keeps the same property rather than being reclaimed the instant a
+run ends. An operator reclaims one explicitly, once they are actually done
+inspecting it:
+
+```bash
+curl -X POST http://127.0.0.1:7890/api/machines/cleanup \
+  -d '{"machine": "incredibuild:A"}'
+# or
+ralphus machine cleanup incredibuild:A
+```
+
+**Retention on failure: nothing is discarded.** The daemon keeps no record of
+a provisioned workspace to roll back or retry against — `provision` is
+idempotent and re-derives the same workspace deterministically every time
+(from `run_id`/`session_id`/the requested branch), so there is nothing to
+"forget" on a failed cleanup. If your `cleanup` implementation fails partway
+through (permissions, a process still holding the directory open, a dead
+machine), leave the workspace exactly as it was and reply `{"ok": false,
+"error": "..."}` — the daemon surfaces that reason verbatim to the caller
+rather than swallowing it, so a human can retry or investigate.
+
+### Restart safety
+
+Two different things survive a daemon restart, by two different mechanisms:
+
+- **A provisioned workspace** has no daemon-side record at all. `provision`
+  being idempotent (re-deriving the same path from `run_id`/`session_id`/the
+  branch every time) *is* the restart-safety mechanism — see
+  [`crate::worktrees::ensure_worktree`]'s identical local-only property.
+- **An in-flight async `exec` handle** *is* recorded — in the
+  `remote_exec_handles` SQLite table — the moment `exec` returns one, and
+  cleared once that `exec` finishes by any outcome. On startup, before the
+  scheduler resumes anything, the daemon calls `cancel` on every handle still
+  in that table (a crash mid-poll is the only way one survives to see a
+  restart) and clears the row — this stops the *old* attempt on the provider
+  before a fresh one is dispatched, so a restart never leaves two copies of
+  the same work running remotely at once. Implement `cancel` for real if your
+  provider supports async `exec`: an unimplemented/no-op `cancel` means the
+  old attempt keeps running (and, if it holds a paid resource, keeps costing)
+  after the daemon has already moved on.
 
 ### `provision` and non-git projects
 
@@ -242,8 +306,12 @@ Three requirements are easy to miss, and the first two fail *silently*:
   them there. `examples/providers/loopback.py`'s `cmd_stream` shows the whole
   pattern in five lines.
 - **Forward `llm-invoke` usage events specifically.** The live cost-cap kill
-  reads token/cost usage from them. A provider that drops them silently
-  disables budget enforcement — the run still completes, just uncapped.
+  reads token/cost usage from them — the daemon compares the latest snapshot
+  against `maximum_budget_usd` on every `status`/`stream` poll and cancels the
+  handle the moment it's exceeded, the same as it does for a local session. A
+  provider that drops these events silently disables budget enforcement for
+  its sessions — the run still completes, just uncapped, since there is
+  nothing for the daemon to compare against.
 - **Honor `trace_context`.** The session spec carries a W3C `traceparent`
   (RAL-96). A provider that starts its work without propagating it into the
   remote environment gets a disconnected trace rather than one end-to-end
@@ -303,9 +371,141 @@ python examples/providers/loopback.py stream --handle <handle> --since 0
 python examples/providers/loopback.py cancel --handle <handle>
 ```
 
+## The SSH provider (RAL-200)
+
+`ssh-provider/` ships a standalone provider, `ralphus-ssh-provider`, that
+reaches any host you already have SSH access to — no agent to install, no
+port to open, no second daemon to keep alive. It is the first real (not
+throwaway-example) provider in the repo.
+
+> **Status: `exec` only.** `provision`/`stream`/`status`/`cancel`/`cleanup`
+> daemon-side dispatch is a separate ticket (RAL-201) — check its status
+> before assuming those verbs are wired up. This provider's `exec` runs
+> **synchronously**: it blocks until the remote session finishes and replies
+> with `result` directly, so nothing on the daemon side needs to poll
+> `status`/`stream`/`cancel` for it regardless of RAL-201. It also implements
+> `ping`, since the daemon already dispatches that verb independently (the
+> board's Machines tab "Check" button) — everything else replies with an
+> explicit "not implemented, see RAL-201" error rather than a bare "unknown
+> verb".
+
+### The `<uri>` forms
+
+| Form | Meaning |
+|---|---|
+| `ssh:user@hostname` | Explicit user. |
+| `ssh:hostname` | Falls back to the default user — whatever a bare `ssh hostname` would use. |
+| `ssh:my-alias` | A `~/.ssh/config` `Host` alias. Opaque to this provider; `ssh` resolves it, including any `User`/`IdentityFile` lines. |
+
+### What `exec` actually does
+
+The daemon hands this provider the same session spec it would hand a local
+runner, `cwd` included — but that `cwd` is a path on the **daemon's own
+host**. `exec`:
+
+1. Derives a deterministic remote workspace directory from the local `cwd`
+   (so repeated calls against the same session reuse it rather than
+   recreating it from scratch).
+2. Syncs the local `cwd`'s contents there — `rsync` when available (Linux/macOS
+   daemon hosts, opportunistically), or a `tar | ssh tar -x` stream everywhere
+   else (the mandatory fallback: Windows ships OpenSSH + bsdtar in
+   `System32`, but not `rsync`). Build/vendor directories (`.git`, `target`,
+   `node_modules`, `.venv`, `__pycache__`, …) are excluded by default.
+3. Rewrites the spec's `cwd` to the remote path and pipes it into `ralphus-runner`
+   on the remote host over one non-interactive `ssh` invocation, forwarding
+   `RALPHUS_EVENT:` stderr lines (**including `llm-invoke` usage events**) onto
+   its own stderr *as they arrive*, not buffered until the session ends — this
+   is what keeps the daemon's live cost-cap kill able to act mid-run rather
+   than only after the whole remote session has already finished.
+4. Parses the remote runner's stdout as the session's `SessionResult` and
+   returns it verbatim as `result`, regardless of the remote command's own
+   exit code (`ralphus-runner` exits non-zero for a *failed session* just as
+   validly as it exits zero for a done one — the JSON on stdout is the source
+   of truth, not the process exit code).
+
+**The remote host is assumed to have a POSIX-like shell** (`sh`/`bash`) for
+the extraction/invocation commands this provider constructs — the common case
+for an SSH-reachable dev/build box. A Windows *daemon host* is fully
+supported (that's the transport-selection split above); a Windows *remote
+target* is not exercised by this provider today.
+
+### Non-interactive auth, by construction
+
+Every `ssh` invocation this provider makes carries `BatchMode=yes`,
+`StrictHostKeyChecking=yes`, `PasswordAuthentication=no`, and
+`KbdInteractiveAuthentication=no` — unconditionally, with no configuration
+knob to turn them off. A password or host-key prompt fails the connection
+immediately instead of hanging forever, with a message telling the operator
+exactly what to do:
+
+```bash
+# Before registering this machine:
+ssh-keyscan -H <host> >> ~/.ssh/known_hosts   # verify the fingerprint out-of-band
+ssh-copy-id <user>@<host>                     # or otherwise install your public key
+```
+
+### Configuration (environment variables)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RALPHUS_SSH_REMOTE_BASE` | `~/.ralphus/ssh-workspaces` | Remote parent directory workspaces are created under. |
+| `RALPHUS_SSH_EXCLUDE` | *(none)* | Comma-separated patterns **added to** the default build/vendor exclude list — additive, not a replacement. |
+| `RALPHUS_SSH_CONNECT_TIMEOUT_SECS` | `15` | `ssh -o ConnectTimeout=`. |
+| `RALPHUS_SSH_REMOTE_RUNNER_CMD` | `ralphus-runner` | The command run on the remote host, mirroring the daemon's own `RALPHUS_RUNNER_CMD`. |
+
+### Registering it
+
+Same generic mechanism every provider uses — no new daemon-side plumbing
+(there isn't a TOML-declarable or auto-bootstrapped path; see "Why this is
+not declarable in TOML" above):
+
+```bash
+ralphus machine register --scheme ssh --program /path/to/ralphus-ssh-provider \
+    --description "reaches any host already reachable via ssh (RAL-200)"
+ralphus machine list
+```
+
+`ssh` collides with neither the built-in `local` scheme nor the reserved
+`ralphus` word, so registration and re-registration (which upserts, same as
+every other provider) both just work — `daemon/src/machines.rs`'s
+`the_ssh_scheme_is_registrable_and_re_registration_upserts` test pins exactly
+this.
+
+Then point a task at it:
+
+```toml
+[[task]]
+name    = "ral-200-demo"
+project = "ralphus"
+machine = "ssh:alice@build-box"
+  [[task.session]]
+  cwd    = "/home/alice/work/ralphus-checkout"
+  prompt = "..."
+```
+
+### Testing it
+
+- Unit tests (`ssh-provider/src/*.rs`) cover URI parsing, per-OS transport
+  selection and exact command construction, and failure-message
+  construction — all without a live remote host.
+- `ssh-provider/tests/exec_live_ssh.rs` is an opt-in, `#[ignore]`d-by-default
+  integration test that asserts `RALPHUS_EVENT:`/`llm-invoke` markers survive
+  a real `ssh` round trip. It skips gracefully (prints `SKIP:`) unless
+  `RALPHUS_SSH_LIVE_TEST_TARGET` is set and reachable — run it against your
+  own machine (any dev box with OpenSSH server enabled and key-based auth to
+  itself already satisfies it):
+  ```bash
+  RALPHUS_SSH_LIVE_TEST_TARGET=127.0.0.1 cargo test -p ralphus-ssh-provider \
+      --test exec_live_ssh -- --ignored --nocapture
+  ```
+
 ## See also
 
 - `daemon/src/machines.rs` — the registry, resolution and its tests.
 - `core/src/schema.rs` — `parse_machine`, the inheritance helpers.
 - `docs/daemon-api.md` — the `/api/machines` endpoint shapes.
+- `ssh-provider/` — the SSH provider (RAL-200): `src/uri.rs` (uri parsing),
+  `src/transport.rs` (per-OS source-transfer command construction),
+  `src/ssh.rs` (non-interactive `ssh` invocation + failure interpretation),
+  `src/exec.rs` (the `exec` verb orchestration).
 - `REMOTE.local.md` — the phased implementation plan and open questions.

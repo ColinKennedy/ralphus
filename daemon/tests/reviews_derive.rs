@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ralphus_core::schema::TaskFile;
-use ralphus_daemon::cancel::CancelToken;
+use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::guardian_merge::{run_merge, start_merge};
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
@@ -576,6 +576,7 @@ fn start_merge_resolves_conflicts_with_agent() {
         runner,
         &gid,
         Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
     );
 
     // Generous poll budget: under full-suite parallel load (many git worktree
@@ -697,6 +698,7 @@ fn force_push_then_merge_resolves_cleanly() {
         runner,
         &gid,
         Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
     );
 
     let mut status = String::new();
@@ -798,6 +800,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
         Arc::new(OkRunner),
         &gid,
         Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
     );
     assert_eq!(
         reply.status, 202,
@@ -1062,8 +1065,18 @@ fn non_overlapping_task_does_not_block_readiness() {
     let runner2 = Arc::clone(&runner);
     let run_id2 = run_id.clone();
     let token2 = token.clone();
-    let handle =
-        std::thread::spawn(move || execute_run_with(&store2, runner2.as_ref(), &run_id2, &token2));
+    // RAL-213: a fresh, private registry -- this test only exercises the
+    // task-completion-triggered review-start path, not a guardian-merge
+    // restart via that registry.
+    let handle = std::thread::spawn(move || {
+        execute_run_with(
+            &store2,
+            runner2.as_ref(),
+            &run_id2,
+            &token2,
+            &Cancellations::new(),
+        )
+    });
 
     // Wait until task B's session is blocking (task A must have finished first).
     poll_until(Duration::from_secs(5), "task B should have started", || {
@@ -1133,8 +1146,18 @@ fn undeclared_overlapping_task_blocks_readiness() {
     let runner2 = Arc::clone(&runner);
     let run_id2 = run_id.clone();
     let token2 = token.clone();
-    let handle =
-        std::thread::spawn(move || execute_run_with(&store2, runner2.as_ref(), &run_id2, &token2));
+    // RAL-213: a fresh, private registry -- this test only exercises the
+    // task-completion-triggered review-start path, not a guardian-merge
+    // restart via that registry.
+    let handle = std::thread::spawn(move || {
+        execute_run_with(
+            &store2,
+            runner2.as_ref(),
+            &run_id2,
+            &token2,
+            &Cancellations::new(),
+        )
+    });
 
     // Wait until task B is blocking (task A has finished).
     poll_until(Duration::from_secs(5), "task B should have started", || {

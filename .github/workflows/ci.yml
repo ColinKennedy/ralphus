@@ -46,7 +46,7 @@ jobs:
         run: npm test
 
   python:
-    name: Python (ruff, mypy --strict, privata, pytest)
+    name: Python (ruff, mypy --strict, privata, deadcode, pytest)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -66,7 +66,11 @@ jobs:
       - name: mypy --strict
         run: uv run mypy
       - name: privata (module privacy)
-        run: uvx privata src
+        run: |
+          uv run privata src
+          uv run privata tests
+      - name: deadcode
+        run: uv run deadcode src tests
       - name: pytest
         run: uv run pytest
 

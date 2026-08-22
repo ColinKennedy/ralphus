@@ -2,9 +2,9 @@
 
 Distributed tracing (RAL-96) across the full user-story path: a `board.html`
 button click → the librarian's proxy → the daemon's HTTP handler → the
-scheduler → the `ralphus-runner` Python subprocess → the model backend call —
-all as one trace, viewable as a flame/waterfall graph. Entirely opt-in: with
-no collector configured, every process makes zero tracing-related network
+scheduler → the `ralphus-runner` subprocess → the model backend call — all as
+one trace, viewable as a flame/waterfall graph. Entirely opt-in: with no
+collector configured, every process makes zero tracing-related network
 calls, so the default dev loop (`scripts/build-debug.sh`) is unaffected.
 
 ## Viewing a trace (quickstart)
@@ -33,40 +33,34 @@ This env var has to be set in the *same shell* that launches `build-debug.sh`, s
 
 **3. Generate a trace**
 
-Open the board (`http://127.0.0.1:7474`), click **New Task**, submit a TOML task. That one click produces a full trace: browser → librarian → daemon HTTP → scheduler claim → session execution → (for a `prompt` session) the Python runner subprocess → the model call.
+Open the board (`http://127.0.0.1:7474`), click **New Task**, submit a TOML task. That one click produces a full trace: browser → librarian → daemon HTTP → scheduler claim → session execution → (for a `prompt` session) the runner subprocess → the model call.
 
 **4. View it**
 
-Open **http://127.0.0.1:16686** (Jaeger UI) → pick a service from the dropdown (`ralphus-daemon`, `ralphus-librarian`, or `ralphus-runner`) → **Find Traces**. Click into one to see the waterfall — span names like `librarian.request` → `daemon.http` → `scheduler.session` → `runner.subprocess` → `llm.session` → `llm-invoke.agent_run`, all nested under one trace ID.
+Open **http://127.0.0.1:16686** (Jaeger UI) → pick a service from the dropdown (`ralphus-daemon`, `ralphus-librarian`, or `ralphus-runner`) → **Find Traces**. Click into one to see the waterfall — span names like `librarian.request` → `daemon.http` → `scheduler.session` → `runner.subprocess` → `llm.session`, all nested under one trace ID.
 
 ## How it works
 
-**Rust (`daemon`, `librarian`).** Spans are created directly through the
+All three processes (`daemon`, `librarian`, `runner`) are Rust, and all three
+create spans the same way: directly through the
 `opentelemetry`/`opentelemetry_sdk` crates' manual span API
-(`opentelemetry::global::tracer(...).start_with_context(...)`) rather than the
-`tracing` crate. `opentelemetry-otlp` (the official exporter) is deliberately
-*not* a dependency — its HTTP transport pulls in `reqwest` → `tokio` →
-`hyper`, and this workspace keeps no async runtime at all (it is synchronous
-by design: `ureq`, `tiny_http`, a thread-per-worker scheduler) with a
-deliberately small lock file, because build time is a first-class constraint
-here. See AGENTS.md's Logging Policy for the two rules that replaced the older
-"never use `tracing`" wording: stdout is reserved for the daemon↔runner JSON
-contract (now enforced by `clippy::print_stdout = "deny"`), and no async
-runtime may enter the workspace.
-Instead, `daemon/src/otel.rs` (duplicated, with a
-different service name, as `librarian/src/otel.rs` — `ralphus-core` is kept
-dependency-light by design, so this isn't shared through it) hand-rolls a
-minimal OTLP/JSON `SpanExporter` over the already-used synchronous `ureq`
-client.
-
-**Python (`ralphus-runner`).** No such constraint applies to Python, so
-`ralphus/runner/otel.py` uses the official `opentelemetry-sdk` and
-`opentelemetry-exporter-otlp-proto-http` packages directly. Context
-propagation uses the SDK's ordinary contextvar-based ambient context
-(`otel.attach_trace_context(...)` + `tracer.start_as_current_span(...)`)
-rather than threading an explicit `Context` object through every call —
-the runner is single-threaded per subprocess, so this is both idiomatic and
-safe, unlike the Rust daemon's multi-threaded scheduler (see below).
+(`opentelemetry::global::tracer(...).start_with_context(...)`) rather than
+the `tracing` crate. `opentelemetry-otlp` (the official exporter) is
+deliberately *not* a dependency — its HTTP transport pulls in `reqwest` →
+`tokio` → `hyper`, and this workspace keeps no async runtime at all (it is
+synchronous by design: `ureq`, `tiny_http`, a thread-per-worker scheduler)
+with a deliberately small lock file, because build time is a first-class
+constraint here. See AGENTS.md's Logging Policy for the two rules that
+replaced the older "never use `tracing`" wording: stdout is reserved for the
+daemon↔runner JSON contract (now enforced by `clippy::print_stdout = "deny"`),
+and no async runtime may enter the workspace. Instead, each of
+`daemon/src/otel.rs`, `librarian/src/otel.rs`, and `runner/src/otel.rs` hand-
+rolls its own minimal OTLP/JSON `SpanExporter` over the already-used
+synchronous `ureq` client — three standalone copies (not shared through
+`ralphus-core`, which is kept dependency-light by design) rather than one
+shared implementation, since `runner` in particular shouldn't need to pull
+in the whole `daemon` lib (rusqlite, tiny_http, ...) just to reuse ~100 lines
+of tracing code.
 
 **Browser (`board.html`).** No `opentelemetry-js` SDK — the board is plain
 HTML with inline vanilla JS and no build step, and the full browser SDK is
@@ -76,6 +70,16 @@ generated via `crypto.getRandomValues`) and attaches it as a header on every
 mutating action (the `post`/`del` fetch helpers, plus the task-submit and
 open-terminal calls that build their own `fetch()`), i.e. every "user presses
 a button" action that hits the API.
+
+**Known granularity gap.** The runner produces exactly one span per session
+(`llm.session` or `llm.verify`, built in `runner/src/main.rs`'s
+`run_traced`) wrapping the whole `run_session()` call — there is currently no
+nested sub-span around the actual model API call inside
+`agent_backend.rs`/`llm_client.rs` the way a `llm-invoke.agent_run` child
+span once existed. That narrower call boundary is covered today only by the
+plain-text `ralphus [llm-invoke] ...` log lines (see AGENTS.md's Logging
+Policy), not by a trace span — closing that gap (adding the nested span) is
+follow-up work, not yet done.
 
 ## Trace propagation, hop by hop
 
@@ -103,15 +107,16 @@ a button" action that hits the API.
    separate OS threads.
    `daemon/src/runner.rs` puts its own span's `traceparent` on the
    `SessionSpec` JSON sent to the runner on stdin (`trace_context` field,
-   `cli/src/ralphus/runner/spec.py`) — a new, optional field on that existing,
-   tested wire contract, so it never becomes required and old callers/tests
-   are unaffected.
-5. **Runner → model backend.** `ralphus/runner/__main__.py` attaches the
-   incoming trace context as the ambient OTel context for the whole
-   `run_session()` call; `execute.py` and `pydantic_backend.py` each start a
-   nested span around their existing `llm`/`llm-invoke` log points, so the
-   Python side's spans land as children of the Rust `runner.subprocess` span
-   without needing any request the daemon side gets to make.
+   `runner/src/spec.rs`) — an optional field on that existing, tested wire
+   contract, so it never becomes required and old callers/tests are
+   unaffected.
+5. **Runner → model backend.** `runner/src/main.rs`'s `run_traced` builds a
+   `Context` from the incoming `trace_context` field
+   (`otel::context_from_traceparent`) and passes it explicitly into
+   `start_span` for the one `llm.session`/`llm.verify` span around the whole
+   `run_session()` call — explicit `Context` threading throughout, the same
+   as every other Rust hop above, rather than an ambient/contextvar-style
+   mechanism (Rust has no equivalent idiom to reach for here).
 
 A missing/malformed `traceparent` at any hop degrades to "start a fresh
 trace" rather than an error — a broken link produces a disconnected trace,
@@ -167,9 +172,8 @@ loop.
 - **Stopping the stack.** `docker compose -f otel/docker-compose.yml down`.
   Traces are not persisted across restarts (Jaeger's in-memory storage) —
   fine for local dev, not meant for long-term retention.
-- **Never a console exporter.** Every exporter here (Rust's hand-rolled
-  `ureq`-based one, Python's `OTLPSpanExporter`) writes only to its own HTTP
-  connection to the collector — never to stdout (the daemon↔runner JSON
-  contract) or stderr (the `ralphus [TYPE] ...` log format /
-  `RALPHUS_EVENT:` marker). A `ConsoleSpanExporter` must never be introduced
-  on any of these paths.
+- **Never a console exporter.** Every exporter here (all three hand-rolled
+  `ureq`-based ones) writes only to its own HTTP connection to the collector
+  — never to stdout (the daemon↔runner JSON contract) or stderr (the
+  `ralphus [TYPE] ...` log format / `RALPHUS_EVENT:` marker). A
+  `ConsoleSpanExporter` must never be introduced on any of these paths.

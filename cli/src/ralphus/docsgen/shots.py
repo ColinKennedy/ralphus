@@ -1,10 +1,13 @@
 """Generate the deterministic screenshots embedded in docs/site/pages/.
 
 Run via ``uv run ralphus-docs-shots`` (needs the ``docs`` extra plus a
-one-time ``uv run playwright install chromium``). The normal docs build
-(``scripts/docs-build.sh``) never calls this — it only re-renders Markdown
-against whatever PNGs are already committed, so regenerating screenshots is
-an explicit, separate step (``scripts/docs-screenshots.sh``).
+one-time ``uv run playwright install chromium``, and a compiled
+``ralphus-librarian`` — see ``librarian_server.py`` — found via
+``cargo build -p ralphus-librarian`` or ``$RALPHUS_LIBRARIAN_BIN``). The
+normal docs build (``scripts/docs-build.sh``) never calls this — it only
+re-renders Markdown against whatever PNGs are already committed, so
+regenerating screenshots is an explicit, separate step
+(``scripts/docs-screenshots.sh``).
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from pathlib import Path
 from playwright.sync_api import Page, ViewportSize, sync_playwright
 
 from ralphus.docsgen import fixtures
+from ralphus.docsgen.librarian_server import librarian_server
 from ralphus.docsgen.stub_server import fixture_server
 
 __all__ = ["OUT_DIR", "REPO_ROOT", "SCENARIOS", "VIEWPORT", "main"]
@@ -53,21 +57,30 @@ def _shoot(page: Page, name: str) -> None:
 
 
 def _tasks_overview(page: Page) -> None:
-    with fixture_server(fixtures.TASKS_ROUTES) as base_url:
+    with (
+        fixture_server(fixtures.TASKS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
         _goto(page, base_url, "#/tasks/run-000000000004")
         page.wait_for_selector(".run-item.selected")
         _shoot(page, "tasks-overview")
 
 
 def _tasks_session_detail(page: Page) -> None:
-    with fixture_server(fixtures.TASKS_ROUTES) as base_url:
+    with (
+        fixture_server(fixtures.TASKS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
         _goto(page, base_url, "#/tasks/run-000000000004?sel=session:0:1")
         page.wait_for_selector(".run-item.selected")
         _shoot(page, "tasks-session-detail")
 
 
 def _queue_overview(page: Page) -> None:
-    with fixture_server(fixtures.QUEUE_ROUTES) as base_url:
+    with (
+        fixture_server(fixtures.QUEUE_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
         _goto(page, base_url, "#/queue")
         # "Ready only" is on by default (hides blocked/excluded rows) and
         # tasks are collapsed by default — turn both off so the full
@@ -101,7 +114,10 @@ def _queue_overview(page: Page) -> None:
 
 
 def _reviews(page: Page) -> None:
-    with fixture_server(fixtures.REVIEWS_ROUTES) as base_url:
+    with (
+        fixture_server(fixtures.REVIEWS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
         _goto(page, base_url, f"#/reviews/{fixtures.REVIEWS_GUARDIAN['id']}")
         page.wait_for_selector(".branch-row")
         _shoot(page, "reviews-overview")
@@ -117,7 +133,10 @@ def _reviews(page: Page) -> None:
 
 
 def _resources_overview(page: Page) -> None:
-    with fixture_server(fixtures.RESOURCES_ROUTES) as base_url:
+    with (
+        fixture_server(fixtures.RESOURCES_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
         _goto(page, base_url, "#/resources")
         page.wait_for_selector(".res-table")
         _shoot(page, "resources-overview")

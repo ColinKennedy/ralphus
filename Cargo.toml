@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness"]
+members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "runner", "cli-rs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,6 +28,17 @@ base64 = "0.22"
 # libc call because `[workspace.lints.rust] unsafe_code = "forbid"` bans the
 # syscall from being written here; the crate confines that `unsafe` to itself.
 gethostname = "1"
+# Process-table walk for the CLI's `quick-start --command` parent-shell
+# detection (RAL-189/RAL-110 port) -- same crate/version/feature set the
+# daemon already uses for its own Windows process-table read (see
+# `daemon/src/tmux.rs::find_server_pid_windows`), so this is not a new
+# dependency shape for the workspace, just a second consumer of one already
+# vetted here.
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
+# Content-addressed prompt-file naming (RAL-189 port) -- pure-Rust, no
+# transitive deps, not used for anything security-sensitive (just a stable
+# cache-key filename), but a well-tested crate beats hand-rolling a hash.
+sha2 = "0.10"
 # UTC wall-clock parsing only (RAL-122 scheduler down-time windows) — no other
 # crate in the workspace needs date/time handling, so this is deliberately
 # minimal: no "clock"-derived local-time features beyond `Utc::now`.

@@ -1,7 +1,9 @@
-"""A tiny, fully deterministic HTTP server for docs screenshot generation.
+"""A tiny, fully deterministic API stub for docs screenshot generation.
 
-Serves ``librarian/assets/board.html`` verbatim at ``/`` and canned JSON at a
-handful of ``/api/*`` routes — no daemon, no SQLite, no scheduler involved.
+Serves canned JSON at a handful of ``/api/*`` routes — no daemon, no SQLite,
+no scheduler involved. The real ``librarian/assets/board.html`` page is
+served by the real, compiled ``ralphus-librarian`` binary (see
+``librarian_server.py``), which proxies its own `/api/*` requests here.
 board.html never needs a real backend for the scenarios docsgen captures:
 every interaction it screenshots (selecting a run/session via URL hash,
 dragging a queue row, opening the manual-checks dropdown) is client-side only
@@ -15,24 +17,17 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 
-__all__ = ["BOARD_HTML", "REPO_ROOT", "Routes", "fixture_server"]
+__all__ = ["Routes", "fixture_server"]
 
 Routes = dict[str, Any]  # route -> JSON body (dict or list)
-
-REPO_ROOT = Path(__file__).resolve().parents[4]
-BOARD_HTML = REPO_ROOT / "librarian" / "assets" / "board.html"
 
 
 class _Handler(BaseHTTPRequestHandler):
     server: _FixtureHTTPServer
 
     def do_GET(self) -> None:
-        if self.path == "/":
-            self._send(200, self.server.board_html, "text/html; charset=utf-8")
-            return
         if self.path in self.server.routes:
             body = json.dumps(self.server.routes[self.path]).encode("utf-8")
             self._send(200, body, "application/json")
@@ -48,20 +43,20 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _FixtureHTTPServer(ThreadingHTTPServer):
-    def __init__(self, routes: Routes, board_html: bytes) -> None:
+    def __init__(self, routes: Routes) -> None:
         super().__init__(("127.0.0.1", 0), _Handler)
         self.routes = routes
-        self.board_html = board_html
 
 
 @contextmanager
 def fixture_server(routes: Routes) -> Iterator[str]:
     """Start a stub API server bound to ``routes`` on an ephemeral port.
 
-    Yields the server's base URL (``http://127.0.0.1:<port>``). Torn down on
+    Yields the server's base URL (``http://127.0.0.1:<port>``) — hand it to
+    ``librarian_server.librarian_server`` as its ``daemon_url``. Torn down on
     context exit, including on exception.
     """
-    server = _FixtureHTTPServer(routes, BOARD_HTML.read_bytes())
+    server = _FixtureHTTPServer(routes)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

@@ -24,17 +24,18 @@
 //! stay untouched throughout.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
+use crate::cancel::{CancelToken, Cancellations};
 use crate::guardian::{CheckInput, GuardianCheck, GuardianStatus, MergeStatus};
 use crate::runner::{Runner, RunnerSpec};
 use crate::scheduler::Semaphore;
 use crate::server::Reply;
 use crate::store::Store;
+use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
 
 /// The `RunnerSpec.task` value used for every conflict-resolver invocation
@@ -159,24 +160,60 @@ fn head_hash(wt: &Workspace) -> Option<String> {
 const STAGE_DONE_MARKER: &str = "RALPHUS_STAGE: DONE";
 
 /// Run `git` with `args` in `root`, returning stdout on success or a message.
-/// `GIT_EDITOR=true` keeps operations like `rebase --continue` from opening an
-/// interactive editor.
+///
+/// Thin wrapper over [`crate::vcs::GitOps::run`] — the actual `git` subprocess
+/// spawn lives in `vcs.rs`, not here (RAL-213). Kept as a free function
+/// because it is called throughout this module (directly, and via
+/// [`Workspace::git`]) far too pervasively to thread a `GitVcs` value through
+/// every call site.
 pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true")
-        .output()
-        .map_err(|e| format!("could not run git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+    GitVcs.run(root, args)
+}
+
+/// The `.git/worktrees/<name>` admin-entry name for `wt`, resolved rather than
+/// assumed from its directory's basename (RAL-211).
+///
+/// `.git/worktrees/` is a FLAT namespace shared by every worktree in the
+/// repository, but the short directory names under `.git/.ralphus/` make it
+/// possible for two worktrees that are otherwise unrelated -- e.g. two
+/// different guardians both naming a branch `wt-RAL-121` in their own
+/// `g/g<n>/` directory -- to share a basename. Blindly using the basename as
+/// the admin name would then
+/// make [`relink_worktree`] target the SAME `.git/worktrees/wt-RAL-121/`
+/// entry for both, silently cross-wiring them (last write wins).
+///
+/// Prefers the name `wt`'s own `.git` file already records: whenever a
+/// worktree has ever been linked (via `git worktree add` or a prior relink),
+/// that file's `gitdir: .../worktrees/<name>` line names the admin entry git
+/// itself already gave it -- correct and unique by construction, even if the
+/// entry directory itself was since deleted (the exact case `relink_worktree`
+/// exists to repair; the pointer's *content* survives even when its *target*
+/// doesn't). Only when no such pointer survives (the worktree has never been
+/// linked, or its `.git` file is unreadable) is a name invented, and then
+/// it's qualified with the worktree's own parent directory -- the guardian's
+/// `g<n>` folder (unique per guardian) under `.git/.ralphus/g/` -- rather
+/// than the bare basename, so
+/// two guardians can never collide with each other here even though nothing
+/// yet exists to read a real name from.
+fn admin_entry_name(wt: &Workspace) -> String {
+    if let Some(existing) = wt.read_file(".git") {
+        if let Some(name) = existing
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .and_then(|p| Path::new(p).file_name())
+        {
+            return name.to_string_lossy().into_owned();
+        }
+    }
+    let basename = wt
+        .root()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match wt.root().parent().and_then(Path::file_name) {
+        Some(parent) => format!("{}-{basename}", parent.to_string_lossy()),
+        None => basename,
     }
 }
 
@@ -189,12 +226,7 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
 /// `branch` is used to write a placeholder `HEAD` when the entry is being
 /// created from scratch (missing `HEAD` → git refuses to open the gitdir).
 fn relink_worktree(root: &Workspace, wt: &Workspace, branch: &str) -> Result<(), String> {
-    let name = wt
-        .root()
-        .file_name()
-        .ok_or_else(|| "worktree path has no filename component".to_string())?
-        .to_string_lossy()
-        .into_owned();
+    let name = admin_entry_name(wt);
     // Path arithmetic only -- these never touch this host's disk when the
     // workspace is remote; the writes below go through the workspace.
     let entry_dir = root.root().join(".git").join("worktrees").join(&name);
@@ -726,28 +758,6 @@ fn branch_env(
         .unwrap_or_default()
 }
 
-/// The environment for an invocation against the **combined** review worktree
-/// (RAL-191), which contains every enabled branch's work rather than one
-/// branch's. Unions each enabled branch's resolved environment in stack order
-/// (lowest `position` first), so a key two branches both set resolves to the
-/// one stacked on top — matching the precedence the rebase gives their code.
-///
-/// Disabled branches are excluded: their commits are not in the combined
-/// worktree, so their variables have no business being there either.
-#[must_use]
-fn combined_branch_env(
-    guardian: &crate::guardian::GuardianView,
-) -> std::collections::BTreeMap<String, String> {
-    let mut branches: Vec<&crate::guardian::BranchView> =
-        guardian.branches.iter().filter(|b| b.enabled).collect();
-    branches.sort_by_key(|b| b.position);
-    let mut out = std::collections::BTreeMap::new();
-    for b in branches {
-        out.extend(b.resolved_env.clone());
-    }
-    out
-}
-
 /// Quality-bar instructions + ghost-memory prefix for a branch's dedicated
 /// final-verification call (RAL-149/168). Deliberately lazy: callers compute
 /// this only once they've already decided [`run_final_verify`] will actually
@@ -794,6 +804,11 @@ struct VerifyGate {
     /// Whether this branch is the last (by position) enabled branch in the
     /// stack -- the only branch `"final_branch"` scope verifies.
     is_final_branch: bool,
+    /// RAL-110's per-worktree-checks opt-out (`skip_worktree_checks`). Kept as
+    /// a second, independent axis alongside `scope`/`skip_auto_clean` so that
+    /// disabling worktree checks also suppresses the dedicated final-verify
+    /// call itself, not just the quality-bar instructions handed to it.
+    skip_worktree_checks: bool,
 }
 
 impl VerifyGate {
@@ -813,6 +828,7 @@ impl VerifyGate {
                 .as_ref()
                 .is_some_and(|g| g.effective_verify_skip_auto_clean),
             is_final_branch,
+            skip_worktree_checks: guard.guardian_skip_worktree_checks(id).unwrap_or(false),
         }
     }
 
@@ -820,8 +836,12 @@ impl VerifyGate {
     /// the agent just resolved. A branch that hit real conflicts is never
     /// "auto-clean" (`skip_auto_clean` is irrelevant here, matching RAL-168's
     /// own Q2 resolution: "if a rebase occurred [with conflicts], ... under
-    /// Each branch verification must happen").
+    /// Each branch verification must happen"). `skip_worktree_checks` still
+    /// overrides this, same as it overrides `allows_for_clean_branch`.
     fn allows_after_conflict(&self) -> bool {
+        if self.skip_worktree_checks {
+            return false;
+        }
         match self.scope.as_str() {
             "nothing" => false,
             "final_branch" => self.is_final_branch,
@@ -832,8 +852,12 @@ impl VerifyGate {
     /// Whether [`run_final_verify`] should fire for a branch that rebased
     /// cleanly (no conflict at all) but contributed real changes -- the new
     /// RAL-168 "each_branch" behavior, unless `skip_auto_clean` opts back
-    /// into the old lighter-weight default.
+    /// into the old lighter-weight default. `skip_worktree_checks` (RAL-110)
+    /// is an independent opt-out that also suppresses this call entirely.
     fn allows_for_clean_branch(&self) -> bool {
+        if self.skip_worktree_checks {
+            return false;
+        }
         match self.scope.as_str() {
             "nothing" => false,
             "final_branch" => self.is_final_branch,
@@ -852,6 +876,61 @@ fn final_branch_id(branches: &[crate::guardian::OrderedBranch]) -> Option<&str> 
         .filter(|b| b.enabled)
         .max_by_key(|b| b.position)
         .map(|b| b.id.as_str())
+}
+
+/// Record one guardian LLM call's cost as a line item (RAL-193) -- conflict
+/// resolution, verification, chat, feedback, summary generation, etc. -- and,
+/// if this review has a `maximum_budget_usd` cap, check whether its
+/// cumulative cost (across every rebase/re-merge attempt) has now exceeded
+/// it. Mirrors the RAL-161 session/task budget kill-switch: once exceeded,
+/// callers should stop making further resolver/verifier calls and fail the
+/// guardian/branch, using the returned error message.
+fn record_guardian_call_cost(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch_id: Option<&str>,
+    kind: &str,
+    result: &crate::runner::RunnerResult,
+) -> std::result::Result<(), String> {
+    let guard = store.lock().expect("poisoned");
+    let attempt = guard.guardian_current_attempt(id).unwrap_or(0);
+    let _ = guard.record_guardian_cost(
+        id,
+        branch_id,
+        attempt,
+        kind,
+        result.tokens_in,
+        result.tokens_out,
+        result.cost_usd,
+    );
+    let Ok(Some(cap)) = guard.guardian_maximum_budget_usd(id) else {
+        return Ok(());
+    };
+    let Ok((_, _, cumulative)) = guard.guardian_cost_total(id) else {
+        return Ok(());
+    };
+    if cumulative > cap {
+        crate::rlog!(
+            ERROR,
+            "ralphus [guardian] review {id} cost ${cumulative:.4} exceeded maximum_budget_usd cap ${cap:.4}"
+        );
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::ERROR,
+            source: "guardian",
+            message: "review cost exceeded maximum_budget_usd cap",
+            scope: Some("guardian"),
+            run_id: None,
+            guardian_id: Some(id),
+            session_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"cumulative_cost_usd": cumulative, "cap": cap, "kind": kind}),
+        });
+        return Err(format!(
+            "review cost ${cumulative:.4} exceeded maximum_budget_usd cap ${cap:.4}"
+        ));
+    }
+    Ok(())
 }
 
 /// Derives a concise quality-bar instruction for the conflict-resolver agent.
@@ -887,15 +966,17 @@ fn synthesize_verify_instructions(
         );
     };
 
-    let (skip_worktree_checks, explicit_checks, git_root) = {
+    let (skip_worktree_checks, explicit_checks, git_root, review_machine) = {
         let guard = store.lock().expect("poisoned");
         let skip = guard.guardian_skip_worktree_checks(id).unwrap_or(false);
         let checks = guard.guardian_checks(id).unwrap_or_default();
-        let root = guard
-            .get_guardian(id)
-            .map(|g| g.git_root)
+        let guardian = guard.get_guardian(id).ok();
+        let root = guardian
+            .as_ref()
+            .map(|g| g.git_root.clone())
             .unwrap_or_default();
-        (skip, checks, root)
+        let machine = guardian.and_then(|g| g.machine);
+        (skip, checks, root, machine)
     };
 
     // Opt-out: user has disabled the per-worktree quality-bar prompt (RAL-110).
@@ -1006,9 +1087,16 @@ fn synthesize_verify_instructions(
         // other per-branch invocation so a custom API base/proxy applies here
         // too.
         env_overrides: branch_env(store, id, branch_id),
-        machine: None,
+        // RAL-201: this review may be assigned a remote machine even though
+        // `git_root` here is a bare string, not a `Workspace` -- resolve it
+        // from the guardian row directly rather than always defaulting local.
+        machine: review_machine,
     };
     let result = runner.run(&spec);
+    // RAL-193: not fatal from this helper (it returns a plain `String`, not a
+    // `Result`) -- a budget already exceeded here is caught on the very next
+    // call in `resolve_conflicts_with_agent`'s own loop.
+    let _ = record_guardian_call_cost(store, id, Some(branch_id), "verify_synthesis", &result);
 
     if result.is_done() && !result.summary.trim().is_empty() {
         let synthesized = result.summary.trim().to_string();
@@ -1048,6 +1136,30 @@ fn synthesize_verify_instructions(
     }
 }
 
+/// Log + Cartographer-record a merge cancellation (RAL-213 cancellable
+/// merges). Called from every checkpoint that bails out early once
+/// `cancel.is_cancelled()` trips, so a real cancellation is always visible in
+/// Cartographer alone, matching the nearby "merge starting"/"conflicts
+/// resolved" entries' style. Deliberately does NOT touch guardian/branch
+/// status or run any destructive git operation -- see the checkpoints' own
+/// comments for why.
+fn log_merge_cancelled(store: &Arc<Mutex<Store>>, id: &str) {
+    crate::rlog!(INFO, "ralphus [guardian] review {id} merge cancelled");
+    let guard = store.lock().expect("poisoned");
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "guardian",
+        message: "merge cancelled",
+        scope: Some("guardian"),
+        run_id: None,
+        guardian_id: Some(id),
+        session_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({}),
+    });
+}
+
 /// Drive an agent to resolve the in-progress rebase conflicts in `wt`, then
 /// `git add` + `rebase --continue`, looping until the rebase completes or a cap
 /// is hit. Once every conflict marker is resolved and committed, runs a
@@ -1059,7 +1171,6 @@ fn synthesize_verify_instructions(
 fn resolve_conflicts_with_agent(
     store: &Arc<Mutex<Store>>,
     id: &str,
-    position: i64,
     branch_id: &str,
     runner: &dyn Runner,
     wt: &Workspace,
@@ -1067,6 +1178,7 @@ fn resolve_conflicts_with_agent(
     agent: &str,
     model: &Option<String>,
     gate: &VerifyGate,
+    cancel: &CancelToken,
 ) -> std::result::Result<(Option<String>, String), String> {
     let agent = agent.to_string();
     let model = model.clone();
@@ -1116,6 +1228,7 @@ fn resolve_conflicts_with_agent(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({
                 "branch": branch,
                 "found": found,
@@ -1140,6 +1253,10 @@ fn resolve_conflicts_with_agent(
         .join(format!("{wt_basename}.live_session"));
 
     for _ in 0..32 {
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return Err("cancelled".to_string());
+        }
         let files = conflicted_files(wt);
         if files.is_empty() {
             // No conflicts left: the rebase has either finished or auto-advanced
@@ -1178,22 +1295,31 @@ fn resolve_conflicts_with_agent(
                     guardian_id: Some(id),
                     session_id: None,
                     task: None,
+                    log_path: None,
                     payload: serde_json::json!({"branch": branch, "committed": committed}),
                 });
             }
             // RAL-168: gated by Verify scope -- a branch that just had real
             // conflicts resolved is never "auto-clean", so only `scope`
-            // (not `skip_auto_clean`) matters here.
+            // (not `skip_auto_clean`) matters here. RAL-110's
+            // `skip_worktree_checks` is a separate, independent opt-out that
+            // also suppresses this call.
             if !gate.allows_after_conflict() {
+                let reason = if gate.skip_worktree_checks {
+                    "worktree checks disabled"
+                } else {
+                    "Verify scope"
+                };
                 crate::rlog!(
                     INFO,
                     "ralphus [guardian] review {id} final verification skipped branch={branch:?} \
-                     scope={:?}",
-                    gate.scope
+                     scope={:?} skip_worktree_checks={}",
+                    gate.scope,
+                    gate.skip_worktree_checks
                 );
                 return Ok((
                     last_session_id,
-                    "resolved by agent; final verification skipped (Verify scope)".to_string(),
+                    format!("resolved by agent; final verification skipped ({reason})"),
                 ));
             }
             let (quality_note, ghost_prefix) =
@@ -1201,7 +1327,6 @@ fn resolve_conflicts_with_agent(
             let (verify_session_id, verify_detail) = run_final_verify(
                 store,
                 id,
-                position,
                 branch_id,
                 runner,
                 wt,
@@ -1248,6 +1373,7 @@ fn resolve_conflicts_with_agent(
                     guardian_id: Some(id),
                     session_id: None,
                     task: None,
+                    log_path: None,
                     payload: serde_json::json!({"branch": branch, "files": files.len()}),
                 });
             }
@@ -1295,15 +1421,17 @@ fn resolve_conflicts_with_agent(
              orchestrator advances the rebase as soon as it sees RALPHUS_STAGE: DONE in your \
              output.";
         let spec = RunnerSpec {
-            // RAL-102: unique per (guardian, branch position) so the tmux
-            // session this resolves through (see `crate::tmux::session_name`)
-            // never collides with another guardian's or branch's resolver —
-            // and so the Review tab's capture-pane endpoint can address this
-            // exact invocation via the same (guardian id, position) pair the
-            // route already carries.
+            // RAL-102: unique per (guardian, branch) so the tmux session this
+            // resolves through (see `crate::tmux::session_name`) never
+            // collides with another guardian's or branch's resolver.
+            // RAL-192: keyed on the branch's stable id, not its mutable stack
+            // position, so the Review tab's capture-pane endpoint (and the
+            // historical-record snapshot lookup) can still address this exact
+            // invocation via the same (guardian id, branch id) pair even
+            // after a later reorder/add/remove shifts positions.
             run_id: format!("guardian-{id}"),
             task: RESOLVER_TASK.to_string(),
-            session_id: format!("resolver-{position}"),
+            session_id: format!("resolver-{branch_id}"),
             cwd: wt.root().to_string_lossy().into_owned(),
             prompt: Some(prompt),
             command: None,
@@ -1320,7 +1448,13 @@ fn resolve_conflicts_with_agent(
             // RAL-191: the resolver edits this branch's own worktree, so it
             // runs under the branch's resolved environment.
             env_overrides: branch_env(store, id, branch_id),
-            machine: None,
+            // RAL-201: without this, the resolver agent always ran on the
+            // daemon's own host even when `wt` (and every git/fs op this
+            // function performs on it) is on a review's assigned remote
+            // machine -- a mismatch that fails loudly (the local runner
+            // cannot find a `cwd` that only exists on another host) rather
+            // than silently running in the wrong place, but is still wrong.
+            machine: wt.machine().map(str::to_string),
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -1351,10 +1485,22 @@ fn resolve_conflicts_with_agent(
             }
         });
 
-        let result = runner.run(&spec);
+        let result = runner.run_cancellable(&spec, cancel);
 
         stop.store(true, Ordering::Relaxed);
         let _ = watcher.join();
+
+        record_guardian_call_cost(store, id, Some(branch_id), "resolve_conflict", &result)?;
+
+        // RAL-213: the runner call above may have blocked until `cancel`
+        // tripped (a real subprocess is killed the same way) -- check again
+        // now, before treating a resulting non-done result as a genuine
+        // resolver failure, so a cancellation never gets misreported as
+        // "conflict resolver failed" and never trips the caller's abort path.
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return Err("cancelled".to_string());
+        }
 
         if let Some(sid) = result.agent_session_id.clone() {
             last_session_id = Some(sid);
@@ -1379,6 +1525,7 @@ fn resolve_conflicts_with_agent(
                     guardian_id: Some(id),
                     session_id: None,
                     task: None,
+                    log_path: None,
                     payload: serde_json::json!({"branch": branch, "error": err}),
                 });
             }
@@ -1414,6 +1561,7 @@ fn resolve_conflicts_with_agent(
                         guardian_id: Some(id),
                         session_id: None,
                         task: None,
+                        log_path: None,
                         payload: serde_json::json!({"branch": branch, "len": ghost_text.len()}),
                     });
                 }
@@ -1451,6 +1599,7 @@ fn resolve_conflicts_with_agent(
                     guardian_id: Some(id),
                     session_id: None,
                     task: None,
+                    log_path: None,
                     payload: serde_json::json!({"branch": branch, "committed": committed}),
                 });
             }
@@ -1529,7 +1678,6 @@ fn resolve_conflicts_with_agent(
 fn run_final_verify(
     store: &Arc<Mutex<Store>>,
     id: &str,
-    position: i64,
     branch_id: &str,
     runner: &dyn Runner,
     wt: &Workspace,
@@ -1551,6 +1699,7 @@ fn run_final_verify(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"branch": branch}),
         });
     }
@@ -1573,11 +1722,15 @@ fn run_final_verify(
          rebase-affecting git command -- the orchestrator owns the rebase and has already \
          advanced past the conflict this branch was resolving.";
     let spec = RunnerSpec {
-        // Mirrors the fix pass's `resolver-{position}` session id (RAL-102) --
-        // distinct so the two calls never collide on the same tmux session.
+        // RAL-192: keyed on the branch's stable id (not its mutable stack
+        // position -- see `crate::tmux::session_name`'s doc comment) so a
+        // reorder/add/remove elsewhere in the review never breaks the
+        // historical-record lookup for this session. Mirrors the fix pass's
+        // `resolver-{branch_id}` session id (RAL-102) -- distinct so the two
+        // calls never collide on the same tmux session.
         run_id: format!("guardian-{id}"),
         task: RESOLVER_VERIFY_TASK.to_string(),
-        session_id: format!("resolver-verify-{position}"),
+        session_id: format!("resolver-verify-{branch_id}"),
         cwd: wt.root().to_string_lossy().into_owned(),
         prompt: Some(prompt),
         command: None,
@@ -1593,9 +1746,15 @@ fn run_final_verify(
         resume_agent_session_id: None,
         // RAL-191: same worktree, same environment as the fix pass above.
         env_overrides: branch_env(store, id, branch_id),
-        machine: None,
+        // RAL-201: route to the same machine `wt` is actually on -- see the
+        // identical fix in `resolve_conflicts_with_agent` above.
+        machine: wt.machine().map(str::to_string),
     };
     let result = runner.run(&spec);
+    // RAL-193: not fatal here -- per this function's own doc comment, verify
+    // never blocks the rebase from completing, so a budget overrun is
+    // recorded but doesn't abort an already-in-flight resolution.
+    let _ = record_guardian_call_cost(store, id, Some(branch_id), "verify", &result);
     let passed = result.verify_passed();
 
     crate::rlog!(
@@ -1617,6 +1776,7 @@ fn run_final_verify(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"branch": branch, "passed": passed}),
         });
     }
@@ -1706,6 +1866,61 @@ fn run_commit_checks(
 // Restack helpers (RAL-35)
 // ---------------------------------------------------------------------------
 
+/// Deterministic short worktree-directory names (RAL-211) for every currently
+/// enabled branch a guardian is building in `project` (or, when `project` is
+/// `None`, every enabled branch regardless of project -- used by the
+/// feedback-routing paths, which only ever operate on single-project
+/// guardians, the same assumption `dispatch_routes` already makes when it
+/// resolves `wt_base` from the guardian's primary `git_root`).
+///
+/// Computed fresh from the store's current branch rows every time, in
+/// position order, rather than threaded through as state: as long as every
+/// call site filters the same way (enabled, same project), the same branch
+/// set in the same order always produces the same short names -- which is
+/// what makes a worktree already on disk get found again by a later restack
+/// or feedback pass instead of silently retargeted at the wrong branch.
+fn branch_short_names(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    project: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let guardian = store.lock().expect("poisoned").get_guardian(id).ok();
+    let git_root = guardian
+        .as_ref()
+        .map(|g| g.git_root.clone())
+        .unwrap_or_default();
+    let names: Vec<String> = guardian
+        .map(|g| g.branches)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| b.enabled)
+        .filter(|b| match project {
+            Some(p) => b.project.as_deref().unwrap_or(&git_root) == p,
+            None => true,
+        })
+        .map(|b| b.branch)
+        .collect();
+    crate::short_paths::dedupe_short_names(names.iter().map(String::as_str))
+}
+
+/// The per-branch review worktree directory under `wt_base` for `branch`,
+/// using its RAL-211 short name from `short_names` when one was computed for
+/// it (always true for an enabled branch in the same project `short_names`
+/// was built from); falls back to an un-deduped short name otherwise, which
+/// only happens for a branch outside that scope and therefore can never
+/// collide with one that IS in scope.
+fn branch_wt_dir(
+    wt_base: &Workspace,
+    short_names: &std::collections::HashMap<String, String>,
+    branch: &str,
+) -> Workspace {
+    let short = short_names
+        .get(branch)
+        .cloned()
+        .unwrap_or_else(|| crate::short_paths::short_name(branch));
+    wt_base.join(format!("wt-{short}"))
+}
+
 /// Re-stack every branch whose `position > from_position` onto the review branch
 /// at `from_position` (which is assumed to already have the desired HEAD). Runs
 /// check gates on each branch; finalises the combined worktree at the end.
@@ -1722,6 +1937,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     base_branch: &str,
     from_position: i64,
     set_status: &F,
+    cancel: &CancelToken,
 ) {
     // RAL-103: this is a forced regeneration (feedback routing or a detected
     // manual push) -- clear the stale manual-checks commands up front so
@@ -1732,6 +1948,14 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         .lock()
         .expect("poisoned")
         .clear_guardian_manual_commands(id);
+    // RAL-193: this restack is its own re-merge attempt -- a distinct
+    // resolver/verifier cost bucket from whatever attempt preceded it,
+    // whether triggered by routed reviewer feedback or a detected manual
+    // push (both call this, not `run_merge`).
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .bump_guardian_merge_attempt(id);
     let base_sha = match resolve_base(root, base_branch) {
         Ok(s) => s,
         Err(e) => {
@@ -1747,6 +1971,11 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         .expect("poisoned")
         .guardian_branches(id)
         .unwrap_or_default();
+    // RAL-211: short worktree-directory names, computed once for this pass --
+    // see `branch_short_names`'s doc comment for why this must stay
+    // consistent with every other call site's computation for the same
+    // guardian.
+    let short_names = branch_short_names(store, id, None);
     // RAL-91: resolve each branch's effective project so squash can be applied
     // per-project during the re-stack. `guardian_branches` returns no project, so
     // build the map from the full guardian view.
@@ -1793,7 +2022,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             None,
         );
         let rev = format!("guardian/{id}/wt-{}", ob.branch);
-        let wt_j = wt_base.join(format!("wt-{}", ob.branch));
+        let wt_j = branch_wt_dir(wt_base, &short_names, &ob.branch);
         let wt_j_str = wt_j.root().to_string_lossy().to_string();
         if let Err(e) = worktree_add_or_reset(root, &rev, &wt_j, &ob.branch) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
@@ -1805,18 +2034,8 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             .set_branch_review(id, &ob.id, &rev, &wt_j_str);
         let gate = VerifyGate::resolve(store, id, Some(&ob.id) == final_id.as_ref());
         if stack_pick(
-            store,
-            runner,
-            id,
-            ob.position,
-            &ob.id,
-            &ob.branch,
-            &base_sha,
-            &prev_ref,
-            &rev,
-            &wt_j,
-            squash,
-            &gate,
+            store, runner, id, &ob.id, &ob.branch, &base_sha, &prev_ref, &rev, &wt_j, squash,
+            &gate, cancel,
         )
         .is_err()
         {
@@ -1830,15 +2049,10 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     }
     match finalize_review(store, root, wt_base, id, &prev_ref) {
         Ok(note) => {
-            // RAL-53: regenerate summary from subject lines after re-stacking.
-            let completed: Vec<(i64, String)> = branches
-                .iter()
-                .filter(|b| b.enabled)
-                .map(|b| (b.position, b.branch.clone()))
-                .collect();
-            generate_summary(
-                store, runner, id, root, &base_sha, &completed, &prev_ref, true,
-            );
+            // RAL-208: request a change-summary regen -- a no-op unless the
+            // enabled-branch set actually changed since the last one (a plain
+            // re-stack never does), and debounced when it did.
+            queue_final_summary_regen(store, id);
             // RAL-27/RAL-110: regenerate manual review commands after
             // re-stacking, and try an AI-inferred auto-build if nothing else
             // covered finalize-time verification.
@@ -1849,7 +2063,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
                 root,
                 &base_sha,
                 &prev_ref,
-                Some(&wt_base.join(format!("{id}-review"))),
+                Some(&wt_base.join("review")),
             );
             // RAL-92: re-baseline every branch's review-branch tip now that the
             // stack has settled, so the restacked downstream branches are not
@@ -1892,6 +2106,7 @@ fn dispatch_routes(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"routes": routes.len(), "no_commit": no_commit}),
         });
     }
@@ -1947,6 +2162,7 @@ fn dispatch_routes(
             let position = t.position;
             let branch = t.branch.clone();
             let wt_cwd = t.wt.root().to_string_lossy().into_owned();
+            let wt_machine = t.wt.machine().map(str::to_string);
             let wt_for_thread = t.wt.clone();
             let instructions = t.instructions.clone();
             let r_agent = r_agent.clone();
@@ -2009,7 +2225,10 @@ fn dispatch_routes(
                     // RAL-191: feedback is implemented in the branch's own
                     // review worktree, so it runs under that branch's env.
                     env_overrides: branch_env,
-                    machine: None,
+                    // RAL-201: route to the same machine `wt_cwd` is actually
+                    // on -- see the identical fix in
+                    // `resolve_conflicts_with_agent`.
+                    machine: wt_machine,
                 };
                 let _ = runner_clone.run(&spec);
                 // Defensive amend: if the agent left uncommitted changes and we are
@@ -2057,6 +2276,9 @@ fn dispatch_routes(
             .set_guardian_status(id, s, detail);
     };
     set_status(GuardianStatus::Merging, Some("applying routed feedback"));
+    // RAL-213: route dispatch is a separate reviewer-feedback flow, not a
+    // cancellable merge -- see `run_merge_cancellable`'s doc comment for the
+    // feature this token type serves.
     restack_from_position(
         store,
         runner.as_ref(),
@@ -2066,21 +2288,24 @@ fn dispatch_routes(
         &guardian.base_branch,
         from_position,
         &set_status,
+        &CancelToken::never(),
     );
 }
 
-/// The worktree directory a guardian's review stack is built in.
+/// The worktree directory a guardian's review stack is built in:
+/// `.git/.ralphus/g/g<n>`, `<n>` the guardian's numeric id with zero-padding
+/// stripped (see `crate::short_paths`).
 ///
 /// Lives inside `.git/` (which git already excludes from the working tree) so
 /// the review worktrees never appear at the repo root and need no gitignore
 /// entry. Git worktrees checked out under `.git` resolve normally — the admin
 /// entry in `.git/worktrees/<name>` and the `commondir` back-pointer are
-/// independent of where the checkout itself lives.
+/// independent of where the checkout itself lives. Git branch names are
+/// unaffected -- only this directory name is shortened.
 pub(crate) fn worktree_dir(git_root: &str, guardian_id: &str) -> PathBuf {
-    Path::new(git_root)
-        .join(".git")
-        .join(".ralphus_guardian")
-        .join(guardian_id)
+    crate::short_paths::ralphus_root(Path::new(git_root))
+        .join("g")
+        .join(crate::short_paths::guardian_short_id(guardian_id))
 }
 
 /// Best-effort removal of every review worktree/branch a guardian created, used
@@ -2113,11 +2338,18 @@ pub fn purge_worktrees(store: &Arc<Mutex<Store>>, git_root: &str, id: &str) {
 /// Kick off a background merge for `id`. The spawned worker acquires a slot
 /// from `sem` before doing any work, so the review counts against the same
 /// global concurrency cap as sessions and task-level verifies.
+///
+/// RAL-213: registers a cancel token under `guardian:{id}` in `cancellations`
+/// for the lifetime of the spawned merge (removed once it returns), mirroring
+/// `scheduler::tick`'s register/remove wrapping for runs -- this is what lets
+/// a settings change (or an explicit cancel-and-restart) actually stop this
+/// merge instead of only flipping a DB column underneath it.
 pub fn start_merge(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
     id: &str,
     sem: Arc<Semaphore>,
+    cancellations: Cancellations,
 ) -> Reply {
     let guardian = {
         let guard = store.lock().expect("store mutex poisoned");
@@ -2165,6 +2397,7 @@ pub fn start_merge(
                 guardian_id: Some(id),
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({}),
             });
         }
@@ -2192,15 +2425,66 @@ pub fn start_merge(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"branches": guardian.branches.len()}),
         });
     }
     let sid = id.to_string();
     std::thread::spawn(move || {
         let _permit = sem.acquire();
-        run_merge(&store, runner.as_ref(), &sid);
+        let token = cancellations.register(&format!("guardian:{sid}"));
+        run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
+        cancellations.remove(&format!("guardian:{sid}"));
     });
     reply(202, "{\"status\":\"merging\"}")
+}
+
+/// Bounded wait for a merge worker registered under `guardian:{id}` to
+/// actually exit, mirroring `server::wait_for_worker_stop`'s doc comment
+/// (same double-dispatch race, same 5s/50ms budget) for the guardian-merge
+/// key namespace -- duplicated here rather than reused because that helper
+/// takes a `&Daemon`, which this module has no handle to (only the
+/// individual `store`/`cancellations`/`runner`/`sem` handles it needs).
+fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    while cancellations.is_active(key) {
+        if started.elapsed() >= TIMEOUT {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Stop an in-flight merge for `id` (if any) and start a fresh one, safely.
+///
+/// RAL-213: this is the safe replacement for the old "reset to collecting,
+/// then start a new merge thread without stopping the old one" pattern that
+/// both `guardian_cancel_and_merge` and a guardian-settings change while
+/// `merging` used to follow -- two `run_merge` calls for the same guardian id
+/// operate on identical worktree paths/branch names/carry refs, so without
+/// this the newer thread's cleanup could tear down worktrees/branches the
+/// older thread was still rebasing in. Mirrors `server::restart_run`'s
+/// cancel → wait → reset → restart shape exactly.
+pub fn restart_guardian_merge(
+    store: Arc<Mutex<Store>>,
+    cancellations: Cancellations,
+    runner: Arc<dyn Runner>,
+    id: &str,
+    sem: Arc<Semaphore>,
+) -> Reply {
+    let key = format!("guardian:{id}");
+    cancellations.cancel(&key);
+    wait_for_merge_worker_stop(&cancellations, &key);
+    if let Err(e) = store
+        .lock()
+        .expect("store mutex poisoned")
+        .reset_guardian_to_collecting(id)
+    {
+        return reply(500, &error_body("store_error", &e.to_string()));
+    }
+    start_merge(store, runner, id, sem, cancellations)
 }
 
 /// Kick off a background "set it for me" resolution of one named
@@ -2414,6 +2698,7 @@ pub fn run_chat(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({
                 "backend": r_agent,
                 "model": r_model,
@@ -2462,6 +2747,7 @@ pub fn run_chat(
                     guardian_id: Some(id),
                     session_id: None,
                     task: None,
+                    log_path: None,
                     payload: serde_json::json!({"error": direct_err}),
                 });
             }
@@ -2506,6 +2792,7 @@ pub fn run_chat(
                         guardian_id: Some(id),
                         session_id: None,
                         task: None,
+                        log_path: None,
                         payload: serde_json::json!({"cwd": cwd, "status": guardian.status}),
                     });
                 }
@@ -2536,16 +2823,20 @@ pub fn run_chat(
                     verify: false,
                     trace_context: None,
                     resume_agent_session_id: None,
-                    // RAL-191: the triage agent works in the COMBINED worktree,
-                    // which holds every enabled branch's work at once, so there
-                    // is no single branch env to use. Union them in stack order
-                    // (lowest position first) so a key set by two branches
-                    // resolves to the one stacked on top -- the same precedence
-                    // the rebase itself gives their code.
-                    env_overrides: combined_branch_env(&guardian),
-                    machine: None,
+                    // RAL-191/RAL-203: the triage agent works in the COMBINED
+                    // worktree, which holds every enabled branch's work
+                    // rebased onto the last one -- `combined_env` is already
+                    // that last enabled branch's resolved env
+                    // (see `guardian::combined_env_from_branches`).
+                    env_overrides: guardian.combined_env.clone(),
+                    // RAL-201: route to the review's assigned machine (if
+                    // any) instead of always the daemon's own host -- `cwd`
+                    // above already names the combined worktree on that
+                    // machine.
+                    machine: guardian.machine.clone(),
                 };
                 let result = runner.run(&spec);
+                let _ = record_guardian_call_cost(store, id, None, "chat", &result);
                 if result.is_done() && !result.summary.trim().is_empty() {
                     result.summary
                 } else {
@@ -2594,6 +2885,7 @@ pub fn run_chat(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"has_routes": !routes.is_empty()}),
         });
     }
@@ -2619,6 +2911,7 @@ pub fn run_chat(
                 guardian_id: Some(id),
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({"routes": routes.len(), "branches": route_branches}),
             });
         }
@@ -2656,6 +2949,12 @@ pub fn start_chat(
     reply(202, "{\"status\":\"triaging\"}")
 }
 
+/// [`run_merge`] with no way to stop early -- for tests and any caller with no
+/// live [`CancelToken`] to hand it (`CancelToken::never()` never trips).
+pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
+    run_merge_cancellable(store, runner, id, &CancelToken::never());
+}
+
 /// Build the review stack for a guardian (synchronous; called on a worker thread
 /// or directly in tests). Conflicts are resolved with `runner`.
 ///
@@ -2665,11 +2964,33 @@ pub fn start_chat(
 /// its own independent stacking sequence. All projects must succeed for the
 /// guardian to reach `InReview`. A final, read-only *combined* worktree points at
 /// the head of the last branch in the last project.
-pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
+///
+/// RAL-213: `cancel` lets a guardian-settings change (or an explicit
+/// "cancel and restart") stop an in-flight merge before the next checkpoint,
+/// so a stale build never fights a fresh one over the same worktrees/branches
+/// (see [`restart_guardian_merge`]). On cancellation this returns immediately
+/// at the next checkpoint without any further status write or destructive git
+/// operation -- the next merge's own setup phase (the reset-to-pending +
+/// `cleanup_review_worktrees` pass above) already handles cleaning up
+/// whatever this pass left behind.
+pub fn run_merge_cancellable(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    cancel: &CancelToken,
+) {
     let guardian = match store.lock().expect("poisoned").get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
+    // RAL-193: every call is its own merge/rebase attempt -- bump the
+    // counter so cost line items recorded during it (conflict resolution,
+    // verification) are attributed to this attempt, distinct from the
+    // cumulative total across every attempt this review has gone through.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .bump_guardian_merge_attempt(id);
     // RAL-185 D5: the review's machine, resolved once. Every workspace below is
     // derived from this one, so a path can never lose track of which host it
     // belongs to on the way down.
@@ -2692,6 +3013,7 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({
                 "base": base,
                 "branches": guardian.branches.iter().filter(|b| b.enabled).count(),
@@ -2710,8 +3032,9 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
         let guard = store.lock().expect("poisoned");
         // RAL-103: the change summary is deliberately NOT cleared here -- the
         // last computed summary (preliminary or final) stays visible until
-        // `generate_summary` overwrites it once the stack rebuilds, instead of
-        // showing a misleading empty/"generating" gap for the whole rebuild.
+        // a debounced `generate_final_summary` (RAL-208) eventually overwrites
+        // it, instead of showing a misleading empty/"generating" gap for the
+        // whole rebuild.
         let _ = guard.clear_guardian_manual_commands(id);
         let _ = guard.set_guardian_conflicts(id, None, None, None);
         let _ = guard.clear_all_branch_conflicts(id);
@@ -2846,6 +3169,10 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
     let mut last_build_note: Option<String> = None;
 
     for (proj, proj_branches) in &project_branches {
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return;
+        }
         let root = ws_root.at(PathBuf::from(proj));
         let wt_base = ws_root.at(worktree_dir(proj, id));
 
@@ -2864,6 +3191,11 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
             .lock()
             .expect("poisoned")
             .set_guardian_project_base_commit(id, proj, &base_sha);
+
+        if let Err(e) = preflight_worktree_budget(&root, &wt_base, &base_sha) {
+            set_status(GuardianStatus::MergeFailed, Some(&e));
+            return;
+        }
 
         // CCTL-156: large repos can opt out of per-branch worktrees.
         if guardian.skip_worktrees {
@@ -2889,6 +3221,7 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
                 squash,
                 &set_status,
                 final_branch_id.as_deref(),
+                cancel,
             );
             // On failure, set_status was already called inside run_merge_shared.
             let cur_status = store
@@ -2921,7 +3254,15 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
         // branch), used to carry a prior resolution forward.
         let mut prev_ref = base_sha.clone();
         let mut prev_old: Option<String> = old_base_by_proj.get(proj).cloned();
+        // RAL-211: short worktree-directory names for this project's branches
+        // -- see `branch_short_names`'s doc comment for the stability
+        // requirement this depends on.
+        let short_names = branch_short_names(store, id, Some(proj.as_str()));
         for ob in proj_branches {
+            if cancel.is_cancelled() {
+                log_merge_cancelled(store, id);
+                return;
+            }
             let _ = store.lock().expect("poisoned").set_branch_status(
                 id,
                 &ob.id,
@@ -2936,7 +3277,7 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
                 return;
             }
             let rev = format!("guardian/{id}/wt-{}", ob.branch);
-            let wt = wt_base.join(format!("wt-{}", ob.branch));
+            let wt = branch_wt_dir(&wt_base, &short_names, &ob.branch);
             let wt_str = wt.root().to_string_lossy().to_string();
             if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &ob.branch) {
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
@@ -2969,22 +3310,20 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
                 id,
                 Some(ob.id.as_str()) == final_branch_id.as_deref(),
             );
+            if cancel.is_cancelled() {
+                log_merge_cancelled(store, id);
+                return;
+            }
             if stack_pick(
-                store,
-                runner,
-                id,
-                ob.position,
-                &ob.id,
-                &ob.branch,
-                &upstream,
-                &prev_ref,
-                &rev,
-                &wt,
-                squash,
-                &gate,
+                store, runner, id, &ob.id, &ob.branch, &upstream, &prev_ref, &rev, &wt, squash,
+                &gate, cancel,
             )
             .is_err()
             {
+                return;
+            }
+            if cancel.is_cancelled() {
+                log_merge_cancelled(store, id);
                 return;
             }
             if let Err(e) = run_commit_checks(store, id, &ob.id, &wt, &ob.branch) {
@@ -3017,15 +3356,6 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
                 let combined_wt = std::path::PathBuf::from(&combined_str);
                 last_combined = Some(combined_str);
                 last_root = Some(root.clone());
-                // RAL-53: generate summary from commit subject lines once the
-                // full stack is assembled.
-                let completed: Vec<(i64, String)> = proj_branches
-                    .iter()
-                    .map(|ob| (ob.position, ob.branch.clone()))
-                    .collect();
-                generate_summary(
-                    store, runner, id, &root, &base_sha, &completed, &prev_ref, true,
-                );
                 // RAL-27/RAL-110: regenerate manual review commands once the
                 // stack is ready, and try an AI-inferred auto-build for this
                 // project. Only the last project's note is surfaced below,
@@ -3048,6 +3378,10 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
         }
     }
 
+    if cancel.is_cancelled() {
+        log_merge_cancelled(store, id);
+        return;
+    }
     // Run final check gates against the last combined worktree (all-projects pass).
     let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
         match final_checks(store, id, root, combined_str) {
@@ -3064,6 +3398,11 @@ pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
     // baseline for manual-push detection, so this build (or a base-shift rebuild)
     // is never itself detected as a reviewer's manual push.
     snapshot_review_heads(store, id);
+    // RAL-208: every enabled branch across every project has now finished
+    // rebuilding -- request a (debounced, dedup'd-by-signature) LLM change
+    // summary covering the whole guardian, once, instead of the old
+    // per-project unconditional call this replaced.
+    queue_final_summary_regen(store, id);
     set_status(
         GuardianStatus::InReview,
         note.or(last_build_note).as_deref(),
@@ -3087,17 +3426,20 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     squash: bool,
     set_status: &F,
     final_branch_id: Option<&str>,
+    cancel: &CancelToken,
 ) {
     let combined_branch = format!("guardian/{id}/review");
-    let wt_name = format!("{id}-review");
-    let wt = wt_base.join(&wt_name);
+    let wt = wt_base.join("review");
     let wt_str = wt.root().to_string_lossy().to_string();
     if let Err(e) = worktree_add_or_reset(root, &combined_branch, &wt, base_sha) {
         set_status(GuardianStatus::MergeFailed, Some(&e));
         return;
     }
-    let mut completed: Vec<(i64, String)> = Vec::new();
     for ob in branches {
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return;
+        }
         let _ = store.lock().expect("poisoned").set_branch_status(
             id,
             &ob.id,
@@ -3123,7 +3465,6 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         match drive_rebase(
             store,
             id,
-            ob.position,
             &ob.id,
             runner,
             &ob.branch,
@@ -3132,6 +3473,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             base_sha,
             "HEAD",
             &gate,
+            cancel,
         ) {
             Ok((outcome, session_id)) => {
                 // RAL-91: squash this branch's commits before advancing the shared
@@ -3164,47 +3506,45 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 }
             }
             Err(e) => {
+                // RAL-213: a cancelled merge is already logged by `drive_rebase`'s
+                // own checkpoint -- leave the worktree/branch state as-is for the
+                // next merge's own setup phase to clean up.
+                if cancel.is_cancelled() {
+                    return;
+                }
                 // drive_rebase already aborted; restore the combined branch.
                 let _ = wt.git(&["checkout", "--force", &combined_branch]);
                 fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
                 return;
             }
         }
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return;
+        }
         if let Err(e) = run_commit_checks(store, id, &ob.id, &wt, &ob.branch) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
             return;
         }
-        completed.push((ob.position, ob.branch.clone()));
-        // RAL-39: update interim summary after each branch is stacked.
-        generate_summary(
-            store,
-            runner,
-            id,
-            root,
-            base_sha,
-            &completed,
-            &combined_branch,
-            false,
-        );
+    }
+    if cancel.is_cancelled() {
+        log_merge_cancelled(store, id);
+        return;
     }
     {
         let guard = store.lock().expect("poisoned");
         let _ = guard.set_guardian_review_branch(id, &combined_branch);
         let _ = guard.set_guardian_combined_worktree(id, &wt_str);
     }
+    regenerate_readme(store, root);
     match final_checks(store, id, root, &wt_str) {
         Ok(note) => {
-            // RAL-39: final summary once the whole stack is ready.
-            generate_summary(
-                store,
-                runner,
-                id,
-                root,
-                base_sha,
-                &completed,
-                &combined_branch,
-                true,
-            );
+            // RAL-208: the LLM change summary is no longer regenerated here on
+            // every stack rebuild -- `run_merge` requests a (debounced) regen
+            // once, after every project in this merge has finished, so it is
+            // never re-triggered by a rebuild that didn't add/remove/enable/
+            // disable a branch (a feedback restack, a manual-push rebase, a
+            // base-shift rebuild).
             // RAL-27/RAL-110: generate manual review commands once the stack is
             // ready, and try an AI-inferred auto-build if nothing else covered
             // finalize-time verification.
@@ -3263,6 +3603,7 @@ pub fn run_feedback(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"position": position}),
         });
     }
@@ -3304,7 +3645,7 @@ pub fn run_feedback(
     let spec = RunnerSpec {
         // RAL-102: unique per guardian — a bare "guardian" run_id collides
         // with every other guardian's tmux session name (see the identical
-        // fix on the `generate_summary` spec below).
+        // fix on `generate_final_summary`'s spec).
         run_id: format!("guardian-{id}"),
         task: "feedback".to_string(),
         session_id: "reviewer".to_string(),
@@ -3322,7 +3663,10 @@ pub fn run_feedback(
         trace_context: None,
         resume_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
-        machine: None,
+        // RAL-201: route to the same machine `wt` (and thus `cwd` above) is
+        // actually on -- see the identical fix in
+        // `resolve_conflicts_with_agent`.
+        machine: wt.machine().map(str::to_string),
     };
     let no_commit = is_no_commit_intent(feedback);
     // Stash any pre-existing dirty state so we only include the agent's own
@@ -3337,14 +3681,14 @@ pub fn run_feedback(
     } else {
         false
     };
-    let _ = runner.run(&spec);
+    let result = runner.run(&spec);
+    let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     let dirty = wt.git(&["status", "--porcelain"]).unwrap_or_default();
     if !dirty.trim().is_empty() && !no_commit {
         let _ = wt.git(&["add", "-A"]);
-        let _ = git(
-            wt.root(),
-            &["commit", "-m", &format!("review feedback: {feedback}")],
-        );
+        // RAL-201: was `git(wt.root(), ...)`, a direct bypass of `wt`'s
+        // machine sitting right next to the correctly-routed calls above.
+        let _ = wt.git(&["commit", "-m", &format!("review feedback: {feedback}")]);
     }
     // Restore any pre-existing (no-commit) changes to the working tree.
     if stashed {
@@ -3369,6 +3713,7 @@ pub fn run_feedback(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"position": position, "no_commit": no_commit}),
         });
     }
@@ -3430,6 +3775,10 @@ pub fn run_feedback(
         .squash_projects
         .iter()
         .any(|p| p == &branch_project);
+    // RAL-211: short worktree-directory names for this project's branches --
+    // see `branch_short_names`'s doc comment for the stability requirement
+    // this depends on.
+    let short_names = branch_short_names(store, id, Some(branch_project.as_str()));
     let mut prev_ref = branch
         .review_branch
         .clone()
@@ -3448,7 +3797,7 @@ pub fn run_feedback(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("guardian/{id}/wt-{}", ob.branch));
-        let wt_j = wt_base.join(format!("wt-{}", ob.branch));
+        let wt_j = branch_wt_dir(&wt_base, &short_names, &ob.branch);
         let wt_j_str = wt_j.root().to_string_lossy().to_string();
         // Reset the review branch to the feature tip; drive_rebase replays its
         // own commits onto the revised upstream (`prev_ref`).
@@ -3465,11 +3814,12 @@ pub fn run_feedback(
             id,
             Some(ob.id.as_str()) == final_branch_id.as_deref(),
         );
+        // RAL-213: reviewer feedback is a separate flow from a guardian-settings
+        // -triggered merge restart -- see `run_merge_cancellable`'s doc comment.
         if stack_pick(
             store,
             runner,
             id,
-            ob.position,
             &ob.id,
             &ob.branch,
             &base_sha,
@@ -3478,6 +3828,7 @@ pub fn run_feedback(
             &wt_j,
             squash,
             &gate,
+            &CancelToken::never(),
         )
         .is_err()
         {
@@ -3492,18 +3843,10 @@ pub fn run_feedback(
 
     match finalize_review(store, &root, &wt_base, id, &prev_ref) {
         Ok(note) => {
-            // RAL-53: regenerate summary from subject lines after the re-stack.
-            let completed: Vec<(i64, String)> = all_branches
-                .iter()
-                .filter(|b| {
-                    b.enabled
-                        && b.project.as_deref().unwrap_or(&guardian.git_root) == branch_project
-                })
-                .map(|b| (b.position, b.branch.clone()))
-                .collect();
-            generate_summary(
-                store, runner, id, &root, &base_sha, &completed, &prev_ref, true,
-            );
+            // RAL-208: request a change-summary regen -- a no-op unless the
+            // enabled-branch set actually changed since the last one (a
+            // feedback restack never does), and debounced when it did.
+            queue_final_summary_regen(store, id);
             // RAL-27/RAL-110: regenerate manual review commands after the
             // re-stack, and try an AI-inferred auto-build if nothing else
             // covered finalize-time verification.
@@ -3514,7 +3857,7 @@ pub fn run_feedback(
                 &root,
                 &base_sha,
                 &prev_ref,
-                Some(&wt_base.join(format!("{id}-review"))),
+                Some(&wt_base.join("review")),
             );
             // RAL-92: re-baseline after applying feedback so the new tips (the
             // edited branch and its restacked downstream) are the reference for
@@ -3526,13 +3869,192 @@ pub fn run_feedback(
     }
 }
 
+/// Fetch `alias` from `remote` and rebase branch `branch_id`'s own unique
+/// commits (since `last_synced_sha`, or their merge-base with the fetched tip
+/// when `last_synced_sha` is unknown or stale) onto the fetched PR-branch tip
+/// (RAL-190) — driving the agent through any conflicts exactly like a normal
+/// stack rebase, so a reviewer's direct push to the open PR branch flows back
+/// into the review worktree instead of being silently discarded on the next
+/// force-push. On success, restacks everything downstream of this branch
+/// (same restack [`rebase_on_manual_push`] performs after a detected manual
+/// push) and re-baselines. Returns `Ok(false)` when the fetched tip was
+/// already contained in the branch's history — nothing to pull.
+///
+/// Delegated to from `crate::pr::pull_pr_commits`, which owns fetching the
+/// PR row, calling this, and pushing the merged result back to the remote
+/// afterward (only this crate module has the rebase/conflict-resolution/
+/// restack machinery `pr.rs` needs to reuse — see that module's doc comment
+/// on why it delegates to `run_feedback` for the analogous text-feedback
+/// case).
+pub fn pull_pr_commits(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+    remote: &str,
+    alias: &str,
+    last_synced_sha: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let guardian = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let branch = guardian
+        .branches
+        .iter()
+        .find(|b| b.id == branch_id)
+        .cloned()
+        .ok_or_else(|| format!("no branch with id {branch_id}"))?;
+    let position = branch.position;
+    let branch_project = branch
+        .project
+        .clone()
+        .unwrap_or_else(|| guardian.git_root.clone());
+    let root = Workspace::for_guardian(store, id, PathBuf::from(&branch_project));
+    let Some(wt_str) = branch.worktree.clone() else {
+        return Err("no review worktree yet; run the merge first".to_string());
+    };
+    let Some(review_ref) = branch.review_branch.clone() else {
+        return Err("no review worktree yet; run the merge first".to_string());
+    };
+    let wt = root.at(PathBuf::from(&wt_str));
+
+    root.git(&["fetch", remote, alias])
+        .map_err(|e| format!("fetch {remote}/{alias} failed: {e}"))?;
+    let fetched = root
+        .git(&["rev-parse", "FETCH_HEAD"])
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    let current_tip = wt
+        .git(&["rev-parse", "HEAD"])
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if root
+        .git(&["merge-base", "--is-ancestor", &fetched, &current_tip])
+        .is_ok()
+    {
+        return Ok(false);
+    }
+
+    let base_for_rebase = match last_synced_sha {
+        Some(sha) if root.git(&["cat-file", "-e", sha]).is_ok() => sha.to_string(),
+        _ => root
+            .git(&["merge-base", &current_tip, &fetched])
+            .map_err(|e| format!("no common history with fetched PR branch: {e}"))?
+            .trim()
+            .to_string(),
+    };
+
+    let claimed = {
+        let g = store.lock().expect("poisoned");
+        matches!(g.get_guardian(id), Ok(gv) if gv.status.as_str() == "in_review")
+            && g.set_guardian_status(
+                id,
+                GuardianStatus::Merging,
+                Some("pulling PR branch commits"),
+            )
+            .is_ok()
+    };
+    if !claimed {
+        return Err(
+            "review is not idle (in_review) -- cannot pull PR commits right now".to_string(),
+        );
+    }
+
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} pulling pr commits branch={branch_id} \
+         from={remote}/{alias} fetched={fetched}"
+    );
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "pr",
+            message: "pulling pr commits into worktree",
+            scope: Some("branch"),
+            run_id: None,
+            guardian_id: Some(id),
+            session_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "branch_id": branch_id,
+                "remote": remote,
+                "alias": alias,
+                "fetched": fetched,
+            }),
+        });
+    }
+
+    let set_status = |s: GuardianStatus, detail: Option<&str>| {
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_guardian_status(id, s, detail);
+    };
+    let final_branch_id: Option<String> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled)
+        .max_by_key(|b| b.position)
+        .map(|b| b.id.clone());
+    let gate = VerifyGate::resolve(store, id, Some(branch_id) == final_branch_id.as_deref());
+    // RAL-213: pulling reviewer-pushed PR commits is a separate flow from a
+    // guardian-settings-triggered merge restart -- see
+    // `run_merge_cancellable`'s doc comment.
+    match drive_rebase(
+        store,
+        id,
+        branch_id,
+        runner,
+        &branch.branch,
+        &wt,
+        &fetched,
+        &base_for_rebase,
+        &review_ref,
+        &gate,
+        &CancelToken::never(),
+    ) {
+        Ok(_) => {
+            let wt_base = root.at(worktree_dir(&branch_project, id));
+            restack_from_position(
+                store,
+                runner,
+                id,
+                &root,
+                &wt_base,
+                &guardian.base_branch,
+                position,
+                &set_status,
+                &CancelToken::never(),
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            set_status(
+                GuardianStatus::MergeFailed,
+                Some(&format!("pulling PR commits: {e}")),
+            );
+            Err(e)
+        }
+    }
+}
+
 /// Poll every review for a base-branch shift and rebuild any that drifted, each
 /// on its own thread. Called periodically by the scheduler loop so that new
 /// commits landing on a review's base branch are picked up automatically.
 /// Sweep all `in_review`/`merge_failed` guardians and rebuild any whose base
 /// branch has shifted. Each spawned worker acquires a slot from `sem` only if
 /// it actually decides to rebuild, so this never blocks unnecessarily.
-pub fn review_maintenance(store: &Arc<Mutex<Store>>, sem: &Arc<Semaphore>) {
+pub fn review_maintenance(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+) {
     let straggler_ids: Vec<String> = {
         let guard = store.lock().expect("poisoned");
         guard.guardians_with_ready_stragglers().unwrap_or_default()
@@ -3540,9 +4062,15 @@ pub fn review_maintenance(store: &Arc<Mutex<Store>>, sem: &Arc<Semaphore>) {
     for id in straggler_ids {
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
+        let cancellations = cancellations.clone();
         std::thread::spawn(move || {
             let runner = crate::runner::SubprocessRunner::from_env();
-            reopen_straggler(&store, &runner, &id, &sem);
+            // RAL-213: register/remove around the merge this may trigger, same
+            // shape as `scheduler::tick`'s run-level wrapping, so a guardian
+            // -settings change made while this reopen is rebuilding can stop it.
+            let token = cancellations.register(&format!("guardian:{id}"));
+            reopen_straggler(&store, &runner, &id, &sem, &token);
+            cancellations.remove(&format!("guardian:{id}"));
         });
     }
 
@@ -3559,15 +4087,21 @@ pub fn review_maintenance(store: &Arc<Mutex<Store>>, sem: &Arc<Semaphore>) {
     for id in ids {
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
+        let cancellations = cancellations.clone();
         std::thread::spawn(move || {
             let runner: Arc<dyn Runner> = Arc::new(
                 crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
             );
+            // RAL-213: one token covers both the base-shift rebuild and (if
+            // that didn't run) the manual-push restack below -- either may
+            // trigger a merge for this guardian id.
+            let token = cancellations.register(&format!("guardian:{id}"));
             // A base-shift rebuild (full re-derive) subsumes any manual push via
             // carry-forward, so only look for a manual push when no rebuild ran.
-            if !rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem) {
+            if !rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem, &token) {
                 rebase_on_manual_push(&store, runner.as_ref(), &id, &sem);
             }
+            cancellations.remove(&format!("guardian:{id}"));
         });
     }
 }
@@ -3589,6 +4123,7 @@ pub fn reopen_straggler(
     runner: &dyn Runner,
     id: &str,
     sem: &Semaphore,
+    cancel: &CancelToken,
 ) -> bool {
     let claimed = {
         let guard = store.lock().expect("poisoned");
@@ -3606,7 +4141,7 @@ pub fn reopen_straggler(
             "ralphus [guardian] review {id} reopened: straggler branch ready"
         );
         let _permit = sem.acquire();
-        run_merge(store, runner, id);
+        run_merge_cancellable(store, runner, id, cancel);
     }
     claimed
 }
@@ -3722,6 +4257,7 @@ pub fn rebase_on_manual_push(
                         guardian_id: Some(id),
                         session_id: None,
                         task: None,
+                        log_path: None,
                         payload: serde_json::json!({"position": position, "old": prev, "new": current}),
                     });
                 }
@@ -3778,9 +4314,13 @@ pub fn rebase_on_manual_push(
             guardian_id: Some(id),
             session_id: None,
             task: None,
+            log_path: None,
             payload: serde_json::json!({"from_position": from_position}),
         });
     }
+    // RAL-213: a manual-push restack is a separate reviewer-driven flow, not a
+    // cancellable merge -- see `run_merge_cancellable`'s doc comment for the
+    // feature this token type serves.
     restack_from_position(
         store,
         runner,
@@ -3790,6 +4330,7 @@ pub fn rebase_on_manual_push(
         &guardian.base_branch,
         from_position,
         &set_status,
+        &CancelToken::never(),
     );
     true
 }
@@ -3807,6 +4348,7 @@ pub fn rebuild_on_base_shift(
     runner: &dyn Runner,
     id: &str,
     sem: &Semaphore,
+    cancel: &CancelToken,
 ) -> bool {
     let guardian = match store.lock().expect("poisoned").get_guardian(id) {
         Ok(g) => g,
@@ -3866,7 +4408,7 @@ pub fn rebuild_on_base_shift(
     };
     if claimed {
         let _permit = sem.acquire();
-        run_merge(store, runner, id);
+        run_merge_cancellable(store, runner, id, cancel);
         true
     } else {
         false
@@ -3883,7 +4425,6 @@ fn stack_pick(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
     id: &str,
-    position: i64,
     branch_id: &str,
     feature_branch: &str,
     base_sha: &str,
@@ -3892,6 +4433,7 @@ fn stack_pick(
     wt: &Workspace,
     squash: bool,
     gate: &VerifyGate,
+    cancel: &CancelToken,
 ) -> std::result::Result<(), ()> {
     let set_status = |s: GuardianStatus, d: Option<&str>| {
         let _ = store
@@ -3902,7 +4444,6 @@ fn stack_pick(
     match drive_rebase(
         store,
         id,
-        position,
         branch_id,
         runner,
         feature_branch,
@@ -3911,6 +4452,7 @@ fn stack_pick(
         base_sha,
         rev,
         gate,
+        cancel,
     ) {
         Ok((outcome, session_id)) => {
             let (status, detail): (MergeStatus, Option<String>) = match outcome {
@@ -3942,6 +4484,11 @@ fn stack_pick(
             Ok(())
         }
         Err(e) => {
+            // RAL-213: a cancelled merge is already logged by `drive_rebase`'s
+            // own checkpoint -- never mark the branch/guardian failed for it.
+            if cancel.is_cancelled() {
+                return Err(());
+            }
             fail_branch(store, id, branch_id, feature_branch, &e, &set_status);
             Err(())
         }
@@ -3988,11 +4535,19 @@ fn final_checks(
     root: &Workspace,
     combined_str: &str,
 ) -> std::result::Result<Option<String>, String> {
-    let (skip_auto_build, checks) = {
+    let (skip_auto_build, checks, env) = {
         let guard = store.lock().expect("poisoned");
         (
             guard.guardian_skip_auto_build(id).unwrap_or(false),
             guard.guardian_checks(id).unwrap_or_default(),
+            // RAL-203: run under the same environment the combined worktree's
+            // branches were built with (`combined_env`), plus this review's
+            // own build-step overrides -- a check gate like `cargo test` is
+            // worthless if it runs without the variables the code expects.
+            guard
+                .get_guardian(id)
+                .map(|g| g.build_env)
+                .unwrap_or_default(),
         )
     };
 
@@ -4001,7 +4556,7 @@ fn final_checks(
     }
     if !checks.is_empty() {
         for cmd in &checks {
-            if !root.at(combined_str).run_command(cmd).0 {
+            if !root.at(combined_str).run_command_with_env(cmd, &env).0 {
                 return Err(format!("check failed: {cmd}"));
             }
         }
@@ -4014,7 +4569,7 @@ fn final_checks(
     // inference next.
     match crate::config::resolve(root.root()).auto_build {
         Some(cmd) => {
-            if !root.at(combined_str).run_command(&cmd).0 {
+            if !root.at(combined_str).run_command_with_env(&cmd, &env).0 {
                 return Err(format!("auto-build failed: {cmd}"));
             }
             Ok(Some(format!("auto-built via project default: {cmd}")))
@@ -4214,21 +4769,128 @@ fn rebuild_combined(
     prev_ref: &str,
 ) -> std::result::Result<String, String> {
     let combined_branch = format!("guardian/{id}/review");
-    let wt_name = format!("{id}-review");
-    let combined_wt = wt_base.join(&wt_name);
+    let combined_wt = wt_base.join("review");
     let combined_str = combined_wt.root().to_string_lossy().to_string();
     worktree_add_or_reset(root, &combined_branch, &combined_wt, prev_ref)?;
-    let guard = store.lock().expect("poisoned");
-    let _ = guard.set_guardian_review_branch(id, &combined_branch);
-    let _ = guard.set_guardian_combined_worktree(id, &combined_str);
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.set_guardian_review_branch(id, &combined_branch);
+        let _ = guard.set_guardian_combined_worktree(id, &combined_str);
+    }
+    regenerate_readme(store, root);
     Ok(combined_str)
 }
 
+/// Regenerate `.git/.ralphus/README.md` for the project at `root`, listing
+/// every currently-registered guardian's short-name -> branch mapping so a
+/// human who opens the folder can tell what e.g. `g/g56/wt-RAL-121` refers
+/// to. Called after every successful merge/rebuild.
+///
+/// Best-effort: a write failure here must never fail the review itself, so
+/// errors are swallowed rather than propagated.
+fn regenerate_readme(store: &Arc<Mutex<Store>>, root: &Workspace) {
+    let guardians = store
+        .lock()
+        .expect("poisoned")
+        .list_guardians()
+        .unwrap_or_default();
+    let mut mappings: Vec<(String, String)> = Vec::new();
+    for gv in guardians
+        .iter()
+        .filter(|gv| Path::new(&gv.git_root) == root.root())
+    {
+        let short_id = crate::short_paths::guardian_short_id(&gv.id);
+        for b in &gv.branches {
+            let Some(wt) = &b.worktree else { continue };
+            let Some(name) = Path::new(wt).file_name() else {
+                continue;
+            };
+            mappings.push((
+                format!("g/{short_id}/{}", name.to_string_lossy()),
+                b.branch.clone(),
+            ));
+        }
+        if gv.combined_worktree.is_some() {
+            mappings.push((
+                format!("g/{short_id}/review"),
+                format!("combined review for guardian \"{}\"", gv.name),
+            ));
+        }
+    }
+    mappings.sort();
+    let readme = crate::short_paths::render_readme(&mappings);
+    let _ = root.write_file(
+        Path::new(".git").join(".ralphus").join("README.md"),
+        &readme,
+    );
+}
+
+/// The extra characters a per-branch or combined review worktree directory
+/// name can add under a guardian's `wt_base` -- `"wt-"` (3) plus a
+/// 12-character truncated branch name, plus headroom for a `-99`-style
+/// collision suffix. Used as a conservative stand-in for the real worktree
+/// path in [`preflight_worktree_budget`], which runs once per project build
+/// rather than once per branch: every review branch in a project starts from
+/// the same snapshotted base tree, so one measurement of it (per the RAL-211
+/// ticket's own guidance) covers the whole stack before any review branch
+/// worktree exists.
+const WORST_CASE_WT_SUFFIX_LEN: usize = 3 + 12 + 3; // "wt-" + 12 chars + "-99"
+
+/// OS path-length budget a worktree checkout is held to -- mirrors
+/// `crate::worktrees::path_budget_limit`'s identical rationale (Windows'
+/// `MAX_PATH` is 260 characters; other platforms' limits are high enough in
+/// practice that enforcing this there too would only produce false failures).
+fn path_budget_limit() -> usize {
+    if cfg!(windows) { 260 } else { usize::MAX }
+}
+
+/// Preflight (RAL-211): before this project's branches start materializing
+/// worktrees under `wt_base`, measure whether the deepest tracked path in
+/// `git_ref` (the snapshotted base) would overflow [`path_budget_limit`] once
+/// combined with `wt_base` plus a worst-case per-branch directory name, and
+/// fail with the arithmetic spelled out rather than letting a `git worktree
+/// add` deep in the stack fail with an opaque `Filename too long`.
+///
+/// Reads the tree from the object database (`git ls-tree`, not `ls-files`) --
+/// no checkout, no network.
+fn preflight_worktree_budget(
+    root: &Workspace,
+    wt_base: &Workspace,
+    git_ref: &str,
+) -> Result<(), String> {
+    preflight_worktree_budget_with_limit(root, wt_base, git_ref, path_budget_limit())
+}
+
+/// [`preflight_worktree_budget`] with the limit taken as a plain parameter
+/// rather than read from [`path_budget_limit`], so it is testable without
+/// depending on the host OS.
+fn preflight_worktree_budget_with_limit(
+    root: &Workspace,
+    wt_base: &Workspace,
+    git_ref: &str,
+    limit: usize,
+) -> Result<(), String> {
+    if limit == usize::MAX {
+        return Ok(());
+    }
+    let listing = root
+        .git(&["ls-tree", "-r", "-z", "--name-only", git_ref])
+        .map_err(|e| {
+            format!("could not measure \"{git_ref}\" for a worktree path preflight check: {e}")
+        })?;
+    let worst_case = wt_base.root().join("x".repeat(WORST_CASE_WT_SUFFIX_LEN));
+    crate::short_paths::check_worktree_path_budget(&worst_case, &listing, limit)
+}
+
 /// Remove every review worktree/branch this guardian created previously, so a
-/// re-merge starts from a clean slate. Worktrees are matched by the guardian id
-/// appearing in their path. Branches are removed via `for-each-ref` covering the
-/// current naming (`guardian/<id>/*`) and the legacy `guardian/<num>/*` scheme for
-/// reviews built before RAL-63, plus the interim `review`/`review-*` names.
+/// re-merge starts from a clean slate. Worktrees are matched against
+/// `wt_base` (the guardian's own `.git/.ralphus/g/g<n>` directory) by path
+/// component, not substring -- see [`crate::short_paths::worktree_belongs_to_guardian`]
+/// for why a substring match on a short id is unsafe (`g56` would match a
+/// worktree actually belonging to `g560`). Branches are removed via
+/// `for-each-ref` covering the current naming (`guardian/<id>/*`) and the
+/// legacy `guardian/<num>/*` scheme for reviews built before RAL-63, plus the
+/// interim `review`/`review-*` names.
 fn cleanup_review_worktrees(
     root: &Workspace,
     wt_base: &Workspace,
@@ -4242,7 +4904,7 @@ fn cleanup_review_worktrees(
     for line in list.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             let path = path.trim();
-            if path.contains(id) {
+            if crate::short_paths::worktree_belongs_to_guardian(path, wt_base.root(), id) {
                 // Unlock first so that a locked worktree does not block removal.
                 let _ = root.git(&["worktree", "unlock", path]);
                 // Two --force flags handle dirty/untracked (first) and locked (second).
@@ -4262,9 +4924,11 @@ fn cleanup_review_worktrees(
     for branch in old_review_branches {
         let _ = root.git(&["branch", "-D", branch]);
     }
-    let refs = git(
-        root.root(),
-        &[
+    // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
+    // machine sitting right next to the correctly-routed calls in this same
+    // function.
+    let refs = root
+        .git(&[
             "for-each-ref",
             "--format=%(refname:short)",
             // Current naming: guardian/<id>/wt-* and guardian/<id>/review.
@@ -4276,9 +4940,8 @@ fn cleanup_review_worktrees(
             // Interim naming used between the two schemes: bare `review` and `review-*`.
             "refs/heads/review",
             "refs/heads/review-*",
-        ],
-    )
-    .unwrap_or_default();
+        ])
+        .unwrap_or_default();
     for branch in refs.lines().map(str::trim).filter(|b| !b.is_empty()) {
         let _ = root.git(&["branch", "-D", branch]);
     }
@@ -4375,7 +5038,6 @@ pub(crate) fn resolve_base(
 fn drive_rebase(
     store: &Arc<Mutex<Store>>,
     id: &str,
-    position: i64,
     branch_id: &str,
     runner: &dyn Runner,
     feature: &str,
@@ -4384,7 +5046,12 @@ fn drive_rebase(
     base_sha: &str,
     branch_arg: &str,
     gate: &VerifyGate,
+    cancel: &CancelToken,
 ) -> std::result::Result<(RebaseOutcome, Option<String>), String> {
+    if cancel.is_cancelled() {
+        log_merge_cancelled(store, id);
+        return Err("cancelled".to_string());
+    }
     // Remove untracked files before rebasing. `git rebase --onto <newbase>` fails
     // with "untracked working tree files would be overwritten by checkout" when the
     // worktree contains a file that is tracked in `newbase` but untracked here —
@@ -4422,7 +5089,6 @@ fn drive_rebase(
             let (verify_session_id, verify_detail) = run_final_verify(
                 store,
                 id,
-                position,
                 branch_id,
                 runner,
                 wt,
@@ -4438,6 +5104,10 @@ fn drive_rebase(
             ))
         }
         Err(e) => {
+            if cancel.is_cancelled() {
+                log_merge_cancelled(store, id);
+                return Err("cancelled".to_string());
+            }
             let conflicts = conflicted_files(wt);
             if conflicts.is_empty() && !rebase_in_progress(wt) {
                 // Genuine failure with no conflict to resolve (e.g. a bad ref): abort clean.
@@ -4463,17 +5133,23 @@ fn drive_rebase(
                         guardian_id: Some(id),
                         session_id: None,
                         task: None,
+                        log_path: None,
                         payload: serde_json::json!({"branch": feature}),
                     });
                 }
                 let (agent, model) = resolver_backend(store, id);
                 match resolve_conflicts_with_agent(
-                    store, id, position, branch_id, runner, wt, feature, &agent, &model, gate,
+                    store, id, branch_id, runner, wt, feature, &agent, &model, gate, cancel,
                 ) {
                     Ok((session_id, verify_detail)) => {
                         Ok((RebaseOutcome::Resolved(verify_detail), session_id))
                     }
                     Err(re) => {
+                        if cancel.is_cancelled() {
+                            // Already logged by `resolve_conflicts_with_agent`'s own
+                            // checkpoint -- just propagate without a destructive abort.
+                            return Err(re);
+                        }
                         let _ = wt.git(&["rebase", "--abort"]);
                         Err(re)
                     }
@@ -4546,15 +5222,15 @@ fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
 
 /// RAL-103: Recompute a preliminary, git-log-only change summary from each
 /// not-yet-reviewed ready branch's OWN task worktree (the source session's
-/// `cwd` — never a review-owned worktree). Unlike [`generate_summary`], this
-/// never calls an LLM, so it is cheap enough to recompute synchronously every
-/// time another branch reaches `Ready`, while the guardian is still
+/// `cwd` — never a review-owned worktree). Unlike [`generate_final_summary`],
+/// this never calls an LLM, so it is cheap enough to recompute synchronously
+/// every time another branch reaches `Ready`, while the guardian is still
 /// `collecting` (before any review worktree exists for those branches).
 ///
 /// A branch stops contributing here — and starts being covered by
-/// [`generate_summary`]'s agent-authored final summary instead — once it has
-/// a review worktree (`BranchView.worktree.is_some()`), i.e. once its stacked
-/// rebase has run at least once.
+/// [`generate_final_summary`]'s agent-authored final summary instead — once
+/// it has a review worktree (`BranchView.worktree.is_some()`), i.e. once its
+/// stacked rebase has run at least once.
 ///
 /// A no-op (leaves `change_summary` untouched) when no qualifying branch has
 /// any commits to show — that "nothing ready yet" state is instead surfaced
@@ -4571,6 +5247,13 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
     struct Candidate {
         branch: String,
         cwd: String,
+        // RAL-201: the *producing task session's* machine, not the review's
+        // -- this function explicitly reads each branch's own task worktree
+        // (see the doc comment above), which per RAL-185 D3/D4 may be a
+        // different machine than the review this guardian will eventually
+        // run on, or no machine at all when the review itself is remote but
+        // this task ran locally.
+        machine: Option<String>,
     }
     let (base_branch, candidates) = {
         let guard = store.lock().expect("store mutex poisoned");
@@ -4589,6 +5272,7 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
                     .map(|cwd| Candidate {
                         branch: b.branch.clone(),
                         cwd,
+                        machine: b.source_session_machine.clone(),
                     })
             })
             .collect::<Vec<_>>();
@@ -4601,22 +5285,27 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
     // makes each subsequent section accumulate all prior branches' commits
     // too. Diff against a running `prev_sha` instead -- seeded to
     // `base_branch`, then advanced to each candidate's own HEAD after it's
-    // processed -- mirroring `generate_summary`'s `prev..branch_ref` dedup.
+    // processed -- mirroring `generate_final_summary`'s `prev..branch_ref` dedup.
     let mut sections: Vec<String> = Vec::new();
     let mut prev_sha = base_branch.clone();
     for c in &candidates {
-        let log = git(
-            Path::new(&c.cwd),
-            &["log", "--format=%s", &format!("{prev_sha}..HEAD")],
-        )
-        .unwrap_or_default();
+        // RAL-201: was `git(Path::new(&c.cwd), ...)`, a direct bypass of this
+        // branch's own producing machine -- built once and reused for both
+        // calls below, rather than only for the `rev-parse` that already
+        // used it. Deliberately `Workspace::on` + this branch's own
+        // `source_session_machine`, not `Workspace::for_guardian` -- the
+        // review's own machine assignment does not apply to a branch that
+        // has no review worktree yet.
+        let cwd =
+            Workspace::on(Path::new(&c.cwd), c.machine.as_deref()).with_store(Arc::clone(store));
+        let log = cwd
+            .git(&["log", "--format=%s", &format!("{prev_sha}..HEAD")])
+            .unwrap_or_default();
         let log = log.trim();
         if !log.is_empty() {
             sections.push(format!("{}:\n{log}", c.branch));
         }
-        if let Ok(head_sha) =
-            Workspace::for_guardian(store, id, Path::new(&c.cwd)).git(&["rev-parse", "HEAD"])
-        {
+        if let Ok(head_sha) = cwd.git(&["rev-parse", "HEAD"]) {
             prev_sha = head_sha.trim().to_string();
         }
     }
@@ -4647,109 +5336,198 @@ fn branch_summary_label(branch: &str) -> String {
     branch.to_string()
 }
 
-/// Generate the cross-branch change summary for a guardian using the resolver
-/// agent. Called after the stack is fully assembled (`is_final=true` organises
-/// output per-branch when individual refs exist; otherwise uses the combined log).
-/// A single call covers every branch in `completed` at once (never one call per
-/// branch), so the agent can synthesize/collapse redundant items across branches.
+/// RAL-208: minimum quiet period after the last [`queue_final_summary_regen`]
+/// request before [`sweep_pending_summaries`] actually fires the LLM call --
+/// keeps rapid enable/disable toggling (each of which triggers a full
+/// `run_merge`) from producing one LLM call per toggle. The debounce clock
+/// restarts on every new request for the same guardian, so only the toggle
+/// that settles for this long actually regenerates the summary.
+const FINAL_SUMMARY_DEBOUNCE_MS: i64 = 5_000;
+
+/// RAL-208: identifies which branches (and in what stack order) fed a
+/// guardian's LLM-authored final change summary. Two builds with the same
+/// enabled branches in the same order hash to the same signature, so
+/// [`Store::request_final_summary`] recognises a rebuild that didn't actually
+/// add/remove/reorder a branch (a feedback restack, a manual-push rebase, a
+/// base-branch shift) and skips requeuing a regen for it -- only an actual
+/// enable/disable changes the signature.
+fn enabled_branch_signature(branches: &[crate::guardian::BranchView]) -> String {
+    branches
+        .iter()
+        .filter(|b| b.enabled)
+        .map(|b| b.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// RAL-208: request that guardian `id`'s LLM-authored final change summary be
+/// regenerated to reflect its current enabled-branch set. Safe to call after
+/// every rebuild (a plain re-stack, a manual-push rebase, a base-branch
+/// shift, an enable/disable toggle) -- [`Store::request_final_summary`] is a
+/// no-op unless the enabled-branch set actually changed since the summary
+/// currently stored was generated, and otherwise (re)starts the debounce
+/// window that [`sweep_pending_summaries`] waits out before actually calling
+/// the LLM.
+pub(crate) fn queue_final_summary_regen(store: &Arc<Mutex<Store>>, id: &str) {
+    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+        return;
+    };
+    let signature = enabled_branch_signature(&guardian.branches);
+    store
+        .lock()
+        .expect("poisoned")
+        .request_final_summary(id, &signature, crate::store::now_ms());
+}
+
+/// RAL-208: fire the LLM change-summary call for every guardian whose
+/// debounce window (see [`FINAL_SUMMARY_DEBOUNCE_MS`]) has elapsed since its
+/// last [`queue_final_summary_regen`] request. Called periodically from
+/// `scheduler::run_loop`, mirroring [`review_maintenance`]'s pattern: this
+/// function itself only claims the due ids (a quick, non-blocking store op)
+/// and spawns one thread per guardian -- gated on `sem`, the same global
+/// concurrency cap every other LLM call shares -- to actually run the
+/// (potentially slow) LLM call, so the scheduler tick that called this never
+/// blocks on one.
+pub fn sweep_pending_summaries(store: &Arc<Mutex<Store>>, sem: &Arc<Semaphore>) {
+    let due = store
+        .lock()
+        .expect("poisoned")
+        .take_due_final_summary_requests(crate::store::now_ms(), FINAL_SUMMARY_DEBOUNCE_MS);
+    for (id, signature) in due {
+        let store = Arc::clone(store);
+        let sem = Arc::clone(sem);
+        std::thread::spawn(move || {
+            let _permit = sem.acquire();
+            let runner: Arc<dyn Runner> = Arc::new(
+                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
+            );
+            generate_final_summary(&store, runner.as_ref(), &id, &signature);
+        });
+    }
+}
+
+/// RAL-208: (re)generate guardian `id`'s LLM-authored final change summary
+/// across every project it spans, from the persisted `guardian/<id>/wt-<branch>`
+/// review refs (falling back to the shared `guardian/<id>/review` combined ref
+/// for a project built with `skip_worktrees`, which never gets per-branch
+/// refs). Reconstructed fresh from the store rather than carried from a
+/// `run_merge` call's local state, since this runs on a background sweep well
+/// after that call's thread has already finished.
 ///
-/// The result is stored as `change_summary` on the guardian and surfaced in the
-/// review detail pane. Failures are silent — a missing summary is better than a
-/// crashed merge thread.
+/// A single call covers every enabled branch across every project -- unlike
+/// the pre-RAL-208 per-project calls, which each overwrote the previous
+/// project's result in a multi-project guardian, this can never leave any
+/// project's branches unrepresented in the final summary.
+///
+/// The result is stored as `change_summary` on the guardian and surfaced in
+/// the review detail pane. Failures are silent — a missing summary is better
+/// than a crashed sweep -- and leave `signature` unmarked, so the next
+/// request for the same signature (e.g. the next sweep tick, or a future
+/// unrelated toggle) retries rather than being treated as already-satisfied.
 ///
 /// RAL-53: uses commit subject lines only (no diffs) so the output describes
 /// developer intent rather than low-level file changes.
 ///
-/// RAL-124: whether the output is a one-bullet-per-branch list (default) or the
-/// original prose paragraph is controlled by `[review] summary_format` in
+/// RAL-124: whether the output is a one-bullet-per-branch list (default) or
+/// the original prose paragraph is controlled by `[review] summary_format` in
 /// `.ralphus.toml`/global config (see [`crate::config::ReviewConfig::bullet_summary`]).
 /// In bullet mode, each branch is labelled with [`branch_summary_label`] --
 /// its ticket id when the branch name starts with one, else the branch name
 /// itself -- and the agent is instructed to use that exact label per bullet.
-#[allow(clippy::too_many_arguments)]
-fn generate_summary(
+fn generate_final_summary(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
     id: &str,
-    root: &Workspace,
-    base_sha: &str,
-    completed: &[(i64, String)],
-    tip_ref: &str,
-    is_final: bool,
+    signature: &str,
 ) {
-    if completed.is_empty() {
+    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+        return;
+    };
+    let enabled: Vec<&crate::guardian::BranchView> =
+        guardian.branches.iter().filter(|b| b.enabled).collect();
+    if enabled.is_empty() {
         return;
     }
+    let ws_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
 
-    // Collect per-branch subject lines using the per-branch review refs
-    // (`guardian/<id>/wt-<branch>`). Falls back to the combined log if the refs
-    // don't exist (e.g. skip-worktrees path, where all branches share one ref).
-    let (has_per_branch_refs, context) = if is_final {
-        let first_ref = completed
-            .first()
-            .map(|(_, branch)| format!("guardian/{id}/wt-{branch}"));
-        let has = first_ref.is_some_and(|r| root.git(&["rev-parse", "--verify", &r]).is_ok());
-        if has {
-            let mut prev = base_sha.to_string();
-            let mut lines: Vec<String> = Vec::new();
-            for (_, branch_name) in completed {
-                let branch_ref = format!("guardian/{id}/wt-{branch_name}");
-                let b_log = git(
-                    root.root(),
-                    &["log", "--format=%s", &format!("{prev}..{branch_ref}")],
-                )
-                .unwrap_or_default();
+    // Group by project, preserving stack (position) order within each project
+    // and the order projects first appear -- mirrors `run_merge`'s own grouping.
+    let mut project_order: Vec<String> = Vec::new();
+    let mut by_project: std::collections::HashMap<String, Vec<&crate::guardian::BranchView>> =
+        std::collections::HashMap::new();
+    for b in &enabled {
+        let proj = b
+            .project
+            .clone()
+            .unwrap_or_else(|| guardian.git_root.clone());
+        if !by_project.contains_key(&proj) {
+            project_order.push(proj.clone());
+        }
+        by_project.entry(proj).or_default().push(b);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for proj in &project_order {
+        let branches = &by_project[proj];
+        let Some(base_sha) = guardian.base_commits.get(proj) else {
+            continue;
+        };
+        let root = ws_root.at(PathBuf::from(proj));
+        let first_ref = format!("guardian/{id}/wt-{}", branches[0].branch);
+        if root.git(&["rev-parse", "--verify", &first_ref]).is_ok() {
+            let mut prev = base_sha.clone();
+            for b in branches {
+                let branch_ref = format!("guardian/{id}/wt-{}", b.branch);
+                // RAL-201: was `git(root.root(), ...)`, a direct bypass of
+                // `root`'s machine.
+                let b_log = root
+                    .git(&["log", "--format=%s", &format!("{prev}..{branch_ref}")])
+                    .unwrap_or_default();
                 if !b_log.trim().is_empty() {
-                    let label = branch_summary_label(branch_name);
-                    lines.push(format!("{label}:\n{b_log}"));
+                    lines.push(format!(
+                        "{}:\n{}",
+                        branch_summary_label(&b.branch),
+                        b_log.trim()
+                    ));
                 }
                 prev = branch_ref;
             }
-            let ctx = if lines.is_empty() {
-                return;
-            } else {
-                lines.join("\n\n")
-            };
-            (true, ctx)
         } else {
-            (false, String::new())
+            // `skip_worktrees`: no per-branch refs exist for this project --
+            // fall back to the shared combined ref, labelling the section
+            // with every branch this project contributed.
+            let combined_ref = format!("guardian/{id}/review");
+            // RAL-201: was `git(root.root(), ...)`, a direct bypass of
+            // `root`'s machine.
+            let log = root
+                .git(&["log", "--format=%s", &format!("{base_sha}..{combined_ref}")])
+                .unwrap_or_default();
+            if !log.trim().is_empty() {
+                let labels = branches
+                    .iter()
+                    .map(|b| branch_summary_label(&b.branch))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("{labels}:\n{}", log.trim()));
+            }
         }
-    } else {
-        (false, String::new())
-    };
-
-    let branch_labels = completed
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let context = lines.join("\n\n");
+    let branch_labels = enabled
         .iter()
-        .map(|(_, n)| branch_summary_label(n))
+        .map(|b| branch_summary_label(&b.branch))
         .collect::<Vec<_>>()
         .join(", ");
 
-    let context = if has_per_branch_refs {
-        context
-    } else {
-        let log = git(
-            root.root(),
-            &["log", "--format=%s", &format!("{base_sha}..{tip_ref}")],
-        )
-        .unwrap_or_default();
-        if log.trim().is_empty() {
-            return;
-        }
-        format!("Branches: [{branch_labels}]\n\n{log}")
-    };
+    let a = resolver_agent(guardian.resolver_agent.as_deref());
+    let m = resolver_model(guardian.resolver_model.as_deref(), &a);
+    let (agent, model) = (a, m);
+    let cwd = ws_root.root().to_string_lossy().into_owned();
 
-    let (agent, model) = {
-        let guard = store.lock().expect("poisoned");
-        let g = guard.get_guardian(id).ok();
-        let stored_agent = g.as_ref().and_then(|g| g.resolver_agent.clone());
-        let stored_model = g.and_then(|g| g.resolver_model.clone());
-        let a = resolver_agent(stored_agent.as_deref());
-        let m = resolver_model(stored_model.as_deref(), &a);
-        (a, m)
-    };
-    let cwd = root.root().to_string_lossy().into_owned();
-
-    let prompt = if crate::config::resolve(root.root()).bullet_summary() {
+    let prompt = if crate::config::resolve(ws_root.root()).bullet_summary() {
         format!(
             "You are summarising a stacked code review made up of the branches \
              [{branch_labels}]. The following are commit subject lines for each \
@@ -4757,11 +5535,12 @@ fn generate_summary(
              with EXACTLY one bullet per branch, each on its own line in the \
              form `- <label>: <description>`, where <label> is exactly one of \
              the branch labels given above (do not invent or reformat it). \
-             Each description must be a single concise line focused on \
-             developer intent, not file-level details. You may simplify or \
-             collapse redundant detail within a bullet, but every branch \
-             listed above must be represented by exactly one bullet. Respond \
-             with ONLY the bullet list — no preamble, no trailing remarks.\
+             Each bullet must be a SINGLE LINE, no more than 80 characters \
+             total, focused on developer intent, not file-level details. You \
+             may simplify or collapse redundant detail within a bullet, but \
+             every branch listed above must be represented by exactly one \
+             bullet. Respond with ONLY the bullet list — no preamble, no \
+             trailing remarks.\
              \n\n{context}"
         )
     } else {
@@ -4795,17 +5574,19 @@ fn generate_summary(
         trace_context: None,
         resume_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
-        machine: None,
+        // RAL-201: route to the same machine `cwd` (derived from `ws_root`)
+        // is actually on -- see the identical fix in
+        // `resolve_conflicts_with_agent`.
+        machine: ws_root.machine().map(str::to_string),
     };
     let result = runner.run(&spec);
+    let _ = record_guardian_call_cost(store, id, None, "summary", &result);
     if result.is_done() && !result.summary.trim().is_empty() {
         // RAL-88: record which resolved agent/model produced this summary.
-        let _ = store.lock().expect("poisoned").set_guardian_summary(
-            id,
-            &result.summary,
-            Some(agent.as_str()),
-            model.as_deref(),
-        );
+        let mut guard = store.lock().expect("poisoned");
+        let _ =
+            guard.set_guardian_summary(id, &result.summary, Some(agent.as_str()), model.as_deref());
+        guard.mark_final_summary_generated(id, signature);
     }
 }
 
@@ -5008,7 +5789,7 @@ fn generate_manual_commands(
     let skip_ai_build =
         worktree.is_none() || skip_auto_build || has_explicit_checks || has_config_auto_build;
 
-    let (cwd, prompt) = if let Some(wt) = worktree {
+    let (cwd, machine, prompt) = if let Some(wt) = worktree {
         // Worktree path: embed only the --stat output (always compact — one line
         // per changed file). Never embed the full diff; it can be arbitrarily
         // large and would blow OS command-line limits in harness backends.
@@ -5016,34 +5797,33 @@ fn generate_manual_commands(
         if stat.trim().is_empty() {
             return None;
         }
-        let log = git(
-            root.root(),
-            &["log", "--format=%s", &format!("{base_sha}..{tip_ref}")],
-        )
-        .unwrap_or_default();
+        // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
+        // machine -- `root.git(...)` routes through the provider when `root`
+        // is remote, exactly like the `wt.git(...)` call just above.
+        let log = root
+            .git(&["log", "--format=%s", &format!("{base_sha}..{tip_ref}")])
+            .unwrap_or_default();
         let tail = format!("Changed files (stat):\n{stat}\n\nCommit messages:\n{log}");
         (
             wt.root().to_string_lossy().into_owned(),
+            wt.machine().map(str::to_string),
             manual_commands_prompt(&tail, !skip_ai_build),
         )
     } else {
         // Fallback: list changed file names from the repository root. The file
         // list is always small, so it is safe to embed directly.
-        let files = match git(
-            root.root(),
-            &["diff", "--name-only", &format!("{base_sha}..{tip_ref}")],
-        ) {
+        // RAL-201: same `root.git(...)` fix as above.
+        let files = match root.git(&["diff", "--name-only", &format!("{base_sha}..{tip_ref}")]) {
             Ok(s) if !s.trim().is_empty() => s,
             _ => return None,
         };
-        let log = git(
-            root.root(),
-            &["log", "--format=%s", &format!("{base_sha}..{tip_ref}")],
-        )
-        .unwrap_or_default();
+        let log = root
+            .git(&["log", "--format=%s", &format!("{base_sha}..{tip_ref}")])
+            .unwrap_or_default();
         let tail = format!("Changed files:\n{files}\n\nCommit messages:\n{log}");
         (
             root.root().to_string_lossy().into_owned(),
+            root.machine().map(str::to_string),
             manual_commands_prompt(&tail, false),
         )
     };
@@ -5079,7 +5859,8 @@ fn generate_manual_commands(
         trace_context: None,
         resume_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
-        machine: None,
+        // RAL-201: matches whichever workspace `cwd` above was derived from.
+        machine,
     };
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -5111,6 +5892,7 @@ fn generate_manual_commands(
     });
 
     let result = runner.run(&spec);
+    let _ = record_guardian_call_cost(store, id, None, "manual_commands", &result);
 
     stop.store(true, Ordering::Relaxed);
     let _ = watcher.join();
@@ -5163,6 +5945,7 @@ fn generate_manual_commands(
                 guardian_id: Some(id),
                 session_id: None,
                 task: None,
+                log_path: None,
                 payload: serde_json::json!({"command": cmd}),
             });
     Some(if ok {
@@ -5201,13 +5984,13 @@ pub(crate) fn resolve_check_input(
     command: &str,
     input: &CheckInput,
 ) {
-    let Some((cwd, agent, model)) = ({
+    let Some((cwd, agent, model, machine)) = ({
         let guard = store.lock().expect("poisoned");
         guard.get_guardian(guardian_id).ok().map(|g| {
             let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
             let a = resolver_agent(g.resolver_agent.as_deref());
             let m = resolver_model(g.resolver_model.as_deref(), &a);
-            (cwd, a, m)
+            (cwd, a, m, g.machine)
         })
     }) else {
         let guard = store.lock().expect("poisoned");
@@ -5236,10 +6019,12 @@ pub(crate) fn resolve_check_input(
         trace_context: None,
         resume_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
-        machine: None,
+        // RAL-201: route to the review's assigned machine, matching `cwd`.
+        machine,
     };
 
     let result = runner.run(&spec);
+    let _ = record_guardian_call_cost(store, guardian_id, None, "check_input", &result);
     let guard = store.lock().expect("poisoned");
     if !result.is_done() || result.summary.trim().is_empty() {
         let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
@@ -5319,6 +6104,132 @@ mod tests {
             "git {args:?} in {} failed",
             root.display()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Guardian cost tracking (RAL-193)
+    // -----------------------------------------------------------------------
+
+    fn fake_result(tokens_in: i64, tokens_out: i64, cost_usd: f64) -> RunnerResult {
+        RunnerResult {
+            status: "done".into(),
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            summary: String::new(),
+            error: None,
+            verified: None,
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+
+    #[test]
+    fn record_guardian_call_cost_records_line_item_and_updates_view_totals() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = store
+            .lock()
+            .unwrap()
+            .create_guardian("r", "main", "/repo")
+            .unwrap();
+        let result = fake_result(100, 40, 0.01);
+
+        let outcome = record_guardian_call_cost(&store, &id, None, "resolve_conflict", &result);
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(g.cumulative_tokens_in, 100);
+        assert_eq!(g.cumulative_tokens_out, 40);
+        assert!((g.cumulative_cost_usd - 0.01).abs() < 1e-9);
+        // No merge attempt was ever bumped -- still attributed to attempt 0.
+        assert_eq!(g.attempt_tokens_in, 100);
+    }
+
+    #[test]
+    fn record_guardian_call_cost_without_a_cap_never_errors() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = store
+            .lock()
+            .unwrap()
+            .create_guardian("r", "main", "/repo")
+            .unwrap();
+        let expensive = fake_result(1_000_000, 1_000_000, 500.0);
+        assert!(
+            record_guardian_call_cost(&store, &id, None, "resolve_conflict", &expensive).is_ok()
+        );
+    }
+
+    #[test]
+    fn record_guardian_call_cost_errors_once_cumulative_exceeds_cap() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = store
+            .lock()
+            .unwrap()
+            .create_guardian("r", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_maximum_budget_usd(&id, Some(0.05))
+            .unwrap();
+
+        // Under the cap: no error, and it's still recorded.
+        let under = fake_result(10, 10, 0.02);
+        assert!(record_guardian_call_cost(&store, &id, None, "resolve_conflict", &under).is_ok());
+
+        // This call's own cost pushes the cumulative total over the cap.
+        let pushes_over = fake_result(10, 10, 0.05);
+        let err = record_guardian_call_cost(&store, &id, None, "verify", &pushes_over);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("maximum_budget_usd"));
+
+        // Both calls were still recorded despite the second exceeding the cap --
+        // the caller decides whether/how to stop, this function only reports it.
+        let (_, _, cumulative) = store.lock().unwrap().guardian_cost_total(&id).unwrap();
+        assert!((cumulative - 0.07).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_guardian_call_cost_attributes_to_current_merge_attempt() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = store
+            .lock()
+            .unwrap()
+            .create_guardian("r", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .bump_guardian_merge_attempt(&id)
+            .unwrap(); // attempt 1
+        record_guardian_call_cost(
+            &store,
+            &id,
+            None,
+            "resolve_conflict",
+            &fake_result(10, 5, 0.01),
+        )
+        .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .bump_guardian_merge_attempt(&id)
+            .unwrap(); // attempt 2
+        record_guardian_call_cost(
+            &store,
+            &id,
+            None,
+            "resolve_conflict",
+            &fake_result(20, 8, 0.02),
+        )
+        .unwrap();
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(g.merge_attempt, 2);
+        assert_eq!(g.attempt_tokens_in, 20); // attempt 2 only
+        assert_eq!(g.attempt_tokens_out, 8);
+        assert_eq!(g.cumulative_tokens_in, 30); // both attempts
+        assert_eq!(g.cumulative_tokens_out, 13);
     }
 
     // -----------------------------------------------------------------------
@@ -5913,6 +6824,186 @@ mod tests {
     }
 
     #[test]
+    fn preflight_worktree_budget_with_limit_fails_fast_with_the_arithmetic_spelled_out() {
+        let (base, repo, _fwt) = make_repo("preflight-tight");
+        let root = Workspace::local(&repo);
+        let wt_base = root.at(repo.join("wt-base"));
+        let err = preflight_worktree_budget_with_limit(&root, &wt_base, "HEAD", 20)
+            .expect_err("must fail when the budget is obviously too tight");
+        assert!(err.contains("20-character"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preflight_worktree_budget_with_limit_passes_with_a_generous_limit() {
+        let (base, repo, _fwt) = make_repo("preflight-loose");
+        let root = Workspace::local(&repo);
+        let wt_base = root.at(repo.join("wt-base"));
+        preflight_worktree_budget_with_limit(&root, &wt_base, "HEAD", 4096)
+            .expect("must pass with a generous budget");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn admin_entry_name_falls_back_to_a_guardian_qualified_name_when_nothing_to_recover() {
+        let dir = tmp_dir("admin-name-fresh");
+        let wt = dir.join("g").join("g1").join("wt-RAL-121");
+        std::fs::create_dir_all(&wt).unwrap();
+        let name = admin_entry_name(&Workspace::local(&wt));
+        assert_eq!(name, "g1-wt-RAL-121");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relink_worktree_resolves_the_real_admin_name_when_two_worktrees_share_a_basename() {
+        // Two different guardians can each build a worktree directory named
+        // "wt-RAL-121" in their own g/g<n>/ folder. git's admin namespace
+        // (.git/worktrees/<name>) is flat, so it disambiguates the second one
+        // at `worktree add` time -- relink must recover THAT real name, not
+        // assume the basename, or repairing worktree #2 would clobber
+        // worktree #1's entry.
+        let base = tmp_dir("relink-collide");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "base"]);
+
+        let wt1 = repo
+            .join(".git")
+            .join(".ralphus")
+            .join("g")
+            .join("g1")
+            .join("wt-RAL-121");
+        let wt2 = repo
+            .join(".git")
+            .join(".ralphus")
+            .join("g")
+            .join("g2")
+            .join("wt-RAL-121");
+        std::fs::create_dir_all(wt1.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(wt2.parent().unwrap()).unwrap();
+        g(
+            &repo,
+            &["worktree", "add", "-B", "b1", wt1.to_str().unwrap(), "main"],
+        );
+        g(
+            &repo,
+            &["worktree", "add", "-B", "b2", wt2.to_str().unwrap(), "main"],
+        );
+
+        let root = Workspace::local(&repo);
+        let wt2_ws = Workspace::local(&wt2);
+
+        // Learn wt2's real (git-disambiguated) admin name before breaking anything.
+        let real_name = admin_entry_name(&wt2_ws);
+        assert_ne!(
+            real_name, "wt-RAL-121",
+            "git must have disambiguated the second entry from the first"
+        );
+
+        // Snapshot wt1's own admin entry before touching wt2, so "untouched"
+        // can be checked by exact before/after equality -- comparing against
+        // a manually reconstructed path string is unsafe here since git
+        // resolves short (8.3) path components while a plain PathBuf built
+        // from `std::env::temp_dir()` does not, and on a machine whose TEMP
+        // env var is itself in short form that mismatch is a false failure
+        // unrelated to what this test is actually checking.
+        let wt1_gitdir_path = repo
+            .join(".git")
+            .join("worktrees")
+            .join("wt-RAL-121")
+            .join("gitdir");
+        let wt1_gitdir_before = std::fs::read_to_string(&wt1_gitdir_path).unwrap();
+
+        // Simulate the broken-entry scenario relink_worktree exists to fix:
+        // the admin directory is gone, but wt2's own `.git` pointer survives.
+        std::fs::remove_dir_all(repo.join(".git").join("worktrees").join(&real_name)).unwrap();
+
+        relink_worktree(&root, &wt2_ws, "b2").expect("relink");
+
+        // wt1's own admin entry must be untouched -- a bare-basename
+        // implementation would have overwritten it.
+        let wt1_gitdir_after = std::fs::read_to_string(&wt1_gitdir_path).unwrap();
+        assert_eq!(wt1_gitdir_after, wt1_gitdir_before);
+        // wt2 must be usable again, still on its own branch.
+        assert_eq!(
+            git(&wt2, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "b2"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cleanup_review_worktrees_does_not_destroy_a_similarly_prefixed_guardian() {
+        // RAL-211 regression guard: a substring match on the short guardian id
+        // ("g56" contained in "g560") must not let cleaning up guardian 56
+        // destroy guardian 560's worktree.
+        let base = tmp_dir("cleanup-g56-g560");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "base"]);
+
+        let g56_id = "guardian-000000000056";
+        let g560_id = "guardian-000000000560";
+        let repo_str = repo.to_string_lossy().into_owned();
+        let root = Workspace::local(&repo);
+        let wt_base_56 = root.at(worktree_dir(&repo_str, g56_id));
+        let wt_base_560 = root.at(worktree_dir(&repo_str, g560_id));
+
+        let wt56 = wt_base_56.join("wt-feat");
+        let wt560 = wt_base_560.join("wt-feat");
+        std::fs::create_dir_all(wt56.root().parent().unwrap()).unwrap();
+        std::fs::create_dir_all(wt560.root().parent().unwrap()).unwrap();
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-B",
+                "b56",
+                wt56.root().to_str().unwrap(),
+                "main",
+            ],
+        );
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-B",
+                "b560",
+                wt560.root().to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        cleanup_review_worktrees(&root, &wt_base_56, g56_id, "56", &[]);
+
+        assert!(!wt56.root().exists(), "g56's own worktree must be removed");
+        assert!(
+            wt560.root().exists(),
+            "g560's worktree must survive cleanup of g56"
+        );
+        assert_eq!(
+            git(wt560.root(), &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "b560",
+            "g560's worktree must still be a healthy, usable checkout"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn find_worktree_for_branch_finds_correct_worktree() {
         let (base, repo, fwt) = make_repo("find-wt");
         let found = find_worktree_for_branch(&Workspace::local(&repo), "feature/a");
@@ -6175,11 +7266,11 @@ Let me know if you need anything else."#;
             scope: "nothing".to_string(),
             skip_auto_clean: false,
             is_final_branch: false,
+            skip_worktree_checks: false,
         };
         let result = drive_rebase(
             &store,
             &guardian_id,
-            0,
             &branch_id,
             &NopRunner,
             "feature/a",
@@ -6188,6 +7279,7 @@ Let me know if you need anything else."#;
             old_base,
             rev,
             &gate,
+            &CancelToken::never(),
         );
         assert!(
             result.is_ok(),
@@ -6303,6 +7395,139 @@ Let me know if you need anything else."#;
         assert_ne!(
             g.status, "merge_failed",
             "a local review must not be caught by the remote gate: {:?}",
+            g.detail
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_full_merge_lands_worktrees_at_the_short_ral_211_layout_and_writes_a_readme() {
+        // End-to-end: a full review build must use `.git/.ralphus/g/g<n>/...`,
+        // never the legacy `.ralphus_guardian/<full-id>/...` layout, and must
+        // regenerate `.git/.ralphus/README.md` documenting the mapping.
+        let (base, repo, _fwt) = make_repo("short-layout-e2e");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
+        run_merge(&store, runner.as_ref(), &id);
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(g.status, "in_review", "{:?}", g.detail);
+
+        let short_id = crate::short_paths::guardian_short_id(&id);
+        let sep = std::path::MAIN_SEPARATOR;
+        let combined = g.combined_worktree.expect("combined worktree recorded");
+        assert!(
+            combined.contains(&format!(".ralphus{sep}g{sep}{short_id}{sep}review")),
+            "combined worktree should be at .git/.ralphus/g/{short_id}/review, got {combined}"
+        );
+        assert!(
+            !combined.contains(".ralphus_guardian"),
+            "must not use the legacy layout: {combined}"
+        );
+        let branch_wt = g.branches[0]
+            .worktree
+            .clone()
+            .expect("branch worktree recorded");
+        assert!(
+            branch_wt.contains(&format!(".ralphus{sep}g{sep}{short_id}{sep}wt-feature")),
+            "branch worktree should be under .git/.ralphus/g/{short_id}/wt-<short>, got {branch_wt}"
+        );
+
+        let readme_path = repo.join(".git").join(".ralphus").join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).expect("README.md must be written");
+        assert!(readme.contains(&short_id), "{readme}");
+        assert!(readme.contains("feature/a"), "{readme}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_merge_succeeds_alongside_an_untouched_old_layout_leftover() {
+        // An abandoned old-layout `.ralphus_guardian/<full-id>` directory
+        // must not block or be migrated by a fresh merge under the
+        // `.ralphus/g/g<n>` layout.
+        let (base, repo, _fwt) = make_repo("old-layout-coexist-guardian");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let old_dir = repo.join(".git").join(".ralphus_guardian").join(&id);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("leftover.txt"), "abandoned\n").unwrap();
+
+        let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
+        run_merge(&store, runner.as_ref(), &id);
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(
+            g.status, "in_review",
+            "an old-layout leftover must not block a new merge: {:?}",
+            g.detail
+        );
+        assert!(
+            old_dir.join("leftover.txt").exists(),
+            "old-layout leftovers must be left alone, not migrated or purged"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg_attr(not(windows), ignore = "MAX_PATH is a Windows-specific limit")]
+    fn a_full_merge_completes_from_a_repository_root_long_enough_to_have_failed_pre_ral_211() {
+        // A repo root deep enough that a `.ralphus_guardian/<full-id>/
+        // wt-<branch>` overhead (77-87 chars) would push even a short
+        // tracked file past Windows' 260-char MAX_PATH, but the current
+        // `.ralphus/g/g<n>/wt-<short>` overhead (~31 chars) fits.
+        // `make_repo`'s `tag` becomes part of the temp-dir name itself, so
+        // padding it directly inflates the repo root's path length -- grown
+        // in a small calibration loop so this is robust to how long the
+        // host's own temp directory happens to be.
+        let mut pad_len = 120usize;
+        let (base, repo, _fwt) = loop {
+            let (base, repo, fwt) = make_repo(&"x".repeat(pad_len));
+            let root_len = repo.to_string_lossy().len();
+            if root_len + 87 > 260 && root_len + 31 <= 260 {
+                break (base, repo, fwt);
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(
+                pad_len < 400,
+                "could not reach the target path-length window"
+            );
+            pad_len += 40;
+        };
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
+        run_merge(&store, runner.as_ref(), &id);
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(
+            g.status, "in_review",
+            "a repo root in the pre-RAL-211 failure zone must still merge successfully: {:?}",
             g.detail
         );
 
@@ -6591,7 +7816,7 @@ Let me know if you need anything else."#;
 
         // Once the branch has a review worktree (its first rebase has run),
         // it is no longer this function's concern -- a no-op leaves whatever
-        // `generate_summary` last wrote untouched.
+        // `generate_final_summary` last wrote untouched.
         {
             let guard = store.lock().unwrap();
             guard
@@ -6800,26 +8025,49 @@ Let me know if you need anything else."#;
         }
     }
 
+    /// RAL-208: set up a single-branch, single-project guardian with
+    /// everything [`generate_final_summary`] needs to find real content: a
+    /// base commit recorded via `set_guardian_project_base_commit`, and a
+    /// `guardian/<id>/wt-<branch>` ref (what a real merge's per-branch
+    /// worktree creation leaves behind) pointing at `tip`. Returns the
+    /// guardian id.
+    fn setup_final_summary_guardian(
+        store: &Arc<Mutex<Store>>,
+        repo: &Path,
+        base_sha: &str,
+        branch: &str,
+        tip: &str,
+    ) -> String {
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, branch).unwrap();
+            guard
+                .set_guardian_project_base_commit(&id, repo.to_str().unwrap(), base_sha)
+                .unwrap();
+            id
+        };
+        g(
+            repo,
+            &["branch", "-f", &format!("guardian/{id}/wt-{branch}"), tip],
+        );
+        id
+    }
+
     #[test]
-    fn generate_summary_default_prompt_requests_bullet_list() {
+    fn generate_final_summary_default_prompt_requests_bullet_list() {
         let (base, repo, _fwt) = make_repo("gensum-bullet");
         let base_sha = git(&repo, &["rev-parse", "main"])
             .unwrap()
             .trim()
             .to_string();
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
         let runner = CapturingRunner::new();
 
-        generate_summary(
-            &store,
-            &runner,
-            "guardian-x",
-            &Workspace::local(&repo),
-            &base_sha,
-            &[(0, "feature/a".to_string())],
-            "feature/a",
-            false,
-        );
+        generate_final_summary(&store, &runner, &id, "sig");
 
         let prompt = runner
             .last_prompt
@@ -6828,13 +8076,14 @@ Let me know if you need anything else."#;
             .clone()
             .expect("prompt captured");
         assert!(prompt.contains("bullet list"), "prompt: {prompt}");
+        assert!(prompt.contains("80 characters"), "prompt: {prompt}");
         assert!(prompt.contains("feature/a"), "prompt: {prompt}");
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn generate_summary_prose_config_disables_bullet_list() {
+    fn generate_final_summary_prose_config_disables_bullet_list() {
         let (base, repo, _fwt) = make_repo("gensum-prose");
         std::fs::write(
             repo.join(".ralphus.toml"),
@@ -6846,18 +8095,10 @@ Let me know if you need anything else."#;
             .trim()
             .to_string();
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
         let runner = CapturingRunner::new();
 
-        generate_summary(
-            &store,
-            &runner,
-            "guardian-x",
-            &Workspace::local(&repo),
-            &base_sha,
-            &[(0, "feature/a".to_string())],
-            "feature/a",
-            false,
-        );
+        generate_final_summary(&store, &runner, &id, "sig");
 
         let prompt = runner
             .last_prompt
@@ -6872,28 +8113,26 @@ Let me know if you need anything else."#;
     }
 
     #[test]
-    fn generate_summary_bullet_prompt_uses_ticket_label_not_raw_branch_name() {
+    fn generate_final_summary_bullet_prompt_uses_ticket_label_not_raw_branch_name() {
         let (base, repo, _fwt) = make_repo("gensum-label");
         let base_sha = git(&repo, &["rev-parse", "main"])
             .unwrap()
             .trim()
             .to_string();
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        // The branch's own review-worktree ref points at feature/a's real
+        // tip -- only the guardian branch's *name* is ticket-shaped, so this
+        // isolates label substitution from git-log resolution.
+        let id = setup_final_summary_guardian(
+            &store,
+            &repo,
+            &base_sha,
+            "RAL-124-bullet_change_summary",
+            "feature/a",
+        );
         let runner = CapturingRunner::new();
 
-        // The actual git ref (`tip_ref`) stays `feature/a` -- only the
-        // `completed` label fed to the prompt is ticket-shaped, so this
-        // isolates label substitution from git-log resolution.
-        generate_summary(
-            &store,
-            &runner,
-            "guardian-x",
-            &Workspace::local(&repo),
-            &base_sha,
-            &[(0, "RAL-124-bullet_change_summary".to_string())],
-            "feature/a",
-            false,
-        );
+        generate_final_summary(&store, &runner, &id, "sig");
 
         let prompt = runner
             .last_prompt
@@ -6905,6 +8144,39 @@ Let me know if you need anything else."#;
         assert!(
             !prompt.contains("RAL-124-bullet_change_summary"),
             "prompt should use the extracted ticket label, not the full branch name: {prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn generate_final_summary_marks_signature_generated_on_success() {
+        let (base, repo, _fwt) = make_repo("gensum-mark");
+        let base_sha = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
+        let runner = CapturingRunner::new();
+
+        generate_final_summary(&store, &runner, &id, "sig-1");
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(g.change_summary.as_deref(), Some("captured"));
+
+        // A second request for the SAME signature is now recognised as
+        // already-satisfied and stays a no-op.
+        store
+            .lock()
+            .unwrap()
+            .request_final_summary(&id, "sig-1", crate::store::now_ms());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
+                .is_empty()
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -7006,6 +8278,49 @@ Let me know if you need anything else."#;
         // The configured `exit 1` check gate fails the review.
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("check failed"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RAL-203: `final_checks` (the finalize-time build/check-gate step
+    /// against the combined worktree) runs under this review's own
+    /// `build_env` -- the check command below fails unless the overridden
+    /// variable is actually present in its process environment.
+    #[test]
+    fn final_checks_runs_check_gates_under_this_reviews_build_env_override() {
+        let (base, repo, _fwt) = make_repo("finalchecks-buildenv");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let check_cmd = if cfg!(windows) {
+            "if not \"%RAL203_BUILD_VAR%\"==\"expected\" exit 1"
+        } else {
+            "test \"$RAL203_BUILD_VAR\" = expected"
+        };
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_checks(&id, &[check_cmd.to_string()])
+                .unwrap();
+            let mut set = std::collections::BTreeMap::new();
+            set.insert("RAL203_BUILD_VAR".to_string(), "expected".to_string());
+            guard
+                .set_guardian_build_env_overrides(&id, &set, &[], &[])
+                .unwrap();
+            id
+        };
+
+        let result = final_checks(
+            &store,
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+        );
+        assert!(
+            result.is_ok(),
+            "check gate must see the build-env override: {result:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

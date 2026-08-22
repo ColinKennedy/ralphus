@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use opentelemetry::Context;
 
@@ -18,6 +17,7 @@ use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key
 use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
 use crate::store::{SessionRow, Store, TaskRow};
+use crate::vcs::{GitOps, GitVcs};
 
 /// A submit-time review preflight / derivation failure (surfaced to the client).
 #[derive(Debug)]
@@ -40,18 +40,15 @@ impl std::fmt::Display for ReviewError {
     }
 }
 
-/// Run `git args` in `dir`, returning trimmed stdout or the trimmed stderr.
+/// Run `git args` in `dir`, returning trimmed stdout.
+///
+/// Thin wrapper over [`crate::vcs::GitOps::run`] — the actual `git`
+/// subprocess spawn lives in `vcs.rs`, not here (RAL-213). Trims the result
+/// since every caller here treats the output as a single ref/path/branch
+/// name, where a trailing newline would corrupt a subsequent `PathBuf` join
+/// or ref comparison.
 fn git(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| format!("could not run git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
+    GitVcs.run(dir, args).map(|s| s.trim().to_string())
 }
 
 /// The project root for a session `cwd`, or `None` when it is not inside a git
@@ -112,75 +109,40 @@ pub(crate) fn same_git_repo(cwd_a: &Path, cwd_b: &Path) -> bool {
 /// Uncommitted changes are stashed beforehand and restored after so a dirty
 /// worktree (e.g. a session restarted mid-flight) doesn't block the rebase.
 /// On failure the rebase is aborted automatically so the worktree is left
-/// clean. Returns the git stderr as the error string.
+/// clean. The error string describes which git step failed and why.
 pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Result<(), String> {
     // Detect any working-tree or index changes (tracked or untracked).
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("could not run git status: {e}"))?;
-    let has_changes = !dirty.stdout.is_empty();
+    let has_changes = !git(cwd, &["status", "--porcelain"])?.is_empty();
 
     if has_changes {
-        let stash = Command::new("git")
-            .args([
+        git(
+            cwd,
+            &[
                 "stash",
                 "push",
                 "--include-untracked",
                 "-m",
                 "ralphus-rebase-stash",
-            ])
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("could not run git stash: {e}"))?;
-        if !stash.status.success() {
-            return Err(format!(
-                "git stash before rebase failed: {}",
-                String::from_utf8_lossy(&stash.stderr).trim()
-            ));
-        }
+            ],
+        )
+        .map_err(|e| format!("git stash before rebase failed: {e}"))?;
     }
 
-    let out = Command::new("git")
-        .args(["rebase", target_branch])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("could not run git rebase: {e}"))?;
-
-    if !out.status.success() {
+    if let Err(e) = git(cwd, &["rebase", target_branch]) {
         // Abort the incomplete rebase so the worktree stays usable.
-        let _ = Command::new("git")
-            .args(["rebase", "--abort"])
-            .current_dir(cwd)
-            .output();
+        let _ = git(cwd, &["rebase", "--abort"]);
         // Restore stashed work so nothing is lost.
         if has_changes {
-            let _ = Command::new("git")
-                .args(["stash", "pop"])
-                .current_dir(cwd)
-                .output();
+            let _ = git(cwd, &["stash", "pop"]);
         }
-        return Err(format!(
-            "git rebase {} failed: {}",
-            target_branch,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(format!("git rebase {target_branch} failed: {e}"));
     }
 
     // Rebase succeeded — restore any stashed work.
     if has_changes {
-        let pop = Command::new("git")
-            .args(["stash", "pop"])
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("could not run git stash pop: {e}"))?;
-        if !pop.status.success() {
-            return Err(format!(
-                "rebase succeeded but git stash pop failed (stash preserved): {}",
-                String::from_utf8_lossy(&pop.stderr).trim()
-            ));
-        }
+        git(cwd, &["stash", "pop"]).map_err(|e| {
+            format!("rebase succeeded but git stash pop failed (stash preserved): {e}")
+        })?;
     }
 
     Ok(())
@@ -256,6 +218,8 @@ struct Membership {
     /// The machine this review's worktrees, rebase and conflict resolution run
     /// on (RAL-185). `None` means the daemon's own host.
     machine: Option<String>,
+    /// Optional USD spend cap declared on the review (RAL-193).
+    maximum_budget_usd: Option<f64>,
 }
 
 /// Build the planner's session/task rows straight from the task file (same order
@@ -562,6 +526,7 @@ pub fn derive_reviews(
             machine: rv
                 .and_then(|r| r.machine.clone())
                 .filter(|s| !s.trim().is_empty()),
+            maximum_budget_usd: rv.and_then(|r| r.maximum_budget_usd),
         });
     }
 
@@ -747,6 +712,12 @@ fn apply_resolver(
             .set_guardian_machine(gid, Some(&machine))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
+    // RAL-193: this review's own USD spend cap.
+    if let Some(cap) = members.iter().find_map(|m| m.maximum_budget_usd) {
+        store
+            .set_guardian_maximum_budget_usd(gid, Some(cap))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -822,7 +793,8 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::rebase_onto;
+    use super::{Membership, apply_resolver, rebase_onto};
+    use crate::store::Store;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -1061,5 +1033,40 @@ mod tests {
             "must not fall back to the tracking ref when a chained dependency is declared but unresolved"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── RAL-193: [[review]] maximum_budget_usd wiring ────────────────────
+
+    fn membership(maximum_budget_usd: Option<f64>) -> Membership {
+        Membership {
+            project: PathBuf::from("/repo"),
+            branch: "feat".to_string(),
+            base: "main".to_string(),
+            name: "r".to_string(),
+            order: 0,
+            link_key: None,
+            agent: None,
+            model: None,
+            machine: None,
+            maximum_budget_usd,
+        }
+    }
+
+    #[test]
+    fn apply_resolver_sets_maximum_budget_usd_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(Some(3.5));
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(store.guardian_maximum_budget_usd(&gid).unwrap(), Some(3.5));
+    }
+
+    #[test]
+    fn apply_resolver_leaves_maximum_budget_usd_unset_when_no_member_declares_one() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(store.guardian_maximum_budget_usd(&gid).unwrap(), None);
     }
 }

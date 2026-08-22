@@ -1,14 +1,15 @@
-"""RAL-94: opt-in, in-process, serial benchmark harness for Python tests.
+"""RAL-94: SVG/HTML graph rendering for benchmark data.
 
-Not part of the normal `pytest` invocation — see `ralphus.bench.pytest_plugin`
-for the `--ralphus-bench` opt-in flag and `ralphus.bench.graphs` for the SVG
-graph generator. Rust tests are tracked separately (see `bench-macros` /
-`bench-harness` in the Cargo workspace); the two ecosystems' data never mix.
+Reads already-stored `durable_min`/stats records and renders them as graphs
+(`ralphus.bench.graphs`) — it never runs or times a test itself. Both this
+crate's `cli-rs`/`runner`/`daemon`/etc. (Rust, via `bench-harness`/
+`bench-macros`) and this package (Python) write into their own subtree of
+`bench_data/` in the same record shape this module reads; the two
+ecosystems' data never mix.
 """
 
 from __future__ import annotations
 
-from ralphus.bench.durable_min import DEFAULT_PATIENCE, DurableMinResult, run_durable_min
 from ralphus.bench.gitinfo import GitState, current_git_state
 from ralphus.bench.stats import StatsBundle, compute_stats
 from ralphus.bench.storage import (
@@ -23,9 +24,7 @@ from ralphus.bench.storage import (
 )
 
 __all__ = [
-    "DEFAULT_PATIENCE",
     "BenchRecord",
-    "DurableMinResult",
     "GitState",
     "Language",
     "StatsBundle",
@@ -36,6 +35,5 @@ __all__ = [
     "find_repo_root",
     "load_records",
     "record_from_stats",
-    "run_durable_min",
     "test_data_path",
 ]

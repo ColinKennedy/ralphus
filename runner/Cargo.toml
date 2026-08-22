@@ -1,0 +1,31 @@
+[package]
+name = "ralphus-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ralphus session runner: executes one SessionSpec (command/prompt/verify) and reports a SessionResult. Spawned per-session by the daemon; speaks JSON on stdin/stdout."
+
+[[bin]]
+name = "ralphus-runner"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_runner"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true, features = ["tls"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+sha2 = { workspace = true }
+sysinfo = { workspace = true }
+
+[dev-dependencies]
+ureq = { workspace = true }

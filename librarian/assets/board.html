@@ -17,6 +17,8 @@
         --solo: #ffa657;
         --stale: #db6d28;
         --empty: #ff9492;
+        --drift: #f0883e;
+        --incomplete: #db6d28;
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -179,6 +181,15 @@
          state above (--muted) and from any entity-status color. */
       .peek-activity { margin-left: 8px; color: var(--muted); white-space: nowrap; }
       .peek-activity.stale { color: var(--stale); font-weight: 600; }
+      /* Durable terminal-log attempt history (RAL-154): lists every persisted
+         attempt for a session/verify/resolver's tmux pane, independent of and
+         alongside the live peek box above. */
+      .history-box { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); overflow: hidden; }
+      .history-head { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+      .history-list { max-height: 160px; overflow: auto; }
+      .history-item { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; font-size: 11px; border-bottom: 1px solid var(--border); cursor: pointer; }
+      .history-item:last-child { border-bottom: none; }
+      .history-item:hover { background: var(--panel-2); }
       .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
       /* RAL-108: review-action failure toasts. Fixed bottom-right stack so a
          rejected action (e.g. a 409) is visible without blocking the UI like
@@ -527,6 +538,8 @@
        * @property {{id: string, name: string, status: string, branch?: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this session (hierarchical env overrides, extending RAL-150); merged on top of the owning task's/run's when the session's own subprocess is spawned. Empty/absent for the vast majority of sessions.
        * @property {{[key: string]: string}} [verify_env_overrides] - Persistent environment-variable overrides applied only to this session's own verify steps, merged on top of `env_overrides` (and its ancestors).
+       * @property {number|null} [started_at_ms]
+       * @property {number|null} [finished_at_ms]
        */
       /**
        * @typedef {object} TaskView
@@ -541,6 +554,8 @@
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this task (hierarchical env overrides, extending RAL-150); merged on top of the run's, and merged onto every session under this task. Empty/absent for the vast majority of tasks.
        * @property {{[key: string]: string}} [verify_env_overrides] - Persistent environment-variable overrides applied only to this task's own (task-scoped) verify steps, merged on top of `env_overrides` (and the run's).
        * @property {boolean} soloed
+       * @property {number|null} [started_at_ms]
+       * @property {number|null} [finished_at_ms]
        */
       /**
        * One session's derived git info from `GET /api/runs/{id}/worktrees`
@@ -554,11 +569,22 @@
        * @property {string|null} upstream
        */
       /**
+       * One durably-persisted terminal-log attempt's metadata (RAL-154), from
+       * `GET .../terminal-log-attempts` — `attempt` `0` is the initial run,
+       * `1..` each subsequent tmux reattach.
+       * @typedef {object} AttemptMeta
+       * @property {number} attempt
+       * @property {number} size_bytes
+       * @property {number} modified_ms
+       */
+      /**
        * @typedef {object} RunView
        * @property {string} id
        * @property {string|null} label
        * @property {string} state
        * @property {number} created_at_ms
+       * @property {number|null} [started_at_ms]
+       * @property {number|null} [finished_at_ms]
        * @property {TaskView[]} tasks
        * @property {{id: string, name: string, status: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every session/verify subprocess this run spawns from now on, until unset. Empty/absent for the vast majority of runs.
@@ -670,6 +696,50 @@
        * @property {boolean|null} [verify_skip_auto_clean] - RAL-168: this review's own override for "each_branch"'s auto-clean-skip sub-option, or null to inherit the project default.
        * @property {string} [effective_verify_scope] - RAL-168: verify_scope resolved against the project default -- always "each_branch"|"final_branch"|"nothing".
        * @property {boolean} [effective_verify_skip_auto_clean] - RAL-168: verify_skip_auto_clean resolved against the project default.
+       * @property {{[key: string]: string}} [combined_env] - RAL-203: the environment the combined worktree inherits by default -- the last enabled branch's own `resolved_env`. Shared baseline `build_env`/`manual_checks_env` each layer their own overrides on top of.
+       * @property {{[key: string]: (string|null)}} [build_env_overrides] - RAL-203: this review's own env-override layer for the finalize-time build/check-gate step. A string value overrides the inherited one; `null` is a tombstone; an absent key is simply inherited.
+       * @property {{[key: string]: string}} [build_env] - RAL-203: the effective environment the build/check-gate step runs under -- `combined_env` with `build_env_overrides` applied.
+       * @property {{[key: string]: (string|null)}} [manual_checks_env_overrides] - RAL-203: this review's own env-override layer for the manual-checks step (the LLM-suggested commands run via `ralphus review checks run` / "Run all"). Independent of `build_env_overrides`.
+       * @property {{[key: string]: string}} [manual_checks_env] - RAL-203: the effective environment the manual-checks step runs under -- `combined_env` with `manual_checks_env_overrides` applied.
+       * @property {number|null} [maximum_budget_usd] - RAL-193: this review's own USD spend cap, or null for no cap.
+       * @property {number} [merge_attempt] - RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
+       * @property {number} [attempt_tokens_in] - RAL-193: input tokens spent on this review's own resolver/verifier calls during the current merge attempt only.
+       * @property {number} [attempt_tokens_out] - RAL-193: output tokens, current merge attempt only.
+       * @property {number} [attempt_cost_usd] - RAL-193: USD cost, current merge attempt only.
+       * @property {number} [cumulative_tokens_in] - RAL-193: input tokens spent on this review's own resolver/verifier calls, cumulative across every rebase/re-merge attempt.
+       * @property {number} [cumulative_tokens_out] - RAL-193: output tokens, cumulative across every attempt.
+       * @property {number} [cumulative_cost_usd] - RAL-193: USD cost, cumulative across every attempt -- what maximum_budget_usd is enforced against.
+       */
+      /**
+       * A pull/merge request submitted for one of a review's branches, or for
+       * its combined (all-branches) worktree when `branch_id` is null (RAL-117/RAL-190).
+       * @typedef {object} PullRequestView
+       * @property {string} id
+       * @property {string} guardian_id
+       * @property {string|null} [branch_id]
+       * @property {string} forge - "github" | "gitlab"
+       * @property {string} repo
+       * @property {string} branch_alias - The branch name actually pushed to the remote.
+       * @property {string} base_ref
+       * @property {string} title
+       * @property {string} description
+       * @property {number|null} [pr_number]
+       * @property {string|null} [pr_url]
+       * @property {string} state - "open" | "merged" | "closed"
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       * @property {string|null} [last_pushed_sha]
+       */
+      /**
+       * Live drift check between a PR's remote branch and its owning review
+       * worktree (RAL-190) -- see `GET /api/pull-requests/{id}/sync-status`.
+       * @typedef {object} PrSyncStatus
+       * @property {string|null} [remote_sha]
+       * @property {string|null} [local_sha]
+       * @property {string|null} [last_pushed_sha]
+       * @property {boolean} in_sync
+       * @property {boolean} pr_ahead
+       * @property {boolean} worktree_ahead
        */
       /**
        * @typedef {object} ChatMessage
@@ -882,6 +952,18 @@
       let selectedBranch = {};
       /** @type {{[key: string]: BranchConflicts}} "gid:branch_id" -> last-fetched live conflicting-files list (RAL-148) */
       let branchConflicts = {};
+      /** @type {{[gid: string]: PullRequestView[]}} PRs submitted for a review, fetched on demand (RAL-190). */
+      let pullRequests = {};
+      /** @type {{[prId: string]: PrSyncStatus}} last-fetched drift check per still-open PR with a recorded forge number (RAL-190). */
+      let prSyncStatus = {};
+      /** @type {Set<string>} which inline "submit PR" forms (keyed "gid:branchId" or "gid:combined") are expanded (RAL-190). */
+      let prFormOpen = new Set();
+      /** @type {{[key: string]: boolean}} peek key -> whether the durable terminal-log attempt-history box (RAL-154) is expanded */
+      let historyOpen = {};
+      /** @type {{[key: string]: AttemptMeta[]}} peek key -> last-fetched list of persisted attempts for that session/verify/resolver */
+      let historyAttempts = {};
+      /** @type {{[key: string]: {attempt: number, content: string}|null}} peek key -> the one historical attempt currently being viewed in full, if any */
+      let historyViewing = {};
 
       // ---------- helpers ----------
       /**
@@ -1338,6 +1420,15 @@
        * @returns {string}
        */
       const runLogsBtn = (id) => `<button class="logs-btn" data-tip="View run logs — events, task states, session timings, and verifier output." onclick="openRunLogs(event,'${id}')">📄 Logs</button>`;
+      // Run-level Timeline button (RAL-155) — generates and opens the merged,
+      // chronological uber-log-viewer for the whole run.
+      /**
+       * Renders a run-level "Timeline" button that generates and opens the
+       * merged uber-log-viewer for the whole run.
+       * @param {string} id
+       * @returns {string}
+       */
+      const runTimelineBtn = (id) => `<button class="logs-btn" data-tip="Generate the merged, chronological timeline for this whole run (RAL-155) — every state transition, Cartographer event, and terminal-log excerpt from every task/session, in one time-ordered document.\nWho/when: use this for incident review or debugging instead of cross-referencing the Logs modal, per-session terminal logs, and task/run state by hand.\nRegenerates a temp file on the daemon on every click (not a persistent export)." onclick="openRunTimeline(event,'${id}')">⏱ Timeline</button>`;
       // Per-session failure-log button (opens the traceback popup) — next to a failed badge.
       /**
        * Renders a per-session failure-log button that opens the traceback popup.
@@ -2507,9 +2598,13 @@
        * Renders the expandable live-pane peek box for a given key, or an
        * empty string when collapsed.
        * @param {string} key
+       * @param {number|null} [startedAtMs] - RAL-210: the owning session's most
+       *   recent start time (epoch ms, local time), shown in the header when
+       *   given. Only meaningful for a session-scoped peek — omitted for
+       *   verify/guardian peeks, which have no session start time of their own.
        * @returns {string}
        */
-      function peekBox(key) {
+      function peekBox(key, startedAtMs) {
         if (!peekOpen[key]) return "";
         // Reuse the last-fetched content (if any) instead of always starting from
         // "Loading…" — the details pane fully re-renders on every pushed event
@@ -2535,8 +2630,14 @@
         const activityHtml = activity.text
           ? `<span id="peek-activity-${cssKey}" class="peek-activity${activity.stale ? ' stale' : ''}" data-tip="${activity.tip}">${activity.text}</span>`
           : `<span id="peek-activity-${cssKey}" class="peek-activity"></span>`;
+        // RAL-210: session start time, when the caller has one to show.
+        // Re-derived from the (freshly re-rendered) session data on every
+        // call, so a restart's new started_at_ms shows up immediately.
+        const startedHtml = startedAtMs
+          ? `<span class="peek-activity" data-tip="When this session most recently started running.\nUpdates to a new time if the session is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
+          : "";
         return `<div class="peek-box" data-tip="${headTip}">
-            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${activityHtml}</span><span style="display:flex;gap:4px;align-items:center"><button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." onclick="copyPeekText(event,'${key}')">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" onclick="togglePeek('${key}');event.stopPropagation()" data-tip="Collapse this live view.">✕ Hide</button></span></div>
+            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${activityHtml}</span><span style="display:flex;gap:4px;align-items:center"><button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." onclick="copyPeekText(event,'${key}')">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" onclick="togglePeek('${key}');event.stopPropagation()" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             <div class="peek-pre-wrap">
               <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" onscroll="onPeekScroll('${key}')" onkeydown="handlePeekKeydown(event,'${key}')" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${cached ? esc(cached) : "Loading…"}</pre>
               <button id="peek-jump-${cssKey}" class="peek-jump-btn" style="display:none" onclick="peekScrollToBottom('${key}')" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button>
@@ -2694,6 +2795,143 @@
         if (!e.ctrlKey) return;
         if (e.key === "End") { e.preventDefault(); peekScrollToBottom(key); }
         else if (e.key === "Home") { e.preventDefault(); peekScrollToTop(key); }
+      }
+
+      // ---- Durable terminal-log attempt history (RAL-154) ----
+      // Sibling feature to the live pane peek above: lists every durably
+      // persisted attempt (initial run + each tmux reattach) for a session's
+      // terminal log, and lets any one of them be opened and read in full —
+      // unlike the peek box, this survives pane death and daemon restarts,
+      // and stays keyed the same way (see peekUrlFor) so the same `key`
+      // string works for both features.
+      /**
+       * Resolves a peek key to the daemon API URL for listing that session's
+       * persisted terminal-log attempts (or reading one's content, when
+       * `attempt` is given).
+       * @param {string} key
+       * @param {number} [attempt]
+       * @returns {string|null}
+       */
+      function terminalLogAttemptsUrlFor(key, attempt) {
+        const [kind, ...rest] = key.split("|");
+        /** @type {string|null} */
+        let base = null;
+        if (kind === "session") { const [runId, ti, si] = rest; base = `/api/runs/${runId}/sessions/${ti}/${si}/terminal-log-attempts`; }
+        else if (kind === "verify") { const [runId, ti, scope, si, vi] = rest; base = `/api/runs/${runId}/verifies/${ti}/${scope}/${si}/${vi}/terminal-log-attempts`; }
+        else if (kind === "guardian") { const [gid, branchId] = rest; base = `/api/guardians/${gid}/branches/${branchId}/terminal-log-attempts`; }
+        else if (kind === "guardian-manual") { const [gid] = rest; base = `/api/guardians/${gid}/manual-checks/terminal-log-attempts`; }
+        if (base === null) return null;
+        return attempt === undefined ? base : `${base}/${attempt}`;
+      }
+      /**
+       * Toggles the attempt-history box open or closed, keyed the same way as
+       * the matching peek box. Fetches the attempt list immediately on open.
+       * @param {string} key
+       * @returns {void}
+       */
+      function toggleHistory(key) {
+        historyOpen[key] = !historyOpen[key];
+        if (!historyOpen[key]) {
+          delete historyAttempts[key];
+          delete historyViewing[key];
+        }
+        if (sel.kind) renderDetails();
+        if (selectedGuardian) renderReviewDetail();
+        if (historyOpen[key]) fetchHistoryList(key);
+      }
+      /**
+       * Fetches the list of persisted terminal-log attempts for `key` and
+       * re-renders whichever pane owns it.
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function fetchHistoryList(key) {
+        const url = terminalLogAttemptsUrlFor(key);
+        if (!url) return;
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) { historyAttempts[key] = []; return; }
+          const data = await resp.json();
+          historyAttempts[key] = data.attempts || [];
+        } catch (_) {
+          historyAttempts[key] = [];
+        }
+        if (sel.kind) renderDetails();
+        if (selectedGuardian) renderReviewDetail();
+      }
+      /**
+       * Fetches one historical attempt's full content and shows it inline in
+       * the attempt-history box.
+       * @param {string} key
+       * @param {number} attempt
+       * @returns {Promise<void>}
+       */
+      async function viewHistoryAttempt(key, attempt) {
+        const url = terminalLogAttemptsUrlFor(key, attempt);
+        if (!url) return;
+        historyViewing[key] = { attempt, content: "Loading…" };
+        if (sel.kind) renderDetails();
+        if (selectedGuardian) renderReviewDetail();
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) { historyViewing[key] = { attempt, content: "Could not load this attempt's log." }; return; }
+          const data = await resp.json();
+          historyViewing[key] = { attempt, content: data.content || "(empty)" };
+        } catch (_) {
+          historyViewing[key] = { attempt, content: "Could not load this attempt's log (network error)." };
+        }
+        if (sel.kind) renderDetails();
+        if (selectedGuardian) renderReviewDetail();
+      }
+      /**
+       * Returns to the attempt list from the single-attempt content view.
+       * @param {string} key
+       * @returns {void}
+       */
+      function closeHistoryAttempt(key) {
+        delete historyViewing[key];
+        if (sel.kind) renderDetails();
+        if (selectedGuardian) renderReviewDetail();
+      }
+      /**
+       * Formats a byte count as a short human-readable size ("1.2 KB").
+       * @param {number} bytes
+       * @returns {string}
+       */
+      function fmtAttemptSize(bytes) {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      }
+      /**
+       * Renders the expandable attempt-history box for a given key, or an
+       * empty string when collapsed. Shows either the list of persisted
+       * attempts, or (once one is picked) that attempt's full content.
+       * @param {string} key
+       * @returns {string}
+       */
+      function historyBox(key) {
+        if (!historyOpen[key]) return "";
+        const viewing = historyViewing[key];
+        if (viewing) {
+          return `<div class="history-box" data-tip="One persisted attempt's full terminal-log content, read from durable on-disk storage (RAL-154).\nThis is a fixed historical record — it never changes, even if the session later reattaches again.">
+              <div class="history-head"><span>Attempt ${viewing.attempt}</span><button class="btn" style="padding:1px 7px;font-size:11px" onclick="closeHistoryAttempt('${key}')" data-tip="Back to the list of persisted attempts.">← Back</button></div>
+              <div class="peek-pre-wrap"><pre class="peek-pre" style="height:${peekPaneHeight}px">${esc(viewing.content)}</pre></div>
+            </div>`;
+        }
+        const attempts = historyAttempts[key];
+        const body = attempts === undefined
+          ? `<div style="padding:8px;font-size:11px;color:var(--muted)">Loading…</div>`
+          : attempts.length === 0
+            ? `<div style="padding:8px;font-size:11px;color:var(--muted)">No persisted attempts yet — a durable log is written once this session's first tmux attempt finishes.</div>`
+            : `<div class="history-list">${attempts.map((a) => `<div class="history-item" onclick="viewHistoryAttempt('${key}',${a.attempt})" data-tip="Open attempt ${a.attempt}'s full, durably-persisted terminal-log content.\nEach reattach gets its own attempt file, so this survives pane death and daemon restarts.">
+                <span>Attempt ${a.attempt}${a.attempt === 0 ? " (initial)" : " (reattach)"}</span>
+                <span style="color:var(--muted)">${fmtAttemptSize(a.size_bytes)} · ${new Date(a.modified_ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+              </div>`).join("")}</div>`;
+        return `<div class="history-box" data-tip="Every durably-persisted terminal-log attempt for this session (RAL-154), including reattaches — kept on disk independent of whether the live tmux pane is still around.">
+            <div class="history-head"><span>Attempt history</span><button class="btn" style="padding:1px 7px;font-size:11px" onclick="toggleHistory('${key}')" data-tip="Collapse this attempt history.">✕ Hide</button></div>
+            ${body}
+          </div>`;
       }
       // RAL-139: drag-to-resize for peek box terminal panes, mirroring the
       // pointer-capture drag mechanism used by #chat-resize-handle. Called after
@@ -3579,7 +3817,7 @@
           return "";
         };
         const banner = `<div class="run-banner selectable ${sel.kind === "run" ? "sel" : ""}" onclick="pick('run')">
-            ${sdot(run.state)}<span class="rid">${esc(run.label || run.id)}</span>${copyBtn(run.label || run.id)} ${pill(run.state)}${runLogsBtn(run.id)}
+            ${sdot(run.state)}<span class="rid">${esc(run.label || run.id)}</span>${copyBtn(run.label || run.id)} ${pill(run.state)}${runLogsBtn(run.id)}${runTimelineBtn(run.id)}
             <span style="flex:1"></span></div>`;
         const tasks = run.tasks.map((t, ti) => {
           const sessions = t.sessions.map((s, si) => `
@@ -3751,6 +3989,53 @@
        */
       const editBtn = () => `<div class="btn-row"><button class="btn primary" onclick="startEdit()" data-tip="Edit this item — change its label, prompt, agent, model, or command.\nIf the run is currently running it will be stopped and reset to Pending.">✎ Edit</button></div>`;
       /**
+       * Formats a Unix-epoch-ms timestamp as an unambiguous UTC string for the
+       * Details Pane's "started at" field.
+       * @param {number} ms
+       * @returns {string}
+       */
+      function fmtUtc(ms) {
+        return `${new Date(ms).toISOString().replace("T", " ").replace(/\.\d+Z$/, "")} UTC`;
+      }
+      /**
+       * Formats a millisecond duration as a compact "1h 5m 32s"-style string
+       * for the Details Pane's "time running" field.
+       * @param {number} ms
+       * @returns {string}
+       */
+      function fmtDuration(ms) {
+        const totalSec = Math.max(0, Math.floor(ms / 1000));
+        const h = Math.floor(totalSec / 3600);
+        const m = Math.floor((totalSec % 3600) / 60);
+        const s = totalSec % 60;
+        if (h > 0) return `${h}h ${m}m ${s}s`;
+        if (m > 0) return `${m}m ${s}s`;
+        return `${s}s`;
+      }
+      /**
+       * Renders the shared "started at" (UTC) / "time running" kv-rows for a
+       * run/task/session's Details Pane, from its started_at_ms/finished_at_ms.
+       * Live (ticks via the normal 2s poll re-render) while unfinished;
+       * frozen at the total elapsed time once finished.
+       * @param {number|null|undefined} startedAtMs
+       * @param {number|null|undefined} finishedAtMs
+       * @returns {string}
+       */
+      function timingRows(startedAtMs, finishedAtMs) {
+        const startedTip = "When this first started executing, in UTC — not when it was submitted or queued, if those differ."
+          + "\nUseful for confirming exactly when execution began without doing timezone math from a local timestamp.";
+        const runningTip = "How long this has been executing."
+          + "\nUpdates live while still running; freezes at the total elapsed time once it finishes."
+          + "\nUseful for spotting a run/task/session that's taking longer than expected without cross-referencing logs.";
+        if (!startedAtMs) {
+          return `<div class="kv-row"><span class="k">started at</span><span class="v" data-tip="${startedTip}">—</span></div>
+            <div class="kv-row"><span class="k">time running</span><span class="v" data-tip="${runningTip}">—</span></div>`;
+        }
+        const elapsed = (finishedAtMs || Date.now()) - startedAtMs;
+        return `<div class="kv-row"><span class="k">started at</span><span class="v mono" data-tip="${startedTip}">${fmtUtc(startedAtMs)}</span></div>
+          <div class="kv-row"><span class="k">time running</span><span class="v" data-tip="${runningTip}">${fmtDuration(elapsed)}</span></div>`;
+      }
+      /**
        * Renders the run-level details pane.
        * @param {RunView} r
        * @returns {string}
@@ -3771,7 +4056,8 @@
         return `<div class="dhead"><span class="k">▶ run</span></div>
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(r.id)}${copyBtn(r.id)}</span></div>
           <div class="kv-row"><span class="k">label</span><span class="v">${esc(r.label || "—")}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${pill(runDisplayState(r))}${["pending","queued"].includes(r.state) ? "" : runLogsBtn(r.id)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${pill(runDisplayState(r))}${["pending","queued"].includes(r.state) ? "" : runLogsBtn(r.id) + runTimelineBtn(r.id)}</span></div>
+          ${timingRows(r.started_at_ms, r.finished_at_ms)}
           ${tasks}
           ${reviews}
           ${envOverridesSection(r)}
@@ -3905,20 +4191,68 @@
         return renderEnvOverrides(v.env_overrides, "this verify step", apiPath);
       }
       /**
+       * One row of a four-state (inherited/overridden/added/unset)
+       * env-override table -- shared by every scope where a layer doesn't
+       * own its variables outright but shadows an *inherited* baseline
+       * instead (RAL-191's review branches, RAL-203's combined-worktree
+       * build/manual-checks steps):
+       *   - inherited  — value comes from the baseline (italic value, per
+       *                  docs/colors.md's "inherited resolved value" rule)
+       *   - overridden — this layer replaced the inherited value
+       *   - added      — this layer set a variable the baseline never had
+       *   - unset      — this layer tombstoned it; the step does not get it
+       *                  at all (struck through, muted)
+       * @param {string} key
+       * @param {{[key: string]: string}} inherited
+       * @param {{[key: string]: (string|null)}} own
+       * @param {string} apiPath
+       * @param {string} scopeLabel - human-readable scope name for prompt/confirm copy, e.g. "this review worktree" or "the build step".
+       * @returns {string}
+       */
+      function renderInheritedEnvOverrideRow(key, inherited, own, apiPath, scopeLabel) {
+        const hasOwn = Object.prototype.hasOwnProperty.call(own, key);
+        const ownVal = hasOwn ? own[key] : undefined;
+        const isUnset = hasOwn && ownVal === null;
+        const isInherited = !hasOwn;
+        const shown = isUnset ? (inherited[key] ?? "") : (hasOwn ? String(ownVal) : inherited[key]);
+        const tag = isUnset
+          ? `<span class="badge" style="color:var(--muted);border-color:var(--muted);font-size:10px" data-tip="Tombstoned here — removed from ${esc(scopeLabel)}'s environment entirely, even though it would otherwise be inherited.">unset</span>`
+          : isInherited
+            ? `<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:10px" data-tip="Inherited — change it upstream (or override it here) to affect ${esc(scopeLabel)}.">inherited</span>`
+            : (key in inherited)
+              ? `<span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:10px" data-tip="Overridden here — replaces the inherited value for ${esc(scopeLabel)} only.">overridden</span>`
+              : `<span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:10px" data-tip="Added here — not present upstream.">added</span>`;
+        // docs/colors.md: an inherited resolved value renders italic in the
+        // normal text color — provenance, not a status or a warning.
+        const valStyle = isUnset
+          ? "flex:1;text-decoration:line-through;color:var(--muted)"
+          : isInherited
+            ? "flex:1;font-style:italic"
+            : "flex:1";
+        const revertBtn = hasOwn
+          ? `<button class="btn" onclick="clearScopedEnvOverride('${apiPath}','${esc(key)}','${esc(scopeLabel)}')" data-tip="Drop this setting for ${esc(key)}, so it goes back to inheriting the upstream value.\nWho/when: you overrode or unset a variable for ${esc(scopeLabel)} and now want the inherited value back.\nThis cannot be undone.">↩ Inherit</button>`
+          : "";
+        const unsetBtn = isUnset
+          ? ""
+          : `<button class="btn" onclick="unsetScopedEnvOverride('${apiPath}','${esc(key)}','${esc(scopeLabel)}')" data-tip="Remove ${esc(key)} from ${esc(scopeLabel)}'s environment entirely, even though it would otherwise be inherited.\nWho/when: an upstream variable (a token, a proxy) that this step must run without.\nThis cannot be undone.">⊘ Unset</button>`;
+        return `<div class="kv-row" style="margin:0">
+            <span class="v mono" style="flex:1;font-size:11px">${esc(key)}</span>
+            <span class="v mono" style="${valStyle};font-size:11px">${esc(shown)}</span>
+            ${tag}
+            <button class="btn" onclick="setScopedEnvOverride('${apiPath}','${esc(key)}','${esc(scopeLabel)}')" data-tip="Set a value for ${esc(key)} here, replacing the inherited one for ${esc(scopeLabel)} only.">✎ Override</button>
+            ${unsetBtn}${revertBtn}
+          </div>`;
+      }
+      /**
        * Renders the per-review-worktree "environment overrides" section shown
        * inside one review branch's expanded row (RAL-191).
        *
        * Unlike every other scope's widget (`renderEnvOverrides`), a review
        * branch does not own its variables to begin with: it inherits its
        * source session's resolved environment, because the worktree is built
-       * from that session's work. So each key is in one of four states, and
-       * the row shows which:
-       *   - inherited  — value comes from the source session (italic value,
-       *                  per docs/colors.md's "inherited resolved value" rule)
-       *   - overridden — this branch replaced the inherited value
-       *   - added      — this branch set a variable the session never had
-       *   - unset      — this branch tombstoned it; the worktree does not get
-       *                  it at all (struck through, muted)
+       * from that session's work — see `renderInheritedEnvOverrideRow` for the
+       * four-state row logic this (and RAL-203's build/manual-checks
+       * sections) share.
        * @param {GuardianView} g
        * @param {GuardianBranch} b
        * @returns {string}
@@ -3933,40 +4267,7 @@
           ? `<div class="kv-row" style="margin:0 0 2px" data-tip="This review worktree does not run with exactly the environment its source session ran under.\nThe conflict resolver, final-verify pass, feedback routing, and check gates for this branch all use the values shown below.">⚠ ${overrideCount} branch override${overrideCount === 1 ? "" : "s"} — this worktree differs from its source session</div>`
           : "";
         const rows = keys.length
-          ? keys.map((k) => {
-              const hasOwn = Object.prototype.hasOwnProperty.call(own, k);
-              const ownVal = hasOwn ? own[k] : undefined;
-              const isUnset = hasOwn && ownVal === null;
-              const isInherited = !hasOwn;
-              const shown = isUnset ? (inherited[k] ?? "") : (hasOwn ? String(ownVal) : inherited[k]);
-              const tag = isUnset
-                ? `<span class="badge" style="color:var(--muted);border-color:var(--muted);font-size:10px" data-tip="Tombstoned by this branch — the variable is removed from this review worktree's environment entirely, even though the source session had it.">unset</span>`
-                : isInherited
-                  ? `<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:10px" data-tip="Inherited from this branch's source session — change it on the session (or override it here) to affect this worktree.">inherited</span>`
-                  : (k in inherited)
-                    ? `<span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:10px" data-tip="Overridden by this branch — replaces the value inherited from the source session.">overridden</span>`
-                    : `<span class="badge" style="color:var(--accent);border-color:var(--accent);font-size:10px" data-tip="Added by this branch — the source session never set this variable.">added</span>`;
-              // docs/colors.md: an inherited resolved value renders italic in
-              // the normal text color — provenance, not a status or a warning.
-              const valStyle = isUnset
-                ? "flex:1;text-decoration:line-through;color:var(--muted)"
-                : isInherited
-                  ? "flex:1;font-style:italic"
-                  : "flex:1";
-              const revertBtn = hasOwn
-                ? `<button class="btn" onclick="clearBranchEnvOverride('${g.id}','${b.id}','${esc(k)}')" data-tip="Drop this branch's own setting for ${esc(k)}, so it goes back to inheriting whatever its source session resolves to.\nWho/when: you overrode or unset a variable for this worktree and now want the session's value back.\nThis cannot be undone.">↩ Inherit</button>`
-                : "";
-              const unsetBtn = isUnset
-                ? ""
-                : `<button class="btn" onclick="unsetBranchEnvOverride('${g.id}','${b.id}','${esc(k)}')" data-tip="Remove ${esc(k)} from this review worktree's environment entirely, even though the source session sets it.\nWho/when: the session needed a variable (a token, a proxy) that the review must run without.\nThis cannot be undone.">⊘ Unset</button>`;
-              return `<div class="kv-row" style="margin:0">
-                  <span class="v mono" style="flex:1;font-size:11px">${esc(k)}</span>
-                  <span class="v mono" style="${valStyle};font-size:11px">${esc(shown)}</span>
-                  ${tag}
-                  <button class="btn" onclick="setBranchEnvOverride('${g.id}','${b.id}','${esc(k)}')" data-tip="Set this branch's own value for ${esc(k)}, replacing the inherited one for this review worktree only.\nWho/when: pointing one branch's review at a staging endpoint or a different toolchain without touching the original task.">✎ Override</button>
-                  ${unsetBtn}${revertBtn}
-                </div>`;
-            }).join("")
+          ? keys.map((k) => renderInheritedEnvOverrideRow(k, inherited, own, apiPath, "this review worktree")).join("")
           : `<div class="kv-row" style="margin:0"><span class="v">None</span></div>`;
         return `<h3 class="section" style="margin-top:8px" data-tip="The environment this branch's review worktree runs under.\nA review worktree is assembled from a session's work, so it inherits that session's resolved environment by default — the conflict resolver needs the same variables the code was written under.\nOverride or unset any of them here to change just this branch's review, leaving the original task untouched.">environment overrides (review worktree)</h3>
           ${banner}
@@ -3974,47 +4275,101 @@
           <div class="kv-row" style="margin:2px 0 0"><button class="btn" onclick="addEnvOverrideAt('${apiPath}')" data-tip="Add an environment variable for this review worktree only.\nWho/when: the review needs a variable its source session never set — a reviewer-only flag, a different API base, a test credential.\nApplies the next time this branch's resolver, verify pass, feedback routing, or check gates run, and stays set until removed.">+ Add override</button></div>`;
       }
       /**
-       * Prompts for a value and sets it as this review branch's own override
-       * for `key` (RAL-191), shadowing the value inherited from its source
-       * session for this worktree only.
-       * @param {string} gid
-       * @param {string} bid
+       * Renders the build/check-gate step's "environment overrides" section
+       * (RAL-203), shown in a review's "check gates" area. The combined
+       * worktree has no source session of its own to inherit from, so this
+       * shadows `g.combined_env` — the last enabled branch's own resolved
+       * environment — instead. Independent of the manual-checks layer
+       * rendered by `renderGuardianManualChecksEnvOverrides`.
+       * @param {GuardianView} g
+       * @returns {string}
+       */
+      function renderGuardianBuildEnvOverrides(g) {
+        const inherited = g.combined_env || {};
+        const own = g.build_env_overrides || {};
+        const apiPath = `/api/guardians/${g.id}/build-env`;
+        const keys = Array.from(new Set(Object.keys(inherited).concat(Object.keys(own)))).sort();
+        const overrideCount = Object.keys(own).length;
+        const banner = overrideCount
+          ? `<div class="kv-row" style="margin:0 0 2px" data-tip="The finalize-time build/check-gate step does not run with exactly the environment the combined branch stack was built under.">⚠ ${overrideCount} build override${overrideCount === 1 ? "" : "s"} active</div>`
+          : "";
+        const rows = keys.length
+          ? keys.map((k) => renderInheritedEnvOverrideRow(k, inherited, own, apiPath, "the build step")).join("")
+          : `<div class="kv-row" style="margin:0"><span class="v">None</span></div>`;
+        return `<h3 class="section" style="margin-top:8px" data-tip="The environment the finalize-time build/check-gate step runs under (RAL-203).\nBy default this is the last enabled branch's own resolved environment — the same variables the code was written under.\nOverride or unset any of them here to change just this step, independent of the manual-checks step below.">environment overrides (build step)</h3>
+          ${banner}
+          ${rows}
+          <div class="kv-row" style="margin:2px 0 0"><button class="btn" onclick="addEnvOverrideAt('${apiPath}')" data-tip="Add an environment variable for the build/check-gate step only.\nWho/when: the check gate needs a variable no branch set — a CI-only flag, a different API base, a test credential.\nApplies the next time this review's check gates run, and stays set until removed.">+ Add override</button></div>`;
+      }
+      /**
+       * Renders the manual-checks step's "environment overrides" section
+       * (RAL-203) — the LLM-suggested commands run via `ralphus review checks
+       * run` / the board's "Run all". Shadows the same `g.combined_env`
+       * baseline as `renderGuardianBuildEnvOverrides`, but as its own,
+       * independent layer.
+       * @param {GuardianView} g
+       * @returns {string}
+       */
+      function renderGuardianManualChecksEnvOverrides(g) {
+        const inherited = g.combined_env || {};
+        const own = g.manual_checks_env_overrides || {};
+        const apiPath = `/api/guardians/${g.id}/manual-checks-env`;
+        const keys = Array.from(new Set(Object.keys(inherited).concat(Object.keys(own)))).sort();
+        const overrideCount = Object.keys(own).length;
+        const banner = overrideCount
+          ? `<div class="kv-row" style="margin:0 0 2px" data-tip="The manual-checks step (\"Run all\" and individual check commands) does not run with exactly the environment the combined branch stack was built under.">⚠ ${overrideCount} manual-checks override${overrideCount === 1 ? "" : "s"} active</div>`
+          : "";
+        const rows = keys.length
+          ? keys.map((k) => renderInheritedEnvOverrideRow(k, inherited, own, apiPath, "the manual-checks step")).join("")
+          : `<div class="kv-row" style="margin:0"><span class="v">None</span></div>`;
+        return `<h3 class="section" style="margin-top:8px" data-tip="The environment the manual-checks step runs under (RAL-203) — \"Run all\", an individual suggested command, or a [[review.action]] hint.\nBy default this is the last enabled branch's own resolved environment.\nOverride or unset any of them here to change just this step, independent of the build step above.">environment overrides (manual checks)</h3>
+          ${banner}
+          ${rows}
+          <div class="kv-row" style="margin:2px 0 0"><button class="btn" onclick="addEnvOverrideAt('${apiPath}')" data-tip="Add an environment variable for the manual-checks step only.\nWho/when: a suggested command needs a variable no branch set — a reviewer-only flag, a different API base, a test credential.\nApplies the next time a manual check runs, and stays set until removed.">+ Add override</button></div>`;
+      }
+      /**
+       * Prompts for a value and sets it as this scope's own override for
+       * `key` (RAL-191/RAL-203), shadowing the inherited value for this scope
+       * only. Shared by review-branch, build-step, and manual-checks-step env
+       * sections — `apiPath` fully addresses which layer is mutated.
+       * @param {string} apiPath
        * @param {string} key
+       * @param {string} scopeLabel
        * @returns {Promise<void>}
        */
-      async function setBranchEnvOverride(gid, bid, key) {
-        const value = prompt(`Value for ${key} in this review worktree:`);
+      async function setScopedEnvOverride(apiPath, key, scopeLabel) {
+        const value = prompt(`Value for ${key} in ${scopeLabel}:`);
         if (value === null) return;
-        const res = await post(`/api/guardians/${gid}/branches/${bid}/env`, { set: { [key]: value } });
+        const res = await post(apiPath, { set: { [key]: value } });
         if (!res.ok) { alert("Failed to set the environment override."); return; }
         tick();
       }
       /**
-       * Tombstones `key` for this review branch (RAL-191) — the variable is
-       * removed from the worktree's environment even though the source
-       * session sets it.
-       * @param {string} gid
-       * @param {string} bid
+       * Tombstones `key` for this scope (RAL-191/RAL-203) — the variable is
+       * removed from this scope's environment even though it would otherwise
+       * be inherited.
+       * @param {string} apiPath
        * @param {string} key
+       * @param {string} scopeLabel
        * @returns {Promise<void>}
        */
-      async function unsetBranchEnvOverride(gid, bid, key) {
-        if (!confirm(`Remove "${key}" from this review worktree's environment?\nIt will not be set at all here, even though the source session sets it.\nThis cannot be undone.`)) return;
-        const res = await post(`/api/guardians/${gid}/branches/${bid}/env`, { unset: [key] });
+      async function unsetScopedEnvOverride(apiPath, key, scopeLabel) {
+        if (!confirm(`Remove "${key}" from ${scopeLabel}'s environment?\nIt will not be set at all here, even though it would otherwise be inherited.\nThis cannot be undone.`)) return;
+        const res = await post(apiPath, { unset: [key] });
         if (!res.ok) { alert("Failed to unset the environment variable."); return; }
         tick();
       }
       /**
-       * Drops this review branch's own entry for `key` (RAL-191), so it goes
-       * back to inheriting whatever its source session resolves to.
-       * @param {string} gid
-       * @param {string} bid
+       * Drops this scope's own entry for `key` (RAL-191/RAL-203), so it goes
+       * back to inheriting the upstream value.
+       * @param {string} apiPath
        * @param {string} key
+       * @param {string} scopeLabel
        * @returns {Promise<void>}
        */
-      async function clearBranchEnvOverride(gid, bid, key) {
-        if (!confirm(`Go back to inheriting "${key}" from this branch's source session?\nThis cannot be undone.`)) return;
-        const res = await post(`/api/guardians/${gid}/branches/${bid}/env`, { clear: [key] });
+      async function clearScopedEnvOverride(apiPath, key, scopeLabel) {
+        if (!confirm(`Go back to inheriting "${key}" for ${scopeLabel}?\nThis cannot be undone.`)) return;
+        const res = await post(apiPath, { clear: [key] });
         if (!res.ok) { alert("Failed to revert the environment override."); return; }
         tick();
       }
@@ -4194,6 +4549,7 @@
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${["pending","queued"].includes(t.state) ? "" : runLogsBtn(r.id)}</span></div>
+          ${timingRows(t.started_at_ms, t.finished_at_ms)}
           ${sessions}
           ${verify}
           ${taskEnvOverridesSection(r, ti, t)}
@@ -4277,8 +4633,11 @@
           const items = terminalMenuItem(key, "Open Terminal Log",
               `openVerifyTerminal('${r.id}',${ti},'${scope}',${si},${vi})`,
               "Attach an interactive terminal to this verify step's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the verify step is actively running — fails gracefully otherwise.")
-            + openAgentItem;
-          return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key)}`;
+            + openAgentItem
+            + terminalMenuItem(key, "View Attempt History",
+                `toggleHistory('${key}')`,
+                "List every durably-persisted terminal-log attempt for this verify step, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
+          return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key)}${historyBox(key)}`;
         })();
         return `<div class="dhead"><span class="k">✓ verify step</span></div>
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(v.id || "—")}</span></div>
@@ -4365,6 +4724,7 @@
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${["pending","queued"].includes(s.state) ? "" : runLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          ${timingRows(s.started_at_ms, s.finished_at_ms)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
           <div class="kv-row"><span class="k">project</span><span class="v mono">${esc(project)}${paths && paths.project ? copyBtn(paths.project) : ""}</span></div>
@@ -4404,8 +4764,11 @@
             const items = terminalMenuItem(key, "Open Terminal Log",
                 `openTerminal('${r.id}',${sel.taskIdx},${sel.sessionIdx})`,
                 "Attach an interactive terminal to this session's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the session is actively running — fails gracefully otherwise.")
-              + openAgentItem;
-            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key)}`;
+              + openAgentItem
+              + terminalMenuItem(key, "View Attempt History",
+                  `toggleHistory('${key}')`,
+                  "List every durably-persisted terminal-log attempt for this session, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
+            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms)}${historyBox(key)}`;
           })()}`;
       }
       // CCTL-115: render each command line elided in a fixed-height box; a
@@ -5480,6 +5843,78 @@
         const cumHead = `<span data-tip="${cumTip}">cumulative (all restarts)</span>`;
         return T(["task", "session", "state", "tokens (this run)", "cost (this run)", cumHead, "error"], cumulativeSessionRows(run));
       }
+
+      // ---------- uber-log-viewer timeline modal (RAL-155) ----------
+      /**
+       * @typedef {object} RunTimelineMeta
+       * @property {string} run_id
+       * @property {number} generated_at_ms
+       * @property {number|null} start_ms
+       * @property {number|null} end_ms
+       * @property {number} event_count
+       * @property {number} terminal_log_count
+       * @property {number} task_count
+       * @property {number} session_count
+       * @property {boolean} truncated
+       * @property {boolean} gaps_possible
+       */
+      /**
+       * @typedef {object} RunTimeline
+       * @property {RunTimelineMeta} meta
+       * @property {object[]} entries
+       * @property {string} text
+       * @property {string} file_path
+       */
+      /**
+       * Opens the Timeline modal for a run from a button click, generating a
+       * fresh merged view on every open (the daemon regenerates its temp file
+       * each call too — see `runTimelineBtn`'s tooltip).
+       * @param {MouseEvent} e
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function openRunTimeline(e, id) {
+        e.stopPropagation();
+        const run = findRun(id);
+        if (!run) return;
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg"><div class="modal" style="width:880px;max-width:94vw">
+            <h2>Timeline — ${esc(run.label || run.id)}</h2>
+            <p style="font-size:13px;color:var(--muted)">Generating…</p>
+          </div></div>`;
+        /** @type {RunTimeline} */
+        let timeline;
+        try {
+          const resp = await fetch(`/api/runs/${id}/timeline`);
+          if (!resp.ok) { closeModal(); alert("Failed to generate the timeline."); return; }
+          timeline = await resp.json();
+        } catch (_) { closeModal(); alert("Failed to generate the timeline: network error."); return; }
+        renderRunTimeline(run, timeline);
+      }
+      /**
+       * Renders a generated `RunTimeline` into the Timeline modal.
+       * @param {RunView} run
+       * @param {RunTimeline} timeline
+       * @returns {void}
+       */
+      function renderRunTimeline(run, timeline) {
+        const m = timeline.meta;
+        const gapsNote = m.gaps_possible
+          ? `<p style="font-size:12px;color:var(--incomplete)" data-tip="Cartographer's retention pruning (retention_days/max_rows) has already removed some of this run's earliest history — this timeline is best-effort, not guaranteed complete.">⚠ earliest history may have been pruned — this view is best-effort</p>`
+          : "";
+        const truncatedNote = m.truncated
+          ? `<p style="font-size:12px;color:var(--incomplete)" data-tip="This run generated more events than the conservative per-generation cap — only the earliest events up to the cap are shown.">⚠ truncated — this run has more events than fit in one generation</p>`
+          : "";
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw">
+            <h2>Timeline — ${esc(run.label || run.id)}</h2>
+            <p style="font-size:12px;color:var(--muted)" data-tip="Every state transition, Cartographer event, and terminal-log excerpt for this run, merged in chronological order.">${m.event_count} events · ${m.terminal_log_count} terminal-log refs · ${m.task_count} tasks · ${m.session_count} sessions</p>
+            <p style="font-size:12px;color:var(--muted)" data-tip="Where the daemon (best-effort) wrote this generation's rendered text as a temp file — not a persistent export.">file: <span class="mono">${esc(timeline.file_path)}</span>${copyBtn(timeline.file_path)}</p>
+            ${gapsNote}${truncatedNote}
+            <pre style="max-height:55vh;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:12px;white-space:pre-wrap;word-break:break-word">${esc(timeline.text)}</pre>
+            <div class="btn-row">${copyBtn(timeline.text)}<button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button></div>
+          </div></div>`;
+      }
       // Files tab: validate + queue every loaded file as its own run, named
       // after the file. Files that fail validation or submission stay in the
       // batch (with their error shown inline) so the user can fix and retry
@@ -5639,20 +6074,26 @@
           + (b.resolver_agent_session_id
             ? terminalMenuItem(key, "Open Agent", `openGuardianBranchTerminal('${g.id}','${b.id}','agent')`, agentTip)
             : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this resolver.", true))
-          + terminalMenuItem(key, "Open Worktree Shell", `openGuardianBranchTerminal('${g.id}','${b.id}','worktree')`, wtTip);
+          + terminalMenuItem(key, "Open Worktree Shell", `openGuardianBranchTerminal('${g.id}','${b.id}','worktree')`, wtTip)
+          + terminalMenuItem(key, "View Attempt History",
+              `toggleHistory('${key}')`,
+              "List every durably-persisted terminal-log attempt for this resolver, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
         return `${previewBtn}${terminalMenuHtml(key, items)}`;
       }
       // Sibling to resolverTerminalBtns — rendered outside the flex btn-row
       // (see the call site) so the box lays out on its own line, not squeezed
       // in as a flex item next to the buttons.
       /**
-       * Renders a review branch's resolver live-pane peek box, if its worktree exists.
+       * Renders a review branch's resolver live-pane peek box plus its
+       * attempt-history box, if its worktree exists.
        * @param {GuardianView} g
        * @param {GuardianBranch} b
        * @returns {string}
        */
       function resolverPeekBox(g, b) {
-        return b.worktree ? peekBox(`guardian|${g.id}|${b.id}`) : "";
+        if (!b.worktree) return "";
+        const key = `guardian|${g.id}|${b.id}`;
+        return `${peekBox(key)}${historyBox(key)}`;
       }
 
       // Render manual-checks-generation terminal buttons for a review (RAL-88
@@ -5683,20 +6124,26 @@
         const items = terminalMenuItem(key, openLabel, `openGuardianManualChecksTerminal('${g.id}','open')`, openTip)
           + (g.manual_commands_agent_session_id
             ? terminalMenuItem(key, "Open Agent", `openGuardianManualChecksTerminal('${g.id}','agent')`, agentTip)
-            : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this generation pass.", true));
+            : terminalMenuItem(key, "Open Agent", "", "Not available yet — no resumable agent session has started for this generation pass.", true))
+          + terminalMenuItem(key, "View Attempt History",
+              `toggleHistory('${key}')`,
+              "List every durably-persisted terminal-log attempt for this generation pass, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
         return `${previewBtn}${terminalMenuHtml(key, items)}`;
       }
       // Sibling to manualChecksTerminalBtns — rendered outside the flex
       // btn-row so the box lays out on its own line.
       /**
-       * Renders a review's manual-checks-generation live-pane peek box, if generation has started.
+       * Renders a review's manual-checks-generation live-pane peek box plus
+       * its attempt-history box, if generation has started.
        * @param {GuardianView} g
        * @returns {string}
        */
       function manualChecksPeekBox(g) {
         const cmds = g.manual_commands || [];
         const state = g.checks_state || (cmds.length ? "ready" : "waiting");
-        return state !== "waiting" ? peekBox(`guardian-manual|${g.id}`) : "";
+        if (state === "waiting") return "";
+        const key = `guardian-manual|${g.id}`;
+        return `${peekBox(key)}${historyBox(key)}`;
       }
 
       // ---------- structured check inputs (RAL-164) ----------
@@ -5981,6 +6428,28 @@
         const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
         return `<div class="kv-row" data-tip="${tip}"><span class="k">conflicts</span><span>${found} found · ${fixed} fixed · ${committed} committed${resolving}</span></div>`;
       }
+      // RAL-193: this review's own agent cost -- conflict-resolution and
+      // verifier LLM calls made by the guardian merge machinery -- scoped to
+      // the current merge attempt and cumulatively across every
+      // rebase/re-merge attempt. Deliberately excludes the cost of the
+      // tasks/sessions that fed into the review.
+      /**
+       * Renders a review's own resolver/verifier cost (current attempt + cumulative).
+       * @param {GuardianView} g
+       * @returns {string}
+       */
+      function reviewCostSummary(g) {
+        const hasAttempt = (g.attempt_tokens_in ?? 0) > 0 || (g.attempt_tokens_out ?? 0) > 0 || (g.attempt_cost_usd ?? 0) > 0;
+        const hasCumulative = (g.cumulative_tokens_in ?? 0) > 0 || (g.cumulative_tokens_out ?? 0) > 0 || (g.cumulative_cost_usd ?? 0) > 0;
+        if (!hasAttempt && !hasCumulative) return "";
+        const cap = g.maximum_budget_usd;
+        const capNote = cap ? ` <span style="color:var(--muted)">/ cap $${cap.toFixed(4)}</span>` : "";
+        const overCap = cap != null && (g.cumulative_cost_usd ?? 0) > cap;
+        const attemptTip = "This review's own conflict-resolution and verifier agent cost for the CURRENT merge attempt only.\nExcludes the cost of the tasks/sessions that fed into the review.\nWho/when: check this to see what the most recent rebase/re-merge attempt cost by itself.";
+        const cumulativeTip = "This review's own conflict-resolution and verifier agent cost, summed across EVERY rebase/re-merge attempt this review has gone through.\nExcludes the cost of the tasks/sessions that fed into the review.\nWho/when: check this to see the full spend on a review that needed several re-merges.\nIf maximum_budget_usd is set, this is the value it's enforced against — once exceeded, the daemon stops making further resolver/verifier calls and fails the review.";
+        return `<div class="kv-row" data-tip="${attemptTip}"><span class="k">attempt cost</span><span>input ${g.attempt_tokens_in ?? 0} · output ${g.attempt_tokens_out ?? 0} · ${fmtCostUsd(g.attempt_cost_usd)}</span></div>
+          <div class="kv-row" data-tip="${cumulativeTip}"><span class="k">cumulative cost</span><span>input ${g.cumulative_tokens_in ?? 0} · output ${g.cumulative_tokens_out ?? 0} · ${fmtCostUsd(g.cumulative_cost_usd)}${capNote}${overCap ? ` <span style="color:var(--failed)">⚠ over cap</span>` : ""}</span></div>`;
+      }
       /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
        * @param {GuardianBranch} b
@@ -6126,6 +6595,91 @@ Check the task's session output and re-run it — or, if this branch is meant to
         }
         return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task session finishes — no need to wait for merging/rebasing.">change summary</h3><div class="empty">waiting for a branch to be ready…</div>`;
       }
+      // ---------- PR submission + sync (RAL-117/RAL-190) ----------
+      // Shared inline style for the "submit PR" form's text fields -- kept as
+      // one constant since branchPrSection/combinedPrSection each render three.
+      const prInputStyle = "background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px;width:100%";
+      /**
+       * Renders one existing PR's status row: forge/number/state, and a drift
+       * banner (RAL-190) offering "pull PR commits" when the PR branch has
+       * commits the review worktree does not yet.
+       * @param {PullRequestView} p
+       * @returns {string}
+       */
+      function prCard(p) {
+        const link = p.pr_url
+          ? `<a href="${esc(p.pr_url)}" target="_blank" rel="noopener" class="mono" style="color:var(--accent)" data-tip="Open this pull/merge request on ${esc(p.forge)}.">#${p.pr_number ?? "?"}</a>`
+          : `<span class="mono">${esc(p.branch_alias)}</span>`;
+        const sync = prSyncStatus[p.id];
+        let drift = "";
+        if (sync && sync.pr_ahead) {
+          drift = `<div class="row" style="margin-top:4px;gap:6px">
+              <span class="badge" style="color:var(--drift);border-color:var(--drift);font-size:11px" data-tip="A reviewer pushed commit(s) directly to this PR branch that this review worktree does not have yet.\nWho/when: pull them in before this branch is pushed again, so they aren't silently overwritten.">⇅ PR branch has new commits</span>
+              <button class="btn" style="padding:1px 8px;font-size:11px" onclick="pullPrCommits('${p.id}')" data-tip="Fetch the PR branch's new commits and rebase them into this review worktree.\nConflicts are resolved the same way a normal stacked rebase resolves them, then everything downstream of this branch is restacked on top.\nThe merged result is pushed back to the PR branch afterward.">Pull PR commits</button>
+            </div>`;
+        } else if (sync && sync.worktree_ahead) {
+          drift = `<div class="row" style="margin-top:4px">
+              <span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="This review worktree has commits not yet reflected on the PR branch -- e.g. feedback was just resolved.\nInformational only: submitting again, or resolving PR feedback, pushes the latest worktree state to the PR branch automatically.">worktree ahead of PR — syncs on next push</span>
+            </div>`;
+        }
+        return `<div class="pr-card" style="border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px" data-tip="Pull/merge request submitted via ${esc(p.forge)}.">
+            <div class="row" style="justify-content:space-between;gap:6px">
+              <span>${esc(p.forge)} ${link} <span class="mono" style="color:var(--muted);font-size:11px">${esc(p.branch_alias)} → ${esc(p.base_ref)}</span></span>
+              <span class="badge" style="font-size:11px">${esc(p.state)}</span>
+            </div>
+            ${drift}
+          </div>`;
+      }
+      /**
+       * Renders the inline "submit PR" form's three fields for `formKey`
+       * (RAL-190) -- shared by the per-branch and combined-worktree sections.
+       * @param {string} formKey
+       * @param {string} defaultAliasHint
+       * @returns {string}
+       */
+      function prForm(formKey, defaultAliasHint) {
+        return `<div class="row" style="flex-direction:column;align-items:stretch;gap:4px;margin-top:4px">
+            <input type="text" id="pr-alias-${formKey}" placeholder="PR branch name (blank = ${esc(defaultAliasHint)})" style="${prInputStyle}" data-tip="The branch name actually pushed to the remote for this PR.\nLeft blank, it defaults to ${esc(defaultAliasHint)} -- so the review worktree branch can be reused directly as the PR branch with no separate name.\nA name already used by another open PR is auto-suffixed (-002, -003, ...) automatically.">
+            <input type="text" id="pr-title-${formKey}" placeholder="title (blank = AI-generated)" style="${prInputStyle}" data-tip="Pull/merge request title.\nLeft blank, one is generated from this branch's commits, following the target repo's PR template when it has one.">
+            <textarea id="pr-desc-${formKey}" placeholder="description (blank = AI-generated)" rows="2" style="${prInputStyle};resize:vertical" data-tip="Pull/merge request description.\nLeft blank, one is generated the same way as the title."></textarea>
+          </div>`;
+      }
+      /**
+       * Renders the PR submission/status section for one stacked branch
+       * (RAL-190): existing open PR(s) for it, and an inline "submit PR" form.
+       * @param {GuardianView} g
+       * @param {GuardianBranch} b
+       * @returns {string}
+       */
+      function branchPrSection(g, b) {
+        if (!b.worktree) return "";
+        const prs = (pullRequests[g.id] || []).filter((p) => p.branch_id === b.id && p.state === "open");
+        const formKey = `${g.id}:${b.id}`;
+        const formOpen = prFormOpen.has(formKey);
+        const existing = prs.map(prCard).join("");
+        const toggleBtn = `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="event.stopPropagation();togglePrForm('${formKey}')" data-tip="Submit a pull/merge request for this branch's review worktree to GitHub/GitLab.\nWho/when: once a branch's review worktree looks good, open a real PR for it without leaving the board.">${formOpen ? "− cancel" : "+ submit PR"}</button>`;
+        const form = formOpen ? `${prForm(formKey, b.branch)}
+            <button class="btn primary" style="padding:3px 10px;font-size:11px;margin-top:4px" onclick="event.stopPropagation();submitBranchPr('${g.id}','${b.id}')" data-tip="Push this branch and open the PR/MR.\nRuns in the background -- the row above updates once the forge call completes.">Submit</button>` : "";
+        return `<div class="pr-section" style="margin-top:6px" onclick="event.stopPropagation()">${existing}${toggleBtn}${form}</div>`;
+      }
+      /**
+       * Renders the PR section for the review's combined (all-branches)
+       * worktree (RAL-190) -- shown once at the top of the detail pane rather
+       * than per-branch.
+       * @param {GuardianView} g
+       * @returns {string}
+       */
+      function combinedPrSection(g) {
+        if (!g.review_branch) return "";
+        const prs = (pullRequests[g.id] || []).filter((p) => !p.branch_id && p.state === "open");
+        const formKey = `${g.id}:combined`;
+        const formOpen = prFormOpen.has(formKey);
+        const existing = prs.map(prCard).join("");
+        const toggleBtn = `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="togglePrForm('${formKey}')" data-tip="Submit a pull/merge request for the whole combined (all-branches-rebased) review worktree, instead of one PR per branch.\nWho/when: reviewing the stack as a single PR rather than a stacked series.">${formOpen ? "− cancel" : "+ submit combined PR"}</button>`;
+        const form = formOpen ? `${prForm(formKey, "review/" + g.name)}
+            <button class="btn primary" style="padding:3px 10px;font-size:11px;margin-top:4px" onclick="submitCombinedPr('${g.id}')" data-tip="Push the combined worktree and open the PR/MR.\nRuns in the background -- the row above updates once the forge call completes.">Submit</button>` : "";
+        return `<h3 class="section" data-tip="Pull/merge requests submitted for this review on GitHub/GitLab (RAL-117/RAL-190).">pull requests</h3>${existing}${toggleBtn}${form}`;
+      }
       /**
        * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
        * @returns {void}
@@ -6182,6 +6736,7 @@ Check the task's session output and re-run it — or, if this branch is meant to
                   <button class="btn" onclick="sendFeedback('${g.id}','${b.id}')" data-tip="Send reviewer feedback for this specific branch.\nThe guardian agent routes it to the session that owns this branch.">Send feedback</button>
                 </div>` : ""}
               ${renderBranchEnvOverrides(g, b)}
+              ${branchPrSection(g, b)}
             </div>` : "";
           // RAL-43: enable/disable toggle — staged like drag-reorder, takes effect on Save.
           const enableToggle = canReorder
@@ -6245,7 +6800,7 @@ Check the task's session output and re-run it — or, if this branch is meant to
               : `<div class="row"><span class="vchip" style="border-color:var(--unverified);color:var(--unverified)" data-tip="No check gates are configured for this review, the project has no auto_build default in .ralphus.toml, and either the resolver agent found no build step to infer or skip auto-build is on.\nWho/when: relevant to anyone relying on 'in review' meaning 'built and tested' — right now this review reached that status with zero build or test verification.\nAdd checks above, or set [review] auto_build in the project's .ralphus.toml, to close this gap.">⚠ no build verification configured</span></div>`;
         const skipToggles = `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nUseful while iterating on check gates, or to avoid an unwanted inferred build.\nManual checks are still generated — only the automatic build/check step is skipped.">
             <input type="checkbox" ${g.skip_auto_build ? "checked" : ""} onchange="setSkipAutoBuild('${g.id}',this.checked)">skip auto-build${g.skip_auto_build && gChecks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Omit the quality-bar instructions (run task/session verify steps, formatters, linters) from both the per-branch fix pass and the dedicated final-verification call (RAL-149).\nUseful when the resolver agent's self-verification pass is slow or unreliable for this review.\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts, not the finalize-time build.">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip the dedicated final-verification call (RAL-149) entirely, and omit the quality-bar instructions (run task/session verify steps, formatters, linters) from the per-branch fix pass.\nUseful when the resolver agent's self-verification pass is slow or unreliable for this review.\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts and the final-verify call, not the finalize-time build.">
             <input type="checkbox" ${g.skip_worktree_checks ? "checked" : ""} onchange="setSkipWorktreeChecks('${g.id}',this.checked)">skip per-worktree checks</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees.\nFaster for large repos but gives less isolation between branches.">
             <input type="checkbox" ${g.skip_worktrees ? "checked" : ""} onchange="setSkipWorktrees('${g.id}',this.checked)">skip per-branch worktrees (build the stack in one shared worktree)</label>`;
@@ -6268,7 +6823,7 @@ Check the task's session output and re-run it — or, if this branch is meant to
         const rSelVal = rp ? rp.agent : (g.resolver_agent || "");
         const resolverRow = resolverFrozen
           ? `<div class="kv-row"><span class="k">resolver</span><span class="v mono">${esc(g.resolver_agent || "ollama")}</span></div>`
-          : `<div class="kv-row"><span class="k">resolver</span><div style="display:flex;flex-direction:column;gap:4px"><select id="resolver-select" onchange="onResolverChange('${g.id}',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts.\nBackends: ollama (local, default), claude (Anthropic API), claude-code (interactive harness), codex-cli (OpenAI Codex CLI, non-interactive).\nPress Save to apply — if the review is active it will trigger a fresh rebase with the new backend."><option value="" ${rSelVal===""?"selected":""}>ollama (default)</option><option value="claude" ${rSelVal==="claude"?"selected":""}>claude</option><option value="claude-code" ${rSelVal==="claude-code"?"selected":""}>claude-code</option><option value="codex-cli" ${rSelVal==="codex-cli"?"selected":""}>codex-cli</option></select><div id="resolver-pending" style="display:${rPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" onclick="saveResolver('${g.id}','${g.status}')" data-tip="Save the resolver backend.\nIf the review is active, a rebase will be triggered immediately with the new backend.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelResolver('${g.id}')" data-tip="Discard — revert the dropdown to the last saved value.">Cancel</button></div></div></div>`;
+          : `<div class="kv-row"><span class="k">resolver</span><div style="display:flex;flex-direction:column;gap:4px"><select id="resolver-select" onchange="onResolverChange('${g.id}',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts.\nBackends: ollama (local, default), claude (Anthropic API), claude-code (interactive harness), codex-cli (OpenAI Codex CLI, non-interactive).\nPress Save to apply — if a rebase is already in progress it restarts immediately with the new backend."><option value="" ${rSelVal===""?"selected":""}>ollama (default)</option><option value="claude" ${rSelVal==="claude"?"selected":""}>claude</option><option value="claude-code" ${rSelVal==="claude-code"?"selected":""}>claude-code</option><option value="codex-cli" ${rSelVal==="codex-cli"?"selected":""}>codex-cli</option></select><div id="resolver-pending" style="display:${rPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" onclick="saveResolver('${g.id}')" data-tip="Save the resolver backend.\nIf a rebase is already in progress, it restarts immediately with the new backend.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelResolver('${g.id}')" data-tip="Discard — revert the dropdown to the last saved value.">Cancel</button></div></div></div>`;
         // RAL-168: "Verify" scope -- how often the dedicated LLM-based
         // final-verify pass runs. Save/Cancel like the resolver dropdown
         // above (interview Q6: confirm via Save/Cancel, but no rebase
@@ -6334,6 +6889,7 @@ Check the task's session output and re-run it — or, if this branch is meant to
             <span style="flex:1"></span><button class="icon-btn" onclick="openReviewLogs('${g.id}')" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn runbtn" onclick="openReviewTitleMenu(event,'${g.id}')" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
+          ${reviewCostSummary(g)}
           <div class="kv-row"><span class="k">review id</span><span class="mono" style="cursor:pointer" data-tip="The unique identifier for this Guardian review.\nUse this ID in API calls, daemon logs, or to find the review worktree on disk.\nClick to copy the full ID." data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
           ${g.run_id ? `<div class="kv-row"><span class="k">from run</span><span class="v"><a href="#" onclick="gotoRun('${g.run_id}');return false" style="color:var(--accent)" data-tip="Switch to the Tasks tab and open this run.">${esc(g.run_id)}</a></span></div>` : ""}
           ${g.status === "collecting" && g.run_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its run finishes — or start it now below"}</span></div>` : ""}
@@ -6347,7 +6903,9 @@ Check the task's session output and re-run it — or, if this branch is meant to
           <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
           ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono" style="font-size:11px">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
+          ${combinedPrSection(g)}
           <h3 class="section">check gates</h3>${checks}${skipToggles}
+          ${renderGuardianBuildEnvOverrides(g)}
           <h3 class="section" data-tip="Squash controls how each task branch's commits appear in the review worktree.\nScope is per git project — set it independently for each project in the review.">squash</h3>${squashSection}
           ${g.detail && !autoBuiltCmd ? `<div class="warn">${esc(g.detail)}</div>` : ""}
           <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
@@ -6470,7 +7028,8 @@ Check the task's session output and re-run it — or, if this branch is meant to
                 ${menuOpen ? `<div style="position:absolute;top:100%;left:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;min-width:200px;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.4);padding:4px 0;margin-top:2px">${menuItems}</div>` : ""}` : ""}
               </div>
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
-              ${manualChecksPeekBox(g)}`;
+              ${manualChecksPeekBox(g)}
+              ${renderGuardianManualChecksEnvOverrides(g)}`;
           })()}
           ${chatSection}`;
         const handle = document.getElementById("chat-resize-handle");
@@ -6670,6 +7229,71 @@ Check the task's session output and re-run it — or, if this branch is meant to
         if (!feedback) return;
         if (input) input.value = "";
         await guardianAction(`/api/guardians/${gid}/branches/${branchId}/feedback`, { feedback });
+        tick();
+      }
+      /**
+       * Toggles an inline "submit PR" form's visibility (RAL-190).
+       * @param {string} key - "gid:branchId" or "gid:combined"
+       * @returns {void}
+       */
+      function togglePrForm(key) {
+        if (prFormOpen.has(key)) prFormOpen.delete(key); else prFormOpen.add(key);
+        renderReviewDetail();
+      }
+      /**
+       * Reads a "submit PR" form's three fields for `formKey` into a request
+       * body fragment (RAL-190) -- blank fields are omitted so the daemon
+       * applies its own defaults/auto-generation.
+       * @param {string} formKey
+       * @returns {{branch_alias?: string, title?: string, description?: string}}
+       */
+      function readPrForm(formKey) {
+        const alias = /** @type {HTMLInputElement|null} */ (document.getElementById(`pr-alias-${formKey}`));
+        const title = /** @type {HTMLInputElement|null} */ (document.getElementById(`pr-title-${formKey}`));
+        const desc = /** @type {HTMLTextAreaElement|null} */ (document.getElementById(`pr-desc-${formKey}`));
+        /** @type {{branch_alias?: string, title?: string, description?: string}} */
+        const out = {};
+        const aliasVal = (alias && alias.value || "").trim();
+        const titleVal = (title && title.value || "").trim();
+        const descVal = (desc && desc.value || "").trim();
+        if (aliasVal) out.branch_alias = aliasVal;
+        if (titleVal) out.title = titleVal;
+        if (descVal) out.description = descVal;
+        return out;
+      }
+      /**
+       * Submits a PR for one stacked branch, reading the inline form's fields (RAL-190).
+       * @param {string} gid
+       * @param {string} branchId
+       * @returns {Promise<void>}
+       */
+      async function submitBranchPr(gid, branchId) {
+        const req = { branch_id: branchId, ...readPrForm(`${gid}:${branchId}`) };
+        prFormOpen.delete(`${gid}:${branchId}`);
+        await guardianAction(`/api/guardians/${gid}/pull-requests`, { prs: [req] });
+        await pollPullRequests(gid);
+        renderReviewDetail();
+      }
+      /**
+       * Submits a PR for the review's combined (all-branches) worktree,
+       * reading the inline form's fields (RAL-190).
+       * @param {string} gid
+       * @returns {Promise<void>}
+       */
+      async function submitCombinedPr(gid) {
+        const req = readPrForm(`${gid}:combined`);
+        prFormOpen.delete(`${gid}:combined`);
+        await guardianAction(`/api/guardians/${gid}/pull-requests`, { prs: [req] });
+        await pollPullRequests(gid);
+        renderReviewDetail();
+      }
+      /**
+       * Pulls a PR branch's fetched commits into its owning review worktree (RAL-190).
+       * @param {string} prId
+       * @returns {Promise<void>}
+       */
+      async function pullPrCommits(prId) {
+        await guardianAction(`/api/pull-requests/${prId}/pull-from-pr`);
         tick();
       }
       // RAL-24: candidate base-branch lists, keyed by guardian id. Fetched once on
@@ -7033,23 +7657,16 @@ Check the task's session output and re-run it — or, if this branch is meant to
         renderReviewDetail();
       }
       /**
-       * Saves the staged resolver-agent choice and re-triggers the rebase if the review is active.
+       * Saves the staged resolver-agent choice. The daemon itself restarts an
+       * already-`merging` review's in-flight rebase so the new resolver takes
+       * effect immediately (RAL-213) -- this no longer needs to do that here.
        * @param {string} gid
-       * @param {string} status
        * @returns {Promise<void>}
        */
-      async function saveResolver(gid, status) {
+      async function saveResolver(gid) {
         const agent = pendingResolver ? pendingResolver.agent : "";
         pendingResolver = null;
         await guardianAction(`/api/guardians/${gid}/settings`, { resolver_agent: agent, resolver_model: "" });
-        const done = ["approved", "cancelled", "deployed"];
-        if (!done.includes(status)) {
-          if (status === "merging") {
-            await guardianAction(`/api/guardians/${gid}/cancel_and_merge`);
-          } else {
-            await guardianAction(`/api/guardians/${gid}/merge`);
-          }
-        }
         tick();
       }
       /**
@@ -7132,7 +7749,7 @@ Check the task's session output and re-run it — or, if this branch is meant to
                 <label data-tip="Absolute path to the git repository root on this machine. The daemon checks out worktrees here.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
                 <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nGates are still stored — you can re-enable this later."><input type="checkbox" id="cr-skip-auto-build" style="width:auto;margin:0">skip auto-build</label>
-                <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Omit the quality-bar instructions (run task/session verify steps, formatters, linters) from both the per-branch fix pass and the dedicated final-verification call (RAL-149).\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts, not the finalize-time build."><input type="checkbox" id="cr-skip-worktree-checks" style="width:auto;margin:0">skip per-worktree checks</label>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Skip the dedicated final-verification call (RAL-149) entirely, and omit the quality-bar instructions (run task/session verify steps, formatters, linters) from the per-branch fix pass.\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts and the final-verify call, not the finalize-time build."><input type="checkbox" id="cr-skip-worktree-checks" style="width:auto;margin:0">skip per-worktree checks</label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Use one shared worktree for the entire stack instead of per-branch worktrees. Faster for large repos."><input type="checkbox" id="cr-skip-worktrees" style="width:auto;margin:0">skip per-branch worktrees (large repos)</label>
               </div>
               <div id="cr-other-fields" class="hidden"><div class="empty" style="margin:12px 0">No extra fields for this review type yet.</div></div>
@@ -7835,6 +8452,41 @@ Check the task's session output and re-run it — or, if this branch is meant to
         await Promise.all([...failedIds].map((bid) => fetchBranchConflicts(gid, bid)));
       }
       /**
+       * Fetches and caches the live drift check for one open PR (RAL-190).
+       * Silent on failure -- a transient error leaves the previous cached
+       * value in place until the next poll.
+       * @param {string} prId
+       * @returns {Promise<void>}
+       */
+      async function fetchPrSyncStatus(prId) {
+        try {
+          const res = await fetch(`/api/pull-requests/${prId}/sync-status`);
+          if (!res.ok) return;
+          /** @type {PrSyncStatus} */
+          const data = await res.json();
+          prSyncStatus[prId] = data;
+        } catch (e) { /* transient -- the next poll retries */ }
+      }
+      /**
+       * Fetches the PRs submitted for a review and caches them, along with a
+       * live drift check (RAL-190) for each still-open one that has a
+       * recorded forge number. Only polled for the open review, mirroring
+       * `pollBranchConflicts`.
+       * @param {string} gid
+       * @returns {Promise<void>}
+       */
+      async function pollPullRequests(gid) {
+        try {
+          const res = await fetch(`/api/guardians/${gid}/pull-requests`);
+          if (!res.ok) return;
+          /** @type {PullRequestView[]} */
+          const prs = await res.json();
+          pullRequests[gid] = prs;
+          const open = prs.filter((p) => p.state === "open" && p.pr_number != null);
+          await Promise.all(open.map((p) => fetchPrSyncStatus(p.id)));
+        } catch (e) { /* transient -- the next poll retries */ }
+      }
+      /**
        * Polls `/api/guardians` and re-renders the Reviews tab.
        * @returns {Promise<void>}
        */
@@ -7870,6 +8522,7 @@ Check the task's session output and re-run it — or, if this branch is meant to
           // guardian's async replies appear without a manual refresh.
           if (selectedGuardian) await loadReviewMessages(selectedGuardian, { silent: true });
           if (selectedGuardian) await pollBranchConflicts(selectedGuardian);
+          if (selectedGuardian) await pollPullRequests(selectedGuardian);
           if (!userIsSelecting()) { renderReviews(); applyChatSmartScroll(() => preserveUserState(document.getElementById("review-detail"), renderReviewDetail)); }
         } catch (e) { byId("conn").className = "dot off"; }
       }

@@ -1,0 +1,30 @@
+[bundle]
+root_dir = "ralphus"
+docs = [
+  "docs/cli-reference.md",
+  "docs/daemon-api.md",
+  "docs/dependencies.md",
+  "docs/glossary.md",
+  "docs/machine-providers.md",
+  "docs/otel-tracing.md",
+  "docs/secure-dist.md",
+  "docs/tmux-embedding.md",
+]
+examples = [
+  "examples/hello.toml",
+]
+root_files = [
+  "LICENSE",
+]
+launchers = [
+  "scripts/start-ralphus.cmd",
+  "scripts/start-ralphus.sh",
+]
+
+[tmux.windows]
+package_dir = "%LOCALAPPDATA%/Microsoft/WinGet/Packages/marlocarlo.psmux_Microsoft.Winget.Source_8wekyb3d8bbwe"
+exe = "tmux.exe"
+license = "LICENSE"
+readme = "README.md"
+sha256 = "F3A4AD033F0332972BC79B8D695387ADB4FCD1D268074E113C1C84E5381051A6"
+version_substring = "psmux 3.3.7 (05cc5d4 2026-07-20)"

@@ -108,6 +108,15 @@ pub struct TaskDef {
     /// `POST /api/runs/{id}/tasks/{ti}/env`.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Opts a git-backed task out of the daemon's automatic no-new-commits
+    /// guard (RAL-156): normally, when the task's `project` is registered as
+    /// git, the finalizer fails the task if none of its sessions produced a
+    /// commit since the task started. Set this for tasks that are legitimately
+    /// expected to produce no commits (e.g. a read-only investigation). Has no
+    /// effect on non-git-backed tasks, and never affects the manual
+    /// `set_status → Done` override (RAL-74), which always bypasses the guard.
+    #[serde(default)]
+    pub no_commit_required: bool,
     /// The agent sessions.
     #[serde(default)]
     pub session: Vec<SessionDef>,
@@ -249,7 +258,12 @@ pub const WORKTREE_PLACEHOLDER_PREFIX: &str = "ralphus:new-worktree/";
 /// real absolute path never starts with the literal `ralphus:new-worktree/`
 /// prefix, so this is unambiguous. The project to materialize the branch
 /// under is NOT embedded here -- it comes from the owning task's `project`
-/// field (see [`crate::validate`]).
+/// field (see [`crate::validate`]). The parser does no further segmentation:
+/// everything after the prefix, slashes included, is returned as one literal
+/// branch name. A value like `ralphus:new-worktree/origin/feature/x` therefore
+/// parses as the branch name `origin/feature/x`; any later interpretation of
+/// that shape as "maybe a remote-tracking branch" happens in daemon-side
+/// worktree materialization, not here.
 #[must_use]
 pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
     let branch = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
@@ -462,6 +476,15 @@ pub struct ReviewDef {
     /// linear rebase needs all of the branches in one repo on one filesystem.
     #[serde(default)]
     pub machine: Option<String>,
+    /// Max spend cap in USD for this review's own agent cost -- conflict
+    /// resolution and verifier calls made by the guardian merge machinery,
+    /// summed cumulatively across every rebase/re-merge attempt (RAL-193).
+    /// Enforced the same way [`TaskDef::maximum_budget_usd`]/
+    /// [`SessionDef::maximum_budget_usd`] are: once exceeded, the daemon
+    /// stops making further resolver/verifier calls for this review and
+    /// fails it.
+    #[serde(default)]
+    pub maximum_budget_usd: Option<f64>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
@@ -657,6 +680,7 @@ mod tests {
             timeout_minutes: None,
             depends_on: vec![],
             environment: BTreeMap::new(),
+            no_commit_required: false,
             session: vec![],
             verify: vec![],
         }
@@ -1128,6 +1152,33 @@ mod tests {
             Some("incredibuild:A"),
             "a task-scope verify follows the task"
         );
+    }
+
+    #[test]
+    fn no_commit_required_defaults_to_false() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.session]]
+            cwd = "/tmp"
+            command = "cargo build"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert!(!parsed.task[0].no_commit_required);
+    }
+
+    #[test]
+    fn no_commit_required_true_deserializes() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            no_commit_required = true
+            [[task.session]]
+            cwd = "/tmp"
+            command = "cargo build"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert!(parsed.task[0].no_commit_required);
     }
 
     #[test]
