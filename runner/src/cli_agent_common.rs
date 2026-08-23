@@ -6,11 +6,6 @@ use std::path::{Path, PathBuf};
 
 use crate::tools::ToolError;
 
-/// Sent instead of the original task prompt when resuming a dropped tmux
-/// session -- the model already has the original prompt in its own
-/// conversation history via `--resume`/`resume <thread_id>`.
-pub const RESUME_CONTINUATION_PROMPT: &str = "Continue where you left off. If the task is already complete, just confirm that and summarize what was done.";
-
 /// Whether `value` should be routed through a shell rather than exec'd
 /// directly: has a space, and isn't a single quoted/wrapped path token (a
 /// fully quoted value -- e.g. `"C:\path with space\claude.exe"` -- is a

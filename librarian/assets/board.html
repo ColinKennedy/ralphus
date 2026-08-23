@@ -1039,6 +1039,7 @@
       CLICK_HANDLERS.saveReorder = (e, ds) => saveReorder(ds.guardianId || "");
       CLICK_HANDLERS.discardReorder = (e, ds) => discardReorder(ds.guardianId || "");
       CLICK_HANDLERS.mergeReview = (e, ds) => mergeReview(ds.guardianId || "", ds.status || "");
+      CLICK_HANDLERS.stopMerge = (e, ds) => stopMerge(ds.guardianId || "");
       CLICK_HANDLERS.forceStartReview = (e, ds) => forceStartReview(ds.guardianId || "");
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");
@@ -1089,7 +1090,7 @@
       }, true);
 
       const STATES = ["running","done","failed","pending","queued","cancelled","ignored"];
-      const GUARDIAN_STATES = ["collecting","merging","merge_failed","in_review","approved","cancelled","deployed"];
+      const GUARDIAN_STATES = ["collecting","merging","merge_failed","merge_stopped","in_review","approved","cancelled","deployed"];
       const SQUAD_STATES = ["queued","pending","running","done","failed","cancelled","ignored"];
       const NODE_STATES = ["pending","running","done","failed","cancelled","ignored"];
       const IRREVERSIBLE_STATES = new Set(["done","failed","cancelled"]);
@@ -2514,13 +2515,13 @@
         await post(cancelUrl);
         tick();
       }
-      // Attach an interactive terminal to a task cell's live tmux session
+      // Attach an interactive terminal to a task cell's live tmux cell
       // (RAL-102 — replaces the old `claude --resume` spawn). Fails gracefully
-      // via the alert below when the underlying tmux session isn't currently
+      // via the alert below when the underlying tmux cell isn't currently
       // running (e.g. the cell already finished).
       /**
        * Spawns a resumed cell terminal on the daemon host, attached to the
-       * cell's live tmux session.
+       * cell's live tmux cell.
        * @param {string} squadId
        * @param {number} ti
        * @param {number} si
@@ -2539,7 +2540,7 @@
       }
       /**
        * Spawns a proof step's terminal on the daemon host, attached to the
-       * proof step's live tmux session.
+       * proof step's live tmux cell.
        * @param {string} squadId
        * @param {number} taskIdx
        * @param {string} scope
@@ -2558,7 +2559,7 @@
           alert('Failed to open terminal: network error');
         }
       }
-      // mode is "open" (attach to the resolver's live tmux session), "worktree"
+      // mode is "open" (attach to the resolver's live tmux cell), "worktree"
       // (plain shell in the review worktree directory — unrelated to tmux,
       // available even before any resolver cell exists), or "agent" (resume
       // the real `claude` CLI on the resolver's own conversation).
@@ -2719,7 +2720,7 @@
       // RALPHUS-PEEK-STATE-MACHINE:BEGIN
       /**
        * @typedef {object} PeekPaneResponse
-       * @property {boolean} [active] - Whether the daemon found a live tmux session for this key.
+       * @property {boolean} [active] - Whether the daemon found a live tmux cell for this key.
        * @property {string} [content] - Live pane content, or the persisted historical snapshot when inactive.
        * @property {number|null} [last_activity_ms] - Unix-epoch-ms of the last observed fresh output (RAL-170).
        */
@@ -2818,7 +2819,7 @@
             lastActivityMs: null, // a finished cell's last output is history, not a liveness signal
             text: (data.content && data.content.trim())
               ? data.content + "\n\n[Read-only historical record — this terminal session has ended.]"
-              : "Terminal session has ended. No output was recorded before it ended.",
+              : "Terminal cell has ended. No output was recorded before it ended.",
           },
           headerChanged: !prev.ended,
         };
@@ -2878,6 +2879,47 @@
           .join("\n");
       }
       // RALPHUS-DEBUG-STRIP:END
+
+      // ---- RAL-247: credential env-var redaction (defense-in-depth) ----
+      /**
+       * Whether an env-var name is a credential whose value must never be
+       * displayed. Mirrors `ralphus_core::redact::is_secret_env_key`: explicit
+       * known names plus a generic name heuristic, so a new provider's key is
+       * caught without editing this list. Over-matching a non-secret name is
+       * safe (it just over-redacts); under-matching is the bug.
+       * @param {string} key
+       * @returns {boolean}
+       */
+      function isSecretEnvKey(key) {
+        const u = key.toUpperCase();
+        if (u === "ANTHROPIC_BASE_URL") return true;
+        return ["TOKEN", "_KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"]
+          .some((s) => u.indexOf(s) !== -1);
+      }
+      /**
+       * Defense-in-depth (RAL-247): mask the *values* of credential env-var
+       * assignments — PowerShell `$env:KEY = '<value>'` (the concrete leak
+       * path) and POSIX `KEY='<value>'` — that could appear in pane or
+       * transcript text with `[REDACTED]`. The daemon already redacts at every
+       * API boundary the board reads, so this is a second line that also
+       * protects against an older or otherwise-unpatched daemon. Plain text
+       * carrying no assignment marker is returned unchanged. Display-only: it
+       * never rewrites what the daemon persists.
+       * @param {string} text
+       * @returns {string}
+       */
+      function scrubSecrets(text) {
+        const ASSIGN = /\$env:([A-Za-z_][A-Za-z0-9_]*) = '([^'\n]*)'|([A-Za-z_][A-Za-z0-9_]*)='([^'\n]*)'/g;
+        if (ASSIGN.test(text) === false) return text;
+        ASSIGN.lastIndex = 0;
+        return text.replace(ASSIGN, (m, envKey, envVal, plainKey, plainVal) => {
+          const key = envKey || plainKey;
+          const val = envVal !== undefined ? envVal : plainVal;
+          if (!isSecretEnvKey(key)) return m;
+          return m.slice(0, m.length - val.length - 1) + "[REDACTED]'";
+        });
+      }
+      // ---- /RAL-247 ----
 
       /**
        * Toggles a peek box's expanded/collapsed state and re-renders whichever
@@ -3023,10 +3065,11 @@
        * Renders the expandable live-pane peek box for a given key, or an
        * empty string when collapsed.
        * @param {string} key
-       * @param {number|null} [startedAtMs] - RAL-210: the owning cell's most
-       *   recent start time (epoch ms, local time), shown in the header when
-       *   given. Only meaningful for a cell-scoped peek — omitted for
-       *   proof/guardian peeks, which have no cell start time of their own.
+       * @param {number|null} [startedAtMs] - RAL-210/RAL-259: the most recent
+       *   start time (epoch ms, local time) of the agent this peek shows —
+       *   a task cell's run, a review branch's conflict-resolver/final-proof
+       *   cell, or a review's manual-checks generation pass. Shown in the
+       *   header when given.
        * @returns {string}
        */
       function peekBox(key, startedAtMs) {
@@ -3044,10 +3087,10 @@
         // docs/colors.md's "read-only field indicator" convention: --muted,
         // never the caution-reserved --ignored or --danger/--failed.
         const ended = !!peekEnded[key];
-        const headLabel = ended ? "Historical record (read-only) — session ended" : "Live terminal (read-only)";
+        const headLabel = ended ? "Historical record (read-only) — cell ended" : "Live terminal (read-only)";
         const headTip = ended
-          ? "This tmux session has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within a poll tick or two on its own. You never need to navigate away and back."
-          : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux session ends.";
+          ? "This tmux cell has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within a poll tick or two on its own. You never need to navigate away and back."
+          : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux cell ends.";
         // RAL-170: last-activity label, seeded from cached state (if any) so
         // it doesn't blank out on every full re-render -- fetchPeek patches
         // it in place afterward via updatePeekActivityLabel.
@@ -3140,6 +3183,7 @@
           if (!resp.ok) { setPeekPreText(preId, "Could not load terminal output."); return; }
           /** @type {PeekPaneResponse} */
           const data = await resp.json();
+          if (data.content !== undefined) data.content = scrubSecrets(data.content);
           const before = document.getElementById(preId);
           if (!before) return;
           const atBottom = forceBottom || before.scrollTop + before.clientHeight >= before.scrollHeight - 4;
@@ -3311,7 +3355,7 @@
           const resp = await fetch(url);
           if (!resp.ok) { historyViewing[key] = { attempt, content: "Could not load this attempt's log." }; return; }
           const data = await resp.json();
-          historyViewing[key] = { attempt, content: data.content || "(empty)" };
+          historyViewing[key] = { attempt, content: scrubSecrets(data.content || "(empty)") };
         } catch (_) {
           historyViewing[key] = { attempt, content: "Could not load this attempt's log (network error)." };
         }
@@ -5063,11 +5107,11 @@
                 ? terminalMenuItem(key, "Open Agent",
                     "openAgentProofTerminalMenuItem", { squadId: r.id, ti, scope, si, vi },
                     "Resume the real CLI agent, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the step is still running or already finished.")
-                : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent session has started for this proof step.", true))
+                : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this proof step.", true))
             : "";
           const items = terminalMenuItem(key, "Open Terminal Log",
               "openProofTerminalMenuItem", { squadId: r.id, ti, scope, si, vi },
-              "Attach an interactive terminal to this proof step's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the proof step is actively running — fails gracefully otherwise.")
+              "Attach an interactive terminal to this proof step's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the proof step is actively running — fails gracefully otherwise.")
             + openAgentItem
             + terminalMenuItem(key, "View Attempt History",
                 "toggleHistoryMenuItem", {},
@@ -5195,10 +5239,10 @@
                   ? terminalMenuItem(key, "Open Agent",
                       "openAgentTerminalMenuItem", { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
                       "Resume the real CLI agent, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the cell is still running or already finished.")
-                  : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent session has started for this cell.", true));
+                  : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this cell.", true));
             const items = terminalMenuItem(key, "Open Terminal Log",
                 "openTerminalMenuItem", { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                "Attach an interactive terminal to this cell's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the cell is actively running — fails gracefully otherwise.")
+                "Attach an interactive terminal to this cell's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the cell is actively running — fails gracefully otherwise.")
               + openAgentItem
               + terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
@@ -6487,7 +6531,7 @@
        */
       function resolverTerminalBtns(g, b) {
         // RAL-149/<new>: proof_pending and actioning also have a live
-        // resolver tmux session (the dedicated final-proof call, or the
+        // resolver tmux cell (the dedicated final-proof call, or the
         // feedback-revision agent pass), so they count as "live" alongside
         // in_progress (the fix pass / rebase itself).
         const isLive = g.status === "merging" && (b.merge_status === "in_progress" || b.merge_status === "proof_pending" || b.merge_status === "actioning");
@@ -6499,7 +6543,7 @@
         const previewLabel = peekOpen[key] ? "Hide Live View" : (isLive ? "Watch Live" : "Show Live View");
         const openLabel = isLive ? "Open Live Terminal Log" : "Open Terminal Log";
         const previewTip = "Peek at the conflict resolver's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the resolver isn't running.";
-        const openTip = "Attach an interactive terminal to the conflict resolver's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the resolver is actively running — fails gracefully otherwise.";
+        const openTip = "Attach an interactive terminal to the conflict resolver's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the resolver is actively running — fails gracefully otherwise.";
         const agentTip = "Resume the real CLI agent, attached to this exact conflict-resolution conversation.\nWho/when: you want to keep working with the resolver interactively, picking up right where it left off.\nWorks whether the resolver is still running or already finished.";
         const wtTip = isLive
           ? "Open a shell in the review worktree while the resolver is working.\nRun 'git diff' or 'git status' to watch files change in real time."
@@ -6508,7 +6552,7 @@
         const items = terminalMenuItem(key, openLabel, "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "open" }, openTip)
           + (b.resolver_agent_session_id
             ? terminalMenuItem(key, "Open Agent", "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "agent" }, agentTip)
-            : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent session has started for this resolver.", true))
+            : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this resolver.", true))
           + terminalMenuItem(key, "Open Worktree Shell", "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "worktree" }, wtTip)
           + terminalMenuItem(key, "View Attempt History",
               "toggleHistoryMenuItem", {},
@@ -6534,7 +6578,7 @@
       // Render manual-checks-generation terminal buttons for a review (RAL-88
       // follow-up). Generation is a single guardian-level pass (not per-branch),
       // gated on `checks_state` rather than a worktree: "waiting" means
-      // generation hasn't started yet (no tmux session could exist), so the
+      // generation hasn't started yet (no tmux cell could exist), so the
       // button stays disabled until it reaches "generating" or "ready".
       /**
        * Renders a review's manual-checks-generation terminal button(s), varying by live/agent state.
@@ -6553,13 +6597,13 @@
         const previewLabel = peekOpen[key] ? "Hide Live View" : (isLive ? "Watch Live" : "Show Live View");
         const openLabel = isLive ? "Open Live Terminal Log" : "Open Terminal Log";
         const previewTip = "Peek at the manual-checks generation's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once generation isn't running.";
-        const openTip = "Attach an interactive terminal to the manual-checks generation's live tmux session.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while generation is actively running — fails gracefully otherwise.";
+        const openTip = "Attach an interactive terminal to the manual-checks generation's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while generation is actively running — fails gracefully otherwise.";
         const agentTip = "Resume the real CLI agent, attached to this exact manual-checks generation conversation.\nWho/when: you want to inspect or continue the reasoning behind the suggested commands.\nWorks whether generation is still running or already finished.";
         const previewBtn = `<button class="btn" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px;font-size:11px;padding:1px 7px" data-tip="${previewTip}">${previewLabel}</button>`;
         const items = terminalMenuItem(key, openLabel, "openGuardianManualChecksTerminalMenuItem", { gid: g.id, mode: "open" }, openTip)
           + (g.manual_commands_agent_session_id
             ? terminalMenuItem(key, "Open Agent", "openGuardianManualChecksTerminalMenuItem", { gid: g.id, mode: "agent" }, agentTip)
-            : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent session has started for this generation pass.", true))
+            : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this generation pass.", true))
           + terminalMenuItem(key, "View Attempt History",
               "toggleHistoryMenuItem", {},
               "List every durably-persisted terminal-log attempt for this generation pass, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
@@ -6707,12 +6751,12 @@
 
       // ---------- reviews (list + detail, read-only for now) ----------
       /** @type {{[key: string]: string}} */
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed" };
       // States in which a review may be cancelled — mirrors the backend's
       // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
       // list menu and the detail pane's upper-right ⋯ menu use this one set so
       // "Cancel review" appears in the same states everywhere.
-      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "in_review", "approved"];
+      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "merge_stopped", "in_review", "approved"];
       /**
        * Renders a colored status dot for a guardian/branch/merge state.
        * @param {string} s
@@ -7375,19 +7419,28 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               // global `.btn[disabled]` rule, so the tooltip engine's
               // mouseover listener never sees it — data-tip must live on a
               // wrapping <span> instead whenever the button may be disabled.
-              const canMerge = ["collecting", "merge_failed", "in_review"].includes(g.status);
+              const canMerge = ["collecting", "merge_failed", "merge_stopped", "in_review"].includes(g.status);
               /** @type {Record<string, string>} */
               const mergeDisabledReason = {
-                merging: "A rebase is already in progress — wait for it to finish.\nTo restart from scratch, cancel the running merge first.",
-                approved: "This review has already been approved — merge/rebase locks once a review is approved.\nOnly available when status is collecting, in_review, or merge_failed.",
-                cancelled: "This review was cancelled — merge/rebase is not available for a cancelled review.\nOnly available when status is collecting, in_review, or merge_failed.",
-                deployed: "This review has already been deployed — merge/rebase is not available once deployed.\nOnly available when status is collecting, in_review, or merge_failed.",
+                merging: "A rebase is already in progress — wait for it to finish, or press Stop to halt it mid-rebase.\nTo restart from scratch, stop then merge, or cancel the running merge first.",
+                approved: "This review has already been approved — merge/rebase locks once a review is approved.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+                cancelled: "This review was cancelled — merge/rebase is not available for a cancelled review.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+                deployed: "This review has already been deployed — merge/rebase is not available once deployed.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
               };
               const mergeTip = canMerge
-                ? "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, or merge_failed."
+                ? (g.status === "merge_stopped"
+                    ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept."
+                    : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, or merge_failed.")
                 : (mergeDisabledReason[g.status] || `Not available — this review's status is currently "${esc(g.status)}".\nOnly available when status is collecting, in_review, or merge_failed.`);
-              const mergeBtn = `<button class="btn primary" data-click="mergeReview" data-guardian-id="${esc(g.id)}" data-status="${esc(g.status)}" ${canMerge ? "" : "disabled"}${canMerge ? ` data-tip="${mergeTip}"` : ""}>Merge / rebase</button>`;
+              const mergeBtn = `<button class="btn primary" data-click="mergeReview" data-guardian-id="${esc(g.id)}" data-status="${esc(g.status)}" ${canMerge ? "" : "disabled"}${canMerge ? ` data-tip="${mergeTip}"` : ""}>${g.status === "merge_stopped" ? "Resume rebase" : "Merge / rebase"}</button>`;
               return canMerge ? mergeBtn : `<span data-tip="${mergeTip}">${mergeBtn}</span>`;
+            })()}
+            ${(() => {
+              // RAL-249: halt an in-progress rebase at its next checkpoint,
+              // keeping the review resumable — distinct from "Cancel review".
+              const canStop = g.status === "merging";
+              if (!canStop) return "";
+              return `<button class="btn" data-click="stopMerge" data-guardian-id="${esc(g.id)}" data-tip="Stop this rebase mid-flight — halts at the next checkpoint and pauses the review.\nThe review and its branches are kept, so you can resume the rebase afterward.\nThis is not a cancel: nothing is discarded.">⏸ Stop</button>`;
             })()}
             ${(() => {
               const hasNotReady = g.status === "collecting" && (g.branches || []).some(
@@ -7405,6 +7458,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 collecting: "Still collecting branches — approve is only available once every branch has merged and the review reaches in_review.",
                 merging: "A rebase is currently in progress — approve becomes available once it finishes and the review reaches in_review.",
                 merge_failed: "The last rebase failed — resolve the failure (see the review's detail/logs, or click Merge / rebase to retry) before you can approve.",
+                merge_stopped: "This review is stopped mid-rebase — resume it (Resume rebase) and let it finish before you can approve.",
                 approved: "This review has already been approved.",
                 cancelled: "This review was cancelled — approve is not available for a cancelled review.",
                 deployed: "This review has already been deployed (and was approved to get there).",
@@ -7710,6 +7764,50 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const row = (data.rows || []).find((r) => r.message === "pr stack submission completed");
           return row ? row.payload || {} : null;
         } catch (e) { return null; }
+      }
+      /**
+       * Toggles an inline "submit PR" form's visibility (RAL-190).
+       * @param {string} key - "gid:branchId" or "gid:combined"
+       * @returns {void}
+       */
+      function togglePrForm(key) {
+        if (prFormOpen.has(key)) prFormOpen.delete(key); else prFormOpen.add(key);
+        renderReviewDetail();
+      }
+      /**
+       * Reads a "submit PR" form's three fields for `formKey` into a request
+       * body fragment (RAL-190) -- blank fields are omitted so the daemon
+       * applies its own defaults/auto-generation.
+       * @param {string} formKey
+       * @returns {{branch_alias?: string, title?: string, description?: string}}
+       */
+      function readPrForm(formKey) {
+        const alias = /** @type {HTMLInputElement|null} */ (document.getElementById(`pr-alias-${formKey}`));
+        const title = /** @type {HTMLInputElement|null} */ (document.getElementById(`pr-title-${formKey}`));
+        const desc = /** @type {HTMLTextAreaElement|null} */ (document.getElementById(`pr-desc-${formKey}`));
+        /** @type {{branch_alias?: string, title?: string, description?: string}} */
+        const out = {};
+        const aliasVal = (alias && alias.value || "").trim();
+        const titleVal = (title && title.value || "").trim();
+        const descVal = (desc && desc.value || "").trim();
+        if (aliasVal) out.branch_alias = aliasVal;
+        if (titleVal) out.title = titleVal;
+        if (descVal) out.description = descVal;
+        return out;
+      }
+      /**
+       * Submits a PR for one stacked branch, reading the inline form's fields (RAL-190).
+       * @param {string} gid
+       * @param {string} branchId
+       * @returns {Promise<void>}
+       */
+      async function submitBranchPr(gid, branchId) {
+        const req = { branch_id: branchId, ...readPrForm(`${gid}:${branchId}`) };
+        prFormOpen.delete(`${gid}:${branchId}`);
+        const sinceMs = Date.now();
+        await guardianAction(`/api/guardians/${gid}/pull-requests`, { prs: [req] });
+        await waitForPrOutcome(gid, sinceMs);
+        renderReviewDetail();
       }
       /**
        * Fetches recent Cartographer `source=pr`/`level=error` rows for a
@@ -8490,6 +8588,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         tick();
       }
       /**
+       * Stops an in-progress rebase at its next checkpoint, leaving the review
+       * in the resumable `merge_stopped` state (RAL-249) — distinct from
+       * cancelling (which discards the review back to collecting).
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function stopMerge(id) {
+        if (!confirm("Stop this rebase mid-flight? It will halt at the next checkpoint and pause the review (resumable). Nothing is discarded — this is not a cancel.")) return;
+        await guardianAction(`/api/guardians/${id}/stop`);
+        tick();
+      }
+      /**
        * Approves an in-review review for deployment. Marks the button
        * pending/disabled immediately (RAL-234) -- the daemon write itself is
        * a single status-string match, but the follow-up `tick()` reload
@@ -8623,7 +8733,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {Promise<void>}
        */
       async function runAllManualChecks(id) {
-        await guardianAction(`/api/guardians/${id}/run-manual-commands`, {});
+        await guardianAction(`/api/guardians/${id}/squad-manual-commands`, {});
       }
       /**
        * Runs a single suggested manual-check command by index.
@@ -8634,7 +8744,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       async function runSingleManualCheck(id, index) {
         manualMenuOpen[id] = false;
         renderReviewDetail();
-        await guardianAction(`/api/guardians/${id}/run-manual-commands`, { index });
+        await guardianAction(`/api/guardians/${id}/squad-manual-commands`, { index });
       }
       // RAL-77: run a user-declared action hint by index.
       /**
@@ -8644,7 +8754,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {Promise<void>}
        */
       async function runActionHint(id, index) {
-        await guardianAction(`/api/guardians/${id}/run-action-hint`, { index });
+        await guardianAction(`/api/guardians/${id}/squad-action-hint`, { index });
       }
 
       // ---------- structured check inputs (RAL-164) ----------
@@ -8680,7 +8790,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const squad_cleanup = !!(cleanupEl && cleanupEl.checked);
         checkFormOpen[key] = false;
         renderReviewDetail();
-        const url = `/api/guardians/${id}/${kind === "manual" ? "run-manual-commands" : "run-action-hint"}`;
+        const url = `/api/guardians/${id}/${kind === "manual" ? "squad-manual-commands" : "squad-action-hint"}`;
         await guardianAction(url, { index, inputs, squad_cleanup });
         tick();
       }

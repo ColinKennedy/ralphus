@@ -88,6 +88,7 @@ pub enum ReviewCommand {
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
         skip_auto_clean: Option<bool>,
+        skip_base_updates: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -110,6 +111,9 @@ pub enum ReviewCommand {
         selector: String,
     },
     RestartMerge {
+        selector: String,
+    },
+    StopMerge {
         selector: String,
     },
     ForceStart {
@@ -319,6 +323,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
+            let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -330,6 +335,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 auto_pr_feedback,
                 proof_scope,
                 skip_auto_clean,
+                skip_base_updates,
             })
         }
         Some("build-env") => match parse_guardian_env(scanner) {
@@ -390,6 +396,9 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("merge") => with_selector(scanner, |selector| ReviewCommand::Merge { selector }),
         Some("restart-merge") => {
             with_selector(scanner, |selector| ReviewCommand::RestartMerge { selector })
+        }
+        Some("stop-merge") => {
+            with_selector(scanner, |selector| ReviewCommand::StopMerge { selector })
         }
         Some("force-start") => {
             with_selector(scanner, |selector| ReviewCommand::ForceStart { selector })
@@ -1207,6 +1216,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             auto_pr_feedback,
             proof_scope,
             skip_auto_clean,
+            skip_base_updates,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1219,6 +1229,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
+                skip_base_updates,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -1299,6 +1310,12 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let result = client.guardian_cancel_and_merge(&resolved.guardian_id)?;
             emit(opts, &result, |_| println!("{selector} merge restarted"));
+            Ok(())
+        }),
+        ReviewCommand::StopMerge { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_stop(&resolved.guardian_id)?;
+            emit(opts, &result, |_| println!("{selector} merge stopped"));
             Ok(())
         }),
         ReviewCommand::ForceStart { selector } => run_and_report(opts, None, || {
@@ -2588,11 +2605,31 @@ mod tests {
             ReviewCommand::Settings {
                 skip_auto_build,
                 skip_worktrees,
+                skip_base_updates,
                 ..
             } => {
                 assert_eq!(skip_auto_build, None);
                 assert_eq!(skip_worktrees, None);
+                assert_eq!(skip_base_updates, None);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_skip_base_updates_tri_state() {
+        // Both the positive opt-out and its --no- negative parse to the
+        // expected tri-state values (RAL-250).
+        match parse(&v(&["settings", "g1", "--skip-base-updates"])) {
+            ReviewCommand::Settings {
+                skip_base_updates, ..
+            } => assert_eq!(skip_base_updates, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1", "--no-skip-base-updates"])) {
+            ReviewCommand::Settings {
+                skip_base_updates, ..
+            } => assert_eq!(skip_base_updates, Some(false)),
             other => panic!("unexpected: {other:?}"),
         }
     }

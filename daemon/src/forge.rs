@@ -806,6 +806,7 @@ fn extract_glab_token(text: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+
 /// Resolve the effective forge client for a git repository at `root`,
 /// combining the layered [`ForgeConfig`] (explicit overrides) with
 /// autodetection from `git remote get-url <remote>` (host → kind, path →

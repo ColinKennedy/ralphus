@@ -14,7 +14,7 @@ use ralphus_daemon::guardian::GuardianCheck;
 use ralphus_daemon::guardian_merge::{
     pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
     rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_chat, run_feedback,
-    run_merge, start_merge,
+    run_merge, run_merge_staged, start_merge, stop_guardian_merge,
 };
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
@@ -1300,6 +1300,66 @@ fn base_branch_shift_triggers_rebuild() {
     assert!(
         !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
         "no rebuild when base is unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-250: a review that opts out of base-branch auto-updates is left alone by
+// the maintenance base-shift pass even when its base advances — and the old
+// baseline is kept, so opting back in immediately catches the review up.
+#[test]
+fn skip_base_updates_prevents_auto_rebuild_on_base_shift() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(before.status, "in_review");
+    let base_before = before.base_commit.clone().expect("base recorded");
+
+    // Opt this review out of base-branch auto-updates.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_skip_base_updates(&id, Some(true))
+        .unwrap();
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .effective_skip_base_updates
+    );
+
+    // Advance the base branch (main) with a new commit.
+    git(&root, &["checkout", "main"]);
+    write(&root, "c.txt", "on base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base moves forward"]);
+
+    let sem = Semaphore::new(4);
+    assert!(
+        !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
+        "opted-out review must not auto-rebuild on a base shift"
+    );
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "status untouched");
+    assert_eq!(
+        after.base_commit.as_deref(),
+        Some(base_before.as_str()),
+        "baseline not advanced while opted out, so re-enabling catches up"
+    );
+
+    // Re-enable (opt back in): the base is now ahead of the recorded baseline,
+    // so the very next sweep rebuilds — restoring the auto-update behavior.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_skip_base_updates(&id, Some(false))
+        .unwrap();
+    assert!(
+        rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
+        "re-enabling restores the base-shift rebuild"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -4089,6 +4149,394 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         !has_resolve_proof,
         "resolve-proof must not run once proof_scope is \"nothing\" on the restarted attempt"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-265 harness helper: a repo with `base` plus one feature branch per name
+/// (each adding its own `<name>.txt`), a guardian over all of them, and their
+/// branch ids in position order. Nothing is marked ready — callers set
+/// `MergeStatus::Ready` on the branches they want buildable.
+fn staged_feature_repo(names: &[&str]) -> (PathBuf, Arc<Mutex<Store>>, String, Vec<String>) {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    for name in names {
+        git(&root, &["checkout", "-b", name]);
+        let file = format!("{}.txt", name.split('/').next_back().unwrap());
+        write(&root, &file, "content\n");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("add {file}")]);
+        git(&root, &["checkout", "main"]);
+    }
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        for name in names {
+            g.add_guardian_branch(&id, name).unwrap();
+        }
+        id
+    };
+    let branch_ids: Vec<String> = store
+        .lock()
+        .unwrap()
+        .get_guardian(&id)
+        .unwrap()
+        .branches
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    (root, store, id, branch_ids)
+}
+
+fn mark_ready(store: &Arc<Mutex<Store>>, id: &str, branch_id: &str) {
+    store
+        .lock()
+        .unwrap()
+        .set_branch_status(id, branch_id, MergeStatus::Ready, None)
+        .unwrap();
+}
+
+/// RAL-265: a staged merge rebases just the contiguous ready prefix of branches
+/// and stops (returning to `collecting`) at the first branch still waiting on
+/// its upstream task — it neither waits for the whole stack nor finalizes to
+/// `InReview` (no combined worktree, no manual checks) early.
+#[test]
+fn staged_merge_builds_ready_prefix_and_waits_in_collecting() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b", "feature/c"]);
+    mark_ready(&store, &id, &bids[0]);
+
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.status, "collecting",
+        "must not finalize early: {:?}",
+        view.detail
+    );
+    assert_eq!(view.branches[0].merge_status, "done");
+    assert_eq!(view.branches[1].merge_status, "pending");
+    assert_eq!(view.branches[2].merge_status, "pending");
+    assert!(
+        view.combined_worktree.is_none(),
+        "no combined worktree on a partial build"
+    );
+    let rev_a = view.branches[0]
+        .review_branch
+        .clone()
+        .expect("branch a got a review branch");
+    let files_a = git(&root, &["ls-tree", "-r", "--name-only", &rev_a]);
+    assert!(
+        files_a.contains("base.txt") && files_a.contains("a.txt"),
+        "branch a stacked on base: {files_a}"
+    );
+    // The unreached b/c branches get no worktree yet.
+    assert!(view.branches[1].worktree.is_none());
+    assert!(view.branches[2].worktree.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-265: when the next branch becomes ready, the staged merge resumes from
+/// the already-built tip of the prior branch rather than rebuilding it from the
+/// base — branch b stacks on branch a's preserved tip, and a's tip is untouched.
+#[test]
+fn staged_merge_resumes_from_prior_built_tip() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b", "feature/c"]);
+    mark_ready(&store, &id, &bids[0]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+    let rev_a = format!("guardian/{id}/wt-feature/a");
+    let tip_a_before = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+
+    // Branch b becomes ready; branch c still pending.
+    mark_ready(&store, &id, &bids[1]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "collecting");
+    assert_eq!(view.branches[0].merge_status, "done");
+    assert_eq!(view.branches[1].merge_status, "done");
+    assert_eq!(view.branches[2].merge_status, "pending");
+
+    let tip_a_after = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    assert_eq!(
+        tip_a_before, tip_a_after,
+        "a's already-built tip must be preserved on resume, not rebuilt"
+    );
+    let rev_b = format!("guardian/{id}/wt-feature/b");
+    let tip_b = git(&root, &["rev-parse", &rev_b]).trim().to_string();
+    // b is a descendant of the preserved a tip (stacked on top of it).
+    git(
+        &root,
+        &["merge-base", "--is-ancestor", &tip_a_after, &tip_b],
+    );
+    let files_b = git(&root, &["ls-tree", "-r", "--name-only", &tip_b]);
+    assert!(
+        files_b.contains("a.txt") && files_b.contains("b.txt"),
+        "b layered on a: {files_b}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-265: if the base branch moves after a prefix was built, the recorded
+/// build signature changes so the previously-`Done` prefix is rebuilt onto the
+/// new base rather than a stale tip being carried forward.
+#[test]
+fn staged_merge_rebuilds_prefix_when_base_moves() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
+    mark_ready(&store, &id, &bids[0]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+    let rev_a = format!("guardian/{id}/wt-feature/a");
+    let tip_a_old = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+
+    // Move the base forward while only branch a is built.
+    git(&root, &["checkout", "main"]);
+    write(&root, "extra.txt", "moved base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base moves forward"]);
+
+    // Branch b becomes ready after the base moved.
+    mark_ready(&store, &id, &bids[1]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.status, "in_review",
+        "both branches done: {:?}",
+        view.detail
+    );
+    assert!(view.branches.iter().all(|b| b.merge_status == "done"));
+
+    let tip_a_new = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    assert_ne!(
+        tip_a_old, tip_a_new,
+        "a must be rebuilt onto the new base, not carried forward stale"
+    );
+    let files_a = git(&root, &["ls-tree", "-r", "--name-only", &tip_a_new]);
+    assert!(
+        files_a.contains("extra.txt") && files_a.contains("a.txt"),
+        "a rebuilt on the moved base: {files_a}"
+    );
+    let combined = view.combined_worktree.expect("combined after finalize");
+    assert!(
+        Path::new(&combined).join("extra.txt").exists()
+            && Path::new(&combined).join("a.txt").exists()
+            && Path::new(&combined).join("b.txt").exists(),
+        "combined contains new base + both features"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-265: if every consecutive branch becomes ready together, one staged merge
+/// rebuilds all of them in a single pass and finalizes to `InReview`.
+#[test]
+fn staged_merge_rebuilds_whole_stack_in_one_pass_when_all_ready() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
+    mark_ready(&store, &id, &bids[0]);
+    mark_ready(&store, &id, &bids[1]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(view.branches.iter().all(|b| b.merge_status == "done"));
+    let combined = view.combined_worktree.expect("combined worktree");
+    assert!(
+        Path::new(&combined).join("a.txt").exists() && Path::new(&combined).join("b.txt").exists(),
+        "combined contains both features"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-265: the config-signature guard also invalidates a `Done` prefix when a
+/// project's branch set changes (here: a branch is reordered) rather than
+/// trusting a stale tip.
+#[test]
+fn staged_merge_rebuilds_when_branch_set_changes() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
+    mark_ready(&store, &id, &bids[0]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+    let rev_a = format!("guardian/{id}/wt-feature/a");
+    let tip_a_old = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+
+    // Reorder the branches: feature/b now sits at position 0. The enabled
+    // branch set / order fed to the signature differs, so the built prefix is
+    // no longer considered valid to resume from.
+    store
+        .lock()
+        .unwrap()
+        .reorder_guardian_branches(&id, &["feature/b".to_string(), "feature/a".to_string()])
+        .unwrap();
+
+    mark_ready(&store, &id, &bids[1]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(view.branches.iter().all(|b| b.merge_status == "done"));
+    let tip_a_new = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    assert_ne!(
+        tip_a_old, tip_a_new,
+        "a's tip must be rebuilt after the branch set changed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-249: stopping a mid-rebase merge via `stop_guardian_merge` (the
+/// function behind the new `POST /api/guardians/{id}/stop` handler) halts a
+/// live merge worker at its next checkpoint and leaves the review in the
+/// recoverable `merge_stopped` state — not `cancelled` — with the worker
+/// actually stopped and the review still claimable (resumable) and
+/// cancellable (abandonable).
+#[test]
+fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("stopped merge", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    // A runner that blocks inside the first conflict-resolution call until
+    // its cancel token trips — standing in for a long in-flight rebase.
+    struct BlockingRunner {
+        resolve_started: Arc<AtomicBool>,
+        resolve_calls: Arc<AtomicU32>,
+    }
+    impl Runner for BlockingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            if spec.task == "resolve" {
+                let n = self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+                self.resolve_started.store(true, Ordering::SeqCst);
+                if n == 0 {
+                    for _ in 0..1000 {
+                        if cancel.is_cancelled() {
+                            return RunnerResult::failure("cancelled");
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return RunnerResult::failure("blocking runner was never cancelled");
+                }
+            }
+            MarkerStrippingRunner.run_cancellable(spec, cancel)
+        }
+    }
+
+    let resolve_started = Arc::new(AtomicBool::new(false));
+    let resolve_calls = Arc::new(AtomicU32::new(0));
+    let runner: Arc<dyn Runner> = Arc::new(BlockingRunner {
+        resolve_started: Arc::clone(&resolve_started),
+        resolve_calls: Arc::clone(&resolve_calls),
+    });
+
+    let cancellations = Cancellations::new();
+    let sem = Arc::new(Semaphore::new(4));
+
+    // Kick off the merge exactly the way `POST /api/guardians/{id}/merge` does.
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+        cancellations.clone(),
+    );
+    assert_eq!(reply.status, 202);
+
+    // Wait until the merge is genuinely stuck mid-resolve (same 120s headroom
+    // as the settings-restart test, for the same contended-test reasons).
+    for _ in 0..24000 {
+        if resolve_started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        resolve_started.load(Ordering::SeqCst),
+        "merge never reached the blocking resolve call"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "merging"
+    );
+
+    // Stop it mid-rebase, the way `POST /api/guardians/{id}/stop` does.
+    let stop_reply = stop_guardian_merge(Arc::clone(&store), cancellations.clone(), &id);
+    assert_eq!(stop_reply.status, 200, "{}", stop_reply.body);
+    assert!(
+        stop_reply.body.contains("\"merge_stopped\""),
+        "{}",
+        stop_reply.body
+    );
+
+    // The worker actually halted: its token was tripped and it exited
+    // (not just the DB column flipped underneath a still-running thread).
+    let key = format!("guardian:{id}");
+    for _ in 0..1200 {
+        if !cancellations.is_active(&key) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !cancellations.is_active(&key),
+        "merge worker did not stop after being told to"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "merge_stopped",
+        "a stopped review is merge_stopped, not cancelled"
+    );
+
+    // The blocked resolve was genuinely cancelled by the stop.
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+
+    // The stopped review is resumable (claimable for a fresh merge) and
+    // cancellable (abandonable) — RAL-249's "recoverable, not dead".
+    {
+        let g = store.lock().unwrap();
+        assert!(g.claim_guardian_merge(&id).unwrap());
+        assert_eq!(
+            g.get_guardian(&id).unwrap().status,
+            "merging",
+            "resume works"
+        );
+        assert_eq!(
+            g.cancel_guardian(&id).unwrap(),
+            ralphus_daemon::guardian::GuardianStatus::Cancelled,
+            "a stopped review can still be abandoned"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }

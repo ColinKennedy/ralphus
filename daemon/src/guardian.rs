@@ -128,6 +128,10 @@ pub enum GuardianStatus {
     Merging,
     /// A merge/rebase step failed and needs attention.
     MergeFailed,
+    /// The user halted a mid-rebase merge (RAL-249) — a recoverable pause,
+    /// distinct from [`Self::Cancelled`]: the review and its branches are kept
+    /// and the rebase can be started again from its next checkpoint.
+    MergeStopped,
     /// Stack built; awaiting human review.
     InReview,
     /// Approved by a human.
@@ -146,6 +150,7 @@ impl GuardianStatus {
             Self::Collecting => "collecting",
             Self::Merging => "merging",
             Self::MergeFailed => "merge_failed",
+            Self::MergeStopped => "merge_stopped",
             Self::InReview => "in_review",
             Self::Approved => "approved",
             Self::Cancelled => "cancelled",
@@ -158,6 +163,7 @@ impl GuardianStatus {
             "collecting" => Self::Collecting,
             "merging" => Self::Merging,
             "merge_failed" => Self::MergeFailed,
+            "merge_stopped" => Self::MergeStopped,
             "in_review" => Self::InReview,
             "approved" => Self::Approved,
             "cancelled" => Self::Cancelled,
@@ -548,6 +554,16 @@ pub struct GuardianView {
     /// RAL-168: [`Self::proof_skip_auto_clean`] resolved against the
     /// project-level default.
     pub effective_proof_skip_auto_clean: bool,
+    /// RAL-250: this review's own override for whether the automatic
+    /// base-branch auto-update rebuild (`review_maintenance`'s base-shift pass)
+    /// is skipped. `None` means "inherit the project/global default"
+    /// (resolved into [`Self::effective_skip_base_updates`] at hydration time).
+    pub skip_base_updates: Option<bool>,
+    /// RAL-250: [`Self::skip_base_updates`] resolved against the
+    /// project-level `.ralphus.toml [review] skip_base_updates` default,
+    /// this project's creation-time stamp, and the live global config -- the
+    /// value `rebuild_on_base_shift` actually gates on.
+    pub effective_skip_base_updates: bool,
     /// `true` once the review is built and awaiting human approval
     /// (`status == "in_review"`). Ported from board.html's "ready to act on"
     /// banner condition (`renderReadyBanner`, minus its client-only dismissed
@@ -787,11 +803,14 @@ impl Store {
     /// caller should proceed with the merge), `false` when the guardian was
     /// already `merging`, or in a state that must never be reopened implicitly
     /// (`approved`, `deployed`, `cancelled`) — another caller claimed it first,
-    /// or an explicit cancel is required.
+    /// or an explicit cancel is required. `merge_stopped` (RAL-249) is
+    /// claimable so a stopped rebase can be resumed. States this transitions
+    /// into `merging`: `collecting`, `merge_failed`, `merge_stopped`,
+    /// `in_review`.
     pub fn claim_guardian_merge(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE guardians SET status='merging', updated_at_ms=? \
-             WHERE id=? AND status IN ('collecting','merge_failed','in_review')",
+             WHERE id=? AND status IN ('collecting','merge_failed','merge_stopped','in_review')",
             params![crate::store::now_ms(), id],
         )?;
         Ok(n > 0)
@@ -1196,9 +1215,11 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        if from_status == "merging" || to_status == "merging" {
+        if (from_status == "merging" || from_status == "merge_stopped")
+            || (to_status == "merging" || to_status == "merge_stopped")
+        {
             return Err(StoreError::InvalidTransition(
-                "cannot move a branch while the source or destination review has a merge/rebase in progress"
+                "cannot move a branch while the source or destination review has a merge/rebase in progress or stopped mid-rebase"
                     .to_string(),
             ));
         }
@@ -1694,6 +1715,21 @@ impl Store {
     pub fn set_guardian_proof_skip_auto_clean(&self, id: &str, skip: Option<bool>) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardians SET proof_skip_auto_clean=?, updated_at_ms=? WHERE id=?",
+            params![skip.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own override for whether the automatic base-branch
+    /// auto-update rebuild is skipped (RAL-250). `None` resets it to "inherit
+    /// the project/global default".
+    pub fn set_guardian_skip_base_updates(&self, id: &str, skip: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET skip_base_updates=?, updated_at_ms=? WHERE id=?",
             params![skip.map(i64::from), crate::store::now_ms(), id],
         )?;
         if n == 0 {
@@ -2512,7 +2548,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -2525,7 +2561,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -2578,6 +2614,8 @@ impl Store {
             manual_checks_env_overrides: r.get(39)?,
             maximum_budget_usd: r.get(40)?,
             merge_attempt: r.get(41)?,
+            skip_base_updates: r.get::<_, Option<i64>>(42)?.map(|v| v != 0),
+            manual_checks_started_at_ms: r.get(43)?,
         })
     }
 
@@ -2812,6 +2850,23 @@ impl Store {
             .proof_skip_auto_clean
             .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
 
+        // RAL-250: effective base-branch auto-update opt-out, layered
+        // per-review override > explicit `.ralphus.toml [review]` value > this
+        // project's creation-time stamp (the frozen global value) > the live
+        // global config > `false` (auto-update on). The raw per-review column
+        // is read separately from `project_review_config` (which already
+        // merges global in) so an explicit project override can be told apart
+        // from the stamp and the live global.
+        let explicit_project = crate::config::project_review_config(Path::new(&row.git_root));
+        let stamp = self.project_skip_base_updates_stamp(&row.git_root);
+        let live_global = crate::config::global_review_config();
+        let effective_skip_base_updates = row
+            .skip_base_updates
+            .or(explicit_project.skip_base_updates)
+            .or(stamp)
+            .or(live_global.skip_base_updates)
+            .unwrap_or(false);
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -2872,6 +2927,8 @@ impl Store {
             machine: row.machine,
             effective_proof_scope,
             effective_proof_skip_auto_clean,
+            skip_base_updates: row.skip_base_updates,
+            effective_skip_base_updates,
             ready,
             merge_progress,
             summary_state,
@@ -3010,7 +3067,7 @@ impl Store {
         }
     }
 
-    /// Cancel a guardian that is in a cancellable state (collecting, merging, in_review, merge_failed, or approved).
+    /// Cancel a guardian that is in a cancellable state (collecting, merging, in_review, merge_failed, merge_stopped, or approved).
     /// Background threads that are still running should check the status on completion
     /// and discard their result if the guardian is already cancelled.
     pub fn cancel_guardian(&self, id: &str) -> Result<GuardianStatus> {
@@ -3019,6 +3076,7 @@ impl Store {
                 GuardianStatus::Collecting
                 | GuardianStatus::Merging
                 | GuardianStatus::MergeFailed
+                | GuardianStatus::MergeStopped
                 | GuardianStatus::InReview
                 | GuardianStatus::Approved,
             ) => {
@@ -3057,6 +3115,34 @@ impl Store {
             );
             Ok(())
         }
+    }
+
+    /// Halt a guardian's in-flight merge (RAL-249), leaving it in the
+    /// recoverable `merge_stopped` state rather than cancelled. Only valid from
+    /// `merging`; the calling worker must already have been told to stop (via
+    /// its cancel token) before this is called. The atomic `WHERE status =
+    /// 'merging'` guard means a merge that actually completed (now `in_review`)
+    /// in the meantime is left untouched rather than mis-labelled.
+    pub fn stop_guardian_merge(&self, id: &str) -> Result<GuardianStatus> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET status='merge_stopped', detail=NULL, updated_at_ms=? \
+             WHERE id=? AND status='merging'",
+            params![crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            let _ = self.guardian_status_str(id)?; // propagate NotFound if missing
+            return Err(StoreError::InvalidTransition(
+                "can only stop a guardian that is currently merging".into(),
+            ));
+        }
+        let _ = self.log_event(
+            None,
+            Some(id),
+            "guardian",
+            None,
+            "review → merge_stopped (stopped mid-rebase)",
+        );
+        Ok(GuardianStatus::MergeStopped)
     }
 
     fn guardian_status_str(&self, id: &str) -> Result<String> {
@@ -3118,6 +3204,9 @@ struct GuardianRow {
     /// RAL-168: per-review auto-clean-skip override. `None` inherits the
     /// project-level default.
     proof_skip_auto_clean: Option<bool>,
+    /// RAL-250: per-review base-branch auto-update opt-out. `None` inherits
+    /// the project/global default.
+    skip_base_updates: Option<bool>,
     /// RAL-185: the machine this review runs on. NULL means the daemon's host.
     machine: Option<String>,
     /// RAL-203: this review's own env overrides for the finalize-time
@@ -4069,6 +4158,42 @@ mod tests {
             .unwrap();
         assert!(store.claim_guardian_merge(&id).unwrap());
         assert_eq!(store.get_guardian(&id).unwrap().status, "merging");
+
+        // RAL-249: a `merge_stopped` review can be resumed with a fresh merge.
+        store
+            .set_guardian_status(&id, GuardianStatus::MergeStopped, None)
+            .unwrap();
+        assert!(store.claim_guardian_merge(&id).unwrap());
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merging");
+    }
+
+    #[test]
+    fn stop_guardian_merge_flips_merging_to_merge_stopped_only() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        // Not merging: stop must be rejected.
+        assert!(store.stop_guardian_merge(&id).is_err());
+        assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
+
+        // Merging: stop flips to merge_stopped.
+        store.claim_guardian_merge(&id).unwrap();
+        assert_eq!(
+            store.stop_guardian_merge(&id).unwrap(),
+            GuardianStatus::MergeStopped
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merge_stopped");
+
+        // merge_stopped is distinct from cancelled and is cancellable.
+        assert_eq!(
+            store.cancel_guardian(&id).unwrap(),
+            GuardianStatus::Cancelled
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().status, "cancelled");
+
+        // A terminal/cancelled review can't be stopped.
+        assert!(store.stop_guardian_merge(&id).is_err());
     }
 
     #[test]
@@ -4166,6 +4291,37 @@ mod tests {
         assert!(
             store
                 .set_guardian_proof_skip_auto_clean("nope", Some(true))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn skip_base_updates_defaults_off_and_toggles_independently() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.skip_base_updates, None);
+        assert!(
+            !g.effective_skip_base_updates,
+            "defaults to auto-update on (no skip)"
+        );
+
+        store
+            .set_guardian_skip_base_updates(&id, Some(true))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.skip_base_updates, Some(true));
+        assert!(g.effective_skip_base_updates);
+
+        // Resetting back to None restores "inherit the project/global default".
+        store.set_guardian_skip_base_updates(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.skip_base_updates, None);
+        assert!(!g.effective_skip_base_updates);
+
+        assert!(
+            store
+                .set_guardian_skip_base_updates("nope", Some(true))
                 .is_err()
         );
     }

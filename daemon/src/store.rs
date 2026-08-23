@@ -732,6 +732,7 @@ impl Store {
                 resolver_model    TEXT,
                 proof_scope      TEXT,
                 proof_skip_auto_clean INTEGER,
+                skip_base_updates INTEGER,
                 created_at_ms     INTEGER NOT NULL,
                 updated_at_ms     INTEGER NOT NULL
             );
@@ -817,7 +818,8 @@ impl Store {
                 description   TEXT NOT NULL DEFAULT '',
                 path          TEXT NOT NULL,
                 vcs           TEXT NOT NULL DEFAULT 'git',
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                skip_base_updates INTEGER
             );
             -- Minimal user registry (RAL-?): a placeholder identity a request
             -- can name itself as, for `AgentAccess` (`agent_access.rs`) to key
@@ -1118,6 +1120,9 @@ impl Store {
             // RAL-185: the machine this review's worktrees and merge run on.
             // NULL means the daemon's own host, which is every pre-RAL-185 row.
             "ALTER TABLE guardians ADD COLUMN machine TEXT",
+            // RAL-250: per-review opt-out of the automatic base-branch
+            // auto-update rebuild. NULL = inherit the project/global default.
+            "ALTER TABLE guardians ADD COLUMN skip_base_updates INTEGER",
             // Proof steps never recorded their own token/cost usage -- only
             // cells did -- so a `prompt`/`command`-kind proof step's LLM
             // spend was silently discarded instead of being shown in the
@@ -1170,6 +1175,12 @@ impl Store {
             // equivalent concept) and for a GitHub review that hasn't
             // registered a stack yet.
             "ALTER TABLE guardians ADD COLUMN forge_stack_number INTEGER",
+            // RAL-250: the `skip_base_updates` value a project stamped from the
+            // live global config at first registration, so a later global
+            // change doesn't retroactively flip an already-created project.
+            // NULL = never stamped (pre-RAL-250 project, deliberately not
+            // backfilled -- the ticket's explicit no-migration decision).
+            "ALTER TABLE projects ADD COLUMN skip_base_updates INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -2612,10 +2623,44 @@ impl Store {
         path: &str,
         vcs: &str,
     ) -> Result<()> {
+        // RAL-250: stamp the *current* global `skip_base_updates` value into a
+        // brand-new project at first registration, so a later global change
+        // does not retroactively flip it.
+        let global = crate::config::global_review_config().skip_base_updates();
+        self.register_project_with_stamp(name, description, path, vcs, Some(global))
+    }
+
+    /// RAL-250: `register_project` with the global value that would normally be
+    /// read from the process's `global_review_config()` passed in explicitly,
+    /// so the stamping behavior is testable in-process -- the workspace forbids
+    /// `unsafe_code` outright, so `std::env::set_var`/`remove_var` can't be
+    /// used to point `$RALPHUS_CONFIG_HOME` at a controlled value in a test
+    /// (the same rationale `agent_profiles.rs::configuration_path_entries`
+    /// documents for its own env parameter).
+    fn register_project_with_stamp(
+        &self,
+        name: &str,
+        description: &str,
+        path: &str,
+        vcs: &str,
+        stamp: Option<bool>,
+    ) -> Result<()> {
+        // An existing project being re-registered (an upsert update, not a
+        // first insert) is deliberately left untouched -- the ticket's explicit
+        // "no backfill" decision, so `stamp` is only applied on a true insert.
+        let exists = self
+            .conn
+            .query_row("SELECT 1 FROM projects WHERE name=?", params![name], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        let stamp = if exists { None } else { stamp };
         self.conn.execute(
-            "INSERT INTO projects(name, description, path, vcs, created_at_ms) VALUES(?,?,?,?,?)
+            "INSERT INTO projects(name, description, path, vcs, created_at_ms, skip_base_updates)
+             VALUES(?,?,?,?,?,?)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, path=excluded.path, vcs=excluded.vcs",
-            params![name, description, path, vcs, now_ms()],
+            params![name, description, path, vcs, now_ms(), stamp.map(i64::from)],
         )?;
         crate::rlog!(
             INFO,
@@ -2634,6 +2679,43 @@ impl Store {
             payload: serde_json::json!({"name": name, "path": path, "vcs": vcs}),
         });
         Ok(())
+    }
+
+    /// RAL-250: the `skip_base_updates` value a project stamped from the live
+    /// global config when it was first registered, looked up by repo path.
+    /// `None` when no registered project path is `path` itself or an ancestor
+    /// of it (or that project was registered before this column existed --
+    /// those are deliberately not backfilled). This frozen value is what keeps
+    /// a later global change from retroactively flipping an already-created
+    /// project.
+    pub fn project_skip_base_updates_stamp(&self, path: &str) -> Option<bool> {
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT path, skip_base_updates FROM projects")
+        {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
+            .ok()?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        for (proj, stamp) in rows {
+            let proj = proj.trim_end_matches(['/', '\\']);
+            let matches = trimmed == proj
+                || trimmed
+                    .strip_prefix(proj)
+                    .map(|rest| rest.starts_with(['/', '\\']))
+                    .unwrap_or(false);
+            if matches {
+                return stamp.map(|v| v != 0);
+            }
+        }
+        None
     }
 
     /// A project by its exact registered name, or `None` when absent.
@@ -8926,6 +9008,84 @@ command = "check-c"
         );
         assert_eq!(all[0].description, "new description");
         assert_eq!(all[0].path, "C:/new/path");
+    }
+
+    #[test]
+    fn register_project_stamps_global_skip_base_updates_on_first_insert() {
+        let store = Store::open_in_memory().unwrap();
+        // The global value at first registration (here `true`) is stamped into
+        // the new project row via the injectable seam -- `agent_profiles.rs`
+        // documents why the process env can't be mutated in-test to supply it.
+        store
+            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true))
+            .unwrap();
+        assert_eq!(
+            store.project_skip_base_updates_stamp("C:/repos/ralphus"),
+            Some(true)
+        );
+        // A subdirectory of the project also resolves to the same stamp.
+        assert_eq!(
+            store.project_skip_base_updates_stamp("C:/repos/ralphus/daemon"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn reregistering_existing_project_does_not_restamp() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true))
+            .unwrap();
+
+        // Re-register the same name with a *different* global value (`false`):
+        // registration is an upsert, so the existing row's stamp is preserved
+        // rather than being restamped from the now-changed global (RAL-250's
+        // "no backfill for existing projects").
+        store
+            .register_project_with_stamp(
+                "ralphus",
+                "updated",
+                "C:/repos/ralphus",
+                "git",
+                Some(false),
+            )
+            .unwrap();
+        assert_eq!(
+            store.project_skip_base_updates_stamp("C:/repos/ralphus"),
+            Some(true),
+            "re-registering must not overwrite the original creation-time stamp"
+        );
+    }
+
+    #[test]
+    fn stamp_is_none_only_for_pre_ral250_unstamped_project() {
+        let store = Store::open_in_memory().unwrap();
+        // A project registered with an explicit value resolves to that value.
+        store
+            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(false))
+            .unwrap();
+        assert_eq!(
+            store.project_skip_base_updates_stamp("C:/repos/ralphus"),
+            Some(false),
+            "an explicit false stamp must resolve to Some(false)"
+        );
+        // Unregistered path has no stamp.
+        assert_eq!(store.project_skip_base_updates_stamp("C:/unrelated"), None);
+        // A pre-RAL-250 project (never stamped, column NULL) deliberately has
+        // no stamp -- the ticket's "existing projects are not backfilled".
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(name, description, path, vcs, created_at_ms, skip_base_updates)
+                 VALUES('legacy','','C:/legacy','git',1,NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.project_skip_base_updates_stamp("C:/legacy"),
+            None,
+            "an unstamped legacy project must resolve to None (not backfilled)"
+        );
     }
 
     #[test]

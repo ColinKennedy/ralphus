@@ -226,6 +226,7 @@ aborts the remaining batch).
 | `review branch enable\|disable <selector#branch>` | Enable/disable one branch + rebase |
 | `review merge <selector>` | Start/continue the stacked rebase |
 | `review restart-merge <selector>` | Cancel an in-progress rebase, start fresh |
+| `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
 | `review approve <selector>` | Approve an in_review review |
 | `review feedback <selector#branch> <text>` | Post feedback on a branch |
@@ -606,10 +607,11 @@ use; see `READ_ONLY_NOTE`.
         - rename selector [str] name [str]  {Rename a review.}
         - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-worktree-checks/--no-skip-worktree-checks --skip-worktrees/--no-skip-worktrees --verify-scope [each_branch|final_branch|nothing]  {Update per-review opt-out settings.}
+        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktree-checks/--no-skip-worktree-checks --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [str]  {Show a single review's detail.}
         - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
+        - stop-merge selector [str]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - (read-only-safe) worktrees selector [str]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}

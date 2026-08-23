@@ -554,6 +554,15 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "stop-merge",
+        &["selector [str]"],
+        &[],
+        "Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "settings",
         &["selector [str]"],
         &[
@@ -563,6 +572,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
             "--resolver-model [name]",
             "--skip-auto-build/--no-skip-auto-build",
             "--skip-auto-clean/--no-skip-auto-clean",
+            "--skip-base-updates/--no-skip-base-updates",
             "--skip-worktree-checks/--no-skip-worktree-checks",
             "--skip-worktrees/--no-skip-worktrees",
             "--proof-scope [each_branch|final_branch|nothing]",

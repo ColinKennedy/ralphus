@@ -2676,6 +2676,42 @@ pub fn restart_guardian_merge(
     start_merge(store, runner, id, sem, cancellations)
 }
 
+/// Halt an in-flight merge for `id` at its next checkpoint, leaving the review
+/// in the recoverable `merge_stopped` state (RAL-249) rather than cancelled.
+///
+/// Distinct from [`restart_guardian_merge`]: it stops the live worker the same
+/// way (cancel token + bounded wait) but then leaves the review and branches
+/// alone instead of resetting to `collecting` and starting fresh — the next
+/// `start_merge` (the board's "Merge / rebase" on a `merge_stopped` review)
+/// resumes from the first review worktree, and the next merge's own setup phase
+/// handles whatever leftovers this halt left behind. The store write is atomic
+/// on `status='merging'`, so a merge that actually completed before the wait
+/// gave up is left in `in_review` rather than mis-labelled.
+pub fn stop_guardian_merge(
+    store: Arc<Mutex<Store>>,
+    cancellations: Cancellations,
+    id: &str,
+) -> Reply {
+    let key = format!("guardian:{id}");
+    cancellations.cancel(&key);
+    wait_for_merge_worker_stop(&cancellations, &key);
+    match store
+        .lock()
+        .expect("store mutex poisoned")
+        .stop_guardian_merge(id)
+    {
+        Ok(status) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} merge stopped → {}",
+                status.as_str()
+            );
+            reply(200, &format!("{{\"status\":\"{}\"}}", status.as_str()))
+        }
+        Err(e) => reply(500, &error_body("store_error", &e.to_string())),
+    }
+}
+
 /// Kick off a background "set it for me" resolution of one named
 /// [`CheckInput`] (RAL-164). Looks the input up across the guardian's
 /// `manual_commands`/`action_hints` (first match wins) to recover the
@@ -4773,6 +4809,13 @@ pub fn rebuild_on_base_shift(
         Err(_) => return false,
     };
     if !matches!(guardian.status.as_str(), "in_review" | "merge_failed") {
+        return false;
+    }
+    // RAL-250: when this review has opted out of base-branch auto-updates, the
+    // maintenance sweep must not rebuild it on a base shift. This gates ONLY
+    // this automatic pass -- a manual `review base set` / merge goes through
+    // its own explicit path and is unaffected.
+    if guardian.effective_skip_base_updates {
         return false;
     }
 

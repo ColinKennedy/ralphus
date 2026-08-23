@@ -9,9 +9,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
-use crate::cli_agent_common::{
-    RESUME_CONTINUATION_PROMPT, live_session_path, write_live_session_id, write_prompt_file,
-};
+use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
 use crate::shellcmd::{self, Env, SpawnArgs};
 use crate::tools::Workspace;
 
@@ -33,14 +31,14 @@ impl ModelBackend for ClaudeCodeBackend {
         workspace: &Workspace,
         options: &RunOptions<'_>,
     ) -> Result<BackendOutcome, BackendError> {
-        let resuming = options.resume_agent_session_id.is_some();
-        let effective_prompt = if resuming {
-            RESUME_CONTINUATION_PROMPT
-        } else {
-            prompt
-        };
-        let prompt_file =
-            write_prompt_file(effective_prompt).map_err(|e| BackendError(e.to_string()))?;
+        // Always deliver the cell's own prompt, even when resuming a session.
+        // A resumed conversation treats the `-p` prompt as a fresh user turn
+        // layered on top of the accumulated context (RAL-248 AC3): cross-cell
+        // session sharing needs the *new* cell's task text, not a generic
+        // "continue" — the session's tool/file state still carries forward
+        // and the new prompt does not corrupt it (codex already does the
+        // same: it streams `prompt` straight into a resumed thread).
+        let prompt_file = write_prompt_file(prompt).map_err(|e| BackendError(e.to_string()))?;
 
         let program = self.program_override.clone().unwrap_or_else(|| {
             std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())

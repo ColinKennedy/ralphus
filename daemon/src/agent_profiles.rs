@@ -624,6 +624,60 @@ backend = "claude-code"
     }
 
     #[test]
+    fn load_profiles_for_path_with_reads_configuration_path_entries() {
+        let config_dir = tempdir("configuration-path-source");
+        let config_file = config_dir.join(".ralphus.toml");
+        fs::write(
+            &config_file,
+            r#"
+[agent.profiles.from-configuration-path]
+backend = "claude-code"
+"#,
+        )
+        .expect("write configuration-path file");
+
+        // `cwd` is unrelated to `config_dir` -- no ancestor `.ralphus.toml` and
+        // no `$RALPHUS_CONFIG_HOME`, so the only way this profile can be found
+        // is through the `$RALPHUS_CONFIGURATION_PATH` entry.
+        let cwd = tempdir("configuration-path-unrelated-cwd");
+        let profiles = load_profiles_for_path_with(&cwd, Some(config_file.to_str().unwrap()))
+            .expect("load profiles");
+        assert!(profiles.contains_key("from-configuration-path"));
+    }
+
+    #[test]
+    fn load_profiles_for_path_with_project_local_wins_over_configuration_path() {
+        let config_dir = tempdir("configuration-path-loser");
+        let config_file = config_dir.join(".ralphus.toml");
+        fs::write(
+            &config_file,
+            r#"
+[agent.profiles.shared]
+backend = "codex"
+"#,
+        )
+        .expect("write configuration-path file");
+
+        let project_root = tempdir("configuration-path-project-local-winner");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.shared]
+backend = "claude-code"
+"#,
+        )
+        .expect("write project config");
+
+        let profiles =
+            load_profiles_for_path_with(&project_root, Some(config_file.to_str().unwrap()))
+                .expect("load profiles");
+        assert_eq!(
+            profiles.get("shared").map(|p| p.backend.as_str()),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
     fn merge_profiles_prefers_project_layer_on_name_collision() {
         let mut global = BTreeMap::new();
         global.insert(

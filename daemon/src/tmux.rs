@@ -302,7 +302,17 @@ fn write_pane_snapshot_in(dir: &std::path::Path, session_name: &str, content: &s
         );
         return;
     }
-    let truncated = crate::runner::tail_lines(content, PANE_SNAPSHOT_MAX_LINES);
+    // RAL-264: scrub resolved `from_env` secret values out of the pane content
+    // before persisting it — the pane can legitimately show the agent's own
+    // `$env:... = 'sk-or-v1-...'` assignment, and a stale snapshot is exactly
+    // the kind of durable artifact the leak must not survive in.
+    //
+    // RAL-247: additionally scrub credential env-var values by pattern, so a
+    // secret value that was never registered is still caught before the pane
+    // text ever hits disk.
+    let content = crate::redact::redact_all(content);
+    let redacted = ralphus_core::redact::redact_secrets(&content);
+    let truncated = crate::runner::tail_lines(&redacted, PANE_SNAPSHOT_MAX_LINES);
     if let Err(e) = std::fs::write(pane_snapshot_path_in(dir, session_name), truncated) {
         crate::rlog!(
             WARNING,
@@ -331,9 +341,12 @@ pub fn write_pane_snapshot(session_name: &str, content: &str) {
 /// it's unit-testable against a throwaway directory instead of the real
 /// `state_dir()`.
 fn read_pane_snapshot_in(dir: &std::path::Path, session_name: &str) -> Option<String> {
+    // RAL-247: redact on read too — a snapshot written before this fix (or by
+    // a version without it) may already carry a secret value on disk.
     std::fs::read_to_string(pane_snapshot_path_in(dir, session_name))
         .ok()
         .filter(|s| !s.is_empty())
+        .map(|s| ralphus_core::redact::redact_secrets(&s).into_owned())
 }
 
 /// Read back a session's persisted last-pane-content snapshot, if one was
@@ -441,6 +454,25 @@ pub fn build_command_line_with_env(
             .collect();
         format!("{assigns}{base}")
     }
+}
+
+/// Rendered `-e KEY=value` flag pairs for `new-session` (RAL-247), one per
+/// validated override in `env`. Values are passed to tmux as separate
+/// arguments, so unlike the inline-command form they are never typed into the
+/// pane and never echoed. Keys use the same
+/// [`crate::config::is_valid_env_key`] filter as [`build_command_line_with_env`],
+/// and values were already control-character-checked at the HTTP boundary
+/// (RAL-227), so this is a pure mapping over already-sanitized entries.
+fn env_override_flags(env: &BTreeMap<String, String>) -> Vec<String> {
+    let mut flags = Vec::with_capacity(env.len() * 2);
+    for (k, v) in env
+        .iter()
+        .filter(|(k, _)| crate::config::is_valid_env_key(k))
+    {
+        flags.push("-e".to_string());
+        flags.push(format!("{k}={v}"));
+    }
+    flags
 }
 
 /// Search `PATH` by hand (no extra dependency) for an executable named
@@ -601,7 +633,8 @@ impl Tmux {
     }
 
     /// Create a detached session named `name` rooted at `cwd`, with
-    /// `remain-on-exit` enabled, then start `command` as the pane's process.
+    /// `remain-on-exit` enabled, then start the program `program` with `args`
+    /// as the pane's process.
     ///
     /// Real tmux supports replacing the initial shell in one step
     /// (`respawn-pane <command>`); the Windows-alternative tmux build this
@@ -611,6 +644,23 @@ impl Tmux {
     /// into the shell via `send-keys` — the same fallback gastown's own
     /// Windows port uses for the identical gap.
     ///
+    /// `env` holds RAL-150-style per-session environment overrides. Since a
+    /// typed `send-keys` line is echoed verbatim into the pane, inlining them
+    /// as `$env:KEY = 'value'` assignments would leak their values into pane
+    /// captures (RAL-247). On Windows they are therefore delivered through
+    /// `new-session -e KEY=value` instead, which seeds the pane shell's own
+    /// environment — the value never becomes pane text, yet the launched
+    /// program (and anything it spawns) still inherits it. On POSIX the
+    /// `respawn-pane` path never echoes, so overrides are kept inlined in the
+    /// command (unchanged, and guaranteed to reach the process); `-e` is not
+    /// used there so no POSIX-only tmux behavior is relied on.
+    ///
+    /// Because the Windows launch line must stay free of secrets, the caller
+    /// passes `program`/`args` rather than a pre-rendered command string: the
+    /// method renders the bare command for `send-keys` (Windows) and the
+    /// env-inlined command for `respawn-pane` (POSIX) itself, so the two can
+    /// never drift.
+    ///
     /// # Errors
     /// Returns an error if any of the underlying tmux calls fail; the
     /// partially-created session is killed before returning so a failed
@@ -619,8 +669,12 @@ impl Tmux {
         &self,
         name: &str,
         cwd: &str,
-        command: &str,
+        env: &BTreeMap<String, String>,
+        program: &str,
+        args: &[String],
     ) -> Result<(), TmuxError> {
+        let base = build_command_line(program, args);
+        let full = build_command_line_with_env(program, args, env);
         // Deliberately very wide (default is much narrower) so a long line --
         // e.g. a Bash tool call's rendered command/description in the live
         // pane -- doesn't get hard-wrapped by the pane itself on top of the
@@ -629,18 +683,23 @@ impl Tmux {
         // downside to going wide here: this pane is consumed via
         // `capture-pane` (an automated poll), not sat in front of by a human
         // at a fixed terminal width, so there's no reason to economize.
-        self.run(&[
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-c",
-            cwd,
-            "-x",
-            "500",
-            "-y",
-            "50",
-        ])?;
+        let mut new_session_args: Vec<String> = vec![
+            "new-session".to_string(),
+            "-d".to_string(),
+            "-s".to_string(),
+            name.to_string(),
+            "-c".to_string(),
+            cwd.to_string(),
+            "-x".to_string(),
+            "500".to_string(),
+            "-y".to_string(),
+            "50".to_string(),
+        ];
+        if cfg!(target_os = "windows") {
+            new_session_args.extend(env_override_flags(env));
+        }
+        let ns_refs: Vec<&str> = new_session_args.iter().map(String::as_str).collect();
+        self.run(&ns_refs)?;
         // Best-effort: without this, tmux discards a dead pane's content
         // immediately, which would race the daemon's own sentinel-based
         // completion detection.
@@ -652,9 +711,9 @@ impl Tmux {
         // own buffer trimming while a long-running session is still live.
         let _ = self.run(&["set-option", "-t", name, "history-limit", "200000"]);
         let started = if cfg!(target_os = "windows") {
-            self.run(&["send-keys", "-t", name, command, "Enter"])
+            self.run(&["send-keys", "-t", name, base.as_str(), "Enter"])
         } else {
-            self.run(&["respawn-pane", "-k", "-t", name, "-c", cwd, command])
+            self.run(&["respawn-pane", "-k", "-t", name, "-c", cwd, full.as_str()])
         };
         if let Err(e) = started {
             let _ = self.kill_session(name);
@@ -1201,6 +1260,44 @@ mod tests {
     }
 
     #[test]
+    fn write_pane_snapshot_redacts_secret_env_values_from_disk() {
+        // RAL-247: the persisted pane-snapshot *file* must never contain a
+        // credential env-var value, even when the captured pane did.
+        let dir = TempSnapshotDir::new("redact-secret");
+        let secret = "sk-snapshot-leak-guard";
+        let content = format!("$env:ANTHROPIC_AUTH_TOKEN = '{secret}';\nordinary line");
+        write_pane_snapshot_in(&dir.0, "s", &content);
+        let disk =
+            std::fs::read_to_string(pane_snapshot_path_in(&dir.0, "s")).expect("snapshot written");
+        assert!(
+            !disk.contains(secret),
+            "credential value leaked into the pane-snapshot file: {disk}"
+        );
+        assert!(disk.contains("[REDACTED]"), "{disk}");
+        assert!(
+            disk.contains("ordinary line"),
+            "non-secret content must be preserved: {disk}"
+        );
+    }
+
+    #[test]
+    fn read_pane_snapshot_redacts_secret_values_from_a_legacy_file() {
+        // RAL-247: a snapshot file written before this fix may already carry
+        // a secret value — the read path must scrub it defensively too.
+        let dir = TempSnapshotDir::new("read-redacts-legacy");
+        let secret = "sk-snapshot-legacy";
+        let path = pane_snapshot_path_in(&dir.0, "s");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("$env:ANTHROPIC_API_KEY = '{secret}'")).unwrap();
+        let content = read_pane_snapshot_in(&dir.0, "s").expect("legacy snapshot readable");
+        assert!(
+            !content.contains(secret),
+            "credential value leaked from a legacy snapshot: {content}"
+        );
+        assert!(content.contains("[REDACTED]"), "{content}");
+    }
+
+    #[test]
     fn pane_snapshot_empty_content_reads_back_as_none() {
         // An attempt that produced no pane output at all writes an empty
         // file (see `write_pane_snapshot`'s doc comment) — the reader treats
@@ -1353,9 +1450,14 @@ mod tests {
 
         let cwd = std::env::temp_dir();
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let command = build_command_line("echo", &["tmux-roundtrip-ok".to_string()]);
-        tmux.new_detached_session_with_command(&name, &cwd_str, &command)
-            .unwrap();
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd_str,
+            &BTreeMap::new(),
+            "echo",
+            &["tmux-roundtrip-ok".to_string()],
+        )
+        .unwrap();
 
         let mut seen = String::new();
         for _ in 0..50 {
@@ -1395,9 +1497,14 @@ mod tests {
 
         let cwd = std::env::temp_dir();
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let command = build_command_line("echo", &["ral237-marker".to_string()]);
-        tmux.new_detached_session_with_command(&name, &cwd_str, &command)
-            .unwrap();
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd_str,
+            &BTreeMap::new(),
+            "echo",
+            &["ral237-marker".to_string()],
+        )
+        .unwrap();
 
         let mut captured = String::new();
         for _ in 0..50 {
@@ -1435,22 +1542,103 @@ mod tests {
         assert!(!tmux.has_session("definitely-not-a-real-ralphus-session-xyz"));
     }
 
+    /// RAL-247: on Windows the per-session env overrides are delivered via
+    /// `new-session -e KEY=value` (see [`Tmux::new_detached_session_with_command`]),
+    /// not by inlining `$env:KEY = 'value'` assignments into the `send-keys`
+    /// line, so a value that would previously have been typed — and echoed —
+    /// into the pane never becomes pane text. This test drives a sentinel
+    /// token through that real delivery path and asserts the pane shows the
+    /// command but never the value, while the process still sees the variable
+    /// (proved by echoing its length, never the value).
+    #[test]
+    fn live_tmux_env_override_delivered_without_leaking_its_value() {
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        if !cfg!(target_os = "windows") {
+            println!("SKIP: exercises the Windows send-keys delivery path only");
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let sentinel = "sk-ant-test-247-leak-guard";
+        let mut env = BTreeMap::new();
+        env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), sentinel.to_string());
+
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "env-redaction");
+        let _ = tmux.kill_session(&name);
+        let cwd = std::env::temp_dir();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd_str,
+            &env,
+            "echo",
+            &["intended-marker".to_string()],
+        )
+        .unwrap();
+
+        let mut seen = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(200));
+            seen = tmux.capture_pane(&name, 50).unwrap_or_default();
+            if seen.contains("intended-marker") {
+                break;
+            }
+        }
+        assert!(
+            seen.contains("intended-marker"),
+            "expected the launch command to run, pane: {seen:?}"
+        );
+        // The credential must still be present in the pane's process env:
+        // echo `$env:ANTHROPIC_AUTH_TOKEN.Length` (a number, not the value).
+        tmux.send_keys_literal(
+            &name,
+            "Write-Output (\":LEN=\" + $env:ANTHROPIC_AUTH_TOKEN.Length)",
+        )
+        .unwrap();
+        let mut with_len = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(200));
+            with_len = tmux.capture_pane(&name, 50).unwrap_or_default();
+            if with_len.contains(":LEN=") {
+                break;
+            }
+        }
+        tmux.kill_session(&name).unwrap();
+
+        // The credential reached the process...
+        assert!(
+            with_len.contains(&format!(":LEN={}", sentinel.len())),
+            "expected the sentinel length to be echoed (credential was not \
+             delivered), pane: {with_len:?}"
+        );
+        // ...but its value never appeared as pane text.
+        assert!(
+            !with_len.contains(sentinel),
+            "sentinel value leaked into the pane: {with_len:?}"
+        );
+        assert!(
+            !with_len.contains("$env:ANTHROPIC_AUTH_TOKEN ="),
+            "no inline assignment should have been typed: {with_len:?}"
+        );
+    }
+
     /// RAL-227: proves *why* `crate::config::is_valid_env_value` rejects a
     /// `\n`-carrying env-override value at the HTTP boundary
-    /// (`daemon/src/server.rs`, before the value ever reaches
-    /// [`build_command_line_with_env`]), by deliberately bypassing that
-    /// check here and sending the resulting unsanitized command line down
-    /// the real Windows delivery path -- `send-keys` typed into a live pty
-    /// (see [`Tmux::new_detached_session_with_command`]'s doc comment).
-    /// `quote_for_shell`'s escaping does not neutralize an embedded literal
-    /// newline: it submits everything typed so far as an incomplete
-    /// PowerShell statement (observed: the pane lands in a `>>` open-quote
-    /// continuation prompt) instead of running the intended command, so the
-    /// expected marker never appears. This is the live, empirical
-    /// confirmation that the boundary check closes a real gap, not an
-    /// assumed one.
+    /// (`daemon/src/server.rs`). Since RAL-247, Windows delivers overrides via
+    /// `new-session -e` (never typed into the pane), so a would-be injected
+    /// `\n...` in a value is carried as literal env data, not re-interpreted
+    /// as a second command — the intended marker still runs. This test
+    /// bypasses the boundary check on purpose and drives such a value down the
+    /// real delivery path to confirm the launch line is no longer a place a
+    /// newline can corrupt or split a command.
     #[test]
-    fn live_tmux_send_keys_embedded_newline_in_env_value_corrupts_the_command() {
+    fn live_tmux_env_value_newline_delivered_via_e_does_not_corrupt_the_command() {
         if !tmux_on_path() {
             println!("SKIP: tmux not found on PATH");
             return;
@@ -1471,19 +1659,20 @@ mod tests {
 
         let mut env = BTreeMap::new();
         env.insert("INJECTED".to_string(), malicious_value.to_string());
-        let command = build_command_line_with_env("echo", &["intended-marker".to_string()], &env);
-        assert!(
-            command.contains('\n'),
-            "expected the raw newline to survive quoting: {command:?}"
-        );
 
         let tmux = Tmux::resolve().unwrap();
         let name = session_name(&unique_test_tag("test-run"), "build", "newline-injection");
         let _ = tmux.kill_session(&name);
         let cwd = std::env::temp_dir();
         let cwd_str = cwd.to_string_lossy().into_owned();
-        tmux.new_detached_session_with_command(&name, &cwd_str, &command)
-            .unwrap();
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd_str,
+            &env,
+            "echo",
+            &["intended-marker".to_string()],
+        )
+        .unwrap();
 
         let mut seen = String::new();
         for _ in 0..25 {
@@ -1496,9 +1685,14 @@ mod tests {
         tmux.kill_session(&name).unwrap();
 
         assert!(
-            !seen.contains("intended-marker"),
-            "expected the embedded newline to prevent the intended command \
-             from completing, but it ran anyway: {seen:?}"
+            seen.contains("intended-marker"),
+            "expected the intended command to run despite the newline value, \
+             pane: {seen:?}"
+        );
+        assert!(
+            !seen.contains("SPLIT-MARKER"),
+            "the newline value must not be executed as a second command, \
+             pane: {seen:?}"
         );
     }
 }

@@ -197,7 +197,11 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
 /// error).
 fn read_log_excerpt(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    Some(crate::runner::tail_lines(&content, MAX_LOG_EXCERPT_LINES))
+    // RAL-247: this file is read directly from disk (not via `read_attempt`),
+    // so scrub credential values here too — a legacy file written before the
+    // write-time redaction could otherwise surface in the served timeline.
+    let redacted = ralphus_core::redact::redact_secrets(&content);
+    Some(crate::runner::tail_lines(&redacted, MAX_LOG_EXCERPT_LINES))
 }
 
 fn render_text(meta: &SquadTimelineMeta, entries: &[SquadTimelineEntry]) -> String {
