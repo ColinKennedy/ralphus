@@ -107,6 +107,7 @@ where one exists.
 | POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
+| POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
 | POST | `/api/guardians/{id}/approve` | Approve an in_review guardian |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
 | POST | `/api/guardians/{id}/run-manual-commands` | Spawn manual-check commands **on the daemon host** |
@@ -1154,6 +1155,22 @@ becomes the alias of the nearest-preceding enabled branch that has its own
 open PR (or the review's own base branch, if none precedes it). The local
 `base_ref` record always updates; the forge PR's base is best-effort PATCHed
 too (`GET .../pull-requests` reflects the recorded state either way).
+
+### `POST /api/guardians/{id}/stop`
+
+Halt an in-progress rebase (status `merging`) at its next checkpoint, leaving
+the review in the recoverable `merge_stopped` state (RAL-249) — **not**
+cancelled. The live merge worker is told to stop (via its cancel token, so any
+in-flight conflict-resolution agent is wound down) and the daemon then
+atomically flips `merging → merge_stopped`; the review, its branches, and its
+worktrees are kept. `POST /api/guardians/{id}/merge` on a `merge_stopped`
+review resumes the rebase from the first remaining worktree; `POST
+/api/guardians/{id}/cancel` still abandons it.
+
+Returns `{"status":"merge_stopped"}` on success. Because the state flip is
+guarded on the review actually being `merging`, a merge that had already
+completed before the worker was stopped is left in `in_review` (the endpoint
+reports a `store_error`), rather than being mis-labelled as stopped.
 
 ### `GET /api/pull-requests`
 Look up the ralphus PR row for a given forge PR/MR (the PR → worktree

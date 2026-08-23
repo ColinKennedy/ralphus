@@ -802,10 +802,14 @@ fn print_history_content(content: &str) {
         println!("(no history recorded yet)");
         return;
     }
+    // RAL-247: defense-in-depth — the daemon redacts at its read/serve paths,
+    // but a CLI talking to an older daemon must still never print a
+    // credential value to the terminal.
+    let redacted = ralphus_core::redact::redact_secrets(content);
     if content.ends_with('\n') {
-        print!("{content}");
+        print!("{redacted}");
     } else {
-        println!("{content}");
+        println!("{redacted}");
     }
 }
 

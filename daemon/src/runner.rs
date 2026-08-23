@@ -120,13 +120,18 @@ pub struct RunnerSpec {
     /// is not configured (see `daemon/src/otel.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<String>,
-    /// When set, tells the runner to resume this exact claude-code
-    /// conversation (`claude -p --resume <id>`) instead of starting a fresh
-    /// one — used by [`SubprocessRunner::run_via_tmux`]'s auto-reattach retry
-    /// when a cell's tmux pane vanishes unexpectedly mid-run but its live
-    /// `agent_session_id` was already captured. `None` for a normal (first
-    /// attempt) invocation. Only the claude-code backend honors it; other
-    /// backends accept and ignore it (mirrors `system_prompt`'s precedent).
+    /// When set, tells the runner to resume an existing agent conversation
+    /// (`claude -p --resume <id>` / `codex exec resume <id>`) instead of
+    /// starting a fresh one. Two producers set it today: the claude-code
+    /// backend's own still-working async retry loop, and (RAL-248) the
+    /// scheduler when a cell continues from a completed dependency's session
+    /// (cross-cell session sharing) — see `scheduler::resolve_shared_session_id`
+    /// and its model-mismatch guard. The daemon's [`SubprocessRunner::run_via_tmux`]
+    /// auto-reattach retry also sets it when a cell's tmux pane vanishes
+    /// mid-run but its live `agent_session_id` was already captured. `None`
+    /// for a normal (first attempt) invocation. Both the claude-code and
+    /// codex backends honor it; the hand-rolled backends accept and ignore it
+    /// (mirrors `system_prompt`'s precedent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_agent_session_id: Option<String>,
     /// Persistent, user-set environment-variable overrides for the owning
@@ -971,11 +976,6 @@ impl SubprocessRunner {
         all_args.push(spec_path.to_string_lossy().into_owned());
         all_args.push("--result-file".to_string());
         all_args.push(result_path.to_string_lossy().into_owned());
-        let command = crate::tmux::build_command_line_with_env(
-            &self.program,
-            &all_args,
-            &attempt_spec.env_overrides,
-        );
 
         // A tmux session with this exact deterministic name can already exist
         // and still be alive: tmux sessions are owned by the tmux server, not
@@ -1020,9 +1020,13 @@ impl SubprocessRunner {
             }
             let _ = tmux.kill_session(session_name);
         }
-        if let Err(e) =
-            tmux.new_detached_session_with_command(session_name, &attempt_spec.cwd, &command)
-        {
+        if let Err(e) = tmux.new_detached_session_with_command(
+            session_name,
+            &attempt_spec.cwd,
+            &attempt_spec.env_overrides,
+            &self.program,
+            &all_args,
+        ) {
             let _ = std::fs::remove_file(spec_path);
             return (
                 RunnerResult::failure(format!("could not start tmux session: {e}")),
@@ -1490,7 +1494,20 @@ impl SubprocessRunner {
                 RunnerResult::failure(format!("runner result file was not valid JSON: {e}"))
             }),
             Err(e) => {
-                let tail = last_pane.map(|pane| tail_lines(pane, 60));
+                // RAL-264: this pane tail becomes the branch `detail` (surfaced
+                // by `ralphus review show`/`worktrees` and stored in SQLite), so
+                // scrub resolved `from_env` secret values out of it first — the
+                // pane can legitimately show the agent's own `$env:... =
+                // 'sk-or-v1-...'` assignment and it must not be persisted here.
+                //
+                // RAL-247: additionally scrub credential env-var values by
+                // pattern, so a secret value that was never registered is
+                // still caught before this failure message is surfaced.
+                let tail = last_pane.map(|pane| {
+                    let registered_scrubbed = crate::redact::redact_all(pane);
+                    let redacted = ralphus_core::redact::redact_secrets(&registered_scrubbed);
+                    tail_lines(&redacted, 60)
+                });
                 match tail {
                     Some(tail) if !tail.is_empty() => RunnerResult::failure(format!(
                         "runner produced no result file: {e}\nlast pane output:\n{tail}"

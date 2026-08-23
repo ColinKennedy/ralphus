@@ -713,6 +713,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             ],
         ) => guardian_manual_checks_terminal_log_attempt(daemon, id, attempt),
         ("POST", ["api", "guardians", id, "merge"]) => guardian_merge(daemon, id),
+        ("POST", ["api", "guardians", id, "stop"]) => guardian_stop(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
         }
@@ -3965,7 +3966,11 @@ fn capture_pane_reply(
             200,
             &PaneResponse {
                 active: true,
-                content,
+                // RAL-247: scrub credential env-var values before serving the
+                // live pane to the board/CLI. (A live pane is served before
+                // it's ever persisted, so this is the one read path the
+                // snapshot/terminal-log write-time redaction can't cover.)
+                content: ralphus_core::redact::redact_secrets(&content).into_owned(),
                 last_activity_ms: daemon.lock().live_activity_ms(&name),
             },
         ),
@@ -5681,7 +5686,11 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
             continue;
         }
         if let Ok(content) = tmux.capture_pane(&target.pane_name, 2000) {
-            let trimmed = content.trim();
+            // RAL-247: scrub credential env-var values before folding the pane
+            // capture into the cell's ghost (which is later served back and
+            // prepended to the next attempt's prompt).
+            let masked = ralphus_core::redact::redact_secrets(&content);
+            let trimmed = masked.trim();
             if !trimmed.is_empty() {
                 let uri =
                     crate::ghost::cell_uri(squad_id, target.ghost_task_idx, target.ghost_cell_idx);
@@ -6113,6 +6122,11 @@ struct GuardianSettingsBody {
     /// empty string works for `proof_scope`.
     #[serde(default)]
     proof_skip_auto_clean: Option<bool>,
+    /// RAL-250: this review's own override for whether the automatic
+    /// base-branch auto-update rebuild is skipped. `None` (or the field being
+    /// absent) means "inherit the project/global default".
+    #[serde(default)]
+    skip_base_updates: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -6288,6 +6302,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(skip) = req.proof_skip_auto_clean {
         if let Err(e) = store.set_guardian_proof_skip_auto_clean(id, Some(skip)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(skip) = req.skip_base_updates {
+        if let Err(e) = store.set_guardian_skip_base_updates(id, Some(skip)) {
             return store_error(&e);
         }
     }
@@ -7227,6 +7246,17 @@ fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+    )
+}
+
+/// Stop an in-progress rebase (status `merging`) at its next checkpoint,
+/// leaving the review in the recoverable `merge_stopped` state — distinct from
+/// [`guardian_cancel`] (which discards the review back to `collecting`).
+fn guardian_stop(daemon: &Daemon, id: &str) -> Reply {
+    crate::guardian_merge::stop_guardian_merge(
+        daemon.store_handle(),
+        daemon.cancellations_handle(),
+        id,
     )
 }
 
@@ -10949,9 +10979,14 @@ command = "true"
         let tmux = crate::tmux::Tmux::resolve().unwrap();
         let _ = tmux.kill_session(name);
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let command = crate::tmux::build_command_line("echo", &[marker.to_string()]);
-        tmux.new_detached_session_with_command(name, &cwd, &command)
-            .unwrap();
+        tmux.new_detached_session_with_command(
+            name,
+            &cwd,
+            &std::collections::BTreeMap::new(),
+            "echo",
+            &[marker.to_string()],
+        )
+        .unwrap();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if tmux
@@ -13097,6 +13132,24 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"proof_skip_auto_clean\":true"));
         assert!(r.body.contains("\"effective_proof_skip_auto_clean\":true"));
+    }
+
+    #[test]
+    fn guardian_settings_sets_and_resets_skip_base_updates() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        // Set the per-review opt-out on.
+        let body = serde_json::json!({"skip_base_updates": true}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"skip_base_updates\":true"));
+        assert!(r.body.contains("\"effective_skip_base_updates\":true"));
+        // Flip it explicitly back off (don't auto-update skip).
+        let body = serde_json::json!({"skip_base_updates": false}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"skip_base_updates\":false"));
+        assert!(r.body.contains("\"effective_skip_base_updates\":false"));
     }
 
     // -----------------------------------------------------------------------

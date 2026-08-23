@@ -47,6 +47,122 @@ fn resolve_agent_selection(
     crate::agent_profiles::resolve_agent_for_path(agent, Path::new(cwd))
 }
 
+/// Whether a resolved backend name is Claude Code (`claude-code`, `claude-cli`).
+fn is_claude_code_backend(backend: &str) -> bool {
+    backend == "claude-code" || backend == "claude-cli"
+}
+
+/// RAL-248: returns a human reason when the current cell must NOT resume a
+/// dependency's agent session — `None` when sharing is safe.
+///
+/// The only blocking case today: two `claude-code` cells on different models.
+/// Claude Code keys its session cache on the model, so
+/// `claude -p --resume <id> --model <other>` silently starts a cold session,
+/// discarding the very context cross-cell sharing exists to carry forward.
+/// Any other pairing (a non-claude-code cell, or matching models) resumes
+/// fine — a fresh `--append-system-prompt`/prompt is applied on top of the
+/// resumed session without corrupting it (RAL-248 AC3; the claude-code
+/// backend already passes both flags together).
+#[must_use]
+fn sharing_blocked_reason(
+    current_backend: &str,
+    current_model: Option<&str>,
+    dep_backend: &str,
+    dep_model: Option<&str>,
+) -> Option<String> {
+    if is_claude_code_backend(current_backend)
+        && is_claude_code_backend(dep_backend)
+        && current_model != dep_model
+    {
+        Some(format!(
+            "claude-code model mismatch (dependency {} vs this cell {})",
+            dep_model.unwrap_or("default"),
+            current_model.unwrap_or("default")
+        ))
+    } else {
+        None
+    }
+}
+
+/// Outcome of cross-cell session-sharing resolution (RAL-248).
+enum SessionShare {
+    /// Resume the named completed dependency's agent session.
+    Resume {
+        session_id: String,
+        from_cell: String,
+        from_task: String,
+    },
+    /// A dependency produced a resumable session but it must not be shared —
+    /// start fresh instead, logging why.
+    Skip { reason: String },
+    /// No completed dependency produced a resumable session id.
+    None,
+}
+
+/// RAL-248: decide whether cell `i` should resume one of its completed
+/// dependencies' agent sessions (cross-cell session sharing) rather than
+/// start fresh. See [`sharing_blocked_reason`] for the guard.
+///
+/// Because ready cells dispatch in parallel, the only cells guaranteed
+/// finished when `i` starts are its `plan.deps[i]` — so the prior session (if
+/// any) has to come from one of them. We share the first session-bearing,
+/// guard-passing dependency's id.
+fn resolve_shared_session_id(
+    store: &Arc<Mutex<Store>>,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    cells: &[crate::store::CellRow],
+    plan: &crate::plan::ExecutionPlan,
+    i: usize,
+    current_backend: &str,
+) -> SessionShare {
+    // Collect each dependency's stored session id in one short DB read, then
+    // release the store lock before doing any config-file I/O below
+    // (`resolve_agent_selection` reads `.ralphus.toml` from disk, which must
+    // not happen while holding the global store mutex).
+    let dep_sessions: Vec<(usize, String)> = {
+        let guard = store.lock().expect("store mutex poisoned");
+        plan.deps[i]
+            .iter()
+            .filter_map(|&d| {
+                let dep = &cells[d];
+                guard
+                    .get_cell_agent_resume(squad_id, dep.task_idx, dep.idx)
+                    .ok()
+                    .and_then(|(_, _, sid)| sid.map(|sid| (d, sid)))
+                // Only resumable when the dependency actually produced a
+                // session id; a dependency without one can't be shared.
+            })
+            .collect()
+    };
+    let mut blocked_reason: Option<String> = None;
+    for (d, session_id) in dep_sessions {
+        let dep = &cells[d];
+        let dep_backend = resolve_agent_selection(&dep.agent, dep.cwd.as_deref().unwrap_or("."))
+            .map(|s| s.backend)
+            .unwrap_or_else(|_| dep.agent.clone());
+        if let Some(reason) = sharing_blocked_reason(
+            current_backend,
+            row.model.as_deref(),
+            &dep_backend,
+            dep.model.as_deref(),
+        ) {
+            blocked_reason = Some(reason);
+            continue;
+        }
+        return SessionShare::Resume {
+            session_id,
+            from_cell: dep.cell_id.clone(),
+            from_task: dep.task_name.clone(),
+        };
+    }
+    if let Some(reason) = blocked_reason {
+        SessionShare::Skip { reason }
+    } else {
+        SessionShare::None
+    }
+}
+
 /// A dependency-free counting semaphore that bounds how many cells execute
 /// at once. One instance is shared across every squad's worker threads, so the
 /// concurrency cap is *global and task-level* — independent tasks (across one
@@ -1338,6 +1454,36 @@ fn run_cell_worker(
     let mut merged_profile_env = selection.env;
     merged_profile_env.extend(spec.env_overrides.clone());
     spec.env_overrides = merged_profile_env;
+
+    // RAL-248: continue from a completed dependency's agent session when safe
+    // (cross-cell session sharing), so this cell resumes with the context the
+    // prior cell already built instead of re-reading files from scratch.
+    // Start fresh otherwise, logging why (model mismatch / no session to resume).
+    match resolve_shared_session_id(store, squad_id, row, cells, plan, i, &selection.backend) {
+        SessionShare::Resume {
+            session_id,
+            from_cell,
+            from_task,
+        } => {
+            crate::rlog!(
+                INFO,
+                "ralphus [scheduler] cell {squad_id}/{} resuming agent session {} from {}/{}",
+                row.cell_id,
+                session_id,
+                from_task,
+                from_cell,
+            );
+            spec.resume_agent_session_id = Some(session_id);
+        }
+        SessionShare::Skip { reason } => {
+            crate::rlog!(
+                INFO,
+                "ralphus [scheduler] cell {squad_id}/{} NOT sharing agent session (fresh cell): {reason}",
+                row.cell_id,
+            );
+        }
+        SessionShare::None => {}
+    }
     {
         let guard = store.lock().expect("store mutex poisoned");
         let _ = guard.set_cell_effective_system_prompt(
@@ -5183,5 +5329,139 @@ mod tests {
             store.lock().unwrap().squad_state(&id).unwrap(),
             SquadState::Done
         );
+    }
+
+    // ── RAL-248 cross-cell session sharing ────────────────────────────────
+
+    #[test]
+    fn sharing_blocked_reason_guards_only_claude_code_model_mismatch() {
+        // Matching models (both explicit, both None/default) → share.
+        assert_eq!(
+            sharing_blocked_reason("claude-code", Some("a"), "claude-code", Some("a")),
+            None
+        );
+        assert_eq!(
+            sharing_blocked_reason("claude-code", None, "claude-code", None),
+            None
+        );
+        // Two claude-code cells on different models → block.
+        assert!(
+            sharing_blocked_reason("claude-code", Some("a"), "claude-code", Some("b")).is_some()
+        );
+        // One side not claude-code → never blocked, regardless of models.
+        assert_eq!(
+            sharing_blocked_reason("claude", Some("a"), "claude-code", Some("b")),
+            None
+        );
+        assert_eq!(
+            sharing_blocked_reason("claude-code", Some("a"), "codex", Some("b")),
+            None
+        );
+        assert_eq!(
+            sharing_blocked_reason("claude", None, "codex", Some("b")),
+            None
+        );
+    }
+
+    /// One `(cell_id, resume_seen)` record per cell launch.
+    type SessionShareSeen = Vec<(String, Option<String>)>;
+
+    /// RAL-248 test runner: records the `resume_agent_session_id` each cell
+    /// saw at launch, and returns a fixed session id for the named `provider`
+    /// cell so a dependent cell has something to resume.
+    struct SessionShareRunner {
+        provider: String,
+        session_id: String,
+        seen: Arc<Mutex<SessionShareSeen>>,
+    }
+
+    impl Runner for SessionShareRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((spec.cell_id.clone(), spec.resume_agent_session_id.clone()));
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 2,
+                cost_usd: 0.5,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: if spec.cell_id == self.provider {
+                    Some(self.session_id.clone())
+                } else {
+                    None
+                },
+                ghost: None,
+            }
+        }
+    }
+
+    fn session_share_recorded(seen: &Arc<Mutex<SessionShareSeen>>, cell: &str) -> Option<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|(c, _)| c == cell)
+            .and_then(|(_, r)| r.clone())
+    }
+
+    #[test]
+    fn cell_resumes_a_completed_dependency_session() {
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
+            [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = SessionShareRunner {
+            provider: "provider".into(),
+            session_id: "sess-1".into(),
+            seen: Arc::clone(&seen),
+        };
+        execute_squad(&store, &runner, &id);
+        // The consumer resumes its completed dependency's session; the
+        // provider itself (no dependency) starts fresh.
+        assert_eq!(
+            session_share_recorded(&seen, "consumer"),
+            Some("sess-1".to_string())
+        );
+        assert_eq!(session_share_recorded(&seen, "provider"), None);
+    }
+
+    #[test]
+    fn claude_code_model_mismatch_starts_fresh() {
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
+            [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-opus-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = SessionShareRunner {
+            provider: "provider".into(),
+            session_id: "sess-1".into(),
+            seen: Arc::clone(&seen),
+        };
+        execute_squad(&store, &runner, &id);
+        // Different claude-code models → the session must NOT be shared and
+        // the consumer starts fresh.
+        assert_eq!(session_share_recorded(&seen, "consumer"), None);
+    }
+
+    #[test]
+    fn dependency_without_a_session_id_means_fresh_cell() {
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
+            [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // `provider` is never produced, so no cell returns a session id and
+        // the consumer has nothing to resume → fresh.
+        let runner = SessionShareRunner {
+            provider: "never".into(),
+            session_id: "sess-1".into(),
+            seen: Arc::clone(&seen),
+        };
+        execute_squad(&store, &runner, &id);
+        assert_eq!(session_share_recorded(&seen, "consumer"), None);
     }
 }

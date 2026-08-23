@@ -2,7 +2,7 @@
 //
 // The bug this file exists for: opening "Show Live View" on a proof step,
 // restarting that proof step, and coming back found the box still showing the
-// stale "Historical record (read-only) — session ended" log. Only navigating
+// stale "Historical record (read-only) — cell ended" log. Only navigating
 // to another node and back fixed it.
 //
 // The client-side half of that was an asymmetry — a `live -> ended` flip
@@ -74,7 +74,7 @@ test("a single inactive poll is absorbed as a transient miss, keeping the last c
   assert.equal(headerChanged, false);
 });
 
-test("reaching the strike limit confirms the session ended and asks for a re-render", () => {
+test("reaching the strike limit confirms the cell ended and asks for a re-render", () => {
   const started = nextPeekPaneState(FRESH, live("working…\n"), PEEK_MISSING_STRIKE_LIMIT).state;
   const ticks = poll(started, Array(PEEK_MISSING_STRIKE_LIMIT).fill(gone("final output\n")));
   const last = ticks[ticks.length - 1];
@@ -85,11 +85,11 @@ test("reaching the strike limit confirms the session ended and asks for a re-ren
   assert.equal(last.headerChanged, true, "live -> ended must force the banner/dot to re-render");
 });
 
-test("an ended session that never produced output says so explicitly", () => {
+test("an ended cell that never produced output says so explicitly", () => {
   const ticks = poll(FRESH, Array(PEEK_MISSING_STRIKE_LIMIT).fill({ active: false, content: "   \n" }));
   const last = ticks[ticks.length - 1];
   assert.equal(last.state.ended, true);
-  assert.equal(last.state.text, "Terminal session has ended. No output was recorded before it ended.");
+  assert.equal(last.state.text, "Terminal cell has ended. No output was recorded before it ended.");
 });
 
 test("staying ended does not keep asking for re-renders", () => {

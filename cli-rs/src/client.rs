@@ -895,6 +895,7 @@ impl DaemonClient {
             "proof_skip_auto_clean",
             settings.proof_skip_auto_clean,
         );
+        set_if_some(&mut body, "skip_base_updates", settings.skip_base_updates);
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -1025,6 +1026,12 @@ impl DaemonClient {
         )
     }
 
+    /// Stop an in-progress rebase at its next checkpoint, leaving the review in
+    /// the recoverable `merge_stopped` state (RAL-249), distinct from cancel.
+    pub fn guardian_stop(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/guardians/{guardian_id}/stop"), None)
+    }
+
     pub fn guardian_approve(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/guardians/{guardian_id}/approve"), None)
     }
@@ -1141,6 +1148,8 @@ pub struct GuardianSettings<'a> {
     pub auto_pr_feedback: Option<bool>,
     pub proof_scope: Option<&'a str>,
     pub proof_skip_auto_clean: Option<bool>,
+    /// RAL-250: whether this review skips automatic base-branch auto-updates.
+    pub skip_base_updates: Option<bool>,
 }
 
 #[cfg(test)]

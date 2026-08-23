@@ -113,7 +113,21 @@ fn write_attempt_in(
         );
         return;
     }
-    let truncated = crate::runner::tail_lines(content, max_lines);
+    // RAL-264: scrub resolved `from_env` secret values out of the transcript
+    // before persisting it — the pane can legitimately show the agent's own
+    // `$env:... = 'sk-or-v1-...'` assignment, and a durable per-attempt log is
+    // exactly the artifact RAL-264 must keep secrets out of. This is a deliberate
+    // lossiness: after scrubbing, the original pane text is unrecoverable from
+    // this file for debugging — an accepted tradeoff, revisitable if a future
+    // need for verbatim transcripts outweighs the credential-exposure risk.
+    //
+    // RAL-247: additionally scrub credential env-var values by pattern, so a
+    // secret value that was never registered (e.g. sourced from the raw
+    // process environment rather than a resolved agent-profile `from_env`)
+    // is still caught before the pane text ever hits disk.
+    let content = crate::redact::redact_all(content);
+    let redacted = ralphus_core::redact::redact_secrets(&content);
+    let truncated = crate::runner::tail_lines(&redacted, max_lines);
     let header = format!(
         "=== ralphus terminal log -- session={session_name} attempt={attempt} written={} ===\n",
         chrono::Utc::now().to_rfc3339()
@@ -171,7 +185,11 @@ pub fn read_attempt(session_name: &str, attempt: u32) -> Option<String> {
 }
 
 fn read_attempt_in(root: &std::path::Path, session_name: &str, attempt: u32) -> Option<String> {
-    std::fs::read_to_string(attempt_path_in(root, session_name, attempt)).ok()
+    // RAL-247: redact on read too — an attempt file written before this fix
+    // (or by a version without it) may already carry a secret value on disk.
+    std::fs::read_to_string(attempt_path_in(root, session_name, attempt))
+        .ok()
+        .map(|s| ralphus_core::redact::redact_secrets(&s).into_owned())
 }
 
 /// Delete every persisted attempt for one session outright.
@@ -374,6 +392,46 @@ mod tests {
         let content = read_attempt_in(&root.0, "sess-a", 0).unwrap();
         assert!(content.contains("fresher content"));
         assert!(!content.contains("stale content"));
+    }
+
+    #[test]
+    fn write_redacts_secret_env_values_from_persisted_content() {
+        // RAL-247: the durable terminal-log *file* on disk must never contain
+        // a credential env-var value, even when the pane capture did.
+        let root = TempRoot::new("write-redacts-secret");
+        let secret = "sk-ant-leak-guard";
+        let content =
+            format!("$env:ANTHROPIC_AUTH_TOKEN = '{secret}'; & 'runner' x\nrest of output");
+        write_attempt_in(&root.0, "sess-a", 0, &content, 100);
+        let disk = std::fs::read_to_string(attempt_path_in(&root.0, "sess-a", 0))
+            .expect("attempt written");
+        assert!(
+            !disk.contains(secret),
+            "credential value leaked into the persisted terminal-log file: {disk}"
+        );
+        assert!(disk.contains("[REDACTED]"), "{disk}");
+        assert!(
+            disk.contains("rest of output"),
+            "non-secret content must be preserved: {disk}"
+        );
+    }
+
+    #[test]
+    fn read_redacts_secret_values_from_a_legacy_file() {
+        // RAL-247: a file written before this fix (or by a version without
+        // it) may already carry a secret value on disk — the read path must
+        // scrub it defensively too.
+        let root = TempRoot::new("read-redacts-legacy");
+        let secret = "sk-legacy-leak";
+        let path = attempt_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("$env:ANTHROPIC_API_KEY = '{secret}'")).unwrap();
+        let content = read_attempt_in(&root.0, "sess-a", 0).expect("legacy file readable");
+        assert!(
+            !content.contains(secret),
+            "credential value leaked from a legacy file: {content}"
+        );
+        assert!(content.contains("[REDACTED]"), "{content}");
     }
 
     #[test]

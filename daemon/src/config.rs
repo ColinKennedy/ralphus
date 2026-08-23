@@ -72,6 +72,14 @@ pub struct ReviewConfig {
     /// per-project scalars win over the global layer, same as `skip_worktrees`.
     #[serde(default)]
     pub default_resolver_agent: Option<String>,
+    /// RAL-250: whether a review opts out of the automatic base-branch
+    /// auto-update rebuild (`review_maintenance`'s base-shift pass in
+    /// `guardian_merge.rs`). `None` means unset, which resolves to `false`
+    /// (auto-update stays on); per-project scalars win over the global layer,
+    /// same as `skip_worktrees`. A per-review override (see
+    /// `Guardian::skip_base_updates` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub skip_base_updates: Option<bool>,
 }
 
 impl ReviewConfig {
@@ -120,6 +128,13 @@ impl ReviewConfig {
         self.default_resolver_agent.as_deref().unwrap_or("ollama")
     }
 
+    /// Whether a review opts out of the automatic base-branch auto-update
+    /// rebuild (unset resolves to `false`, i.e. auto-update stays on). RAL-250.
+    #[must_use]
+    pub fn skip_base_updates(&self) -> bool {
+        self.skip_base_updates.unwrap_or(false)
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -139,6 +154,7 @@ impl ReviewConfig {
             verify_scope: over.verify_scope.or(self.verify_scope),
             verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
+            skip_base_updates: over.skip_base_updates.or(self.skip_base_updates),
         }
     }
 }
@@ -574,9 +590,11 @@ impl EnvOverridesConfig {
 /// Whether `key` is a syntactically valid environment-variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`) — required for a RAL-150 env override key.
 /// Enforced at the API boundary ([`crate::server`]'s env-override handler)
-/// so an override key can never smuggle shell metacharacters into the
-/// env-assignment prefix [`crate::tmux::build_command_line_with_env`] embeds
-/// ahead of a tmux-wrapped runner invocation.
+/// so an override key is always a clean identifier everywhere it's used —
+/// the env-assignment prefix [`crate::tmux::build_command_line_with_env`]
+/// embeds for the POSIX `respawn-pane` path, and the `-e KEY=value` flag
+/// [`crate::tmux::new_detached_session_with_command`] passes to `new-session`
+/// on Windows.
 #[must_use]
 pub fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
@@ -590,17 +608,14 @@ pub fn is_valid_env_key(key: &str) -> bool {
 /// Whether `value` is free of control characters (`\n`, `\r`, ESC, NUL, tabs,
 /// ...) -- required for a RAL-227 env override value. Enforced at the same
 /// API boundary as [`is_valid_env_key`] (`crate::server`'s env-override
-/// handlers) so key and value get consistent, co-located validation, rather
-/// than a second check living deep inside
-/// [`crate::tmux::build_command_line_with_env`] that could drift out of
-/// sync. On Windows, a session's launch command is delivered via `send-keys`
-/// typed keystroke-by-keystroke into an already-running interactive pane
-/// (not parsed once as a complete string like the POSIX `respawn-pane`
-/// path) -- an embedded literal `\n` would act like pressing Enter
-/// mid-command, submitting a truncated command early with the remainder
-/// typed in as a second, independently-interpreted command. Values legitimately
-/// carry arbitrary content (API keys, config values), so this rejects only
-/// control characters, not general content.
+/// handlers) so key and value get consistent, co-located validation. On
+/// Windows (RAL-247) an override is delivered as an environment variable via
+/// `new-session -e`, so a `\n` no longer splits the launch `send-keys` line —
+/// but a literal control character in an env value is still bad hygiene
+/// (it renders as terminal noise and is masked-broken by the generic
+/// redactor), so it stays rejected up front. Values legitimately carry
+/// arbitrary content (API keys, config values), so this rejects only control
+/// characters, not general content.
 #[must_use]
 pub fn is_valid_env_value(value: &str) -> bool {
     !value.chars().any(|c| c.is_control())
@@ -794,6 +809,29 @@ pub fn resolve(cwd: &Path) -> ReviewConfig {
         .map(|p| load_file(&p))
         .unwrap_or_default();
     global.merge(project)
+}
+
+/// The global review config only (no per-project layer). RAL-250 uses this at
+/// project-registration time to stamp the *current* global `skip_base_updates`
+/// value into a newly-created project, so a later global change does not
+/// retroactively flip that project (see `Store::register_project`).
+#[must_use]
+pub fn global_review_config() -> ReviewConfig {
+    global_config_path()
+        .map(|p| load_file(&p))
+        .unwrap_or_default()
+}
+
+/// The nearest per-project `.ralphus.toml [review]` config only -- **without**
+/// the global layer. RAL-250's layering reads this raw value (rather than the
+/// merged [`resolve`]) so an explicitly-set project default can be told apart
+/// from one inherited from the global config: an explicit project value wins
+/// over both the project's creation-time stamp and the live global value.
+#[must_use]
+pub fn project_review_config(cwd: &Path) -> ReviewConfig {
+    find_project_config(cwd)
+        .map(|p| load_file(&p))
+        .unwrap_or_default()
 }
 
 /// Parse a `ForgeConfig` from the given TOML text.
@@ -1540,6 +1578,43 @@ mod tests {
         assert!(!is_valid_env_key("HAS=EQUALS"));
         assert!(!is_valid_env_key("HAS;SEMI"));
         assert!(!is_valid_env_key("$(injected)"));
+    }
+
+    // ── skip_base_updates (RAL-250) ───────────────────────────────────────
+
+    #[test]
+    fn skip_base_updates_defaults_to_false_when_unset() {
+        assert!(!ReviewConfig::default().skip_base_updates());
+        assert!(!from_toml_str("[review]\nskip_worktrees = true\n").skip_base_updates());
+    }
+
+    #[test]
+    fn skip_base_updates_parses_explicit_true() {
+        let c = from_toml_str("[review]\nskip_base_updates = true\n");
+        assert_eq!(c.skip_base_updates, Some(true));
+        assert!(c.skip_base_updates());
+    }
+
+    #[test]
+    fn skip_base_updates_parses_explicit_false() {
+        let c = from_toml_str("[review]\nskip_base_updates = false\n");
+        assert_eq!(c.skip_base_updates, Some(false));
+        assert!(!c.skip_base_updates());
+    }
+
+    #[test]
+    fn merge_skip_base_updates_project_wins() {
+        let global = ReviewConfig {
+            skip_base_updates: Some(true),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            skip_base_updates: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(!global.clone().merge(project).skip_base_updates());
+        // Project unset falls back to the global value.
+        assert!(global.merge(ReviewConfig::default()).skip_base_updates());
     }
 
     #[test]
