@@ -7076,6 +7076,26 @@ struct ChangeBaseBody {
     branch: String,
 }
 
+#[derive(Serialize)]
+struct ChangeBaseAction {
+    label: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct ChangeBaseStatus {
+    status: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<ChangeBaseAction>,
+}
+
+#[derive(Serialize)]
+struct ChangeBaseReply {
+    guardian: crate::guardian::GuardianView,
+    base_change: ChangeBaseStatus,
+}
+
 /// Change the base branch of a review and trigger a rebuild. Guards against
 /// `approved`/`deployed` status; all other states are permitted.
 fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
@@ -7103,21 +7123,106 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return store_error(&e);
     }
     let has_branches = !guardian.branches.is_empty();
+    let was_merging = guardian.status == "merging";
     drop(store);
+    let updated_guardian = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
     if !has_branches {
-        return match daemon.lock().get_guardian(id) {
-            Ok(g) => json(200, &g),
-            Err(e) => store_error(&e),
-        };
+        return json(
+            200,
+            &ChangeBaseReply {
+                guardian: updated_guardian,
+                base_change: ChangeBaseStatus {
+                    status: "saved".to_string(),
+                    message: format!("Base branch saved as '{branch}'."),
+                    action: None,
+                },
+            },
+        );
+    }
+    if was_merging {
+        return json(
+            200,
+            &ChangeBaseReply {
+                guardian: updated_guardian,
+                base_change: ChangeBaseStatus {
+                    status: "rebase_in_progress".to_string(),
+                    message: "You changed the base but there's a rebase in progress. We'll trigger a new rebase once this one completes.".to_string(),
+                    action: Some(ChangeBaseAction {
+                        label: "Stop and restart now".to_string(),
+                        url: format!("/api/guardians/{id}/cancel_and_merge"),
+                    }),
+                },
+            },
+        );
     }
     let runner = guardian_agent_runner(daemon);
-    crate::guardian_merge::start_merge(
+    let outcome = crate::guardian_merge::kickoff_merge(
         daemon.store_handle(),
         runner,
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
-    )
+    );
+    match outcome {
+        Ok(crate::guardian_merge::StartMergeOutcome::Merging) => json(
+            202,
+            &ChangeBaseReply {
+                guardian: updated_guardian,
+                base_change: ChangeBaseStatus {
+                    status: "merging".to_string(),
+                    message: format!("Base branch saved as '{branch}' and the rebase restarted."),
+                    action: None,
+                },
+            },
+        ),
+        Ok(crate::guardian_merge::StartMergeOutcome::Deferred) => json(
+            200,
+            &ChangeBaseReply {
+                guardian: updated_guardian,
+                base_change: ChangeBaseStatus {
+                    status: "deferred".to_string(),
+                    message: format!(
+                        "We will use '{branch}' once the branches are ready to merge."
+                    ),
+                    action: None,
+                },
+            },
+        ),
+        Ok(crate::guardian_merge::StartMergeOutcome::AlreadyInProgress) => json(
+            200,
+            &ChangeBaseReply {
+                guardian: updated_guardian,
+                base_change: ChangeBaseStatus {
+                    status: "rebase_in_progress".to_string(),
+                    message: "You changed the base but there's a rebase in progress. We'll trigger a new rebase once this one completes.".to_string(),
+                    action: Some(ChangeBaseAction {
+                        label: "Stop and restart now".to_string(),
+                        url: format!("/api/guardians/{id}/cancel_and_merge"),
+                    }),
+                },
+            },
+        ),
+        Err(crate::guardian_merge::StartMergeError::NotFound(message)) => {
+            error(404, "not_found", &message, vec![])
+        }
+        Err(crate::guardian_merge::StartMergeError::NoBranches) => json(
+            200,
+            &ChangeBaseReply {
+                guardian: updated_guardian,
+                base_change: ChangeBaseStatus {
+                    status: "saved".to_string(),
+                    message: format!("Base branch saved as '{branch}'."),
+                    action: None,
+                },
+            },
+        ),
+        Err(crate::guardian_merge::StartMergeError::Store(message)) => {
+            error(500, "store_error", &message, vec![])
+        }
+    }
 }
 
 /// Force-start a collecting review (RAL-69): disable all enabled branches whose
@@ -7933,6 +8038,27 @@ mod tests {
 
     fn submit_body(toml: &str) -> String {
         serde_json::to_string(&serde_json::json!({ "toml": toml })).unwrap()
+    }
+
+    /// Isolate this test's terminal-log storage (see
+    /// `crate::terminal_log::set_test_root`). Every test that writes, reads, or
+    /// deletes terminal logs -- or deletes a squad/guardian, which wipes the
+    /// `ralphus_*_` log prefix -- runs against its own temp directory so
+    /// parallel tests can't race on the shared `~/.ralphus/terminal_logs`
+    /// namespace (e.g. a squad-delete test deleting `ralphus_squad-..._*` out
+    /// from under the terminal-log reader mid-run).
+    fn isolated_terminal_root() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-server-tlog-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create isolated terminal-log root");
+        crate::terminal_log::set_test_root(dir.clone());
+        dir
     }
 
     // -----------------------------------------------------------------------
@@ -10156,6 +10282,7 @@ machine=\"incredibuild:B\"
     #[test]
     fn delete_squad_route() {
         let d = daemon();
+        let _troot = isolated_terminal_root();
         route(&d, "POST", "/api/squads", &submit_body(GOOD));
         let del = route(&d, "DELETE", "/api/squads/squad-000000000001", "");
         assert_eq!(del.status, 200);
@@ -10176,6 +10303,7 @@ machine=\"incredibuild:B\"
     #[test]
     fn cell_terminal_log_attempts_route_lists_and_reads_attempts() {
         let d = daemon();
+        let _troot = isolated_terminal_root();
         route(&d, "POST", "/api/squads", &submit_body(GOOD));
         let squad_id = "squad-000000000001";
 
@@ -10248,6 +10376,7 @@ machine=\"incredibuild:B\"
     #[test]
     fn deleting_a_squad_deletes_its_terminal_logs() {
         let d = daemon();
+        let _troot = isolated_terminal_root();
         route(&d, "POST", "/api/squads", &submit_body(GOOD));
         let squad_id = "squad-000000000001";
         let task = d.lock().get_task_name(squad_id, 0).unwrap();
@@ -11963,6 +12092,7 @@ command = "true"
     #[test]
     fn deleting_a_guardian_deletes_its_terminal_logs() {
         let d = daemon();
+        let _troot = isolated_terminal_root();
         let body =
             serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);

@@ -391,6 +391,13 @@ pub struct BranchView {
     /// this branch's own overrides are applied. Lets the board show which keys
     /// are inherited, overridden, or tombstoned without recomputing the merge.
     pub inherited_env: BTreeMap<String, String>,
+    /// RAL-259: when this branch's conflict-resolver agent (fix pass or
+    /// final-proof call) most recently began running — the Review Live View's
+    /// "started" timestamp (epoch ms). `None` until a resolver session
+    /// actually starts, or for a branch that never needed one. Cleared and
+    /// re-stamped per merge attempt (mirrors cell `started_at_ms`, RAL-210);
+    /// persists after the resolver finishes so completed reviews still show it.
+    pub started_at_ms: Option<i64>,
 }
 
 /// One message in a guardian's global feedback thread (RAL-22).
@@ -625,6 +632,12 @@ pub struct GuardianView {
     /// [`Self::attempt_tokens_out`]/[`Self::attempt_cost_usd`] are scoped to
     /// this attempt.
     pub merge_attempt: i64,
+    /// RAL-259: when this review's manual-checks generation agent most
+    /// recently began work (epoch ms), for the manual-checks Live View panel's
+    /// "started" timestamp. `None` until generation starts. Persists after
+    /// generation finishes so a completed generation still shows it; re-stamped
+    /// fresh on every regeneration.
+    pub manual_checks_started_at_ms: Option<i64>,
     /// RAL-193: input tokens spent on this review's own conflict-resolution
     /// and prover agent calls during the current merge attempt only --
     /// excludes the tasks/cells that fed into the review.
@@ -1016,6 +1029,31 @@ impl Store {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(ids)
+    }
+
+    /// Names of `guardian_id`'s enabled branches whose linked cell(s)
+    /// (`cells.review_branch = guardian_branches.branch`) are not all `done`
+    /// yet -- i.e. branches a merge started right now would run ahead of,
+    /// because they're still waiting on their upstream Cell (RAL-255).
+    /// Mirrors [`Self::collecting_guardians_ready`]'s own `NOT EXISTS`
+    /// clause but as a single-guardian query callable from
+    /// [`crate::guardian_merge::start_merge`] itself, so every caller is
+    /// protected, not just the ones that already route through
+    /// `collecting_guardians_ready`.
+    ///
+    /// A branch with no linked cell at all (e.g. manually added, never
+    /// wired to a task) never appears here -- there's nothing to wait for.
+    pub fn guardian_unfinished_linked_branches(&self, guardian_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT gb.branch FROM guardian_branches gb
+             JOIN cells s ON s.review_branch = gb.branch
+             WHERE gb.guardian_id = ?1 AND gb.enabled = 1 AND s.state != 'done'
+             ORDER BY gb.branch",
+        )?;
+        let branches = stmt
+            .query_map(params![guardian_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(branches)
     }
 
     /// Ids of guardians that have already left `collecting` (`in_review` or
@@ -2176,6 +2214,46 @@ impl Store {
         Ok(())
     }
 
+    /// RAL-259: reset a branch's `started_at_ms`, marking the start of a fresh
+    /// merge attempt. Called at the entry of each per-branch resolution pass
+    /// (`guardian_merge::drive_rebase`) so a re-merge/re-restart re-stamps from
+    /// scratch via [`Self::stamp_branch_started_at`]'s COALESCE — mirrors the
+    /// cell `started_at_ms` clear-on-restart pattern (RAL-210). Leaves the value
+    /// NULL (not stamped) for a branch that never invokes a resolver agent.
+    pub fn clear_branch_started_at(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET started_at_ms=NULL WHERE guardian_id=? AND id=?",
+            params![guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-259: stamp a branch's `started_at_ms` once, when its resolver agent
+    /// actually begins running. `COALESCE` keeps the first stamp within the
+    /// current attempt (the conflict-resolver fix pass) if a later call in the
+    /// same attempt (the final-proof call) also fires — see
+    /// [`Self::clear_branch_started_at`] for the matching reset.
+    pub fn stamp_branch_started_at(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET started_at_ms=COALESCE(started_at_ms, ?)
+             WHERE guardian_id=? AND id=?",
+            params![crate::store::now_ms(), guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-259: stamp when this review's manual-checks generation agent began
+    /// work. Unlike the per-branch resolver stamp this is a plain overwrite
+    /// (the *most recent* generation's start), matching the manual-checks Live
+    /// View's need to show the current/latest generation rather than the first.
+    pub fn stamp_guardian_manual_checks_started_at(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET manual_checks_started_at_ms=? WHERE id=?",
+            params![crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
     /// Reorder a guardian's branches to match `order` (a permutation of the
     /// existing branch names). Positions are first shifted out of range to avoid
     /// colliding with the `(guardian_id, position)` primary key, then rewritten.
@@ -2636,7 +2714,7 @@ impl Store {
                     s.idx AS source_cell_idx,
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
                     gb.is_empty, s.machine AS source_cell_machine,
-                    gb.env_overrides
+                    gb.env_overrides, gb.started_at_ms
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -2696,6 +2774,7 @@ impl Store {
                     env_overrides: branch_env_from_json(&r.get::<_, String>(21)?),
                     resolved_env: BTreeMap::new(),
                     inherited_env: BTreeMap::new(),
+                    started_at_ms: r.get(22)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2940,6 +3019,7 @@ impl Store {
             manual_checks_env,
             maximum_budget_usd: row.maximum_budget_usd,
             merge_attempt: row.merge_attempt,
+            manual_checks_started_at_ms: row.manual_checks_started_at_ms,
             attempt_tokens_in,
             attempt_tokens_out,
             attempt_cost_usd,
@@ -3219,6 +3299,8 @@ struct GuardianRow {
     maximum_budget_usd: Option<f64>,
     /// RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
     merge_attempt: i64,
+    /// RAL-259: when the manual-checks generation agent most recently began work.
+    manual_checks_started_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
@@ -3336,6 +3418,7 @@ mod tests {
             env_overrides: BTreeMap::new(),
             resolved_env: BTreeMap::new(),
             inherited_env: BTreeMap::new(),
+            started_at_ms: None,
         }
     }
 

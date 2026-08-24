@@ -16,8 +16,10 @@ use ralphus_daemon::guardian_merge::{
     rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_chat, run_feedback,
     run_merge, run_merge_staged, start_merge, stop_guardian_merge,
 };
+use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
+use ralphus_daemon::server::{Daemon, route};
 use ralphus_daemon::store::{NodeState, Store};
 use ralphus_daemon::workspace::Workspace;
 
@@ -222,6 +224,56 @@ fn init_repo(root: &Path) {
     git(root, &["init", "-b", "main"]);
 }
 
+fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String) {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    let wt_a = root.join("wt-a");
+    let wt_b = root.join("wt-b");
+    git(
+        &root,
+        &["worktree", "add", "-b", "feature/a", wt_a.to_str().unwrap()],
+    );
+    git(
+        &root,
+        &["worktree", "add", "-b", "feature/b", wt_b.to_str().unwrap()],
+    );
+    git(&wt_a, &["branch", "--set-upstream-to=main"]);
+    git(&wt_b, &["branch", "--set-upstream-to=main"]);
+    write(&wt_a, "a.txt", "from a\n");
+    git(&wt_a, &["add", "."]);
+    git(&wt_a, &["commit", "-m", "add a"]);
+    write(&wt_b, "b.txt", "from b\n");
+    git(&wt_b, &["add", "."]);
+    git(&wt_b, &["commit", "-m", "add b"]);
+
+    let cwd_a = wt_a.to_string_lossy().replace('\\', "/");
+    let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
+    let toml = format!(
+        "[[task]]\nname=\"a\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[review]]\nid=\"rev\"\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let gid = derive_reviews(store, &run_id, &file).unwrap()[0].clone();
+    store
+        .set_cell_state(&run_id, 0, 0, NodeState::Done)
+        .unwrap();
+    store.mark_ready_branches_with_done_cells(&gid).unwrap();
+
+    let guardian = store.get_guardian(&gid).unwrap();
+    assert_eq!(guardian.status, "collecting");
+    assert_eq!(guardian.branches[0].merge_status, "ready");
+    assert_eq!(guardian.branches[1].merge_status, "pending");
+    (root, gid)
+}
+
 #[test]
 fn builds_review_branch_from_two_features() {
     let root = temp_repo();
@@ -262,6 +314,70 @@ fn builds_review_branch_from_two_features() {
 
     let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
     assert!(files.contains("base.txt") && files.contains("a.txt") && files.contains("b.txt"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn start_merge_defers_while_an_enabled_branch_is_still_pending() {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let (root, gid) = {
+        let mut guard = store.lock().unwrap();
+        setup_review_with_pending_last_branch(&mut guard)
+    };
+
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &gid,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 202, "body={}", reply.body);
+    assert!(
+        reply.body.contains("\"status\":\"deferred\""),
+        "body={}",
+        reply.body
+    );
+
+    let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert_eq!(guardian.status, "collecting");
+    assert_eq!(guardian.base_branch, "main");
+    assert_eq!(guardian.branches[0].merge_status, "ready");
+    assert_eq!(guardian.branches[1].merge_status, "pending");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn change_base_route_records_base_but_defers_merge_while_last_branch_is_pending() {
+    let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
+    let store = daemon.store_handle();
+    let (root, gid) = {
+        let mut guard = store.lock().unwrap();
+        setup_review_with_pending_last_branch(&mut guard)
+    };
+
+    let reply = route(
+        &daemon,
+        "POST",
+        &format!("/api/guardians/{gid}/base"),
+        &serde_json::json!({ "branch": "release/2026" }).to_string(),
+    );
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["guardian"]["base_branch"], "release/2026");
+    assert_eq!(body["base_change"]["status"], "deferred");
+    assert_eq!(
+        body["base_change"]["message"],
+        "We will use 'release/2026' once the branches are ready to merge."
+    );
+
+    let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert_eq!(guardian.status, "collecting");
+    assert_eq!(guardian.base_branch, "release/2026");
+    assert_eq!(guardian.branches[0].merge_status, "ready");
+    assert_eq!(guardian.branches[1].merge_status, "pending");
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -12,7 +12,12 @@
 //! cwd with none, and [`ensure_worktree`] always applies it via
 //! `git branch --set-upstream-to`, so a freshly materialized branch's
 //! tracking target is always the author's explicit choice, never a guess
-//! from whatever `HEAD` happened to be at materialization time.
+//! from whatever `HEAD` happened to be at materialization time. Two reserved
+//! `?upstream=<<...>>` sentinels (RAL-258) let the author defer that choice:
+//! `<<default>>` (the repository's default branch, recommended) and
+//! `<<current_branch>>` (whatever branch the project currently has checked
+//! out). [`resolve_placeholders`] expands these against the project root via
+//! [`resolve_upstream`] before materialization.
 //! [`resolve_placeholders`] resolves every placeholder among a squad's cells
 //! exactly once (memoized by the literal placeholder string, so the same
 //! value repeated across cells/tasks only materializes one worktree),
@@ -184,6 +189,101 @@ fn validate_branch_name(root: &Path, branch: &str) -> Result<(), String> {
     git(root, &["check-ref-format", "--branch", branch]).map(|_| ())
 }
 
+/// Resolve a placeholder cell `cwd`'s `?upstream=` value against the project
+/// `root` (RAL-258). The two reserved `<<...>>` sentinels are expanded to a
+/// concrete branch by querying live git state in `root`; any literal branch
+/// name or `<remote>/<branch>` value is passed through unchanged.
+///
+/// `<<default>>` becomes the repository's default branch (the branch the
+/// `origin` remote's HEAD symref points at); `<<current_branch>>` becomes
+/// whatever branch `root` currently has checked out. Lookup failures are hard
+/// errors — ralphus never guesses `main`/`master`, consistent with RAL-100's
+/// no-guessing intent for `?upstream=`. Any other `<<...>>` value (a typo, or
+/// an unsupported sentinel) is also rejected here, defense-in-depth on top of
+/// the submit-time check in `ralphus_core::validate`.
+fn resolve_upstream(root: &Path, upstream: &str) -> Result<String, String> {
+    use ralphus_core::schema::{WORKTREE_UPSTREAM_CURRENT_BRANCH, WORKTREE_UPSTREAM_DEFAULT};
+    match upstream {
+        WORKTREE_UPSTREAM_DEFAULT => default_branch(root),
+        WORKTREE_UPSTREAM_CURRENT_BRANCH => current_checked_out_branch(root),
+        other if other.starts_with("<<") => Err(format!(
+            "\"?upstream={other}\" is not a supported sentinel; use \"{WORKTREE_UPSTREAM_DEFAULT}\" \
+             or \"{WORKTREE_UPSTREAM_CURRENT_BRANCH}\", or a literal branch name"
+        )),
+        other => Ok(other.to_string()),
+    }
+}
+
+/// The repository's default branch for `root`: the branch the `origin`
+/// remote's `HEAD` symbolic ref points at (the ref `git clone` sets on first
+/// clone). Prefers the conventional `origin` remote, then falls back to any
+/// other configured remote's `HEAD`, so a repo whose origin is named
+/// differently still resolves rather than failing on a naming accident.
+///
+/// On lookup failure — no remote at all, or no remote `HEAD` symref (a repo
+/// never cloned or fetched with its HEAD resolved) — this FAILS with a clear
+/// error rather than guessing `main`/`master`, consistent with RAL-100's
+/// no-guessing intent.
+fn default_branch(root: &Path) -> Result<String, String> {
+    let mut candidates = vec!["origin".to_string()];
+    if let Ok(remotes) = git(root, &["remote"]) {
+        let mut rest: Vec<String> = remotes
+            .lines()
+            .map(str::trim)
+            .filter(|r| !r.is_empty() && *r != "origin")
+            .map(str::to_string)
+            .collect();
+        rest.sort();
+        candidates.extend(rest);
+    }
+    for remote in &candidates {
+        let symref = format!("refs/remotes/{remote}/HEAD");
+        let Ok(out) = git(root, &["symbolic-ref", &symref]) else {
+            continue;
+        };
+        let refname = out.trim();
+        // `refs/remotes/<remote>/<branch>` → the bare `<branch>`.
+        let branch = refname
+            .strip_prefix("refs/remotes/")
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, b)| b)
+            .unwrap_or(refname);
+        if !branch.is_empty() {
+            return Ok(branch.to_string());
+        }
+    }
+    Err(format!(
+        "could not resolve \"?upstream=<<default>>\" in {}: no remote HEAD symbolic ref \
+         (refs/remotes/<remote>/HEAD) exists — set one (e.g. `git remote set-head origin \
+         --auto`) or use a literal \"?upstream=<branch>\" value instead",
+        root.display()
+    ))
+}
+
+/// The branch currently checked out in the project's registered root/primary
+/// worktree `root` — what `?upstream=<<current_branch>>` names. Resolves
+/// against the *root* (the registered project path), NOT the not-yet-created
+/// new worktree, which doesn't exist at resolution time. Uses the same
+/// `git symbolic-ref --quiet --short HEAD` technique as
+/// `crate::reviews::worktree_branch`.
+fn current_checked_out_branch(root: &Path) -> Result<String, String> {
+    let out = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| {
+        format!(
+            "could not resolve \"?upstream=<<current_branch>>\" in {}: no branch checked out \
+             (detached HEAD)",
+            root.display()
+        )
+    })?;
+    let branch = out.trim();
+    if branch.is_empty() {
+        return Err(format!(
+            "could not resolve \"?upstream=<<current_branch>>\" in {}: no branch checked out",
+            root.display()
+        ));
+    }
+    Ok(branch.to_string())
+}
+
 fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterialization, String> {
     validate_branch_name(root, branch)?;
     let branch_ref = format!("refs/heads/{branch}");
@@ -230,6 +330,17 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// entirely. A remote-tracking match is preferred over a same-named local
 /// branch, since tracking a remote is `?upstream=`'s primary purpose.
 fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
+    // RAL-258: the reserved `<<...>>` sentinels are never literal branch names.
+    // They must be expanded by `resolve_upstream` before materialization; a
+    // literal `<<...>>` here means resolution was skipped, not a real ref to
+    // track (a branch named `<<default>>` would be meaningless and ambiguous).
+    if upstream.starts_with("<<") {
+        return Err(format!(
+            "\"?upstream={upstream}\" is a reserved sentinel and must be resolved to a concrete \
+             branch (via resolve_upstream) before materializing a worktree, not treated as a \
+             literal branch name"
+        ));
+    }
     let fail = |e: String| -> String {
         format!(
             "could not set upstream to \"{upstream}\" for the worktree at {}: {e} -- the \
@@ -399,6 +510,212 @@ pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<Path
     set_explicit_upstream(&wt, branch, upstream)?;
     resync_remote_tracking_branch(&wt)?;
     Ok(wt)
+}
+
+fn project_startup_adapter(vcs: &str) -> Option<&'static dyn ProjectStartupAdapter> {
+    match vcs {
+        "git" => Some(&GitProjectStartupAdapter),
+        _ => None,
+    }
+}
+
+fn placeholder_cache_key(machine: Option<&str>, placeholder: &str) -> String {
+    format!("{}\u{0}{placeholder}", machine.unwrap_or(""))
+}
+
+fn placeholder_context_for_cell<'a>(
+    squad_id: &'a str,
+    cell: &'a CellRow,
+) -> PlaceholderContext<'a> {
+    PlaceholderContext {
+        squad_id,
+        task_idx: cell.task_idx,
+        cell_idx: cell.idx,
+        task_name: &cell.task_name,
+        cell_id: &cell.cell_id,
+        machine: cell.machine.as_deref(),
+    }
+}
+
+fn synthetic_cell_row(ctx: PlaceholderContext<'_>) -> CellRow {
+    CellRow {
+        task_idx: ctx.task_idx,
+        idx: ctx.cell_idx,
+        task_name: ctx.task_name.to_string(),
+        cell_id: ctx.cell_id.to_string(),
+        cwd: None,
+        subprojects: Vec::new(),
+        prompt: None,
+        command: None,
+        agent: "raw".to_string(),
+        model: None,
+        system_prompt: None,
+        system_prompt_position: None,
+        depends_on: Vec::new(),
+        timeout_sec: None,
+        budget_tokens: None,
+        maximum_budget_usd: None,
+        upstream: None,
+        machine: ctx.machine.map(str::to_string),
+    }
+}
+
+impl ProjectStartupAdapter for GitProjectStartupAdapter {
+    fn resolve_placeholder(
+        &self,
+        store: &Store,
+        project: &ProjectView,
+        placeholder: &str,
+        ctx: PlaceholderContext<'_>,
+    ) -> Result<Option<String>, String> {
+        let Some(branch) = ralphus_core::schema::parse_worktree_placeholder(placeholder) else {
+            return Ok(None);
+        };
+        let upstream = ralphus_core::schema::parse_worktree_placeholder_upstream(placeholder)
+            .ok_or_else(|| {
+                format!(
+                    "cell '{}': placeholder \"{placeholder}\" is missing the required \
+                         \"?upstream=<upstream>\" suffix (e.g. \"{}{branch}?upstream=main\")",
+                    ctx.cell_id,
+                    ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
+                )
+            })?;
+        // RAL-258: expand any `?upstream=<<...>>` sentinel to a concrete branch
+        // against the project root, so both local materialization and remote
+        // provisioning act on a real tracking target -- never a literal
+        // `<<...>>` (which no ref can resolve to, and which
+        // `set_explicit_upstream` rejects). Failing to resolve is a hard error,
+        // never a guess at `main`/`master`.
+        let upstream = resolve_upstream(Path::new(&project.path), upstream)?;
+        let resolved = match ctx.machine {
+            Some(machine) if !machine.trim().is_empty() => provision_remote(
+                store,
+                machine,
+                project,
+                branch,
+                &synthetic_cell_row(ctx),
+                ctx.squad_id,
+            )?,
+            _ => ensure_worktree(Path::new(&project.path), branch, upstream)
+                .map_err(|e| {
+                    format!(
+                        "cell '{}': could not materialize worktree for \"{placeholder}\": {e}",
+                        ctx.cell_id
+                    )
+                })?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        Ok(Some(resolved))
+    }
+}
+
+fn expand_placeholder_text(
+    raw: &str,
+    mut resolve: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut offset = 0usize;
+    while let Some(open_rel) = raw[offset..].find("<<") {
+        let open = offset + open_rel;
+        out.push_str(&raw[offset..open]);
+        let body_start = open + 2;
+        let Some(close_rel) = raw[body_start..].find(">>") else {
+            out.push_str(&raw[open..]);
+            return Ok(out);
+        };
+        let close = body_start + close_rel;
+        let body = &raw[body_start..close];
+        if let Some(resolved) = resolve(body)? {
+            out.push_str(&resolved);
+        } else {
+            out.push_str(&raw[open..close + 2]);
+        }
+        offset = close + 2;
+    }
+    out.push_str(&raw[offset..]);
+    Ok(out)
+}
+
+fn validate_worktree_placeholders(raw: &str, cell_id: &str) -> Result<(), String> {
+    let mut placeholders = Vec::new();
+    if classify_placeholder(raw)?.is_some() {
+        placeholders.push(raw);
+    }
+    placeholders.extend(
+        ralphus_core::schema::text_placeholders(raw)
+            .into_iter()
+            .filter(|body| ralphus_core::schema::parse_worktree_placeholder(body).is_some()),
+    );
+    for placeholder in placeholders {
+        let branch = ralphus_core::schema::parse_worktree_placeholder(placeholder)
+            .expect("filtered to recognized placeholders");
+        if ralphus_core::schema::parse_worktree_placeholder_upstream(placeholder).is_none() {
+            return Err(format!(
+                "cell '{cell_id}': placeholder \"{placeholder}\" is missing the required \
+                 \"?upstream=<upstream>\" suffix (e.g. \"{}{branch}?upstream=main\")",
+                ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_placeholder_text_for_project(
+    store: &Store,
+    project_name: &str,
+    raw: &str,
+    ctx: PlaceholderContext<'_>,
+    cache: &mut HashMap<String, String>,
+) -> Result<String, String> {
+    validate_worktree_placeholders(raw, ctx.cell_id)?;
+    let project = store
+        .resolve_project(project_name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "cell '{}': project \"{project_name}\" is not registered",
+                ctx.cell_id
+            )
+        })?;
+    let Some(adapter) = project_startup_adapter(&project.vcs) else {
+        return Ok(raw.to_string());
+    };
+    let mut resolve_known = |placeholder: &str| -> Result<Option<String>, String> {
+        let key = placeholder_cache_key(ctx.machine, placeholder);
+        if let Some(cached) = cache.get(&key) {
+            return Ok(Some(cached.clone()));
+        }
+        let Some(resolved) = adapter.resolve_placeholder(store, &project, placeholder, ctx)? else {
+            return Ok(None);
+        };
+        cache.insert(key, resolved.clone());
+        Ok(Some(resolved))
+    };
+    if classify_placeholder(raw)?.is_some() {
+        return resolve_known(raw)?.ok_or_else(|| raw.to_string());
+    }
+    expand_placeholder_text(raw, resolve_known)
+}
+
+pub(crate) fn materialize_env_overrides(
+    store: &Store,
+    ctx: PlaceholderContext<'_>,
+    env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(project_name) = store
+        .task_project_at(ctx.squad_id, ctx.task_idx)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(env.clone());
+    };
+    let mut cache = HashMap::new();
+    env.iter()
+        .map(|(key, value)| {
+            resolve_placeholder_text_for_project(store, &project_name, value, ctx, &mut cache)
+                .map(|resolved| (key.clone(), resolved))
+        })
+        .collect()
 }
 
 /// Classify a cell `cwd` as a placeholder needing materialization, a plain
@@ -898,6 +1215,61 @@ mod tests {
         let err = ensure_worktree(&repo, "feature-w", "does-not-exist")
             .expect_err("a nonexistent upstream must fail");
         assert!(err.contains("does-not-exist"), "{err}");
+    }
+
+    #[test]
+    fn resolve_upstream_expands_the_default_sentinel_via_origin_head() {
+        // `init_repo_with_remote_branch` clones a remote seeded with a `main`
+        // default branch, so the clone's `refs/remotes/origin/HEAD` resolves
+        // to `main` — `<<default>>` must expand to it.
+        let (repo, _) = init_repo_with_remote_branch("sentinel-default", "origin/foo");
+        assert_eq!(
+            resolve_upstream(&repo, "<<default>>").expect("default sentinel"),
+            "main"
+        );
+        // And a literal value is passed through untouched.
+        assert_eq!(resolve_upstream(&repo, "main").unwrap(), "main");
+        assert_eq!(resolve_upstream(&repo, "origin/foo").unwrap(), "origin/foo");
+    }
+
+    #[test]
+    fn resolve_upstream_expands_the_current_branch_sentinel_from_root() {
+        let repo = init_repo("sentinel-current");
+        assert_eq!(
+            resolve_upstream(&repo, "<<current_branch>>").expect("current branch sentinel"),
+            "main"
+        );
+        // Following the project's checked-out branch moves the sentinel with it
+        // (the riskier, run-varying behavior the tutor flags).
+        g(&repo, &["checkout", "-b", "some-feature"]);
+        assert_eq!(
+            resolve_upstream(&repo, "<<current_branch>>").unwrap(),
+            "some-feature"
+        );
+    }
+
+    #[test]
+    fn resolve_upstream_default_fails_without_a_remote_head_and_never_guesses() {
+        // `init_repo` has no remote at all, so `refs/remotes/origin/HEAD`
+        // cannot resolve. `<<default>>` must FAIL with a clear error rather
+        // than guessing `main`/`master`.
+        let repo = init_repo("sentinel-no-remote");
+        let err = resolve_upstream(&repo, "<<default>>")
+            .expect_err("no remote HEAD must be a hard error, not a guess");
+        assert!(
+            err.contains("<<default>>") && err.contains("no remote HEAD"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_upstream_rejects_an_unknown_sentinel_defensively() {
+        let repo = init_repo("sentinel-unknown");
+        let err = resolve_upstream(&repo, "<<wat>>").expect_err("unknown sentinel must fail");
+        assert!(
+            err.contains("<<wat>>") && err.contains("<<current_branch>>"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1583,5 +1955,49 @@ mod tests {
             .expect("restart no-op");
         assert_eq!(cells[0].cwd.as_deref(), Some(resolved.as_str()));
         assert!(Path::new(&resolved).join("marker.txt").exists());
+    }
+
+    #[test]
+    fn resolve_placeholders_expands_the_current_branch_sentinel_end_to_end() {
+        // `?upstream=<<current_branch>>` must resolve to the project's
+        // currently-checked-out branch and drive the new worktree's tracking —
+        // the full path from placeholder cwd to materialized worktree.
+        let repo = init_repo("resolve-sentinel-current");
+        g(&repo, &["checkout", "-b", "base-branch"]);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feature?upstream=<<current_branch>>"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("resolve current_branch sentinel");
+        let resolved = PathBuf::from(cells[0].cwd.clone().unwrap());
+        assert_eq!(
+            git(&resolved, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap()
+                .trim(),
+            "feature"
+        );
+        assert_eq!(
+            git(
+                &resolved,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )
+            .unwrap()
+            .trim(),
+            "base-branch",
+            "the new branch must track the project's checked-out branch"
+        );
     }
 }

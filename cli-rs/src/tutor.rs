@@ -91,27 +91,41 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         Requires the task's `project` field to name a
                                         project registered via `ralphus project git`
                                         (NOT embedded in `cwd` itself). The daemon
-                                        resolves it, creates (or reuses) a git worktree
-                                        for <branch>, and rewrites `cwd` to that real
-                                        path before the cell runs. See "Project
-                                        registry" below.
-                                        The trailing "?upstream=<upstream>" is
-                                        REQUIRED -- submission fails validation
-                                        without it. ALWAYS set it explicitly rather
-                                        than hoping ralphus guesses right: it names
-                                        the branch <branch> should track (a local
-                                        branch, e.g. "?upstream=main", or a
+                                        resolves the `<<...>>` marker, creates (or
+                                        reuses) a git worktree for <branch>, and
+                                        rewrites `cwd` to that real path before the
+                                        cell runs. The marker may be embedded in a
+                                        longer value, e.g. "<<...>>/subdir". See
+                                        "Project registry" below.
+                                        The "?upstream=<upstream>" suffix names what
+                                        branch <branch> should track -- i.e. what it is
+                                        based on/compared against. Add it only when
+                                        <branch> should track something (almost always the
+                                        case for a review/feature branch). You rarely need
+                                        to name a specific branch up front: use the
+                                        reserved sentinel "?upstream=<<default>>" (the
+                                        repo's default branch, recommended) and ralphus
+                                        resolves it at run time, or
+                                        "?upstream=<<current_branch>>" (whatever branch the
+                                        project currently has checked out -- riskier, since
+                                        it can silently change between runs). Name a literal
+                                        branch -- a local one, e.g. "?upstream=main", or a
                                         remote-qualified one, e.g.
-                                        "?upstream=origin/main"). This is what
-                                        `derive_reviews` uses to find a review's base
-                                        and what drives resync-on-reuse (fetch +
-                                        rebase) for a remote-tracking branch -- it is
-                                        a DIFFERENT thing from the cell's own
-                                        `upstream` field below (that one rebases this
-                                        cell's branch onto another task/cell's tip
-                                        before the cell runs; this one only configures
-                                        git tracking). A cell may need both.
+                                        "?upstream=origin/main" -- when it should track
+                                        something other than the default (e.g. a specific
+                                        remote branch it should resync with). A placeholder
+                                        cwd with no "?upstream=" at all fails validation,
+                                        so always include a suffix (sentinel or name). This
+                                        value is what `derive_reviews` uses to find a
+                                        review's base and what drives resync-on-reuse (fetch
+                                        + rebase) for a remote-tracking branch -- it is a
+                                        DIFFERENT thing from the cell's own `upstream` field
+                                        below (that one rebases this cell's branch onto
+                                        another task/cell's tip before the cell runs; this
+                                        one only configures git tracking). A cell may need
+                                        both.
                                         Examples:
+                                          cwd = "ralphus:new-worktree/RAL-123-fix?upstream=<<default>>"
                                           cwd = "ralphus:new-worktree/RAL-123-fix?upstream=main"
                                           cwd = "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
                                         ALTERNATIVE: an absolute path to an
@@ -367,13 +381,25 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  speech-to-text) still resolves via fuzzy/description matching, but prefer
  exact names.
 
- ALWAYS set "?upstream=<upstream>" explicitly -- it is REQUIRED (validation
- rejects a placeholder cwd without it) and tells ralphus exactly what the
- branch tracks, rather than leaving it to guess from HEAD. Point it at
- whatever branch <branch> is meant to be based on/compared against -- almost
- always "main" (or your repo's default branch) for a fresh feature branch, or
- "origin/<branch>" (or another remote-qualified name) when you want the
- branch to track and resync with a remote.
+ The trailing "?upstream=<upstream>" tells ralphus what <branch> tracks (its
+ base/compare target) rather than guessing from HEAD. It is only something
+ you need to pin down explicitly when that target *can't* be inferred; for
+ the common case -- a fresh feature branch based on the repo's default
+ branch -- use the sentinel "?upstream=<<default>>" instead of hardcoding a
+ name:
+
+   [[task.cell]]
+   cwd    = "ralphus:new-worktree/RAL-124-other_feature?upstream=<<default>>"
+   prompt = "..."
+
+ ralphus resolves "<<default>>" to the project's default branch at run time.
+ The alternative sentinel, "?upstream=<<current_branch>>", tracks whatever
+ branch the project currently has checked out -- use it with care, since that
+ can silently change between runs. Give a literal name ("?upstream=main", or
+ a remote-qualified "?upstream=origin/<branch>") only when <branch> should
+ track something other than the default -- e.g. a remote branch you want it
+ to resync with. A placeholder cwd with no "?upstream=" at all fails
+ validation, so always include a suffix (a sentinel or a literal name).
 
 ---------------------------------------------------------------
  depends_on formats

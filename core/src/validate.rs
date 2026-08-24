@@ -556,17 +556,40 @@ fn validate_cells(
                 if let Some(s) = v.as_str() {
                     if crate::schema::parse_worktree_placeholder(s).is_some() {
                         has_placeholder = true;
-                        if crate::schema::parse_worktree_placeholder_upstream(s).is_none() {
-                            let line = ctx.key_line(header, "cwd");
-                            ctx.error(
+                        let line = ctx.key_line(header, "cwd");
+                        match crate::schema::parse_worktree_placeholder_upstream(s) {
+                            None => ctx.error(
                                 &format!("{path}.cwd"),
                                 ErrorKind::MissingRequired,
                                 "a \"ralphus:new-worktree/<branch>\" placeholder cwd requires \
                                  an explicit \"?upstream=<upstream>\" suffix, e.g. \
-                                 \"ralphus:new-worktree/<branch>?upstream=main\", so ralphus \
-                                 knows what the branch tracks instead of guessing from HEAD",
+                                 \"ralphus:new-worktree/<branch>?upstream=main\" (or the \
+                                 \"?upstream=<<default>>\" sentinel), so ralphus knows what \
+                                 the branch tracks instead of guessing from HEAD",
                                 line,
-                            );
+                            ),
+                            // A `<<...>>` value is only ever a reserved sentinel:
+                            // any other one is a typo or an unsupported sentinel,
+                            // and must fail fast here (before it ever reaches the
+                            // daemon) with the valid options spelled out.
+                            Some(upstream) if upstream.starts_with("<<") => {
+                                if !crate::schema::is_worktree_upstream_sentinel(upstream) {
+                                    let options =
+                                        crate::schema::WORKTREE_UPSTREAM_SENTINELS.join(", ");
+                                    ctx.error(
+                                        &format!("{path}.cwd"),
+                                        ErrorKind::InvalidValue,
+                                        format!(
+                                            "\"?upstream={upstream}\" is not a supported \
+                                             sentinel. Choose one of {options} (alphabetical) \
+                                             or use an existing branch name as the literal \
+                                             tracking target, e.g. \"?upstream=main\""
+                                        ),
+                                        line,
+                                    );
+                                }
+                            }
+                            Some(_) => {}
                         }
                     }
                 }
@@ -1586,6 +1609,42 @@ command = "cargo build"
     fn command_only_cell_is_valid() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\n";
         assert!(validate_toml(src).is_ok());
+    }
+
+    #[test]
+    fn placeholder_cwd_accepts_reserved_upstream_sentinels() {
+        for upstream in ["<<default>>", "<<current_branch>>"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream={upstream}\"\nprompt=\"p\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(
+                r.errors.iter().all(|e| e.kind != ErrorKind::MissingRequired
+                    && !e.message.contains("not a supported sentinel")),
+                "sentinel {upstream} must pass, got {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_cwd_rejects_an_unknown_sentinel_with_an_actionable_message() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=<<wat>>\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.kind == ErrorKind::InvalidValue)
+            .expect("unknown sentinel must be an InvalidValue error");
+        // Lists the valid options alphabetically and suggests a literal branch.
+        assert!(
+            e.message.contains("not a supported sentinel")
+                && e.message.contains("<<current_branch>>")
+                && e.message.contains("<<default>>")
+                && e.message.contains("?upstream=main"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
