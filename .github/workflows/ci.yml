@@ -8,21 +8,81 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# CI matrix audit (RAL-260) — gaps found and how this workflow addresses them:
+#
+#   * Python version: the python job previously ran against a single, unpinned
+#     interpreter — uv resolved whatever it found, bounded only by
+#     `cli/pyproject.toml`'s `requires-python = ">=3.11"` (floor, no ceiling).
+#     It now runs as a matrix over 3.11 / 3.12 / 3.13 plus a floating "3" leg
+#     that always resolves to the newest available Python, keeping CI
+#     forward-looking without manual bumps.             ADDRESSED here.
+#
+#   * Rust MSRV: the rust job only ran a floating `stable` toolchain, with no
+#     committed lower bound. [workspace.package] already declares an MSRV via
+#     `rust-version = "1.85"`, but that is stale — the locked icu_*/idna_adapter
+#     deps require rustc 1.86 (verified: 1.85 fails, 1.86 builds). The rust job
+#     therefore adds a pinned 1.86 build-only leg; the declared MSRV is written
+#     directly in ci.yml (rather than a new rust-toolchain.toml, which would
+#     repin every local dev `cargo` too), and Cargo.toml's `rust-version`
+#     should be bumped to 1.86 to match (follow-up).     ADDRESSED here.
+#
+#   * OS: every job ran on ubuntu-latest only, despite .agent/gotchas.md
+#     documenting real Windows-specific code paths in the Rust daemon/runner
+#     (cell `cwd` path format; the psmux tmux-alternative reattach mitigation)
+#     — and the dev environment itself is Windows. The rust job now runs its
+#     full fmt/clippy/test suite on both ubuntu-latest and windows-latest.
+#                                                        ADDRESSED here.
+#
+#   * Node: the web job pins node "22" with no .nvmrc or `engines` backing it.
+#     A real but smaller/lower-priority gap than the above; intentionally NOT
+#     addressed in this change — left as a follow-up so the version's
+#     source-of-truth moves into the repo (.nvmrc / package.json engines).
+# ---------------------------------------------------------------------------
+
 jobs:
   rust:
     name: Rust (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # toolchain x OS. The floating `stable` leg runs the full
+        # fmt/clippy/test suite on both ubuntu and windows so the documented
+        # Windows-specific daemon/runner paths are covered (see
+        # .agent/gotchas.md). The pinned "1.86" MSRV leg only proves the
+        # workspace still builds at the minimum supported toolchain; lint/test
+        # drift is stable's job.
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            suite: full
+          - os: windows-latest
+            toolchain: stable
+            suite: full
+          - os: ubuntu-latest
+            toolchain: "1.86"
+            suite: msrv
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format check
-        run: cargo fmt --all -- --check
+        if: matrix.suite == 'full'
+        run: cargo "+${{ matrix.toolchain }}" fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        if: matrix.suite == 'full'
+        run: cargo "+${{ matrix.toolchain }}" clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all-targets
+        if: matrix.suite == 'full'
+        run: cargo "+${{ matrix.toolchain }}" test --all-targets
+      # MSRV leg: just prove the workspace compiles at the oldest supported
+      # toolchain. (Cargo's default resolver is not MSRV-aware, so this is the
+      # only guard against a dependency silently bumping the floor.)
+      - name: Build (MSRV verification)
+        if: matrix.suite == 'msrv'
+        run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
   web:
     name: Web (eslint + tsc --checkJs + knip + node --test on board.html)
@@ -46,13 +106,28 @@ jobs:
         run: npm test
 
   python:
-    name: Python (ruff, mypy --strict, privata, deadcode, pytest)
+    name: Python ${{ matrix.python-version }} (ruff, mypy --strict, privata, deadcode, pytest)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: cli
+    env:
+      # Make every `uv` step use the matrix's interpreter, not just whatever uv
+      # first finds that satisfies requires-python (>=3.11).
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The versions cli/pyproject.toml's `requires-python = ">=3.11"` covers
+        # in practice, plus a floating "3" leg that always resolves to the
+        # newest available Python so CI stays forward-looking.
+        python-version: ["3.11", "3.12", "3.13", "3"]
     steps:
       - uses: actions/checkout@v4
+      - name: Install Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:

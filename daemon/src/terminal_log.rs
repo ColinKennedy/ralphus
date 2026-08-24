@@ -40,7 +40,34 @@ use std::time::UNIX_EPOCH;
 
 /// Directory every session's terminal-log attempts live under.
 fn terminal_log_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(root) = TEST_ROOT.with(|r| r.borrow().clone()) {
+            return root;
+        }
+    }
     crate::state_dir().join("terminal_logs")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-scoped override for [`terminal_log_root`], set via [`set_test_root`].
+    /// Lets a test's writes/reads/deletes hit an isolated directory instead of
+    /// the real `~/.ralphus`, so parallel tests can't race on a shared namespace.
+    static TEST_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Redirect this thread's terminal-log storage to `root` for the duration of a
+/// test. Rust runs tests on separate threads, so each test that calls this gets
+/// an isolated directory -- its writes can no longer be wiped by a different,
+/// concurrently-running test that deletes a squad/guardian sharing the same
+/// `ralphus_*_` prefix in the real `~/.ralphus/terminal_logs` (a real flake:
+/// `server::tests`'s terminal-log reader collided with the squad-delete test on
+/// `ralphus_squad-000000000001_`). Call at the top of any test that writes,
+/// reads, or deletes terminal logs, or deletes a squad/guardian.
+#[cfg(test)]
+pub(crate) fn set_test_root(root: PathBuf) {
+    TEST_ROOT.with(|r| *r.borrow_mut() = Some(root));
 }
 
 /// Directory `session_name`'s attempt files live under.

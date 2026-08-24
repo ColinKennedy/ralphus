@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cancel::{CancelToken, Cancellations};
 use crate::guardian::{CheckInput, CheckInputType, GuardianCheck, GuardianStatus, MergeStatus};
@@ -61,6 +61,14 @@ pub(crate) const MANUAL_COMMANDS_SESSION: &str = "manual-reviewer";
 /// Task name for "set it for me" input resolution (RAL-164) -- see
 /// [`resolve_check_input`].
 pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StartMergeOutcome {
+    Merging,
+    Deferred,
+    AlreadyInProgress,
+}
 
 // ---------------------------------------------------------------------------
 // XML route-block helpers (RAL-35)
@@ -1636,6 +1644,13 @@ fn resolve_conflicts_with_agent(
             }
         });
 
+        // RAL-259: the resolver agent is actually beginning to run — stamp the
+        // branch's Live-View start time (COALESCE so the fix pass, fired first
+        // within this attempt, wins over the final-proof call that may follow).
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .stamp_branch_started_at(id, branch_id);
         let result = runner.run_cancellable(&spec, cancel);
 
         stop.store(true, Ordering::Relaxed);
@@ -1908,6 +1923,14 @@ fn run_final_proof(
         // identical fix in `resolve_conflicts_with_agent` above.
         machine: wt.machine().map(str::to_string),
     };
+    // RAL-259: the final-proof agent is actually beginning to run — stamp the
+    // branch's Live-View start time. COALESCE means a branch that already
+    // started a fix pass keeps that (earlier) start; one that went straight to
+    // proof (clean rebase) gets stamped here.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .stamp_branch_started_at(id, branch_id);
     let result = runner.run(&spec);
     // RAL-193: not fatal here -- per this function's own doc comment, the
     // proof call never blocks the rebase from completing, so a budget overrun is
@@ -2540,6 +2563,42 @@ pub fn start_merge(
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
 ) -> Reply {
+    match kickoff_merge(store, runner, id, sem, cancellations) {
+        Ok(StartMergeOutcome::Merging) => reply(202, "{\"status\":\"merging\"}"),
+        Ok(StartMergeOutcome::Deferred) => reply(
+            202,
+            "{\"status\":\"deferred\",\"message\":\"merge deferred until every enabled branch is ready\"}",
+        ),
+        Ok(StartMergeOutcome::AlreadyInProgress) => reply(
+            409,
+            &error_body(
+                "already_in_progress",
+                "a rebase is already in progress; cancel it before starting a new one",
+            ),
+        ),
+        Err(StartMergeError::NotFound(message)) => reply(404, &error_body("not_found", &message)),
+        Err(StartMergeError::NoBranches) => reply(
+            400,
+            &error_body("no_branches", "guardian has no branches to merge"),
+        ),
+        Err(StartMergeError::Store(message)) => reply(500, &error_body("store_error", &message)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartMergeError {
+    NotFound(String),
+    NoBranches,
+    Store(String),
+}
+
+pub(crate) fn kickoff_merge(
+    store: Arc<Mutex<Store>>,
+    runner: Arc<dyn Runner>,
+    id: &str,
+    sem: Arc<Semaphore>,
+    cancellations: Cancellations,
+) -> Result<StartMergeOutcome, StartMergeError> {
     let guardian = {
         let guard = store.lock().expect("store mutex poisoned");
         guard.get_guardian(id)
@@ -2547,14 +2606,51 @@ pub fn start_merge(
     let guardian = match guardian {
         Ok(g) => g,
         Err(e) => {
-            return reply(404, &error_body("not_found", &e.to_string()));
+            return Err(StartMergeError::NotFound(e.to_string()));
         }
     };
     if guardian.branches.is_empty() {
-        return reply(
-            400,
-            &error_body("no_branches", "guardian has no branches to merge"),
-        );
+        return Err(StartMergeError::NoBranches);
+    }
+    // Only a still-`collecting` guardian can have a branch genuinely waiting
+    // on its upstream Cell -- once a guardian has left `collecting` (reached
+    // `in_review`/`merge_failed`, or is already `merging`), every enabled
+    // branch has already gone through a full merge pass at least once, and a
+    // re-trigger (the "Merge / rebase" button, a settings-change restart, a
+    // base-branch shift on an already-built review) is a deliberate re-run
+    // that must not silently no-op just because some cell's `cells.state`
+    // still reads back non-`done` (e.g. it was never wired to a real task,
+    // like a manually added test branch, or the review outlived its squad).
+    if guardian.status == GuardianStatus::Collecting.as_str() {
+        let unfinished = {
+            let guard = store.lock().expect("store mutex poisoned");
+            match guard.guardian_unfinished_linked_branches(id) {
+                Ok(b) => b,
+                Err(e) => return Err(StartMergeError::Store(e.to_string())),
+            }
+        };
+        if !unfinished.is_empty() {
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} merge deferred: pending branches remain"
+            );
+            {
+                let guard = store.lock().expect("store mutex poisoned");
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "guardian",
+                    message: "merge deferred: pending branches remain",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({ "pending_branches": unfinished }),
+                });
+            }
+            return Ok(StartMergeOutcome::Deferred);
+        }
     }
 
     // Atomically transition collecting, merge_failed, or in_review → merging
@@ -2568,7 +2664,7 @@ pub fn start_merge(
         .claim_guardian_merge(id)
     {
         Ok(c) => c,
-        Err(e) => return reply(500, &error_body("store_error", &e.to_string())),
+        Err(e) => return Err(StartMergeError::Store(e.to_string())),
     };
     if !claimed {
         crate::rlog!(
@@ -2590,13 +2686,7 @@ pub fn start_merge(
                 payload: serde_json::json!({}),
             });
         }
-        return reply(
-            409,
-            &error_body(
-                "already_in_progress",
-                "a rebase is already in progress; cancel it before starting a new one",
-            ),
-        );
+        return Ok(StartMergeOutcome::AlreadyInProgress);
     }
     crate::rlog!(
         INFO,
@@ -2625,7 +2715,7 @@ pub fn start_merge(
         run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
         cancellations.remove(&format!("guardian:{sid}"));
     });
-    reply(202, "{\"status\":\"merging\"}")
+    Ok(StartMergeOutcome::Merging)
 }
 
 /// Bounded wait for a merge worker registered under `guardian:{id}` to
@@ -5513,6 +5603,16 @@ fn drive_rebase(
         log_merge_cancelled(store, id);
         return Err("cancelled".to_string());
     }
+    // RAL-259: this `drive_rebase` call is one branch-resolution attempt, so
+    // clear the branch's Live-View start time before anything runs — a
+    // re-merge / restart re-stamps from scratch (see
+    // `Store::stamp_branch_started_at`'s COALESCE, fired at each actual
+    // resolver/proof session start below). Left NULL if no resolver ever runs
+    // for this branch.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .clear_branch_started_at(id, branch_id);
     // Remove untracked files before rebasing. `git rebase --onto <newbase>` fails
     // with "untracked working tree files would be overwritten by checkout" when the
     // worktree contains a file that is tracked in `newbase` but untracked here —
@@ -6383,6 +6483,13 @@ fn generate_manual_commands(
         }
     });
 
+    // RAL-259: the manual-checks generation agent is beginning to run — stamp
+    // the guardian-level Live-View start time (plain overwrite, so a
+    // regeneration always shows the latest generation's start).
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .stamp_guardian_manual_checks_started_at(id);
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "manual_commands", &result);
 

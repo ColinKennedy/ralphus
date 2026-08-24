@@ -377,8 +377,15 @@ should track (`git branch --set-upstream-to`) -- a local branch (`?upstream=main
 or a remote-qualified one (`?upstream=origin/main`); it decides what a
 review's base resolves to and drives the resync-on-reuse behavior described
 below, rather than the daemon guessing from `HEAD` at materialization time.
-The placeholder parser treats everything between `ralphus:new-worktree/` and
-the first `?` as one literal branch name, slashes included. During
+Two reserved sentinel values may be used instead of a literal branch name
+(RAL-258): `?upstream=<<default>>` (resolve to the repository's default
+branch, against the project root, at resolution time — recommended) and
+`?upstream=<<current_branch>>` (resolve to whatever branch the project
+currently has checked out). These sentinels are reserved and are never
+treated as literal branch names; any other `<<...>>` value is rejected at
+validation time. The placeholder parser treats everything between
+`ralphus:new-worktree/` and the first `?` as one literal branch name, slashes
+included. During
 materialization the daemon first validates that branch name with
 `git check-ref-format --branch`. If a local branch by that exact name already
 exists, it is reused. Otherwise, a slash-containing name like `origin/foo` is

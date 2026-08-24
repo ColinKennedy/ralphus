@@ -2152,6 +2152,7 @@ mod tests {
             env_overrides: std::collections::BTreeMap::new(),
             resolved_env: std::collections::BTreeMap::new(),
             inherited_env: std::collections::BTreeMap::new(),
+            started_at_ms: None,
         }
     }
 

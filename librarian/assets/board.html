@@ -19,6 +19,7 @@
         --empty: #ff9492;
         --drift: #f0883e;
         --incomplete: #db6d28;
+        --toast-warn: #d29922;
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -202,8 +203,10 @@
          alert() does; showReviewError() dedupes so repeated identical
          failures don't pile these up. */
       .toast-root { position: fixed; right: 16px; bottom: 16px; z-index: 100; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
-      .toast { background: var(--panel); border: 1px solid var(--failed); color: var(--text); border-radius: 6px; padding: 8px 12px; font-size: 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+      .toast { background: var(--panel); border: 1px solid var(--failed); color: var(--text); border-radius: 6px; padding: 8px 12px; font-size: 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); pointer-events: auto; display: flex; flex-direction: column; gap: 8px; }
       .toast.info { border-color: var(--accent); }
+      .toast.warn { border-color: var(--toast-warn); }
+      .toast-actions { display: flex; justify-content: flex-end; gap: 8px; }
       .edit-form label { display: block; font-size: 12px; color: var(--muted); margin-top: 8px; }
       .edit-form input, .edit-form textarea, .edit-form select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; margin-top: 3px; }
       .btn { border: 1px solid var(--border); background: var(--panel-2); color: var(--text); border-radius: 6px; padding: 5px 12px; }
@@ -343,6 +346,14 @@
       .q-modal h3 { margin: 0 0 8px; }
       .q-modal input[type=number] { width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; }
       .q-modal .row { display: flex; gap: 14px; margin: 12px 0; flex-wrap: wrap; }
+      .goto-search-modal { width: 760px; max-width: 94vw; }
+      .goto-search-input { width: 100%; box-sizing: border-box; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 11px; font: inherit; }
+      .goto-search-summary { color: var(--muted); font-size: 12px; margin: 8px 0 10px; }
+      .goto-search-list { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+      .goto-search-row { width: 100%; display: block; text-align: left; padding: 10px 12px; border: none; border-bottom: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; font: inherit; }
+      .goto-search-row:last-child { border-bottom: none; }
+      .goto-search-row:hover { background: var(--panel-2); }
+      .goto-search-row.selected { background: rgba(74,163,255,.16); box-shadow: inset 0 0 0 1px var(--accent); }
     </style>
   </head>
   <body>
@@ -366,7 +377,9 @@
           <div id="running-menu" class="running-menu hidden"></div>
         </div>
         <span id="updated" data-tip="Last time the board refreshed its view of the daemon.\nRefreshes are pushed by the daemon as things change, with a slower periodic re-check as a safety net — so this updates whenever something actually happened, not on a fixed clock.">—</span>
-        <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" data-tip="Toggle between dark and light theme.">☾</button>
+        <button class="icon-btn" onclick="openGotoSearch()" id="goto-search-btn" data-tip="Open task go-to search across every squad.\nWho/when: use this from any tab when you know a task name but not where its squad currently is.\nHotkey: press / while you're not typing in an input.">⌕</button>
+        <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" aria-label="Toggle theme" data-tip="Toggle the board theme — the flashbang icon is the bright light theme, the night-vision goggles are the dark theme.\nUse it if the current theme is hard on your eyes or to match your surroundings."><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="13" r="4.4"/><circle cx="16" cy="13" r="4.4"/><circle cx="8" cy="13" r="1.9"/><circle cx="16" cy="13" r="1.9"/><line x1="12" y1="11.8" x2="12" y2="14.2"/><path d="M7.6 8.7c-2.5-1.2-4.2-1.2-4.5-2"/><path d="M16.4 8.7c2.5-1.2 4.2-1.2 4.5-2"/></svg></button>
+
       </div>
     </header>
 
@@ -639,6 +652,7 @@
        * @property {{[key: string]: (string|null)}} [env_overrides] - RAL-191: this branch's own env-override layer. A string value overrides the inherited one; `null` is a tombstone removing the inherited variable entirely; an absent key is simply inherited.
        * @property {{[key: string]: string}} [inherited_env] - RAL-191: the environment inherited from this branch's source cell (`squad < task < cell`), before `env_overrides` is applied.
        * @property {{[key: string]: string}} [resolved_env] - RAL-191: the effective environment this branch's review worktree actually runs under — `inherited_env` with `env_overrides` applied.
+       * @property {number|null} [started_at_ms] - RAL-259: epoch-ms when this branch's conflict-resolver agent (fix pass or final-proof call) most recently began running, or null if none has started. Persists after the resolver finishes.
        */
       /**
        * A named, defaulted value referenced by a GuardianCheck's
@@ -720,6 +734,7 @@
        * @property {{[key: string]: string}} [manual_checks_env] - RAL-203: the effective environment the manual-checks step runs under -- `combined_env` with `manual_checks_env_overrides` applied.
        * @property {number|null} [maximum_budget_usd] - RAL-193: this review's own USD spend cap, or null for no cap.
        * @property {number} [merge_attempt] - RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
+       * @property {number|null} [manual_checks_started_at_ms] - RAL-259: epoch-ms when this review's manual-checks generation agent most recently began work, or null if generation hasn't started yet. Persists after generation finishes.
        * @property {number} [attempt_tokens_in] - RAL-193: input tokens spent on this review's own resolver/proof calls during the current merge attempt only.
        * @property {number} [attempt_tokens_out] - RAL-193: output tokens, current merge attempt only.
        * @property {number} [attempt_cost_usd] - RAL-193: USD cost, current merge attempt only.
@@ -757,6 +772,14 @@
        * @property {boolean} in_sync
        * @property {boolean} pr_ahead
        * @property {boolean} worktree_ahead
+       */
+      /**
+       * One cross-squad task hit in the go-to search overlay (RAL-253).
+       * @typedef {object} GotoSearchResult
+       * @property {string} squadId
+       * @property {number} taskIdx
+       * @property {string} taskName
+       * @property {string} label
        */
       /**
        * @typedef {object} ChatMessage
@@ -1097,6 +1120,8 @@
       let tab = "tasks";
       /** @type {SquadView[]} */
       let squads = [];
+      let gotoSearchQuery = "";
+      let gotoSearchSelected = 0;
       /** @type {GuardianView[]} */
       let guardians = [];
       /** @type {ResourceEntry[]} */
@@ -1125,6 +1150,150 @@
       let userError = "";
       /** @type {Map<string, AgentOptionsCacheEntry>} cwd -> agents + default fetched from GET /api/agents, cached for the page's lifetime. */
       const agentOptionsByCwd = new Map();
+      /**
+       * Whether a global keyboard shortcut should stay dormant because the
+       * user is typing into a text control.
+       * @param {EventTarget|null} target
+       * @returns {boolean}
+       */
+      function isTypingShortcutTarget(target) {
+        const el = target instanceof HTMLElement ? target : null;
+        return !!el && /input|textarea/i.test(el.tagName || "");
+      }
+      /**
+       * Returns every task whose name contains the current search query.
+       * Empty query means "show everything."
+       * @param {string} query
+       * @returns {GotoSearchResult[]}
+       */
+      function gotoSearchResults(query) {
+        const needle = String(query || "").trim().toLowerCase();
+        /** @type {GotoSearchResult[]} */
+        const out = [];
+        squads.forEach((squad) => {
+          squad.tasks.forEach((task, taskIdx) => {
+            if (needle && !task.name.toLowerCase().includes(needle)) return;
+            out.push({
+              squadId: squad.id,
+              taskIdx,
+              taskName: task.name,
+              label: `${squad.id} > ${task.name}`,
+            });
+          });
+        });
+        return out;
+      }
+      /**
+       * Keeps the overlay's selected result index within the currently-visible range.
+       * @param {number} resultCount
+       * @returns {void}
+       */
+      function clampGotoSearchSelection(resultCount) {
+        if (resultCount <= 0) { gotoSearchSelected = -1; return; }
+        if (gotoSearchSelected < 0) gotoSearchSelected = 0;
+        if (gotoSearchSelected >= resultCount) gotoSearchSelected = resultCount - 1;
+      }
+      /**
+       * Opens the cross-squad task go-to search overlay (RAL-253).
+       * @returns {void}
+       */
+      function openGotoSearch() {
+        gotoSearchQuery = "";
+        gotoSearchSelected = 0;
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal goto-search-modal">
+            <h2>Go To Task</h2>
+            <input type="text" id="goto-search-input" class="goto-search-input" placeholder="search tasks across every squad…" oninput="gotoSearchInput(this.value)" onkeydown="gotoSearchInputKeydown(event)" data-tip="Filter every task by substring match on task name.\nWho/when: use this when you know part of a task's name and want the owning squad shown beside it.\nArrow keys move the selection · Enter opens it." />
+            <div id="goto-search-summary" class="goto-search-summary"></div>
+            <div id="goto-search-list" class="goto-search-list" data-tip="Matching tasks across every squad, shown as squad-id > task-name so duplicate names stay unambiguous.\nClick once to select a row; double-click or press Enter to open it."></div>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Close task go-to search without navigating anywhere.">Cancel</button>
+              <button class="btn primary" onclick="gotoSelectedTaskSearchResult()" data-tip="Jump to the selected task on the Tasks tab.\nWho/when: use this after narrowing the list to the task you want.">Go To</button>
+            </div>
+          </div></div>`;
+        const input = /** @type {HTMLInputElement|null} */ (document.getElementById("goto-search-input"));
+        if (input) {
+          input.value = gotoSearchQuery;
+          input.focus();
+        }
+        renderGotoSearchResults();
+      }
+      /**
+       * Re-renders the go-to search result list and summary.
+       * @returns {void}
+       */
+      function renderGotoSearchResults() {
+        const list = document.getElementById("goto-search-list");
+        const summary = document.getElementById("goto-search-summary");
+        if (!list || !summary) return;
+        const results = gotoSearchResults(gotoSearchQuery);
+        clampGotoSearchSelection(results.length);
+        summary.textContent = `${results.length} matching task${results.length === 1 ? "" : "s"} across ${squads.length} squad${squads.length === 1 ? "" : "s"}.`;
+        list.innerHTML = results.length
+          ? results.map((result, index) => `<button type="button" id="goto-search-row-${index}" class="goto-search-row${index === gotoSearchSelected ? " selected" : ""}" onclick="selectGotoSearchResult(${index})" ondblclick="gotoSelectedTaskSearchResult()" data-tip="Open ${esc(result.label)} on the Tasks tab.\nWho/when: use this when several squads contain similarly named work and you need the exact owner shown.">${esc(result.label)}</button>`).join("")
+          : `<div class="empty" style="margin:0;padding:20px" data-tip="No current task names contain this substring.\nWho/when: clear or broaden the query to search across every squad again.">No matching tasks.</div>`;
+        scrollGotoSearchSelectionIntoView();
+      }
+      /**
+       * Applies a new query to the go-to search overlay.
+       * @param {string} value
+       * @returns {void}
+       */
+      function gotoSearchInput(value) {
+        gotoSearchQuery = value;
+        gotoSearchSelected = 0;
+        renderGotoSearchResults();
+      }
+      /**
+       * Selects one visible search result row.
+       * @param {number} index
+       * @returns {void}
+       */
+      function selectGotoSearchResult(index) {
+        gotoSearchSelected = index;
+        renderGotoSearchResults();
+      }
+      /**
+       * Keeps the selected search result visible while keyboard navigation moves it.
+       * @returns {void}
+       */
+      function scrollGotoSearchSelectionIntoView() {
+        if (gotoSearchSelected < 0) return;
+        document.getElementById(`goto-search-row-${gotoSearchSelected}`)?.scrollIntoView({ block: "nearest" });
+      }
+      /**
+       * Keyboard navigation for the go-to search input.
+       * @param {KeyboardEvent} event
+       * @returns {void}
+       */
+      function gotoSearchInputKeydown(event) {
+        const results = gotoSearchResults(gotoSearchQuery);
+        if (!results.length && event.key !== "Enter") return;
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          gotoSearchSelected = Math.min(results.length - 1, Math.max(0, gotoSearchSelected + 1));
+          renderGotoSearchResults();
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          gotoSearchSelected = Math.max(0, gotoSearchSelected - 1);
+          renderGotoSearchResults();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          gotoSelectedTaskSearchResult();
+        }
+      }
+      /**
+       * Navigates to the currently selected go-to search hit.
+       * @returns {void}
+       */
+      function gotoSelectedTaskSearchResult() {
+        const results = gotoSearchResults(gotoSearchQuery);
+        clampGotoSearchSelection(results.length);
+        const hit = results[gotoSearchSelected] || null;
+        if (!hit) return;
+        closeModal();
+        jumpToTask(hit.squadId, hit.taskIdx, -1, "task");
+      }
       /**
        * @returns {{q: string, sort: string, dir: number, status: Set<string>}}
        */
@@ -1730,14 +1899,21 @@
       }
 
       // ---------- theme ----------
+      // RAL-257: the toggle swaps inline SVG icons instead of a Unicode glyph.
+      // Each icon uses `currentColor`, so it inherits the .icon-btn
+      // `color: var(--text)` and stays legible in either theme: the flashbang
+      // (light theme) renders dark-on-light, the night-vision goggles (dark
+      // theme) render light-on-dark.
+      const FLASHBANG_ICON = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="8.5" width="13" height="12.5" rx="2.8"/><line x1="5.5" y1="11.5" x2="18.5" y2="11.5"/><path d="M7.5 8.5a4.5 3.5 0 0 1 9 0"/><circle cx="16" cy="4.4" r="1.7"/><line x1="14.7" y1="6" x2="12.6" y2="7.6"/></svg>`;
+      const NIGHTVISION_ICON = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="13" r="4.4"/><circle cx="16" cy="13" r="4.4"/><circle cx="8" cy="13" r="1.9"/><circle cx="16" cy="13" r="1.9"/><line x1="12" y1="11.8" x2="12" y2="14.2"/><path d="M7.6 8.7c-2.5-1.2-4.2-1.2-4.5-2"/><path d="M16.4 8.7c2.5-1.2 4.2-1.2 4.5-2"/></svg>`;
       /**
-       * Applies a theme ("light"|"dark") to the document root and updates the toggle button glyph.
+       * Applies a theme ("light"|"dark") to the document root and updates the toggle button icon.
        * @param {string} t
        * @returns {void}
        */
       function applyTheme(t) {
         document.documentElement.dataset.theme = t;
-        byId("theme-btn").textContent = t === "light" ? "☀" : "☾";
+        byId("theme-btn").innerHTML = t === "light" ? FLASHBANG_ICON : NIGHTVISION_ICON;
       }
       /**
        * Flips the current theme and persists the choice to localStorage.
@@ -3102,7 +3278,7 @@
         // Re-derived from the (freshly re-rendered) cell data on every
         // call, so a restart's new started_at_ms shows up immediately.
         const startedHtml = startedAtMs
-          ? `<span class="peek-activity" data-tip="When this cell most recently started running.\nUpdates to a new time if the cell is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
+          ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently started running.\nUpdates to a new time if it is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
           : "";
         // RAL-232: ralphus's own diagnostic/telemetry lines are hidden from
         // this rendering by default -- peekContent always caches the raw,
@@ -6572,7 +6748,7 @@
       function resolverPeekBox(g, b) {
         if (!b.worktree) return "";
         const key = `guardian|${g.id}|${b.id}`;
-        return `${peekBox(key)}${historyBox(key)}`;
+        return `${peekBox(key, b.started_at_ms ?? null)}${historyBox(key)}`;
       }
 
       // Render manual-checks-generation terminal buttons for a review (RAL-88
@@ -6622,7 +6798,7 @@
         const state = g.checks_state || (cmds.length ? "ready" : "waiting");
         if (state === "waiting") return "";
         const key = `guardian-manual|${g.id}`;
-        return `${peekBox(key)}${historyBox(key)}`;
+        return `${peekBox(key, g.manual_checks_started_at_ms ?? null)}${historyBox(key)}`;
       }
 
       // ---------- structured check inputs (RAL-164) ----------
@@ -8231,7 +8407,28 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           return;
         }
         delete baseBranchCache[gid];
-        await guardianAction(`/api/guardians/${gid}/base`, { branch: val });
+        const resp = await guardianAction(`/api/guardians/${gid}/base`, { branch: val });
+        if (resp && resp.ok) {
+          const data = await resp.json().catch(() => null);
+          const change = data && data.base_change;
+          if (change && change.status === "deferred") {
+            showInfoToast(change.message || `We will use '${val}' once the branches are ready to merge.`);
+          } else if (change && change.status === "rebase_in_progress") {
+            const action = change.action && change.action.url
+              ? {
+                  label: change.action.label || "Stop and restart now",
+                  run: async () => {
+                    await guardianAction(change.action.url);
+                    tick();
+                  },
+                }
+              : undefined;
+            showWarningToast(
+              change.message || "You changed the base but there's a rebase in progress. We'll trigger a new rebase once this one completes.",
+              action,
+            );
+          }
+        }
         tick();
       }
       /**
@@ -8546,6 +8743,41 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         el.setAttribute("data-tip", "Confirms the action was accepted and is running in the background.\nDisappears automatically after a few seconds; if it fails, a separate red error toast follows once the failure is detected.");
         root.appendChild(el);
         setTimeout(() => el.remove(), 4000);
+      }
+      /**
+       * Shows a warning toast, optionally with a one-click follow-up action.
+       * @param {string} message
+       * @param {{label: string, run: () => Promise<void>}} [action]
+       * @returns {void}
+       */
+      function showWarningToast(message, action) {
+        const root = document.getElementById("toast-root");
+        if (!root) return;
+        const el = document.createElement("div");
+        el.className = "toast warn";
+        const msg = document.createElement("div");
+        msg.textContent = message;
+        el.appendChild(msg);
+        if (action) {
+          const actions = document.createElement("div");
+          actions.className = "toast-actions";
+          const btn = document.createElement("button");
+          btn.className = "btn";
+          btn.textContent = action.label;
+          btn.onclick = async () => {
+            btn.disabled = true;
+            try {
+              await action.run();
+            } finally {
+              el.remove();
+            }
+          };
+          actions.appendChild(btn);
+          el.appendChild(actions);
+        }
+        el.setAttribute("data-tip", "Warns that the base change was saved while a review rebase was already in progress.\nUse the button to safely stop and restart now, or leave it alone and the board will rebuild again after the current rebase finishes.");
+        root.appendChild(el);
+        setTimeout(() => el.remove(), 8000);
       }
       // POST to a guardian/review action endpoint; on failure, surfaces a
       // deduped toast instead of silently no-oping. `body`, when given, is
@@ -9765,24 +9997,24 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const rows = projects.map((p) => projectRowHtml(p)).join("");
         el.innerHTML = `<table class="proj-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
       }
-      // Jump straight to the exact running cell in the Tasks tab and scroll to it.
+      // Jump straight to a task/cell in the Tasks tab and scroll to it.
       /**
-       * Switches to the Tasks tab and scrolls to a specific running cell.
+       * Switches to the Tasks tab and scrolls to a specific task or cell.
        * @param {string} squadId
        * @param {number} ti
        * @param {number} si
+       * @param {"task"|"cell"} [kind]
        * @returns {void}
        */
-      function jumpToTask(squadId, ti, si) {
-        if (findSquad(squadId)) {
-          selectedSquadId = squadId;
-          sel = { kind: "cell", taskIdx: +ti, cellIdx: +si, proofIdx: -1 };
-          editing = false;
-        } else {
-          pendingHash = { tab: "tasks", squadId, sel: `cell:${ti}:${si}` };
+      function jumpToTask(squadId, ti, si, kind = "cell") {
+        const taskIdx = +ti;
+        const cellIdx = +si;
+        gotoSquadItem(squadId, kind, taskIdx, cellIdx, -1);
+        if (!findSquad(squadId)) {
+          pendingHash = { tab: "tasks", squadId, sel: `${kind}:${taskIdx}:${cellIdx}` };
         }
-        showTab("tasks", true);
-        setTimeout(() => document.getElementById(`n-${ti}-${si}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
+        const scrollId = kind === "task" ? `tk-${taskIdx}` : `n-${taskIdx}-${cellIdx}`;
+        setTimeout(() => document.getElementById(scrollId)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
       }
 
       // ---------- Queue tab (RAL Queue) ----------
@@ -10576,7 +10808,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
 
       document.addEventListener("keydown", (/** @type {KeyboardEvent} */ e) => {
         if (e.key === "Escape") closeModal();
-        else if ((e.key === "l" || e.key === "L") && tab === "tasks" && !/input|textarea/i.test((/** @type {HTMLElement} */ (e.target).tagName || ""))) openLogs();
+        else if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !isTypingShortcutTarget(e.target)) {
+          e.preventDefault();
+          openGotoSearch();
+        } else if ((e.key === "l" || e.key === "L") && tab === "tasks" && !isTypingShortcutTarget(e.target)) openLogs();
       });
       window.addEventListener("popstate", () => {
         _inPopstate = true;

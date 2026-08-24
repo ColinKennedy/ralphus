@@ -751,6 +751,7 @@ impl Store {
                 conflicts_committed INTEGER,
                 is_empty            INTEGER NOT NULL DEFAULT 0,
                 env_overrides       TEXT NOT NULL DEFAULT '{}',
+                started_at_ms       INTEGER,
                 PRIMARY KEY (guardian_id, position)
             );
             -- RAL-193: per-call cost line items for a guardian's own
@@ -1288,6 +1289,18 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN started_at_ms INTEGER",
             "ALTER TABLE tasks ADD COLUMN finished_at_ms INTEGER",
             "ALTER TABLE cells ADD COLUMN finished_at_ms INTEGER",
+            // RAL-259: when a review branch's conflict-resolver agent (fix pass
+            // or final-proof call) most recently began running, so the Review
+            // Live View can show both when work began and how long it's been
+            // going. NULL until a resolver session actually starts. Stamped
+            // via COALESCE once per merge attempt and cleared at each attempt
+            // start (see `Store::clear_branch_started_at`/`stamp_branch_started_at`),
+            // mirroring the cell `started_at_ms` pattern (RAL-210).
+            "ALTER TABLE guardian_branches ADD COLUMN started_at_ms INTEGER",
+            // RAL-259: when this review's manual-checks generation agent most
+            // recently began work, for the manual-checks Live View panel. NULL
+            // until generation starts. Stamped fresh on every regeneration.
+            "ALTER TABLE guardians ADD COLUMN manual_checks_started_at_ms INTEGER",
             // RAL-155: path to an on-disk log file a Cartographer row
             // references (e.g. a RAL-154 durable terminal-log attempt file),
             // carried by path rather than embedding the file's content — see

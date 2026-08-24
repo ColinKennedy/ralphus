@@ -568,6 +568,15 @@ fn start_merge_resolves_conflicts_with_agent() {
         let g = store.lock().unwrap();
         derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
     };
+    // RAL-255: start_merge now defers a still-collecting guardian's merge
+    // while an enabled branch's upstream Cell isn't done yet, so mark both
+    // cells done first -- matching the real precondition for the "Merge /
+    // rebase" button to actually be pressable.
+    {
+        let g = store.lock().unwrap();
+        g.set_cell_state(&run_id, 0, 0, NodeState::Done).unwrap();
+        g.set_cell_state(&run_id, 1, 0, NodeState::Done).unwrap();
+    }
 
     // Simulate the "Merge / rebase" button.
     let runner = Arc::new(ConflictResolvingRunner) as Arc<dyn Runner>;

@@ -89,7 +89,7 @@ RAL-252 is done` comments at each one.
 | **soloed** | A task marked so the scheduler dispatches *only* soloed tasks' cells while any is set — everything else in the squad pauses. |
 | **queue rank** | The live ordering hint for pending work, seeded from `priority` and owned by the Queue view/CLI thereafter. |
 | **gating** | Cross-squad dependency: a squad waiting on another squad's completion. |
-| **sentinel** | A `<<…>>` value resolved at squad time rather than authored literally — e.g. `upstream = "<<task:name>>"` rebases this cell's branch onto that dependency's tip. |
+| **sentinel** | A `<<…>>` value resolved at squad time rather than authored literally — e.g. `upstream = "<<task:name>>"` rebases this cell's branch onto that dependency's tip. `[[task.cell]].review` is another: `<<review:<id>>>` or `<<ralphus:new-review/<key>>>` (RAL-269) — the bare, unwrapped form is a validation error. The reserved `?upstream=` sentinels on a `ralphus:new-worktree/<branch>` placeholder cwd are `<<default>>` (resolve to the repository's default branch — recommended) and `<<current_branch>>` (resolve to whatever branch the project currently has checked out — riskier, since it can change between runs). These `<<…>>` values are reserved: they are never treated as literal branch names, and any other `<<…>>` value is rejected at validation time. `depends_on` is deliberately NOT a sentinel: it's a bare-string lookup into IDs that already exist in the file, nothing about it is resolved or modified later. |
 | **restart_on** | A proof step's declaration that another step firing should re-run this cell's proof cursor. Grammar: `task/cell/proof?on=pass\|fail\|both`. |
 
 ## Components

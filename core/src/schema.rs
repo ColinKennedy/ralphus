@@ -250,8 +250,11 @@ pub fn parse_upstream_task_ref(upstream: &str) -> Option<&str> {
 /// under. The trailing `?upstream=<upstream>` is REQUIRED (see
 /// [`parse_worktree_placeholder_upstream`]) so ralphus always knows what the
 /// branch tracks, rather than guessing from whatever `HEAD` happens to be at
-/// materialization time. The daemon resolves that project, materializes (or
-/// reuses) a git worktree for the branch under
+/// materialization time. The value may be a literal branch name (`main`,
+/// `origin/main`) or one of the reserved sentinels [`WORKTREE_UPSTREAM_DEFAULT`]
+/// / [`WORKTREE_UPSTREAM_CURRENT_BRANCH`], which the daemon expands against
+/// the project before materialization. The daemon resolves that project,
+/// materializes (or reuses) a git worktree for the branch under
 /// `.git/.ralphus_worktrees/<branch>`, and rewrites the cell's `cwd` to that
 /// real path before the cell runs.
 pub const WORKTREE_PLACEHOLDER_PREFIX: &str = "ralphus:new-worktree/";
@@ -312,6 +315,70 @@ pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
         return None;
     }
     Some(value)
+}
+
+/// Find every `<<...>>` placeholder body embedded in `text`, in order.
+///
+/// Unterminated `<<...` runs are ignored and left to callers as literal text.
+/// The returned slices exclude the surrounding `<<` / `>>` delimiters.
+#[must_use]
+pub fn text_placeholders(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while let Some(open_rel) = text[offset..].find("<<") {
+        let open = offset + open_rel;
+        let body_start = open + 2;
+        let Some(close_rel) = text[body_start..].find(">>") else {
+            break;
+        };
+        let close = body_start + close_rel;
+        out.push(&text[body_start..close]);
+        offset = close + 2;
+    }
+    out
+}
+
+/// The first worktree placeholder found in `text`, either as the whole string
+/// itself (`ralphus:new-worktree/...`) or wrapped inside `<<...>>`.
+#[must_use]
+pub fn first_worktree_placeholder_in_text(text: &str) -> Option<&str> {
+    parse_worktree_placeholder(text).map(|_| text).or_else(|| {
+        text_placeholders(text)
+            .into_iter()
+            .find(|body| parse_worktree_placeholder(body).is_some())
+    })
+}
+
+/// Reserved `?upstream=` sentinel value meaning "the repository's default
+/// branch" — expanded daemon-side against the project root (see
+/// `ralphus_daemon::worktrees::resolve_upstream`). Authored as
+/// `?upstream=<<default>>`. The recommended choice: it names a stable,
+/// well-defined tracking target without the caller needing to know the
+/// branch name up front.
+pub const WORKTREE_UPSTREAM_DEFAULT: &str = "<<default>>";
+
+/// Reserved `?upstream=` sentinel value meaning "whatever branch the project
+/// currently has checked out in its registered root/primary worktree" —
+/// expanded daemon-side (see `ralphus_daemon::worktrees::resolve_upstream`).
+/// Authored as `?upstream=<<current_branch>>`. Flagged in the tutor as
+/// riskier than `<<default>>`: the checked-out branch can silently change
+/// between runs, so the tracking target is not stable across submissions.
+pub const WORKTREE_UPSTREAM_CURRENT_BRANCH: &str = "<<current_branch>>";
+
+/// The recognized reserved `?upstream=` sentinels, in alphabetical order
+/// (used to build the actionable "choose one of these" message at submit-time
+/// validation in [`crate::validate`]).
+pub const WORKTREE_UPSTREAM_SENTINELS: [&str; 2] =
+    [WORKTREE_UPSTREAM_CURRENT_BRANCH, WORKTREE_UPSTREAM_DEFAULT];
+
+/// Is `upstream` one of the reserved `?upstream=` sentinels
+/// ([`WORKTREE_UPSTREAM_DEFAULT`] / [`WORKTREE_UPSTREAM_CURRENT_BRANCH`])?
+/// Callers use this to reject any other `<<...>>` value — a typo or an
+/// unsupported sentinel — at validation time, so it fails fast at submit
+/// rather than reaching the daemon. A literal branch name returns `false`.
+#[must_use]
+pub fn is_worktree_upstream_sentinel(upstream: &str) -> bool {
+    WORKTREE_UPSTREAM_SENTINELS.contains(&upstream)
 }
 
 /// The scheme prefix for a new-review placeholder id. A review whose `id` is
@@ -1142,6 +1209,55 @@ mod tests {
             None
         );
         assert_eq!(parse_worktree_placeholder_upstream("/home/me/repo"), None);
+    }
+
+    #[test]
+    fn text_placeholders_extracts_embedded_marker_bodies() {
+        assert_eq!(
+            text_placeholders("prefix <<ralphus:new-worktree/feat?upstream=main>> suffix"),
+            vec!["ralphus:new-worktree/feat?upstream=main"]
+        );
+        assert_eq!(text_placeholders("<<one>><<two>>"), vec!["one", "two"]);
+        assert!(text_placeholders("<<unterminated").is_empty());
+    }
+
+    #[test]
+    fn first_worktree_placeholder_in_text_finds_bare_and_wrapped_forms() {
+        assert_eq!(
+            first_worktree_placeholder_in_text("ralphus:new-worktree/feat?upstream=main"),
+            Some("ralphus:new-worktree/feat?upstream=main")
+        );
+        assert_eq!(
+            first_worktree_placeholder_in_text(
+                "<<ralphus:new-worktree/feat?upstream=main>>/more/text"
+            ),
+            Some("ralphus:new-worktree/feat?upstream=main")
+        );
+        assert_eq!(first_worktree_placeholder_in_text("<<unknown>>"), None);
+    }
+
+    #[test]
+    fn worktree_upstream_sentinel_recognition() {
+        // Both reserved sentinels parse as ordinary upstream values and are
+        // recognized as such.
+        assert_eq!(
+            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?upstream=<<default>>"),
+            Some("<<default>>")
+        );
+        assert_eq!(
+            parse_worktree_placeholder_upstream(
+                "ralphus:new-worktree/feat?upstream=<<current_branch>>"
+            ),
+            Some("<<current_branch>>")
+        );
+        assert!(is_worktree_upstream_sentinel("<<default>>"));
+        assert!(is_worktree_upstream_sentinel("<<current_branch>>"));
+
+        // A plain branch name, or a `<<...>>` typo/unsupported sentinel, is
+        // NOT a recognized sentinel -- the latter must fail validation fast.
+        assert!(!is_worktree_upstream_sentinel("main"));
+        assert!(!is_worktree_upstream_sentinel("<<does-not-exist>>"));
+        assert!(!is_worktree_upstream_sentinel(""));
     }
 
     // ── machine URI parsing (RAL-185) ─────────────────────────────────────
