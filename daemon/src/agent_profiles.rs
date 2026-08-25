@@ -14,6 +14,7 @@ const PROFILE_BACKENDS: &[&str] = &[
     "claude",
     "claude-code",
     "codex",
+    "pi",
     "ollama",
     "anthropic",
     "raw",
@@ -86,7 +87,7 @@ fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, Str
         }
         if is_native_backend(&profile.backend) && profile.executable.is_some() {
             return Err(format!(
-                "{}: agent profile \"{name}\" sets executable for native backend {:?}; executable is only meaningful for claude-code, codex, or raw",
+                "{}: agent profile \"{name}\" sets executable for native backend {:?}; executable is only meaningful for claude-code, codex, pi, or raw",
                 path.display(),
                 profile.backend
             ));
@@ -204,6 +205,7 @@ pub fn normalize_builtin_agent(agent: &str) -> Option<&'static str> {
         "raw" => Some("raw"),
         "claude-code" | "claude-cli" => Some("claude-code"),
         "codex" | "codex-cli" => Some("codex"),
+        "pi" => Some("pi"),
         _ => None,
     }
 }
@@ -248,7 +250,7 @@ fn config_cwd_for_cell(
     cell: &ralphus_core::schema::CellDef,
 ) -> Option<PathBuf> {
     if let Some(cwd) = cell.cwd.as_deref() {
-        if ralphus_core::schema::parse_worktree_placeholder(cwd).is_none() {
+        if ralphus_core::schema::first_worktree_placeholder_in_text(cwd).is_none() {
             return Some(PathBuf::from(cwd));
         }
     }
@@ -330,8 +332,8 @@ fn validate_task_file_profiles_with(
                     kind: ErrorKind::InvalidValue,
                     message: format!(
                         "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
-                         support system_prompt/system_prompt_position (only claude-code and \
-                         codex backends do)",
+                         support system_prompt/system_prompt_position (only claude-code, \
+                         codex, and pi backends do)",
                         selection.backend
                     ),
                     line: None,
@@ -836,6 +838,6 @@ executable = "should-not-be-here"
         )
         .expect("rewrite config");
         let err = parse_profile_file(&config).expect_err("native executable error");
-        assert!(err.contains("executable is only meaningful for claude-code, codex, or raw"));
+        assert!(err.contains("executable is only meaningful for claude-code, codex, pi, or raw"));
     }
 }

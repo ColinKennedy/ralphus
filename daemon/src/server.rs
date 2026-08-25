@@ -985,7 +985,7 @@ fn validate_projects_registered(
         let needs_project = task.cell.iter().any(|s| {
             s.cwd
                 .as_deref()
-                .and_then(ralphus_core::schema::parse_worktree_placeholder)
+                .and_then(ralphus_core::schema::first_worktree_placeholder_in_text)
                 .is_some()
         });
         if !needs_project {
@@ -1048,7 +1048,7 @@ fn validate_remote_reviews_are_declarative(
             if cell
                 .cwd
                 .as_deref()
-                .and_then(ralphus_core::schema::parse_worktree_placeholder)
+                .and_then(ralphus_core::schema::first_worktree_placeholder_in_text)
                 .is_none()
             {
                 return Err(format!(
@@ -4717,7 +4717,8 @@ fn resolver_task_and_cell_id(
 // build the exact same resume command line -- see `ralphus_core::agent_resume`
 // for the logic and its tests.
 use ralphus_core::agent_resume::{
-    is_codex_agent, resume_agent_command, resume_codex_agent_command,
+    is_codex_agent, is_pi_agent, resume_agent_command, resume_codex_agent_command,
+    resume_pi_agent_command,
 };
 
 fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
@@ -4742,6 +4743,9 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
         let program =
             std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
         resume_codex_agent_command(&program, cell_id)
+    } else if is_pi_agent(agent) {
+        let program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
+        resume_pi_agent_command(&program, cell_id)
     } else {
         // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
         // same override point resolves both the headless squad and this
@@ -9536,6 +9540,13 @@ machine=\"incredibuild:B\"
         assert!(!is_codex_agent(Some("claude-cli")));
         assert!(!is_codex_agent(Some("ollama")));
         assert!(!is_codex_agent(None));
+    }
+
+    #[test]
+    fn resume_pi_agent_command_uses_pi_flags() {
+        let cmd = resume_pi_agent_command("pi", "sess-123");
+        assert!(cmd.contains("--session 'sess-123'"));
+        assert!(cmd.contains("--approve"));
     }
 
     #[test]

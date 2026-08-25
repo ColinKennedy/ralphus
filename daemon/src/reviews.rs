@@ -343,6 +343,7 @@ fn remote_cell_derivation(
     // this point `resolve_placeholders` has rewritten cwd to a path on the
     // remote machine, which says nothing about the branch name.
     let branch = raw_cwd
+        .and_then(ralphus_core::schema::first_worktree_placeholder_in_text)
         .and_then(ralphus_core::schema::parse_worktree_placeholder)
         .map(str::to_string)
         .ok_or_else(|| {

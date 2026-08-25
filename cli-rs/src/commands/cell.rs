@@ -165,6 +165,17 @@ fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str)
         cmd.push("exec".to_string());
         cmd.push("resume".to_string());
         cmd.push(agent_session_id.to_string());
+    } else if matches!(agent, Some("pi")) {
+        cmd = vec![
+            "pi".to_string(),
+            "--session".to_string(),
+            agent_session_id.to_string(),
+            "--approve".to_string(),
+        ];
+        if mode == "readonly" {
+            cmd.push("--append-system-prompt".to_string());
+            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
+        }
     } else {
         cmd = vec![
             "claude".to_string(),
@@ -480,6 +491,12 @@ mod tests {
     fn agent_resume_command_uses_claude_by_default() {
         let cmd = agent_resume_command(Some("claude"), "sess-1", "open");
         assert_eq!(cmd, vec!["claude", "--resume", "sess-1"]);
+    }
+
+    #[test]
+    fn agent_resume_command_uses_pi_for_pi_agents() {
+        let cmd = agent_resume_command(Some("pi"), "sess-1", "open");
+        assert_eq!(cmd, vec!["pi", "--session", "sess-1", "--approve"]);
     }
 
     #[test]

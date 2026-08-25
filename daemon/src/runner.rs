@@ -845,7 +845,7 @@ impl SubprocessRunner {
             let already_timed_out = timed_out(started.elapsed(), deadline);
             let reason = if !matches!(
                 attempt_spec.agent.as_str(),
-                "claude-code" | "claude-cli" | "codex" | "codex-cli"
+                "claude-code" | "claude-cli" | "codex" | "codex-cli" | "pi"
             ) {
                 "agent does not support resume"
             } else if resumable_agent_session_id.is_none() {

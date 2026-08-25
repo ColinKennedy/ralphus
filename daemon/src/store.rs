@@ -680,6 +680,7 @@ impl Store {
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
+                materialized_env_overrides TEXT,
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
                 PRIMARY KEY (squad_id, task_idx, idx)
@@ -703,6 +704,7 @@ impl Store {
                 budget_tokens INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
+                materialized_env_overrides TEXT,
                 PRIMARY KEY (squad_id, task_idx, scope, cell_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS guardians (
@@ -1229,6 +1231,12 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN proof_env_overrides TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE cells ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE cells ADD COLUMN proof_env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-267: the effective env map a cell first started with, after
+            // placeholder expansion against its task's project type. Stored
+            // separately from the authored override layers so retries/restarts
+            // reuse the already-materialized values without changing what the
+            // board/API means by `env_overrides`.
+            "ALTER TABLE cells ADD COLUMN materialized_env_overrides TEXT",
             // RAL-157: a task can be "soloed" to pause its non-soloed siblings
             // within the same squad -- see `Store::solo_task`/`unsolo_task` and the
             // scheduler dispatcher's live solo gate. Multiple tasks in the same
@@ -1245,6 +1253,9 @@ impl Store {
             // same key to different values must not collide. See
             // `Store::resolve_task_proof_step_env_overrides` and its sibling.
             "ALTER TABLE proofs ADD COLUMN env_overrides TEXT NOT NULL DEFAULT '{}'",
+            // RAL-267: proof-step analogue of
+            // `cells.materialized_env_overrides`.
+            "ALTER TABLE proofs ADD COLUMN materialized_env_overrides TEXT",
             // RAL-191: a review branch's own env overrides, layered on top of
             // whatever its *source cell* resolves to, so a review worktree
             // inherits the environment the work was produced under. Unlike
@@ -2164,6 +2175,19 @@ impl Store {
             .optional()?)
     }
 
+    /// The registered project name for one task, if any.
+    pub fn task_project_at(&self, squad_id: &str, task_idx: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT project FROM tasks WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// The cell id (`sid`) at `(squad_id, task_idx, cell_idx)`, or `None`
     /// if no such cell exists. Used the same way as [`Store::task_name_at`]
     /// to translate an index-addressed [`crate::entity_uri::EntityUri::Cell`]
@@ -2842,6 +2866,42 @@ impl Store {
         Ok(())
     }
 
+    /// The effective environment map a cell first started with, after
+    /// placeholder expansion. `None` means the cell has not materialized one
+    /// yet; `Some({})` means it did, and it resolved to an empty map.
+    pub fn get_cell_materialized_env_overrides(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT materialized_env_overrides FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.as_deref().map(from_json_map))
+    }
+
+    /// Persist the effective environment map a cell first started with.
+    pub fn set_cell_materialized_env_overrides(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        env: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET materialized_env_overrides=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![to_json_map(env), squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
     /// Persist the effective read-only system prompt shown for a proof step in
     /// the board details pane.
     pub fn set_proof_effective_system_prompt(
@@ -2856,6 +2916,47 @@ impl Store {
         self.conn.execute(
             "UPDATE proofs SET effective_system_prompt=? WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
             params![system_prompt, squad_id, task_idx, scope, cell_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// The effective environment map a proof step first started with, after
+    /// placeholder expansion. `None` means it has not materialized one yet.
+    pub fn get_proof_materialized_env_overrides(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT materialized_env_overrides FROM proofs
+                 WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.as_deref().map(from_json_map))
+    }
+
+    /// Persist the effective environment map a proof step first started with.
+    pub fn set_proof_materialized_env_overrides(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+        env: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET materialized_env_overrides=?
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![to_json_map(env), squad_id, task_idx, scope, cell_idx, idx],
         )?;
         Ok(())
     }

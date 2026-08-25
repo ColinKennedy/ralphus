@@ -172,8 +172,9 @@ pub struct CellDef {
     /// System-prompt text delivered to the agent as an *appended* system prompt
     /// (via the backend's own mechanism, e.g. the Claude Code CLI's
     /// `--append-system-prompt`) rather than concatenated into the user prompt.
-    /// Cell-level only; validation restricts it to the `claude-code` backend
-    /// until the other backends' support is complete (RAL-5).
+    /// Cell-level only; validation restricts it to backends with complete
+    /// appended-system-prompt support (currently `claude-code`, `codex`, and
+    /// `pi`) until the other backends' support is complete (RAL-5).
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// Where [`system_prompt`](Self::system_prompt) is placed. The only accepted
@@ -745,6 +746,7 @@ pub const RESERVED_AGENT_NAMES: &[&str] = &[
     "claude-cli",
     "codex",
     "codex-cli",
+    "pi",
     "raw",
 ];
 
@@ -754,9 +756,9 @@ pub const RESERVED_AGENT_NAMES: &[&str] = &[
 /// appended system prompt to a real backend flag (`--append-system-prompt`);
 /// the Codex CLI (`codex`, and its `codex-cli` alias) maps it to its own
 /// config-override mechanism (`-c developer_instructions=...` -- there is no
-/// dedicated flag). Support for other backends is best-effort but not
-/// complete, so validation rejects `system_prompt`/`system_prompt_position`
-/// for any other agent (RAL-5).
+/// dedicated flag); Pi maps it to `--append-system-prompt`. Support for other
+/// backends is best-effort but not complete, so validation rejects
+/// `system_prompt`/`system_prompt_position` for any other agent (RAL-5).
 ///
 /// Also used, unmodified, to test a *resolved backend* string (e.g. a custom
 /// agent profile's `backend = "claude-code"`) -- see
@@ -765,7 +767,10 @@ pub const RESERVED_AGENT_NAMES: &[&str] = &[
 /// itself defers on any agent name outside [`RESERVED_AGENT_NAMES`].
 #[must_use]
 pub fn agent_supports_system_prompt(agent: &str) -> bool {
-    matches!(agent, "claude-code" | "claude-cli" | "codex" | "codex-cli")
+    matches!(
+        agent,
+        "claude-code" | "claude-cli" | "codex" | "codex-cli" | "pi"
+    )
 }
 
 impl ResolvedAgent {

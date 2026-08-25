@@ -8,6 +8,7 @@ use crate::backend::{BackendOutcome, ModelBackend, RunOptions};
 use crate::claude_code_backend::ClaudeCodeBackend;
 use crate::codex_backend::CodexBackend;
 use crate::harness_backend::HarnessBackend;
+use crate::pi_backend::PiBackend;
 use crate::spec::{CellResult, CellSpec};
 use crate::tools::Workspace;
 
@@ -54,7 +55,7 @@ const GHOST_MAX_CHARS: usize = 4000;
 const COMMAND_TAIL_CHARS: usize = 2000;
 
 /// Resolves an agent name to its backend, mirroring the three-way dispatch
-/// documented in `runner/__main__.py::_load_backend`: `claude-code`/`codex`
+/// documented in `runner/__main__.py::_load_backend`: `claude-code`/`codex`/`pi`
 /// drive an external CLI with stream parsing; `claude`/`anthropic`/`ollama`
 /// use the hand-rolled tool loop; `raw` is the explicit generic harness.
 fn load_backend(
@@ -71,6 +72,10 @@ fn load_backend(
             keep_temporary_files,
             program_override: executable.map(str::to_string),
         })),
+        "pi" => Ok(Box::new(PiBackend {
+            keep_temporary_files,
+            program_override: executable.map(str::to_string),
+        })),
         "claude" | "anthropic" | "ollama" => Ok(Box::new(AgentBackend {
             agent: agent.to_string(),
         })),
@@ -80,7 +85,7 @@ fn load_backend(
                 .to_string(),
         })),
         other => Err(format!(
-            "unknown backend {other:?}; expected claude, anthropic, ollama, claude-code, codex, or raw"
+            "unknown backend {other:?}; expected claude, anthropic, ollama, claude-code, codex, pi, or raw"
         )),
     }
 }

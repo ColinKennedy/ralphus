@@ -1,5 +1,5 @@
 //! Builds the local CLI command line that resumes a CLI-agent conversation
-//! (`claude --resume <id>` / `codex exec resume <id>`).
+//! (`claude --resume <id>` / `codex exec resume <id>` / `pi --session <id>`).
 //!
 //! Shared by the daemon (which prints this command for its `open-terminal`
 //! HTTP endpoints) and the CLI (`ralphus session terminal` / `ralphus review
@@ -31,13 +31,25 @@ pub fn resume_codex_agent_command(program: &str, session_id: &str) -> String {
     )
 }
 
+/// Pi resumes a concrete session via `--session <id>` and uses `--approve`
+/// to trust project-local files for the resumed run.
+#[must_use]
+pub fn resume_pi_agent_command(program: &str, session_id: &str) -> String {
+    let safe_program = program.replace('\'', "''");
+    let safe_session = session_id.replace('\'', "''");
+    format!("& '{safe_program}' --session '{safe_session}' --approve")
+}
+
 /// True when `agent` identifies a Codex-family backend (`codex`/`codex-cli`).
-/// Anything else -- including `claude-code`/`claude-cli`, `None` (an older
-/// row from before the `agent` column was threaded through this lookup), or
-/// any other string -- resumes via the Claude Code CLI.
 #[must_use]
 pub fn is_codex_agent(agent: Option<&str>) -> bool {
     matches!(agent, Some("codex" | "codex-cli"))
+}
+
+/// True when `agent` identifies the Pi backend.
+#[must_use]
+pub fn is_pi_agent(agent: Option<&str>) -> bool {
+    matches!(agent, Some("pi"))
 }
 
 #[cfg(test)]
@@ -75,6 +87,14 @@ mod tests {
     }
 
     #[test]
+    fn resume_pi_agent_command_uses_session_and_approve() {
+        let cmd = resume_pi_agent_command("pi", "session-123");
+        assert!(cmd.contains("--session 'session-123'"));
+        assert!(cmd.contains("--approve"));
+        assert!(cmd.contains("& 'pi'"));
+    }
+
+    #[test]
     fn is_codex_agent_matches_both_aliases() {
         assert!(is_codex_agent(Some("codex")));
         assert!(is_codex_agent(Some("codex-cli")));
@@ -86,5 +106,13 @@ mod tests {
         assert!(!is_codex_agent(Some("claude-cli")));
         assert!(!is_codex_agent(Some("ollama")));
         assert!(!is_codex_agent(None));
+    }
+
+    #[test]
+    fn is_pi_agent_only_matches_pi() {
+        assert!(is_pi_agent(Some("pi")));
+        assert!(!is_pi_agent(Some("codex")));
+        assert!(!is_pi_agent(Some("claude-code")));
+        assert!(!is_pi_agent(None));
     }
 }
