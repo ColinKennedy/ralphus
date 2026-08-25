@@ -101,6 +101,30 @@ pub fn token_path() -> PathBuf {
 }
 
 /// Command-line action parsed from the daemon's arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpCommand {
+    Serve,
+    Validate,
+    Mux,
+    Stop,
+    License,
+    Version,
+}
+
+impl HelpCommand {
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Validate => "validate",
+            Self::Mux => "mux",
+            Self::Stop => "stop",
+            Self::License => "license",
+            Self::Version => "version",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Print version and exit.
@@ -108,7 +132,7 @@ pub enum Command {
     /// Print the embedded LICENSE text and exit.
     License,
     /// Print usage and exit.
-    Help,
+    Help(Option<HelpCommand>),
     /// Run the daemon (serve the HTTP API).
     Serve {
         /// Port the HTTP API binds to on `127.0.0.1` (see [`resolve_bind_host`]
@@ -143,25 +167,71 @@ pub enum Command {
 /// `Help` so the binary always has a well-defined, non-panicking behavior.
 #[must_use]
 pub fn parse_args(args: &[String]) -> Command {
-    match args.first().map(String::as_str) {
-        Some("--version" | "-V" | "version") => Command::Version,
-        Some("license") => Command::License,
-        Some("serve") => {
+    if let Some(command) = requested_help(args) {
+        return Command::Help(command);
+    }
+    let Some(first) = args.first().map(String::as_str) else {
+        return Command::Help(None);
+    };
+    if matches!(first, "--version" | "-V") {
+        return Command::Version;
+    }
+    match registered_command(first) {
+        Some(HelpCommand::Version) => Command::Version,
+        Some(HelpCommand::License) => Command::License,
+        Some(HelpCommand::Serve) => {
             let tail = &args[1..];
             let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
             let db = parse_db_flag(tail);
             Command::Serve { port, db }
         }
-        Some("validate") => Command::Validate(args.get(1).cloned().unwrap_or_default()),
-        Some("mux") => Command::Mux(args[1..].to_vec()),
-        Some("stop") => {
+        Some(HelpCommand::Validate) => Command::Validate(args.get(1).cloned().unwrap_or_default()),
+        Some(HelpCommand::Mux) => Command::Mux(args[1..].to_vec()),
+        Some(HelpCommand::Stop) => {
             let tail = &args[1..];
             let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
             let auto_cancel = tail.iter().any(|a| a == "--auto-cancel");
             Command::Stop { port, auto_cancel }
         }
-        _ => Command::Help,
+        None => Command::Help(None),
     }
+}
+
+fn registered_command(name: &str) -> Option<HelpCommand> {
+    match name {
+        "serve" => Some(HelpCommand::Serve),
+        "validate" => Some(HelpCommand::Validate),
+        "mux" => Some(HelpCommand::Mux),
+        "stop" => Some(HelpCommand::Stop),
+        "license" => Some(HelpCommand::License),
+        "version" => Some(HelpCommand::Version),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+const HELP_COMMANDS: &[HelpCommand] = &[
+    HelpCommand::Serve,
+    HelpCommand::Validate,
+    HelpCommand::Mux,
+    HelpCommand::Stop,
+    HelpCommand::License,
+    HelpCommand::Version,
+];
+
+fn requested_help(args: &[String]) -> Option<Option<HelpCommand>> {
+    let before_separator: Vec<&String> =
+        args.iter().take_while(|arg| arg.as_str() != "--").collect();
+    if !before_separator
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return None;
+    }
+    let command = before_separator
+        .first()
+        .and_then(|arg| registered_command(arg.as_str()));
+    Some(command)
 }
 
 /// Extract `--port <N>` from the argument tail, if present and valid.
@@ -190,8 +260,55 @@ fn parse_db_flag(tail: &[String]) -> Option<PathBuf> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n",
+        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n",
         ralphus_core::version()
+    )
+}
+
+/// Detailed help for one registered daemon command.
+#[must_use]
+pub fn command_usage(command: Option<HelpCommand>) -> String {
+    let Some(command) = command else {
+        return usage();
+    };
+    let (summary, invocation, details) = match command {
+        HelpCommand::Serve => (
+            "Run the daemon and serve the HTTP/JSON API.",
+            "ralphus-daemon serve [--port <integer>] [--db <path>]",
+            format!(
+                "    --port <integer>    TCP port to bind (default {DEFAULT_PORT})\n    --db <path>        SQLite database path\n"
+            ),
+        ),
+        HelpCommand::Validate => (
+            "Validate one task TOML file offline.",
+            "ralphus-daemon validate <file>",
+            "    <file>              Task TOML path to validate\n".to_string(),
+        ),
+        HelpCommand::Mux => (
+            "Forward arguments to the configured tmux-compatible program.",
+            "ralphus-daemon mux <args...>",
+            "    <args...>           Arguments forwarded verbatim to tmux\n".to_string(),
+        ),
+        HelpCommand::Stop => (
+            "Ask a running daemon to stop.",
+            "ralphus-daemon stop [--port <integer>] [--auto-cancel]",
+            format!(
+                "    --port <integer>    Daemon TCP port (default {DEFAULT_PORT})\n    --auto-cancel       Cancel in-flight work before shutdown\n"
+            ),
+        ),
+        HelpCommand::License => (
+            "Print the embedded LICENSE text.",
+            "ralphus-daemon license",
+            String::new(),
+        ),
+        HelpCommand::Version => (
+            "Print the daemon version.",
+            "ralphus-daemon version",
+            String::new(),
+        ),
+    };
+    format!(
+        "{invocation} -- {summary}\n\nUSAGE:\n    {invocation}\n\nARGUMENTS AND OPTIONS:\n{details}    -h, --help         Print help and exit\n"
     )
 }
 
@@ -341,8 +458,8 @@ mod tests {
 
     #[test]
     fn unknown_and_empty_fall_back_to_help() {
-        assert_eq!(parse_args(&args(&[])), Command::Help);
-        assert_eq!(parse_args(&args(&["wat"])), Command::Help);
+        assert_eq!(parse_args(&args(&[])), Command::Help(None));
+        assert_eq!(parse_args(&args(&["wat"])), Command::Help(None));
     }
 
     #[test]
@@ -387,6 +504,27 @@ mod tests {
     #[test]
     fn usage_mentions_license() {
         assert!(usage().contains("license"));
+    }
+
+    #[test]
+    fn help_precedes_every_daemon_command_argument() {
+        for command in HELP_COMMANDS {
+            assert_eq!(
+                parse_args(&args(&[command.name(), "--bad", "--help"])),
+                Command::Help(Some(*command))
+            );
+            let text = command_usage(Some(*command));
+            assert!(text.contains("-h, --help"));
+            assert!(text.contains("USAGE:"));
+        }
+    }
+
+    #[test]
+    fn help_after_separator_is_forwarded() {
+        assert_eq!(
+            parse_args(&args(&["mux", "--", "--help"])),
+            Command::Mux(args(&["--", "--help"]))
+        );
     }
 
     #[test]

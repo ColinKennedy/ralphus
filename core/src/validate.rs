@@ -554,10 +554,11 @@ fn validate_cells(
                 // A non-empty string (the two guarded arms above handled empty /
                 // non-string cases): check whether it's a worktree placeholder.
                 if let Some(s) = v.as_str() {
-                    if crate::schema::parse_worktree_placeholder(s).is_some() {
+                    if let Some(placeholder) = crate::schema::first_worktree_placeholder_in_text(s)
+                    {
                         has_placeholder = true;
                         let line = ctx.key_line(header, "cwd");
-                        match crate::schema::parse_worktree_placeholder_upstream(s) {
+                        match crate::schema::parse_worktree_placeholder_upstream(placeholder) {
                             None => ctx.error(
                                 &format!("{path}.cwd"),
                                 ErrorKind::MissingRequired,
@@ -2679,6 +2680,26 @@ command = "cargo build"
         let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/origin/feature/x?upstream=origin/blah\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn wrapped_placeholder_cwd_with_project_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>/more/text\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn wrapped_placeholder_cwd_without_upstream_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat>>/more/text\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("upstream")),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //! resolved and persisted, a restarted squad reads the real path back from the
 //! store — the placeholder string is gone; there's nothing left to resolve.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use opentelemetry::Context;
@@ -35,7 +35,7 @@ use opentelemetry::trace::{SpanKind, Status};
 
 use crate::guardian_merge::git;
 use crate::otel;
-use crate::store::{CellRow, Store, TaskRow};
+use crate::store::{CellRow, ProjectView, Store, TaskRow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchMaterialization {
@@ -43,6 +43,28 @@ enum BranchMaterialization {
     NewFromRemote { remote_ref: String },
     NewFromHead { warning: Option<String> },
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlaceholderContext<'a> {
+    pub(crate) squad_id: &'a str,
+    pub(crate) task_idx: i64,
+    pub(crate) cell_idx: i64,
+    pub(crate) task_name: &'a str,
+    pub(crate) cell_id: &'a str,
+    pub(crate) machine: Option<&'a str>,
+}
+
+trait ProjectStartupAdapter {
+    fn resolve_placeholder(
+        &self,
+        store: &Store,
+        project: &ProjectView,
+        placeholder: &str,
+        ctx: PlaceholderContext<'_>,
+    ) -> Result<Option<String>, String>;
+}
+
+struct GitProjectStartupAdapter;
 
 /// The on-disk worktree directory for `branch` under a project's `root`:
 /// `.git/.ralphus/w/<short>`, `<short>` a truncated form of `branch` (see
@@ -907,80 +929,39 @@ fn resolve_placeholders_inner(
         let Some(cwd) = cell.cwd.clone() else {
             continue;
         };
-        let Some(branch) = classify_placeholder(&cwd).map_err(|e| {
+        classify_placeholder(&cwd).map_err(|e| {
             format!(
                 "cell '{}': could not resolve cwd \"{cwd}\": {e}",
                 cell.cell_id
             )
-        })?
-        else {
+        })?;
+        let Some(project_name) = task_projects.get(&cell.task_idx).copied().flatten() else {
+            if ralphus_core::schema::first_worktree_placeholder_in_text(&cwd).is_some() {
+                return Err(format!(
+                    "cell '{}': task \"{}\" has no 'project' set for its placeholder cwd",
+                    cell.cell_id, cell.task_name
+                ));
+            }
             continue;
         };
-        // Submit-time validation (`ralphus_core::validate`) already requires
-        // every placeholder cwd to carry an explicit `?upstream=`; this is the
-        // scheduler's own defensive re-check for stale/hand-edited data (the
-        // same reasoning as the project-registration check below).
-        let upstream =
-            ralphus_core::schema::parse_worktree_placeholder_upstream(&cwd).ok_or_else(|| {
-                format!(
-                    "cell '{}': cwd \"{cwd}\" is missing the required \"?upstream=<upstream>\" \
-                     suffix (e.g. \"{}{branch}?upstream=main\")",
-                    cell.cell_id,
-                    ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
-                )
-            })?;
-        // RAL-185: the same placeholder on two different machines must
-        // materialize two different workspaces, so the memo key carries the
-        // machine. A purely `cwd`-keyed cache would hand machine B the path
-        // machine A was given.
-        let cache_key = format!("{}\u{0}{cwd}", cell.machine.as_deref().unwrap_or(""));
-        let resolved = if let Some(cached) = cache.get(&cache_key) {
-            cached.clone()
-        } else {
-            let project_name = task_projects
-                .get(&cell.task_idx)
-                .copied()
-                .flatten()
-                .ok_or_else(|| {
-                    format!(
-                        "cell '{}': task \"{}\" has no 'project' set for its placeholder cwd",
-                        cell.cell_id, cell.task_name
-                    )
-                })?;
-            let project = store
-                .resolve_project(project_name)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "cell '{}': project \"{project_name}\" is not registered",
-                        cell.cell_id
-                    )
-                })?;
-            let resolved = match cell.machine.as_deref() {
-                // Remote: the provider owns workspace creation on its own
-                // machine. Materializing locally and shipping the path would
-                // point the agent at a directory that either doesn't exist
-                // there or — on a fleet with a matching layout — is the wrong
-                // checkout entirely.
-                Some(machine) if !machine.trim().is_empty() => {
-                    provision_remote(store, machine, &project, branch, cell, squad_id)?
-                }
-                _ => {
-                    let wt = ensure_worktree(Path::new(&project.path), branch, upstream).map_err(
-                        |e| {
-                            format!(
-                                "cell '{}': could not materialize worktree for \"{cwd}\": {e}",
-                                cell.cell_id
-                            )
-                        },
-                    )?;
-                    wt.to_string_lossy().into_owned()
-                }
-            };
-            cache.insert(cache_key, resolved.clone());
-            materialized += 1;
-            resolved
-        };
+        let cache_before = cache.len();
+        let resolved = resolve_placeholder_text_for_project(
+            store,
+            project_name,
+            &cwd,
+            placeholder_context_for_cell(squad_id, cell),
+            &mut cache,
+        )
+        .map_err(|e| {
+            format!(
+                "cell '{}': could not resolve cwd \"{cwd}\": {e}",
+                cell.cell_id
+            )
+        })?;
+        materialized += cache.len().saturating_sub(cache_before);
+        if resolved == cwd {
+            continue;
+        }
         store
             .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
@@ -1834,6 +1815,48 @@ mod tests {
         let resolved = cells[0].cwd.clone().expect("resolved cwd");
         assert_eq!(resolved, worktree_dir(&repo, "feat-a").to_string_lossy());
         assert!(Path::new(&resolved).join(".git").exists());
+    }
+
+    #[test]
+    fn resolve_placeholders_expands_a_wrapped_placeholder_inside_cwd_text() {
+        let repo = init_repo("wrapped-cwd");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("myproj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("<<ralphus:new-worktree/feat-wrapped?upstream=main>>/more/text"),
+        )];
+        let tasks = vec![task_row(0, Some("myproj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize wrapped cwd");
+        let resolved = cells[0].cwd.clone().expect("resolved cwd");
+        assert_eq!(
+            Path::new(&resolved),
+            worktree_dir(&repo, "feat-wrapped")
+                .join("more")
+                .join("text")
+        );
+    }
+
+    #[test]
+    fn resolve_placeholders_preserves_unknown_wrapped_text_in_cwd() {
+        let repo = init_repo("unknown-wrapped-cwd");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("myproj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let raw = "prefix/<<not-a-ralphus-placeholder>>/suffix";
+        let mut cells = vec![cell_row(0, 0, "s0", Some(raw))];
+        let tasks = vec![task_row(0, Some("myproj"))];
+
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("unknown placeholder text must pass through");
+
+        assert_eq!(cells[0].cwd.as_deref(), Some(raw));
     }
 
     #[test]

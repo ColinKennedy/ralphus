@@ -21,9 +21,34 @@ use ralphus_runner::{config, otel};
 /// Must match `daemon/src/runner.rs::TMUX_DONE_MARKER`.
 const TMUX_DONE_MARKER: &str = "RALPHUS_TMUX_DONE";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpCommand {
+    Send,
+    License,
+    Version,
+}
+
+impl HelpCommand {
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Send => "send",
+            Self::License => "license",
+            Self::Version => "version",
+        }
+    }
+}
+
+#[cfg(test)]
+const HELP_COMMANDS: &[HelpCommand] = &[
+    HelpCommand::Send,
+    HelpCommand::License,
+    HelpCommand::Version,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
-    Help,
+    Help(Option<HelpCommand>),
     Version,
     License,
     Send {
@@ -39,7 +64,7 @@ fn main() -> std::process::ExitCode {
     std::hint::black_box(ralphus_core::license::embedded_license());
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&raw_args) {
-        Command::Help => print_help(),
+        Command::Help(command) => print_help(command),
         Command::Version => print_version(),
         Command::License => print_license(),
         Command::Send {
@@ -54,8 +79,8 @@ fn main() -> std::process::ExitCode {
 /// `finish` below) exists to protect, hence the local opt-out from the
 /// workspace-wide `clippy::print_stdout = "deny"`.
 #[allow(clippy::print_stdout)]
-fn print_help() -> std::process::ExitCode {
-    print!("{}", usage());
+fn print_help(command: Option<HelpCommand>) -> std::process::ExitCode {
+    print!("{}", usage(command));
     std::process::ExitCode::SUCCESS
 }
 
@@ -107,13 +132,44 @@ fn send(spec_path: Option<&str>, result_file: Option<&str>) -> std::process::Exi
 /// historical "implicit send" argv shape remains accepted as a compatibility
 /// fallback for callers that still invoke `ralphus-runner [spec]`.
 fn parse_args(args: &[String]) -> Command {
-    match args.first().map(String::as_str) {
-        Some("--version" | "-V" | "version") => Command::Version,
-        Some("license") => Command::License,
-        Some("--help" | "-h" | "help") => Command::Help,
-        Some("send") => parse_send_args(&args[1..]),
-        _ => parse_send_args(args),
+    if let Some(command) = requested_help(args) {
+        return Command::Help(command);
     }
+    match args.first().map(String::as_str) {
+        Some("--version" | "-V") => Command::Version,
+        Some("help") => Command::Help(None),
+        Some(name) => match registered_command(name) {
+            Some(HelpCommand::Version) => Command::Version,
+            Some(HelpCommand::License) => Command::License,
+            Some(HelpCommand::Send) => parse_send_args(&args[1..]),
+            None => parse_send_args(args),
+        },
+        None => parse_send_args(args),
+    }
+}
+
+fn registered_command(name: &str) -> Option<HelpCommand> {
+    match name {
+        "send" => Some(HelpCommand::Send),
+        "license" => Some(HelpCommand::License),
+        "version" => Some(HelpCommand::Version),
+        _ => None,
+    }
+}
+
+fn requested_help(args: &[String]) -> Option<Option<HelpCommand>> {
+    let before_separator: Vec<&String> =
+        args.iter().take_while(|arg| arg.as_str() != "--").collect();
+    if !before_separator
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return None;
+    }
+    let command = before_separator
+        .first()
+        .and_then(|arg| registered_command(arg.as_str()));
+    Some(command)
 }
 
 /// Splits an optional `--result-file PATH` out of a `send` invocation,
@@ -137,11 +193,16 @@ fn parse_send_args(args: &[String]) -> Command {
     }
 }
 
-fn usage() -> String {
-    format!(
-        "ralphus-runner {}\n\nUSAGE:\n    ralphus-runner send [spec.json] [--result-file <path>]\n    ralphus-runner license\n    ralphus-runner version\n    ralphus-runner help\n\nCOMMANDS:\n    send              Execute one cell spec from stdin or a file path\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n",
-        ralphus_core::version()
-    )
+fn usage(command: Option<HelpCommand>) -> String {
+    match command {
+        Some(HelpCommand::Send) => "ralphus-runner send -- Execute one cell specification.\n\nUSAGE:\n    ralphus-runner send [spec.json] [--result-file <path>]\n\nARGUMENTS:\n    spec.json             Optional JSON file; stdin is used when omitted\n\nOPTIONS:\n    --result-file <path>  Write the CellResult JSON to this path\n    -h, --help            Print help and exit\n".to_string(),
+        Some(HelpCommand::License) => "ralphus-runner license -- Print the embedded LICENSE text.\n\nUSAGE:\n    ralphus-runner license\n\nOPTIONS:\n    -h, --help            Print help and exit\n".to_string(),
+        Some(HelpCommand::Version) => "ralphus-runner version -- Print the runner version.\n\nUSAGE:\n    ralphus-runner version\n\nOPTIONS:\n    -h, --help            Print help and exit\n".to_string(),
+        None => format!(
+            "ralphus-runner {}\n\nUSAGE:\n    ralphus-runner <COMMAND> [ARGS...]\n\nCOMMANDS:\n    send              Execute one cell spec from stdin or a file path\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n",
+            ralphus_core::version()
+        ),
+    }
 }
 
 /// Reads the spec JSON from `path` when given, else from stdin -- mirrors
@@ -237,13 +298,45 @@ mod tests {
     #[test]
     fn parse_license_and_help_commands() {
         assert_eq!(parse_args(&v(&["license"])), Command::License);
-        assert_eq!(parse_args(&v(&["help"])), Command::Help);
+        assert_eq!(parse_args(&v(&["help"])), Command::Help(None));
     }
 
     #[test]
     fn usage_mentions_send_and_license() {
-        let text = usage();
+        let text = usage(None);
         assert!(text.contains("send"));
         assert!(text.contains("license"));
+    }
+
+    #[test]
+    fn help_precedes_send_validation_and_result_file_handling() {
+        assert_eq!(
+            parse_args(&v(&[
+                "send",
+                "missing.json",
+                "--result-file",
+                "out.json",
+                "--help",
+            ])),
+            Command::Help(Some(HelpCommand::Send))
+        );
+        assert!(usage(Some(HelpCommand::Send)).contains("--result-file <path>"));
+    }
+
+    #[test]
+    fn every_registered_runner_command_has_help() {
+        for command in HELP_COMMANDS {
+            let parsed = parse_args(&v(&[command.name(), "--bad", "--help"]));
+            assert_eq!(parsed, Command::Help(Some(*command)));
+            assert!(usage(Some(*command)).contains("-h, --help"));
+        }
+    }
+
+    #[test]
+    fn help_after_separator_is_not_intercepted() {
+        assert!(matches!(
+            parse_args(&v(&["send", "spec.json", "--", "--help"])),
+            Command::Send { .. }
+        ));
     }
 }

@@ -36,7 +36,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  name         string  REQ    Unique task name, e.g. "build"
  project      string         Namespace label. REQUIRED, whenever a
                              placeholder cwd is used
-                             (e.g. "ralphus:new-worktree/<branch>").
+                             (e.g. "<<ralphus:new-worktree/<branch>?upstream=<upstream>>>").
                              `project` MUST match a project from `ralphus project list`.
  root         string         The VCS root, if any. e.g. a git repository root.
  agent        string         Default agent for the task's cells
@@ -86,7 +86,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  name                    string         Human-readable display label shown in the board
                                         (card and detail pane). Falls back to `id` when
                                         unset. No structural meaning -- safe to rename.
- cwd                     string  REQ    RECOMMENDED: "ralphus:new-worktree/<branch>?upstream=<upstream>"
+ cwd                     string  REQ    RECOMMENDED: "<<ralphus:new-worktree/<branch>?upstream=<upstream>>>"
                                         -- a placeholder naming a branch to materialize.
                                         Requires the task's `project` field to name a
                                         project registered via `ralphus project git`
@@ -128,6 +128,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                           cwd = "ralphus:new-worktree/RAL-123-fix?upstream=<<default>>"
                                           cwd = "ralphus:new-worktree/RAL-123-fix?upstream=main"
                                           cwd = "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
+                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=main>>"
+                                          cwd = "<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>/package"
                                         ALTERNATIVE: an absolute path to an
                                         already-built git WORKTREE, if you built it
                                         yourself. ALWAYS use forward slashes (e.g.
@@ -172,7 +174,10 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         Merges with the owning task's
                                         `environment`, winning on a shared
                                         key. Same key/value rules as the
-                                        task-level field above.
+                                        task-level field above. Values support the
+                                        same embedded `<<ralphus:new-worktree/...>>`
+                                        expansion as `cwd`; repeat the exact marker
+                                        to reuse that worktree's resolved path.
  budget_tokens           integer        Per-cell total-token cap (falls back to task)
  timeout_minutes         integer        Per-cell wall-clock timeout (falls back to task)
  priority                integer        Initial Queue priority hint (lower = runs sooner);
@@ -356,7 +361,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  Project registry + placeholder cwd
 ---------------------------------------------------------------
  A cell `cwd` may be the placeholder
- "ralphus:new-worktree/<branch>?upstream=<upstream>" instead of a real path.
+ "<<ralphus:new-worktree/<branch>?upstream=<upstream>>>" instead of a real path.
  Register the project once, up front:
 
    ralphus project git --path C:/Users/me/repo --name my-project --description "Backend API service"
@@ -369,12 +374,12 @@ Tip: validate before submitting -- `ralphus validate file.toml`
    project = "my-project"          # REQUIRED: must match a registered name
 
      [[task.cell]]
-     cwd    = "ralphus:new-worktree/RAL-123-add_feature?upstream=main"
+     cwd    = "<<ralphus:new-worktree/RAL-123-add_feature?upstream=main>>"
      prompt = "..."
 
  The daemon resolves "my-project" (the task's `project` field) against its
  registry, creates (or reuses, across restarts) a git worktree for the
- branch named after "ralphus:new-worktree/", and rewrites cwd to that real
+ branch named inside the `<<ralphus:new-worktree/...>>` marker, and rewrites cwd to that real
  path before the cell runs. Both forms of `cwd` are valid -- a plain
  absolute path (you already built the worktree yourself) or this placeholder
  (the daemon builds it for you). A near-miss project name (e.g. from
@@ -446,7 +451,7 @@ Guardian exists to surface, and is almost never what you want.
       [[task.cell]]
       id                     = "work"
       agent                  = "{<insert recommended agent here>}"  # see "Agent selection" above
-      cwd                    = "ralphus:new-worktree/RAL-X?upstream=main"
+      cwd                    = "<<ralphus:new-worktree/RAL-X?upstream=main>>"
       system_prompt          = "Do NOT commit and do NOT push under any circumstances."
       system_prompt_position = "append"
       prompt                 = "{<ticket text>}"
@@ -529,7 +534,7 @@ name    = "hello"
 project = "my-project"            # REQUIRED: must match a registered name
 
   [[task.cell]]
-  cwd    = "ralphus:new-worktree/hello?upstream=main"
+  cwd    = "<<ralphus:new-worktree/hello?upstream=main>>"
   prompt = "Print 'Hello, World!' to a new file hello.txt."
 
 -- 2. A local (Ollama) deterministic check --------------------
@@ -539,7 +544,7 @@ name    = "check"
 project = "my-project"
 
   [[task.cell]]
-  cwd     = "ralphus:new-worktree/check?upstream=main"
+  cwd     = "<<ralphus:new-worktree/check?upstream=main>>"
   agent   = "{<...put your recommended agent here>}"
   model   = "qwen3:8b"
   command = "cargo test"          # command ignores agent/model anyway
@@ -552,7 +557,7 @@ project = "my-project"
 
   [[task.cell]]
   id     = "init"
-  cwd    = "ralphus:new-worktree/feature-a?upstream=main"
+  cwd    = "<<ralphus:new-worktree/feature-a?upstream=main>>"
   prompt = "Create data.json with {\"version\": 1}."
   review = "backend"              # opt this worktree branch into the review
 
@@ -565,7 +570,7 @@ project    = "my-project"
 depends_on = ["setup"]            # waits for all of setup's cells + proof steps
 
   [[task.cell]]
-  cwd      = "ralphus:new-worktree/feature-b?upstream=main"
+  cwd      = "<<ralphus:new-worktree/feature-b?upstream=main>>"
   upstream = "<<task:setup>>"     # rebase feature-b onto setup's branch tip first
   prompt   = "Using {handoff:setup}, write a summary to report.md."
   review   = "backend"
@@ -607,7 +612,7 @@ project = "my-project"            # both cells' worktree materializes under this
   [[task.cell]]
   id                     = "work"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
-  cwd                    = "ralphus:new-worktree/ral-2?upstream=main"
+  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=main>>"
   review                 = "ralphus:new-review/ral-batch"
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
@@ -636,7 +641,7 @@ project = "my-project"            # both cells' worktree materializes under this
   [[task.cell]]
   id                     = "finalize"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
-  cwd                    = "ralphus:new-worktree/ral-2?upstream=main"
+  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=main>>"
   depends_on             = ["work"]
   system_prompt          = "Do NOT run formatters, linters, or tests. Just stage, commit, and push."
   system_prompt_position = "append"
@@ -653,7 +658,7 @@ depends_on = ["ral-2"]
   [[task.cell]]
   id                     = "work"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
-  cwd                    = "ralphus:new-worktree/ral-3?upstream=main"
+  cwd                    = "<<ralphus:new-worktree/ral-3?upstream=main>>"
   upstream               = "<<task:ral-2>>"
   review                 = "ralphus:new-review/ral-batch"  # same key folds into same review
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
@@ -668,7 +673,9 @@ name    = "add-widget"
 project = "my-project"
 
   [[task.cell]]
-  cwd    = "ralphus:new-worktree/RAL-999-add_widget?upstream=main"
+  cwd    = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>"
+  # Repeating the same marker in an environment value reuses this worktree.
+  environment = { WIDGET_WORKTREE = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>" }
   prompt = "Add a widget module."
 
 Submit it:  ralphus submit tasks.toml
@@ -713,5 +720,28 @@ mod tests {
         assert!(TASK_TUTOR.contains("[[task]]"));
         assert!(TASK_TUTOR.contains("[[task.cell]]"));
         assert!(TASK_TUTOR.contains("[[review]]"));
+    }
+
+    #[test]
+    fn tutor_uses_wrapped_worktree_placeholders_for_cwd_examples() {
+        assert!(TASK_TUTOR.contains("cwd    = \"<<ralphus:new-worktree/hello?upstream=main>>\""));
+        assert!(
+            !TASK_TUTOR
+                .lines()
+                .any(|line| line.contains("cwd") && line.contains("= \"ralphus:new-worktree/")),
+            "cwd examples must teach the wrapped <<...>> expansion syntax"
+        );
+    }
+
+    #[test]
+    fn tutor_shows_an_environment_value_reusing_the_cwd_worktree() {
+        assert!(TASK_TUTOR.contains(
+            "environment = { WIDGET_WORKTREE = \"<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>\" }"
+        ));
+        assert!(
+            TASK_TUTOR.contains(
+                "Repeating the same marker in an environment value reuses this worktree."
+            )
+        );
     }
 }

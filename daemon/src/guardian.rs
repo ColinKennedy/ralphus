@@ -746,7 +746,7 @@ pub fn terminal_modes_for(
         .default_resolver_agent()
         .to_string();
     let agent = resolver_agent.unwrap_or(&default_agent);
-    let is_cli_agent = matches!(agent, "claude-code" | "codex" | "codex-cli");
+    let is_cli_agent = matches!(agent, "claude-code" | "codex" | "codex-cli" | "pi");
     if is_cli_agent && has_worktree {
         return vec!["worktree"];
     }
@@ -3341,7 +3341,7 @@ mod tests {
 
     #[test]
     fn terminal_modes_cli_agent_with_worktree_offers_worktree_only() {
-        for agent in ["claude-code", "codex", "codex-cli"] {
+        for agent in ["claude-code", "codex", "codex-cli", "pi"] {
             assert_eq!(
                 terminal_modes_for(Some(agent), false, true, Path::new(".")),
                 vec!["worktree"]

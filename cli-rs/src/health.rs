@@ -5,7 +5,8 @@
 //! - `core`: things every user needs (daemon reachable, git, every
 //!   registered project's on-disk path/git-repo validity, the runner
 //!   binary, Ollama for local-model runs, `nvidia-smi` for GPU metrics,
-//!   `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND` when set). Hard
+//!   `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND`/`$RALPHUS_PI_COMMAND`
+//!   when set). Hard
 //!   requirements (`fail`) except `nvidia-smi` (`warn` -- the GPU column
 //!   just degrades to N/A without it).
 //! - `developer`: `cargo`, needed only to build the Rust binaries from
@@ -501,6 +502,11 @@ pub fn run_checks(daemon_url: &str, cwd: &Path, enable_developer_checks: bool) -
         "codex-command",
         "RALPHUS_CODEX_COMMAND",
         "codex",
+    ));
+    results.push(check_agent_command(
+        "pi-command",
+        "RALPHUS_PI_COMMAND",
+        "pi",
     ));
     if enable_developer_checks {
         results.push(check_cargo());

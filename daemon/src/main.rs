@@ -11,7 +11,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use ralphus_daemon::{
-    Command, DEFAULT_MAX_CONCURRENT, default_db_path, parse_args, server, usage, validate_file,
+    Command, DEFAULT_MAX_CONCURRENT, command_usage, default_db_path, parse_args, server,
+    validate_file,
 };
 
 fn main() -> ExitCode {
@@ -29,8 +30,8 @@ fn main() -> ExitCode {
             print!("{}", ralphus_core::license::embedded_license());
             ExitCode::SUCCESS
         }
-        Command::Help => {
-            print!("{}", usage());
+        Command::Help(command) => {
+            print!("{}", command_usage(command));
             ExitCode::SUCCESS
         }
         Command::Validate(file) => {

@@ -14,6 +14,22 @@ fn main() -> std::process::ExitCode {
     // subcommand landing.
     std::hint::black_box(ralphus_core::license::embedded_license());
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(help) = ralphus_cli::help_map::requested_help(&raw_args) {
+        println!("{help}");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if raw_args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--version")
+    {
+        println!("ralphus {}", ralphus_core::version());
+        return std::process::ExitCode::SUCCESS;
+    }
+    if let Err(message) = ralphus_cli::help_map::validate_invocation(&raw_args) {
+        println!("usage error: {message}");
+        return std::process::ExitCode::from(2);
+    }
     let (opts, args) = extract_global_opts(&raw_args);
     let cmd = parse_args(&args);
     eprintln!("ralphus [cli] {cmd:?}");

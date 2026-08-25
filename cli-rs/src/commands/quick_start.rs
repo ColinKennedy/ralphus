@@ -1,4 +1,4 @@
-//! `ralphus quick-start <manager|reviewer|watcher> <claude-code|codex>`.
+//! `ralphus quick-start <manager|reviewer|watcher> <claude-code|codex|pi>`.
 //! `manager`/`reviewer` are ported from `cli/src/ralphus/__main__.py`'s
 //! quick-start group; `watcher` is new (RAL-241) -- a mailbox-polling
 //! supervisor session that registers a `client_id` with the daemon on
@@ -14,7 +14,7 @@
 //! subprocess spawn that inherits this process's own stdin/stdout/stderr
 //! directly (`std::process::Command::status()`, matching Python's
 //! `subprocess.run(args, check=False)` with no captured stdio) -- the
-//! spawned `claude`/`codex` process IS the user's terminal session from
+//! spawned `claude`/`codex`/`pi` process IS the user's terminal session from
 //! that point on.
 
 use std::process::Command;
@@ -22,8 +22,21 @@ use std::process::Command;
 use crate::args::GlobalOpts;
 use crate::flags::Scanner;
 
-const CLAUDE_READ_ONLY_MECHANISM: &str = "--permission-mode plan";
-const CODEX_READ_ONLY_MECHANISM: &str = "--sandbox read-only";
+const CLAUDE_READ_ONLY_MECHANISM: ReadOnlyMechanism =
+    ReadOnlyMechanism::HarnessFlag("--permission-mode plan");
+const CODEX_READ_ONLY_MECHANISM: ReadOnlyMechanism =
+    ReadOnlyMechanism::HarnessFlag("--sandbox read-only");
+const PI_READ_ONLY_MECHANISM: ReadOnlyMechanism = ReadOnlyMechanism::InstructionOnly(
+    "Pi has no native read-only sandbox flag. This launch passed `--no-approve` to ignore \
+     project-local trusted resources, but actual write prevention relies on the read-only \
+     instructions in this system prompt.",
+);
+
+#[derive(Debug, Clone, Copy)]
+enum ReadOnlyMechanism {
+    HarnessFlag(&'static str),
+    InstructionOnly(&'static str),
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LaunchArgs {
@@ -39,12 +52,17 @@ pub enum QuickStartCommand {
     ManagerHelp,
     ManagerClaudeCode(LaunchArgs),
     ManagerCodex(LaunchArgs),
+    ManagerPi(LaunchArgs),
     ReviewerHelp,
     ReviewerClaudeCode {
         target: Option<String>,
         args: LaunchArgs,
     },
     ReviewerCodex {
+        target: Option<String>,
+        args: LaunchArgs,
+    },
+    ReviewerPi {
         target: Option<String>,
         args: LaunchArgs,
     },
@@ -55,13 +73,14 @@ pub enum QuickStartCommand {
     WatcherHelp,
     WatcherClaudeCode(LaunchArgs),
     WatcherCodex(LaunchArgs),
+    WatcherPi(LaunchArgs),
     UsageError(String),
 }
 
 /// Splits `args` at the first bare `--`, matching Python's
 /// `_split_passthrough`: only `quick-start` gets this treatment, so a
 /// command line typed at a shell prompt (and forwarded verbatim to
-/// `claude`/`codex`) is never flag-scanned by this CLI's own parser.
+/// `claude`/`codex`/`pi`) is never flag-scanned by this CLI's own parser.
 fn split_passthrough(args: &[String]) -> (Vec<String>, Vec<String>) {
     match args.iter().position(|a| a == "--") {
         Some(idx) => (args[..idx].to_vec(), args[idx + 1..].to_vec()),
@@ -101,6 +120,10 @@ pub fn parse(args: &[String]) -> QuickStartCommand {
                 let (launch, _) = parse_launch_args(&head[2..], passthrough);
                 QuickStartCommand::ManagerCodex(launch)
             }
+            Some("pi") => {
+                let (launch, _) = parse_launch_args(&head[2..], passthrough);
+                QuickStartCommand::ManagerPi(launch)
+            }
             Some(other) => QuickStartCommand::UsageError(format!(
                 "unknown quick-start manager subcommand: {other}"
             )),
@@ -121,6 +144,13 @@ pub fn parse(args: &[String]) -> QuickStartCommand {
                     args: launch,
                 }
             }
+            Some("pi") => {
+                let (launch, rest) = parse_launch_args(&head[2..], passthrough);
+                QuickStartCommand::ReviewerPi {
+                    target: rest.into_iter().next(),
+                    args: launch,
+                }
+            }
             Some(other) => QuickStartCommand::UsageError(format!(
                 "unknown quick-start reviewer subcommand: {other}"
             )),
@@ -134,6 +164,10 @@ pub fn parse(args: &[String]) -> QuickStartCommand {
             Some("codex") => {
                 let (launch, _) = parse_launch_args(&head[2..], passthrough);
                 QuickStartCommand::WatcherCodex(launch)
+            }
+            Some("pi") => {
+                let (launch, _) = parse_launch_args(&head[2..], passthrough);
+                QuickStartCommand::WatcherPi(launch)
             }
             Some(other) => QuickStartCommand::UsageError(format!(
                 "unknown quick-start watcher subcommand: {other}"
@@ -151,20 +185,20 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
     match cmd {
         QuickStartCommand::Help => {
             println!(
-                "ralphus quick-start <manager|reviewer|watcher> <claude-code|codex> [--command CMD] [--shell SHELL] [--read-only] [-- ARGS...]"
+                "ralphus quick-start <manager|reviewer|watcher> <claude-code|codex|pi> [--command CMD] [--shell SHELL] [--read-only] [-- ARGS...]"
             );
             0
         }
         QuickStartCommand::ManagerHelp => {
-            println!("ralphus quick-start manager <claude-code|codex>");
+            println!("ralphus quick-start manager <claude-code|codex|pi>");
             0
         }
         QuickStartCommand::ReviewerHelp => {
-            println!("ralphus quick-start reviewer <claude-code|codex> [target]");
+            println!("ralphus quick-start reviewer <claude-code|codex|pi> [target]");
             0
         }
         QuickStartCommand::WatcherHelp => {
-            println!("ralphus quick-start watcher <claude-code|codex>");
+            println!("ralphus quick-start watcher <claude-code|codex|pi>");
             0
         }
         QuickStartCommand::UsageError(m) => {
@@ -179,6 +213,11 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
         QuickStartCommand::ManagerCodex(launch) => launch_codex(
             "quick-start-manager-codex",
             manager_system_prompt_content(launch.read_only, CODEX_READ_ONLY_MECHANISM),
+            &launch,
+        ),
+        QuickStartCommand::ManagerPi(launch) => launch_pi(
+            "quick-start-manager-pi",
+            manager_system_prompt_content(launch.read_only, PI_READ_ONLY_MECHANISM),
             &launch,
         ),
         QuickStartCommand::ReviewerClaudeCode { target, args } => launch_claude(
@@ -199,6 +238,15 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
             ),
             &args,
         ),
+        QuickStartCommand::ReviewerPi { target, args } => launch_pi(
+            "quick-start-reviewer-pi",
+            reviewer_system_prompt_content(
+                target.as_deref(),
+                args.read_only,
+                PI_READ_ONLY_MECHANISM,
+            ),
+            &args,
+        ),
         QuickStartCommand::WatcherClaudeCode(launch) => {
             if ensure_watcher_registered(opts).is_none() {
                 return 2;
@@ -216,6 +264,16 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
             launch_codex(
                 "quick-start-watcher-codex",
                 watcher_system_prompt_content(launch.read_only, CODEX_READ_ONLY_MECHANISM),
+                &launch,
+            )
+        }
+        QuickStartCommand::WatcherPi(launch) => {
+            if ensure_watcher_registered(opts).is_none() {
+                return 2;
+            }
+            launch_pi(
+                "quick-start-watcher-pi",
+                watcher_system_prompt_content(launch.read_only, PI_READ_ONLY_MECHANISM),
                 &launch,
             )
         }
@@ -245,7 +303,15 @@ fn ensure_watcher_registered(opts: &GlobalOpts) -> Option<()> {
 
 // ---- system prompt composition ------------------------------------------
 
-fn read_only_session_note(mechanism: &str) -> String {
+fn read_only_session_note(mechanism: ReadOnlyMechanism) -> String {
+    let tail = match mechanism {
+        ReadOnlyMechanism::HarnessFlag(flag) => format!(
+            "This launch also passed `{flag}` to enforce the same boundary at the \
+             harness-permission level. Honor this guidance directly too, as defense-in-depth, \
+             rather than assuming the harness alone will stop you."
+        ),
+        ReadOnlyMechanism::InstructionOnly(note) => note.to_string(),
+    };
     format!(
         "READ-ONLY MODE: this session was launched with `--read-only`. You can freely read and \
          look at anything -- browse and read files, and call any `ralphus` subcommand tagged \
@@ -254,14 +320,11 @@ fn read_only_session_note(mechanism: &str) -> String {
          take any mutating action: no writing or editing files, no running a command that \
          changes state, and no invoking a mutating `ralphus` subcommand (submit, review \
          create/merge/approve/feedback/..., run/task/session/verify set-status/restart/edit/..., \
-         clear, machine register/remove, project git, initialize git, etc.). This launch also \
-         passed `{mechanism}` to enforce the same boundary at the harness-permission level -- \
-         honor this guidance directly too, as defense-in-depth, rather than assuming the harness \
-         alone will stop you."
+         clear, machine register/remove, project git, initialize git, etc.). {tail}"
     )
 }
 
-fn manager_system_prompt_content(read_only: bool, harness_mechanism: &str) -> String {
+fn manager_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMechanism) -> String {
     let read_only_block = if read_only {
         format!("\n\n{}", read_only_session_note(harness_mechanism))
     } else {
@@ -305,7 +368,7 @@ fn parse_review_target(target: &str) -> String {
 fn reviewer_system_prompt_content(
     target: Option<&str>,
     read_only: bool,
-    harness_mechanism: &str,
+    harness_mechanism: ReadOnlyMechanism,
 ) -> String {
     let target_note = target.map_or_else(String::new, |t| {
         let selector = parse_review_target(t);
@@ -334,7 +397,7 @@ fn reviewer_system_prompt_content(
 /// inspect/act on the squad/task/review the escalation is about.
 const WATCHER_ROLE_NOTE: &str = "You are Ralphus operating in WATCHER mode (RAL-241). Your job is to supervise autonomous ralphus work by draining its escalation mailbox -- a queue of `urgent`/`high`/`normal` priority messages the daemon writes when something needs attention (a task/cell failed, or a session appears to have stalled with no activity for several minutes).\n\nMANDATORY: after every user turn -- i.e. as the first thing you do once you finish responding to what the user just asked, before going idle waiting for their next message -- run `ralphus mailbox check` and show its output to the user verbatim, even if it reports no unread messages. Do not silently swallow or summarize away a message.\n\nHow to react once you've shown a message:\n  - `urgent` -- stop and read it now. Treat it as more important than whatever else you were about to say; investigate it (e.g. `ralphus get <selector>`, `ralphus cell show <selector>`, `ralphus cartographer --squad-id <id>`) before continuing.\n  - `high` -- process it before you would otherwise go idle; it does not need to interrupt an in-progress response, but must not be left unaddressed.\n  - `normal` -- informational; mention it, no action required.\n\n`ralphus mailbox check` also marks whatever it returns as read (drained), so only genuinely new escalations appear on each subsequent check -- you do not need to deduplicate against earlier turns yourself.";
 
-fn watcher_system_prompt_content(read_only: bool, harness_mechanism: &str) -> String {
+fn watcher_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMechanism) -> String {
     let read_only_block = if read_only {
         format!("\n\n{}", read_only_session_note(harness_mechanism))
     } else {
@@ -432,6 +495,14 @@ fn resolve_codex_launch_command(launch: &LaunchArgs) -> String {
     )
 }
 
+fn resolve_pi_launch_command(launch: &LaunchArgs) -> String {
+    resolve_launch_command_with(
+        launch.command.as_deref(),
+        std::env::var("RALPHUS_PI_COMMAND").ok().as_deref(),
+        "pi",
+    )
+}
+
 fn launch_claude(label: &str, system_prompt_content: String, launch: &LaunchArgs) -> i32 {
     launch_claude_with(label, system_prompt_content, launch, real_spawn)
 }
@@ -498,6 +569,10 @@ fn launch_codex(label: &str, developer_instructions: String, launch: &LaunchArgs
     launch_codex_with(label, developer_instructions, launch, real_spawn)
 }
 
+fn launch_pi(label: &str, system_prompt_content: String, launch: &LaunchArgs) -> i32 {
+    launch_pi_with(label, system_prompt_content, launch, real_spawn)
+}
+
 /// Same as [`launch_codex`], but with the actual OS process spawn delegated
 /// to `spawn` -- see [`launch_claude_with`].
 fn launch_codex_with(
@@ -527,6 +602,51 @@ fn launch_codex_with(
         launch.shell.as_deref(),
         spawn,
     )
+}
+
+fn launch_pi_with(
+    label: &str,
+    system_prompt_content: String,
+    launch: &LaunchArgs,
+    spawn: impl FnOnce(SpawnKind) -> std::io::Result<i32>,
+) -> i32 {
+    let Some((file_content, passthrough)) =
+        merge_append_system_prompt_file(&system_prompt_content, &launch.passthrough)
+    else {
+        return 2;
+    };
+    let tmp_path =
+        std::env::temp_dir().join(format!("ralphus-quick-start-{}.md", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp_path, &file_content) {
+        println!("error: could not write temp file: {e}");
+        return 2;
+    }
+    eprintln!(
+        "ralphus [spec] {label} system-prompt len={} combined_len={}",
+        system_prompt_content.len(),
+        file_content.len()
+    );
+
+    let raw_command = resolve_pi_launch_command(launch);
+    let mut extra_args: Vec<String> = if launch.read_only {
+        vec!["--no-approve".to_string()]
+    } else {
+        vec!["--approve".to_string()]
+    };
+    extra_args.push("--append-system-prompt".to_string());
+    extra_args.push(tmp_path.display().to_string());
+    extra_args.extend(passthrough);
+
+    let result = run_quick_start_subprocess_with(
+        label,
+        "pi",
+        &raw_command,
+        &extra_args,
+        launch.shell.as_deref(),
+        spawn,
+    );
+    let _ = std::fs::remove_file(&tmp_path);
+    result
 }
 
 #[derive(Debug)]
@@ -685,6 +805,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_manager_pi_with_flags_and_passthrough() {
+        match parse(&v(&[
+            "manager",
+            "pi",
+            "--command",
+            "my-pi",
+            "--read-only",
+            "--",
+            "--model",
+            "deepseek",
+        ])) {
+            QuickStartCommand::ManagerPi(launch) => {
+                assert_eq!(launch.command.as_deref(), Some("my-pi"));
+                assert!(launch.read_only);
+                assert_eq!(launch.passthrough, v(&["--model", "deepseek"]));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn split_passthrough_without_separator_returns_empty_passthrough() {
         let (head, passthrough) = split_passthrough(&v(&["manager", "claude-code"]));
         assert_eq!(head, v(&["manager", "claude-code"]));
@@ -696,6 +837,16 @@ mod tests {
         match parse(&v(&["reviewer", "claude-code", "guardian-1"])) {
             QuickStartCommand::ReviewerClaudeCode { target, .. } => {
                 assert_eq!(target.as_deref(), Some("guardian-1"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reviewer_pi_target_is_first_non_flag_token() {
+        match parse(&v(&["reviewer", "pi", "guardian-9"])) {
+            QuickStartCommand::ReviewerPi { target, .. } => {
+                assert_eq!(target.as_deref(), Some("guardian-9"));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -736,6 +887,16 @@ mod tests {
         match parse(&v(&["watcher", "codex", "--", "--model", "gpt-5-codex"])) {
             QuickStartCommand::WatcherCodex(launch) => {
                 assert_eq!(launch.passthrough, v(&["--model", "gpt-5-codex"]));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_watcher_pi_with_passthrough() {
+        match parse(&v(&["watcher", "pi", "--", "--model", "deepseek"])) {
+            QuickStartCommand::WatcherPi(launch) => {
+                assert_eq!(launch.passthrough, v(&["--model", "deepseek"]));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -841,8 +1002,17 @@ mod tests {
     fn manager_system_prompt_adds_read_only_note_when_requested() {
         let content = manager_system_prompt_content(true, CLAUDE_READ_ONLY_MECHANISM);
         assert!(content.contains("READ-ONLY MODE"));
-        assert!(content.contains(CLAUDE_READ_ONLY_MECHANISM));
+        assert!(content.contains("--permission-mode plan"));
         assert!(content.contains("(read-only-safe)"));
+    }
+
+    #[test]
+    fn manager_system_prompt_pi_read_only_describes_instruction_only_boundary() {
+        let content = manager_system_prompt_content(true, PI_READ_ONLY_MECHANISM);
+        assert!(content.contains("READ-ONLY MODE"));
+        assert!(content.contains("Pi has no native read-only sandbox flag."));
+        assert!(content.contains("`--no-approve`"));
+        assert!(!content.contains("This launch also passed `Pi has no native"));
     }
 
     #[test]
@@ -868,7 +1038,7 @@ mod tests {
     fn reviewer_system_prompt_read_only_adds_guidance_and_mechanism() {
         let content = reviewer_system_prompt_content(None, true, CODEX_READ_ONLY_MECHANISM);
         assert!(content.contains("READ-ONLY MODE"));
-        assert!(content.contains(CODEX_READ_ONLY_MECHANISM));
+        assert!(content.contains("--sandbox read-only"));
     }
 
     #[test]
@@ -937,7 +1107,7 @@ mod tests {
     fn watcher_system_prompt_adds_read_only_note_when_requested() {
         let content = watcher_system_prompt_content(true, CODEX_READ_ONLY_MECHANISM);
         assert!(content.contains("READ-ONLY MODE"));
-        assert!(content.contains(CODEX_READ_ONLY_MECHANISM));
+        assert!(content.contains("--sandbox read-only"));
     }
 
     // ---- launch command precedence -----------------------------------
@@ -1030,10 +1200,10 @@ mod tests {
     // "run", fake_run)` end-to-end tests.
 
     /// Records the [`SpawnKind`] a fake spawn closure was asked to run, and
-    /// (if present) the contents of the `--append-system-prompt-file` temp
-    /// file at spawn time -- captured there because `launch_claude_with`
-    /// deletes that file the moment `run_quick_start_subprocess_with`
-    /// returns, before the test gets a chance to look.
+    /// (if present) the contents of the temp system-prompt file at spawn
+    /// time -- captured there because the quick-start launcher deletes that
+    /// file the moment `run_quick_start_subprocess_with` returns, before
+    /// the test gets a chance to look.
     #[derive(Default)]
     struct Captured {
         kind: std::cell::RefCell<Option<SpawnKind>>,
@@ -1046,8 +1216,9 @@ mod tests {
         fn record(&self) -> impl FnOnce(SpawnKind) -> std::io::Result<i32> + '_ {
             move |kind| {
                 if let SpawnKind::Argv(argv) = &kind {
-                    if let Some(idx) = argv.iter().position(|a| a == "--append-system-prompt-file")
-                    {
+                    if let Some(idx) = argv.iter().position(|a| {
+                        a == "--append-system-prompt-file" || a == "--append-system-prompt"
+                    }) {
                         if let Some(path) = argv.get(idx + 1) {
                             if let Ok(content) = std::fs::read_to_string(path) {
                                 *self.file_content.borrow_mut() = Some(content);
@@ -1067,15 +1238,15 @@ mod tests {
             }
         }
 
-        /// The `--append-system-prompt-file` temp file's content, read at
-        /// spawn time (before `launch_claude_with` deletes it). Only
-        /// meaningful after a `launch_claude_with` call -- `launch_codex_with`
-        /// never writes such a file.
+        /// The temp system-prompt file's content, read at spawn time
+        /// (before the launcher deletes it). Only meaningful after a
+        /// `launch_claude_with` or `launch_pi_with` call --
+        /// `launch_codex_with` never writes such a file.
         fn file_content(&self) -> String {
             self.file_content
                 .borrow()
                 .clone()
-                .expect("no --append-system-prompt-file flag was captured")
+                .expect("no quick-start system prompt file flag was captured")
         }
     }
 
@@ -1085,11 +1256,12 @@ mod tests {
         Err(std::io::Error::other("no such program"))
     }
 
-    /// Serializes every test that calls `launch_claude_with` -- it always
-    /// writes/deletes the same PID-derived temp path
+    /// Serializes every test that calls a quick-start launcher which writes
+    /// a temp prompt file -- they always write/delete the same PID-derived
+    /// temp path
     /// (`ralphus-quick-start-<pid>.md`), so concurrent `cargo test` threads
     /// racing on that one file would otherwise be flaky.
-    fn claude_temp_file_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn quick_start_temp_file_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1106,7 +1278,7 @@ mod tests {
 
     #[test]
     fn manager_claude_code_bare_path_invocation_spawns_expected_argv() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = launch_with_command("my-claude");
         let content = manager_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
@@ -1117,13 +1289,13 @@ mod tests {
         assert_eq!(argv[0], "my-claude");
         assert!(argv.contains(&"--dangerously-skip-permissions".to_string()));
         let file_content = captured.file_content();
-        assert!(file_content.contains("validate it first with `ralphus validate <file>`"));
+        assert!(file_content.contains("You orchestrate the `ralphus` CLI"));
         assert!(file_content.contains("- ralphus "));
     }
 
     #[test]
     fn manager_claude_code_forwards_extra_passthrough_args() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = LaunchArgs {
             passthrough: v(&["--mode", "auto"]),
@@ -1139,7 +1311,7 @@ mod tests {
 
     #[test]
     fn manager_claude_code_merges_user_system_prompt_file_into_one_flag() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let user_file = temp_file("user-prompt-merge.md");
         std::fs::write(&user_file, "be nice").expect("write user file");
 
@@ -1174,7 +1346,7 @@ mod tests {
 
     #[test]
     fn manager_claude_code_compound_command_uses_shell() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = LaunchArgs {
             shell: Some("bash".to_string()),
@@ -1192,7 +1364,7 @@ mod tests {
 
     #[test]
     fn manager_claude_code_cleans_up_temp_file_after_spawn() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let written: std::cell::RefCell<Option<std::path::PathBuf>> = std::cell::RefCell::new(None);
         let launch = launch_with_command("my-claude");
         let content = manager_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
@@ -1216,7 +1388,7 @@ mod tests {
 
     #[test]
     fn manager_claude_code_launch_failure_returns_2() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let launch = launch_with_command("my-claude");
         let content = manager_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
         let code = launch_claude_with("test-label", content, &launch, failing_spawn);
@@ -1225,7 +1397,7 @@ mod tests {
 
     #[test]
     fn manager_claude_code_read_only_uses_permission_mode_plan() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = LaunchArgs {
             read_only: true,
@@ -1331,11 +1503,77 @@ mod tests {
         assert!(!captured.argv().contains(&"--sandbox".to_string()));
     }
 
+    // -- manager pi --
+
+    #[test]
+    fn manager_pi_bare_path_invocation_spawns_expected_argv() {
+        let _guard = quick_start_temp_file_lock();
+        let captured = Captured::default();
+        let launch = launch_with_command("my-pi");
+        let content = manager_system_prompt_content(false, PI_READ_ONLY_MECHANISM);
+        let code = launch_pi_with("test-label", content, &launch, captured.record());
+        assert_eq!(code, 0);
+        let argv = captured.argv();
+        assert_eq!(argv[0], "my-pi");
+        assert!(argv.contains(&"--approve".to_string()));
+        let idx = argv
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("flag present");
+        let path = std::path::PathBuf::from(&argv[idx + 1]);
+        assert!(!path.exists());
+        assert!(captured.file_content().contains("- ralphus "));
+    }
+
+    #[test]
+    fn manager_pi_forwards_extra_passthrough_args() {
+        let _guard = quick_start_temp_file_lock();
+        let captured = Captured::default();
+        let launch = LaunchArgs {
+            passthrough: v(&["--model", "deepseek"]),
+            ..launch_with_command("my-pi")
+        };
+        let content = manager_system_prompt_content(false, PI_READ_ONLY_MECHANISM);
+        let code = launch_pi_with("test-label", content, &launch, captured.record());
+        assert_eq!(code, 0);
+        let argv = captured.argv();
+        assert_eq!(argv[argv.len() - 2], "--model");
+        assert_eq!(argv[argv.len() - 1], "deepseek");
+    }
+
+    #[test]
+    fn manager_pi_read_only_uses_no_approve_and_prompt_guidance() {
+        let _guard = quick_start_temp_file_lock();
+        let captured = Captured::default();
+        let launch = LaunchArgs {
+            read_only: true,
+            ..launch_with_command("my-pi")
+        };
+        let content = manager_system_prompt_content(true, PI_READ_ONLY_MECHANISM);
+        let code = launch_pi_with("test-label", content, &launch, captured.record());
+        assert_eq!(code, 0);
+        let argv = captured.argv();
+        assert!(argv.contains(&"--no-approve".to_string()));
+        assert!(!argv.contains(&"--approve".to_string()));
+        let file_content = captured.file_content();
+        assert!(file_content.contains("READ-ONLY MODE"));
+        assert!(file_content.contains("Pi has no native read-only sandbox flag."));
+    }
+
+    #[test]
+    fn manager_pi_launch_failure_returns_2() {
+        let _guard = quick_start_temp_file_lock();
+        let launch = launch_with_command("my-pi");
+        let content = manager_system_prompt_content(false, PI_READ_ONLY_MECHANISM);
+        let code = launch_pi_with("test-label", content, &launch, failing_spawn);
+        assert_eq!(code, 2);
+    }
+
     // -- reviewer claude-code --
 
     #[test]
     fn reviewer_claude_code_no_target() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = launch_with_command("my-claude");
         let content = reviewer_system_prompt_content(None, false, CLAUDE_READ_ONLY_MECHANISM);
@@ -1349,7 +1587,7 @@ mod tests {
 
     #[test]
     fn reviewer_claude_code_with_target() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = launch_with_command("my-claude");
         let content =
@@ -1365,7 +1603,7 @@ mod tests {
 
     #[test]
     fn reviewer_claude_code_read_only_uses_permission_mode_plan() {
-        let _guard = claude_temp_file_lock();
+        let _guard = quick_start_temp_file_lock();
         let captured = Captured::default();
         let launch = LaunchArgs {
             read_only: true,
@@ -1438,6 +1676,43 @@ mod tests {
         let content = reviewer_system_prompt_content(None, false, CODEX_READ_ONLY_MECHANISM);
         let code = launch_codex_with("test-label", content, &launch, failing_spawn);
         assert_eq!(code, 2);
+    }
+
+    // -- reviewer pi --
+
+    #[test]
+    fn reviewer_pi_with_url_target_resolves_id_in_prompt() {
+        let _guard = quick_start_temp_file_lock();
+        let captured = Captured::default();
+        let launch = launch_with_command("my-pi");
+        let content = reviewer_system_prompt_content(
+            Some("http://127.0.0.1:7474/#/reviews/guardian-12"),
+            false,
+            PI_READ_ONLY_MECHANISM,
+        );
+        let code = launch_pi_with("test-label", content, &launch, captured.record());
+        assert_eq!(code, 0);
+        assert!(
+            captured
+                .file_content()
+                .contains("Initial review target for this session: `guardian-12`")
+        );
+    }
+
+    #[test]
+    fn reviewer_pi_read_only_uses_no_approve() {
+        let _guard = quick_start_temp_file_lock();
+        let captured = Captured::default();
+        let launch = LaunchArgs {
+            read_only: true,
+            ..launch_with_command("my-pi")
+        };
+        let content = reviewer_system_prompt_content(None, true, PI_READ_ONLY_MECHANISM);
+        let code = launch_pi_with("test-label", content, &launch, captured.record());
+        assert_eq!(code, 0);
+        let argv = captured.argv();
+        assert!(argv.contains(&"--no-approve".to_string()));
+        assert!(captured.file_content().contains("READ-ONLY MODE"));
     }
 
     // ---- RAL-189: a couple of the same shapes, actually executed ---------

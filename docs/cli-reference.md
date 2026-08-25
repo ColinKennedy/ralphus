@@ -6,11 +6,11 @@ endpoints. See `CLI_PARITY_PLAN.local.md` for the design history.
 
 ## Global flags
 
-General rule: a global flag is declared on the root parser, not on any
-subcommand's own parser, so it must come **before** the subcommand name, e.g.
-`ralphus --daemon-url http://127.0.0.1:7890 status`, not
-`ralphus status --daemon-url http://127.0.0.1:7890`. `--json` is the one
-exception — see below.
+Global flags work anywhere before a bare `--`: both
+`ralphus --daemon-url http://127.0.0.1:7890 status` and
+`ralphus status --daemon-url http://127.0.0.1:7890` are equivalent. Tokens
+after `--` belong to the downstream command and are never interpreted as
+Ralphus flags.
 
 - `--daemon-url URL` — base URL of the daemon (default `http://127.0.0.1:7890`,
   or `$RALPHUS_DAEMON_URL`).
@@ -19,14 +19,19 @@ exception — see below.
   can involve TOML validation, project-registry lookups, and git calls during
   review derivation, so a busy daemon can take longer than a health check to
   respond. No CLI flag yet — env var only.
-- `--json` — emit the raw daemon JSON instead of human-readable text. Works on
-  every subcommand that reads or mutates daemon state, and — unlike every
-  other global flag — in **either position**: both `ralphus --json status`
-  and `ralphus status --json` work identically (RAL-214). It's still declared
-  on the root parser only; `main()` strips a literal `--json` token out of
-  the argument list wherever it appears before handing the rest to argparse,
-  rather than requiring it to precede the subcommand.
+- `--json` — emit raw daemon JSON instead of human-readable text. Both
+  `ralphus --json status` and `ralphus status --json` work identically.
+- `-h`, `--help` — print detailed help for the deepest recognized command and
+  exit successfully. Help takes precedence over missing arguments, invalid
+  flag values, unknown trailing tokens, global flags, and normal command work.
+  Like other Ralphus flags it is not intercepted after a bare `--`.
 - `--version` — print the CLI version and exit.
+
+The companion executables follow the same help rule: `ralphus-runner`,
+`ralphus-daemon`, and `ralphus-librarian` accept `--help`/`-h` at the root and
+after each explicit command. For example, `ralphus-runner send --help`,
+`ralphus-daemon stop --help`, and `ralphus-librarian serve --help` all print
+detailed usage and exit before doing any command work.
 
 ## Exit codes
 
@@ -279,17 +284,20 @@ input name(s) instead of printing a command with a bare, unsubstituted
 
 ## quick-start
 
-Two independent command families (RAL-166), each with a `claude-code` and a
-`codex` entrypoint:
+Three independent command families (RAL-166/RAL-241), each with a
+`claude-code`, `codex`, and `pi` entrypoint:
 
 | Command | What |
 |---|---|
 | `quick-start manager claude-code [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed with the full CLI help-map as a system prompt, so it can orchestrate `ralphus` unsupervised. See [quick-start manager](#quick-start-manager) below |
 | `quick-start manager codex [--command] [--shell] [-- ARGS...]` | Launch Codex primed with the same help-map system prompt, so it can orchestrate `ralphus` unsupervised. See [quick-start manager](#quick-start-manager) below |
+| `quick-start manager pi [--command] [--shell] [-- ARGS...]` | Launch Pi primed with the same manager role and help-map. See [quick-start manager](#quick-start-manager) below |
 | `quick-start reviewer claude-code [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
 | `quick-start reviewer codex [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Codex primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
+| `quick-start reviewer pi [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Pi primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
 | `quick-start watcher claude-code [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
 | `quick-start watcher codex [--command] [--shell] [-- ARGS...]` | Launch Codex primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
+| `quick-start watcher pi [--command] [--shell] [-- ARGS...]` | Launch Pi primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
 
 There is no compatibility alias for the old `quick-start claude-code` shape —
 it is fully replaced by `quick-start manager claude-code`.
@@ -518,7 +526,7 @@ use; see `READ_ONLY_NOTE`.
 
 <!-- BEGIN GENERATED HELP-MAP (RAL-110) -->
 ```
-- ralphus --daemon-url [url] --json  {Submit and manage autonomous agent tasks against the ralphus daemon.}
+- ralphus --daemon-url [url] --json --version  {Submit and manage autonomous agent tasks against the ralphus daemon.}
     - agent  {Inspect agent backends ralphus can run.}
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
     - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
@@ -541,6 +549,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) history selector [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
+    - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
     - (read-only-safe) listen selector [str] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
         - cleanup machine [str]  {Tear down one provisioned workspace on a machine provider (RAL-201).}
@@ -548,6 +557,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
+    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention.}
+        - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
         - git --description [text] --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}

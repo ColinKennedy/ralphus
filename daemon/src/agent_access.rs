@@ -48,7 +48,14 @@ pub struct AvailableAgent {
 /// `agent_profiles::PROFILE_BACKENDS` minus `"raw"` -- `raw` is only ever
 /// meaningful via a profile that also supplies an `executable`
 /// (`cli-rs/src/agents.rs`'s own description), never bare.
-const BUILTIN_AGENTS: &[&str] = &["claude", "claude-code", "codex", "ollama", "anthropic"];
+const BUILTIN_AGENTS: &[&str] = &[
+    "claude",
+    "claude-code",
+    "codex",
+    "pi",
+    "ollama",
+    "anthropic",
+];
 
 /// Decides which agents a given user may see/select for a given project.
 ///

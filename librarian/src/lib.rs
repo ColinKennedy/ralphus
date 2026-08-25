@@ -33,6 +33,24 @@ pub fn resolve_bind_host(env_override: Option<&str>) -> String {
 }
 
 /// Command-line action parsed from the librarian's arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpCommand {
+    Serve,
+    License,
+    Version,
+}
+
+impl HelpCommand {
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::License => "license",
+            Self::Version => "version",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Print version and exit.
@@ -40,7 +58,7 @@ pub enum Command {
     /// Print the embedded LICENSE text and exit.
     License,
     /// Print usage and exit.
-    Help,
+    Help(Option<HelpCommand>),
     /// Serve the web UI on the given port. Not yet implemented in this phase.
     Serve { port: u16 },
 }
@@ -50,15 +68,55 @@ pub enum Command {
 /// Supports `serve [--port N]`. Unknown input falls back to `Help`.
 #[must_use]
 pub fn parse_args(args: &[String]) -> Command {
-    match args.first().map(String::as_str) {
-        Some("--version" | "-V" | "version") => Command::Version,
-        Some("license") => Command::License,
-        Some("serve") => {
+    if let Some(command) = requested_help(args) {
+        return Command::Help(command);
+    }
+    let Some(first) = args.first().map(String::as_str) else {
+        return Command::Help(None);
+    };
+    if matches!(first, "--version" | "-V") {
+        return Command::Version;
+    }
+    match registered_command(first) {
+        Some(HelpCommand::Version) => Command::Version,
+        Some(HelpCommand::License) => Command::License,
+        Some(HelpCommand::Serve) => {
             let port = parse_port_flag(&args[1..]).unwrap_or(DEFAULT_PORT);
             Command::Serve { port }
         }
-        _ => Command::Help,
+        None => Command::Help(None),
     }
+}
+
+fn registered_command(name: &str) -> Option<HelpCommand> {
+    match name {
+        "serve" => Some(HelpCommand::Serve),
+        "license" => Some(HelpCommand::License),
+        "version" => Some(HelpCommand::Version),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+const HELP_COMMANDS: &[HelpCommand] = &[
+    HelpCommand::Serve,
+    HelpCommand::License,
+    HelpCommand::Version,
+];
+
+fn requested_help(args: &[String]) -> Option<Option<HelpCommand>> {
+    let before_separator: Vec<&String> =
+        args.iter().take_while(|arg| arg.as_str() != "--").collect();
+    if !before_separator
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return None;
+    }
+    let command = before_separator
+        .first()
+        .and_then(|arg| registered_command(arg.as_str()));
+    Some(command)
 }
 
 /// Extract `--port <N>` from the argument tail, if present and valid.
@@ -76,8 +134,36 @@ fn parse_port_flag(tail: &[String]) -> Option<u16> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "ralphus-librarian {}\n\nUSAGE:\n    ralphus-librarian <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}]   Run the board web server\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nThe librarian renders the daemon's state at {DEFAULT_DAEMON_URL}.\nIt fails gracefully if the daemon is not running.\n",
+        "ralphus-librarian {}\n\nUSAGE:\n    ralphus-librarian <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}]   Run the board web server\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n\nThe librarian renders the daemon's state at {DEFAULT_DAEMON_URL}.\nIt fails gracefully if the daemon is not running.\n",
         ralphus_core::version()
+    )
+}
+
+/// Detailed help for one registered librarian command.
+#[must_use]
+pub fn command_usage(command: Option<HelpCommand>) -> String {
+    let Some(command) = command else {
+        return usage();
+    };
+    let (summary, invocation, details) = match command {
+        HelpCommand::Serve => (
+            "Run the board web server.",
+            "ralphus-librarian serve [--port <integer>]",
+            format!("    --port <integer>    TCP port to bind (default {DEFAULT_PORT})\n"),
+        ),
+        HelpCommand::License => (
+            "Print the embedded LICENSE text.",
+            "ralphus-librarian license",
+            String::new(),
+        ),
+        HelpCommand::Version => (
+            "Print the librarian version.",
+            "ralphus-librarian version",
+            String::new(),
+        ),
+    };
+    format!(
+        "{invocation} -- {summary}\n\nUSAGE:\n    {invocation}\n\nARGUMENTS AND OPTIONS:\n{details}    -h, --help         Print help and exit\n"
     )
 }
 
@@ -117,7 +203,7 @@ mod tests {
     fn version_and_help() {
         assert_eq!(parse_args(&args(&["-V"])), Command::Version);
         assert_eq!(parse_args(&args(&["license"])), Command::License);
-        assert_eq!(parse_args(&args(&[])), Command::Help);
+        assert_eq!(parse_args(&args(&[])), Command::Help(None));
         assert!(usage().contains("librarian"));
         assert!(usage().contains("license"));
     }

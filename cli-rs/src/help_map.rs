@@ -37,9 +37,10 @@
 //! `take_tri_bool`, mirroring Python's `argparse.BooleanOptionalAction`) is
 //! rendered as one combined chip.
 //!
-//! `author` and `quick-start` are excluded entirely, mirroring Python's own
-//! `_HIDDEN_COMMANDS` -- neither is meant for an AI agent already driving
-//! `ralphus` via this help-map to invoke on itself.
+//! `quick-start` is excluded from the AI-oriented generated map, mirroring
+//! Python's `_HIDDEN_COMMANDS`, but is present in the user-facing command
+//! registry below. The registry gates dispatch, so a command cannot become
+//! callable without first acquiring a help definition.
 
 #![allow(clippy::print_stdout)] // Guidance text is this module's product, like commands/mod.rs.
 
@@ -1066,6 +1067,107 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const QUICK_START_BACKENDS: &[HelpNode] = &[
+    node(
+        "claude-code",
+        &[],
+        &["--command [cmd]", "--read-only", "--shell [shell]"],
+        "Launch Claude Code with the selected Ralphus role prompt; arguments after `--` are forwarded verbatim.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "codex",
+        &[],
+        &["--command [cmd]", "--read-only", "--shell [shell]"],
+        "Launch Codex with the selected Ralphus role prompt; arguments after `--` are forwarded verbatim.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "pi",
+        &[],
+        &["--command [cmd]", "--read-only", "--shell [shell]"],
+        "Launch Pi with the selected Ralphus role prompt; arguments after `--` are forwarded verbatim.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const QUICK_START_REVIEWER_BACKENDS: &[HelpNode] = &[
+    node(
+        "claude-code",
+        &["target [str, optional]"],
+        &["--command [cmd]", "--read-only", "--shell [shell]"],
+        "Launch Claude Code as a reviewer; arguments after `--` are forwarded verbatim.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "codex",
+        &["target [str, optional]"],
+        &["--command [cmd]", "--read-only", "--shell [shell]"],
+        "Launch Codex as a reviewer; arguments after `--` are forwarded verbatim.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "pi",
+        &["target [str, optional]"],
+        &["--command [cmd]", "--read-only", "--shell [shell]"],
+        "Launch Pi as a reviewer; arguments after `--` are forwarded verbatim.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+/// User-facing but deliberately omitted from [`generate`], because an agent
+/// already running inside quick-start must not recursively launch another
+/// harness. It remains part of the mandatory invocation registry.
+pub const QUICK_START: HelpNode = node(
+    "quick-start",
+    &[],
+    &[],
+    "Launch an interactive agent preconfigured for a Ralphus role.",
+    false,
+    false,
+    &[
+        node(
+            "manager",
+            &[],
+            &[],
+            "Launch an agent that can orchestrate Ralphus tasks.",
+            false,
+            false,
+            QUICK_START_BACKENDS,
+        ),
+        node(
+            "reviewer",
+            &[],
+            &[],
+            "Launch an agent that operates an existing Guardian review.",
+            false,
+            false,
+            QUICK_START_REVIEWER_BACKENDS,
+        ),
+        node(
+            "watcher",
+            &[],
+            &[],
+            "Launch an agent that monitors and drains the escalation mailbox.",
+            false,
+            false,
+            QUICK_START_BACKENDS,
+        ),
+    ],
+);
+
 // ---- the whole tree --------------------------------------------------------
 
 /// The full command tree, rooted at `ralphus`. `author`/`quick-start` are
@@ -1408,6 +1510,13 @@ fn find_node<'a>(node: &'a HelpNode, path: &[&str]) -> Option<&'a HelpNode> {
     }
 }
 
+fn find_registered_node(path: &[&str]) -> Option<&'static HelpNode> {
+    match path.split_first() {
+        Some((head, tail)) if *head == "quick-start" => find_node(&QUICK_START, tail),
+        _ => find_node(&ROOT, path),
+    }
+}
+
 fn signature(n: &HelpNode) -> String {
     let mut chips: Vec<&str> = n.positionals.to_vec();
     let mut opts: Vec<&str> = n.options.to_vec();
@@ -1430,7 +1539,7 @@ fn command_path(path: &[&str]) -> String {
 
 #[must_use]
 pub fn command_help(path: &[&str]) -> Option<String> {
-    let node = find_node(&ROOT, path)?;
+    let node = find_registered_node(path)?;
     let full = command_path(path);
     let mut out = String::new();
     out.push_str(&format!("{full} -- {}\n", node.description));
@@ -1447,27 +1556,174 @@ pub fn command_help(path: &[&str]) -> Option<String> {
         out.push_str(" <SUBCOMMAND> [ARGS...]");
     }
     out.push('\n');
-    if !node.options.is_empty() {
+    if !node.positionals.is_empty() {
+        out.push_str("\nARGUMENTS:\n");
+        for positional in node.positionals {
+            out.push_str(&format!(
+                "    {:<32} {}\n",
+                positional,
+                chip_description(positional, false)
+            ));
+        }
+    }
+    {
         let mut opts: Vec<&str> = node.options.to_vec();
         opts.sort_unstable();
         out.push_str("\nOPTIONS:\n");
         for opt in opts {
-            out.push_str(&format!("    {opt}\n"));
+            out.push_str(&format!("    {opt:<32} {}\n", chip_description(opt, true)));
         }
+        out.push_str("    -h, --help                       Print help and exit\n");
     }
-    if !node.children.is_empty() {
+    if !node.children.is_empty() || path.is_empty() {
         let mut children: Vec<&HelpNode> = node.children.iter().collect();
+        if path.is_empty() {
+            children.push(&QUICK_START);
+        }
         children.sort_by_key(|child| child.name);
         out.push_str("\nSUBCOMMANDS:\n");
         for child in children {
             out.push_str(&format!(
-                "    {:<32} {}\n",
+                "    {}  {}\n",
                 signature(child),
                 child.description
             ));
         }
     }
     Some(out.trim_end().to_string())
+}
+
+fn chip_description(chip: &str, option: bool) -> String {
+    let name = chip.split_whitespace().next().unwrap_or(chip);
+    let key = name.trim_start_matches('-').replace('-', " ");
+    if option {
+        match name {
+            "--daemon-url" => "Base URL of the Ralphus daemon.".to_string(),
+            "--json" => "Emit machine-readable JSON instead of human output.".to_string(),
+            "--version" => "Print the version and exit.".to_string(),
+            "--command" => "Override the agent harness command for this launch.".to_string(),
+            "--shell" => "Shell used to interpret the command override.".to_string(),
+            "--read-only" => "Launch the agent with read-only restrictions.".to_string(),
+            _ if chip.contains('[') => format!("Set the {key} value using the shown value type."),
+            _ => format!("Enable {key}."),
+        }
+    } else {
+        match name {
+            "selector" => "Entity selector or URI identifying the target.".to_string(),
+            "squad_id" => "Squad identifier or accepted squad selector.".to_string(),
+            "target" => "Optional review target supplied to the launched reviewer.".to_string(),
+            "file" => "Input file path; repeat where the usage permits it.".to_string(),
+            "field" => "Optional dotted field path to extract from the entity JSON.".to_string(),
+            "text" => "Text content sent to the selected operation.".to_string(),
+            "state" => "Destination state accepted by the selected entity type.".to_string(),
+            _ => format!("{key} value using the type shown in usage."),
+        }
+    }
+}
+
+fn command_tokens(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == "--json" || arg == "--version" {
+            i += 1;
+            continue;
+        }
+        if arg == "--daemon-url" {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--daemon-url=") || matches!(arg, "--help" | "-h") {
+            i += 1;
+            continue;
+        }
+        out.push(arg);
+        i += 1;
+    }
+    out
+}
+
+fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, String> {
+    let tokens = command_tokens(args);
+    let Some(first) = tokens.first().copied() else {
+        return Ok(Vec::new());
+    };
+    if first == "help" {
+        return Ok(Vec::new());
+    }
+    let mut path = vec![first];
+    let mut node =
+        find_registered_node(&path).ok_or_else(|| format!("unknown command: {first}"))?;
+    let mut index = 1;
+    while !node.children.is_empty() && index < tokens.len() {
+        let candidate = tokens[index];
+        if candidate == "help" {
+            return Ok(path);
+        }
+        let Some(child) = node.children.iter().find(|child| child.name == candidate) else {
+            if strict {
+                return Err(format!(
+                    "unknown {} subcommand: {candidate}",
+                    path.join(" ")
+                ));
+            }
+            break;
+        };
+        path.push(candidate);
+        node = child;
+        index += 1;
+    }
+    Ok(path)
+}
+
+/// Returns the requested help screen before any ordinary parsing or work.
+/// A bare `--` ends Ralphus option handling, so later help flags are passed
+/// through to the downstream command unchanged.
+#[must_use]
+pub fn requested_help(args: &[String]) -> Option<String> {
+    let help = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
+    if !help {
+        return None;
+    }
+    let path = resolved_path(args, false).unwrap_or_default();
+    command_help(&path)
+}
+
+/// Validates the command-prefix portion of an invocation against the same
+/// registry that renders help. This is the structural guard: adding parser
+/// code alone cannot expose a new command without a registered help node.
+pub fn validate_invocation(args: &[String]) -> Result<(), String> {
+    resolved_path(args, true).map(|_| ())
+}
+
+/// Every user-callable command path, used by exhaustive invariant tests.
+#[must_use]
+pub fn registered_paths() -> Vec<Vec<&'static str>> {
+    fn walk(
+        node: &'static HelpNode,
+        path: &mut Vec<&'static str>,
+        out: &mut Vec<Vec<&'static str>>,
+    ) {
+        out.push(path.clone());
+        for child in node.children {
+            path.push(child.name);
+            walk(child, path, out);
+            path.pop();
+        }
+    }
+    let mut out = vec![Vec::new()];
+    for child in ROOT.children.iter().chain(std::iter::once(&QUICK_START)) {
+        let mut path = vec![child.name];
+        walk(child, &mut path, &mut out);
+    }
+    out
 }
 
 /// The full alphabetized, indented help-map tree, as one string -- ports
@@ -1692,5 +1948,54 @@ mod tests {
         assert!(text.contains("comments"));
         assert!(text.contains("pull-feedback"));
         assert!(text.contains("submit"));
+    }
+
+    #[test]
+    fn quick_start_manager_has_discoverable_backend_help() {
+        let text = command_help(&["quick-start", "manager"]).expect("manager help");
+        assert!(text.contains("claude-code"));
+        assert!(text.contains("codex"));
+        assert!(text.contains("pi"));
+    }
+
+    #[test]
+    fn every_registered_path_has_detailed_help_and_universal_precedence() {
+        for path in registered_paths() {
+            let text = command_help(&path).unwrap_or_else(|| panic!("missing help for {path:?}"));
+            assert!(text.contains("USAGE:"), "incomplete help for {path:?}");
+            assert!(
+                text.contains("-h, --help"),
+                "missing help flag for {path:?}"
+            );
+
+            let mut argv: Vec<String> = path.iter().map(|part| (*part).to_string()).collect();
+            argv.extend(["--definitely-invalid".to_string(), "--help".to_string()]);
+            assert_eq!(
+                requested_help(&argv).as_deref(),
+                Some(text.as_str()),
+                "help did not take precedence for {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_gates_unknown_subcommands_but_help_uses_deepest_known_parent() {
+        let argv = ["quick-start", "manager", "future-backend"]
+            .map(str::to_string)
+            .to_vec();
+        assert!(validate_invocation(&argv).is_err());
+
+        let mut with_help = argv;
+        with_help.push("--help".to_string());
+        let text = requested_help(&with_help).expect("parent help");
+        assert!(text.starts_with("ralphus quick-start manager --"));
+    }
+
+    #[test]
+    fn help_after_passthrough_separator_is_not_intercepted() {
+        let argv = ["quick-start", "manager", "codex", "--", "--help"]
+            .map(str::to_string)
+            .to_vec();
+        assert!(requested_help(&argv).is_none());
     }
 }

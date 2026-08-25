@@ -1446,11 +1446,39 @@ fn run_cell_worker(
         spec.prompt = spec.prompt.map(|p| format!("{ctx}{p}"));
     }
     spec.trace_context = cell_trace_context.clone();
-    spec.env_overrides = store
-        .lock()
-        .expect("store mutex poisoned")
-        .resolve_cell_env_overrides(squad_id, row.task_idx, row.idx)
-        .unwrap_or_default();
+    spec.env_overrides = {
+        let guard = store.lock().expect("store mutex poisoned");
+        if let Some(snapshot) = guard
+            .get_cell_materialized_env_overrides(squad_id, row.task_idx, row.idx)
+            .unwrap_or_default()
+        {
+            snapshot
+        } else {
+            let merged = guard
+                .resolve_cell_env_overrides(squad_id, row.task_idx, row.idx)
+                .unwrap_or_default();
+            let materialized = crate::worktrees::materialize_env_overrides(
+                &guard,
+                crate::worktrees::PlaceholderContext {
+                    squad_id,
+                    task_idx: row.task_idx,
+                    cell_idx: row.idx,
+                    task_name: &row.task_name,
+                    cell_id: &row.cell_id,
+                    machine: row.machine.as_deref(),
+                },
+                &merged,
+            )
+            .unwrap_or(merged);
+            let _ = guard.set_cell_materialized_env_overrides(
+                squad_id,
+                row.task_idx,
+                row.idx,
+                &materialized,
+            );
+            materialized
+        }
+    };
     let mut merged_profile_env = selection.env;
     merged_profile_env.extend(spec.env_overrides.clone());
     spec.env_overrides = merged_profile_env;
@@ -2475,12 +2503,41 @@ fn run_proofs(
         // steps under the same task can set the same key to different values.
         let env_overrides = {
             let guard = store.lock().expect("store mutex poisoned");
-            if scope == "task" {
-                guard.resolve_task_proof_step_env_overrides(squad_id, task_idx, idx)
+            if let Some(snapshot) = guard
+                .get_proof_materialized_env_overrides(squad_id, task_idx, scope, cell_idx, idx)
+                .unwrap_or_default()
+            {
+                snapshot
             } else {
-                guard.resolve_cell_proof_step_env_overrides(squad_id, task_idx, cell_idx, idx)
+                let merged = if scope == "task" {
+                    guard.resolve_task_proof_step_env_overrides(squad_id, task_idx, idx)
+                } else {
+                    guard.resolve_cell_proof_step_env_overrides(squad_id, task_idx, cell_idx, idx)
+                }
+                .unwrap_or_default();
+                let materialized = crate::worktrees::materialize_env_overrides(
+                    &guard,
+                    crate::worktrees::PlaceholderContext {
+                        squad_id,
+                        task_idx,
+                        cell_idx,
+                        task_name,
+                        cell_id: cell_sid.unwrap_or(scope),
+                        machine: cell_machine,
+                    },
+                    &merged,
+                )
+                .unwrap_or(merged);
+                let _ = guard.set_proof_materialized_env_overrides(
+                    squad_id,
+                    task_idx,
+                    scope,
+                    cell_idx,
+                    idx,
+                    &materialized,
+                );
+                materialized
             }
-            .unwrap_or_default()
         };
         let mut env_overrides = {
             let mut merged = selection.env.clone();
@@ -2792,6 +2849,7 @@ fn set_proof_running(
 mod tests {
     use super::*;
     use crate::runner::{RunnerResult, RunnerSpec};
+    use std::collections::BTreeMap;
 
     /// Simulates the `"exit N"` shell-command convention this test module's
     /// TOML fixtures use for a `command`-kind proof step. Since RAL-151
@@ -5167,6 +5225,102 @@ mod tests {
             list.matches("worktree ").count(),
             2,
             "restart must not duplicate the worktree: {list}"
+        );
+    }
+
+    struct EnvCapturingRunner {
+        seen: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl Runner for EnvCapturingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.seen.lock().unwrap().push(spec.env_overrides.clone());
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: spec.proof.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    #[test]
+    fn execute_squad_materializes_shared_cwd_and_env_placeholder_once_and_preserves_unknown_text() {
+        let repo = wt_test_repo("env-materialize");
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat-env?upstream=main>>\"\ncommand=\"do-thing\"\nenvironment={WT=\"<<ralphus:new-worktree/feat-env?upstream=main>>\", NESTED=\"<<ralphus:new-worktree/feat-env?upstream=main>>/nested\", RAW=\"prefix <<unknown>> suffix\"}\n";
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(toml).unwrap();
+        let id = store.insert_squad(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        execute_squad(
+            &store,
+            Arc::new(EnvCapturingRunner {
+                seen: Arc::clone(&seen),
+            })
+            .as_ref(),
+            &id,
+        );
+        store.lock().unwrap().restart_squad(&id).unwrap();
+        execute_squad(
+            &store,
+            Arc::new(EnvCapturingRunner {
+                seen: Arc::clone(&seen),
+            })
+            .as_ref(),
+            &id,
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0], seen[1],
+            "restart must reuse the first materialized env"
+        );
+        let wt = seen[0].get("WT").expect("materialized env");
+        let persisted_cwd = store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0]
+            .cwd
+            .clone()
+            .expect("persisted cwd");
+        assert_eq!(wt, &persisted_cwd, "cwd and env must reuse one worktree");
+        assert_eq!(
+            Path::new(wt),
+            crate::worktrees::worktree_dir(&repo, "feat-env")
+        );
+        assert_eq!(
+            seen[0].get("NESTED").map(Path::new),
+            Some(
+                crate::worktrees::worktree_dir(&repo, "feat-env")
+                    .join("nested")
+                    .as_path()
+            )
+        );
+        assert_eq!(
+            seen[0].get("RAW").map(String::as_str),
+            Some("prefix <<unknown>> suffix"),
+            "unknown placeholders must remain byte-for-byte unchanged"
+        );
+        let snapshot = store
+            .lock()
+            .unwrap()
+            .get_cell_materialized_env_overrides(&id, 0, 0)
+            .unwrap()
+            .expect("persisted snapshot");
+        assert_eq!(snapshot.get("WT"), Some(wt));
+        let list = crate::guardian_merge::git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(
+            list.matches("worktree ").count(),
+            2,
+            "shared cwd/env placeholder should materialize exactly one extra worktree: {list}"
         );
     }
 

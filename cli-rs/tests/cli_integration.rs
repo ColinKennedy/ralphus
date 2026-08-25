@@ -208,6 +208,42 @@ fn quick_start_unknown_subcommand_is_a_usage_error() {
 }
 
 #[test]
+fn quick_start_manager_help_is_detailed_and_never_launches() {
+    let (code, stdout) = run_cli(
+        "http://127.0.0.1:1",
+        &["quick-start", "manager", "--definitely-invalid", "--help"],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("ralphus quick-start manager"));
+    assert!(stdout.contains("claude-code"));
+    assert!(stdout.contains("codex"));
+    assert!(stdout.contains("pi"));
+}
+
+#[test]
+fn help_precedes_missing_positionals_and_global_flag_validation() {
+    let (code, stdout) = run_cli(
+        "http://127.0.0.1:1",
+        &["task", "show", "--daemon-url", "--help"],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("ralphus task show"));
+    assert!(stdout.contains("selector [str]"));
+}
+
+#[test]
+fn help_precedes_version_and_version_remains_global() {
+    let (help_code, help_stdout) =
+        run_cli("http://127.0.0.1:1", &["status", "--version", "--help"]);
+    assert_eq!(help_code, 0);
+    assert!(help_stdout.contains("ralphus status"));
+
+    let (version_code, version_stdout) = run_cli("http://127.0.0.1:1", &["status", "--version"]);
+    assert_eq!(version_code, 0);
+    assert!(version_stdout.starts_with("ralphus "));
+}
+
+#[test]
 fn license_prints_the_embedded_workspace_license_without_daemon_access() {
     let (code, stdout) = run_cli("http://127.0.0.1:1", &["license"]);
     assert_eq!(code, 0);

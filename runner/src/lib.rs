@@ -16,6 +16,7 @@ pub mod harness_backend;
 pub mod hostos;
 pub mod llm_client;
 pub mod otel;
+pub mod pi_backend;
 pub mod providers;
 pub mod shellcmd;
 pub mod spec;

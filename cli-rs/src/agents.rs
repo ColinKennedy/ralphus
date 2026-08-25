@@ -44,6 +44,13 @@ pub const KNOWN_AGENTS: &[AgentInfo] = &[
         default_model: None,
     },
     AgentInfo {
+        name: "pi",
+        aliases: &[],
+        description: "Pi coding-agent CLI, run as a subprocess with JSON event parsing.",
+        models: None,
+        default_model: None,
+    },
+    AgentInfo {
         name: "raw",
         aliases: &[],
         description: "Generic external executable backend. Only valid when selected via an agent profile that also provides an executable.",

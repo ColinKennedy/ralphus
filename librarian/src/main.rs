@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use ralphus_librarian::{Command, DEFAULT_DAEMON_URL, parse_args, server, usage};
+use ralphus_librarian::{Command, DEFAULT_DAEMON_URL, command_usage, parse_args, server};
 
 fn main() -> ExitCode {
     // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
@@ -24,8 +24,8 @@ fn main() -> ExitCode {
             print!("{}", ralphus_core::license::embedded_license());
             ExitCode::SUCCESS
         }
-        Command::Help => {
-            print!("{}", usage());
+        Command::Help(command) => {
+            print!("{}", command_usage(command));
             ExitCode::SUCCESS
         }
         Command::Serve { port } => {
