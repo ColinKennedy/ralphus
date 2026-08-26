@@ -168,13 +168,26 @@ fn commit_on_worktree(cwd: &str, file: &str, contents: &str) {
     git(wt, &["commit", "-m", &format!("add {file}")]);
 }
 
+/// The `<<...>>` sentinel form (RAL-269) of a cell's `review` field for the
+/// given `[[review]].id` value: `<<ralphus:new-review/<key>>>` for a
+/// new-review placeholder id, `<<review:<id>>>` for a plain existing id.
+fn cell_review_sentinel(review_id: &str) -> String {
+    if review_id.starts_with("ralphus:") {
+        format!("<<{review_id}>>")
+    } else {
+        format!("<<review:{review_id}>>")
+    }
+}
+
 /// Build a minimal task TOML with one session that opts into a review.
-/// `review_id` is the id for both the session's `review` field and the
-/// top-level `[[review]]` block. `review_attrs` is any extra `key = "value"`
-/// lines to append inside the `[[review]]` block (may be empty).
+/// `review_id` is the id for both the session's `review` field (wrapped as a
+/// `<<...>>` sentinel) and the top-level `[[review]]` block (unwrapped).
+/// `review_attrs` is any extra `key = "value"` lines to append inside the
+/// `[[review]]` block (may be empty).
 fn session_toml(cwd: &str, review_id: &str, review_attrs: &str) -> String {
+    let sentinel = cell_review_sentinel(review_id);
     format!(
-        "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+        "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
          [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
     )
 }
@@ -184,10 +197,11 @@ fn session_toml(cwd: &str, review_id: &str, review_attrs: &str) -> String {
 /// multi-branch) link-group guardian is built now that `ralphus:new-review/<key>`
 /// only groups WITHIN a submission.
 fn two_session_toml(cwd_a: &str, cwd_b: &str, review_id: &str, review_attrs: &str) -> String {
+    let sentinel = cell_review_sentinel(review_id);
     format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"{review_id}\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
          [[review]]\nid=\"{review_id}\"\n{review_attrs}\n"
     )
 }
@@ -230,8 +244,8 @@ fn two_projects_make_two_disambiguated_reviews() {
     let cwd_b = repo_with_worktree(&base_b, "feature/b");
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"one\"\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"two\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:one>>\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"<<review:two>>\"\n\
          [[review]]\nid=\"one\"\n\
          [[review]]\nid=\"two\"\n"
     );
@@ -404,20 +418,20 @@ fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
     // File 1: task "t1", opts into the shared key.
     let file1_text = format!(
         "[[task]]\nname=\"t1\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/shared>>\"\n\
          [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
     );
     // File 2: task "t2", opts into the SAME shared key (repeated [[review]]
     // block, matching the documented multi-file convention).
     let file2_text = format!(
         "[[task]]\nname=\"t2\"\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/shared\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/shared>>\"\n\
          [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
     );
     // File 3: task "t3", opts into a DIFFERENT key -- must end up in its own review.
     let file3_text = format!(
         "[[task]]\nname=\"t3\"\n\
-         [[task.cell]]\ncwd=\"{cwd_c}\"\nprompt=\"p\"\nreview=\"ralphus:new-review/solo\"\n\
+         [[task.cell]]\ncwd=\"{cwd_c}\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/solo>>\"\n\
          [[review]]\nid=\"ralphus:new-review/solo\"\nname=\"Solo\"\n"
     );
 
@@ -491,7 +505,7 @@ fn reviews_auto_start_when_the_run_succeeds() {
     // terminates the auto-started merge immediately and hermetically.
     let cwd = repo_with_worktree(&base, "feature/a");
     let toml = format!(
-        "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"<<review:r>>\"\n\
          [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -552,9 +566,9 @@ fn start_merge_resolves_conflicts_with_agent() {
     let (cwd_a, cwd_b) = two_conflicting_worktrees(&base);
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -664,9 +678,9 @@ fn force_push_then_merge_resolves_cleanly() {
     let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -775,9 +789,9 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
@@ -1046,7 +1060,7 @@ fn non_overlapping_task_does_not_block_readiness() {
     // Task A: fast, in project-X, declares a review.
     // Task B: slow/blocking, in project-Y, no review declaration.
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
@@ -1116,7 +1130,7 @@ fn non_overlapping_task_does_not_block_readiness() {
 }
 
 /// A task that shares the guardian's project directory blocks the review even
-/// when none of its sessions set `review = "<id>"`. The guardian for
+/// when none of its sessions set `review = "<<review:<id>>>"`. The guardian for
 /// project-X must wait for BOTH tasks (A and B) to be Done, even though only A
 /// declared the review.
 #[test]
@@ -1127,7 +1141,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
 
     // Task A: fast, declares a review. Task B: blocking, no review declaration.
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
@@ -1323,9 +1337,9 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     // 1) The "ticket": a Task TOML. Validate it with the offline validator.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     assert!(
@@ -1508,8 +1522,8 @@ fn proj_group_branches_carry_no_project_tag() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"rA\"\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"rB\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:rA>>\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"<<review:rB>>\"\n\
          [[review]]\nid=\"rA\"\n\
          [[review]]\nid=\"rB\"\n"
     );
@@ -1712,7 +1726,7 @@ fn per_project_base_commits_stored_and_retrieved() {
 
 // ── RAL-159: implicit worktree-sharing review membership ────────────────────
 
-/// A session with no `review = "<id>"` of its own, but whose cwd is a nested
+/// A session with no `review = "<<review:<id>>>"` of its own, but whose cwd is a nested
 /// subfolder of another session's review-linked worktree, implicitly joins
 /// that same branch's review (matched by literal worktree root, not mere
 /// project identity) -- so it shows up in the session's "in reviews" list
@@ -1730,7 +1744,7 @@ fn nested_cwd_session_implicitly_joins_review_and_reviews_list() {
     std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
 
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_share}\"\nprompt=\"p\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_share}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
          [[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"{cwd_other}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
@@ -1780,7 +1794,7 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
 
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );
@@ -1834,7 +1848,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
     std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
 
     let toml = format!(
-        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"r\"\n\
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
          [[review]]\nid=\"r\"\n"
     );

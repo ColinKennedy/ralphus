@@ -383,9 +383,9 @@ fn full_monorepo_flow_with_subproject_cells() {
     //    of the same monorepo, both scoped to `packages/alpha`.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     assert!(

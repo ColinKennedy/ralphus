@@ -27,6 +27,7 @@ pub mod plan;
 pub mod pr;
 pub mod procreg;
 pub mod proof;
+pub mod redact;
 pub mod remote_runner;
 pub mod resources;
 pub mod reviews;

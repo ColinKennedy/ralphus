@@ -1562,6 +1562,11 @@ mod tests {
 
     #[test]
     fn manager_pi_launch_failure_returns_2() {
+        // `launch_pi_with` writes (and later removes) the shared PID-derived
+        // temp prompt file just like `launch_claude_with`, so this test must
+        // hold the same lock every other temp-prompt-file writer holds --
+        // otherwise it races them in parallel test threads (RAL-264 caught
+        // this: concurrent removal during a peer's write/spawn window).
         let _guard = quick_start_temp_file_lock();
         let launch = launch_with_command("my-pi");
         let content = manager_system_prompt_content(false, PI_READ_ONLY_MECHANISM);

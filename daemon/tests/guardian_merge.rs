@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
-use ralphus_daemon::guardian::GuardianCheck;
+use ralphus_daemon::guardian::{GuardianCheck, MergeStatus};
 use ralphus_daemon::guardian_merge::{
     pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
     rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_chat, run_feedback,
-    run_merge, run_merge_staged, start_merge, stop_guardian_merge,
+    run_merge, run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
 };
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
@@ -664,6 +664,18 @@ fn per_branch_and_combined_worktrees_are_recorded() {
 fn feedback_edits_review_worktree_and_restacks_downstream() {
     let root = temp_repo();
     init_repo(&root);
+    // `run_feedback` now pushes the review branch to the repo's default
+    // remote (`remote.pushDefault`, falling back to `origin`) after each
+    // feedback commit (see `push_feedback_branch`). Give the temp repo a
+    // bare `origin` so that push succeeds; without one the feedback is
+    // still committed but the detail becomes "feedback committed but push
+    // failed" instead of an applied-success marker.
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
     write(&root, "base.txt", "base\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "base"]);
@@ -704,7 +716,15 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let rev0 = view.branches[0].review_branch.clone().unwrap();
     let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
     assert!(files0.contains("note.txt"), "feedback commit on branch 0");
-    assert_eq!(view.branches[0].detail.as_deref(), Some("feedback applied"));
+    let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
+    assert!(
+        detail0.starts_with("feedback applied"),
+        "feedback success detail, got: {detail0:?}"
+    );
+    assert!(
+        !detail0.contains("push failed"),
+        "feedback must not report a push failure, got: {detail0:?}"
+    );
 
     // ...and the downstream branch + combined worktree are rebuilt on top of it.
     let combined = view
@@ -717,6 +737,60 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
     assert!(files.contains("note.txt") && files.contains("a.txt") && files.contains("b.txt"));
 
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
+    // RAL-272: giving feedback on one branch must record it in that branch's
+    // own read-only thread, synchronously (before the spawned background
+    // apply/reply work even starts), and it must not show up under any
+    // other branch's thread.
+    let (root, store, id) = single_feature_repo();
+    // Deterministic, network-free: "claude-code" is resolvable but not
+    // supported by chat_client::call_direct (see chat_no_commit_leaves_
+    // working_tree_dirty above), so the best-effort reply generation always
+    // no-ops instead of racing a real API call.
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    let reply = start_feedback(
+        store.clone(),
+        Arc::new(FeedbackRunner),
+        &id,
+        &bid0,
+        "please add a note file".to_string(),
+    );
+    assert_eq!(reply.status, 202);
+
+    let msgs = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, "reviewer");
+    assert_eq!(msgs[0].text, "please add a note file");
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .guardian_branch_messages(&id, "some-other-branch")
+            .unwrap()
+            .is_empty()
+    );
+
+    // Let the background apply + best-effort reply generation finish before
+    // the repo is removed out from under it.
+    std::thread::sleep(Duration::from_millis(500));
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -2882,6 +2882,11 @@ pub fn start_resolve_input(
 
 /// Validate that a branch position has a review worktree, then kick off a
 /// background feedback application. Returns immediately.
+///
+/// RAL-272: also persists the feedback text into that branch's read-only
+/// feedback thread (`guardian_messages`, scoped by `branch_id`) and, in the
+/// background, generates a short triage-style acknowledgment reply the same
+/// way the old global chat did -- see [`record_feedback_reply`].
 pub fn start_feedback(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
@@ -2897,8 +2902,8 @@ pub fn start_feedback(
         Ok(g) => g,
         Err(e) => return reply(404, &error_body("not_found", &e.to_string())),
     };
-    match guardian.branches.iter().find(|b| b.id == branch_id) {
-        Some(b) if b.worktree.is_some() => {}
+    let feature = match guardian.branches.iter().find(|b| b.id == branch_id) {
+        Some(b) if b.worktree.is_some() => b.branch.clone(),
         Some(_) => {
             return reply(
                 409,
@@ -2906,10 +2911,20 @@ pub fn start_feedback(
             );
         }
         None => return reply(404, &error_body("not_found", "no such branch")),
+    };
+    if let Err(e) = store.lock().expect("poisoned").add_guardian_message(
+        id,
+        "reviewer",
+        &feedback,
+        None,
+        Some(branch_id),
+    ) {
+        return reply(500, &error_body("internal", &e.to_string()));
     }
     let sid = id.to_string();
     let bid = branch_id.to_string();
     std::thread::spawn(move || {
+        record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
         let outcome = run_feedback(&store, runner.as_ref(), &sid, &bid, &feedback);
         crate::rlog!(
             INFO,
@@ -2919,6 +2934,77 @@ pub fn start_feedback(
         );
     });
     reply(202, "{\"status\":\"applying_feedback\"}")
+}
+
+/// Generate a short, conversational acknowledgment of branch feedback and
+/// persist it into that branch's read-only feedback thread (RAL-272), reusing
+/// the same direct-LLM-call plumbing the old global chat used
+/// (`chat_client::call_direct`) rather than the file-editing resolver agent
+/// `run_feedback` spawns separately. Best-effort: any failure here is logged
+/// and swallowed rather than failing the feedback-application flow.
+fn record_feedback_reply(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch_id: &str,
+    feature: &str,
+    feedback: &str,
+) {
+    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let resolved = match resolve_resolver_agent(
+        guardian.resolver_agent.as_deref(),
+        guardian.resolver_model.as_deref(),
+        Path::new(&guardian.git_root),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} branch {branch_id} feedback reply skipped: \
+                 unresolvable resolver agent: {e}"
+            );
+            return;
+        }
+    };
+    if resolved.custom_profile {
+        // `call_direct` reads provider credentials straight from the daemon's
+        // own environment and has no way to honor a custom profile's env
+        // (e.g. an OpenRouter base URL/key) -- same limitation `run_chat`'s
+        // direct-call path has, so skip rather than silently hit the wrong
+        // endpoint/key.
+        return;
+    }
+    let system = format!(
+        "You are the review Guardian. A reviewer just left feedback on branch \
+         '{feature}', which an agent is now applying in its review worktree. \
+         Reply with a brief, conversational 1-2 sentence acknowledgment of what \
+         you understood from the feedback. Do not describe git commands or ask \
+         the reviewer to run anything themselves."
+    );
+    let messages = [crate::chat_client::ChatMessage {
+        role: "user",
+        content: feedback.to_string(),
+        image: None,
+    }];
+    let reply_text = match crate::chat_client::call_direct(
+        &resolved.backend,
+        resolved.model.as_deref(),
+        &system,
+        &messages,
+    ) {
+        Ok(text) => text,
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} branch {branch_id} feedback reply skipped: {e}"
+            );
+            return;
+        }
+    };
+    let guard = store.lock().expect("poisoned");
+    let _ = guard.add_guardian_message(id, "guardian", &reply_text, None, Some(branch_id));
 }
 
 /// Run the global feedback triage agent for a guardian (RAL-22). It works in
@@ -3244,7 +3330,7 @@ pub fn run_chat(
 
     {
         let guard = store.lock().expect("poisoned");
-        let _ = guard.add_guardian_message(id, "guardian", &visible_text, None);
+        let _ = guard.add_guardian_message(id, "guardian", &visible_text, None, None);
         // RAL-88: record which resolved agent/model produced this reply.
         let _ = guard.set_guardian_chat_agent(id, &chat_agent_used, chat_model_used.as_deref());
         // RAL-167: the reviewer-facing content the chat UI's post-send poll is
@@ -3315,6 +3401,7 @@ pub fn start_chat(
         "reviewer",
         &message,
         image.as_deref(),
+        None,
     ) {
         return reply(500, &error_body("internal", &e.to_string()));
     }
@@ -3328,6 +3415,572 @@ pub fn start_chat(
 /// live [`CancelToken`] to hand it (`CancelToken::never()` never trips).
 pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
     run_merge_cancellable(store, runner, id, &CancelToken::never());
+}
+
+/// What a single [`staged_merge_pass`] returned, and whether the caller should
+/// keep looping.
+enum StagedPassOutcome {
+    /// The pass ran to completion. `built_any` is true iff it rebased at least
+    /// one branch this pass.
+    Ok { built_any: bool },
+    /// A branch failed; `fail_branch` already set the branch + guardian to
+    /// `failed`/`merge_failed` with a detail message, so there's nothing more
+    /// to record.
+    Failed,
+    /// The pass was cancelled at a checkpoint (`log_merge_cancelled` already
+    /// ran); leave the merge state for the next pass's cleanup.
+    Cancelled,
+}
+
+/// RAL-265: incremental stack rebase. Unlike the all-or-nothing
+/// [`run_merge_cancellable`], which waits for every enabled branch's
+/// contributing cell to finish before rebasing anything and then rebuilds the
+/// whole stack from the base in one synchronous pass, this builds the stack
+/// piecewise:
+///
+/// - Each *pass* rebases the contiguous prefix of branches whose cells are
+///   done, stopping at the first branch still waiting on its upstream task.
+/// - A still-valid `Done`/`ConflictResolved` prefix (same branch config and
+///   same per-project base — see [`staged_build_signature`]) is preserved and
+///   the next pass seeds its `prev_ref` from that prefix's last tip rather
+///   than rebuilding it from the base. A changed base or branch config changes
+///   the signature, so the next pass rebuilds the prefix from the base instead
+///   of trusting a stale `Done` tip.
+/// - Only when *every* enabled branch across *every* project is done does it
+///   finalize: combined worktrees, manual command generation, final check
+///   gates, and the `InReview` transition (mirroring `run_merge_cancellable`'s
+///   tail). Otherwise it returns to `Collecting` so a later task completion
+///   re-triggers a further pass via `try_start_ready_reviews_for_task`.
+/// - The residual race — a branch becoming `ready` *while* a pass is already
+///   building, so `try_start_ready_reviews_for_task`'s claim loses to the
+///   running merge — is closed by the pass-level loop below coalescing
+///   consecutive completions instead of dropping them.
+///
+/// `claim_guardian_merge` (collecting→merging) already guarantees a single
+/// merge runs at a time, so concurrent task completions can never double-trigger
+/// a pass.
+///
+/// `skip_worktrees` reviews (shared worktree, no per-branch worktrees) are not
+/// incremental in this design: they fall back to the legacy all-or-nothing
+/// `run_merge_cancellable`, once every enabled branch's cells are done.
+pub fn run_merge_staged(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    cancel: &CancelToken,
+) {
+    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guardian.skip_worktrees {
+        // Shared-worktree reviews have no per-branch worktrees to resume from,
+        // so the staged skip-and-resume has nothing to preserve. Reuse the
+        // legacy merge, but only once every enabled branch's cells are done
+        // (the only input it can build); otherwise stay collecting for now.
+        if !all_enabled_branches_terminal(store, id) {
+            let _ = store.lock().expect("poisoned").set_guardian_status(
+                id,
+                GuardianStatus::Collecting,
+                None,
+            );
+        } else {
+            run_merge_cancellable(store, runner, id, cancel);
+        }
+        return;
+    }
+    let set_status = |s: GuardianStatus, detail: Option<&str>| {
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_guardian_status(id, s, detail);
+    };
+    set_status(GuardianStatus::Merging, None);
+    {
+        let guard = store.lock().expect("poisoned");
+        // RAL-103/RAL-27: clear the previous build's manual-check commands and
+        // conflict bookkeeping up front so the board never shows a stale
+        // "checks ready" state or leftover conflict progress while the staged
+        // build is in flight. (Manual commands are only regenerated on final
+        // InReview, not on a partial pass.)
+        let _ = guard.clear_guardian_manual_commands(id);
+        let _ = guard.set_guardian_conflicts(id, None, None, None);
+        let _ = guard.clear_all_branch_conflicts(id);
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} staged merge executing (incremental stack rebase)"
+    );
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "guardian",
+            message: "staged merge executing",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({}),
+        });
+    }
+
+    let mut built_any_total = false;
+    loop {
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return;
+        }
+        match staged_merge_pass(store, runner, id, cancel) {
+            StagedPassOutcome::Cancelled => return,
+            StagedPassOutcome::Failed => return,
+            StagedPassOutcome::Ok { built_any } => {
+                if built_any {
+                    built_any_total = true;
+                }
+                if all_enabled_branches_terminal(store, id) {
+                    // Whole stack is rebased — finalize now, exactly once.
+                    if built_any_total {
+                        let _ = store
+                            .lock()
+                            .expect("poisoned")
+                            .bump_guardian_merge_attempt(id);
+                    }
+                    finish_staged_merge(store, runner, id, cancel, &set_status);
+                    return;
+                }
+                if !built_any || !next_not_built_is_ready(store, id) {
+                    // Nothing more can build right now: return to Collecting so
+                    // the next task completion re-triggers a further pass.
+                    set_status(GuardianStatus::Collecting, None);
+                    return;
+                }
+                // A `pending` branch became `ready` while we were building;
+                // coalesce it into this same merge rather than waiting.
+            }
+        }
+    }
+}
+
+/// Every enabled branch across every project of `id` is in a terminal
+/// (rebase-complete) state — `done` or `conflict_resolved`. This is the gate
+/// for the `InReview` finalize and for the shared-worktree fallback.
+fn all_enabled_branches_terminal(store: &Arc<Mutex<Store>>, id: &str) -> bool {
+    let Ok(g) = store.lock().expect("poisoned").get_guardian(id) else {
+        return false;
+    };
+    g.branches.iter().filter(|b| b.enabled).all(|b| {
+        b.merge_status == MergeStatus::Done.as_str()
+            || b.merge_status == MergeStatus::ConflictResolved.as_str()
+    })
+}
+
+/// Whether the first enabled branch that is NOT yet rebase-complete (`done` /
+/// `conflict_resolved`) is in the `ready` state — i.e. another staged pass
+/// would build at least one branch immediately. Used to coalesce a branch that
+/// became `ready` mid-pass.
+fn next_not_built_is_ready(store: &Arc<Mutex<Store>>, id: &str) -> bool {
+    let Ok(g) = store.lock().expect("poisoned").get_guardian(id) else {
+        return false;
+    };
+    let mut branches: Vec<_> = g.branches.iter().filter(|b| b.enabled).collect();
+    branches.sort_by_key(|b| b.position);
+    match branches.into_iter().find(|b| {
+        b.merge_status != MergeStatus::Done.as_str()
+            && b.merge_status != MergeStatus::ConflictResolved.as_str()
+    }) {
+        Some(b) => b.merge_status == MergeStatus::Ready.as_str(),
+        None => false,
+    }
+}
+
+/// Hash identifying the stack configuration a staged pass builds against: each
+/// project's resolved base commit plus the ordered identity of every enabled
+/// branch (position, feature branch name, owning project). Two passes share a
+/// signature iff the base is unchanged AND the branch set is unchanged, which
+/// is exactly when a previously-`Done` prefix is still valid to resume from.
+///
+/// `base_shas` is `{project_root: resolved_base_sha}` resolved by the caller.
+fn staged_build_signature(
+    project_order: &[String],
+    base_shas: &std::collections::HashMap<String, String>,
+    enabled_branches: &[crate::guardian::BranchView],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for proj in project_order {
+        if let Some(sha) = base_shas.get(proj) {
+            parts.push(format!("base:{proj}:{sha}"));
+        }
+    }
+    let mut ordered: Vec<&crate::guardian::BranchView> =
+        enabled_branches.iter().filter(|b| b.enabled).collect();
+    ordered.sort_by_key(|b| b.position);
+    for b in ordered {
+        let proj = b.project.clone().unwrap_or_default();
+        parts.push(format!("branch:{proj}:{}:{}", b.position, b.branch));
+    }
+    parts.join("|")
+}
+
+/// One incremental pass: rebase the contiguous ready prefix of each project,
+/// reusing a still-valid `Done` prefix when the recorded signature matches the
+/// current one, rebuilding it (from the base) when it doesn't. Stops at the
+/// first `pending` (cells-not-done) branch per project. Records the fresh
+/// signature so the next pass can resume.
+#[allow(clippy::too_many_arguments)]
+fn staged_merge_pass(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    cancel: &CancelToken,
+) -> StagedPassOutcome {
+    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return StagedPassOutcome::Ok { built_any: false },
+    };
+    let git_root = guardian.git_root.clone();
+
+    // Partition enabled branches by project, preserving position order within
+    // each project and project-first-appearance across the guardian.
+    let mut project_order: Vec<String> = Vec::new();
+    let mut project_branches: std::collections::HashMap<String, Vec<crate::guardian::BranchView>> =
+        std::collections::HashMap::new();
+    for b in guardian.branches.iter().filter(|b| b.enabled) {
+        let proj = b.project.clone().unwrap_or_else(|| git_root.clone());
+        if !project_branches.contains_key(&proj) {
+            project_order.push(proj.clone());
+        }
+        project_branches.entry(proj).or_default().push(b.clone());
+    }
+    for branches in project_branches.values_mut() {
+        branches.sort_by_key(|b| b.position);
+    }
+
+    let set_status = |s: GuardianStatus, d: Option<&str>| {
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_guardian_status(id, s, d);
+    };
+
+    // Resolve every project's base commit up front; if any base is unresolvable
+    // the whole pass fails (mirrors run_merge_cancellable).
+    let mut base_shas: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for proj in &project_order {
+        let root = Workspace::for_guardian(store, id, PathBuf::from(&proj));
+        match resolve_base(&root, &guardian.base_branch) {
+            Ok(sha) => {
+                base_shas.insert(proj.clone(), sha.clone());
+                let _ = store
+                    .lock()
+                    .expect("poisoned")
+                    .set_guardian_project_base_commit(id, proj, &sha);
+            }
+            Err(e) => {
+                set_status(
+                    GuardianStatus::MergeFailed,
+                    Some(&format!(
+                        "{proj}: base branch '{}': {e}",
+                        guardian.base_branch
+                    )),
+                );
+                return StagedPassOutcome::Failed;
+            }
+        }
+    }
+
+    let enabled_branches: Vec<crate::guardian::BranchView> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled)
+        .cloned()
+        .collect();
+    let current_sig = staged_build_signature(&project_order, &base_shas, &enabled_branches);
+    let stored_sig = store
+        .lock()
+        .expect("poisoned")
+        .guardian_build_signature(id)
+        .unwrap_or(None);
+    // Resume only when the recorded config/base matches the current one; a
+    // mismatch (base moved, branch reordered/added/removed/enabled/disabled)
+    // forces a rebuild of the previously-`Done` prefix so a stale tip is never
+    // treated as valid.
+    let resume = stored_sig.as_deref() == Some(current_sig.as_str());
+
+    // Unambiguous last branch in the stack for `ProofScope::FinalBranch`.
+    let final_id = final_branch_id(
+        &enabled_branches
+            .iter()
+            .map(|b| crate::guardian::OrderedBranch {
+                id: b.id.clone(),
+                position: b.position,
+                branch: b.branch.clone(),
+                enabled: b.enabled,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map(str::to_string);
+
+    let mut built_any = false;
+    for proj in &project_order {
+        if cancel.is_cancelled() {
+            return StagedPassOutcome::Cancelled;
+        }
+        let root = Workspace::for_guardian(store, id, PathBuf::from(&proj));
+        let wt_base = root.at(worktree_dir(proj, id));
+        let base_sha = base_shas.get(proj).cloned().unwrap_or_default();
+        if let Err(e) = preflight_worktree_budget(&root, &wt_base, &base_sha) {
+            set_status(GuardianStatus::MergeFailed, Some(&e));
+            return StagedPassOutcome::Failed;
+        }
+        // For resume, reuse the maximal `Done` prefix's last tip as the seed;
+        // otherwise seed from the base (full rebuild of the ready prefix).
+        let proj_branches = &project_branches[proj];
+        let (mut prev_ref, start_idx) = if resume {
+            staged_resume_point(&root, id, proj_branches, &base_sha)
+        } else {
+            (base_sha.clone(), 0usize)
+        };
+        let short_names = branch_short_names(store, id, Some(proj.as_str()));
+        let squash = guardian.squash_projects.iter().any(|p| p == proj);
+        for (idx, bv) in proj_branches.iter().enumerate() {
+            if idx < start_idx {
+                continue; // preserved, already-built prefix
+            }
+            if cancel.is_cancelled() {
+                return StagedPassOutcome::Cancelled;
+            }
+            // Stop the project's build at the first branch whose cells aren't
+            // all done yet.
+            if bv.merge_status == MergeStatus::Pending.as_str() {
+                break;
+            }
+            let _ = store.lock().expect("poisoned").set_branch_status(
+                id,
+                &bv.id,
+                MergeStatus::InProgress,
+                None,
+            );
+            if let Err(e) = fetch_branch_for_remote_cell(store, id, bv) {
+                fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
+                return StagedPassOutcome::Failed;
+            }
+            let rev = format!("guardian/{id}/wt-{}", bv.branch);
+            let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
+            let wt_str = wt.root().to_string_lossy().to_string();
+            if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &bv.branch) {
+                fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
+                return StagedPassOutcome::Failed;
+            }
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .set_branch_review(id, &bv.id, &rev, &wt_str);
+            let gate = ProofGate::resolve(store, id, Some(&bv.id) == final_id.as_ref());
+            if cancel.is_cancelled() {
+                return StagedPassOutcome::Cancelled;
+            }
+            // `upstream` is the rebase boundary; `prev_ref` is what the branch
+            // stacks onto (base at the first build of a project, else the prior
+            // branch's tip — preserved on resume, the last rebuilt branch on a
+            // rebuild).
+            let upstream = base_sha.clone();
+            if stack_pick(
+                store, runner, id, &bv.id, &bv.branch, &upstream, &prev_ref, &rev, &wt, squash,
+                &gate, cancel,
+            )
+            .is_err()
+            {
+                // stack_pick already set this branch + guardian failed.
+                return StagedPassOutcome::Failed;
+            }
+            if cancel.is_cancelled() {
+                return StagedPassOutcome::Cancelled;
+            }
+            if let Err(e) = run_commit_checks(store, id, &bv.id, &wt, &bv.branch) {
+                fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
+                return StagedPassOutcome::Failed;
+            }
+            if note_if_branch_is_empty(store, id, &bv.id, &bv.branch, &root, &upstream) {
+                fail_branch(
+                    store,
+                    id,
+                    &bv.id,
+                    &bv.branch,
+                    "branch is empty: it adds no changes over the branch beneath it in the stack.                      Its task most likely never committed its work -- check that cell, then re-run                      it. If this branch is meant to be empty, disable it to drop it from the stack.",
+                    &set_status,
+                );
+                return StagedPassOutcome::Failed;
+            }
+            prev_ref = rev;
+            built_any = true;
+        }
+    }
+
+    // Record the current config/base so the next pass recognizes this prefix as
+    // valid to resume from (it IS valid — it was just built against this
+    // signature, and it is the longest built prefix).
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .set_guardian_build_signature(id, &current_sig);
+
+    StagedPassOutcome::Ok { built_any }
+}
+
+/// For one project's ordered branches, find the maximal contiguous prefix that
+/// is already rebase-complete (`done`/`conflict_resolved`) AND whose review ref
+/// still resolves. Returns `(seed_prev_ref, first_index_to_build)`. When
+/// nothing can be preserved, seeds from `base_sha` and starts at index 0.
+fn staged_resume_point(
+    root: &Workspace,
+    id: &str,
+    proj_branches: &[crate::guardian::BranchView],
+    base_sha: &str,
+) -> (String, usize) {
+    let mut prev_ref = base_sha.to_string();
+    let mut start = 0usize;
+    for (i, bv) in proj_branches.iter().enumerate() {
+        let terminal = bv.merge_status == MergeStatus::Done.as_str()
+            || bv.merge_status == MergeStatus::ConflictResolved.as_str();
+        if !terminal {
+            break;
+        }
+        let rev = format!("guardian/{id}/wt-{}", bv.branch);
+        if root.git(&["rev-parse", "--verify", &rev]).is_err() {
+            // The tip ref is gone (e.g. a worktree prune removed it) — the
+            // prefix is no longer reusable; rebuild everything from here.
+            break;
+        }
+        prev_ref = rev;
+        start = i + 1;
+    }
+    (prev_ref, start)
+}
+
+/// Finalize a fully-rebased staged merge: build each project's combined
+/// worktree, regenerate manual commands, run the final check gates, snapshot
+/// review heads for manual-push detection, and move to `InReview`. Mirrors the
+/// tail of [`run_merge_cancellable`].
+#[allow(clippy::too_many_arguments)]
+fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    cancel: &CancelToken,
+    set_status: &F,
+) {
+    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if cancel.is_cancelled() {
+        return;
+    }
+    let mut project_order: Vec<String> = Vec::new();
+    let mut project_branches: std::collections::HashMap<String, Vec<crate::guardian::BranchView>> =
+        std::collections::HashMap::new();
+    for b in guardian.branches.iter().filter(|b| b.enabled) {
+        let proj = b
+            .project
+            .clone()
+            .unwrap_or_else(|| guardian.git_root.clone());
+        if !project_branches.contains_key(&proj) {
+            project_order.push(proj.clone());
+        }
+        project_branches.entry(proj).or_default().push(b.clone());
+    }
+    for branches in project_branches.values_mut() {
+        branches.sort_by_key(|b| b.position);
+    }
+    if project_order.is_empty() {
+        // All branches disabled — review is a no-op.
+        set_status(
+            GuardianStatus::InReview,
+            Some("all branches disabled — review is a no-op"),
+        );
+        return;
+    }
+
+    let mut last_combined: Option<String> = None;
+    let mut last_root: Option<Workspace> = None;
+    let mut last_build_note: Option<String> = None;
+    for proj in &project_order {
+        if cancel.is_cancelled() {
+            log_merge_cancelled(store, id);
+            return;
+        }
+        let root = Workspace::for_guardian(store, id, PathBuf::from(&proj));
+        let wt_base = root.at(worktree_dir(proj, id));
+        let base_sha = match resolve_base(&root, &guardian.base_branch) {
+            Ok(s) => s,
+            Err(e) => {
+                set_status(
+                    GuardianStatus::MergeFailed,
+                    Some(&format!(
+                        "{proj}: base branch '{}': {e}",
+                        guardian.base_branch
+                    )),
+                );
+                return;
+            }
+        };
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_guardian_project_base_commit(id, proj, &base_sha);
+        // Combined worktree points at the head of this project's last branch.
+        let prev_ref = project_branches[proj]
+            .last()
+            .map(|b| format!("guardian/{id}/wt-{}", b.branch))
+            .unwrap_or_else(|| base_sha.clone());
+        match rebuild_combined(store, &root, &wt_base, id, &prev_ref) {
+            Ok(combined_str) => {
+                last_combined = Some(combined_str);
+                last_root = Some(root.clone());
+                last_build_note = generate_manual_commands(
+                    store,
+                    runner,
+                    id,
+                    &root,
+                    &base_sha,
+                    &prev_ref,
+                    Some(&wt_base.join("review")),
+                );
+            }
+            Err(e) => {
+                set_status(GuardianStatus::MergeFailed, Some(&e));
+                return;
+            }
+        }
+    }
+    if cancel.is_cancelled() {
+        log_merge_cancelled(store, id);
+        return;
+    }
+    let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
+        match final_checks(store, id, root, combined_str) {
+            Ok(n) => n,
+            Err(e) => {
+                set_status(GuardianStatus::MergeFailed, Some(&e));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    // RAL-92: baseline the freshly-built review-branch tips so this build is
+    // never read as a reviewer's manual push on the next maintenance sweep.
+    snapshot_review_heads(store, id);
+    // RAL-208: debounced LLM change summary for the whole guardian, now that
+    // every branch has finished rebuilding.
+    queue_final_summary_regen(store, id);
+    set_status(
+        GuardianStatus::InReview,
+        note.or(last_build_note).as_deref(),
+    );
 }
 
 /// Build the review stack for a guardian (synchronous; called on a worker thread
@@ -8208,6 +8861,48 @@ Let me know if you need anything else."#;
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn record_feedback_reply_is_best_effort_and_leaves_thread_untouched_on_failure() {
+        // RAL-272: an agent unsupported by the direct-LLM-call fast path
+        // (`chat_client::call_direct` only supports claude/anthropic/ollama)
+        // must not panic or leak an error into the branch's feedback thread
+        // -- the reply generation is best-effort only, with no subprocess
+        // fallback (unlike the global chat's `run_chat`). "claude-code" is
+        // resolvable but unsupported, so this is deterministic and
+        // network-free regardless of whether ANTHROPIC_API_KEY is set in the
+        // environment (see the identical reasoning in
+        // `chat_no_commit_leaves_working_tree_dirty` in
+        // daemon/tests/guardian_merge.rs).
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let g = store.lock().unwrap();
+            let id = g.create_guardian("r", "main", "/repo").unwrap();
+            g.add_guardian_branch(&id, "feature/a").unwrap();
+            g.set_guardian_resolver(&id, Some("claude-code"), None)
+                .unwrap();
+            id
+        };
+        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+        record_feedback_reply(
+            &store,
+            &id,
+            &branch_id,
+            "feature/a",
+            "please fix the naming",
+        );
+        let msgs = store
+            .lock()
+            .unwrap()
+            .guardian_branch_messages(&id, &branch_id)
+            .unwrap();
+        assert!(
+            msgs.is_empty(),
+            "an unsupported resolver agent must not record a reply: {msgs:?}"
+        );
     }
 
     #[test]

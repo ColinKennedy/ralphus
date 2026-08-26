@@ -126,10 +126,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         both.
                                         Examples:
                                           cwd = "ralphus:new-worktree/RAL-123-fix?upstream=<<default>>"
-                                          cwd = "ralphus:new-worktree/RAL-123-fix?upstream=main"
-                                          cwd = "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
                                           cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=main>>"
-                                          cwd = "<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>/package"
+                                          cwd = "<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>"
                                         ALTERNATIVE: an absolute path to an
                                         already-built git WORKTREE, if you built it
                                         yourself. ALWAYS use forward slashes (e.g.
@@ -245,8 +243,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  [[review]]   (zero or more per file, top-level)
 ---------------------------------------------------------------
  Declares a Guardian code review. Cells opt in by setting
- `review = "<id>"` in their [[task.cell]] block. Branch order
- follows the task/cell dependency order.
+ `review = "<<review:<id>>>"` in their [[task.cell]] block. Branch
+ order follows the task/cell dependency order.
 
  The review's base branch is always resolved from the worktree's
  upstream tracking branch at submit time (a hard error if the
@@ -279,7 +277,12 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  id     string  Human-readable review id (also the default label),
                 OR a link placeholder "ralphus:new-review/<key>"
                 whose <key> is letters/digits/-/_/. Cells
-                reference this review by setting `review = "<id>"`.
+                reference this review by setting the [[task.cell]]
+                `review` field to a wrapped sentinel: either
+                "<<review:<id>>>" for a plain id, or
+                "<<ralphus:new-review/<key>>>" for a link
+                placeholder id -- the bare, unwrapped id/placeholder
+                is rejected.
  name   string  GUI label; falls back to `id` when unset. For a
                 link id, set `name` so the review has a readable
                 label (not the raw URI).
@@ -499,7 +502,7 @@ Guardian exists to surface, and is almost never what you want.
  5. ONE review for the whole batch (the DEFAULT unless the user says
     otherwise): add a top-level [[review]] block with id =
     "ralphus:new-review/<key>", then set review =
-    "ralphus:new-review/<key>" on every [[task.cell]] whose cwd is a
+    "<<ralphus:new-review/<key>>>" on every [[task.cell]] whose cwd is a
     git worktree. Every cell naming the same <key> attaches to ONE
     shared Guardian -- but the <key> only groups WITHIN a single
     submission. The prescriptive default is one Guardian review per
@@ -559,7 +562,7 @@ project = "my-project"
   id     = "init"
   cwd    = "<<ralphus:new-worktree/feature-a?upstream=main>>"
   prompt = "Create data.json with {\"version\": 1}."
-  review = "backend"              # opt this worktree branch into the review
+  review = "<<review:backend>>"   # opt this worktree branch into the review
 
     [[task.cell.proof]]
     command = "test -f data.json"
@@ -573,7 +576,7 @@ depends_on = ["setup"]            # waits for all of setup's cells + proof steps
   cwd      = "<<ralphus:new-worktree/feature-b?upstream=main>>"
   upstream = "<<task:setup>>"     # rebase feature-b onto setup's branch tip first
   prompt   = "Using {handoff:setup}, write a summary to report.md."
-  review   = "backend"
+  review   = "<<review:backend>>"
 
     [[task.cell.proof]]
     command = "test -f report.md"
@@ -613,7 +616,7 @@ project = "my-project"            # both cells' worktree materializes under this
   id                     = "work"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
   cwd                    = "<<ralphus:new-worktree/ral-2?upstream=main>>"
-  review                 = "ralphus:new-review/ral-batch"
+  review                 = "<<ralphus:new-review/ral-batch>>"
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
   prompt                 = "{<the RAL-2 ticket text, pasted verbatim>}"
@@ -660,7 +663,7 @@ depends_on = ["ral-2"]
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
   cwd                    = "<<ralphus:new-worktree/ral-3?upstream=main>>"
   upstream               = "<<task:ral-2>>"
-  review                 = "ralphus:new-review/ral-batch"  # same key folds into same review
+  review                 = "<<ralphus:new-review/ral-batch>>"  # same key folds into same review
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
   prompt                 = "{<the RAL-3 ticket text, pasted verbatim>}"
@@ -726,10 +729,25 @@ mod tests {
     fn tutor_uses_wrapped_worktree_placeholders_for_cwd_examples() {
         assert!(TASK_TUTOR.contains("cwd    = \"<<ralphus:new-worktree/hello?upstream=main>>\""));
         assert!(
+            !TASK_TUTOR.lines().any(|line| line.contains("cwd")
+                && line.contains("= \"ralphus:new-worktree/")
+                && !line.contains("upstream=<<")),
+            "cwd examples must teach the wrapped <<...>> expansion syntax, except \
+             when the ?upstream= value is itself a reserved <<...>> sentinel -- \
+             that can't be nested inside an outer <<...>> wrap"
+        );
+    }
+
+    #[test]
+    fn tutor_uses_wrapped_review_sentinel_for_review_examples() {
+        assert!(
             !TASK_TUTOR
                 .lines()
-                .any(|line| line.contains("cwd") && line.contains("= \"ralphus:new-worktree/")),
-            "cwd examples must teach the wrapped <<...>> expansion syntax"
+                .any(|line| line.trim_start().starts_with("review")
+                    && line.contains('=')
+                    && line.contains('"')
+                    && !line.contains("<<")),
+            "cell 'review' examples must teach the wrapped <<...>> sentinel syntax (RAL-269)"
         );
     }
 

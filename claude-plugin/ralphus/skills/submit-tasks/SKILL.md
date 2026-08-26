@@ -69,7 +69,7 @@ that can run in parallel. Then ask me if that order looks right.
 Before writing, briefly surface the layout trade-offs and let me choose (don't
 silently pick). Keep it short:
 - **Reviews:** if these branches belong in ONE review, define one `[[review]]`
-  and give each `[[task.session]]` the same `review = "ralphus:new-review/<key>"`
+  and give each `[[task.session]]` the same `review = "<<ralphus:new-review/<key>>>"`
   so they link into a single Guardian -- even across separate files. Otherwise
   say plainly "this will create N separate reviews" so I can confirm that's intended.
 - **Verifiers:** ask whether the format/lint/test steps should be plain

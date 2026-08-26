@@ -26,6 +26,14 @@ pub struct AgentProfile {
     pub backend: String,
     pub executable: Option<String>,
     pub env: BTreeMap<String, String>,
+    /// The resolved values of every `env` entry that was indirection via
+    /// `from_env` (as opposed to a literal authored in the config file).
+    /// These are treated as secrets for RAL-264: the daemon registers them
+    /// with `crate::redact` so the resolved value never lands in durable pane
+    /// text / failure `detail`s even when the agent echoes it into its own
+    /// terminal (e.g. `$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-...'`). Literal
+    /// values are excluded — they are already plaintext in the config file.
+    pub secret_values: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +42,10 @@ pub struct ResolvedAgentSelection {
     pub executable: Option<String>,
     pub env: BTreeMap<String, String>,
     pub custom_profile: bool,
+    /// The agent-profile `from_env`-resolved secret values in play for this
+    /// selection (empty for a built-in backend, which has no `env`).
+    /// Propagated from [`AgentProfile::secret_values`]; see its doc comment.
+    pub secret_values: BTreeSet<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -99,16 +111,26 @@ fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, Str
             ));
         }
         let mut env = BTreeMap::new();
+        // RAL-264: the resolved values of every `from_env`-indirected entry are
+        // secret-shaped and must be scrubbed out of any durable pane text.
+        // Collected here (where the parse still distinguishes
+        // `RawEnvValue::FromEnv` from `RawEnvValue::Literal`) so resolution can
+        // hand them to the redaction layer; see [`AgentProfile::secret_values`].
+        let mut secret_values = BTreeSet::new();
         for (key, value) in profile.env {
             let resolved = match value {
                 RawEnvValue::Literal(s) => s,
-                RawEnvValue::FromEnv { from_env } => std::env::var(&from_env).map_err(|_| {
-                    format!(
-                        "{}: agent profile \"{name}\" requires environment variable {from_env:?}, but it is not set in the daemon process environment. \
-                        Set {from_env} in the environment the `ralphus-daemon serve` process runs in (not just your shell), then restart the daemon.",
-                        path.display()
-                    )
-                })?,
+                RawEnvValue::FromEnv { from_env } => {
+                    let resolved = std::env::var(&from_env).map_err(|_| {
+                        format!(
+                            "{}: agent profile \"{name}\" requires environment variable {from_env:?}, but it is not set in the daemon process environment. \
+                            Set {from_env} in the environment the `ralphus-daemon serve` process runs in (not just your shell), then restart the daemon.",
+                            path.display()
+                        )
+                    })?;
+                    secret_values.insert(resolved.clone());
+                    resolved
+                }
             };
             env.insert(key, resolved);
         }
@@ -118,6 +140,7 @@ fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, Str
                 backend: profile.backend,
                 executable: profile.executable,
                 env,
+                secret_values,
             },
         );
     }
@@ -224,11 +247,18 @@ fn resolve_agent_for_path_with(
 ) -> Result<ResolvedAgentSelection, String> {
     let profiles = load_profiles_for_path_with(cwd, configuration_path_env)?;
     if let Some(profile) = profiles.get(agent) {
+        // RAL-264: this profile is about to be used to run a cell, so its
+        // `from_env`-resolved secret values must be scrubbed everywhere raw
+        // pane text gets persisted. Even though the profile may already be
+        // registered from a prior resolution (idempotent), registering here
+        // guarantees the values are in place before any tmux pane capture.
+        crate::redact::register_all(profile.secret_values.iter().cloned());
         return Ok(ResolvedAgentSelection {
             backend: profile.backend.clone(),
             executable: profile.executable.clone(),
             env: profile.env.clone(),
             custom_profile: true,
+            secret_values: profile.secret_values.clone(),
         });
     }
     if let Some(backend) = normalize_builtin_agent(agent) {
@@ -237,6 +267,7 @@ fn resolve_agent_for_path_with(
             executable: None,
             env: BTreeMap::new(),
             custom_profile: false,
+            secret_values: BTreeSet::new(),
         });
     }
     Err(format!(
@@ -344,9 +375,9 @@ fn validate_task_file_profiles_with(
 
     // `[[review]].agent` gets the same treatment as a cell's `agent`, but a
     // review has no `cwd`/`project` of its own -- it's inferred from
-    // whichever cells opt in via `cell.review = "<id>"` (a review can span
-    // several projects, materializing one guardian per project). Resolve
-    // against every distinct project a matching cell resolves to.
+    // whichever cells opt in via `cell.review = "<<review:<id>>>"` (a review
+    // can span several projects, materializing one guardian per project).
+    // Resolve against every distinct project a matching cell resolves to.
     for (review_idx, review) in file.review.iter().enumerate() {
         let (Some(review_id), Some(agent)) = (review.id.as_deref(), review.agent.as_deref()) else {
             continue;
@@ -354,7 +385,11 @@ fn validate_task_file_profiles_with(
         let mut seen_cwds = BTreeSet::new();
         for task in &file.task {
             for cell in &task.cell {
-                if cell.review.as_deref() != Some(review_id) {
+                let cell_review_id = cell
+                    .review
+                    .as_deref()
+                    .and_then(ralphus_core::schema::parse_cell_review_sentinel);
+                if cell_review_id != Some(review_id) {
                     continue;
                 }
                 let Some(cwd) = config_cwd_for_cell(store, task, cell) else {
@@ -569,6 +604,41 @@ PATH_COPY = { from_env = "PATH" }
             shared.env.get("PATH_COPY").map(String::as_str),
             std::env::var("PATH").ok().as_deref()
         );
+        // RAL-264: the `from_env`-resolved value is tracked as a secret value
+        // (scrubbed from durable pane text), even though it isn't itself an
+        // API key — `from_env` is the marker for "could be sensitive".
+        assert!(
+            shared
+                .secret_values
+                .contains(std::env::var("PATH").ok().unwrap_or_default().as_str())
+        );
+    }
+
+    #[test]
+    fn literal_env_values_are_not_treated_as_secrets() {
+        let root = tempdir("literal-not-secret");
+        fs::write(
+            root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom]
+backend = "raw"
+executable = "my-raw-runner"
+
+[agent.profiles.custom.env]
+FEATURE_FLAG = "enabled"
+"#,
+        )
+        .expect("write project config");
+
+        let profiles = parse_profile_file(&root.join(".ralphus.toml")).expect("parse profiles");
+        let custom = profiles.get("custom").expect("custom profile");
+        assert_eq!(
+            custom.env.get("FEATURE_FLAG").map(String::as_str),
+            Some("enabled")
+        );
+        // A literal authored in the config file is already plaintext there, so
+        // it is not promoted to the redaction set (RAL-264).
+        assert!(custom.secret_values.is_empty());
     }
 
     #[test]
@@ -688,6 +758,7 @@ backend = "claude-code"
                 backend: "codex".to_string(),
                 executable: Some("codex-global".to_string()),
                 env: BTreeMap::from([("GLOBAL_ONLY".to_string(), "1".to_string())]),
+                secret_values: BTreeSet::new(),
             },
         );
         let mut project = BTreeMap::new();
@@ -697,6 +768,7 @@ backend = "claude-code"
                 backend: "raw".to_string(),
                 executable: Some("project-runner".to_string()),
                 env: BTreeMap::from([("PROJECT_ONLY".to_string(), "1".to_string())]),
+                secret_values: BTreeSet::new(),
             },
         );
 
@@ -770,7 +842,7 @@ backend = "claude-code"
         let src = format!(
             "[[review]]\nid=\"r\"\nagent=\"{review_agent}\"\n\
              [[task]]\nname=\"t\"\nproject=\"unused\"\n\
-             [[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nreview=\"r\"\nprompt=\"p\"\n"
+             [[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nreview=\"<<review:r>>\"\nprompt=\"p\"\n"
         );
         toml::from_str(&src).expect("parse task file")
     }

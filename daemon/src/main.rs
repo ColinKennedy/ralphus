@@ -133,11 +133,23 @@ fn main() -> ExitCode {
             // health` (`GET /api/health/agent-profiles`) re-validates this
             // independently and surfaces it there instead of blocking every
             // daemon startup on one profile's config.
-            if let Err(e) = ralphus_daemon::agent_profiles::load_profiles_for_current_dir() {
-                ralphus_daemon::logging::write_line(
+            match ralphus_daemon::agent_profiles::load_profiles_for_current_dir() {
+                Ok(profiles) => {
+                    // RAL-264: seed the secret-redaction registry from every
+                    // agent profile the daemon can see from its cwd, so resolved
+                    // `from_env` values are scrubbed from durable pane text even
+                    // for a profile that is first used before (or without) a
+                    // fresh `resolve_agent_for_path` call.
+                    ralphus_daemon::redact::register_all(
+                        profiles
+                            .values()
+                            .flat_map(|p| p.secret_values.iter().cloned()),
+                    );
+                }
+                Err(e) => ralphus_daemon::logging::write_line(
                     ralphus_daemon::logging::LogLevel::WARNING,
                     &format!("agent profile config issue (see `ralphus check health`): {e}"),
-                );
+                ),
             }
             let db = db.unwrap_or_else(default_db_path);
             let bind_host = ralphus_daemon::resolve_bind_host(

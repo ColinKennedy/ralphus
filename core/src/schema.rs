@@ -33,7 +33,8 @@ pub struct TaskFile {
     #[serde(default)]
     pub task: Vec<TaskDef>,
     /// Top-level review (guardian) declarations. Cells opt in by setting
-    /// `review = "<id>"` to match a review's `id` field.
+    /// `review = "<<review:<id>>>"` to match a review's `id` field (see
+    /// [`parse_cell_review_sentinel`]).
     #[serde(default)]
     pub review: Vec<ReviewDef>,
 }
@@ -206,8 +207,14 @@ pub struct CellDef {
     /// Cell-level proof steps.
     #[serde(default)]
     pub proof: Vec<ProofStep>,
-    /// Review (guardian) opt-in. Set to the `id` of a top-level `[[review]]`
-    /// block to include this cell's worktree branch in that review.
+    /// Review (guardian) opt-in. Must be wrapped in `<<...>>` sentinel syntax
+    /// (per `docs/glossary.md`'s sentinel definition -- this value is
+    /// resolved/minted at squad time, not used literally): either
+    /// `<<review:<id>>>` naming the `id` of a top-level `[[review]]` block to
+    /// include this cell's worktree branch in that review, or
+    /// `<<ralphus:new-review/<key>>>` to mint a fresh guardian for this
+    /// submission (see [`REVIEW_LINK_PREFIX`]). See
+    /// [`parse_cell_review_sentinel`].
     #[serde(default)]
     pub review: Option<String>,
     /// Environment variables for this cell's spawned subprocess
@@ -402,6 +409,31 @@ pub fn review_link_key(id: &str) -> Option<&str> {
         .filter(|k| !k.is_empty())
 }
 
+/// Sentinel prefix for `review = "<<review:<id>>>"`: wraps a plain,
+/// already-declared `[[review]].id` reference. Mirrors
+/// [`UPSTREAM_TASK_REF_PREFIX`]'s `<<task:...>>` form.
+pub const REVIEW_REF_PREFIX: &str = "<<review:";
+
+/// Parse a `[[task.cell]].review` value (RAL-269). The value MUST be wrapped
+/// in `<<...>>` -- a bare, unwrapped string is rejected (see
+/// `core/src/validate.rs`'s `check_review`) -- either as `<<review:<id>>>`
+/// naming an existing `[[review]].id` literally, or as
+/// `<<ralphus:new-review/<key>>>` wrapping the new-review placeholder (see
+/// [`REVIEW_LINK_PREFIX`]). Returns the unwrapped id/placeholder -- the value
+/// to match against `[[review]].id` -- or `None` for a bare/unwrapped or
+/// malformed value.
+#[must_use]
+pub fn parse_cell_review_sentinel(review: &str) -> Option<&str> {
+    if let Some(inner) = review
+        .strip_prefix(REVIEW_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))
+    {
+        return (!inner.is_empty()).then_some(inner);
+    }
+    let inner = review.strip_prefix("<<")?.strip_suffix(">>")?;
+    review_link_key(inner).is_some().then_some(inner)
+}
+
 /// The reserved `machine` value naming the daemon's own host. Also the
 /// implicit default when `machine` is unset anywhere in the inheritance chain,
 /// so an existing task file that never mentions `machine` keeps running
@@ -537,7 +569,7 @@ pub fn resolve_cell_proof_machine(
 
 /// A top-level review (guardian) declaration via `[[review]]`.
 ///
-/// Cells opt in by declaring `review = "<id>"`. When several cells resolve
+/// Cells opt in by declaring `review = "<<review:<id>>>"`. When several cells resolve
 /// to the same project they collapse into one guardian; across N projects the
 /// daemon materialises N guardians and disambiguates their names. The base branch
 /// is always resolved from each worktree's tracking upstream at submit time.
@@ -893,7 +925,7 @@ mod tests {
             [[task.cell]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
-            review = "backend"
+            review = "<<review:backend>>"
 
             [[review]]
             id = "backend"
@@ -910,7 +942,10 @@ mod tests {
             prompt = "Open localhost:3000 and click through the new wizard"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        assert_eq!(parsed.task[0].cell[0].review.as_deref(), Some("backend"));
+        assert_eq!(
+            parsed.task[0].cell[0].review.as_deref(),
+            Some("<<review:backend>>")
+        );
         let review = &parsed.review;
         assert_eq!(review.len(), 1);
         assert_eq!(review[0].id.as_deref(), Some("backend"));
@@ -934,7 +969,7 @@ mod tests {
             [[task.cell]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
-            review = "backend"
+            review = "<<review:backend>>"
 
             [[review]]
             id = "backend"
@@ -969,7 +1004,7 @@ mod tests {
             [[task.cell]]
             cwd = "/repo/.wt/feat"
             prompt = "do work"
-            review = "backend"
+            review = "<<review:backend>>"
 
             [[review]]
             id = "backend"
@@ -1134,6 +1169,34 @@ mod tests {
         assert_eq!(parse_upstream_task_ref("main"), None);
         assert_eq!(parse_upstream_task_ref("<<upstream>>"), None);
         assert_eq!(parse_upstream_task_ref(""), None);
+    }
+
+    #[test]
+    fn cell_review_sentinel_matches_plain_id() {
+        assert_eq!(
+            parse_cell_review_sentinel("<<review:backend>>"),
+            Some("backend")
+        );
+    }
+
+    #[test]
+    fn cell_review_sentinel_matches_new_review_placeholder() {
+        assert_eq!(
+            parse_cell_review_sentinel("<<ralphus:new-review/ral-batch>>"),
+            Some("ralphus:new-review/ral-batch")
+        );
+    }
+
+    #[test]
+    fn cell_review_sentinel_none_for_bare_or_malformed() {
+        assert_eq!(parse_cell_review_sentinel("backend"), None);
+        assert_eq!(
+            parse_cell_review_sentinel("ralphus:new-review/ral-batch"),
+            None
+        );
+        assert_eq!(parse_cell_review_sentinel("<<review:>>"), None);
+        assert_eq!(parse_cell_review_sentinel("<<unknown>>"), None);
+        assert_eq!(parse_cell_review_sentinel(""), None);
     }
 
     #[test]

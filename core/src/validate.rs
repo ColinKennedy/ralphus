@@ -666,6 +666,7 @@ fn validate_cells(
         check_upstream_task_ref_exists(ctx, table, &path, header, task_cell_index);
 
         check_type(ctx, table, "review", Ty::Str, &path, header);
+        check_review(ctx, table, &path, header);
 
         validate_proof_array(table.get("proof"), &format!("{path}.proof"), ctx);
     }
@@ -1117,6 +1118,37 @@ fn check_upstream(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option
                 line,
             );
         }
+    }
+}
+
+/// Validate the `review` field of a cell (RAL-269). It must be wrapped in
+/// `<<...>>` sentinel syntax -- a bare, unwrapped string (the retired form)
+/// is rejected with no backwards-compatible alias. See
+/// [`crate::schema::parse_cell_review_sentinel`].
+fn check_review(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(val) = table.get("review").and_then(toml::Value::as_str) else {
+        return;
+    };
+    if val.trim().is_empty() {
+        let line = ctx.key_line(header, "review");
+        ctx.error(
+            &format!("{path}.review"),
+            ErrorKind::InvalidValue,
+            "'review' must not be empty",
+            line,
+        );
+        return;
+    }
+    if crate::schema::parse_cell_review_sentinel(val).is_none() {
+        let line = ctx.key_line(header, "review");
+        ctx.error(
+            &format!("{path}.review"),
+            ErrorKind::InvalidValue,
+            "'review' must be wrapped in \"<<...>>\" sentinel syntax, e.g. \
+             \"<<review:backend>>\" for an existing review id, or \
+             \"<<ralphus:new-review/<key>>>\" to mint a new one",
+            line,
+        );
     }
 }
 
@@ -1759,14 +1791,14 @@ command = "cargo build"
 
     #[test]
     fn review_maximum_budget_usd_accepted() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=10.0\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=10.0\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn review_maximum_budget_usd_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=\"lots\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=\"lots\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
@@ -1778,7 +1810,7 @@ command = "cargo build"
 
     #[test]
     fn review_maximum_budget_usd_zero_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=0.0\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nmaximum_budget_usd=0.0\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2163,7 +2195,7 @@ command = "cargo build"
 
     #[test]
     fn toplevel_review_block_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"be\"\n[[review]]\nid=\"be\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:be>>\"\n[[review]]\nid=\"be\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2176,7 +2208,7 @@ command = "cargo build"
     #[test]
     fn machine_is_valid_at_every_level() {
         let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
-                   [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmachine=\"incredibuild:A\"\nreview=\"r\"\n\
+                   [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmachine=\"incredibuild:A\"\nreview=\"<<review:r>>\"\n\
                    [[task.cell.proof]]\ncommand=\"cargo test\"\nmachine=\"incredibuild:A\"\n\
                    [[task.proof]]\ncommand=\"cargo fmt\"\nmachine=\"local\"\n\
                    [[review]]\nid=\"r\"\nmachine=\"incredibuild:C\"\n";
@@ -2256,7 +2288,7 @@ command = "cargo build"
 
     #[test]
     fn review_with_action_command_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run tests\"\ncommand=\"cargo test\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run tests\"\ncommand=\"cargo test\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2266,7 +2298,7 @@ command = "cargo build"
 
     #[test]
     fn review_with_action_prompt_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check UI\"\nprompt=\"Open localhost:3000 and verify the wizard\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check UI\"\nprompt=\"Open localhost:3000 and verify the wizard\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2276,7 +2308,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_both_prompt_and_command_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\nprompt=\"do x\"\ncommand=\"do y\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\nprompt=\"do x\"\ncommand=\"do y\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2289,7 +2321,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_missing_both_prompt_and_command_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Check\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2302,7 +2334,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_missing_label_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\ncommand=\"cargo test\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\ncommand=\"cargo test\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2315,7 +2347,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_unknown_key_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nfoo=\"bar\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nfoo=\"bar\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2328,7 +2360,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_cleanup_command_alone_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\ncleanup_command=\"ralphus-daemon stop --port {port}\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\ncleanup_command=\"ralphus-daemon stop --port {port}\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2338,7 +2370,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port for the daemon\"\ndefault=\"7890\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port for the daemon\"\ndefault=\"7890\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2348,7 +2380,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_missing_name_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nmessage=\"Port for the daemon\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nmessage=\"Port for the daemon\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2361,7 +2393,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_missing_message_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2374,7 +2406,7 @@ command = "cargo build"
 
     #[test]
     fn review_action_input_unknown_key_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port\"\nfoo=\"bar\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Serve\"\ncommand=\"ralphus-daemon serve --port {port}\"\n[[review.action.input]]\nname=\"port\"\nmessage=\"Port\"\nfoo=\"bar\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2387,7 +2419,7 @@ command = "cargo build"
 
     #[test]
     fn review_link_placeholder_id_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"ralphus:new-review/ral-batch\"\n[[review]]\nid=\"ralphus:new-review/ral-batch\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/ral-batch>>\"\n[[review]]\nid=\"ralphus:new-review/ral-batch\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -2456,10 +2488,62 @@ command = "cargo build"
         );
     }
 
+    // ── RAL-269: cell `review` requires <<...>> sentinel syntax ───────────
+
+    #[test]
+    fn cell_review_bare_plain_id_rejected() {
+        // The bare (unwrapped) form is retired -- no backwards-compatible alias.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("sentinel")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn cell_review_bare_new_review_placeholder_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"ralphus:new-review/ral-batch\"\n[[review]]\nid=\"ralphus:new-review/ral-batch\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("sentinel")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn cell_review_wrapped_plain_id_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    // The wrapped new-review-placeholder form (`<<ralphus:new-review/<key>>>`)
+    // is already covered by `review_link_placeholder_id_is_valid` above.
+
+    #[test]
+    fn cell_review_empty_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("empty")),
+            "{:?}",
+            r.errors
+        );
+    }
+
     #[test]
     fn review_without_action_block_works_identically() {
         // A [[review]] with no [[review.action]] sub-blocks must still validate.
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"r\"\n[[review]]\nid=\"r\"\nagent=\"claude\"\nmodel=\"claude-opus-4-8\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nagent=\"claude\"\nmodel=\"claude-opus-4-8\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",

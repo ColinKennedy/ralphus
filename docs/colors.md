@@ -45,6 +45,7 @@ role in the table below, then use it.
 | `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that contributes no changes — fails the review, RAL-190) |
 | `--drift` | `#f0883e` | *(shared)* | semantic (a submitted PR's remote branch and its review worktree have diverged, RAL-190) |
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
+| `--out-of-date` | `#d4a72c` | *(shared)* | semantic (a task/cell/proof step's env overrides changed since it last ran, RAL-271) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -196,6 +197,18 @@ caution-reserved `--ignored` (that amber is for the genuine `ignored`
 status, not generic "pay attention") and from `--warn` (reserved for
 Cartographer log severity) — `--stale` exists only because no existing role
 fit this new concept (see "Adding a new UI element" below).
+
+### Env overrides "out of date" — `--out-of-date` only (RAL-271)
+A task/cell/proof step's Details Pane shows a small `⚠ env out of date` badge
+next to its status pill once its own environment-variable overrides have
+been edited since it last ran/retried or had its status explicitly set
+(`Set Status`). This is purely cosmetic — no behavior changes and no proof
+result is invalidated — so it deliberately does not reuse `--failed`/
+`--danger` (nothing failed), `--ignored` (reserved for the real `ignored`
+status), or `--drift` (reserved for PR/worktree divergence, RAL-190,
+a different concept even though both are "stored state diverged from
+current"); `--out-of-date` exists only because no existing role fit this
+new concept (see "Adding a new UI element" below).
 
 ### Inherited resolved value — italic text only (no new color)
 A detail-pane field whose displayed value is a resolved fallback from a parent

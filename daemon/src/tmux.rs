@@ -1254,6 +1254,32 @@ mod tests {
     }
 
     #[test]
+    fn pane_snapshot_redacts_registered_secret_values() {
+        // RAL-264: the pane snapshot is the durable "what was last there"
+        // record the board's Live View shows; a pane that echoed the agent's
+        // own `$env:... = 'sk-or-v1-...'` assignment must not persist the
+        // resolved value under it.
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            crate::redact::register("sk-or-v1-pane-snapshot-test-token");
+
+            let dir = TempSnapshotDir::new("redact");
+            write_pane_snapshot_in(
+                &dir.0,
+                "s",
+                "$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-pane-snapshot-test-token'\ndone",
+            );
+            let content = read_pane_snapshot_in(&dir.0, "s").expect("snapshot written");
+            assert!(
+                !content.contains("sk-or-v1-pane-snapshot-test-token"),
+                "secret leaked into pane snapshot: {content}"
+            );
+            assert!(content.contains(crate::redact::REDACTED));
+            assert!(content.contains("done"));
+        });
+    }
+
+    #[test]
     fn pane_snapshot_missing_file_is_none() {
         let dir = TempSnapshotDir::new("missing");
         assert_eq!(read_pane_snapshot_in(&dir.0, "never-written"), None);

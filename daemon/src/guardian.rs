@@ -1113,6 +1113,60 @@ impl Store {
         Ok(n)
     }
 
+    /// Record the stack configuration a staged merge pass built against (RAL-265):
+    /// a hash of the enabled-branch order/identity plus each project's resolved
+    /// base commit. Written after every (partial or full) build pass so the next
+    /// pass can tell a still-valid `Done` prefix (same signature → resume) from a
+    /// changed base or branch config (different signature → rebuild the prefix).
+    pub fn set_guardian_build_signature(&self, id: &str, sig: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET build_signature=?, updated_at_ms=? WHERE id=?",
+            params![sig, crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// The last recorded build signature for `id`, if any. `None` means no prior
+    /// (partial or full) build pass has completed, so there is nothing to resume.
+    pub fn guardian_build_signature(&self, id: &str) -> Result<Option<String>> {
+        let value: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT build_signature FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
+    }
+
+    /// Ids of collecting guardians that are mid-incremental (RAL-265) and can
+    /// still make staged progress: at least one enabled branch is in a
+    /// buildable-but-not-terminal state (`ready` — its cell done, waiting to
+    /// rebase — or `in_progress`/`proof_pending`/`actioning`, a branch a crashed
+    /// pass left half-built) while other enabled branches are still `pending`.
+    /// Used at daemon startup so a restart doesn't strand a partially rebuilt
+    /// stack waiting for a task completion that never comes.
+    pub fn collecting_guardians_resumable(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT g.id FROM guardians g
+             JOIN guardian_branches gb ON gb.guardian_id = g.id
+             WHERE g.status = 'collecting'
+               AND gb.enabled = 1
+               AND gb.merge_status IN ('ready', 'in_progress', 'proof_pending', 'actioning')
+               AND EXISTS (
+                   SELECT 1 FROM guardian_branches other
+                   WHERE other.guardian_id = g.id AND other.enabled = 1
+                     AND other.merge_status = 'pending'
+               )
+             ORDER BY g.created_at_ms, g.id",
+        )?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// The `cwd` of the most recent cell that contributed to `branch` (matched
     /// via `cells.review_branch`), if any (RAL-103). Used to compute a
     /// preliminary, git-log-only change summary from the task's own worktree
@@ -1382,19 +1436,22 @@ impl Store {
         }
     }
 
-    /// Append a message to a guardian's global feedback thread (RAL-22). `role`
-    /// is `"reviewer"` (the human) or `"guardian"` (the triage agent). `image`
-    /// is an optional base64 data-URI attached to the message (RAL-59).
+    /// Append a message to a guardian's feedback thread. `role` is
+    /// `"reviewer"` (the human) or `"guardian"` (the triage agent). `image` is
+    /// an optional base64 data-URI attached to the message (RAL-59).
+    /// `branch_id` scopes the message to one review branch (RAL-272); `None`
+    /// keeps it in the old global thread (RAL-22).
     pub fn add_guardian_message(
         &self,
         guardian_id: &str,
         role: &str,
         text: &str,
         image: Option<&str>,
+        branch_id: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image) VALUES(?,?,?,?,?)",
-            params![guardian_id, role, text, crate::store::now_ms(), image],
+            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image, branch_id) VALUES(?,?,?,?,?,?)",
+            params![guardian_id, role, text, crate::store::now_ms(), image, branch_id],
         )?;
         Ok(())
     }
@@ -1420,6 +1477,32 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![guardian_id], |r| {
+                Ok(MessageView {
+                    seq: r.get(0)?,
+                    role: r.get(1)?,
+                    text: r.get(2)?,
+                    at_ms: r.get(3)?,
+                    image: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One review branch's feedback thread, oldest first (RAL-272). Only
+    /// messages explicitly scoped to `branch_id` are returned -- the old
+    /// global thread (`branch_id IS NULL`) never appears here.
+    pub fn guardian_branch_messages(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Vec<MessageView>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, role, text, at_ms, image FROM guardian_messages \
+             WHERE guardian_id=? AND branch_id=? ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![guardian_id, branch_id], |r| {
                 Ok(MessageView {
                     seq: r.get(0)?,
                     role: r.get(1)?,
@@ -4144,10 +4227,16 @@ mod tests {
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         assert!(store.guardian_messages(&id).unwrap().is_empty());
         store
-            .add_guardian_message(&id, "reviewer", "please fix the naming", None)
+            .add_guardian_message(&id, "reviewer", "please fix the naming", None, None)
             .unwrap();
         store
-            .add_guardian_message(&id, "guardian", "that lands on branch feature/a", None)
+            .add_guardian_message(
+                &id,
+                "guardian",
+                "that lands on branch feature/a",
+                None,
+                None,
+            )
             .unwrap();
         let thread = store.guardian_messages(&id).unwrap();
         assert_eq!(thread.len(), 2);
@@ -4161,7 +4250,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "hi", None)
+            .add_guardian_message(&id, "reviewer", "hi", None, None)
             .unwrap();
         store.delete_guardian(&id).unwrap();
         assert!(store.guardian_messages(&id).unwrap().is_empty());
@@ -4172,13 +4261,13 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "msg1", None)
+            .add_guardian_message(&id, "reviewer", "msg1", None, None)
             .unwrap();
         store
-            .add_guardian_message(&id, "guardian", "msg2", None)
+            .add_guardian_message(&id, "guardian", "msg2", None, None)
             .unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "msg3", None)
+            .add_guardian_message(&id, "reviewer", "msg3", None, None)
             .unwrap();
         let thread = store.guardian_messages(&id).unwrap();
         assert_eq!(thread.len(), 3);
@@ -4197,13 +4286,13 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "a", None)
+            .add_guardian_message(&id, "reviewer", "a", None, None)
             .unwrap();
         store
-            .add_guardian_message(&id, "guardian", "b", None)
+            .add_guardian_message(&id, "guardian", "b", None, None)
             .unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "c", None)
+            .add_guardian_message(&id, "reviewer", "c", None, None)
             .unwrap();
         let msgs = store.guardian_messages(&id).unwrap();
         assert_eq!(msgs.len(), 3);
@@ -4213,6 +4302,45 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].text, "a");
         assert_eq!(after[0].role, "reviewer");
+    }
+
+    #[test]
+    fn guardian_branch_messages_are_isolated_per_branch() {
+        // RAL-272: a branch-scoped message only shows up under its own
+        // branch_id, and the old global thread (branch_id=None) never leaks
+        // into a per-branch query.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "global", None, None)
+            .unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "feedback on a", None, Some("branch-a"))
+            .unwrap();
+        store
+            .add_guardian_message(&id, "guardian", "reply on a", None, Some("branch-a"))
+            .unwrap();
+        store
+            .add_guardian_message(&id, "reviewer", "feedback on b", None, Some("branch-b"))
+            .unwrap();
+
+        let a = store.guardian_branch_messages(&id, "branch-a").unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].text, "feedback on a");
+        assert_eq!(a[1].text, "reply on a");
+
+        let b = store.guardian_branch_messages(&id, "branch-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].text, "feedback on b");
+
+        assert!(
+            store
+                .guardian_branch_messages(&id, "branch-c")
+                .unwrap()
+                .is_empty()
+        );
+        // The global thread still contains every row, scoped or not.
+        assert_eq!(store.guardian_messages(&id).unwrap().len(), 4);
     }
 
     #[test]

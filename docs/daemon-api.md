@@ -93,6 +93,7 @@ where one exists.
 | POST | `/api/guardians/{id}/branches/reorder` | [Reorder branches](#post-apiguardiansidbranchesreorder) (does **not** rebase) |
 | POST | `/api/guardians/{id}/branches/arrange` | [Reorder + rebase atomically](#post-apiguardiansidbranchesarrange) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/feedback` | Feedback on one branch → resolver re-attempt |
+| GET | `/api/guardians/{id}/branches/{branch_id}/messages` | [Per-branch feedback thread](#get-apiguardiansidbranchesbranch_idmessages) |
 | GET | `/api/guardians/{id}/messages` | [Global feedback thread](#get-apiguardiansidmessages) |
 | POST | `/api/guardians/{id}/chat` | [Post to the feedback thread](#post-apiguardiansidchat) |
 | POST | `/api/guardians/{id}/chat/fork` | Fork the thread at a message seq |
@@ -1104,6 +1105,19 @@ The review's global feedback thread (RAL-22), oldest first:
 `role` is `reviewer` (human) or `guardian` (triage agent). `at_ms` is when the
 message was posted (Unix epoch ms); the board renders it beside each message.
 
+### `GET /api/guardians/{id}/branches/{branch_id}/messages`
+One review branch's read-only feedback thread (RAL-272), same shape as the
+global thread above but scoped to `branch_id`. Populated by `POST
+.../branches/{branch_id}/feedback`: the reviewer's feedback text is persisted
+immediately (`role: "reviewer"`), and a short conversational acknowledgment
+from the guardian follows in the background (`role: "guardian"`), generated
+the same way the global chat's triage replies are (`chat_client::call_direct`)
+but without the `<route>`-block routing step, since the branch is already
+known. The board shows this thread only once a branch's detail view is
+expanded and it has at least one message — otherwise it shows a "No feedback
+yet" placeholder pointing at the `feedback` command above. Messages posted to
+the old global thread (`branch_id` unset) never appear here.
+
 ### `POST /api/guardians/{id}/chat`
 Post a reviewer message to the global feedback thread. Body `{ "text": "..." }`
 (empty is a `400`). The message is persisted immediately; the triage agent then
@@ -1339,10 +1353,11 @@ keeps the default newest-first order).
           "model": null,
           "state": "running",
           "soloed": false,
+          "env_out_of_date": false,
           "started_at_ms": 1783120107300,
           "finished_at_ms": null,
-          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null } ] } ],
-          "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null } ]
+          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false } ] } ],
+          "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null, "env_out_of_date": false } ]
         }
       ]
     }
@@ -1447,6 +1462,18 @@ and `.../proof/env`) -- see
 [Hierarchical env overrides](#hierarchical-env-overrides-taskcellproof-layers)
 above for how these merge with the squad's. All four are raw unredacted
 `{key: value}` pairs, omitted from the JSON when empty, same as the squad's.
+
+Each `TaskView`/`CellView`/`ProofView` also carries `env_out_of_date`
+(RAL-271): a cosmetic, non-blocking `boolean` that flips to `true` once the
+row's own env overrides (or, for a task/cell, its own proof steps'
+`proof_env_overrides`/per-step `env_overrides`) are edited after the row
+already exists. Editing a task's `env_overrides` also marks every cell it
+owns; editing a cell's `env_overrides` also marks that cell's own proof
+steps -- never a sibling task/cell, and never a grandchild two ownership
+levels down. It clears back to `false` when the row is reset to `pending` by
+a restart/retry, or on any `POST /api/squads/{id}/set-status` call
+targeting it (any state, not just a restart). Purely informational -- it has
+no effect on scheduling or proof results.
 
 For prompt-driven cells, each `CellView` may also carry `system_prompt`:
 the read-only effective appended system prompt the agent actually received,
