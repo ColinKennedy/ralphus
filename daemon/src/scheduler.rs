@@ -248,14 +248,18 @@ pub fn run_loop(
     let mut last_terminal_log_prune = std::time::Instant::now();
     // Recovery: restart merges that were interrupted by a daemon shutdown.
     // Guardians stuck in `merging` have no live background thread; reset them to
-    // `collecting` so `claim_guardian_merge` can claim them again.
+    // `collecting` so `claim_guardian_merge` can claim them again. Notably we do
+    // NOT promote their branches to `ready` here: since RAL-265 the staged merge
+    // can run while only part of the stack's cells are done, so a blindly
+    // promoted `pending` branch (its cell not yet done) would be wrongly built.
+    // Once `collecting`, the all-cells-done case below and the partial-ready case
+    // further down re-trigger the right level of work.
     {
         let ids = {
             let guard = store.lock().expect("store mutex poisoned");
             let ids = guard.interrupted_merges().unwrap_or_default();
             for gid in &ids {
                 let _ = guard.reset_guardian_to_collecting(gid);
-                let _ = guard.mark_guardian_branches_ready(gid);
             }
             ids
         };
@@ -263,7 +267,8 @@ pub fn run_loop(
     }
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
-    // completed but before the guardian auto-started.
+    // completed but before the guardian auto-started, and a full-merge crash (its
+    // branches were reset to `pending` by `run_merge_cancellable`).
     {
         let ids = {
             let guard = store.lock().expect("store mutex poisoned");
@@ -272,6 +277,18 @@ pub fn run_loop(
                 let _ = guard.mark_guardian_branches_ready(gid);
             }
             ids
+        };
+        start_reviews(&store, ids, &sem, &cancellations);
+    }
+    // Recovery: start collecting guardians that are mid-incremental (RAL-265) —
+    // a buildable-but-not-terminal branch (`ready`, or one a crashed pass left
+    // half-built) but not all branches done. A staged merge builds their
+    // already-`Done` prefix plus the next buildable branch. Branches are left in
+    // whatever state the crash left them; the pass re-evaluates.
+    {
+        let ids = {
+            let guard = store.lock().expect("store mutex poisoned");
+            guard.collecting_guardians_resumable().unwrap_or_default()
         };
         start_reviews(&store, ids, &sem, &cancellations);
     }
@@ -2149,14 +2166,17 @@ fn run_task_finalizer(
 /// Spawn a background merge for each guardian that is still `collecting`.
 /// Uses an atomic DB transition (`collecting → merging`) so that concurrent
 /// calls for the same guardian — possible when multiple task finalizers finish
-/// simultaneously — never both proceed to `run_merge`. A user can still start
+/// simultaneously — never both proceed to the merge. A user can still start
 /// one earlier via the merge endpoint ("allow review"); that path uses the same
-/// guard inside `run_merge`. Conflict resolution uses a fresh subprocess
-/// runner, independent of the cell runner.
+/// guard. Conflict resolution uses a fresh subprocess runner, independent of the
+/// cell runner.
 ///
 /// Each spawned merge worker acquires a slot from `sem` before calling
-/// `run_merge`, so review merges count against the same global concurrency cap
-/// as cells and task-level proofs.
+/// [`crate::guardian_merge::run_merge_staged`], so review merges count against
+/// the same global concurrency cap as cells and task-level proofs. The staged
+/// merge (RAL-265) rebases just the ready prefix of branches, returning to
+/// `Collecting` when only part of the stack is done, so this is safe to invoke
+/// on any `collecting` guardian the new task completion may have advanced.
 ///
 /// RAL-213: registers/removes a `guardian:{id}`-keyed cancel token around the
 /// merge, same as `guardian_merge::start_merge`, so a settings change made
@@ -2209,7 +2229,12 @@ fn start_reviews(
                     Arc::clone(&store),
                 ));
                 let token = cancellations.register(&format!("guardian:{gid}"));
-                crate::guardian_merge::run_merge_cancellable(&store, runner.as_ref(), &gid, &token);
+                // RAL-265: use the incremental staged merge so a guardian can
+                // begin rebasing as soon as its first branch's cell is done,
+                // resuming from already-built `Done` tips as later branches
+                // finish, and only finalizing to `InReview` once every branch is
+                // rebased.
+                crate::guardian_merge::run_merge_staged(&store, runner.as_ref(), &gid, &token);
                 cancellations.remove(&format!("guardian:{gid}"));
             }
         });
@@ -2245,9 +2270,13 @@ fn guardian_blocking_tasks(cells: &[crate::store::CellRow], git_root: &str) -> H
 /// from `squad_id`: promote any of ITS branches whose own contributing cell is
 /// now done to `ready` (RAL-103 — independent of sibling branches still waiting
 /// on a different task, so the change summary can recompute per-branch as the
-/// guardian collects), and if all of the guardian's blocking tasks (those with
-/// cells under the guardian's `git_root`) are now Done, kick off that
-/// guardian's merge immediately — without waiting for the whole squad to finish.
+/// guardian collects), and kick off an incremental staged merge
+/// (RAL-265). The staged merge rebases the contiguous prefix of branches whose
+/// cells are done, stopping at the first branch still waiting on its upstream
+/// task, so it needs only that `completed_task_idx` to have advanced the stack
+/// — not every blocking task finished. When the completed task's branch isn't
+/// yet buildable (an earlier branch is still `pending`), the staged merge
+/// no-ops back to `Collecting` and a later completion re-triggers it.
 #[allow(clippy::too_many_arguments)]
 fn try_start_ready_reviews_for_task(
     store: &Arc<Mutex<Store>>,
@@ -2301,11 +2330,10 @@ fn try_start_ready_reviews_for_task(
         // blocking task finishes. Mirrors the straggler path
         // (`mark_ready_branches_with_done_cells`), just invoked eagerly
         // here rather than on the periodic maintenance sweep.
-        let (all_done, needs_summary) = {
+        let needs_summary = {
             let guard = store.lock().expect("store mutex poisoned");
             let promoted = guard.mark_ready_branches_with_done_cells(gid).unwrap_or(0);
-            let all_done = guard.all_tasks_done(squad_id, &blocking).unwrap_or(false);
-            (all_done, promoted > 0)
+            promoted > 0
         };
         if needs_summary {
             // RAL-121: enqueue instead of recomputing synchronously under the
@@ -2317,8 +2345,23 @@ fn try_start_ready_reviews_for_task(
             // because this guardian just had user-visible progress.
             summary_queue.enqueue(gid, crate::summary_worker::Priority::High);
         }
-        if all_done {
-            ready.push(gid.clone());
+        // RAL-265: the staged merge needs only this completed task to advance
+        // the stack, not all blocking tasks done — so fire it on every blocking
+        // completion of a still-`collecting` guardian. It no-ops back to
+        // `Collecting` if the next buildable branch isn't ready yet.
+        {
+            let guard = store.lock().expect("store mutex poisoned");
+            let collecting = guard
+                .get_guardian(gid)
+                .map(|g| g.status == "collecting")
+                .unwrap_or(false);
+            if collecting {
+                ready.push(gid.clone());
+            }
+            // A guardian that has already left `collecting` (e.g. `in_review`)
+            // is not re-merged here — a late task completion for one of its
+            // branches is handled by the maintenance sweep's straggler path,
+            // not by restarting the whole review.
         }
     }
     // RAL-213: the real daemon-wide registry, threaded all the way down from

@@ -2247,6 +2247,62 @@ mod tests {
         assert_eq!(tail_lines("\n\n", 5), "");
     }
 
+    /// RAL-264: a "no result file" failure folds the last pane tail into the
+    /// message, and that message becomes the branch `detail` (surfaced by
+    /// `ralphus review show`/`worktrees` and persisted to SQLite). When the
+    /// pane shows the agent's own `$env:... = 'sk-or-v1-...'` assignment — the
+    /// exact leak this ticket exists for — the resolved secret must be
+    /// scrubbed out of the failure message before it is returned.
+    ///
+    /// Exercises the true leak site (`read_tmux_result`) directly: a write-time
+    /// reproduction of the incident, where a `from_env`-sourced token value
+    /// landed in `last_pane` while the session vanished without writing a
+    /// result file.
+    #[test]
+    fn read_tmux_result_redacts_secret_values_from_folded_pane_text() {
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            crate::redact::register("sk-or-v1-ral264-unit-test-token");
+
+            let missing = std::env::temp_dir().join(format!(
+                "ralphus-test-missing-result-{}.json",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_file(&missing);
+
+            let pane = concat!(
+                "some prior work output\n",
+                "$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-ral264-unit-test-token'\n",
+                "still printing...\n",
+            );
+            let result = <SubprocessRunner>::read_tmux_result(&missing, Some(pane));
+            // The failure is surfaced (there was no result file) and the secret
+            // value is gone from the `detail`, replaced by the placeholder.
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("no result file"),
+                "expected a no-result-file failure, got {:?}",
+                result.error
+            );
+            let detail = result.error.unwrap_or_default();
+            assert!(
+                !detail.contains("sk-or-v1-ral264-unit-test-token"),
+                "secret leaked into failure detail: {detail}"
+            );
+            assert!(
+                detail.contains(crate::redact::REDACTED),
+                "expected the redaction placeholder in detail: {detail}"
+            );
+            let _ = std::fs::remove_file(&missing);
+        });
+    }
+
     #[test]
     fn command_line_splits_program_and_args() {
         let r = SubprocessRunner::new("python -m ralphus.runner");

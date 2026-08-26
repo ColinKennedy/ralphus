@@ -1,7 +1,7 @@
 //! Derive per-project Guardian reviews from top-level `[[review]]` blocks.
 //!
-//! At submit time, cells that opt in to a review (via `review = "<id>"` on the
-//! cell) are grouped by the *project* their worktree belongs to (its shared
+//! At submit time, cells that opt in to a review (via `review = "<<review:<id>>>"`
+//! on the cell) are grouped by the *project* their worktree belongs to (its shared
 //! git dir, so linked worktrees of one repo collapse together). Each project
 //! becomes one guardian, whose branch list is the cells' worktree branches in
 //! topological order. The base branch is always the worktree's upstream tracking
@@ -261,8 +261,15 @@ fn rows_from_file<'a>(file: &'a TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellRe
                 upstream: s.upstream.clone(),
                 machine: ralphus_core::schema::resolve_cell_machine(task, s),
             });
-            // Collect the cell's cwd and its optional review opt-in id.
-            cell_info.push((s.cwd.clone(), s.review.as_deref()));
+            // Collect the cell's cwd and its optional review opt-in id. `review`
+            // is a `<<review:<id>>>` / `<<ralphus:new-review/<key>>>` sentinel
+            // (RAL-269); unwrap it here so every downstream lookup against
+            // `[[review]].id` (itself unwrapped) compares like with like.
+            let rev_id = s
+                .review
+                .as_deref()
+                .and_then(ralphus_core::schema::parse_cell_review_sentinel);
+            cell_info.push((s.cwd.clone(), rev_id));
         }
     }
     (cells, tasks, cell_info)
@@ -425,7 +432,7 @@ pub fn derive_reviews(
     // RAL-159: the worktree root and assigned branch of every explicitly
     // review-linked cell, so a second pass below can attach cells that
     // merely share that worktree (e.g. a nested cwd subfolder) but declared no
-    // `review = "<id>"` of their own.
+    // `review = "<<review:<id>>>"` of their own.
     let mut explicit_roots: Vec<(PathBuf, String)> = Vec::new();
 
     // Task rows indexed for the remote-derivation lookup below, which needs the
@@ -540,7 +547,7 @@ pub fn derive_reviews(
     // RAL-159: cells that share a worktree with an explicitly review-linked
     // cell -- e.g. one at the worktree root, another at a nested cwd
     // subfolder -- implicitly belong to that same branch's review too, even
-    // without their own `review = "<id>"`: they can commit to the exact same
+    // without their own `review = "<<review:<id>>>"`: they can commit to the exact same
     // branch, since a worktree checks out exactly one branch at a time. This
     // makes the readiness gate (`Store::mark_ready_branches_with_done_cells`)
     // wait for them, and surfaces them in the cell's "in reviews" list

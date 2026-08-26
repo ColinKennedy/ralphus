@@ -8,37 +8,8 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# ---------------------------------------------------------------------------
-# CI matrix audit (RAL-260) — gaps found and how this workflow addresses them:
-#
-#   * Python version: the python job previously ran against a single, unpinned
-#     interpreter — uv resolved whatever it found, bounded only by
-#     `cli/pyproject.toml`'s `requires-python = ">=3.11"` (floor, no ceiling).
-#     It now runs as a matrix over 3.11 / 3.12 / 3.13 plus a floating "3" leg
-#     that always resolves to the newest available Python, keeping CI
-#     forward-looking without manual bumps.             ADDRESSED here.
-#
-#   * Rust MSRV: the rust job only ran a floating `stable` toolchain, with no
-#     committed lower bound. [workspace.package] already declares an MSRV via
-#     `rust-version = "1.85"`, but that is stale — the locked icu_*/idna_adapter
-#     deps require rustc 1.86 (verified: 1.85 fails, 1.86 builds). The rust job
-#     therefore adds a pinned 1.86 build-only leg; the declared MSRV is written
-#     directly in ci.yml (rather than a new rust-toolchain.toml, which would
-#     repin every local dev `cargo` too), and Cargo.toml's `rust-version`
-#     should be bumped to 1.86 to match (follow-up).     ADDRESSED here.
-#
-#   * OS: every job ran on ubuntu-latest only, despite .agent/gotchas.md
-#     documenting real Windows-specific code paths in the Rust daemon/runner
-#     (cell `cwd` path format; the psmux tmux-alternative reattach mitigation)
-#     — and the dev environment itself is Windows. The rust job now runs its
-#     full fmt/clippy/test suite on both ubuntu-latest and windows-latest.
-#                                                        ADDRESSED here.
-#
-#   * Node: the web job pins node "22" with no .nvmrc or `engines` backing it.
-#     A real but smaller/lower-priority gap than the above; intentionally NOT
-#     addressed in this change — left as a follow-up so the version's
-#     source-of-truth moves into the repo (.nvmrc / package.json engines).
-# ---------------------------------------------------------------------------
+# RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
+# full suite on linux+windows plus a pinned 1.86 MSRV build-only leg.
 
 jobs:
   rust:

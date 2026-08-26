@@ -1610,7 +1610,14 @@ mod tests {
         let s = store();
         register(&s, "ib", &script);
         let (router, _local) = router(Arc::clone(&s));
-        let sp = spec(Some("ib:A"));
+        // Use a cell id unique to this test: the pane snapshot is keyed by
+        // `session_name(squad, task, cell)`, and every sibling test in this
+        // module reuses `spec()`'s default `squad-1/t/s0` — writing to that
+        // shared file concurrently would let a sibling's start-state snapshot
+        // ("building...") clobber this test's streamed output before it reads
+        // it back. A distinct cell id keeps this read/write pair private.
+        let mut sp = spec(Some("ib:A"));
+        sp.cell_id = "s0-farm-stream".to_string();
         let r = router.run(&sp);
         assert_eq!(r.status, "done", "{r:?}");
         let name = crate::tmux::session_name(&sp.squad_id, &sp.task, &sp.cell_id);

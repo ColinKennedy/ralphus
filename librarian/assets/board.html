@@ -20,6 +20,7 @@
         --drift: #f0883e;
         --incomplete: #db6d28;
         --toast-warn: #d29922;
+        --out-of-date: #d4a72c;
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -134,6 +135,7 @@
       .p-waiting { color: var(--waiting); border-color: var(--waiting); }
       .p-warn { color: var(--warn); border-color: var(--warn); }
       .p-solo { color: var(--solo); border-color: var(--solo); }
+      .p-out-of-date { color: var(--out-of-date); border-color: var(--out-of-date); }
       .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
       .p-proof_pending { color: var(--running); border-color: var(--running); }
       .p-in_progress { color: var(--running); border-color: var(--running); }
@@ -262,12 +264,15 @@
       .chat-bubble-wrap.user { justify-content: flex-end; }
       .chat-bubble-wrap.guardian { justify-content: flex-start; }
       .chat-bubble-wrap > div { max-width: 80%; }
-      .chat-bubble { max-width: 100%; padding: 7px 10px; border-radius: 14px; font-size: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+      .chat-bubble { position: relative; max-width: min(100%, 80ch); padding: 7px 24px 7px 10px; border-radius: 14px; font-size: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
       .chat-bubble-wrap.user .chat-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
       .chat-bubble-wrap.guardian .chat-bubble { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
       .chat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 2px; }
       .chat-bubble-wrap.user .chat-label { text-align: right; }
       .chat-time { text-transform: none; letter-spacing: 0; opacity: .7; font-weight: 400; cursor: default; }
+      /* RAL-272: expand/collapse toggle pinned to a bubble's corner. */
+      .chat-expand-btn { position: absolute; top: 4px; right: 4px; background: transparent; border: none; color: inherit; opacity: .65; cursor: pointer; font-size: 11px; line-height: 1; padding: 2px 4px; }
+      .chat-expand-btn:hover { opacity: 1; }
       .ctx-menu { position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 5px; z-index: 60; min-width: 160px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
       .ctx-menu div { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
       .ctx-menu div:hover { background: var(--panel-2); }
@@ -545,6 +550,7 @@
        * @property {number} [tokens_out]
        * @property {number} [cost_usd]
        * @property {{[key: string]: string}} [env_overrides] - RAL-191: environment-variable overrides set on this individual proof step — the narrowest layer, merged on top of the owning scope's `proof_env_overrides` and its ancestors. Absent for the vast majority of steps.
+       * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this step's own `env_overrides` (or its owning scope's `proof_env_overrides`) has been edited since the step last ran/retried or had its status explicitly set. No behavioral effect.
        */
       /**
        * @typedef {object} CellView
@@ -570,6 +576,7 @@
        * @property {{[key: string]: string}} [proof_env_overrides] - Persistent environment-variable overrides applied only to this cell's own proof steps, merged on top of `env_overrides` (and its ancestors).
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
+       * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this cell's own `env_overrides` has been edited since the cell last ran/retried or had its status explicitly set. No behavioral effect.
        */
       /**
        * @typedef {object} TaskView
@@ -586,6 +593,7 @@
        * @property {boolean} soloed
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
+       * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this task's own `env_overrides` has been edited since the task last ran/retried or had its status explicitly set. No behavioral effect.
        */
       /**
        * One cell's derived git info from `GET /api/squads/{id}/worktrees`
@@ -997,6 +1005,7 @@
       CLICK_HANDLERS.pick = (e, ds) => pick(/** @type {"squad"|"task"|"cell"|"proof"} */ (ds.kind || "squad"), ds.ti !== undefined ? Number(ds.ti) : 0, ds.si !== undefined ? Number(ds.si) : 0, ds.vi !== undefined ? Number(ds.vi) : -1);
       CLICK_HANDLERS.removeEnvOverrideAt = (e, ds) => removeEnvOverrideAt(ds.apiPath || "", ds.key || "");
       CLICK_HANDLERS.addEnvOverrideAt = (e, ds) => addEnvOverrideAt(ds.apiPath || "");
+      CLICK_HANDLERS.editEnvOverrideAt = (e, ds) => editEnvOverrideAt(ds.apiPath || "", ds.key || "", ds.value || "");
       CLICK_HANDLERS.clearScopedEnvOverride = (e, ds) => clearScopedEnvOverride(ds.apiPath || "", ds.key || "", ds.scopeLabel || "");
       CLICK_HANDLERS.unsetScopedEnvOverride = (e, ds) => unsetScopedEnvOverride(ds.apiPath || "", ds.key || "", ds.scopeLabel || "");
       CLICK_HANDLERS.setScopedEnvOverride = (e, ds) => setScopedEnvOverride(ds.apiPath || "", ds.key || "", ds.scopeLabel || "");
@@ -1042,10 +1051,8 @@
       CLICK_HANDLERS.cancelResolver = (e, ds) => cancelResolver(ds.guardianId || "");
       CLICK_HANDLERS.saveProofScope = (e, ds) => saveProofScope(ds.guardianId || "");
       CLICK_HANDLERS.cancelProofScope = (e, ds) => cancelProofScope(ds.guardianId || "");
-      CLICK_HANDLERS.saveChatEdit = (e, ds) => saveChatEdit(ds.guardianId || "", Number(ds.seq));
-      CLICK_HANDLERS.startChatEdit = (e, ds) => startChatEdit(Number(ds.seq), ds.guardianId || "");
-      CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "");
-      CLICK_HANDLERS.sendChat = (e, ds) => sendChat(ds.guardianId || "");
+      CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");
+      CLICK_HANDLERS.toggleChatBubble = (e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); gotoSquad(ds.squadId || ""); };
       CLICK_HANDLERS.loadBaseBranchesShowPicker = (e, ds) => {
         loadBaseBranches(ds.guardianId || "").then(() => {
@@ -1067,7 +1074,7 @@
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");
       CLICK_HANDLERS.toggleManualMenu = (e, ds) => toggleManualMenu(ds.guardianId || "");
-      CLICK_HANDLERS.copyChatAs = (e, ds) => copyChatAs(ds.guardianId || "", ds.format || "");
+      CLICK_HANDLERS.copyChatAs = (e, ds) => copyChatAs(ds.guardianId || "", ds.branchId || "", ds.format || "");
       CLICK_HANDLERS.doForceStart = (e, ds) => doForceStart(ds.guardianId || "");
       CLICK_HANDLERS.moveBranchTo = (e, ds) => moveBranchTo(ds.guardianId || "", ds.branchId || "", ds.targetId || "");
       CLICK_HANDLERS.dismissReady = (e, ds) => dismissReady(ds.guardianId || "");
@@ -1095,20 +1102,6 @@
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-ctx]"));
         if (!el || !el.dataset.ctx) return;
         const handler = CTX_HANDLERS[el.dataset.ctx];
-        if (handler) handler(e, el.dataset);
-      }, true);
-      // Sibling to CLICK_HANDLERS/CTX_HANDLERS above, for the one inline
-      // handler that needed to stay an ondblclick="..." (a chat message
-      // bubble double-click) because it's conditionally present at all --
-      // reuses the same data-dblclick + dataset dispatch pattern.
-      /** @type {{[action: string]: DelegatedHandler}} */
-      const DBLCLICK_HANDLERS = {
-        startChatEdit: (e, ds) => startChatEdit(Number(ds.seq), ds.guardianId || ""),
-      };
-      document.addEventListener("dblclick", (/** @type {MouseEvent} */ e) => {
-        const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-dblclick]"));
-        if (!el || !el.dataset.dblclick) return;
-        const handler = DBLCLICK_HANDLERS[el.dataset.dblclick];
         if (handler) handler(e, el.dataset);
       }, true);
 
@@ -1719,6 +1712,18 @@
        */
       const soloBadge = (t) => t.soloed
         ? `<span class="pill p-solo" data-tip="This task is soloed — every other task in the squad is paused (their not-yet-started cells won't launch) until un-soloed.\nRight-click this task and choose \"Un-solo task\" to resume the others.">★ solo</span>`
+        : "";
+      /**
+       * Renders a cosmetic "out of date" badge (RAL-271) for a task/cell/proof
+       * step whose own environment-variable overrides were edited after it
+       * last ran/retried or had its status explicitly set, or an empty string
+       * when the flag isn't set. Purely informational — nothing is blocked
+       * and no proof result is invalidated.
+       * @param {boolean} [flag]
+       * @returns {string}
+       */
+      const outOfDateBadge = (flag) => flag
+        ? ` <span class="pill p-out-of-date" data-tip="This item's environment-variable overrides changed since it last ran/retried — a purely cosmetic signal, nothing is blocked or invalidated.\nWho/when: notice this before trusting an old run's results as still reflecting the current overrides.\nClears automatically the next time this item runs/retries, or when its status is set explicitly (e.g. via Set Status).">⚠ env out of date</span>`
         : "";
       /** @type {{[key: string]: ("task"|"cell"|"proof")[]}} */
       const GRAPH_NODE_ACTION_COMPAT = {
@@ -3588,8 +3593,8 @@
             ${body}
           </div>`;
       }
-      // RAL-139: drag-to-resize for peek box terminal panes, mirroring the
-      // pointer-capture drag mechanism used by #chat-resize-handle. Called after
+      // RAL-139: drag-to-resize for peek box terminal panes, using a
+      // pointer-capture drag mechanism. Called after
       // any render that may include peek boxes — handles are freshly created DOM
       // nodes each time (innerHTML is replaced), so there's no risk of attaching
       // duplicate listeners to stale elements.
@@ -4722,12 +4727,16 @@
        * Shared markup for an "environment overrides" section at any scope
        * (squad/task/task-proof/cell/cell-proof; hierarchical env
        * overrides, extending RAL-150): a warning banner when non-empty, a
-       * row per KEY/VALUE with a "Remove" button, and an "+ Add override"
-       * button. Always rendered, even when empty, so the add-override
-       * affordance stays reachable. `label` is the human-readable scope name
-       * used in the heading/tooltips (e.g. "squad", "task", "task proof
-       * steps"); `apiPath` is the `POST .../env`-shaped endpoint this
-       * scope's overrides live at.
+       * row per KEY/VALUE with "Edit"/"Remove" buttons, and an "+ Add
+       * override" button. Always rendered, even when empty, so the
+       * add-override affordance stays reachable. `label` is the
+       * human-readable scope name used in the heading/tooltips (e.g.
+       * "squad", "task", "task proof steps"); `apiPath` is the
+       * `POST .../env`-shaped endpoint this scope's overrides live at.
+       *
+       * RAL-271: "Edit" changes one key's value in place (via the same
+       * `{set: ...}` body "+ Add override" uses) without a Remove +
+       * re-Add round trip.
        * @param {{[key: string]: string} | undefined} overrides
        * @param {string} label
        * @param {string} apiPath
@@ -4743,6 +4752,7 @@
           ? keys.map((k) =>
               `<div class="kv-row"><span class="v mono" style="flex:1">${esc(k)}</span>` +
               `<span class="v mono" style="flex:1">${esc(map[k])}</span>` +
+              `<button class="btn" data-click="editEnvOverrideAt" data-api-path="${esc(apiPath)}" data-key="${esc(k)}" data-value="${esc(map[k])}" data-tip="Change this environment-variable override's value in place, without removing and re-adding it.\nWho/when: quick iteration, e.g. tweaking a flag for a single retry.\nApplies the next time this ${esc(label)} executes.">✎ Edit</button>` +
               `<button class="btn" data-click="removeEnvOverrideAt" data-api-path="${esc(apiPath)}" data-key="${esc(k)}" data-tip="Remove this environment-variable override from this ${esc(label)}.\nFuture retries here fall back to whatever the next-higher scope resolves to.\nThis cannot be undone.">✕ Remove</button></div>`).join("")
           : `<div class="kv-row"><span class="v">None</span></div>`;
         return `<h3 class="section">environment overrides (${esc(label)})</h3>
@@ -5051,6 +5061,24 @@
         tick();
       }
       /**
+       * Prompts for a new VALUE for an already-set KEY and updates it in
+       * place at `apiPath` (same `{set: ...}` semantics as
+       * `addEnvOverrideAt`) — shared by every scope's "Edit" button
+       * (RAL-271). Lets a single value be tweaked without a Remove +
+       * re-Add round trip; the prompt is pre-filled with the current value.
+       * @param {string} apiPath
+       * @param {string} key
+       * @param {string} currentValue
+       * @returns {Promise<void>}
+       */
+      async function editEnvOverrideAt(apiPath, key, currentValue) {
+        const value = prompt(`New value for ${key}:`, currentValue);
+        if (value === null || value === currentValue) return;
+        const res = await post(apiPath, { set: { [key]: value } });
+        if (!res.ok) { alert("Failed to update the environment override."); return; }
+        tick();
+      }
+      /**
        * Removes a persistent environment-variable override at `apiPath`
        * (hierarchical env overrides, extending RAL-150) — shared by every
        * scope's "Remove" button.
@@ -5203,7 +5231,7 @@
         return `<div class="dhead"><span class="k">⯀ task</span></div>
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${["pending","queued"].includes(t.state) ? "" : squadLogsBtn(r.id)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${outOfDateBadge(t.env_out_of_date)}${["pending","queued"].includes(t.state) ? "" : squadLogsBtn(r.id)}</span></div>
           ${timingRows(t.started_at_ms, t.finished_at_ms)}
           ${cells}
           ${proof}
@@ -5299,7 +5327,7 @@
           <div class="kv-row"><span class="k">kind</span><span class="v">${esc(v.kind)}</span></div>
           <div class="kv-row"><span class="k">scope</span><span class="v">${scopeLabel}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}${outOfDateBadge(v.env_out_of_date)}</span></div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(proofModel || "—", proofModelTip)}</div>
           <div class="kv-row" data-tip="${PROOF_TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">input ${v.tokens_in} · output ${v.tokens_out} · ${fmtCostUsd(v.cost_usd)}</span></div>
           <div class="kv-row" data-tip="${PROOF_LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="${proofCartoElId}">—</span> <button class="btn" data-click="loadCumulativeCost" data-cell-id="${esc(proofCartoElId)}" data-tip="${PROOF_LIFETIME_COST_TIP}">Σ load total</button></span></div>
@@ -5378,7 +5406,7 @@
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${outOfDateBadge(s.env_out_of_date)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
@@ -5513,12 +5541,20 @@
         const running = r.state === "running";
         const warn = running ? `<div class="warn">This squad is Running. Saving will stop it and set it back to Pending.</div>` : "";
         let fields = "";
+        // RAL-271: environment overrides aren't part of the Save/Cancel
+        // form fields below (they POST directly via their own
+        // Add/Edit/Remove buttons, same as outside edit mode) — surfaced
+        // here too so they're visible/editable while editing this item,
+        // not just when not editing.
+        let envSection = "";
         if (sel.kind === "squad") {
           fields = `<label>label<input id="e-label" value="${esc(r.label || "")}"></label>`;
+          envSection = envOverridesSection(r);
         } else if (sel.kind === "task") {
           const t = r.tasks[sel.taskIdx];
           fields = `<label>name<input id="e-name" value="${esc(t.name)}"></label>
             <label>project<input id="e-project" value="${esc(t.project)}"></label>`;
+          envSection = taskEnvOverridesSection(r, sel.taskIdx, t) + taskProofEnvOverridesSection(r, sel.taskIdx, t);
         } else {
           const s = r.tasks[sel.taskIdx].cells[sel.cellIdx];
           const isCmd = !!s.command;
@@ -5540,9 +5576,11 @@
             <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
               <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
             </div>`;
+          envSection = cellEnvOverridesSection(r, sel.taskIdx, sel.cellIdx, s) + cellProofEnvOverridesSection(r, sel.taskIdx, sel.cellIdx, s);
         }
         return `<div class="dhead"><span class="k">✎ editing ${sel.kind}</span></div>${warn}
           <div class="edit-form">${fields}</div>
+          ${envSection}
           <div id="save-err" class="verr"></div>
           <div class="btn-row"><button class="btn primary" onclick="saveEdit()" data-tip="Save these edits.\nIf the squad is currently running it will be stopped and reset to Pending.">Save</button><button class="btn" onclick="cancelEdit()" data-tip="Discard these edits and exit edit mode.">Cancel</button></div>`;
       }
@@ -7393,6 +7431,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${resolverPeekBox(g, b)}
               ${renderBranchEnvOverrides(g, b)}
               ${branchPrSection(g, b)}
+              ${open ? branchFeedbackSection(g, b) : ""}
             </div>` : "";
           // RAL-43: enable/disable toggle — staged like drag-reorder, takes effect on Save.
           const enableToggle = canReorder
@@ -7500,49 +7539,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             <input type="checkbox" ${vSkipAutoClean ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="onProofScopeSkipAutoCleanChange(this.dataset.guardianId,this.checked)">skip auto-clean branches</label>` : ""}
           <div id="proof-scope-pending" style="display:${vPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveProofScope" data-guardian-id="${esc(g.id)}" data-tip="Save the Proof scope for this review.\nApplies immediately -- no rebase is triggered.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelProofScope" data-guardian-id="${esc(g.id)}" data-tip="Discard — revert to the last saved value.">Cancel</button></div>
         </div></div>`;
-        // RAL-22: a global feedback chat — a persisted triage thread for the whole
-        // review, distinct from the per-branch feedback inputs above. The guardian
-        // agent replies in-thread, routing instructions to individual branches.
-        if (reviewMessages[g.id] === undefined) loadReviewMessages(g.id);
-        const msgs = reviewMessages[g.id] || [];
-        // RAL-35: strip any residual <route …>…</route> blocks (server strips
-        // them before storing, but guard here in case of old messages).
-        /**
-         * @param {string} t
-         * @returns {string}
-         */
-        const stripRoute = (t) => t.replace(/<route\s[^>]*>[\s\S]*?<\/route>/g, '').trim();
-        const thread = msgs.length
-          ? msgs.map((m) => {
-              const isUser = m.role === "reviewer";
-              // RAL-89: datetime the message was sent (reviewer) or received
-              // (guardian), rendered beside the role label. Static value derived
-              // from m.at_ms, so every chat re-render redraws it identically.
-              const tStr = fmtMsgTime(m.at_ms);
-              const ts = tStr
-                ? `<span class="chat-time" data-tip="When this message was ${isUser ? "sent" : "received"} (${esc(fmtMsgTimeFull(m.at_ms))}, your local time).\nShows the conversation timeline — including how long the guardian took to reply.">${esc(tStr)}</span>`
-                : "";
-              if (isUser) {
-                const isEditing = m.seq > 0 && chatEditState === m.seq;
-                if (isEditing) {
-                  return `<div class="chat-msg chat-bubble-wrap user"><div style="max-width:80%"><div class="chat-label" style="text-align:right">you</div><div class="chat-bubble" style="padding:6px;background:var(--bg);border:1px solid var(--accent)"><textarea id="chat-edit-input" rows="3" style="width:100%;box-sizing:border-box;background:var(--bg);border:none;color:var(--text);font-family:inherit;font-size:inherit;resize:vertical;outline:none" oninput="chatEditContent=this.value" data-guardian-id="${esc(g.id)}" data-seq="${m.seq}" onkeydown="if(event.key==='Escape'){cancelChatEdit();event.preventDefault();}else if(event.key==='Enter'&&event.shiftKey){CLICK_HANDLERS.saveChatEdit(event,this.dataset);event.preventDefault();}" data-tip="Edit your message.\nShift+Enter saves · Esc cancels.">${esc(chatEditContent)}</textarea><div style="display:flex;gap:4px;justify-content:flex-end;margin-top:4px"><button class="btn" onclick="cancelChatEdit()" data-tip="Cancel editing — restore the original message.">Cancel</button><button class="btn primary" data-click="saveChatEdit" data-guardian-id="${esc(g.id)}" data-seq="${m.seq}" data-tip="Save this edit — clears all messages after this one and re-sends to the guardian.\nThis cannot be undone.">Save</button></div></div></div></div>`;
-                }
-                const editBtn = m.seq > 0 ? `<button class="icon-btn" style="font-size:10px;padding:0 3px;opacity:.55;min-width:0;line-height:1" data-click="startChatEdit" data-guardian-id="${esc(g.id)}" data-seq="${m.seq}" data-tip="Edit this message — clears all messages after it and re-sends to the guardian.\nThis cannot be undone.">✏</button>` : "";
-                return `<div class="chat-msg chat-bubble-wrap user"><div><div class="chat-label" style="text-align:right;display:flex;align-items:center;gap:3px;justify-content:flex-end">${editBtn}<span>you</span>${ts}</div><div class="chat-bubble"${m.seq > 0 ? ` data-dblclick="startChatEdit" data-guardian-id="${esc(g.id)}" data-seq="${m.seq}"` : ""} data-tip="${m.seq > 0 ? 'Double-click to edit this message.' : ''}">${esc(stripRoute(m.text))}</div></div></div>`;
-              }
-              return `<div class="chat-msg chat-bubble-wrap guardian"><div><div class="chat-label" style="display:flex;align-items:center;gap:4px">guardian${ts}</div><div class="chat-bubble">${esc(stripRoute(m.text))}</div></div></div>`;
-            }).join("")
-          : `<div class="empty" style="margin-top:8px">No feedback yet — ask the guardian to route a change across the review.</div>`;
-        const imagePreviewHtml = chatPendingImage
-          ? `<div style="display:flex;align-items:center;gap:6px;margin-top:4px;padding:4px 8px;background:var(--panel-2);border-radius:6px;border:1px solid var(--border)"><img src="${chatPendingImage}" style="max-height:50px;border-radius:3px" data-tip="Image attached to the next message."><button class="btn" style="padding:2px 6px;font-size:11px" onclick="clearChatImage()" data-tip="Remove the attached image.">✕ Remove</button></div>`
-          : "";
-        const chatSection = `<h3 class="section" style="display:flex;align-items:center;gap:6px">feedback chat <button class="copy-btn" data-tip="Copy this conversation to clipboard.\nChoose Markdown for readable text or JSON for raw data." data-click="showChatCopyMenu" data-guardian-id="${esc(g.id)}">⧉</button>${agentInspectBtn(g.id, "chat", "feedback chat", g.chat_agent || g.resolver_agent, g.chat_model || g.resolver_model)}</h3>
-          <div id="chat-thread" style="height:${chatPanelHeight}px;min-height:80px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;background:var(--bg);position:relative"><div id="chat-resize-handle" style="position:absolute;top:0;left:0;right:0;height:6px;cursor:ns-resize;background:#444;border-radius:3px 3px 0 0" data-tip="Drag to resize the feedback panel.\nDrag up to expand, drag down to shrink."></div>${thread}</div>
-          ${imagePreviewHtml}
-          <div class="row" style="margin-top:6px;align-items:flex-start">
-            <textarea id="chat-input" placeholder="feedback for the whole review…" rows="3" data-guardian-id="${esc(g.id)}" onkeydown="chatInputKeydown(event,this.dataset.guardianId)" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;resize:vertical;font-family:inherit;font-size:inherit" data-tip="Send a message to the guardian agent for the whole review.\nShift+Enter sends · ESC×2 clears draft · ↑ navigates history · paste an image to attach it.\nThe agent can route instructions to individual branches or coordinate across the stack."></textarea>
-            <button class="btn primary" data-click="sendChat" data-guardian-id="${esc(g.id)}" data-tip="Send this message to the guardian agent.\nPress Shift+Enter in the input field as a shortcut.">Send</button>
-          </div>`;
         el.innerHTML = `<div class="squad-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)}
             <span style="flex:1"></span><button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
@@ -7701,46 +7697,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
               ${manualChecksPeekBox(g)}
               ${renderGuardianManualChecksEnvOverrides(g)}`;
-          })()}
-          ${chatSection}`;
-        const handle = document.getElementById("chat-resize-handle");
-        if (handle) {
-          handle.addEventListener("pointerdown", (/** @type {PointerEvent} */ e) => {
-            e.preventDefault();
-            handle.setPointerCapture(e.pointerId);
-            const startY = e.clientY;
-            const startH = chatPanelHeight;
-            /**
-             * @param {PointerEvent} ev
-             * @returns {void}
-             */
-            const onMove = ev => {
-              const delta = startY - ev.clientY;
-              const min = 80, max = Math.floor(window.innerHeight * 0.8);
-              chatPanelHeight = Math.min(max, Math.max(min, startH + delta));
-              const ct = document.getElementById("chat-thread");
-              if (ct) ct.style.height = chatPanelHeight + "px";
-            };
-            const onUp = () => {
-              handle.removeEventListener("pointermove", onMove);
-              handle.removeEventListener("pointerup", onUp);
-            };
-            handle.addEventListener("pointermove", onMove);
-            handle.addEventListener("pointerup", onUp);
-          });
-        }
+          })()}`;
         attachPeekResizeHandlers();
-        // RAL-59: attach paste handler to capture clipboard images.
-        const chatInputEl = document.getElementById("chat-input");
-        if (chatInputEl) chatInputEl.addEventListener("paste", handleChatPaste);
-        // Focus the inline edit textarea and seed its value when editing mode is active.
-        if (chatEditState !== null) {
-          const editTa = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("chat-edit-input"));
-          if (editTa && document.activeElement !== editTa) {
-            editTa.focus({ preventScroll: true });
-            editTa.setSelectionRange(editTa.value.length, editTa.value.length);
-          }
-        }
       }
       // CCTL-135: per-branch merge detail is collapsed by default; toggle open.
       /**
@@ -8079,258 +8037,114 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // re-fetches with the new remote scope.
       /** @type {{[key: string]: string[]}} */
       let baseBranchCache = {};
-      // Persists the user-dragged height of the chat thread across re-renders.
-      let chatPanelHeight = 260;
       // RAL-139: persists the user-dragged height of live tmux pane peek boxes
       // across re-renders and tab navigation within this browser session.
       let peekPaneHeight = 320;
-      // RAL-22: global feedback chat — a persisted triage thread per review.
+      // RAL-272: per-branch read-only feedback thread, keyed by `${gid}:${branchId}`.
       /** @type {{[key: string]: ChatMessage[]}} */
-      let reviewMessages = {};
-      // RAL-59: conversation branching state.
-      /** @type {number|null} seq of the bubble currently being edited inline */
-      let chatEditState = null;
-      let chatEditContent = "";   // text the user has typed in the edit textarea
-      let chatHistoryPos = -1;    // index into user-msg history; -1 = not navigating
-      /** @type {number|null} seq of the forked message when navigating history */
-      let chatHistorySeq = null;
-      let chatHistoryDraft = "";  // original draft to restore when exiting history nav
-      let lastEsc = 0;            // timestamp of the last ESC keypress
-      /** @type {string|null} data-URI of the pasted image waiting to be sent */
-      let chatPendingImage = null;
+      let branchMessages = {};
+      // RAL-272: keys (`${gid}:${branchId}:${seq}`) of bubbles the user has
+      // expanded past their collapsed first-line preview.
+      /** @type {Set<string>} */
+      let expandedChatBubbles = new Set();
       /**
-       * Fetches and caches a review's feedback-chat messages, re-rendering unless `opts.silent`.
+       * Strips any residual <route …>…</route> block from a feedback-thread
+       * message (the daemon strips them before storing; this guards old rows).
+       * @param {string} t
+       * @returns {string}
+       */
+      function stripRoute(t) { return t.replace(/<route\s[^>]*>[\s\S]*?<\/route>/g, '').trim(); }
+      /**
+       * The first line of a (possibly multi-line) message body.
+       * @param {string} t
+       * @returns {string}
+       */
+      function firstLine(t) { return t.split("\n")[0]; }
+      /**
+       * Fetches and caches one review branch's read-only feedback thread (RAL-272), re-rendering unless `opts.silent`.
+       * @param {string} gid
+       * @param {string} bid
+       * @param {{silent?: boolean}} [opts]
+       * @returns {Promise<void>}
+       */
+      async function loadBranchMessages(gid, bid, opts) {
+        const key = `${gid}:${bid}`;
+        try {
+          const data = await (await fetch(`/api/guardians/${gid}/branches/${bid}/messages`)).json();
+          branchMessages[key] = data.messages || [];
+        } catch (_) { branchMessages[key] = branchMessages[key] || []; }
+        // `silent` callers (the poll loop) re-render themselves afterwards.
+        if (!(opts && opts.silent) && selectedGuardian === gid) {
+          renderReviewDetail();
+        }
+      }
+      /**
+       * Refreshes the read-only feedback thread for every currently-expanded branch of `gid` (RAL-272).
        * @param {string} gid
        * @param {{silent?: boolean}} [opts]
        * @returns {Promise<void>}
        */
-      async function loadReviewMessages(gid, opts) {
-        try {
-          const data = await (await fetch(`/api/guardians/${gid}/messages`)).json();
-          reviewMessages[gid] = data.messages || [];
-        } catch (_) { reviewMessages[gid] = reviewMessages[gid] || []; }
-        // `silent` callers (the poll loop) re-render themselves afterwards.
-        if (!(opts && opts.silent) && selectedGuardian === gid) {
-          renderReviewDetail();
-          const ct = document.getElementById("chat-thread");
-          if (ct) ct.scrollTop = ct.scrollHeight;
-        }
+      async function refreshExpandedBranchMessages(gid, opts) {
+        const prefix = `${gid}:`;
+        /** @type {string[]} */
+        const bids = [];
+        expandedBranches.forEach((k) => { if (k.startsWith(prefix)) bids.push(k.slice(prefix.length)); });
+        await Promise.all(bids.map((bid) => loadBranchMessages(gid, bid, opts)));
       }
       /**
-       * Sends the reviewer's chat-input text (and any pending image) to the guardian.
-       * @param {string} gid
-       * @returns {Promise<void>}
-       */
-      async function sendChat(gid) {
-        const input = /** @type {HTMLTextAreaElement} */ (document.getElementById("chat-input"));
-        const text = (input && input.value || "").trim();
-        if (!text) return;
-        const image = chatPendingImage || null;
-        chatPendingImage = null;
-        input.value = "";
-        // RAL-59: if the user navigated to a history message, fork from it.
-        if (chatHistorySeq !== null) {
-          const seq = chatHistorySeq;
-          chatHistorySeq = null;
-          chatHistoryPos = -1;
-          await forkChat(gid, seq, text, image);
-          return;
-        }
-        // Optimistically show the reviewer's message; the guardian's reply
-        // arrives via the poll loop once the triage agent finishes.
-        (reviewMessages[gid] = reviewMessages[gid] || []).push({ seq: 0, role: "reviewer", text, at_ms: 0 });
-        renderReviewDetail();
-        const sendCt = document.getElementById("chat-thread");
-        if (sendCt) sendCt.scrollTop = sendCt.scrollHeight;
-        const chatBody = image ? { text, image } : { text };
-        await post(`/api/guardians/${gid}/chat`, chatBody);
-        // RAL-33: poll every 500 ms until the guardian's reply arrives (direct LLM
-        // call cuts per-message latency from ~6s to ~1-3s, so a short interval here
-        // surfaces the reply promptly without hammering the daemon).
-        const sentLen = (reviewMessages[gid] || []).length;
-        var chatPolls = 0;
-        var pollForReply = function() {
-          loadReviewMessages(gid).then(function() {
-            var replied = (reviewMessages[gid] || []).length > sentLen;
-            if (!replied && chatPolls++ < 20) setTimeout(pollForReply, 500);
-          });
-        };
-        setTimeout(pollForReply, 500);
-      }
-      // RAL-59: inline bubble editing ─────────────────────────────────────────
-      /**
-       * Enters inline-edit mode for a chat bubble.
-       * @param {number} seq
-       * @param {string} gid
+       * Toggles whether one chat bubble shows its full message or just its collapsed first line.
+       * @param {string} key
        * @returns {void}
        */
-      function startChatEdit(seq, gid) {
-        const msgs = reviewMessages[gid] || [];
-        const msg = msgs.find((m) => m.seq === seq);
-        chatEditContent = msg ? msg.text : "";
-        chatEditState = seq;
+      function toggleChatBubble(key) {
+        if (expandedChatBubbles.has(key)) expandedChatBubbles.delete(key); else expandedChatBubbles.add(key);
         renderReviewDetail();
       }
       /**
-       * Exits inline chat-bubble edit mode without saving.
-       * @returns {void}
+       * Renders one review branch's read-only feedback thread (RAL-272):
+       * lazily loads it into `branchMessages` on first render, then shows
+       * either the collapsed message bubbles or a "No feedback yet" placeholder.
+       * @param {GuardianView} g
+       * @param {GuardianBranch} b
+       * @returns {string}
        */
-      function cancelChatEdit() {
-        chatEditState = null;
-        chatEditContent = "";
-        renderReviewDetail();
+      function branchFeedbackSection(g, b) {
+        const key = `${g.id}:${b.id}`;
+        if (branchMessages[key] === undefined) loadBranchMessages(g.id, b.id);
+        const msgs = branchMessages[key] || [];
+        if (msgs.length === 0) {
+          return `<div class="empty" style="margin-top:8px" data-tip="This branch has no feedback yet, so its thread stays hidden until it does.\nGive feedback from the CLI: ralphus review feedback <selector> <text>\nThe reviewer's message and the guardian's short acknowledgment both appear here, read-only, once given.">No feedback yet</div>`;
+        }
+        const thread = msgs.map((m) => {
+          const isUser = m.role === "reviewer";
+          const bubbleKey = `${key}:${m.seq}`;
+          const text = stripRoute(m.text);
+          const expanded = expandedChatBubbles.has(bubbleKey);
+          const shown = expanded ? text : firstLine(text);
+          // RAL-89: datetime the message was sent (reviewer) or received (guardian).
+          const tStr = fmtMsgTime(m.at_ms);
+          const ts = tStr
+            ? `<span class="chat-time" data-tip="When this message was ${isUser ? "sent" : "received"} (${esc(fmtMsgTimeFull(m.at_ms))}, your local time).">${esc(tStr)}</span>`
+            : "";
+          const expandBtn = text.includes("\n")
+            ? `<button class="chat-expand-btn" data-click="toggleChatBubble" data-key="${esc(bubbleKey)}" data-tip="${expanded ? "Collapse this message back to its first line." : "Expand to show the full message."}">${expanded ? "−" : "+"}</button>`
+            : "";
+          return `<div class="chat-msg chat-bubble-wrap ${isUser ? "user" : "guardian"}"><div>
+              <div class="chat-label"${isUser ? ' style="text-align:right"' : ""}>${isUser ? "you" : "guardian"}${ts}</div>
+              <div class="chat-bubble">${esc(shown)}${expandBtn}</div>
+            </div></div>`;
+        }).join("");
+        return `<h3 class="section" style="display:flex;align-items:center;gap:6px;margin-top:8px">branch feedback <button class="copy-btn" data-tip="Copy this branch's feedback thread to clipboard.\nChoose Markdown for readable text or JSON for raw data." data-click="showChatCopyMenu" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">⧉</button></h3>
+          <div style="max-height:260px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;background:var(--bg)">${thread}</div>`;
       }
       /**
-       * Saves an inline chat-bubble edit by forking the thread at that message.
-       * @param {string} gid
-       * @param {number} seq
-       * @returns {Promise<void>}
-       */
-      async function saveChatEdit(gid, seq) {
-        const text = chatEditContent.trim();
-        if (!text) return;
-        const msgs = reviewMessages[gid] || [];
-        const original = msgs.find((m) => m.seq === seq);
-        if (original && original.text === text) { cancelChatEdit(); return; }
-        chatEditState = null;
-        chatEditContent = "";
-        await forkChat(gid, seq, text, null);
-      }
-      // RAL-59: fork — replace everything from seq onwards with a new message ─
-      /**
-       * Replaces every chat message from `seq` onward with a new message.
-       * @param {string} gid
-       * @param {number} seq
-       * @param {string} text
-       * @param {string|null} image
-       * @returns {Promise<void>}
-       */
-      async function forkChat(gid, seq, text, image) {
-        const msgs = reviewMessages[gid] || [];
-        const pruned = msgs.filter((m) => m.seq > 0 && m.seq < seq);
-        pruned.push({ seq: 0, role: "reviewer", text, at_ms: 0 });
-        reviewMessages[gid] = pruned;
-        renderReviewDetail();
-        const ct = document.getElementById("chat-thread");
-        if (ct) ct.scrollTop = ct.scrollHeight;
-        const forkBody = image ? { seq, text, image } : { seq, text };
-        await post(`/api/guardians/${gid}/chat/fork`, forkBody);
-        const sentLen = pruned.length;
-        var polls = 0;
-        var poll = function() {
-          loadReviewMessages(gid).then(function() {
-            if ((reviewMessages[gid] || []).length <= sentLen && polls++ < 20) setTimeout(poll, 500);
-          });
-        };
-        setTimeout(poll, 500);
-      }
-      // RAL-59: image paste ────────────────────────────────────────────────────
-      /**
-       * Captures a pasted clipboard image and stages it as `chatPendingImage`.
-       * @param {ClipboardEvent} e
-       * @returns {void}
-       */
-      function handleChatPaste(e) {
-        if (!e.clipboardData) return;
-        const items = e.clipboardData.items;
-        for (let i = 0; i < items.length; i++) {
-          if (items[i].type.startsWith("image/")) {
-            e.preventDefault();
-            const file = items[i].getAsFile();
-            if (!file) continue;
-            const reader = new FileReader();
-            reader.onload = function(evt) {
-              chatPendingImage = /** @type {string} */ (evt.target?.result);
-              renderReviewDetail();
-            };
-            reader.readAsDataURL(file);
-            return;
-          }
-        }
-      }
-      /**
-       * Removes the pending pasted-image attachment.
-       * @returns {void}
-       */
-      function clearChatImage() { chatPendingImage = null; renderReviewDetail(); }
-      // RAL-59: keyboard handler for the main chat input ──────────────────────
-      /**
-       * Keydown handler for the chat input: ESC×2 clears, ↑/↓ navigate history, Shift+Enter sends.
-       * @param {KeyboardEvent} event
-       * @param {string} gid
-       * @returns {void}
-       */
-      function chatInputKeydown(event, gid) {
-        if (event.key === "Escape") {
-          const now = Date.now();
-          if (now - lastEsc < 400) {
-            const inp = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("chat-input"));
-            if (inp) inp.value = "";
-            chatPendingImage = null;
-            chatHistoryPos = -1;
-            chatHistorySeq = null;
-            renderReviewDetail();
-          }
-          lastEsc = now;
-          return;
-        }
-        if (event.key === "ArrowUp") {
-          const inp = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("chat-input"));
-          if (!inp) return;
-          const onFirstLine = inp.value.substring(0, inp.selectionStart).indexOf("\n") === -1;
-          if (!onFirstLine && chatHistoryPos < 0) return;
-          const userMsgs = (reviewMessages[gid] || []).filter((m) => m.role === "reviewer" && m.seq > 0);
-          if (chatHistoryPos < 0) {
-            if (inp.value.trim() !== "") return;
-            if (userMsgs.length === 0) return;
-            chatHistoryDraft = inp.value;
-            chatHistoryPos = userMsgs.length - 1;
-          } else if (chatHistoryPos > 0) {
-            chatHistoryPos--;
-          } else {
-            return;
-          }
-          inp.value = userMsgs[chatHistoryPos].text;
-          chatHistorySeq = userMsgs[chatHistoryPos].seq;
-          event.preventDefault();
-          return;
-        }
-        if (event.key === "ArrowDown") {
-          if (chatHistoryPos < 0) return;
-          const inp = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("chat-input"));
-          if (!inp) return;
-          const userMsgs = (reviewMessages[gid] || []).filter((m) => m.role === "reviewer" && m.seq > 0);
-          chatHistoryPos++;
-          if (chatHistoryPos >= userMsgs.length) {
-            chatHistoryPos = -1;
-            chatHistorySeq = null;
-            inp.value = chatHistoryDraft;
-          } else {
-            inp.value = userMsgs[chatHistoryPos].text;
-            chatHistorySeq = userMsgs[chatHistoryPos].seq;
-          }
-          event.preventDefault();
-          return;
-        }
-        if (event.key === "Enter" && event.shiftKey) {
-          event.preventDefault();
-          sendChat(gid);
-          return;
-        }
-        // Exit history navigation on any character-modifying key.
-        if (chatHistoryPos >= 0 && (event.key.length === 1 || event.key === "Backspace" || event.key === "Delete")) {
-          chatHistoryPos = -1;
-          chatHistorySeq = null;
-        }
-      }
-      // ────────────────────────────────────────────────────────────────────────
-      /**
-       * Opens the "copy chat as" (Markdown/JSON) menu.
+       * Opens the "copy chat as" (Markdown/JSON) menu for one branch's feedback thread.
        * @param {MouseEvent} e
        * @param {string} gid
+       * @param {string} bid
        * @returns {void}
        */
-      function showChatCopyMenu(e, gid) {
+      function showChatCopyMenu(e, gid, bid) {
         e.stopPropagation();
         const existing = document.getElementById("chat-copy-menu");
         if (existing) { existing.remove(); return; }
@@ -8340,20 +8154,21 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         menu.className = "copy-menu";
         menu.style.top = (rect.bottom + 4) + "px";
         menu.style.left = rect.left + "px";
-        menu.innerHTML = `<div class="copy-menu-item" data-click="copyChatAs" data-guardian-id="${esc(gid)}" data-format="markdown">Markdown</div><div class="copy-menu-item" data-click="copyChatAs" data-guardian-id="${esc(gid)}" data-format="json">JSON</div>`;
+        menu.innerHTML = `<div class="copy-menu-item" data-click="copyChatAs" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-format="markdown">Markdown</div><div class="copy-menu-item" data-click="copyChatAs" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-format="json">JSON</div>`;
         document.body.appendChild(menu);
         setTimeout(() => document.addEventListener("click", () => { const m = document.getElementById("chat-copy-menu"); if (m) m.remove(); }, { once: true }), 0);
       }
       /**
-       * Copies a review's feedback-chat thread to the clipboard as Markdown or JSON.
+       * Copies one branch's feedback thread to the clipboard as Markdown or JSON.
        * @param {string} gid
+       * @param {string} bid
        * @param {string} format
        * @returns {Promise<void>}
        */
-      async function copyChatAs(gid, format) {
+      async function copyChatAs(gid, bid, format) {
         const menu = document.getElementById("chat-copy-menu");
         if (menu) menu.remove();
-        const msgs = reviewMessages[gid] || [];
+        const msgs = branchMessages[`${gid}:${bid}`] || [];
         const text = format === "markdown"
           ? msgs.map((m) => `**${m.role === "reviewer" ? "You" : "Guardian"}:** ${m.text}`).join("\n\n")
           : JSON.stringify(msgs.map((m) => ({ role: m.role, text: m.text })), null, 2);
@@ -9080,33 +8895,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       // ---------- polling ----------
-      // Wraps a renderFn call with smart scroll for #chat-thread: if the user
-      // was at the bottom before render and a new message arrived, scrolls to
-      // the top of that new message. Otherwise leaves scroll position alone.
-      /**
-       * Wraps a chat re-render with smart scroll: keeps the view pinned to the bottom if it already was.
-       * @param {() => void} renderFn
-       * @returns {void}
-       */
-      function applyChatSmartScroll(renderFn) {
-        const ct = document.getElementById("chat-thread");
-        const oldCount = ct ? ct.querySelectorAll(".chat-msg").length : 0;
-        let atBottom = false;
-        if (ct) {
-          const lastEl = /** @type {HTMLElement|null} */ (ct.lastElementChild);
-          const threshold = (lastEl && lastEl.offsetHeight) || 30;
-          atBottom = ct.scrollTop + ct.clientHeight >= ct.scrollHeight - threshold;
-        }
-        renderFn();
-        const newCt = document.getElementById("chat-thread");
-        if (!newCt || !atBottom) return;
-        const newMsgs = /** @type {NodeListOf<HTMLElement>} */ (newCt.querySelectorAll(".chat-msg"));
-        if (newMsgs.length > oldCount) {
-          newCt.scrollTop = newMsgs[oldCount].offsetTop;
-        } else {
-          newCt.scrollTop = newCt.scrollHeight;
-        }
-      }
       // RAL-7: a periodic/pushed refresh re-renders panes via `el.innerHTML = …`, which resets
       // scroll position and wipes in-progress text in a pane's inputs. Captures
       // the user's scroll position and focused field beforehand and restores them
@@ -9228,7 +9016,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       /**
        * Applies whatever the active tab needs in response to one coalesced
        * batch of pushed events -- mirrors `tick()`'s per-tab dispatch, plus a
-       * chat-thread refresh when the open review itself just changed.
+       * feedback-thread refresh when the open review itself just changed.
        * @param {Set<string>} kinds
        * @param {Set<string>} guardianIds
        * @returns {Promise<void>}
@@ -9237,7 +9025,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         await updateCounter();
         if (tab === "reviews" && kinds.has("guardian")) {
           await pollReviews();
-          if (selectedGuardian && guardianIds.has(selectedGuardian)) await loadReviewMessages(selectedGuardian);
+          if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);
         } else if (tab === "queue" && kinds.has("squad") && (queueUI.autoUpdate || !queueLoaded)) {
           await pollQueue();
         } else if (tab === "cartographer") {
@@ -9493,22 +9281,22 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           // already has everything `renderReviewDetail` needs, and the next
           // poll picks up the summary once that worker finishes it.
           if (selectedGuardian) fetch(`/api/guardians/${selectedGuardian}`).catch(() => {});
-          // Keep the selected review's feedback thread fresh (RAL-22) so the
-          // guardian's async replies appear without a manual refresh. These
-          // three fetches are independent of each other (each caches into
-          // its own state and none reads another's result), so they run
+          // Keep every expanded branch's feedback thread fresh (RAL-272) so a
+          // guardian's async acknowledgment appears without a manual refresh.
+          // These four fetches are independent of each other (each caches
+          // into its own state and none reads another's result), so they run
           // concurrently (RAL-234) instead of as a sequential await chain --
-          // the old chained-await version summed all three round-trips
-          // instead of taking the max of them.
+          // the old chained-await version summed all round-trips instead of
+          // taking the max of them.
           if (selectedGuardian) {
             await Promise.all([
-              loadReviewMessages(selectedGuardian, { silent: true }),
+              refreshExpandedBranchMessages(selectedGuardian, { silent: true }),
               pollBranchConflicts(selectedGuardian),
               pollPullRequests(selectedGuardian),
               pollPrErrors(selectedGuardian),
             ]);
           }
-          if (!userIsSelecting()) { renderReviews(); applyChatSmartScroll(() => preserveUserState(document.getElementById("review-detail"), renderReviewDetail)); }
+          if (!userIsSelecting()) { renderReviews(); preserveUserState(document.getElementById("review-detail"), renderReviewDetail); }
         } catch (e) { byId("conn").className = "dot off"; }
       }
 

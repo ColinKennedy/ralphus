@@ -619,6 +619,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             guardian_feedback(daemon, id, branch_id, body)
         }
         ("GET", ["api", "guardians", id, "messages"]) => guardian_messages(daemon, id),
+        ("GET", ["api", "guardians", id, "branches", branch_id, "messages"]) => {
+            guardian_branch_messages(daemon, id, branch_id)
+        }
         ("POST", ["api", "guardians", id, "chat"]) => guardian_chat(daemon, id, body),
         ("POST", ["api", "guardians", id, "chat", "fork"]) => guardian_chat_fork(daemon, id, body),
         ("GET", ["api", "guardians", id, "base-branches"]) => guardian_base_branches(daemon, id),
@@ -1033,7 +1036,11 @@ fn validate_remote_reviews_are_declarative(
 ) -> std::result::Result<(), String> {
     for task in &file.task {
         for (idx, cell) in task.cell.iter().enumerate() {
-            let Some(review_id) = cell.review.as_deref().filter(|r| !r.trim().is_empty()) else {
+            let Some(review_id) = cell
+                .review
+                .as_deref()
+                .and_then(ralphus_core::schema::parse_cell_review_sentinel)
+            else {
                 continue;
             };
             let machine = ralphus_core::schema::resolve_cell_machine(task, cell);
@@ -7426,6 +7433,16 @@ fn guardian_messages(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+/// One review branch's read-only feedback thread (RAL-272) -- populated by
+/// `POST .../branches/{branch_id}/feedback`, distinct from the old global
+/// thread `guardian_messages` above.
+fn guardian_branch_messages(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    match daemon.lock().guardian_branch_messages(id, branch_id) {
+        Ok(messages) => json(200, &MessagesResponse { messages }),
+        Err(e) => store_error(&e),
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatBody {
     #[serde(default)]
@@ -8452,41 +8469,6 @@ mod tests {
         assert!(d.authorized(Some("Bearer right-token")));
     }
 
-    // ── RAL-219: bearer-token auth ──────────────────────────────────────────
-
-    #[test]
-    fn a_daemon_with_no_token_configured_authorizes_everything() {
-        let d = daemon();
-        assert!(d.authorized(None));
-        assert!(d.authorized(Some("Bearer whatever")));
-        assert!(d.authorized(Some("garbage")));
-    }
-
-    #[test]
-    fn a_daemon_with_a_token_rejects_a_missing_header() {
-        let d = daemon().with_token("right-token".to_string());
-        assert!(!d.authorized(None));
-    }
-
-    #[test]
-    fn a_daemon_with_a_token_rejects_a_malformed_header() {
-        let d = daemon().with_token("right-token".to_string());
-        // Missing the "Bearer " scheme prefix.
-        assert!(!d.authorized(Some("right-token")));
-    }
-
-    #[test]
-    fn a_daemon_with_a_token_rejects_the_wrong_token() {
-        let d = daemon().with_token("right-token".to_string());
-        assert!(!d.authorized(Some("Bearer wrong-token")));
-    }
-
-    #[test]
-    fn a_daemon_with_a_token_accepts_the_right_token() {
-        let d = daemon().with_token("right-token".to_string());
-        assert!(d.authorized(Some("Bearer right-token")));
-    }
-
     #[test]
     fn submit_then_list_and_get() {
         let d = daemon();
@@ -9119,7 +9101,7 @@ machine=\"incredibuild:B\"
             &machine_body("incredibuild", "/opt/ib.sh"),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\nreview=\"r\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
                     [[review]]\nid=\"r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
@@ -9150,7 +9132,7 @@ machine=\"incredibuild:B\"
             &machine_body("incredibuild", "/opt/ib.sh"),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"/remote/wt\"\nprompt=\"p\"\nreview=\"r\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"/remote/wt\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
                     [[review]]\nid=\"r\"\nbase=\"main\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
@@ -12007,6 +11989,61 @@ command = "true"
     }
 
     #[test]
+    fn guardian_branch_messages_endpoint_starts_empty() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let r = route(
+            &d,
+            "GET",
+            "/api/guardians/guardian-000000000001/branches/branch-x/messages",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"messages\":[]"));
+    }
+
+    #[test]
+    fn guardian_branch_messages_endpoint_is_scoped_per_branch() {
+        // RAL-272: a branch's own thread only contains messages posted with
+        // that branch_id -- the old global thread never leaks in, and one
+        // branch never sees another's feedback.
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        d.lock().add_guardian_branch(gid, "feature/a").unwrap();
+        let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
+        d.lock()
+            .add_guardian_message(gid, "reviewer", "global msg", None, None)
+            .unwrap();
+        d.lock()
+            .add_guardian_message(gid, "reviewer", "branch feedback", None, Some(&branch_id))
+            .unwrap();
+        d.lock()
+            .add_guardian_message(gid, "guardian", "branch reply", None, Some(&branch_id))
+            .unwrap();
+
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/messages"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("branch feedback"));
+        assert!(r.body.contains("branch reply"));
+        assert!(!r.body.contains("global msg"));
+
+        // The old global endpoint still returns every row, scoped or not.
+        let global = route(&d, "GET", &format!("/api/guardians/{gid}/messages"), "");
+        assert!(global.body.contains("global msg"));
+        assert!(global.body.contains("branch feedback"));
+    }
+
+    #[test]
     fn guardian_chat_fork_empty_text_is_400() {
         let d = daemon();
         let body =
@@ -12506,6 +12543,109 @@ command = "true"
         let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
         let squad: serde_json::Value = serde_json::from_str(&squad.body).unwrap();
         assert_eq!(squad["tasks"][0]["env_overrides"]["A"], "1");
+    }
+
+    /// RAL-271: editing a task's overrides marks the task and its cells "out
+    /// of date" in the same round trip, and a `restart` clears it again.
+    #[test]
+    fn set_task_env_marks_task_and_cells_out_of_date_then_restart_clears_it() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/env",
+            &body,
+        );
+
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        let squad: serde_json::Value = serde_json::from_str(&squad.body).unwrap();
+        assert_eq!(squad["tasks"][0]["env_out_of_date"], true);
+        assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], true);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/restart",
+            "",
+        );
+        assert_eq!(r.status, 200);
+
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        let squad: serde_json::Value = serde_json::from_str(&squad.body).unwrap();
+        assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], false);
+    }
+
+    /// RAL-271: `Set Status` is the second trigger (besides a restart) that
+    /// must clear the badge -- exercised here via the cell env endpoint plus
+    /// `set-status` to `done`, independent of any actual re-run.
+    #[test]
+    fn set_status_done_clears_cell_env_out_of_date() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({"set": {"A": "1"}}).to_string();
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/env",
+            &body,
+        );
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        let squad: serde_json::Value = serde_json::from_str(&squad.body).unwrap();
+        assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], true);
+
+        let status_body = serde_json::json!({
+            "kind": "cell",
+            "task_idx": 0,
+            "cell_idx": 0,
+            "state": "done",
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &status_body,
+        );
+        assert_eq!(r.status, 200);
+        let squad: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], false);
+    }
+
+    /// RAL-271: the board's inline "Edit" button posts the same
+    /// `{set: {key: value}}` body as "+ Add override" against an
+    /// already-present key -- verify that round trip through the HTTP API
+    /// replaces the value in place rather than duplicating or dropping it.
+    #[test]
+    fn editing_an_existing_task_env_override_via_set_replaces_its_value() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/env",
+            &serde_json::json!({"set": {"A": "1"}}).to_string(),
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/env",
+            &serde_json::json!({"set": {"A": "edited"}}).to_string(),
+        );
+        assert_eq!(r.status, 200);
+
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        let squad: serde_json::Value = serde_json::from_str(&squad.body).unwrap();
+        assert_eq!(squad["tasks"][0]["env_overrides"]["A"], "edited");
+        assert_eq!(
+            squad["tasks"][0]["env_overrides"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

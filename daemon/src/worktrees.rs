@@ -618,7 +618,7 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 &synthetic_cell_row(ctx),
                 ctx.squad_id,
             )?,
-            _ => ensure_worktree(Path::new(&project.path), branch, upstream)
+            _ => ensure_worktree(Path::new(&project.path), branch, &upstream)
                 .map_err(|e| {
                     format!(
                         "cell '{}': could not materialize worktree for \"{placeholder}\": {e}",

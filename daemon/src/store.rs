@@ -233,6 +233,12 @@ pub struct ProofView {
     /// common board payload is unchanged.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
+    /// RAL-271: cosmetic "out of date" badge -- `true` once this step's own
+    /// `env_overrides` (or its owning scope's `proof_env_overrides`) has been
+    /// edited since the step last ran/retried or had its status explicitly
+    /// set. No behavioral effect; see [`Store::set_proof_step_env_overrides`].
+    #[serde(default)]
+    pub env_out_of_date: bool,
 }
 
 /// A cell as shown in the board.
@@ -304,6 +310,12 @@ pub struct CellView {
     /// When this cell last reached a terminal state (Unix epoch
     /// milliseconds). `None` while pending/running.
     pub finished_at_ms: Option<i64>,
+    /// RAL-271: cosmetic "out of date" badge -- `true` once this cell's own
+    /// `env_overrides` has been edited since the cell last ran/retried or had
+    /// its status explicitly set. No behavioral effect; see
+    /// [`Store::set_cell_env_overrides`].
+    #[serde(default)]
+    pub env_out_of_date: bool,
 }
 
 /// A task as shown in the board.
@@ -355,6 +367,12 @@ pub struct TaskView {
     /// When this task last reached a terminal state (Unix epoch
     /// milliseconds). `None` while pending/running.
     pub finished_at_ms: Option<i64>,
+    /// RAL-271: cosmetic "out of date" badge -- `true` once this task's own
+    /// `env_overrides` has been edited since the task last ran/retried or had
+    /// its status explicitly set. No behavioral effect; see
+    /// [`Store::set_task_env_overrides`].
+    #[serde(default)]
+    pub env_out_of_date: bool,
 }
 
 /// A lightweight reference to a review (guardian) derived from a squad.
@@ -1006,6 +1024,13 @@ impl Store {
             // JSON map of {project_root: sha}. For single-project guardians this
             // mirrors base_commit; for multi-project it tracks each root independently.
             "ALTER TABLE guardians ADD COLUMN base_commits TEXT NOT NULL DEFAULT '{}'",
+            // RAL-265: hash of the enabled-branch configuration + per-project base
+            // commits the guardian's stack was last built against. Lets an
+            // incremental staged merge recognize a still-valid `Done` prefix
+            // (resume from its tip) versus a changed base/config that forces a
+            // rebuild of that prefix. NULL until the first (partial or full)
+            // build pass records one.
+            "ALTER TABLE guardians ADD COLUMN build_signature TEXT",
             // RAL-27: LLM-generated shell commands for manual review verification.
             // JSON array of command strings, regenerated on every rebase.
             "ALTER TABLE guardians ADD COLUMN manual_commands TEXT NOT NULL DEFAULT '[]'",
@@ -1317,6 +1342,26 @@ impl Store {
             // carried by path rather than embedding the file's content — see
             // `crate::cartographer::CartographerRow::log_path`.
             "ALTER TABLE cartographer_events ADD COLUMN log_path TEXT",
+            // RAL-271: cosmetic "out of date" badge -- set whenever a
+            // task's/cell's own `env_overrides` (or, for a task/cell, its
+            // own proof steps' `proof_env_overrides`/per-step
+            // `env_overrides`) is edited after the row already exists,
+            // cascading exactly one ownership level down (task edit marks
+            // its cells; cell edit marks its own proof steps). Cleared when
+            // the row is reset to `pending` by a restart/retry, or by any
+            // `set_task_state`/`set_cell_state`/`set_proof_state` call
+            // (covers both an explicit `Set Status` and the scheduler's own
+            // transition into `running`). Purely informational -- never
+            // read by the scheduler or proof logic.
+            "ALTER TABLE tasks ADD COLUMN env_out_of_date INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cells ADD COLUMN env_out_of_date INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN env_out_of_date INTEGER NOT NULL DEFAULT 0",
+            // RAL-272: scopes a feedback-chat message to one review branch, so the
+            // board can show a per-branch read-only thread instead of one global
+            // thread. NULL for every pre-existing row (the old global RAL-22
+            // thread) -- those rows simply never match a branch-scoped query,
+            // which is fine since this ticket doesn't migrate old history.
+            "ALTER TABLE guardian_messages ADD COLUMN branch_id TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1973,8 +2018,11 @@ impl Store {
         let now = now_ms();
         let entering_running = i64::from(state == NodeState::Running);
         let entering_terminal = i64::from(state.is_terminal());
+        // RAL-271: any explicit state transition -- an automatic dispatch
+        // into `running` (the "next run") or a manual `Set Status` call to
+        // any state -- clears this cell's cosmetic "out of date" badge.
         self.conn.execute(
-            "UPDATE cells SET state=?,
+            "UPDATE cells SET state=?, env_out_of_date=0,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=?",
@@ -2031,8 +2079,9 @@ impl Store {
         let now = now_ms();
         let entering_running = i64::from(state == NodeState::Running);
         let entering_terminal = i64::from(state.is_terminal());
+        // RAL-271: see the matching comment in `set_cell_state`.
         self.conn.execute(
-            "UPDATE tasks SET state=?,
+            "UPDATE tasks SET state=?, env_out_of_date=0,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND idx=?",
@@ -2361,7 +2410,7 @@ impl Store {
         env_overrides: BTreeMap<String, String>,
     ) -> Result<SquadView> {
         let mut tstmt = self.conn.prepare(
-            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms
+            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date
              FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
         let task_rows = tstmt
@@ -2379,6 +2428,7 @@ impl Store {
                     r.get::<_, bool>(9)?,
                     r.get::<_, Option<i64>>(10)?,
                     r.get::<_, Option<i64>>(11)?,
+                    r.get::<_, bool>(12)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2408,6 +2458,7 @@ impl Store {
             soloed,
             t_started,
             t_finished,
+            t_env_out_of_date,
         ) in task_rows
         {
             let cells = cells_by_task.remove(&t_idx).unwrap_or_default();
@@ -2432,6 +2483,7 @@ impl Store {
                 soloed,
                 started_at_ms: t_started,
                 finished_at_ms: t_finished,
+                env_out_of_date: t_env_out_of_date,
             });
         }
 
@@ -2480,7 +2532,7 @@ impl Store {
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -2517,6 +2569,7 @@ impl Store {
                         proof_env_overrides: from_json_map(&r.get::<_, String>(20)?),
                         started_at_ms: r.get::<_, Option<i64>>(21)?,
                         finished_at_ms: r.get::<_, Option<i64>>(22)?,
+                        env_out_of_date: r.get::<_, bool>(23)?,
                     },
                 ))
             })?
@@ -2583,7 +2636,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -2606,6 +2659,7 @@ impl Store {
                         tokens_out: r.get::<_, i64>(13)?,
                         cost_usd: r.get::<_, f64>(14)?,
                         env_overrides: from_json_map(&r.get::<_, String>(15)?),
+                        env_out_of_date: r.get::<_, bool>(16)?,
                     },
                 ))
             })?
@@ -2625,7 +2679,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -2644,6 +2698,7 @@ impl Store {
                     tokens_out: r.get::<_, i64>(10)?,
                     cost_usd: r.get::<_, f64>(11)?,
                     env_overrides: from_json_map(&r.get::<_, String>(12)?),
+                    env_out_of_date: r.get::<_, bool>(13)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3598,8 +3653,9 @@ impl Store {
             .ok()
             .flatten()
             .unwrap_or_else(|| "unknown".to_string());
+        // RAL-271: see the matching comment in `set_cell_state`.
         self.conn.execute(
-            "UPDATE proofs SET state=?
+            "UPDATE proofs SET state=?, env_out_of_date=0
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
             params![state.as_str(), squad_id, task_idx, scope, cell_idx, idx],
         )?;
@@ -3882,6 +3938,10 @@ impl Store {
 
     /// Add/replace (`set`) and remove (`unset`) entries in a task's own
     /// environment-variable overrides, returning the resulting map.
+    ///
+    /// RAL-271: also marks the task, and every cell it owns, "out of date"
+    /// (cosmetic only) -- one ownership level down from the edited scope,
+    /// never touching sibling tasks/cells.
     pub fn set_task_env_overrides(
         &self,
         squad_id: &str,
@@ -3897,8 +3957,12 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE tasks SET env_overrides=? WHERE squad_id=? AND idx=?",
+            "UPDATE tasks SET env_overrides=?, env_out_of_date=1 WHERE squad_id=? AND idx=?",
             params![to_json_map(&current), squad_id, task_idx],
+        )?;
+        self.conn.execute(
+            "UPDATE cells SET env_out_of_date=1 WHERE squad_id=? AND task_idx=?",
+            params![squad_id, task_idx],
         )?;
         Ok(current)
     }
@@ -3924,6 +3988,10 @@ impl Store {
     /// Add/replace (`set`) and remove (`unset`) entries in a task's
     /// proof-scoped environment-variable overrides, returning the resulting
     /// map.
+    ///
+    /// RAL-271: marks every one of this task's own (task-scoped) proof steps
+    /// "out of date" (cosmetic only) -- this layer feeds those steps
+    /// directly, not the task node itself, so only they are marked.
     pub fn set_task_proof_env_overrides(
         &self,
         squad_id: &str,
@@ -3941,6 +4009,10 @@ impl Store {
         self.conn.execute(
             "UPDATE tasks SET proof_env_overrides=? WHERE squad_id=? AND idx=?",
             params![to_json_map(&current), squad_id, task_idx],
+        )?;
+        self.conn.execute(
+            "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='task'",
+            params![squad_id, task_idx],
         )?;
         Ok(current)
     }
@@ -3967,6 +4039,10 @@ impl Store {
 
     /// Add/replace (`set`) and remove (`unset`) entries in a cell's own
     /// environment-variable overrides, returning the resulting map.
+    ///
+    /// RAL-271: also marks the cell, and its own proof steps, "out of date"
+    /// (cosmetic only) -- one ownership level down from the edited scope,
+    /// never touching sibling cells or the owning task.
     pub fn set_cell_env_overrides(
         &self,
         squad_id: &str,
@@ -3983,8 +4059,12 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE cells SET env_overrides=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            "UPDATE cells SET env_overrides=?, env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND idx=?",
             params![to_json_map(&current), squad_id, task_idx, cell_idx],
+        )?;
+        self.conn.execute(
+            "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+            params![squad_id, task_idx, cell_idx],
         )?;
         Ok(current)
     }
@@ -4011,6 +4091,10 @@ impl Store {
     /// Add/replace (`set`) and remove (`unset`) entries in a cell's
     /// proof-scoped environment-variable overrides, returning the resulting
     /// map.
+    ///
+    /// RAL-271: marks every one of this cell's own proof steps "out of date"
+    /// (cosmetic only) -- this layer feeds those steps directly, not the
+    /// cell node itself, so only they are marked.
     pub fn set_cell_proof_env_overrides(
         &self,
         squad_id: &str,
@@ -4029,6 +4113,10 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET proof_env_overrides=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![to_json_map(&current), squad_id, task_idx, cell_idx],
+        )?;
+        self.conn.execute(
+            "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+            params![squad_id, task_idx, cell_idx],
         )?;
         Ok(current)
     }
@@ -4198,6 +4286,10 @@ impl Store {
     /// Eight arguments because a proof step's primary key genuinely is
     /// five-part (`squad, task, scope, cell, idx`) — the same key every other
     /// `proofs` accessor here takes — plus the set/unset pair.
+    ///
+    /// RAL-271: also marks this individual step "out of date" (cosmetic
+    /// only) -- a proof step is a leaf, so there is nothing further to
+    /// cascade to.
     #[allow(clippy::too_many_arguments)]
     pub fn set_proof_step_env_overrides(
         &self,
@@ -4218,7 +4310,7 @@ impl Store {
             current.insert(k.clone(), v.clone());
         }
         self.conn.execute(
-            "UPDATE proofs SET env_overrides=?
+            "UPDATE proofs SET env_overrides=?, env_out_of_date=1
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
             params![
                 to_json_map(&current),
@@ -4277,15 +4369,15 @@ impl Store {
             params![now_ms(), squad_id],
         )?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=?",
+            "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=?",
+            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE proofs SET state='pending' WHERE squad_id=?",
+            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         Ok(())
@@ -4658,21 +4750,21 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL WHERE squad_id=? AND idx=?",
+                "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND idx=?",
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='task'",
+                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
                 params![squad_id, t.idx],
             )?;
         }
@@ -4785,21 +4877,21 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', error=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+                "UPDATE tasks SET state='pending', env_out_of_date=0 WHERE squad_id=? AND idx=?",
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='task'",
+                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
                 params![squad_id, t.idx],
             )?;
         }
@@ -5546,7 +5638,7 @@ impl Store {
         // Done so the scheduler's proof-only path re-runs proofs without
         // re-running the cell.
         self.conn.execute(
-            "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=? AND idx>=?",
+            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=? AND idx>=?",
             params![squad_id, task_idx, cell_idx, proof_from],
         )?;
         self.revive_failed_downstream_cells(squad_id, &[(task_idx, cell_idx)])?;
@@ -5599,7 +5691,7 @@ impl Store {
         // immediately and re-runs only the affected task-level proofs,
         // without re-running any cell body.
         self.conn.execute(
-            "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='task' AND idx>=?",
+            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task' AND idx>=?",
             params![squad_id, task_idx, proof_from],
         )?;
         let roots: Vec<(i64, i64)> = self
@@ -7698,6 +7790,33 @@ command = "y"
         assert!(store.get_task_env_overrides(&squad, 1).unwrap().is_empty());
     }
 
+    /// RAL-271: the board's inline "Edit" button re-`set`s an already-present
+    /// key rather than unset-then-add -- verify that round trip replaces the
+    /// value without changing the key count or disturbing a sibling key.
+    #[test]
+    fn set_task_env_overrides_editing_an_existing_key_replaces_its_value_in_place() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
+            .unwrap();
+
+        let mut initial = BTreeMap::new();
+        initial.insert("A".to_string(), "1".to_string());
+        initial.insert("B".to_string(), "2".to_string());
+        store
+            .set_task_env_overrides(&squad, 0, &initial, &[])
+            .unwrap();
+
+        let mut edit = BTreeMap::new();
+        edit.insert("A".to_string(), "edited".to_string());
+        let result = store.set_task_env_overrides(&squad, 0, &edit, &[]).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("A").map(String::as_str), Some("edited"));
+        assert_eq!(result.get("B").map(String::as_str), Some("2"));
+        assert_eq!(store.get_task_env_overrides(&squad, 0).unwrap(), result);
+    }
+
     #[test]
     fn set_task_env_overrides_missing_task_is_not_found() {
         let mut store = Store::open_in_memory().unwrap();
@@ -7807,6 +7926,233 @@ command = "y"
             store.set_cell_env_overrides(&squad, 0, 9, &set, &[]),
             Err(StoreError::NotFound)
         ));
+    }
+
+    // ── "out of date" cascade badge (RAL-271) ───────────────────────────────
+
+    /// One task (`t0`) with its own task-scoped proof step, a cell (`s0`)
+    /// with two of its own cell-scoped proof steps, and a bare sibling cell
+    /// (`s1`) with none -- plus an entirely unrelated second task (`t1`) with
+    /// its own cell, used to assert a cascade never crosses into a sibling.
+    fn env_out_of_date_fixture_toml() -> &'static str {
+        "[[task]]\nname=\"t0\"\n\
+         [[task.proof]]\ncommand=\"tp0\"\n\
+         [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+         [[task.cell.proof]]\ncommand=\"cp0\"\n\
+         [[task.cell.proof]]\ncommand=\"cp1\"\n\
+         [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+         [[task]]\nname=\"t1\"\n\
+         [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n"
+    }
+
+    #[test]
+    fn env_out_of_date_defaults_to_false() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let view = store.get_squad(&squad).unwrap();
+        assert!(!view.tasks[0].env_out_of_date);
+        assert!(!view.tasks[0].proof[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].proof[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_task_env_overrides_marks_task_and_its_cells_but_not_grandchildren_or_siblings() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store.set_task_env_overrides(&squad, 0, &set, &[]).unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(view.tasks[0].env_out_of_date);
+        assert!(view.tasks[0].cells[0].env_out_of_date);
+        assert!(view.tasks[0].cells[1].env_out_of_date);
+        // Cascade stops one level down: grandchild proof steps (owned by the
+        // task directly, or by one of its cells) are untouched.
+        assert!(!view.tasks[0].proof[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].proof[0].env_out_of_date);
+        // A sibling task and its cell are never touched.
+        assert!(!view.tasks[1].env_out_of_date);
+        assert!(!view.tasks[1].cells[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_task_proof_env_overrides_marks_only_the_tasks_own_proof_steps() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_task_proof_env_overrides(&squad, 0, &set, &[])
+            .unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(view.tasks[0].proof[0].env_out_of_date);
+        // Neither the task itself nor its cells are marked -- this layer
+        // feeds the task's own proof steps directly.
+        assert!(!view.tasks[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_cell_env_overrides_marks_cell_and_its_proofs_but_not_sibling_cell_or_task() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_cell_env_overrides(&squad, 0, 0, &set, &[])
+            .unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(view.tasks[0].cells[0].env_out_of_date);
+        assert!(view.tasks[0].cells[0].proof[0].env_out_of_date);
+        assert!(view.tasks[0].cells[0].proof[1].env_out_of_date);
+        // The sibling cell, the owning task, and its own proof step are
+        // never touched.
+        assert!(!view.tasks[0].cells[1].env_out_of_date);
+        assert!(!view.tasks[0].env_out_of_date);
+        assert!(!view.tasks[0].proof[0].env_out_of_date);
+        // An unrelated task's cell is never touched.
+        assert!(!view.tasks[1].cells[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_cell_proof_env_overrides_marks_only_that_cells_proof_steps() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_cell_proof_env_overrides(&squad, 0, 0, &set, &[])
+            .unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(view.tasks[0].cells[0].proof[0].env_out_of_date);
+        assert!(view.tasks[0].cells[0].proof[1].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_proof_step_env_overrides_marks_only_that_one_step() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_proof_step_env_overrides(&squad, 0, "cell", 0, 0, &set, &[])
+            .unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(view.tasks[0].cells[0].proof[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].proof[1].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].env_out_of_date);
+    }
+
+    #[test]
+    fn restart_cell_clears_env_out_of_date_for_that_cell_and_its_proofs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_cell_env_overrides(&squad, 0, 0, &set, &[])
+            .unwrap();
+
+        store.restart_cell(&squad, 0, 0).unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(!view.tasks[0].cells[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].proof[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].proof[1].env_out_of_date);
+    }
+
+    #[test]
+    fn restart_task_clears_env_out_of_date_for_task_and_its_cells() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store.set_task_env_overrides(&squad, 0, &set, &[]).unwrap();
+
+        store.restart_task(&squad, 0).unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(!view.tasks[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[0].env_out_of_date);
+        assert!(!view.tasks[0].cells[1].env_out_of_date);
+    }
+
+    #[test]
+    fn set_cell_state_clears_env_out_of_date_even_without_a_restart() {
+        // Covers both triggers the ticket calls out: a manual `Set Status`
+        // call (this test) and the scheduler's own dispatch into `running`
+        // (same code path, since both go through `set_cell_state`).
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_cell_env_overrides(&squad, 0, 0, &set, &[])
+            .unwrap();
+
+        store.set_cell_state(&squad, 0, 0, NodeState::Done).unwrap();
+
+        assert!(!store.get_squad(&squad).unwrap().tasks[0].cells[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_task_state_clears_env_out_of_date() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store.set_task_env_overrides(&squad, 0, &set, &[]).unwrap();
+
+        store.set_task_state(&squad, 0, NodeState::Done).unwrap();
+
+        assert!(!store.get_squad(&squad).unwrap().tasks[0].env_out_of_date);
+    }
+
+    #[test]
+    fn set_proof_state_clears_env_out_of_date() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(env_out_of_date_fixture_toml()), Some("r"), false)
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("A".to_string(), "1".to_string());
+        store
+            .set_proof_step_env_overrides(&squad, 0, "cell", 0, 0, &set, &[])
+            .unwrap();
+
+        store
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Done)
+            .unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        assert!(!view.tasks[0].cells[0].proof[0].env_out_of_date);
     }
 
     #[test]

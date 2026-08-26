@@ -388,6 +388,37 @@ mod tests {
         assert!(content.contains("hello\nworld"));
     }
 
+    /// RAL-264: a durable per-attempt transcript can legitimately contain the
+    /// agent's own `$env:... = 'sk-or-v1-...'` assignment in its pane output;
+    /// the resolved secret must be scrubbed out before the file is written,
+    /// since this file is a durable user-facing artifact (`ralphus review
+    /// logs`/the board's terminal-log viewer read it back).
+    #[test]
+    fn write_attempt_redacts_registered_secret_values() {
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            crate::redact::register("sk-or-v1-terminal-log-test-token");
+
+            let root = TempRoot::new("redact");
+            write_attempt_in(
+                &root.0,
+                "sess-a",
+                0,
+                "working...\n$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-terminal-log-test-token'\ndone\n",
+                100,
+            );
+            let content = read_attempt_in(&root.0, "sess-a", 0).expect("attempt written");
+            assert!(
+                !content.contains("sk-or-v1-terminal-log-test-token"),
+                "secret leaked into terminal log: {content}"
+            );
+            assert!(content.contains(crate::redact::REDACTED));
+            // The surrounding, non-secret transcript survives verbatim.
+            assert!(content.contains("working..."));
+            assert!(content.contains("done"));
+        });
+    }
+
     #[test]
     fn missing_attempt_reads_as_none() {
         let root = TempRoot::new("missing");
