@@ -10,10 +10,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ralphus_daemon::{
-    Command, DEFAULT_MAX_CONCURRENT, command_usage, default_db_path, parse_args, server,
-    validate_file,
-};
+use ralphus_daemon::{Command, command_usage, default_db_path, parse_args, server, validate_file};
 
 fn main() -> ExitCode {
     // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
@@ -164,7 +161,7 @@ fn main() -> ExitCode {
                 ),
             );
             let otel_provider = ralphus_daemon::otel::init("ralphus-daemon");
-            let result = server::serve(addr, &db, DEFAULT_MAX_CONCURRENT);
+            let result = server::serve(addr, &db, daemon_cfg.max_concurrent());
             ralphus_daemon::otel::shutdown(otel_provider);
             match result {
                 Ok(()) => ExitCode::SUCCESS,

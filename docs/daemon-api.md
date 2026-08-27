@@ -1334,6 +1334,8 @@ case-insensitive), `name` (case-insensitive substring match on the label),
 `sort` (`name` sorts by label/id ascending; anything else, including absent,
 keeps the default newest-first order).
 
+`max_concurrent` is the configured global concurrency cap (`0` means no limit).
+
 ```json
 {
   "daemon": { "running": 1, "max_concurrent": 12, "running_reviews": [], "downtime_active": false },

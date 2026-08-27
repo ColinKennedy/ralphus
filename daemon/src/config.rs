@@ -197,6 +197,16 @@ pub struct DaemonConfig {
     /// carry a real authenticated identity instead of a config default.
     #[serde(default)]
     pub default_user: Option<String>,
+    /// The global concurrency cap shared by the scheduler, task-level proofs,
+    /// and guardian review merges (see `crate::DEFAULT_MAX_CONCURRENT`). `None`
+    /// means unset (so a lower layer can supply it); resolved callers use
+    /// [`max_concurrent`](Self::max_concurrent). A configured `0` means "no
+    /// limit". A negative value is treated as unset, matching this file's
+    /// "malformed config never blocks" rule, and falls back to
+    /// `crate::DEFAULT_MAX_CONCURRENT` (12) — `ralphus check health` warns
+    /// when this happens.
+    #[serde(default)]
+    pub max_concurrent: Option<i64>,
 }
 
 impl DaemonConfig {
@@ -214,6 +224,17 @@ impl DaemonConfig {
                 Some((start, end))
             })
             .collect()
+    }
+
+    /// The effective global concurrency cap. `0` means "no limit". Defaults
+    /// to `crate::DEFAULT_MAX_CONCURRENT` when unset, or when the configured
+    /// value is negative.
+    #[must_use]
+    pub fn max_concurrent(&self) -> i64 {
+        match self.max_concurrent {
+            Some(n) if n >= 0 => n,
+            _ => crate::DEFAULT_MAX_CONCURRENT,
+        }
     }
 }
 
@@ -732,6 +753,7 @@ pub fn load_daemon_config() -> DaemonConfig {
         log_level: local.log_level.or(global.log_level),
         downtime: merge_downtime(global.downtime, local.downtime),
         default_user: local.default_user.or(global.default_user),
+        max_concurrent: local.max_concurrent.or(global.max_concurrent),
     }
 }
 
@@ -1353,6 +1375,38 @@ mod tests {
     fn downtime_malformed_toml_is_default() {
         let c = daemon_from_toml_str("not = = valid");
         assert!(c.downtime_windows().is_empty());
+    }
+
+    // ── max_concurrent ────────────────────────────────────────────────────
+
+    #[test]
+    fn max_concurrent_defaults_when_absent() {
+        let c = daemon_from_toml_str("");
+        assert_eq!(c.max_concurrent(), crate::DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[test]
+    fn max_concurrent_parses_explicit_value() {
+        let c = daemon_from_toml_str("[daemon]\nmax_concurrent = 24\n");
+        assert_eq!(c.max_concurrent(), 24);
+    }
+
+    #[test]
+    fn max_concurrent_zero_means_no_limit() {
+        let c = daemon_from_toml_str("[daemon]\nmax_concurrent = 0\n");
+        assert_eq!(c.max_concurrent(), 0);
+    }
+
+    #[test]
+    fn max_concurrent_negative_falls_back_to_default() {
+        let c = daemon_from_toml_str("[daemon]\nmax_concurrent = -5\n");
+        assert_eq!(c.max_concurrent(), crate::DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[test]
+    fn max_concurrent_malformed_toml_is_default() {
+        let c = daemon_from_toml_str("not = = valid");
+        assert_eq!(c.max_concurrent(), crate::DEFAULT_MAX_CONCURRENT);
     }
 
     #[test]

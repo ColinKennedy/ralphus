@@ -254,9 +254,9 @@ fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String)
     let cwd_b = wt_b.to_string_lossy().replace('\\', "/");
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"rev\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();

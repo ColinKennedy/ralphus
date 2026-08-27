@@ -630,7 +630,7 @@
       /**
        * @typedef {object} DaemonStatus
        * @property {number} running
-       * @property {number} max_concurrent
+       * @property {number} max_concurrent - The global concurrency cap; `0` means no limit.
        * @property {string[]} running_reviews
        */
       /**
@@ -8954,6 +8954,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {void}
        */
       function renderAll() { renderSquads(); renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); }
+      /**
+       * Formats the daemon status counter text, showing "unlimited" in place
+       * of the cap when `maxConcurrent` is 0 (no limit).
+       * @param {number} running
+       * @param {number} maxConcurrent
+       * @returns {string}
+       */
+      function formatConcurrencyStatus(running, maxConcurrent) {
+        const cap = maxConcurrent === 0 ? "unlimited" : String(maxConcurrent);
+        return `Running ${running} / ${cap}`;
+      }
       // Fetch /api/tasks for the daemon status block only — updates the "Running X / Y"
       // counter and the `squads` cache (used by the running dropdown) without triggering
       // task-view rendering. Called by tick() on non-task tabs so the counter stays
@@ -8967,7 +8978,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const d = await (await fetch("/api/tasks")).json();
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           squads = d.squads || [];
-          byId("running").textContent = `Running ${d.daemon.running ?? 0} / ${d.daemon.max_concurrent ?? 0}`;
+          byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
         } catch (_) {}
       }
       /**
@@ -9161,7 +9172,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const d = await (await fetch("/api/tasks")).json();
           byId("conn").className = "dot on";
           /** @type {any} */ (window)._daemonStatus = d.daemon;
-          byId("running").textContent = `Running ${d.daemon.running ?? 0} / ${d.daemon.max_concurrent ?? 0}`;
+          byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
           byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
           squads = d.squads || [];
           const wantSquad = pendingHash ? squadForPendingHash(pendingHash) : undefined;

@@ -172,16 +172,24 @@ fn resolve_shared_session_id(
 pub struct Semaphore {
     permits: Mutex<i64>,
     available: Condvar,
+    capacity: i64,
 }
 
 impl Semaphore {
-    /// A semaphore with `permits` slots (clamped to at least 1 so it can never
-    /// deadlock at zero).
+    /// A semaphore with `permits` slots. `0` means "no limit" — internally
+    /// represented as `i64::MAX` so [`acquire`](Self::acquire) never blocks.
+    /// Any other non-positive value is clamped to 1 so it can never deadlock.
     #[must_use]
     pub fn new(permits: i64) -> Self {
+        let capacity = if permits == 0 {
+            i64::MAX
+        } else {
+            permits.max(1)
+        };
         Self {
-            permits: Mutex::new(permits.max(1)),
+            permits: Mutex::new(capacity),
             available: Condvar::new(),
+            capacity,
         }
     }
 
@@ -206,9 +214,9 @@ impl Semaphore {
     /// run, per RAL-64, and a not-yet-started proof step still reads
     /// `pending`) — so counting raw `state='running'` rows undercounts actual
     /// concurrency-slot usage. This is exact regardless of DB row timing.
-    pub(crate) fn in_use(&self, capacity: i64) -> i64 {
+    pub(crate) fn in_use(&self) -> i64 {
         let permits = self.permits.lock().expect("semaphore mutex poisoned");
-        capacity - *permits
+        self.capacity - *permits
     }
 }
 
@@ -3212,6 +3220,16 @@ mod tests {
             drop(a);
         });
         assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn semaphore_zero_means_unlimited() {
+        let sem = Semaphore::new(0);
+        // Hold far more permits at once than any positive cap would allow.
+        let permits: Vec<_> = (0..64).map(|_| sem.acquire()).collect();
+        assert_eq!(sem.in_use(), 64);
+        drop(permits);
+        assert_eq!(sem.in_use(), 0);
     }
 
     /// Stands in for a long-running cell: blocks in `run_cancellable` until

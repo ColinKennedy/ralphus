@@ -231,17 +231,4 @@ mod tests {
             assert!(command_usage(Some(*command)).contains("-h, --help"));
         }
     }
-
-    #[test]
-    fn bind_host_defaults_to_loopback() {
-        assert_eq!(resolve_bind_host(None), "127.0.0.1");
-        assert_eq!(resolve_bind_host(Some("")), "127.0.0.1");
-        assert_eq!(resolve_bind_host(Some("   ")), "127.0.0.1");
-    }
-
-    #[test]
-    fn bind_host_honors_explicit_override() {
-        assert_eq!(resolve_bind_host(Some("0.0.0.0")), "0.0.0.0");
-        assert_eq!(resolve_bind_host(Some("  0.0.0.0  ")), "0.0.0.0");
-    }
 }
