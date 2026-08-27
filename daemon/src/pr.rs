@@ -549,11 +549,21 @@ fn push_ref(
 /// the open PR branch. A remote branch that doesn't exist yet, or one whose
 /// tip is already an ancestor of `local_ref` (so the force-push is a strict
 /// superset), is safe and returns `Ok(())`.
+///
+/// `last_pushed` is the PR row's `last_pushed_sha` (`None` before the first
+/// push). When the remote tip still equals it, every commit on the remote got
+/// there through this daemon, so overwriting them replaces our own history and
+/// is safe no matter how far the two have diverged — which is the case after
+/// any restack, since replaying a branch rewrites every SHA on it and leaves
+/// the remote tip un-ancestored. Ancestry is therefore checked only as a
+/// fallback, backed in turn by a patch-id comparison for a remote whose commits
+/// were all replayed into `local_ref` under new SHAs.
 fn guard_against_clobber(
     root: &Path,
     remote: &str,
     alias: &str,
     local_ref: &str,
+    last_pushed: Option<&str>,
 ) -> std::result::Result<(), String> {
     if git(root, &["fetch", remote, alias]).is_err() {
         // No remote branch yet (or it's unreachable) -- nothing to clobber.
@@ -563,6 +573,9 @@ fn guard_against_clobber(
         return Ok(());
     };
     let remote_sha = remote_sha.trim();
+    if last_pushed == Some(remote_sha) {
+        return Ok(());
+    }
     if git(
         root,
         &["merge-base", "--is-ancestor", remote_sha, local_ref],
@@ -570,6 +583,15 @@ fn guard_against_clobber(
     .is_ok()
     {
         return Ok(());
+    }
+    // `git cherry <upstream> <head>` marks each commit on `head` with `-` when
+    // `upstream` already holds a patch-equivalent commit and `+` when it does
+    // not, so a `+`-free result means the remote carries no work `local_ref`
+    // lacks -- only the pre-restack spelling of work it already has.
+    if let Ok(cherry) = git(root, &["cherry", local_ref, remote_sha]) {
+        if !cherry.lines().any(|l| l.starts_with('+')) {
+            return Ok(());
+        }
     }
     Err(format!(
         "PR branch '{alias}' has commits not present in the review worktree \
@@ -858,6 +880,10 @@ pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Resu
     ordered_branches.sort_by_key(|b| b.position);
 
     let mut changed = 0usize;
+    // PRs GitHub refused to move because they belong to a registered stack,
+    // collected so the stack is dissolved once and all of them retried
+    // together rather than once per refusal.
+    let mut blocked_by_stack: Vec<(String, i64, String)> = Vec::new();
     for branch in &ordered_branches {
         let Some(pr) = by_branch.get(branch.id.as_str()) else {
             continue;
@@ -887,16 +913,115 @@ pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Resu
             changed += 1;
             if let (Some(c), Some(num)) = (&client, pr.pr_number) {
                 if let Err(e) = c.update_pull_request_base(num, &new_base) {
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [pr] review {id} resync base forge update failed pr={}: {e}",
-                        pr.id
-                    );
+                    if is_stack_base_restriction(&e) {
+                        blocked_by_stack.push((pr.id.clone(), num, new_base.clone()));
+                    } else {
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [pr] review {id} resync base forge update failed pr={}: {e}",
+                            pr.id
+                        );
+                    }
                 }
             }
         }
     }
+    if !blocked_by_stack.is_empty() {
+        if let Some(c) = &client {
+            let ordered_pr_numbers: Vec<i64> = ordered_branches
+                .iter()
+                .filter_map(|b| by_branch.get(b.id.as_str()))
+                .filter_map(|pr| pr.pr_number)
+                .collect();
+            repoint_stacked_prs(store, id, c, &ordered_pr_numbers, &blocked_by_stack);
+        }
+    }
     Ok(changed)
+}
+
+/// Whether a forge error is GitHub refusing to move a PR's base because the PR
+/// belongs to a registered stack, as opposed to any other rejection (auth, a
+/// deleted branch, rate limiting) that dissolving the stack would not fix.
+fn is_stack_base_restriction(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("part of a stack")
+}
+
+/// Repoint PRs GitHub refused to move because they belong to a registered
+/// stack: dissolve the stack, retry each base change, then register the stack
+/// again so GitHub's UI still shows the chain.
+///
+/// GitHub has no endpoint for changing a stack's base branch and rejects a
+/// base change on any PR while it is stacked, so a review whose base branch
+/// moves can only be followed by rebuilding the grouping. The PRs themselves
+/// are never closed or recreated — they keep their numbers, their comments and
+/// their CI history, and only stop being displayed as a stack for the moment
+/// between the two calls.
+///
+/// Best-effort throughout: every failure is logged and the remaining PRs are
+/// still attempted, since the local `base_ref` records have already been
+/// updated and a forge that disagrees is reconciled on the next resync.
+fn repoint_stacked_prs(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    client: &crate::forge::ForgeClient,
+    ordered_pr_numbers: &[i64],
+    blocked: &[(String, i64, String)],
+) {
+    let recorded = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian_forge_stack_number(id)
+        .ok()
+        .flatten();
+    let Some(stack_number) = recorded else {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} base move blocked by a stack this review has no record of \
+             -- unstack it on the forge, then change the base again"
+        );
+        return;
+    };
+    if let Err(e) = client.unstack(stack_number) {
+        crate::rlog!(
+            ERROR,
+            "ralphus [pr] review {id} could not dissolve stack {stack_number} to move PR bases: {e}"
+        );
+        return;
+    }
+    for (pr_id, number, new_base) in blocked {
+        if let Err(e) = client.update_pull_request_base(*number, new_base) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} resync base forge update failed pr={pr_id} after \
+                 dissolving stack {stack_number}: {e}"
+            );
+        }
+    }
+    if ordered_pr_numbers.len() < 2 {
+        return;
+    }
+    match client.create_stack(ordered_pr_numbers) {
+        Ok(Some(created)) => {
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .set_guardian_forge_stack_number(id, created.number);
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {id} re-registered stack {} after moving PR bases \
+                 (was {stack_number})",
+                created.number
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [pr] review {id} moved PR bases but could not re-register the stack \
+                 (was {stack_number}), leaving the PRs unstacked: {e}"
+            );
+        }
+    }
 }
 
 /// Kick off [`resync_pr_bases`] in the background — called after a reorder,
@@ -925,6 +1050,127 @@ pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
             crate::rlog!(ERROR, "ralphus [pr] review {sid} resync bases failed: {e}");
         }
     });
+}
+
+/// Reconcile every already-open PR's remote branch with the review branch it
+/// tracks, re-pushing the ones that drifted.
+///
+/// Restacking a review rebuilds each branch's worktree tip in place but never
+/// touches the remote `-review` branches an already-open PR tracks, so without
+/// this an open PR silently goes stale — GitHub keeps showing the pre-restack
+/// diff, and pre-restack conflicts against a base branch that has since moved.
+/// Every path that settles a review reaches the same end state rather than a
+/// common notification point (`guardian_merge`'s explicit merge, restart-merge
+/// and feedback runs, plus `review_maintenance`'s base-shift rebuild and
+/// manual-push restack), so this compares recorded against actual instead of
+/// subscribing to any one of them: it is idempotent, and cheap when nothing
+/// moved, because a PR whose `last_pushed_sha` still matches its local tip is
+/// skipped before any network call.
+///
+/// Only a settled (`in_review`) review is reconciled — a merge in flight owns
+/// the branch tips and will land them itself. Mirrors the push+record-sha
+/// pattern [`submit_pull_requests_inner`] and [`pull_pr_commits`] already use.
+/// Best-effort per PR: one push failing (most likely `guard_against_clobber`
+/// tripping because a reviewer pushed directly to the PR branch) is logged and
+/// does not stop the others.
+pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
+    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+        return;
+    };
+    if guardian.status.as_str() != "in_review" {
+        return;
+    }
+    let prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default();
+    let open_prs: Vec<_> = prs.iter().filter(|p| p.state == "open").collect();
+    if open_prs.is_empty() {
+        return;
+    }
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
+
+    for pr in open_prs {
+        let local_ref = match &pr.branch_id {
+            Some(bid) => guardian
+                .branches
+                .iter()
+                .find(|b| &b.id == bid)
+                .and_then(|b| b.review_branch.clone()),
+            None => guardian.review_branch.clone(),
+        };
+        let Some(local_ref) = local_ref else {
+            continue;
+        };
+        let Ok(local_sha) = git(&root, &["rev-parse", &local_ref]).map(|s| s.trim().to_string())
+        else {
+            continue;
+        };
+        if pr.last_pushed_sha.as_deref() == Some(local_sha.as_str()) {
+            continue; // already in sync -- nothing moved this branch since
+        }
+        if let Err(e) = guard_against_clobber(
+            &root,
+            &remote_name,
+            &pr.branch_alias,
+            &local_ref,
+            pr.last_pushed_sha.as_deref(),
+        ) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} pr branch sync skipped pr={} alias={}: {e}",
+                pr.id,
+                pr.branch_alias
+            );
+            continue;
+        }
+        if let Err(e) = push_ref(&root, &remote_name, &local_ref, &pr.branch_alias) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} pr branch sync push failed pr={} alias={}: {e}",
+                pr.id,
+                pr.branch_alias
+            );
+            continue;
+        }
+        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+            &pr.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(local_sha.as_str())),
+        );
+        {
+            let guard = store.lock().expect("poisoned");
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "pr",
+                message: "pr branch re-pushed to match its review branch",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({
+                    "pr_id": pr.id,
+                    "alias": pr.branch_alias,
+                    "sha": local_sha,
+                }),
+            });
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [pr] review {id} pr={} alias={} re-pushed sha={local_sha}",
+            pr.id,
+            pr.branch_alias
+        );
+    }
 }
 
 /// Submit each request in `requests` as a PR/MR. Stacked requests
@@ -1033,7 +1279,9 @@ fn submit_stacked_branch_pr(
         DEBUG,
         "ralphus [pr] review {id} pushing branch id={branch_id} alias={alias} remote={remote_name}"
     );
-    guard_against_clobber(root, remote_name, &alias, &review_ref)?;
+    // Nothing has been pushed to a brand-new alias yet, so there is no
+    // recorded tip to recognize the remote by.
+    guard_against_clobber(root, remote_name, &alias, &review_ref, None)?;
     push_ref(root, remote_name, &review_ref, &alias)?;
     let pushed_sha = git(root, &["rev-parse", &review_ref])
         .map(|s| s.trim().to_string())
@@ -1925,7 +2173,13 @@ fn action_pr_feedback_inner(
             .review_branch
             .clone()
             .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
-        guard_against_clobber(&root, &remote_name, &pr.branch_alias, &local_ref)?;
+        guard_against_clobber(
+            &root,
+            &remote_name,
+            &pr.branch_alias,
+            &local_ref,
+            pr.last_pushed_sha.as_deref(),
+        )?;
         crate::rlog!(
             DEBUG,
             "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
@@ -2080,6 +2334,7 @@ pub fn start_action_pr_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guardian::GuardianStatus;
     use crate::store::Store;
     use std::process::Command;
 
@@ -2295,11 +2550,11 @@ mod tests {
         let remote = remote_dir.to_str().unwrap();
 
         // No remote branch yet -- safe.
-        assert!(guard_against_clobber(&root, remote, "pr-x", "main").is_ok());
+        assert!(guard_against_clobber(&root, remote, "pr-x", "main", None).is_ok());
 
         g(&root, &["push", remote, "main:refs/heads/pr-x"]);
         // Remote now matches local exactly -- still safe (ancestor of itself).
-        assert!(guard_against_clobber(&root, remote, "pr-x", "main").is_ok());
+        assert!(guard_against_clobber(&root, remote, "pr-x", "main", None).is_ok());
 
         // A reviewer pushes a unique commit straight to the PR branch.
         let clone_dir = tmp_dir("guard-clone");
@@ -2319,17 +2574,92 @@ mod tests {
         g(&clone_dir, &["push", "origin", "pr-x"]);
 
         // Local `main` no longer contains the remote's unique commit -- blocked.
-        let err = guard_against_clobber(&root, remote, "pr-x", "main").unwrap_err();
+        let err = guard_against_clobber(&root, remote, "pr-x", "main", None).unwrap_err();
         assert!(err.contains("pr-x"), "{err}");
 
         // Once local has pulled that commit in, it's a safe superset again.
         g(&root, &["fetch", remote, "pr-x"]);
         g(&root, &["merge", "--ff-only", "FETCH_HEAD"]);
-        assert!(guard_against_clobber(&root, remote, "pr-x", "main").is_ok());
+        assert!(guard_against_clobber(&root, remote, "pr-x", "main", None).is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    /// A restack leaves the remote tip un-ancestored even though nobody else
+    /// touched it, so ancestry alone would refuse every post-restack push.
+    /// Recognizing the tip this daemon itself last pushed is what separates
+    /// "our own history, rewritten" from "someone else's work".
+    #[test]
+    fn guard_against_clobber_allows_overwriting_the_tip_it_last_pushed() {
+        let root = tmp_dir("guard-lastpushed-root");
+        g(&root, &["init", "-b", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["checkout", "-b", "feature"]);
+        gwrite(&root, "feat.txt", "feat\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "feat"]);
+
+        let remote_dir = tmp_dir("guard-lastpushed-remote");
+        g(&remote_dir, &["init", "--bare"]);
+        let remote = remote_dir.to_str().unwrap();
+        g(&root, &["push", remote, "feature:refs/heads/pr-x"]);
+        let pushed = g(&root, &["rev-parse", "feature"]).trim().to_string();
+
+        // Amending rewrites the SHA exactly the way replaying it would.
+        gwrite(&root, "feat.txt", "feat rewritten\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--amend", "-m", "feat rewritten"]);
+        assert_ne!(g(&root, &["rev-parse", "feature"]).trim(), pushed);
+
+        // Ancestry says divergence; the recorded tip says it is ours to replace.
+        assert!(guard_against_clobber(&root, remote, "pr-x", "feature", None).is_err());
+        assert!(
+            guard_against_clobber(&root, remote, "pr-x", "feature", Some(&pushed)).is_ok(),
+            "a remote still sitting on our own last push is safe to overwrite"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// Without a recorded tip to match (a PR adopted from an earlier push, say)
+    /// patch ids still tell a replayed commit apart from a reviewer's own.
+    #[test]
+    fn guard_against_clobber_allows_a_remote_whose_commits_were_all_replayed() {
+        let root = tmp_dir("guard-replay-root");
+        g(&root, &["init", "-b", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["checkout", "-b", "feature"]);
+        gwrite(&root, "feat.txt", "feat\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "feat"]);
+
+        let remote_dir = tmp_dir("guard-replay-remote");
+        g(&remote_dir, &["init", "--bare"]);
+        let remote = remote_dir.to_str().unwrap();
+        g(&root, &["push", remote, "feature:refs/heads/pr-x"]);
+
+        // Advance the base and replay `feature` onto it: same patch, new SHA.
+        g(&root, &["checkout", "main"]);
+        gwrite(&root, "other.txt", "other\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "base advances"]);
+        g(&root, &["checkout", "feature"]);
+        g(&root, &["rebase", "main"]);
+
+        assert!(
+            guard_against_clobber(&root, remote, "pr-x", "feature", None).is_ok(),
+            "every remote commit was replayed into feature under a new sha"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     /// Common fixture for the `compute_sync_status` tests: a repo with a
@@ -2389,11 +2719,18 @@ mod tests {
     fn synced_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
         let (root, remote_dir, store, pr_id) = sync_status_fixture();
         let sha = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
-        store
-            .lock()
-            .unwrap()
-            .update_pull_request_ex(&pr_id, None, None, None, None, None, Some(Some(&sha)))
-            .unwrap();
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .update_pull_request_ex(&pr_id, None, None, None, None, None, Some(Some(&sha)))
+                .unwrap();
+            // A review with an open PR has settled; `sync_open_pr_branches`
+            // only reconciles one that has.
+            let gid = guard.get_pull_request(&pr_id).unwrap().guardian_id;
+            guard
+                .set_guardian_status(&gid, GuardianStatus::InReview, None)
+                .unwrap();
+        }
         (root, remote_dir, store, pr_id)
     }
 
@@ -2793,6 +3130,328 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    // -- RAL-285: repoint stacked PRs when the review's base branch moves ------
+
+    #[test]
+    fn is_stack_base_restriction_matches_only_githubs_stack_refusal() {
+        assert!(is_stack_base_restriction(
+            "forge API 422: {\"message\":\"Validation Failed\",\"errors\":[{\"message\":\
+             \"Cannot change the base branch because the pull request is part of a stack.\"}]}"
+        ));
+        // Anything dissolving the stack would not fix must not dissolve it.
+        assert!(!is_stack_base_restriction("forge API 401: Bad credentials"));
+        assert!(!is_stack_base_restriction(
+            "forge API 422: base branch not found"
+        ));
+        // GitLab has no stacks to dissolve, so none of its rejections may
+        // route into the GitHub recovery path.
+        assert!(!is_stack_base_restriction(
+            "forge API 400: {\"message\":{\"target_branch\":[\"can't be blank\"]}}"
+        ));
+        assert!(!is_stack_base_restriction(
+            "forge API 409: merge request is part of a merge train"
+        ));
+    }
+
+    /// The PRs must survive with their numbers intact: the recovery dissolves
+    /// the stack, retries the base change, and registers the stack again --
+    /// it never closes or recreates a pull request.
+    #[test]
+    fn repoint_stacked_prs_dissolves_retries_the_base_then_re_registers() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            let mut created_payload = serde_json::Value::Null;
+            for _ in 0..3 {
+                let mut req = server.recv().unwrap();
+                let method = req.method().as_str().to_string();
+                let url = req.url().to_string();
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                if url == "/repos/acme/widget/stacks" {
+                    created_payload = serde_json::from_str(&body).unwrap();
+                }
+                seen.push((method, url));
+                req.respond(
+                    tiny_http::Response::from_string("{\"number\": 99}").with_status_code(200),
+                )
+                .unwrap();
+            }
+            (seen, created_payload)
+        });
+
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
+        s.set_guardian_forge_stack_number(&gid, 42).unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        repoint_stacked_prs(
+            &store,
+            &gid,
+            &client,
+            &[7, 8],
+            &[("pr-x".to_string(), 7, "new-base".to_string())],
+        );
+
+        let (seen, created_payload) = handle.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "POST".to_string(),
+                    "/repos/acme/widget/stacks/42/unstack".to_string()
+                ),
+                (
+                    "PATCH".to_string(),
+                    "/repos/acme/widget/pulls/7".to_string()
+                ),
+                ("POST".to_string(), "/repos/acme/widget/stacks".to_string()),
+            ],
+            "must dissolve, then move the base, then rebuild the stack -- in that order"
+        );
+        assert_eq!(created_payload["pull_requests"], serde_json::json!([7, 8]));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian_forge_stack_number(&gid)
+                .unwrap(),
+            Some(99),
+            "the rebuilt stack's number must replace the dissolved one"
+        );
+    }
+
+    #[test]
+    fn repoint_stacked_prs_does_nothing_without_a_recorded_stack() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
+        let store = Arc::new(Mutex::new(s));
+        // An unreachable base URL: reaching the forge at all would be a bug,
+        // since there is no recorded stack to dissolve.
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        repoint_stacked_prs(
+            &store,
+            &gid,
+            &client,
+            &[7, 8],
+            &[("pr-x".to_string(), 7, "new-base".to_string())],
+        );
+
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian_forge_stack_number(&gid)
+                .unwrap(),
+            None
+        );
+    }
+
+    // -- RAL-285: keep already-open PR branches level with their review branch --
+
+    #[test]
+    fn sync_open_pr_branches_pushes_a_worktree_tip_that_moved_locally() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let gid = store
+            .lock()
+            .unwrap()
+            .get_pull_request(&pr_id)
+            .unwrap()
+            .guardian_id;
+
+        // The review-branch worktree tip gains a commit in place (e.g. a
+        // conflict resolution), with nothing pushed to the remote yet.
+        g(&root, &["checkout", "review-branch"]);
+        gwrite(&root, "resolved.txt", "resolved\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "conflict resolution"]);
+        g(&root, &["checkout", "main"]);
+        let new_local_sha = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
+
+        sync_open_pr_branches(&store, &gid);
+
+        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.last_pushed_sha.as_deref(), Some(new_local_sha.as_str()));
+        let remote_sha = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+        assert_eq!(remote_sha, new_local_sha);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// The case the whole feature exists for, and the one a tip that merely
+    /// moves forward never exercises: a restack REPLAYS the branch, so the
+    /// remote tip stops being an ancestor of the local one and a guard that
+    /// only knows ancestry refuses the push that would refresh the PR.
+    #[test]
+    fn sync_open_pr_branches_pushes_a_branch_the_base_shift_restacked() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let gid = store
+            .lock()
+            .unwrap()
+            .get_pull_request(&pr_id)
+            .unwrap()
+            .guardian_id;
+        let pre_restack = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
+
+        // The base branch moves, then the review branch is replayed onto it --
+        // exactly `rebuild_on_base_shift`'s restack, and equally what an
+        // explicit `review merge` leaves behind.
+        g(&root, &["checkout", "main"]);
+        gwrite(&root, "base-advance.txt", "moved\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "base advances"]);
+        g(&root, &["checkout", "review-branch"]);
+        g(&root, &["rebase", "main"]);
+        g(&root, &["checkout", "main"]);
+
+        let restacked = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
+        assert_ne!(restacked, pre_restack, "rebase should rewrite the tip");
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["merge-base", "--is-ancestor", &pre_restack, &restacked])
+                .status()
+                .is_ok_and(|s| !s.success()),
+            "the replayed tip must not descend from the pushed one, or this \
+             test is not covering the restack case"
+        );
+
+        sync_open_pr_branches(&store, &gid);
+
+        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.last_pushed_sha.as_deref(), Some(restacked.as_str()));
+        let remote_sha = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+        assert_eq!(remote_sha, restacked);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn sync_open_pr_branches_leaves_a_review_that_is_still_merging_alone() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let gid = store
+            .lock()
+            .unwrap()
+            .get_pull_request(&pr_id)
+            .unwrap()
+            .guardian_id;
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, GuardianStatus::Merging, None)
+            .unwrap();
+        let remote_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+
+        // A merge in flight owns the branch tips, so a tip that has moved
+        // mid-merge is not yet the state the PR should show.
+        g(&root, &["checkout", "review-branch"]);
+        gwrite(&root, "half-done.txt", "wip\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "mid-merge"]);
+        g(&root, &["checkout", "main"]);
+
+        sync_open_pr_branches(&store, &gid);
+
+        let remote_after = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+        assert_eq!(remote_after, remote_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn sync_open_pr_branches_is_a_noop_when_nothing_changed() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let gid = store
+            .lock()
+            .unwrap()
+            .get_pull_request(&pr_id)
+            .unwrap()
+            .guardian_id;
+        let remote_sha_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+
+        sync_open_pr_branches(&store, &gid);
+
+        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_eq!(
+            pr.last_pushed_sha.as_deref(),
+            Some(remote_sha_before.as_str())
+        );
+        let remote_sha_after = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+        assert_eq!(remote_sha_after, remote_sha_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn sync_open_pr_branches_skips_a_pr_a_reviewer_pushed_directly_to() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let gid = store
+            .lock()
+            .unwrap()
+            .get_pull_request(&pr_id)
+            .unwrap()
+            .guardian_id;
+        let remote = remote_dir.to_str().unwrap();
+
+        // Reviewer pushes directly to the PR branch -- a commit the worktree
+        // doesn't have. The restack also moves the worktree tip locally.
+        let clone_dir = tmp_dir("sync-restack-clobber-clone");
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        g(
+            clone_dir.parent().unwrap(),
+            &[
+                "clone",
+                remote,
+                clone_dir.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        g(&clone_dir, &["checkout", "pr-y"]);
+        gwrite(&clone_dir, "reviewer.txt", "fix\n");
+        g(&clone_dir, &["add", "."]);
+        g(&clone_dir, &["commit", "-m", "reviewer fix"]);
+        g(&clone_dir, &["push", "origin", "pr-y"]);
+        let remote_sha_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+
+        g(&root, &["checkout", "review-branch"]);
+        gwrite(&root, "resolved.txt", "resolved\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-m", "conflict resolution"]);
+        g(&root, &["checkout", "main"]);
+
+        sync_open_pr_branches(&store, &gid);
+
+        // Push refused (would clobber the reviewer's commit) -- last_pushed_sha
+        // and the remote branch are both left untouched.
+        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_ne!(
+            pr.last_pushed_sha.as_deref(),
+            Some(g(&root, &["rev-parse", "review-branch"]).trim())
+        );
+        let remote_sha_after = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+        assert_eq!(remote_sha_after, remote_sha_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&clone_dir);
     }
 
     #[test]

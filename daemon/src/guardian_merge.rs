@@ -249,6 +249,10 @@ pub(crate) fn push_feedback_branch(
 /// superset), is safe and returns `Ok(())`. Only needed ahead of a
 /// force-push — a plain push is already safely rejected by git itself on
 /// divergence.
+///
+/// A restack rewrites every SHA it replays, so a remote holding nothing but
+/// the pre-restack spelling of `local_branch`'s own commits is un-ancestored
+/// yet carries no work to lose; the patch-id fallback recognizes that case.
 fn guard_against_clobber(
     wt: &Workspace,
     remote: &str,
@@ -267,6 +271,14 @@ fn guard_against_clobber(
         .is_ok()
     {
         return Ok(());
+    }
+    // `+`-prefixed lines are remote commits with no patch-equivalent in
+    // `local_branch`; none means the remote is a replayed ancestor in all but
+    // SHA. See `pr::guard_against_clobber` for the same check.
+    if let Ok(cherry) = wt.git(&["cherry", local_branch, remote_sha]) {
+        if !cherry.lines().any(|l| l.starts_with('+')) {
+            return Ok(());
+        }
     }
     Err(format!(
         "remote branch '{remote_branch}' has commits not present in the review \
@@ -5300,6 +5312,15 @@ pub fn review_maintenance(
             if !rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem, &token) {
                 rebase_on_manual_push(&store, runner.as_ref(), &id, &sem);
             }
+            // RAL-285: a restack rebuilds branch worktree tips in place but
+            // never touches the remote branches already-open PRs track, so an
+            // open PR goes stale the moment its review is rebuilt. The restacks
+            // above are only two of the paths that do this -- an explicit
+            // merge, a restart-merge and a feedback run all settle a review the
+            // same way -- so rather than notify from each, reconcile every
+            // settled review here on the sweep that already visits it. Skips
+            // out before any network call when nothing drifted.
+            crate::pr::sync_open_pr_branches(&store, &id);
             cancellations.remove(&format!("guardian:{id}"));
         });
     }

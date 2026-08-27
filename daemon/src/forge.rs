@@ -488,6 +488,58 @@ impl ForgeClient {
         Ok(())
     }
 
+    /// Remove every unmerged PR from a registered GitHub stack
+    /// (`POST /repos/{owner}/{repo}/stacks/{stack_number}/unstack`), which
+    /// dissolves the stack once nothing is left in it. The PRs themselves are
+    /// untouched — they keep their numbers, comments and base refs, and only
+    /// stop being displayed as a linked stack.
+    ///
+    /// GitHub refuses to change the base ref of a PR while it belongs to a
+    /// stack, so repointing a stack at a different base branch means dissolving
+    /// it, moving the bases, and registering it again with [`create_stack`] —
+    /// see [`crate::pr::resync_pr_bases`]. GitLab has no equivalent concept:
+    /// returns `Ok(())` as a documented no-op rather than an error. Logs the
+    /// outbound call (start/done/error) via `rlog!`.
+    pub fn unstack(&self, stack_number: i64) -> Result<(), String> {
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] unstack start kind={} repo={} stack={stack_number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.unstack_inner(stack_number);
+        match &result {
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] unstack done kind={} repo={} stack={stack_number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] unstack failed kind={} repo={} stack={stack_number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn unstack_inner(&self, stack_number: i64) -> Result<(), String> {
+        let token = self.require_token()?;
+        let url = format!(
+            "{}/repos/{}/stacks/{stack_number}/unstack",
+            self.api_base, self.repo_path
+        );
+        send(
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            &serde_json::json!({}),
+        )?;
+        Ok(())
+    }
+
     /// List human-authored comments on a PR/MR, oldest first. GitLab's
     /// system-generated notes (label changes, etc.) are filtered out since
     /// they are never actionable feedback. Logs the outbound call
@@ -1186,5 +1238,91 @@ mod tests {
             None,
         );
         assert!(client.add_to_stack(1, &[2]).is_ok());
+    }
+
+    #[test]
+    fn unstack_posts_to_the_stacks_unstack_endpoint() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42/unstack");
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.unstack(42).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn unstack_is_a_no_op_for_gitlab() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.com/api/v4".to_string(),
+            "group%2Fproj".to_string(),
+            None,
+        );
+        assert!(client.unstack(1).is_ok());
+    }
+
+    /// GitLab has no native stacked-MR grouping, so moving a merge request's
+    /// target branch needs none of the dissolve/re-register dance GitHub's
+    /// stack restriction forces (see `crate::pr::repoint_stacked_prs`). The MR
+    /// keeps its iid because the base move is a plain field update.
+    ///
+    /// Asserted as traffic rather than return values: the stack calls must not
+    /// merely succeed, they must never reach the forge at all.
+    #[test]
+    fn gitlab_moves_a_base_without_ever_calling_a_stack_endpoint() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let caller = std::thread::spawn(move || {
+            let base = client.update_pull_request_base(7, "new-target");
+            // Everything the GitHub recovery path would issue.
+            let unstacked = client.unstack(42);
+            let created = client.create_stack(&[7, 8]);
+            let added = client.add_to_stack(42, &[9]);
+            (base, unstacked, created, added)
+        });
+
+        let mut req = server
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .expect("the base move should reach the forge");
+        assert_eq!(req.method(), &tiny_http::Method::Put);
+        assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/7");
+        let mut body = String::new();
+        req.as_reader().read_to_string(&mut body).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["target_branch"], "new-target");
+        req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+            .unwrap();
+
+        let (base, unstacked, created, added) = caller.join().unwrap();
+        base.unwrap();
+        unstacked.unwrap();
+        assert_eq!(created.unwrap(), None, "no stack is registered on GitLab");
+        added.unwrap();
+
+        assert!(
+            server
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .unwrap()
+                .is_none(),
+            "no stack endpoint may be called on GitLab"
+        );
     }
 }

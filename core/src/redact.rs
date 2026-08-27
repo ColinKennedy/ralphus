@@ -22,6 +22,16 @@ use std::borrow::Cow;
 /// The literal inserted where a secret value was masked.
 pub const REDACTED: &str = "[REDACTED]";
 
+/// The literal `ralphus-daemon`'s exact-value secret registry (RAL-264,
+/// `daemon::redact::REDACTED`) inserts where a *registered* secret value was
+/// masked. Duplicated here rather than imported — `ralphus-core` has no
+/// dependency on the daemon — so an assignment value that the registry has
+/// already scrubbed is recognized and left alone instead of being re-masked
+/// with [`REDACTED`], which would destroy the more specific registry
+/// placeholder for no security benefit (the value is already gone either
+/// way).
+const ALREADY_REDACTED_BY_REGISTRY: &str = "<redacted>";
+
 /// Env-var *name* substrings that mark a variable as a credential, matched
 /// case-insensitively against an uppercased key. `_KEY` (not bare `KEY`) is
 /// used so e.g. `ANTHROPIC_API_KEY` matches while a name like `MONKEY`
@@ -208,6 +218,9 @@ fn redact_assignment_value(
             p += 1;
         }
         let p = value_end?;
+        if &text[v + 1..p] == ALREADY_REDACTED_BY_REGISTRY {
+            return None;
+        }
         out.push_str(&text[id_start..=v]); // includes the opening quote
         out.push_str(REDACTED);
         out.push('\'');
@@ -224,6 +237,9 @@ fn redact_assignment_value(
             && b[p] != b'\r'
         {
             p += 1;
+        }
+        if &text[v..p] == ALREADY_REDACTED_BY_REGISTRY {
+            return None;
         }
         out.push_str(&text[id_start..v]);
         out.push_str(REDACTED);
@@ -354,6 +370,16 @@ mod tests {
     fn returns_borrowed_when_nothing_to_redact() {
         let text = "ordinary agent output with no secrets here";
         assert!(matches!(redact_secrets(text), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn leaves_a_value_already_redacted_by_the_registry_alone() {
+        // RAL-264's registry scrub runs first and replaces a registered
+        // secret's value with `<redacted>`; this pattern-based pass must not
+        // then clobber that placeholder with its own `[REDACTED]`.
+        let line = "$env:ANTHROPIC_AUTH_TOKEN = '<redacted>'; & 'x'";
+        let out = redact_secrets(line);
+        assert_eq!(out, line, "already-redacted value must be left alone");
     }
 
     #[test]

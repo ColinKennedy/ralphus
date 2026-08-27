@@ -27,6 +27,10 @@ pub struct DaemonConfig {
     pub log_path: Option<String>,
     pub log_level: Option<String>,
     pub keep_temporary_files: bool,
+    /// The daemon's global concurrency cap. `None` means unset (the daemon
+    /// falls back to its own default); `Some(0)` means "no limit". Negative
+    /// values are invalid -- `ralphus check health` warns about them.
+    pub max_concurrent: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,10 +161,23 @@ fn validate_raw(raw: &toml::Table) -> Vec<String> {
                 type_name(daemon_raw)
             )),
             Some(table) => {
-                const KNOWN_DAEMON: [&str; 3] = ["log_path", "log_level", "keep_temporary_files"];
+                const KNOWN_DAEMON: [&str; 4] = [
+                    "log_path",
+                    "log_level",
+                    "keep_temporary_files",
+                    "max_concurrent",
+                ];
                 for k in table.keys() {
                     if !KNOWN_DAEMON.contains(&k.as_str()) {
                         issues.push(format!("key \"daemon.{k}\" is unknown"));
+                    }
+                }
+                if let Some(mc) = table.get("max_concurrent") {
+                    if mc.as_integer().is_none() {
+                        issues.push(format!(
+                            "key \"daemon.max_concurrent\" expects \"integer\" but got a \"{}\" type",
+                            type_name(mc)
+                        ));
                     }
                 }
                 if let Some(lp) = table.get("log_path") {
@@ -389,6 +406,10 @@ fn apply_daemon(base: &DaemonConfig, raw: &toml::Table) -> DaemonConfig {
             .get("keep_temporary_files")
             .and_then(toml::Value::as_bool)
             .unwrap_or(base.keep_temporary_files),
+        max_concurrent: section
+            .get("max_concurrent")
+            .and_then(toml::Value::as_integer)
+            .or(base.max_concurrent),
     }
 }
 
@@ -456,6 +477,7 @@ fn load_config_with(
         ("daemon.log_path", None),
         ("daemon.log_level", None),
         ("daemon.keep_temporary_files", None),
+        ("daemon.max_concurrent", None),
     ];
 
     for (path, label) in get_candidates(cwd, include_local, configuration_path_env) {
@@ -481,6 +503,9 @@ fn load_config_with(
         }
         if new_daemon.keep_temporary_files != daemon.keep_temporary_files {
             set_provenance(&mut provenance, "daemon.keep_temporary_files", &path);
+        }
+        if new_daemon.max_concurrent != daemon.max_concurrent {
+            set_provenance(&mut provenance, "daemon.max_concurrent", &path);
         }
         daemon = new_daemon;
 
@@ -623,11 +648,35 @@ BAD = 5
     }
 
     #[test]
+    fn validate_raw_flags_non_integer_max_concurrent() {
+        let raw: toml::Table = "[daemon]\nmax_concurrent = \"nope\"\n".parse().unwrap();
+        let issues = validate_raw(&raw);
+        assert!(
+            issues.iter().any(|i| i.contains("daemon.max_concurrent")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_raw_accepts_zero_max_concurrent() {
+        let raw: toml::Table = "[daemon]\nmax_concurrent = 0\n".parse().unwrap();
+        assert!(validate_raw(&raw).is_empty());
+    }
+
+    #[test]
+    fn apply_daemon_parses_max_concurrent() {
+        let base = DaemonConfig::default();
+        let raw: toml::Table = "[daemon]\nmax_concurrent = 24\n".parse().unwrap();
+        assert_eq!(apply_daemon(&base, &raw).max_concurrent, Some(24));
+    }
+
+    #[test]
     fn apply_daemon_only_overrides_present_fields() {
         let base = DaemonConfig {
             log_path: Some("old.log".to_string()),
             log_level: None,
             keep_temporary_files: false,
+            max_concurrent: None,
         };
         let raw: toml::Table = "[daemon]\nlog_level = \"debug\"\n".parse().unwrap();
         let merged = apply_daemon(&base, &raw);

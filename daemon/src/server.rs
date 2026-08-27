@@ -39,6 +39,7 @@ pub struct Daemon {
     procs: ProcRegistry,
     /// Global concurrency semaphore shared by the scheduler, task-level proofs,
     /// and guardian review merges so all three count against `max_concurrent`.
+    /// `max_concurrent == 0` means no limit (see `Semaphore::new`).
     sem: Arc<Semaphore>,
     /// RAL-121: priority queue of guardians awaiting a preliminary (git-log)
     /// change-summary recompute. Its background worker threads are spawned in
@@ -897,7 +898,7 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
     // a permit is held for a cell/proof/review-merge's entire time in
     // flight, which outlasts the windows where any single row actually reads
     // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
-    let running = daemon.sem.in_use(daemon.max_concurrent);
+    let running = daemon.sem.in_use();
     let running_reviews: Vec<RunningReviewItem> = store
         .merging_guardians()
         .unwrap_or_default()
@@ -6328,7 +6329,14 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // writes above have already succeeded and must not be undone by a
     // restart hiccup, so a failure here is logged, not surfaced to the caller.
     let status = store.get_guardian(id).map(|g| g.status).ok();
+    let base_changed = req.base_branch.as_deref().is_some_and(|s| !s.is_empty());
     drop(store);
+    // RAL-285: the lowest stacked PR targets the review's base branch by name,
+    // so moving the base leaves that PR pointed at the old branch until the
+    // bases are recomputed.
+    if base_changed {
+        crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
+    }
     if status.as_deref() == Some("merging") {
         let runner = guardian_agent_runner(daemon);
         let restarted = crate::guardian_merge::restart_guardian_merge(
@@ -7136,6 +7144,9 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let has_branches = !guardian.branches.is_empty();
     let was_merging = guardian.status == "merging";
     drop(store);
+    // RAL-285: see `guardian_settings` -- the lowest stacked PR names the base
+    // branch directly and has to follow it here too.
+    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
     let updated_guardian = match daemon.lock().get_guardian(id) {
         Ok(g) => g,
         Err(e) => return store_error(&e),
@@ -8485,6 +8496,15 @@ mod tests {
         let got = route(&d, "GET", "/api/squads/squad-000000000001", "");
         assert_eq!(got.status, 200);
         assert!(got.body.contains("\"name\":\"t\""));
+    }
+
+    #[test]
+    fn board_reports_zero_max_concurrent_as_no_limit() {
+        let d = Daemon::new(Store::open_in_memory().unwrap(), 0);
+        let board = route(&d, "GET", "/api/tasks", "");
+        assert_eq!(board.status, 200);
+        assert!(board.body.contains("\"max_concurrent\":0"));
+        assert!(board.body.contains("\"running\":0"));
     }
 
     // ── Project registry (RAL-100) ───────────────────────────────────────────

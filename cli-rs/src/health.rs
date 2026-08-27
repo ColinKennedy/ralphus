@@ -351,6 +351,56 @@ fn check_config(cwd: &Path) -> CheckResult {
     )
 }
 
+/// Validates `.ralphus.toml`'s `[daemon] max_concurrent`. Mirrors
+/// `check_config`'s `0 = unbounded` framing above, but with the opposite
+/// polarity for negatives: a negative `max_concurrent` never reaches the
+/// daemon's scheduler as-is (`DaemonConfig::max_concurrent` silently falls
+/// back to `ralphus_daemon::DEFAULT_MAX_CONCURRENT` per that file's
+/// "malformed config never blocks" rule), so this is a `warn`, not a `fail`
+/// -- it just tells the user their value was ignored and what took its place.
+fn check_max_concurrent(cwd: &Path) -> CheckResult {
+    let config = crate::config::load_config(cwd, true);
+    let Some(mc) = config.daemon.max_concurrent else {
+        return CheckResult::new(
+            "daemon-max-concurrent",
+            PASS,
+            format!(
+                "daemon.max_concurrent unset; using default {}",
+                ralphus_daemon::DEFAULT_MAX_CONCURRENT
+            ),
+        );
+    };
+    let src = config
+        .sources
+        .last()
+        .map(|p| format!(" (from {})", p.display()))
+        .unwrap_or_default();
+    if mc < 0 {
+        return CheckResult::new(
+            "daemon-max-concurrent",
+            WARN,
+            format!(
+                "daemon.max_concurrent is {mc}{src}; must be >= 0 (0 = no limit, positive = concurrency cap) -- falling back to default {}",
+                ralphus_daemon::DEFAULT_MAX_CONCURRENT
+            ),
+        );
+    }
+    if mc == 0 {
+        return CheckResult::new(
+            "daemon-max-concurrent",
+            WARN,
+            format!(
+                "daemon.max_concurrent is 0{src} (no limit); every ready cell may run at once, which can overwhelm the machine"
+            ),
+        );
+    }
+    CheckResult::new(
+        "daemon-max-concurrent",
+        PASS,
+        format!("daemon.max_concurrent={mc}{src}"),
+    )
+}
+
 /// Validates `.ralphus.toml`'s `[forge] pull_request_branch_convention`
 /// (RAL-244) for `cwd`, reusing the daemon's own layered resolution
 /// (`ralphus_daemon::config::resolve_forge` -- global config under the
@@ -490,6 +540,7 @@ pub fn run_checks(daemon_url: &str, cwd: &Path, enable_developer_checks: bool) -
     results.push(check_ollama());
     results.push(check_nvidia_smi());
     results.push(check_config(cwd));
+    results.push(check_max_concurrent(cwd));
     results.push(check_pull_request_branch_convention(cwd));
     results.extend(check_agent_profiles(daemon_url, cwd));
     results.push(check_default_resolver_agent(daemon_url, cwd));
