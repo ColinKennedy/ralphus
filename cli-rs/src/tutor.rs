@@ -117,7 +117,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         cwd with no "?upstream=" at all fails validation,
                                         so always include a suffix (sentinel or name). This
                                         value is what `derive_reviews` uses to find a
-                                        review's base and what drives resync-on-reuse (fetch
+                                        review's upstream branch and what drives resync-on-reuse (fetch
                                         + rebase) for a remote-tracking branch -- it is a
                                         DIFFERENT thing from the cell's own `upstream` field
                                         below (that one rebases this cell's branch onto
@@ -126,7 +126,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         both.
                                         Examples:
                                           cwd = "ralphus:new-worktree/RAL-123-fix?upstream=<<default>>"
-                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=main>>"
+                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=beta>>"
                                           cwd = "<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>"
                                         ALTERNATIVE: an absolute path to an
                                         already-built git WORKTREE, if you built it
@@ -246,10 +246,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  `review = "<<review:<id>>>"` in their [[task.cell]] block. Branch
  order follows the task/cell dependency order.
 
- The review's base branch is always resolved from the worktree's
- upstream tracking branch at submit time (a hard error if the
- branch has no upstream). Set the upstream with:
+ The review's upstream branch is normally resolved from the
+ worktree's git upstream tracking branch at submit time (a hard
+ error if the branch has no upstream and none is declared below).
+ Set the tracking upstream with:
    git branch --set-upstream-to=main <your-branch>
+ -- or declare it explicitly with `upstream = "main"` on the
+ review, which also overrides inference when both are present.
 
  Two ways branches fold into a review:
    * By PROJECT (default): cells with a plain `id` are grouped
@@ -296,6 +299,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  model  string  Model the resolver `agent` runs, e.g. "qwen3:8b".
                 Unset falls back to RALPHUS_RESOLVER_MODEL, then
                 "qwen3:8b" for the ollama backend.
+ upstream
+        string  The branch this review's stack rebases onto.
+                Optional for an all-local review (inferred from
+                each contributing worktree's git upstream), but
+                REQUIRED when any contributing cell runs on a
+                remote machine, since that worktree's git upstream
+                cannot be read from here.
 
  [[review.action]]  (zero or more per [[review]])
  User-declared labelled buttons shown in the review pane.
@@ -377,7 +387,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
    project = "my-project"          # REQUIRED: must match a registered name
 
      [[task.cell]]
-     cwd    = "<<ralphus:new-worktree/RAL-123-add_feature?upstream=main>>"
+     cwd    = "<<ralphus:new-worktree/RAL-123-add_feature?upstream=origin/main>>"
      prompt = "..."
 
  The daemon resolves "my-project" (the task's `project` field) against its
@@ -403,7 +413,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  ralphus resolves "<<default>>" to the project's default branch at run time.
  The alternative sentinel, "?upstream=<<current_branch>>", tracks whatever
  branch the project currently has checked out -- use it with care, since that
- can silently change between runs. Give a literal name ("?upstream=main", or
+ can silently change between runs. Give a literal name ("?upstream=beta", or
  a remote-qualified "?upstream=origin/<branch>") only when <branch> should
  track something other than the default -- e.g. a remote branch you want it
  to resync with. A placeholder cwd with no "?upstream=" at all fails
@@ -454,7 +464,7 @@ Guardian exists to surface, and is almost never what you want.
       [[task.cell]]
       id                     = "work"
       agent                  = "{<insert recommended agent here>}"  # see "Agent selection" above
-      cwd                    = "<<ralphus:new-worktree/RAL-X?upstream=main>>"
+      cwd                    = "<<ralphus:new-worktree/RAL-X?upstream=DEV-1234-add_payment_system>>"
       system_prompt          = "Do NOT commit and do NOT push under any circumstances."
       system_prompt_position = "append"
       prompt                 = "{<ticket text>}"
@@ -547,7 +557,7 @@ name    = "check"
 project = "my-project"
 
   [[task.cell]]
-  cwd     = "<<ralphus:new-worktree/check?upstream=main>>"
+  cwd     = "<<ralphus:new-worktree/check?upstream=beta>>"
   agent   = "{<...put your recommended agent here>}"
   model   = "qwen3:8b"
   command = "cargo test"          # command ignores agent/model anyway
@@ -560,7 +570,7 @@ project = "my-project"
 
   [[task.cell]]
   id     = "init"
-  cwd    = "<<ralphus:new-worktree/feature-a?upstream=main>>"
+  cwd    = "<<ralphus:new-worktree/feature-a?upstream=origin/main>>"
   prompt = "Create data.json with {\"version\": 1}."
   review = "<<review:backend>>"   # opt this worktree branch into the review
 
@@ -573,7 +583,7 @@ project    = "my-project"
 depends_on = ["setup"]            # waits for all of setup's cells + proof steps
 
   [[task.cell]]
-  cwd      = "<<ralphus:new-worktree/feature-b?upstream=main>>"
+  cwd      = "<<ralphus:new-worktree/feature-b?upstream=release/1.2>>"
   upstream = "<<task:setup>>"     # rebase feature-b onto setup's branch tip first
   prompt   = "Using {handoff:setup}, write a summary to report.md."
   review   = "<<review:backend>>"
@@ -581,20 +591,24 @@ depends_on = ["setup"]            # waits for all of setup's cells + proof steps
     [[task.cell.proof]]
     command = "test -f report.md"
 
-# Top-level review declaration (base is always the worktree's upstream tracking branch).
+# Top-level review declaration (upstream is normally inferred from the
+# worktree's git upstream tracking branch; declared explicitly here).
 [[review]]
-id = "backend"
+id       = "backend"
+upstream = "foo"
 
 -- 4. Recommended per-branch shape (agent proof + finalize) --
 
 # One shared review for the whole batch. `agent` here is the CONFLICT-RESOLVER
 # backend (see the [[review]] table above), a separate decision from the
 # cell `agent` below -- pick both deliberately, per submission.
-# The base branch is always resolved from each worktree's upstream tracking branch.
+# The upstream branch is normally resolved from each worktree's git upstream
+# tracking branch; declared explicitly here.
 [[review]]
-id    = "ralphus:new-review/ral-batch"
-name  = "RAL batch"
-agent = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
+id       = "ralphus:new-review/ral-batch"
+name     = "RAL batch"
+upstream = "foo"
+agent    = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
 
 # Optional: user-declared test buttons shown in the review pane.
 [[review.action]]
@@ -615,7 +629,7 @@ project = "my-project"            # both cells' worktree materializes under this
   [[task.cell]]
   id                     = "work"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
-  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=main>>"
+  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=staging>>"
   review                 = "<<ralphus:new-review/ral-batch>>"
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
   system_prompt_position = "append"
@@ -636,20 +650,19 @@ project = "my-project"            # both cells' worktree materializes under this
     system_prompt          = "Do NOT commit and do NOT push under any circumstances."
     system_prompt_position = "append"
 
-  # finalize: AI stages only source files and commits (depends on work).
+  # finalize: AI stages the relevant source files, commits, and pushes (depends on work).
   # Same placeholder string as "work" -- the daemon materializes it once and
-  # reuses the identical worktree for both cells. system_prompt keeps it
-  # to exactly commit + push -- no re-running formatters/linters/tests that
-  # proof already handled.
+  # reuses the identical worktree for both cells. system_prompt limits the
+  # cell to those git actions after proof has completed.
   [[task.cell]]
   id                     = "finalize"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
-  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=main>>"
+  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=staging>>"
   depends_on             = ["work"]
-  system_prompt          = "Do NOT run formatters, linters, or tests. Just stage, commit, and push."
+  system_prompt          = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists."
   system_prompt_position = "append"
-  prompt                 = """Stage only source changes (no build/temp files), commit, \
-                             push if a remote exists."""
+  prompt                 = """ONLY git stage the relevant source files, commit them, and \
+                             push the commit if a remote exists."""
 
 # A second ticket that stacks on ral-2. `upstream` rebases RAL-3's
 # worktree branch onto ral-2's finalized tip before the agent starts.
@@ -661,7 +674,7 @@ depends_on = ["ral-2"]
   [[task.cell]]
   id                     = "work"
   agent                  = "claude-code"  # required for system_prompt (see field reference above)
-  cwd                    = "<<ralphus:new-worktree/ral-3?upstream=main>>"
+  cwd                    = "<<ralphus:new-worktree/ral-3?upstream=origin/main>>"
   upstream               = "<<task:ral-2>>"
   review                 = "<<ralphus:new-review/ral-batch>>"  # same key folds into same review
   system_prompt          = "Do NOT commit and do NOT push under any circumstances."
@@ -695,10 +708,24 @@ Unless the user explicitly asks for a different split, recommend the
 former shape: one submit call, one Guardian review.
 "#;
 
-/// Returns the Task TOML tutorial text.
+/// Returns the Task TOML tutorial text with CLI examples using the running
+/// executable's name. Every replacement includes a command-name separator,
+/// so the `ralphus:` Task-TOML protocol markers are intentionally ineligible.
 #[must_use]
-pub fn task_tutor() -> &'static str {
-    TASK_TUTOR
+pub fn task_tutor() -> String {
+    let program = crate::program_name::resolve_program_name();
+    [
+        "ralphus validate",
+        "ralphus project",
+        "ralphus task",
+        "ralphus agent",
+        "ralphus submit",
+    ]
+    .into_iter()
+    .fold(
+        TASK_TUTOR.replace("ralphus  Task TOML", &format!("{program}  Task TOML")),
+        |text, invocation| text.replace(invocation, &format!("{program}{}", &invocation[7..])),
+    )
 }
 
 #[cfg(test)]
@@ -714,8 +741,10 @@ mod tests {
     }
 
     #[test]
-    fn task_tutor_returns_the_constant() {
-        assert_eq!(task_tutor(), TASK_TUTOR);
+    fn task_tutor_preserves_protocol_markers() {
+        let text = task_tutor();
+        assert!(text.contains("<<ralphus:new-worktree/hello?upstream=main>>"));
+        assert!(text.contains("ralphus:new-review/<key>"));
     }
 
     #[test]
@@ -748,6 +777,24 @@ mod tests {
                     && line.contains('"')
                     && !line.contains("<<")),
             "cell 'review' examples must teach the wrapped <<...>> sentinel syntax (RAL-269)"
+        );
+    }
+
+    #[test]
+    fn finalize_prompt_and_system_prompt_use_affirmative_only_phrasing() {
+        assert!(TASK_TUTOR.contains(
+            "system_prompt          = \"ONLY git stage the relevant source files, commit them, \
+             and push the commit if a remote exists.\""
+        ));
+        assert!(TASK_TUTOR.contains(
+            "prompt                 = \"\"\"ONLY git stage the relevant source files, commit them, and \\"
+        ));
+        assert!(TASK_TUTOR.contains("push the commit if a remote exists.\"\"\""));
+        assert!(
+            !TASK_TUTOR.contains(
+                "Do NOT run formatters, linters, or tests. Just stage, commit, and push."
+            ),
+            "finalize's old negative-phrased system_prompt must be fully replaced"
         );
     }
 

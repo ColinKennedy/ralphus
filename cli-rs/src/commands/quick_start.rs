@@ -185,20 +185,30 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
     match cmd {
         QuickStartCommand::Help => {
             println!(
-                "ralphus quick-start <manager|reviewer|watcher> <claude-code|codex|pi> [--command CMD] [--shell SHELL] [--read-only] [-- ARGS...]"
+                "{} quick-start <manager|reviewer|watcher> <claude-code|codex|pi> [--command CMD] [--shell SHELL] [--read-only] [-- ARGS...]",
+                crate::program_name::resolve_program_name()
             );
             0
         }
         QuickStartCommand::ManagerHelp => {
-            println!("ralphus quick-start manager <claude-code|codex|pi>");
+            println!(
+                "{} quick-start manager <claude-code|codex|pi>",
+                crate::program_name::resolve_program_name()
+            );
             0
         }
         QuickStartCommand::ReviewerHelp => {
-            println!("ralphus quick-start reviewer <claude-code|codex|pi> [target]");
+            println!(
+                "{} quick-start reviewer <claude-code|codex|pi> [target]",
+                crate::program_name::resolve_program_name()
+            );
             0
         }
         QuickStartCommand::WatcherHelp => {
-            println!("ralphus quick-start watcher <claude-code|codex|pi>");
+            println!(
+                "{} quick-start watcher <claude-code|codex|pi>",
+                crate::program_name::resolve_program_name()
+            );
             0
         }
         QuickStartCommand::UsageError(m) => {
@@ -291,7 +301,10 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
 fn ensure_watcher_registered(opts: &GlobalOpts) -> Option<()> {
     match crate::commands::mailbox::ensure_client_id(&opts.client()) {
         Ok(client_id) => {
-            eprintln!("ralphus [runner] quick-start-watcher mailbox client_id={client_id}");
+            eprintln!(
+                "{} [runner] quick-start-watcher mailbox client_id={client_id}",
+                crate::program_name::resolve_program_name()
+            );
             Some(())
         }
         Err(e) => {
@@ -312,7 +325,7 @@ fn read_only_session_note(mechanism: ReadOnlyMechanism) -> String {
         ),
         ReadOnlyMechanism::InstructionOnly(note) => note.to_string(),
     };
-    format!(
+    crate::program_name::substitute_backticked_invocations(&format!(
         "READ-ONLY MODE: this session was launched with `--read-only`. You can freely read and \
          look at anything -- browse and read files, and call any `ralphus` subcommand tagged \
          `(read-only-safe)` in the help-map below (see also its own `READ_ONLY_NOTE`) to inspect \
@@ -321,7 +334,21 @@ fn read_only_session_note(mechanism: ReadOnlyMechanism) -> String {
          changes state, and no invoking a mutating `ralphus` subcommand (submit, review \
          create/merge/approve/feedback/..., run/task/session/verify set-status/restart/edit/..., \
          clear, machine register/remove, project git, initialize git, etc.). {tail}"
-    )
+    ))
+}
+
+/// The command-surface tree to append to a quick-start system prompt: the
+/// full tree normally, or -- under `--read-only` -- the pruned tree
+/// containing only `(read-only-safe)` commands (see
+/// `help_map::generate_read_only_safe`), so a read-only session can't even
+/// discover a mutating command's exact flags, let alone be tempted to call
+/// one.
+fn help_map_tree(read_only: bool) -> String {
+    if read_only {
+        crate::help_map::generate_read_only_safe()
+    } else {
+        crate::help_map::generate()
+    }
 }
 
 fn manager_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMechanism) -> String {
@@ -330,25 +357,33 @@ fn manager_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMec
     } else {
         String::new()
     };
-    format!(
+    crate::program_name::substitute_backticked_invocations(&format!(
         "You are Ralphus. You orchestrate the `ralphus` CLI as an autonomous agent. Its complete \
          command surface -- every subcommand, flag, and expected value type -- is documented \
-         below. Use `ralphus <command> --help` for details on any specific command.\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}{}\n\n{}",
+         below. Use `ralphus <command> --help` for details on any specific command.\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}{}\n\n{}",
         crate::help_map::SUBAGENT_NOTE,
         crate::help_map::READ_ONLY_NOTE,
         crate::help_map::PROJECT_LOOKUP_NOTE,
         crate::help_map::SUBMIT_VALIDATE_NOTE,
         crate::help_map::SUBMIT_REVIEW_NOTE,
+        crate::help_map::SUBMIT_RETRY_NOTE,
         crate::help_map::JSON_NOTE,
         read_only_block,
-        crate::help_map::generate(),
-    )
+        help_map_tree(read_only),
+    ))
 }
 
 /// Shared framing for both reviewer quick-start harnesses: the agent
 /// operates an *existing* review through the CLI's own `review ...` surface,
 /// not a fresh ralphus orchestration session.
-const REVIEWER_ROLE_NOTE: &str = "You are Ralphus operating in REVIEWER mode. You are not orchestrating new ralphus tasks -- you are acting as a human reviewer would inside the ralphus Guardian review board (the web board's Reviews tab), but through the `ralphus review ...` CLI surface instead of a browser. A review (also called a 'guardian') is a stack of one or more branches being rebased onto a base branch, with per-branch and combined feedback, checks, and merge control.\n\nReview operations you should be ready to perform on request, all via `ralphus review ...` (run `ralphus review --help` / `ralphus review <sub> --help` for exact flags):\n  - `review show <selector>` / `review status <selector>` / `review logs <selector>` -- inspect a review's current state and audit trail.\n  - `review feedback <guardian#branch> \"...\"` -- feedback on one branch, triggering a resolver re-attempt.\n  - `review chat send <selector> \"...\"` / `review chat show <selector>` -- combined/global review feedback thread (not tied to one branch).\n  - `review merge <selector>` / `review restart-merge <selector>` -- start or restart the stacked rebase.\n  - `review branch enable <guardian#branch>` / `review branch disable <guardian#branch>` -- enable/disable one branch in the stack.\n  - `review base list <selector>` / `review base set <selector> <branch>` -- inspect/change the base branch.\n  - `review checks list <selector>` / `review checks run <selector> [--index N | --all]` -- the review's manual (lint/format/test) checks; `checks run` PRINTS the command(s) + cwd rather than silently executing writes on your behalf.\n  - `review action list <selector>` / `review action run <selector> --index N` -- user-declared `[[review.action]]` test/action hints, same print-don't-run shape as checks.\n  - `review worktrees <selector>` -- the branches/worktrees a review consumes.\n  - `review list` -- list all reviews; use this (or a fresh `review show <selector>`) to switch to a different review at any point in this conversation -- you do not need to be relaunched to change which review you're operating on.\n\nRemote-state caution: do not assume the review's code lives on this machine. The daemon (reachable via --daemon-url, defaulting to local) is the authoritative source of truth for review state -- the worktree paths `review worktrees` reports may live on a different host than this one. Prefer the CLI's own `--json` views and the printed check/action commands over assuming a local git checkout. Only run a shell command directly against review code if you have independently confirmed the relevant path exists in your own local filesystem, and even then keep any such command read-only (inspection, never mutation).\n\nWrite boundary: every review mutation (feedback, merge/restart-merge, branch enable/disable, base-branch change, settings) must go through an explicit `ralphus review ...` subcommand. Never edit, commit, or push directly inside an inspected worktree -- that bypasses the review's own gating and audit trail.";
+///
+/// The CRITICAL paragraph exists because prior sessions have repeatedly
+/// edited files directly inside a review worktree instead of sending
+/// `review feedback` -- the worktree being visible/writable on this machine
+/// makes that mistake easy to reach for, so the rule is stated once up
+/// front, in imperative terms, before the command list, rather than buried
+/// in a "write boundary" aside at the end.
+const REVIEWER_ROLE_NOTE: &str = "You are Ralphus operating in REVIEWER mode: acting as a human reviewer would inside the ralphus Guardian review board (the web board's Reviews tab), through the `ralphus review ...` CLI surface. A review (\"guardian\") is a stack of branches rebased onto a base branch, with per-branch feedback, checks, and merge control.\n\nCRITICAL -- you never edit, commit, or push code yourself, even if a review's worktree is visible and writable on this machine. ANY requested code change (\"fix X\", \"rename Y\", \"add a test for Z\", anything that would alter a branch's contents) must be sent as `ralphus review feedback <guardian#branch> \"<description of the change>\"`. That feedback triggers the review's own automated resolver, which makes the edit and pushes a commit under the review's gating and audit trail. Editing a worktree file directly bypasses that trail and is never correct here, no matter how small the change looks.\n\nCommon operations (run `ralphus review <sub> --help` for exact flags):\n  - `review show <selector>` / `review status <selector>` / `review logs <selector>` -- inspect state and audit trail.\n  - `review feedback <guardian#branch> \"...\"` -- request a code change on one branch (see CRITICAL above).\n  - `review merge <selector>` / `review restart-merge <selector>` -- start or restart the stacked rebase.\n  - `review branch enable <guardian#branch>` / `review branch disable <guardian#branch>` -- toggle a branch in the stack.\n  - `review upstream list <selector>` / `review upstream set <selector> <branch>` -- inspect/change the upstream branch.\n  - `review checks list <selector>` / `review checks run <selector> [--index N | --all]` -- these PRINT a command + cwd for a human to run by hand; printing it is the entire job, never execute it yourself as if it were your own mutation.\n  - `review action list <selector>` / `review action run <selector> --index N` -- user-declared `[[review.action]]` test/action hints, same print-don't-run shape as checks.\n  - `review worktrees <selector>` -- the branches/worktrees a review consumes.\n  - `review list` -- switch which review you're operating on at any point in this conversation; you do not need to be relaunched.\n\nThe daemon (--daemon-url, defaulting to local) is the source of truth for review state, not this machine's filesystem -- a `review worktrees` path may live on a different host than this one. Prefer the CLI's own `--json` views and the printed check/action commands over assuming a local git checkout. Only read a local worktree file after independently confirming it exists on this machine, and never write to it (see CRITICAL above).";
 
 /// Resolves a reviewer quick-start TARGET to a guardian selector: a raw
 /// selector as-is, or (best-effort) the id extracted from a
@@ -379,13 +414,13 @@ fn reviewer_system_prompt_content(
     } else {
         String::new()
     };
-    format!(
+    crate::program_name::substitute_backticked_invocations(&format!(
         "You are Ralphus. The complete `ralphus` CLI command surface -- every subcommand, flag, \
          and expected value type -- is documented below for reference. Use `ralphus <command> \
          --help` for details on any specific command.\n\n{REVIEWER_ROLE_NOTE}{target_note}\n\n{}{read_only_block}\n\n{}",
         crate::help_map::READ_ONLY_NOTE,
-        crate::help_map::generate(),
-    )
+        help_map_tree(read_only),
+    ))
 }
 
 /// RAL-241: framing for the watcher quick-start harness -- a mailbox-polling
@@ -403,13 +438,13 @@ fn watcher_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMec
     } else {
         String::new()
     };
-    format!(
+    crate::program_name::substitute_backticked_invocations(&format!(
         "You are Ralphus. The complete `ralphus` CLI command surface -- every subcommand, flag, \
          and expected value type -- is documented below for reference. Use `ralphus <command> \
          --help` for details on any specific command.\n\n{WATCHER_ROLE_NOTE}\n\n{}{read_only_block}\n\n{}",
         crate::help_map::READ_ONLY_NOTE,
-        crate::help_map::generate(),
-    )
+        help_map_tree(read_only),
+    ))
 }
 
 // ---- system-prompt-file merging ------------------------------------------
@@ -538,7 +573,8 @@ fn launch_claude_with(
         "ralphus+user-file"
     };
     eprintln!(
-        "ralphus [spec] {label} system-prompt case={case} ralphus_len={} combined_len={}",
+        "{} [spec] {label} system-prompt case={case} ralphus_len={} combined_len={}",
+        crate::program_name::resolve_program_name(),
         system_prompt_content.len(),
         file_content.len()
     );
@@ -582,7 +618,8 @@ fn launch_codex_with(
     spawn: impl FnOnce(SpawnKind) -> std::io::Result<i32>,
 ) -> i32 {
     eprintln!(
-        "ralphus [spec] {label} system-prompt len={}",
+        "{} [spec] {label} system-prompt len={}",
+        crate::program_name::resolve_program_name(),
         developer_instructions.len()
     );
     let raw_command = resolve_codex_launch_command(launch);
@@ -622,7 +659,8 @@ fn launch_pi_with(
         return 2;
     }
     eprintln!(
-        "ralphus [spec] {label} system-prompt len={} combined_len={}",
+        "{} [spec] {label} system-prompt len={} combined_len={}",
+        crate::program_name::resolve_program_name(),
         system_prompt_content.len(),
         file_content.len()
     );
@@ -716,7 +754,8 @@ fn run_quick_start_subprocess_with(
     let (spawn_kind, _use_shell, mode) =
         quick_start_spawn_plan(raw_command, extra_args, &target_shell);
     eprintln!(
-        "ralphus [runner] {label} spawning command={raw_command:?} mode={mode} shell={target_shell}"
+        "{} [runner] {label} spawning command={raw_command:?} mode={mode} shell={target_shell}",
+        crate::program_name::resolve_program_name()
     );
 
     if let SpawnKind::Argv(argv) = &spawn_kind {
@@ -730,7 +769,10 @@ fn run_quick_start_subprocess_with(
 
     match spawn(spawn_kind) {
         Ok(code) => {
-            eprintln!("ralphus [runner] {label} exited returncode={code}");
+            eprintln!(
+                "{} [runner] {label} exited returncode={code}",
+                crate::program_name::resolve_program_name()
+            );
             code
         }
         Err(e) => {
@@ -990,9 +1032,15 @@ mod tests {
     #[test]
     fn manager_system_prompt_includes_help_map_and_notes() {
         let content = manager_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
-        assert!(content.contains("You orchestrate the `ralphus` CLI"));
+        let program = crate::program_name::resolve_program_name();
+        assert!(content.contains(&format!("You orchestrate the `{program}` CLI")));
         assert!(content.contains(crate::help_map::SUBAGENT_NOTE));
-        assert!(content.contains("- ralphus "));
+        assert!(
+            content.contains(&crate::program_name::substitute_backticked_invocations(
+                crate::help_map::SUBMIT_RETRY_NOTE
+            ))
+        );
+        assert!(content.contains(&format!("- {program} ")));
         assert!(!content.contains("READ-ONLY MODE"));
         // The tag-explaining note is present regardless of read-only mode.
         assert!(content.contains("(read-only-safe)"));
@@ -1020,7 +1068,10 @@ mod tests {
         let content =
             reviewer_system_prompt_content(Some("guardian-1"), false, CODEX_READ_ONLY_MECHANISM);
         assert!(content.contains("Initial review target for this session: `guardian-1`"));
-        assert!(content.contains("ralphus review show guardian-1"));
+        assert!(content.contains(&format!(
+            "{} review show guardian-1",
+            crate::program_name::resolve_program_name()
+        )));
         assert!(content.contains("REVIEWER mode"));
     }
 
@@ -1042,6 +1093,18 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_system_prompt_read_only_prunes_mutating_commands_from_tree() {
+        let read_only = reviewer_system_prompt_content(None, true, CODEX_READ_ONLY_MECHANISM);
+        let full = reviewer_system_prompt_content(None, false, CODEX_READ_ONLY_MECHANISM);
+        // "submit" (mutating, no read-only-safe descendant) is dropped entirely
+        // once the tree is pruned to read-only-safe commands.
+        assert!(full.contains("- submit file"));
+        assert!(!read_only.contains("- submit file"));
+        // "review show" stays -- it's read-only-safe.
+        assert!(read_only.contains("(read-only-safe) show selector"));
+    }
+
+    #[test]
     fn reviewer_system_prompt_defaults_to_not_read_only() {
         let content = reviewer_system_prompt_content(None, false, CODEX_READ_ONLY_MECHANISM);
         assert!(!content.contains("READ-ONLY MODE"));
@@ -1056,8 +1119,9 @@ mod tests {
         assert!(reviewer_content.contains("REVIEWER mode"));
         assert!(!manager_content.contains("REVIEWER mode"));
         // Both still carry the full help-map for reference.
-        assert!(manager_content.contains("- ralphus "));
-        assert!(reviewer_content.contains("- ralphus "));
+        let root = format!("- {} ", crate::program_name::resolve_program_name());
+        assert!(manager_content.contains(&root));
+        assert!(reviewer_content.contains(&root));
     }
 
     #[test]
@@ -1065,12 +1129,11 @@ mod tests {
         let content = reviewer_system_prompt_content(None, false, CLAUDE_READ_ONLY_MECHANISM);
         for fragment in [
             "review feedback",
-            "review chat send",
             "review merge",
             "review restart-merge",
             "review branch enable",
             "review branch disable",
-            "review base set",
+            "review upstream set",
             "review checks run",
             "review action run",
         ] {
@@ -1081,8 +1144,15 @@ mod tests {
     #[test]
     fn reviewer_system_prompt_includes_remote_and_write_boundary_notes() {
         let content = reviewer_system_prompt_content(None, false, CLAUDE_READ_ONLY_MECHANISM);
-        assert!(content.contains("do not assume the review's code lives on this machine"));
-        assert!(content.contains("must go through an explicit `ralphus review ...` subcommand"));
+        assert!(
+            content
+                .contains("is the source of truth for review state, not this machine's filesystem")
+        );
+        assert!(content.contains("CRITICAL"));
+        assert!(content.contains(&format!(
+            "must be sent as `{} review feedback",
+            crate::program_name::resolve_program_name()
+        )));
     }
 
     #[test]
@@ -1096,11 +1166,12 @@ mod tests {
         let content = watcher_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
         assert!(content.contains("WATCHER mode"));
         assert!(content.contains("MANDATORY"));
-        assert!(content.contains("ralphus mailbox check"));
+        let program = crate::program_name::resolve_program_name();
+        assert!(content.contains(&format!("{program} mailbox check")));
         assert!(content.contains("after every user turn"));
         assert!(!content.contains("READ-ONLY MODE"));
         // Still carries the full help-map for reference, like manager/reviewer.
-        assert!(content.contains("- ralphus "));
+        assert!(content.contains(&format!("- {program} ")));
     }
 
     #[test]
@@ -1289,8 +1360,9 @@ mod tests {
         assert_eq!(argv[0], "my-claude");
         assert!(argv.contains(&"--dangerously-skip-permissions".to_string()));
         let file_content = captured.file_content();
-        assert!(file_content.contains("You orchestrate the `ralphus` CLI"));
-        assert!(file_content.contains("- ralphus "));
+        let program = crate::program_name::resolve_program_name();
+        assert!(file_content.contains(&format!("You orchestrate the `{program}` CLI")));
+        assert!(file_content.contains(&format!("- {program} ")));
     }
 
     #[test]
@@ -1327,9 +1399,10 @@ mod tests {
 
         let argv = captured.argv();
         let file_content = captured.file_content();
-        assert!(file_content.contains("- ralphus "));
+        let root = format!("- {} ", crate::program_name::resolve_program_name());
+        assert!(file_content.contains(&root));
         assert!(file_content.contains("be nice"));
-        assert!(file_content.find("- ralphus ").unwrap() < file_content.find("be nice").unwrap());
+        assert!(file_content.find(&root).unwrap() < file_content.find("be nice").unwrap());
         assert!(file_content.contains("Important ralphus context:"));
         assert!(file_content.contains("Important user context:"));
         // Only ONE --append-system-prompt-file reaches `claude` -- ralphus's
@@ -1431,7 +1504,10 @@ mod tests {
         // subcommand -- but there is no subcommand here (interactive TUI).
         assert_eq!(argv[1], "-c");
         assert!(argv[2].starts_with("developer_instructions="));
-        assert!(argv[2].contains("- ralphus "));
+        assert!(argv[2].contains(&format!(
+            "- {} ",
+            crate::program_name::resolve_program_name()
+        )));
         assert!(!argv.iter().any(|a| a == "exec"));
     }
 
@@ -1522,7 +1598,10 @@ mod tests {
             .expect("flag present");
         let path = std::path::PathBuf::from(&argv[idx + 1]);
         assert!(!path.exists());
-        assert!(captured.file_content().contains("- ralphus "));
+        assert!(captured.file_content().contains(&format!(
+            "- {} ",
+            crate::program_name::resolve_program_name()
+        )));
     }
 
     #[test]

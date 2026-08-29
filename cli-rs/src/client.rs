@@ -943,36 +943,6 @@ impl DaemonClient {
         )
     }
 
-    pub fn guardian_messages(&self, guardian_id: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/guardians/{guardian_id}/messages"))
-    }
-
-    pub fn guardian_chat(
-        &self,
-        guardian_id: &str,
-        text: &str,
-        image: Option<&str>,
-    ) -> Result<Value, DaemonError> {
-        let mut body = json!({"text": text});
-        set_if_some(&mut body, "image", image.map(str::to_string));
-        self.post(&format!("/api/guardians/{guardian_id}/chat"), Some(body))
-    }
-
-    pub fn guardian_chat_fork(
-        &self,
-        guardian_id: &str,
-        seq: i64,
-        text: &str,
-        image: Option<&str>,
-    ) -> Result<Value, DaemonError> {
-        let mut body = json!({"seq": seq, "text": text});
-        set_if_some(&mut body, "image", image.map(str::to_string));
-        self.post(
-            &format!("/api/guardians/{guardian_id}/chat/fork"),
-            Some(body),
-        )
-    }
-
     pub fn guardian_base_branches(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/guardians/{guardian_id}/base-branches"))
     }
@@ -1017,6 +987,10 @@ impl DaemonClient {
 
     pub fn guardian_merge(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/guardians/{guardian_id}/merge"), None)
+    }
+
+    pub fn guardian_sync_github(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/guardians/{guardian_id}/sync-github"), None)
     }
 
     pub fn guardian_cancel_and_merge(&self, guardian_id: &str) -> Result<Value, DaemonError> {

@@ -44,6 +44,7 @@ pub fn run_command_proof_capture(
     let span = crate::otel::start_span("proof.command", parent, SpanKind::Internal);
     span.set_attribute("proof.cwd", cwd.to_string());
     span.set_attribute("proof.command", command.to_string());
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus [proof] command starting cwd={cwd:?} command={command:?}"
@@ -77,6 +78,7 @@ pub fn run_command_proof_capture(
     } else {
         Status::error("proof command failed")
     });
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus [proof] command completed passed={} cwd={cwd:?}",

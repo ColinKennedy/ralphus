@@ -64,6 +64,7 @@ pub fn init(service_name: &'static str) -> Option<SdkTracerProvider> {
         .with_simple_exporter(exporter)
         .build();
     global::set_tracer_provider(provider.clone());
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(INFO, "ralphus [otel] exporting traces to {endpoint}");
     Some(provider)
 }
@@ -73,6 +74,7 @@ pub fn init(service_name: &'static str) -> Option<SdkTracerProvider> {
 pub fn shutdown(provider: Option<SdkTracerProvider>) {
     if let Some(provider) = provider {
         if let Err(e) = provider.shutdown() {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(WARNING, "ralphus [otel] shutdown: {e}");
         }
     }

@@ -92,11 +92,9 @@ where one exists.
 | POST | `/api/guardians/{id}/branches` | Add a branch |
 | POST | `/api/guardians/{id}/branches/reorder` | [Reorder branches](#post-apiguardiansidbranchesreorder) (does **not** rebase) |
 | POST | `/api/guardians/{id}/branches/arrange` | [Reorder + rebase atomically](#post-apiguardiansidbranchesarrange) |
+| POST | `/api/guardians/{id}/sync-github` | [Check the forge for a stack reorder, on demand](#post-apiguardiansidsync-github) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/feedback` | Feedback on one branch → resolver re-attempt |
 | GET | `/api/guardians/{id}/branches/{branch_id}/messages` | [Per-branch feedback thread](#get-apiguardiansidbranchesbranch_idmessages) |
-| GET | `/api/guardians/{id}/messages` | [Global feedback thread](#get-apiguardiansidmessages) |
-| POST | `/api/guardians/{id}/chat` | [Post to the feedback thread](#post-apiguardiansidchat) |
-| POST | `/api/guardians/{id}/chat/fork` | Fork the thread at a message seq |
 | GET | `/api/guardians/{id}/base-branches` | Candidate base branches (same remote) |
 | POST | `/api/guardians/{id}/base` | Change base branch + rebuild |
 | POST | `/api/guardians/{id}/force_start` | Disable not-yet-done branches, merge immediately |
@@ -296,7 +294,7 @@ Health/version probe. Never requires the DB to be writable.
 
 ### `POST /api/daemon/shutdown`
 Kill every process this daemon has spawned — every cell, proof,
-review/guardian merge, feedback chat, change-summary, and manual check
+review/guardian merge, feedback, change-summary, and manual check
 subprocess it started, transitively — then exit the daemon process. This is
 what `ralphus-daemon stop [--port N] [--auto-cancel]` calls.
 
@@ -376,8 +374,10 @@ git worktree for `<branch>` before the cell runs. The trailing
 placeholder cwd without one) and names the branch `<branch>`'s worktree
 should track (`git branch --set-upstream-to`) -- a local branch (`?upstream=main`)
 or a remote-qualified one (`?upstream=origin/main`); it decides what a
-review's base resolves to and drives the resync-on-reuse behavior described
-below, rather than the daemon guessing from `HEAD` at materialization time.
+review's upstream branch resolves to (unless the review declares its own
+`upstream` field, see `[[review]]` below — a declared value always wins)
+and drives the resync-on-reuse behavior described below, rather than the
+daemon guessing from `HEAD` at materialization time.
 Two reserved sentinel values may be used instead of a literal branch name
 (RAL-258): `?upstream=<<default>>` (resolve to the repository's default
 branch, against the project root, at resolution time — recommended) and
@@ -808,9 +808,9 @@ tombstone for a never-inherited key is a harmless no-op.
 
 The **combined** review worktree spans every enabled branch at once, rebased
 onto the last one in stack order, so anything that runs against it — the
-guardian-level chat/triage agent, the finalize-time build/check-gate step, and
-the manual-checks step (see below) — uses the last enabled branch's own
-resolved environment (highest `position`) instead of one earlier branch's or a
+finalize-time build/check-gate step and the manual-checks step (see below) —
+uses the last enabled branch's own resolved environment (highest `position`)
+instead of one earlier branch's or a
 merge of all of them: that branch's code is what's actually checked out at the
 worktree's tip. Disabled branches are never candidates, since their commits
 are not in the combined worktree either. This is exposed on `GuardianView` as
@@ -959,6 +959,35 @@ caller's `reorder` and `merge` was silently clobbered. Body:
 persisted — so the arrangement is visible via `GET /api/guardians/{id}`
 regardless of whether the merge itself then succeeds.
 
+### `POST /api/guardians/{id}/sync-github`
+Explicit "Sync with GitHub"/"Sync with GitLab" (RAL-273): check this review's
+open PRs' *live* base refs on the forge for a reorder made outside ralphus
+(e.g. dragging PRs into a new order on GitHub's own UI), and apply it if
+found. This is the on-demand path alongside the other one that runs without a
+user pressing anything: a background poll every 5 minutes scoped to reviews
+with an active stack (`in_review`/`merging`). `branches/reorder` and
+`branches/arrange` deliberately do *not* also trigger this check -- see the
+comment on `guardian_reorder` in `daemon/src/server.rs` -- since it reads the
+forge's live PR bases back and racing that against those endpoints' own
+in-flight base PATCHes could misread the review's own just-applied local
+reorder as external drift and undo it. Both paths converge on the same
+detection+apply routine.
+
+Always returns `202` immediately (`{"state":"checking"}`) — detection makes
+forge network calls and applying a found reorder runs a full rebase, so the
+result shows up asynchronously via `GET /api/guardians/{id}` (branch order,
+`status`) the same way any other background rebase does. A `404` is returned
+up front if `{id}` doesn't exist.
+
+If a reorder is found: the review is claimed (`in_review` → `merging`, same
+CAS the other restack triggers use); if the review was busy with something
+else at that moment, RAL-273's "GitHub wins" rule applies -- the in-flight
+operation is cancelled and the claim retried for a few seconds before giving
+up. When that happens, `GuardianView.notice_kind` is set to
+`forge_reorder_interrupted_local` (with `notice_message`/`notice_at_ms`) so
+the board can show a one-time bottom-right toast; a plain reorder (nothing
+was running) applies silently other than the usual Cartographer log entry.
+
 ### `POST /api/guardians/{id}/branches/{branch_id}/move`
 Move a branch out of this review and into another (RAL-118: "compose a review
 from worktrees belonging to other reviews"). `branch_id` is the branch's
@@ -1097,33 +1126,20 @@ The change is persisted and applied on the next `merge`/rebuild (like the other
 per-review opt-out toggles). Returns `200` with the updated guardian view, whose
 `squash_projects` array lists the project roots with squash enabled.
 
-### `GET /api/guardians/{id}/messages`
-The review's global feedback thread (RAL-22), oldest first:
+### `GET /api/guardians/{id}/branches/{branch_id}/messages`
+One review branch's read-only feedback thread (RAL-272), oldest first:
 ```json
 { "messages": [ { "seq": 1, "role": "reviewer", "text": "fix the naming", "at_ms": 1783120106867 } ] }
 ```
 `role` is `reviewer` (human) or `guardian` (triage agent). `at_ms` is when the
 message was posted (Unix epoch ms); the board renders it beside each message.
-
-### `GET /api/guardians/{id}/branches/{branch_id}/messages`
-One review branch's read-only feedback thread (RAL-272), same shape as the
-global thread above but scoped to `branch_id`. Populated by `POST
-.../branches/{branch_id}/feedback`: the reviewer's feedback text is persisted
-immediately (`role: "reviewer"`), and a short conversational acknowledgment
-from the guardian follows in the background (`role: "guardian"`), generated
-the same way the global chat's triage replies are (`chat_client::call_direct`)
-but without the `<route>`-block routing step, since the branch is already
-known. The board shows this thread only once a branch's detail view is
-expanded and it has at least one message — otherwise it shows a "No feedback
-yet" placeholder pointing at the `feedback` command above. Messages posted to
-the old global thread (`branch_id` unset) never appear here.
-
-### `POST /api/guardians/{id}/chat`
-Post a reviewer message to the global feedback thread. Body `{ "text": "..." }`
-(empty is a `400`). The message is persisted immediately; the triage agent then
-replies in the background — it works in the combined (all-branches-rebased)
-review worktree, decides which branch(es) each request applies to, and appends
-its reply to the thread. Returns `202 {"status":"triaging"}`.
+Populated by `POST .../branches/{branch_id}/feedback`: the reviewer's
+feedback text is persisted immediately (`role: "reviewer"`), and a short
+conversational acknowledgment from the guardian follows in the background
+(`role: "guardian"`), generated via `chat_client::call_direct`. The board
+shows this thread only once a branch's detail view is expanded and it has at
+least one message — otherwise it shows a "No feedback yet" placeholder
+pointing at the `feedback` command above.
 
 ### `POST /api/guardians/{id}/pull-requests`
 Submit one or more PRs/MRs for a review (RAL-117). Body:
@@ -1755,7 +1771,7 @@ one of three kinds, derived from which entity references the row carries:
 
 | `event:` name | When |
 |---|---|
-| `guardian` | The row carries a `guardian_id` — a review changed (branches, chat, checks, merge/rebase state, ...). |
+| `guardian` | The row carries a `guardian_id` — a review changed (branches, feedback, checks, merge/rebase state, ...). |
 | `squad` | The row carries a `squad_id` but no `guardian_id` — a squad/task/cell (and, by extension, the queue view) changed. |
 | `other` | Neither — still Cartographer-worthy, but not scoped to one squad or guardian (e.g. daemon-wide startup recovery events). |
 

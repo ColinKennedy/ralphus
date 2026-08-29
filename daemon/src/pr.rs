@@ -39,9 +39,9 @@
 //!
 //! See `crate::forge` for the forge-auth model (RAL-117 Q8).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use opentelemetry::trace::{SpanKind, Status};
 use rusqlite::{OptionalExtension, params};
@@ -488,42 +488,12 @@ fn strip_remote_prefix(branch: &str, remote: &str) -> String {
         .to_string()
 }
 
-/// Guess which git remote a guardian's `base_branch` refers to, when it's
-/// written in `<remote>/<branch>` form (e.g. `gitlab/main`) and that leading
-/// segment names a remote actually configured on this repo. Returns `None`
-/// when `base_branch` has no `/` at all, or its leading segment isn't a real
-/// remote (so it's read as a literal branch name that happens to contain a
-/// slash, e.g. a personal `colin/main`).
-fn remote_from_base_branch(root: &Path, base_branch: &str) -> Option<String> {
-    let (candidate, _) = base_branch.split_once('/')?;
-    git(root, &["remote", "get-url", candidate]).ok()?;
-    Some(candidate.to_string())
-}
-
-/// The effective git remote name to resolve the forge against for one
-/// guardian (RAL-190+): its own `base_branch`, via
-/// [`remote_from_base_branch`], when it names a real configured remote;
-/// otherwise the project's configured `[forge].remote`, else `"origin"`.
-///
-/// Without this, a review based on e.g. `gitlab/main` still silently
-/// resolved/pushed/PATCHed against `origin` (and, on GitHub, GitHub's API):
-/// [`strip_remote_prefix`] already handled an arbitrary `<remote>/` prefix
-/// generically for the *branch name itself*, but forge *kind*/*remote*
-/// detection was hardwired to the project config's remote regardless of
-/// what the guardian's own base branch said -- a mismatch would send a
-/// still-prefixed `"gitlab/main"` as the `base` field to GitHub's API
-/// (rejected as invalid) instead of ever reaching GitLab at all.
-fn effective_remote_name(
-    root: &Path,
-    base_branch: &str,
-    forge_cfg: &crate::config::ForgeConfig,
-) -> String {
-    remote_from_base_branch(root, base_branch).unwrap_or_else(|| {
-        forge_cfg
-            .remote
-            .clone()
-            .unwrap_or_else(|| "origin".to_string())
-    })
+fn qualify_forge_base(current_base: &str, remote: &str, forge_base: &str) -> String {
+    if current_base.starts_with(&format!("{remote}/")) {
+        format!("{remote}/{forge_base}")
+    } else {
+        forge_base.to_string()
+    }
 }
 
 fn push_ref(
@@ -678,6 +648,7 @@ fn synthesize_pr_text(
     };
     let log = commit_log_for(&root, &base_sha, guardian, position);
     if log.trim().is_empty() {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [pr] synthesize pr text position={position:?} skipped: empty commit log"
@@ -723,6 +694,7 @@ fn synthesize_pr_text(
         env_overrides: std::collections::BTreeMap::new(),
         machine: None,
     };
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus [pr] synthesize pr text position={position:?} agent={:?} model={:?}",
@@ -733,6 +705,7 @@ fn synthesize_pr_text(
     if result.is_done() {
         if let Some((title, description)) = parse_suggested_pr(&result.summary) {
             if !title.trim().is_empty() {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(
                     DEBUG,
                     "ralphus [pr] synthesize pr text position={position:?} done: used llm suggestion"
@@ -741,6 +714,7 @@ fn synthesize_pr_text(
             }
         }
     }
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         WARNING,
         "ralphus [pr] synthesize pr text position={position:?} falling back to plain title/summary \
@@ -853,15 +827,22 @@ fn stack_base_for(
 /// PR is logged and does not stop the others from being resynced. Returns the
 /// number of PRs whose `base_ref` changed locally.
 pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Result<usize, String> {
+    resync_pr_bases_inner(store, id, false)
+}
+
+fn resync_pr_bases_inner(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    require_forge_success: bool,
+) -> std::result::Result<usize, String> {
     let guardian = store
         .lock()
         .expect("poisoned")
         .get_guardian(id)
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
-    let mut forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
-    forge_cfg.remote = Some(remote_name.clone());
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
 
     let prs = store
@@ -875,7 +856,8 @@ pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Resu
     }
     let alias_by_branch = open_alias_by_branch(&prs);
 
-    let client = crate::forge::resolve_remote(&root, &forge_cfg).ok();
+    let resolved_client = crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg);
+    let client = resolved_client.as_ref().ok();
     let mut ordered_branches: Vec<_> = guardian.branches.iter().filter(|b| b.enabled).collect();
     ordered_branches.sort_by_key(|b| b.position);
 
@@ -884,6 +866,7 @@ pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Resu
     // collected so the stack is dissolved once and all of them retried
     // together rather than once per refusal.
     let mut blocked_by_stack: Vec<(String, i64, String)> = Vec::new();
+    let mut forge_errors = Vec::new();
     for branch in &ordered_branches {
         let Some(pr) = by_branch.get(branch.id.as_str()) else {
             continue;
@@ -895,34 +878,56 @@ pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Resu
             &base_branch_name,
         );
         if new_base != pr.base_ref {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} resync base pr={} old={} new={new_base}",
                 pr.id,
                 pr.base_ref
             );
-            let _ = store.lock().expect("poisoned").update_pull_request_ex(
-                &pr.id,
-                None,
-                None,
-                None,
-                None,
-                Some(&new_base),
-                None,
-            );
+            if !require_forge_success {
+                let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                    &pr.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&new_base),
+                    None,
+                );
+            }
             changed += 1;
             if let (Some(c), Some(num)) = (&client, pr.pr_number) {
                 if let Err(e) = c.update_pull_request_base(num, &new_base) {
                     if is_stack_base_restriction(&e) {
                         blocked_by_stack.push((pr.id.clone(), num, new_base.clone()));
                     } else {
+                        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                         crate::rlog!(
                             WARNING,
                             "ralphus [pr] review {id} resync base forge update failed pr={}: {e}",
                             pr.id
                         );
                     }
+                    Ok(()) => {}
+                    Err(e) => {
+                        if is_stack_base_restriction(&e) {
+                            blocked_by_stack.push((pr.id.clone(), num, new_base.clone()));
+                        } else {
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [pr] review {id} resync base forge update failed pr={}: {e}",
+                                pr.id
+                            );
+                            forge_errors.push(format!("pr {}: {e}", pr.id));
+                        }
+                    }
                 }
+            } else if require_forge_success {
+                forge_errors.push(format!(
+                    "pr {} has no forge client or forge PR/MR number",
+                    pr.id
+                ));
             }
         }
     }
@@ -933,7 +938,32 @@ pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Resu
                 .filter_map(|b| by_branch.get(b.id.as_str()))
                 .filter_map(|pr| pr.pr_number)
                 .collect();
-            repoint_stacked_prs(store, id, c, &ordered_pr_numbers, &blocked_by_stack);
+            match repoint_stacked_prs(store, id, c, &ordered_pr_numbers, &blocked_by_stack) {
+                Ok(()) if require_forge_success => {
+                    for (pr_id, _, new_base) in &blocked_by_stack {
+                        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                            pr_id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(new_base),
+                            None,
+                            None,
+                        );
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => forge_errors.push(e),
+            }
+        }
+    }
+    if require_forge_success && changed > 0 {
+        if let Err(e) = resolved_client {
+            forge_errors.push(e);
+        }
+        if !forge_errors.is_empty() {
+            return Err(forge_errors.join("; "));
         }
     }
     Ok(changed)
@@ -966,7 +996,7 @@ fn repoint_stacked_prs(
     client: &crate::forge::ForgeClient,
     ordered_pr_numbers: &[i64],
     blocked: &[(String, i64, String)],
-) {
+) -> std::result::Result<(), String> {
     let recorded = store
         .lock()
         .expect("poisoned")
@@ -974,31 +1004,43 @@ fn repoint_stacked_prs(
         .ok()
         .flatten();
     let Some(stack_number) = recorded else {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [pr] review {id} base move blocked by a stack this review has no record of \
              -- unstack it on the forge, then change the base again"
         );
-        return;
+        return Err(
+            "forge rejected the base change because the PR belongs to an unrecorded stack"
+                .to_string(),
+        );
     };
     if let Err(e) = client.unstack(stack_number) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             ERROR,
             "ralphus [pr] review {id} could not dissolve stack {stack_number} to move PR bases: {e}"
         );
-        return;
+        return Err(format!("could not dissolve stack {stack_number}: {e}"));
     }
+    let mut errors = Vec::new();
     for (pr_id, number, new_base) in blocked {
         if let Err(e) = client.update_pull_request_base(*number, new_base) {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [pr] review {id} resync base forge update failed pr={pr_id} after \
                  dissolving stack {stack_number}: {e}"
             );
+            errors.push(format!("pr {pr_id}: {e}"));
         }
     }
     if ordered_pr_numbers.len() < 2 {
-        return;
+        return if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        };
     }
     match client.create_stack(ordered_pr_numbers) {
         Ok(Some(created)) => {
@@ -1006,6 +1048,7 @@ fn repoint_stacked_prs(
                 .lock()
                 .expect("poisoned")
                 .set_guardian_forge_stack_number(id, created.number);
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} re-registered stack {} after moving PR bases \
@@ -1015,22 +1058,296 @@ fn repoint_stacked_prs(
         }
         Ok(None) => {}
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 ERROR,
                 "ralphus [pr] review {id} moved PR bases but could not re-register the stack \
                  (was {stack_number}), leaving the PRs unstacked: {e}"
             );
+            errors.push(format!("could not re-register stack {stack_number}: {e}"));
         }
     }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Guardian ids with a [`resync_pr_bases`] currently in flight (RAL-273).
+///
+/// A plain in-process claim set rather than the guardian-status CAS the merge
+/// triggers use (`claim_guardian_merge`, `rebase_on_manual_push`,
+/// `rebuild_on_base_shift`): a resync commonly runs *alongside* a real
+/// merge/rebase for the same guardian (`guardian_arrange` fires both), so it
+/// must not contend with those for `in_review`/`merging`. Without this guard,
+/// two overlapping resyncs for the same guardian (e.g. two reorders in quick
+/// succession, or a poll firing mid-resync) read stale PR state and race
+/// their forge PATCH calls.
+static RESYNCING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Perform the forge base rebuild before returning to an API caller. Waits
+/// for an older background resync of this same review to finish, then owns
+/// the same claim so stale and fresh PATCH calls cannot overlap.
+pub fn resync_pr_bases_synchronously(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+) -> std::result::Result<usize, String> {
+    for _ in 0..3_000 {
+        if RESYNCING.lock().expect("poisoned").insert(id.to_string()) {
+            let result = resync_pr_bases_inner(store, id, true);
+            RESYNCING.lock().expect("poisoned").remove(id);
+            return result;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err("timed out waiting for an earlier PR/MR base sync".to_string())
 }
 
 /// Kick off [`resync_pr_bases`] in the background — called after a reorder,
 /// so the reorder's own HTTP response is not held up by the forge network
-/// calls this makes.
+/// calls this makes. A no-op (logged, not queued) if a resync for this
+/// guardian is already running -- see [`RESYNCING`].
 pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
     let sid = id.to_string();
-    std::thread::spawn(move || match resync_pr_bases(&store, &sid) {
-        Ok(n) if n > 0 => {
+    {
+        let mut inflight = RESYNCING.lock().expect("poisoned");
+        if !inflight.insert(sid.clone()) {
+            crate::rlog!(
+                DEBUG,
+                "ralphus [pr] review {sid} resync bases skipped: already in flight"
+            );
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let result = resync_pr_bases(&store, &sid);
+        RESYNCING.lock().expect("poisoned").remove(&sid);
+        match result {
+            Ok(n) if n > 0 => {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "pull request base(s) resynced after reorder",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(&sid),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"count": n}),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::rlog!(ERROR, "ralphus [pr] review {sid} resync bases failed: {e}");
+            }
+        }
+    });
+}
+
+/// Poll every PR/MR linked to `id` for a live "merged" state and settle the
+/// review accordingly (RAL-300).
+///
+/// A PR row already recorded `merged` is trusted without a further forge
+/// call; every still-`open` row is re-checked. Once at least one row is
+/// freshly observed merged, the *whole set* is re-read to decide what "all
+/// linked PRs merged" means for this guardian right now:
+///
+/// - `in_review` and every linked PR merged: approve outright via
+///   [`crate::guardian::Store::approve_guardian`] -- the same transition the
+///   "Approve" button drives -- so a review whose stack landed on the forge
+///   never sits stale waiting for a human to notice.
+/// - anything else (`merging`, `merge_failed`, `merge_stopped`: a rebase or
+///   feedback pass owns this review's worktrees right now, or a prior one
+///   failed) and at least one PR merged: this is an *out-of-band* merge that
+///   raced whatever is/was in flight. Forcing an approval here could silently
+///   orphan real follow-up work, so instead the freshly-merged row(s) are
+///   dropped from the review and a board notice + Cartographer entry explain
+///   what happened, leaving the decision to the user (RAL-302 tracks a "view
+///   past PR stacks" affordance for this case, out of scope here).
+///
+/// Fail-safe throughout: a guardian with no linked PRs, or whose forge client
+/// can't be resolved, or whose per-PR state check errors (network, missing
+/// token, forge down, ...) is left exactly as it was -- an unreachable forge
+/// must never be mistaken for "confirmed merged", mirroring
+/// [`refresh_open_prs`]'s "assume still open" fallback. Returns whether
+/// anything changed (approved, or a PR was dropped) -- callers use this to
+/// know the guardian's status may no longer be what they last read.
+pub fn check_pr_merges(store: &Arc<Mutex<Store>>, id: &str) -> bool {
+    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+        return false;
+    };
+    let prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default();
+    if prs.is_empty() {
+        return false;
+    }
+    if prs
+        .iter()
+        .all(|pull_request| pull_request.state == "merged")
+    {
+        return settle_pr_merge_states(store, id, &[]);
+    }
+
+    let mut freshly_merged = Vec::new();
+    for pr in prs
+        .iter()
+        .filter(|pull_request| pull_request.state == "open")
+    {
+        let project_root = pr
+            .branch_id
+            .as_deref()
+            .and_then(|branch_id| {
+                guardian
+                    .branches
+                    .iter()
+                    .find(|branch| branch.id == branch_id)
+            })
+            .and_then(|branch| branch.project.as_deref())
+            .unwrap_or(&guardian.git_root);
+        let root = PathBuf::from(project_root);
+        let forge_cfg = crate::config::resolve_forge(&root);
+        let client = match crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg) {
+            Ok(client) if client.kind().as_str() == pr.forge && client.repo_label() == pr.repo => {
+                client
+            }
+            Ok(client) => {
+                log_pr_merge_check_failure(
+                    store,
+                    id,
+                    pr,
+                    &format!(
+                        "resolved forge {}/{} does not match recorded {}/{}",
+                        client.kind().as_str(),
+                        client.repo_label(),
+                        pr.forge,
+                        pr.repo
+                    ),
+                );
+                continue;
+            }
+            Err(error) => {
+                log_pr_merge_check_failure(store, id, pr, &error);
+                continue;
+            }
+        };
+        poll_pr_merge_state(store, id, pr, &client, &mut freshly_merged);
+    }
+    settle_pr_merge_states(store, id, &freshly_merged)
+}
+
+/// The client-agnostic body of [`check_pr_merges`], split out so tests can
+/// hand it a [`crate::forge::ForgeClient`] pointed at a mock server without
+/// needing a real git remote for [`crate::forge::resolve_remote`] to resolve.
+#[cfg(test)]
+fn apply_pr_merge_check(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    prs: &[PullRequestView],
+    client: &crate::forge::ForgeClient,
+) -> bool {
+    let mut freshly_merged: Vec<PullRequestView> = Vec::new();
+    for pr in prs.iter().filter(|p| p.state == "open") {
+        poll_pr_merge_state(store, id, pr, client, &mut freshly_merged);
+    }
+
+    settle_pr_merge_states(store, id, &freshly_merged)
+}
+
+fn poll_pr_merge_state(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    pr: &PullRequestView,
+    client: &crate::forge::ForgeClient,
+    freshly_merged: &mut Vec<PullRequestView>,
+) {
+    let Some(number) = pr.pr_number else {
+        return;
+    };
+    match client.get_pull_request_state(number) {
+        Ok(state) if state != "open" => {
+            let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                &pr.id,
+                None,
+                None,
+                None,
+                Some(&state),
+                None,
+                None,
+                None,
+            );
+            if state == "merged" {
+                freshly_merged.push(pr.clone());
+            }
+        }
+        Ok(_) => {}
+        Err(error) => log_pr_merge_check_failure(store, id, pr, &error),
+    }
+}
+
+fn log_pr_merge_check_failure(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    pr: &PullRequestView,
+    error: &str,
+) {
+    crate::rlog!(
+        WARNING,
+        "ralphus [pr] review {id} pr {} merge check failed, assuming not merged: {error}",
+        pr.id
+    );
+    let guard = store.lock().expect("poisoned");
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::WARNING,
+        source: "pr",
+        message: "linked pr merge check failed; assuming not merged",
+        scope: Some("guardian"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({"pr_id": pr.id, "error": error}),
+    });
+}
+
+/// Apply the guardian transition implied by the PR states already persisted in
+/// the store. This is shared by forge polling and explicit merge notifications,
+/// which may record every PR as merged before the maintenance sweep runs.
+fn settle_pr_merge_states(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    freshly_merged: &[PullRequestView],
+) -> bool {
+    let current_guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        Ok(guardian) => guardian,
+        Err(_) => return false,
+    };
+    let current_prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default();
+
+    if current_guardian.status.as_str() == "in_review" {
+        let all_merged = !current_prs.is_empty()
+            && current_prs
+                .iter()
+                .all(|pull_request| pull_request.state == "merged");
+        if !all_merged {
+            return false;
+        }
+        let approved = store.lock().expect("poisoned").approve_guardian(id).is_ok();
+        if approved {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {id} approved: every linked pr has merged"
+            );
             let guard = store.lock().expect("poisoned");
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
@@ -1045,9 +1362,30 @@ pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
                 payload: serde_json::json!({"count": n}),
             });
         }
-        Ok(_) => {}
-        Err(e) => {
-            crate::rlog!(ERROR, "ralphus [pr] review {sid} resync bases failed: {e}");
+    }
+    std::thread::spawn(move || {
+        let result = resync_pr_bases(&store, &sid);
+        RESYNCING.lock().expect("poisoned").remove(&sid);
+        match result {
+            Ok(n) if n > 0 => {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "pull request base(s) resynced after reorder",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(&sid),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"count": n}),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::rlog!(ERROR, "ralphus [pr] review {sid} resync bases failed: {e}");
+            }
         }
     });
 }
@@ -1091,7 +1429,7 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
 
     for pr in open_prs {
         let local_ref = match &pr.branch_id {
@@ -1144,6 +1482,7 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
             None,
             None,
             Some(Some(local_sha.as_str())),
+            None,
         );
         {
             let guard = store.lock().expect("poisoned");
@@ -1171,6 +1510,616 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
             pr.branch_alias
         );
     }
+}
+
+/// Discover the branch order implied by each stacked PR's *live* base ref on
+/// the forge (RAL-273): reconstructs the chain by walking, from the
+/// guardian's own base branch, whichever open PR currently bases on it, then
+/// whichever bases on that PR's alias, and so on. Returns `Some(order)` (open
+/// PR branch ids, forge order) only when it differs from the guardian's
+/// current `position` order among that same set of branches. Returns `None`
+/// when there's nothing to reorder (fewer than two stacked PRs), no drift, or
+/// the live bases don't form one unbroken chain (ambiguous -- e.g. mid-edit
+/// on the forge side -- safer to do nothing than guess). A branch with no
+/// open PR of its own is excluded from the comparison entirely, the same way
+/// [`stack_base_for`]/[`resync_pr_bases`] skip it: reordering only ever moves
+/// it along with whichever branch it's implicitly attached to via
+/// `Store::reorder_guardian_branches`'s "leftover" compaction of unmatched
+/// branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeStackDrift {
+    order: Vec<String>,
+    base: String,
+    base_changed_at_ms: i64,
+    base_changed: bool,
+    order_changed: bool,
+}
+
+pub fn detect_forge_reorder(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+) -> std::result::Result<Option<ForgeStackDrift>, String> {
+    let guardian = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(&guardian.git_root);
+    let mut forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    forge_cfg.remote = Some(remote_name.clone());
+    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
+
+    let prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let by_branch = open_prs_by_branch(&prs);
+    if by_branch.is_empty() {
+        return Ok(None);
+    }
+    let alias_by_branch = open_alias_by_branch(&prs);
+
+    let client = crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg)?;
+    let mut live_state: HashMap<String, crate::forge::PullRequestBaseState> = HashMap::new();
+    for (branch_id, pr) in &by_branch {
+        let Some(num) = pr.pr_number else { continue };
+        let state = client.get_pull_request_base_state(num)?;
+        live_state.insert((*branch_id).to_string(), state);
+    }
+    let Some((forge_base, base_changed_at_ms, order)) =
+        reconstruct_forge_stack(&live_state, &alias_by_branch)
+    else {
+        return Ok(None);
+    };
+
+    let mut ordered_branches: Vec<_> = guardian.branches.iter().filter(|b| b.enabled).collect();
+    ordered_branches.sort_by_key(|b| b.position);
+    let local_order: Vec<String> = ordered_branches
+        .into_iter()
+        .filter(|b| by_branch.contains_key(b.id.as_str()))
+        .map(|b| b.id.clone())
+        .collect();
+
+    let order_changed = local_order != order;
+    let base_changed = forge_base != base_branch_name;
+    Ok(if !order_changed && !base_changed {
+        None
+    } else {
+        Some(ForgeStackDrift {
+            order,
+            base: forge_base,
+            base_changed_at_ms,
+            base_changed,
+            order_changed,
+        })
+    })
+}
+
+/// Reconstruct a complete forge stack without assuming ralphus's recorded
+/// base is still its root. Exactly one PR/MR must target a ref that is not
+/// another open PR's alias; that ref is the forge-authored review base.
+fn reconstruct_forge_stack(
+    live_state: &HashMap<String, crate::forge::PullRequestBaseState>,
+    alias_by_branch: &HashMap<String, String>,
+) -> Option<(String, i64, Vec<String>)> {
+    let alias_refs: HashSet<&str> = alias_by_branch.values().map(String::as_str).collect();
+    let roots: Vec<_> = live_state
+        .values()
+        .filter(|state| !alias_refs.contains(state.base.as_str()))
+        .collect();
+    let [root] = roots.as_slice() else {
+        return None;
+    };
+    let live_base: HashMap<String, String> = live_state
+        .iter()
+        .map(|(id, state)| (id.clone(), state.base.clone()))
+        .collect();
+    let order = reconstruct_forge_chain(&root.base, &live_base, alias_by_branch)?;
+    Some((root.base.clone(), root.updated_at_ms, order))
+}
+
+/// Walk `live_base` (branch id -> that branch's live forge base ref) from
+/// `base_branch_name`, one hop at a time: at each step, find the one branch
+/// whose live base matches the current ref, append it to the order, and
+/// advance `current` to that branch's own alias (via `alias_by_branch`) for
+/// the next hop. Pure and side-effect-free so [`detect_forge_reorder`]'s
+/// reconstruction logic is unit-testable without a real forge/network.
+///
+/// Returns `None` when the bases don't form one unbroken chain covering
+/// every entry in `live_base` -- either a dead end (no branch found for the
+/// current ref) or a fork (more than one branch claims the same live base,
+/// unresolvable without guessing).
+fn reconstruct_forge_chain(
+    base_branch_name: &str,
+    live_base: &HashMap<String, String>,
+    alias_by_branch: &HashMap<String, String>,
+) -> Option<Vec<String>> {
+    let mut order: Vec<String> = Vec::new();
+    let mut current = base_branch_name.to_string();
+    let mut remaining: HashSet<String> = live_base.keys().cloned().collect();
+    loop {
+        let matches: Vec<String> = remaining
+            .iter()
+            .filter(|bid| live_base.get(bid.as_str()).is_some_and(|b| *b == current))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => break,
+            1 => {
+                let next = matches.into_iter().next().expect("checked len==1");
+                remaining.remove(&next);
+                current = alias_by_branch.get(&next).cloned().unwrap_or(current);
+                order.push(next);
+            }
+            _ => return None,
+        }
+    }
+    remaining.is_empty().then_some(order)
+}
+
+/// Claim a guardian for an external-reorder rebuild (RAL-273): the same
+/// check-then-set-under-one-lock CAS idiom `rebase_on_manual_push`/
+/// `rebuild_on_base_shift` use for their own triggers -- `in_review` is the
+/// only claimable state, since a reorder only makes sense once a stack is
+/// actually built and has open PRs to compare against.
+fn claim_guardian_for_forge_reorder(store: &Arc<Mutex<Store>>, id: &str) -> bool {
+    let guard = store.lock().expect("poisoned");
+    matches!(guard.get_guardian(id), Ok(gv) if gv.status.as_str() == "in_review")
+        && guard
+            .set_guardian_status(
+                id,
+                crate::guardian::GuardianStatus::Merging,
+                Some("stack reorder detected on the forge; rebuilding"),
+            )
+            .is_ok()
+}
+
+/// Detect and apply an external (GitHub/GitLab) stack reorder for one
+/// guardian (RAL-273): [`detect_forge_reorder`], then, if the forge's order
+/// differs from ralphus's, claim the review, reorder locally, resync PR
+/// bases, and retrigger a full rebuild so any conflict introduced by the new
+/// order surfaces through the existing rebase-run reporting path (per-branch
+/// `merge_status`/conflicts, guardian `detail`, Cartographer).
+///
+/// A GitHub-side reorder always wins over a review already `merging` locally
+/// (RAL-273's last-writer-wins rule): if the claim loses because some other
+/// trigger for this same guardian (a manual reorder's own rebuild, a
+/// base-shift rebuild, a manual-push restack) is in flight, that run is
+/// cancelled and the claim retried for a few seconds before giving up. A
+/// guardian notice is recorded only in that interrupted case, for the
+/// bottom-right toast; a plain (nothing was running) reorder is applied
+/// silently other than the usual Cartographer log. Returns whether a reorder
+/// was detected and applied.
+pub fn check_and_apply_forge_reorder(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    sem: &crate::scheduler::Semaphore,
+    cancellations: &crate::cancel::Cancellations,
+) -> bool {
+    let drift = match detect_forge_reorder(store, id) {
+        Ok(Some(drift)) => drift,
+        Ok(None) => return false,
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} forge reorder check failed: {e}"
+            );
+            return false;
+        }
+    };
+
+    let cancel_key = format!("guardian:{id}");
+    let mut claimed = claim_guardian_for_forge_reorder(store, id);
+    let mut interrupted_local = false;
+    if !claimed && cancellations.is_active(&cancel_key) {
+        cancellations.cancel(&cancel_key);
+        for _ in 0..50 {
+            if claim_guardian_for_forge_reorder(store, id) {
+                claimed = true;
+                interrupted_local = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if !claimed {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} forge reorder detected but the review could not be claimed; will retry next check"
+        );
+        return false;
+    }
+
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] review {id} forge drift detected order={:?} base={} base_changed={} order_changed={} interrupted_local={interrupted_local}",
+        drift.order,
+        drift.base,
+        drift.base_changed,
+        drift.order_changed
+    );
+    {
+        let mut guard = store.lock().expect("poisoned");
+        let guardian = match guard.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [pr] review {id} forge drift apply failed: {e}"
+                );
+                return false;
+            }
+        };
+        let root = PathBuf::from(&guardian.git_root);
+        let forge_cfg = crate::config::resolve_forge(&root);
+        let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+        let local_base = qualify_forge_base(&guardian.base_branch, &remote_name, &drift.base);
+        let base_applied = if drift.base_changed {
+            match guard.set_guardian_base_branch_if_newer(id, &local_base, drift.base_changed_at_ms)
+            {
+                Ok(applied) => applied,
+                Err(e) => {
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [pr] review {id} forge base apply failed: {e}"
+                    );
+                    return false;
+                }
+            }
+        } else {
+            false
+        };
+        if drift.order_changed && guard.reorder_guardian_branches(id, &drift.order).is_err() {
+            crate::rlog!(ERROR, "ralphus [pr] review {id} forge reorder apply failed");
+            let _ = guard.set_guardian_status(
+                id,
+                crate::guardian::GuardianStatus::InReview,
+                Some("forge reorder detected but could not be applied"),
+            );
+            return false;
+        }
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "pr",
+            message: "stack base/order drift detected on the forge; review updated",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "order": drift.order,
+                "base": drift.base,
+                "base_applied": base_applied,
+                "interrupted_local": interrupted_local
+            }),
+        });
+        if interrupted_local {
+            let _ = guard.set_guardian_notice(
+                id,
+                "forge_drift_interrupted_local",
+                "A GitHub/GitLab stack edit arrived while a local review edit was in progress; the newest base edit won.",
+            );
+        }
+    }
+
+    start_resync_pr_bases(Arc::clone(store), id);
+
+    let token = cancellations.register(&cancel_key);
+    let _permit = sem.acquire();
+    guardian_merge::run_merge_cancellable(store, runner, id, &token);
+    cancellations.remove(&cancel_key);
+    true
+}
+
+/// Poll every guardian with an active stack (`in_review`/`merging` only, to
+/// keep forge API usage trivial) for a reorder, each on its own thread
+/// (RAL-273). Called periodically by the scheduler loop -- this is the
+/// "every 5 minutes" background detection path; `POST .../sync-pr`
+/// covers the on-demand/explicit-sync path via the same
+/// [`check_and_apply_forge_reorder`]. `guardian_reorder`/`guardian_arrange`
+/// deliberately do not also call it -- see the comment in `guardian_reorder`
+/// (`daemon/src/server.rs`) on why that would race their own base PATCHes.
+pub fn poll_forge_reorders(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<crate::scheduler::Semaphore>,
+    cancellations: &crate::cancel::Cancellations,
+) {
+    let ids: Vec<String> = {
+        let guard = store.lock().expect("poisoned");
+        guard
+            .list_guardians()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|g| matches!(g.status.as_str(), "in_review" | "merging"))
+            .map(|g| g.id)
+            .collect()
+    };
+    for id in ids {
+        let store = Arc::clone(store);
+        let sem = Arc::clone(sem);
+        let cancellations = cancellations.clone();
+        std::thread::spawn(move || {
+            let runner: Arc<dyn Runner> = Arc::new(
+                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
+            );
+            check_and_apply_forge_reorder(&store, runner.as_ref(), &id, &sem, &cancellations);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forge-to-ralphus base drift poll (RAL-279)
+// ---------------------------------------------------------------------------
+
+/// Whether a PR's live forge base, compared against its two local baselines,
+/// counts as genuine forge-side drift (RAL-279) -- the pure classification
+/// step of [`poll_pr_base_drift`], split out for direct unit testing the
+/// same way [`stack_base_for`] is split out of [`resync_pr_bases`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseDriftKind {
+    /// The forge already agrees with `base_ref`; nothing to do.
+    InSync,
+    /// The forge still matches the last base ralphus itself confirmed
+    /// pushing -- `base_ref` moved ahead of it locally (most likely a
+    /// resync whose forge PATCH hasn't landed yet, or failed), not a
+    /// forge-side change. Left alone so it doesn't get overwritten back to
+    /// a stale value.
+    PendingLocalPush,
+    /// The forge disagrees with both baselines -- a genuine external
+    /// retarget to pull into ralphus's own branch order.
+    Drifted,
+}
+
+fn classify_base_drift(
+    base_ref: &str,
+    last_pushed_base_ref: Option<&str>,
+    forge_base: &str,
+) -> BaseDriftKind {
+    if forge_base == base_ref {
+        BaseDriftKind::InSync
+    } else if last_pushed_base_ref == Some(forge_base) {
+        BaseDriftKind::PendingLocalPush
+    } else {
+        BaseDriftKind::Drifted
+    }
+}
+
+/// Given a drifted PR's branch (`position`) and the forge's new base,
+/// figures out which currently-enabled branches (per `ordered_branches`,
+/// already position-sorted) sat between the new base and `position` and so
+/// must have left the stack -- `Some(vec)` (possibly empty, when the forge
+/// base already names the immediate predecessor branch) if `forge_base`
+/// names a recognized predecessor (an enabled branch's open-PR alias, or the
+/// guardian's own base branch), `None` if it names neither and the caller
+/// should leave this PR alone rather than guess.
+fn branches_skipped_by_drift<'a>(
+    ordered_branches: &[&'a BranchView],
+    alias_by_branch: &HashMap<String, String>,
+    position: i64,
+    base_branch_name: &str,
+    forge_base: &str,
+) -> Option<Vec<&'a BranchView>> {
+    let new_predecessor = ordered_branches
+        .iter()
+        .filter(|b| b.position < position)
+        .find(|b| alias_by_branch.get(b.id.as_str()).map(String::as_str) == Some(forge_base));
+    if new_predecessor.is_none() && forge_base != base_branch_name {
+        return None;
+    }
+    let lower_bound = new_predecessor.map_or(-1, |b| b.position);
+    Some(
+        ordered_branches
+            .iter()
+            .filter(|b| b.position > lower_bound && b.position < position)
+            .copied()
+            .collect(),
+    )
+}
+
+/// Detect a stacked PR whose forge-side base no longer matches ralphus's own
+/// bookkeeping -- a reviewer retargeted it directly on GitHub/GitLab, or an
+/// intervening branch's PR was closed/merged there -- and pull that change
+/// back into this guardian's branch order (the mirror image of
+/// [`resync_pr_bases`], which pushes ralphus's own reorders out to the
+/// forge).
+///
+/// Anti-thrash: a PR's `base_ref` is only treated as genuinely forge-drifted
+/// if the live forge base differs from BOTH `base_ref` (what ralphus already
+/// has recorded) AND `last_pushed_base_ref` (the last base ralphus itself
+/// confirmed the forge accepted) -- mirroring `last_pushed_sha`'s role in
+/// [`compute_sync_status`]. This keeps a forge PATCH that hasn't landed yet
+/// (or failed) from being misread as a forge-side change, and keeps an
+/// accepted forge-side change from being re-flagged as drift on the next
+/// poll once `base_ref` catches up to it.
+///
+/// For each drifted PR, disables every currently-enabled branch that sat
+/// (per ralphus's current position order) between the forge's new base and
+/// this PR's own branch -- forge dropping them from the base chain means
+/// they left the stack. A forge base that names neither a known branch alias
+/// nor the guardian's own base branch is logged and skipped rather than
+/// guessed at. Any branches disabled this way trigger a follow-up
+/// [`resync_pr_bases`] so every other stacked PR's base is recomputed (and
+/// pushed to the forge) against the new order. Returns the number of PRs
+/// pulled into ralphus's order.
+pub fn poll_pr_base_drift(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+) -> std::result::Result<usize, String> {
+    let guardian = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(&guardian.git_root);
+    let mut forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    forge_cfg.remote = Some(remote_name.clone());
+    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
+
+    let prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let by_branch = open_prs_by_branch(&prs);
+    if by_branch.is_empty() {
+        return Ok(0);
+    }
+    let alias_by_branch = open_alias_by_branch(&prs);
+
+    let Ok(client) = crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg) else {
+        return Ok(0);
+    };
+
+    let mut ordered_branches: Vec<_> = guardian.branches.iter().filter(|b| b.enabled).collect();
+    ordered_branches.sort_by_key(|b| b.position);
+
+    let mut pulled = 0usize;
+    for branch in &ordered_branches {
+        let Some(pr) = by_branch.get(branch.id.as_str()) else {
+            continue;
+        };
+        let Some(number) = pr.pr_number else {
+            continue;
+        };
+        let Ok(forge_base) = client.get_pull_request_base(number) else {
+            continue;
+        };
+        match classify_base_drift(
+            &pr.base_ref,
+            pr.last_pushed_base_ref.as_deref(),
+            &forge_base,
+        ) {
+            BaseDriftKind::InSync | BaseDriftKind::PendingLocalPush => continue,
+            BaseDriftKind::Drifted => {}
+        }
+
+        let Some(skipped_branches) = branches_skipped_by_drift(
+            &ordered_branches,
+            &alias_by_branch,
+            branch.position,
+            &base_branch_name,
+            &forge_base,
+        ) else {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} pr={} forge base '{forge_base}' matches neither a known \
+                 branch alias nor the review's base branch -- skipping auto-resync",
+                pr.id
+            );
+            continue;
+        };
+        for skipped in skipped_branches {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {id} branch {} disabled -- forge-side base retarget on pr={} \
+                 (new base '{forge_base}') dropped it from the stack",
+                skipped.id,
+                pr.id
+            );
+            let _ = store.lock().expect("poisoned").set_branch_enabled_by_name(
+                id,
+                &skipped.branch,
+                false,
+            );
+        }
+
+        crate::rlog!(
+            INFO,
+            "ralphus [pr] review {id} pr={} base drifted on the forge: old={} new={forge_base}",
+            pr.id,
+            pr.base_ref
+        );
+        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+            &pr.id,
+            None,
+            None,
+            None,
+            None,
+            Some(&forge_base),
+            None,
+            Some(Some(&forge_base)),
+        );
+        pulled += 1;
+    }
+
+    if pulled > 0 {
+        // Cascade: other stacked PRs downstream of the ones just pulled in
+        // may now need their own base recomputed (and pushed to the forge)
+        // against the updated branch order.
+        let _ = resync_pr_bases(store, id);
+    }
+    Ok(pulled)
+}
+
+/// Poll every guardian with an open PR stack for forge-side base drift
+/// (RAL-279) once, logging a Cartographer entry per guardian where anything
+/// changed. Never touches a review with no submitted PRs (RAL-279's "no
+/// forge calls for a review that was never submitted" requirement) since
+/// [`Store::guardian_ids_with_open_pull_requests`] only returns guardians
+/// that already have one.
+fn poll_pr_base_drift_once(store: &Arc<Mutex<Store>>) {
+    let ids = match store
+        .lock()
+        .expect("poisoned")
+        .guardian_ids_with_open_pull_requests()
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [pr] base drift poll: listing guardians failed: {e}"
+            );
+            return;
+        }
+    };
+    for id in ids {
+        match poll_pr_base_drift(store, &id) {
+            Ok(n) if n > 0 => {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "pull request base drift pulled in from the forge",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(&id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"count": n}),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [pr] review {id} base drift poll failed: {e}"
+                );
+            }
+        }
+    }
+}
+
+/// Interval between forge-side base drift polls (RAL-279) -- infrequent
+/// since it's a best-effort reconciliation against manual forge activity,
+/// not something latency-sensitive.
+const PR_BASE_DRIFT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Spawn the background loop that periodically calls
+/// [`poll_pr_base_drift_once`] for as long as the daemon runs (RAL-279).
+pub fn spawn_pr_base_drift_poller(store: Arc<Mutex<Store>>) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(PR_BASE_DRIFT_POLL_INTERVAL);
+            poll_pr_base_drift_once(&store);
+        }
+    });
 }
 
 /// Submit each request in `requests` as a PR/MR. Stacked requests
@@ -1462,6 +2411,7 @@ fn refresh_open_prs<'a>(
             };
             match client.get_pull_request_state(number) {
                 Ok(state) if state != "open" => {
+                    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
                         INFO,
                         "ralphus [pr] pr {} branch_id={:?} found closed externally (state={state}) \
@@ -1482,6 +2432,7 @@ fn refresh_open_prs<'a>(
                 }
                 Ok(_) => true,
                 Err(e) => {
+                    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
                         WARNING,
                         "ralphus [pr] pr {} state check failed, assuming still open: {e}",
@@ -1663,10 +2614,9 @@ fn submit_pull_requests_inner(
         .get_guardian(id)
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
-    let mut forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
-    forge_cfg.remote = Some(remote_name.clone());
-    let client = crate::forge::resolve_remote(&root, &forge_cfg)?;
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let client = crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg)?;
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
     let pr_branch_convention = forge_cfg.resolved_pr_branch_convention().to_string();
 
@@ -1793,7 +2743,7 @@ pub fn compute_sync_status(
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
 
     let local_ref = if let Some(bid) = &pr.branch_id {
         guardian
@@ -1889,7 +2839,7 @@ pub fn pull_pr_commits(
     };
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
 
     let pulled = guardian_merge::pull_pr_commits(
         store,
@@ -2043,12 +2993,14 @@ pub fn action_pr_feedback(
     let span = crate::otel::start_span("pr.action_feedback", &cx, SpanKind::Internal);
     span.set_attribute("pr_id", pr_id.to_string());
 
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(INFO, "ralphus [pr] pr {pr_id} actioning feedback");
     let result = action_pr_feedback_inner(store, runner, pr_id);
     match &result {
         Ok(n) => {
             span.set_status(Status::Ok);
             span.set_attribute("pr.comments_actioned", *n as i64);
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
                 "ralphus [pr] pr {pr_id} feedback actioned comments={n}"
@@ -2075,10 +3027,9 @@ fn action_pr_feedback_inner(
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
-    let mut forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = effective_remote_name(&root, &guardian.base_branch, &forge_cfg);
-    forge_cfg.remote = Some(remote_name.clone());
-    let client = crate::forge::resolve_remote(&root, &forge_cfg)?;
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let client = crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg)?;
     let pr_number = pr
         .pr_number
         .ok_or_else(|| "PR has no recorded number yet".to_string())?;
@@ -2093,6 +3044,7 @@ fn action_pr_feedback_inner(
         .into_iter()
         .filter(|c| !already.contains(&c.external_id))
         .collect();
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus [pr] pr {pr_id} comments fresh={} already_actioned={}",
@@ -2100,6 +3052,7 @@ fn action_pr_feedback_inner(
         already.len()
     );
     if fresh.is_empty() {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(DEBUG, "ralphus [pr] pr {pr_id} no new comments to action");
         return Ok(0);
     }
@@ -2126,6 +3079,7 @@ fn action_pr_feedback_inner(
             .ok_or_else(|| "guardian has no enabled branches".to_string())?,
     };
 
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus [pr] pr {pr_id} feedback applying {} comment(s) to guardian={} position={position}",
@@ -2180,6 +3134,7 @@ fn action_pr_feedback_inner(
             &local_ref,
             pr.last_pushed_sha.as_deref(),
         )?;
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
@@ -3200,7 +4155,8 @@ mod tests {
             &client,
             &[7, 8],
             &[("pr-x".to_string(), 7, "new-base".to_string())],
-        );
+        )
+        .unwrap();
 
         let (seen, created_payload) = handle.join().unwrap();
         assert_eq!(
@@ -3244,13 +4200,14 @@ mod tests {
             Some("tok".to_string()),
         );
 
-        repoint_stacked_prs(
+        let result = repoint_stacked_prs(
             &store,
             &gid,
             &client,
             &[7, 8],
             &[("pr-x".to_string(), 7, "new-base".to_string())],
         );
+        assert!(result.is_err());
 
         assert_eq!(
             store
@@ -3540,6 +4497,317 @@ mod tests {
         assert_eq!(s.get_pull_request(&pr_c).unwrap().base_ref, "main");
         assert_eq!(s.get_pull_request(&pr_a).unwrap().base_ref, "c");
         assert_eq!(s.get_pull_request(&pr_b).unwrap().base_ref, "a");
+    }
+
+    fn synchronous_multi_branch_base_sync(forge: &str) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let forge_name = forge.to_string();
+        let handle = std::thread::spawn(move || {
+            let mut bases = Vec::new();
+            for number in 1..=3 {
+                let mut req = server.recv().unwrap();
+                let expected_method = if forge_name == "github" {
+                    tiny_http::Method::Patch
+                } else {
+                    tiny_http::Method::Put
+                };
+                assert_eq!(req.method(), &expected_method);
+                let expected_path = if forge_name == "github" {
+                    format!("/repos/acme/widget/pulls/{number}")
+                } else {
+                    format!("/projects/acme%2Fwidget/merge_requests/{number}")
+                };
+                assert_eq!(req.url(), expected_path);
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                bases.push(
+                    payload
+                        .get(if forge_name == "github" {
+                            "base"
+                        } else {
+                            "target_branch"
+                        })
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap()
+                        .to_string(),
+                );
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+            }
+            bases
+        });
+
+        let root = tmp_dir(&format!("sync-base-{forge}"));
+        g(&root, &["init"]);
+        let remote = if forge == "github" {
+            "https://github.com/acme/widget.git"
+        } else {
+            "https://gitlab.com/acme/widget.git"
+        };
+        g(&root, &["remote", "add", "origin", remote]);
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"{forge}\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "release", root.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b", "c"] {
+            store
+                .lock()
+                .unwrap()
+                .add_guardian_branch(&gid, branch)
+                .unwrap();
+        }
+        let ids: Vec<_> = store
+            .lock()
+            .unwrap()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|branch| branch.id)
+            .collect();
+        for (idx, (alias, old_base)) in [
+            ("a-alias", "main"),
+            ("b-alias", "a-alias"),
+            ("c-alias", "b-alias"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .lock()
+                .unwrap()
+                .create_pull_request(
+                    &gid,
+                    Some(&ids[idx]),
+                    forge,
+                    "acme/widget",
+                    alias,
+                    old_base,
+                    alias,
+                    "",
+                    Some(i64::try_from(idx).unwrap() + 1),
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(resync_pr_bases_synchronously(&store, &gid).unwrap(), 3);
+        assert_eq!(
+            handle.join().unwrap(),
+            vec!["release", "a-alias", "b-alias"]
+        );
+        let rows = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|pr| pr.base_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release", "a-alias", "b-alias"]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synchronous_multi_branch_base_sync_updates_every_github_pr() {
+        synchronous_multi_branch_base_sync("github");
+    }
+
+    #[test]
+    fn synchronous_multi_branch_base_sync_updates_every_gitlab_mr() {
+        synchronous_multi_branch_base_sync("gitlab");
+    }
+
+    #[test]
+    fn reconstruct_forge_chain_walks_bases_in_position_order_when_unchanged() {
+        let live_base = HashMap::from([
+            ("a".to_string(), "main".to_string()),
+            ("b".to_string(), "a-alias".to_string()),
+            ("c".to_string(), "b-alias".to_string()),
+        ]);
+        let alias_by_branch = HashMap::from([
+            ("a".to_string(), "a-alias".to_string()),
+            ("b".to_string(), "b-alias".to_string()),
+            ("c".to_string(), "c-alias".to_string()),
+        ]);
+        assert_eq!(
+            reconstruct_forge_chain("main", &live_base, &alias_by_branch),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn reconstruct_forge_chain_detects_a_stack_reordered_on_the_forge() {
+        // c now leads (bases straight on main); a follows c; b still follows a.
+        let live_base = HashMap::from([
+            ("c".to_string(), "main".to_string()),
+            ("a".to_string(), "c-alias".to_string()),
+            ("b".to_string(), "a-alias".to_string()),
+        ]);
+        let alias_by_branch = HashMap::from([
+            ("a".to_string(), "a-alias".to_string()),
+            ("b".to_string(), "b-alias".to_string()),
+            ("c".to_string(), "c-alias".to_string()),
+        ]);
+        assert_eq!(
+            reconstruct_forge_chain("main", &live_base, &alias_by_branch),
+            Some(vec!["c".to_string(), "a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn reconstruct_forge_stack_detects_a_new_base_for_a_multi_pr_chain() {
+        let live = HashMap::from([
+            (
+                "a".to_string(),
+                crate::forge::PullRequestBaseState {
+                    base: "release".to_string(),
+                    updated_at_ms: 9_000,
+                },
+            ),
+            (
+                "b".to_string(),
+                crate::forge::PullRequestBaseState {
+                    base: "a-alias".to_string(),
+                    updated_at_ms: 8_000,
+                },
+            ),
+            (
+                "c".to_string(),
+                crate::forge::PullRequestBaseState {
+                    base: "b-alias".to_string(),
+                    updated_at_ms: 8_000,
+                },
+            ),
+        ]);
+        let aliases = HashMap::from([
+            ("a".to_string(), "a-alias".to_string()),
+            ("b".to_string(), "b-alias".to_string()),
+            ("c".to_string(), "c-alias".to_string()),
+        ]);
+        assert_eq!(
+            reconstruct_forge_stack(&live, &aliases),
+            Some((
+                "release".to_string(),
+                9_000,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reconstruct_forge_chain_is_none_on_a_fork() {
+        // a and b both claim to base directly on main -- unresolvable without guessing.
+        let live_base = HashMap::from([
+            ("a".to_string(), "main".to_string()),
+            ("b".to_string(), "main".to_string()),
+        ]);
+        let alias_by_branch = HashMap::new();
+        assert_eq!(
+            reconstruct_forge_chain("main", &live_base, &alias_by_branch),
+            None
+        );
+    }
+
+    #[test]
+    fn reconstruct_forge_chain_is_none_on_a_dangling_base() {
+        // b's base ref matches nothing reachable from main (a's alias is wrong/stale).
+        let live_base = HashMap::from([
+            ("a".to_string(), "main".to_string()),
+            ("b".to_string(), "some-unrelated-branch".to_string()),
+        ]);
+        let alias_by_branch = HashMap::from([("a".to_string(), "a-alias".to_string())]);
+        assert_eq!(
+            reconstruct_forge_chain("main", &live_base, &alias_by_branch),
+            None
+        );
+    }
+
+    #[test]
+    fn reconstruct_forge_chain_empty_input_is_an_empty_order() {
+        assert_eq!(
+            reconstruct_forge_chain("main", &HashMap::new(), &HashMap::new()),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn resync_in_flight_guard_rejects_a_second_claim_for_the_same_guardian() {
+        let id = "guardian-resync-guard-test".to_string();
+        RESYNCING.lock().unwrap().remove(&id); // in case a prior failed run left it set
+        assert!(
+            RESYNCING.lock().unwrap().insert(id.clone()),
+            "first claim should win"
+        );
+        assert!(
+            !RESYNCING.lock().unwrap().insert(id.clone()),
+            "second claim while the first is still in flight must be rejected"
+        );
+        RESYNCING.lock().unwrap().remove(&id);
+        assert!(
+            RESYNCING.lock().unwrap().insert(id.clone()),
+            "claim should be available again once released"
+        );
+        RESYNCING.lock().unwrap().remove(&id);
+    }
+
+    #[test]
+    fn claim_guardian_for_forge_reorder_only_succeeds_from_in_review() {
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        // Freshly created guardians start out `collecting`, not `in_review`.
+        assert!(!claim_guardian_for_forge_reorder(&store, &gid));
+        assert_eq!(
+            store.lock().unwrap().get_guardian(&gid).unwrap().status,
+            "collecting"
+        );
+
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::InReview, None)
+            .unwrap();
+        assert!(claim_guardian_for_forge_reorder(&store, &gid));
+        assert_eq!(
+            store.lock().unwrap().get_guardian(&gid).unwrap().status,
+            "merging"
+        );
+        // Already claimed -- a second attempt loses the race.
+        assert!(!claim_guardian_for_forge_reorder(&store, &gid));
+    }
+
+    #[test]
+    fn detect_forge_reorder_is_a_noop_with_fewer_than_two_stacked_prs() {
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "a")
+            .unwrap();
+        // No open PRs at all yet -- nothing to compare against the forge.
+        assert_eq!(detect_forge_reorder(&store, &gid).unwrap(), None);
     }
 
     #[test]
@@ -3900,100 +5168,6 @@ mod tests {
             strip_remote_prefix("upstream/main", "origin"),
             "upstream/main"
         );
-    }
-
-    #[test]
-    fn remote_from_base_branch_detects_a_real_configured_remote() {
-        let root = tmp_dir("remote-detect");
-        g(&root, &["init", "-b", "main"]);
-        g(
-            &root,
-            &["remote", "add", "origin", "https://example.com/a/b.git"],
-        );
-        g(
-            &root,
-            &["remote", "add", "gitlab", "https://gitlab.com/a/b.git"],
-        );
-
-        assert_eq!(
-            remote_from_base_branch(&root, "gitlab/main"),
-            Some("gitlab".to_string())
-        );
-        assert_eq!(
-            remote_from_base_branch(&root, "origin/main"),
-            Some("origin".to_string())
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn remote_from_base_branch_is_none_for_a_plain_branch_or_unknown_remote() {
-        let root = tmp_dir("remote-detect-none");
-        g(&root, &["init", "-b", "main"]);
-        g(
-            &root,
-            &["remote", "add", "origin", "https://example.com/a/b.git"],
-        );
-
-        assert_eq!(remote_from_base_branch(&root, "main"), None);
-        assert_eq!(
-            remote_from_base_branch(&root, "colin/feature"),
-            None,
-            "a personal branch name that happens to contain a slash must not be mistaken for a remote"
-        );
-        assert_eq!(
-            remote_from_base_branch(&root, "features/foo/bar"),
-            None,
-            "a slash-namespaced branch name (e.g. features/foo/bar) whose leading segment isn't a \
-             configured remote must not be mistaken for one either"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn effective_remote_name_falls_back_to_default_for_a_slash_namespaced_branch_name() {
-        let root = tmp_dir("effective-remote-namespaced");
-        g(&root, &["init", "-b", "main"]);
-        g(
-            &root,
-            &["remote", "add", "origin", "https://example.com/a/b.git"],
-        );
-
-        let cfg = crate::config::ForgeConfig::default();
-        assert_eq!(
-            effective_remote_name(&root, "features/foo/bar", &cfg),
-            "origin",
-            "the leading segment ('features') isn't a real remote, so this must fall back to the \
-             config/origin default instead of misreading it as a remote name"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn effective_remote_name_prefers_base_branchs_own_remote_over_the_config_default() {
-        let root = tmp_dir("effective-remote");
-        g(&root, &["init", "-b", "main"]);
-        g(
-            &root,
-            &["remote", "add", "origin", "https://example.com/a/b.git"],
-        );
-        g(
-            &root,
-            &["remote", "add", "gitlab", "https://gitlab.com/a/b.git"],
-        );
-
-        let cfg = crate::config::ForgeConfig::default();
-        assert_eq!(
-            effective_remote_name(&root, "gitlab/main", &cfg),
-            "gitlab",
-            "the base branch's own remote prefix must win over the project config default"
-        );
-        assert_eq!(
-            effective_remote_name(&root, "main", &cfg),
-            "origin",
-            "falls back to the config/origin default when base_branch names no remote"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

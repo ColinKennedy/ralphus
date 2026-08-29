@@ -1,8 +1,8 @@
 //! `ralphus review <subcommand>`, ported from `cli/src/ralphus/__main__.py`'s
 //! `review` group (Guardian code review management) -- by far the widest
-//! command tree in the CLI: ~24 top-level leaf commands plus six nested
-//! subcommand groups (`base`, `pr`, `branch`, `checks`, `action`, `chat`),
-//! each with their own leaves.
+//! command tree in the CLI: ~24 top-level leaf commands plus five nested
+//! subcommand groups (`upstream`, `pr`, `branch`, `checks`, `action`), each with
+//! their own leaves.
 //!
 //! One pair of commands is deliberately not fully wired to the daemon:
 //!
@@ -110,6 +110,9 @@ pub enum ReviewCommand {
     Merge {
         selector: String,
     },
+    SyncGithub {
+        selector: String,
+    },
     RestartMerge {
         selector: String,
     },
@@ -133,12 +136,11 @@ pub enum ReviewCommand {
         selector: String,
         to_review: String,
     },
-    Base(ReviewBaseCommand),
+    Upstream(ReviewUpstreamCommand),
     Pr(ReviewPrCommand),
     Branch(ReviewBranchCommand),
     Checks(ReviewChecksCommand),
     Action(ReviewActionCommand),
-    Chat(ReviewChatCommand),
     UsageError(String),
 }
 
@@ -152,7 +154,7 @@ pub struct GuardianEnvArgs {
 }
 
 #[derive(Debug, Clone)]
-pub enum ReviewBaseCommand {
+pub enum ReviewUpstreamCommand {
     Help,
     List { selector: String },
     Set { selector: String, branch: String },
@@ -235,24 +237,6 @@ pub enum ReviewActionCommand {
         selector: String,
         index: i64,
         input: Vec<(String, String)>,
-    },
-    UsageError(String),
-}
-
-#[derive(Debug, Clone)]
-pub enum ReviewChatCommand {
-    Help,
-    Send {
-        selector: String,
-        text: String,
-    },
-    Show {
-        selector: String,
-    },
-    Fork {
-        selector: String,
-        seq: i64,
-        text: String,
     },
     UsageError(String),
 }
@@ -394,6 +378,9 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             }
         }
         Some("merge") => with_selector(scanner, |selector| ReviewCommand::Merge { selector }),
+        Some("sync-github") => {
+            with_selector(scanner, |selector| ReviewCommand::SyncGithub { selector })
+        }
         Some("restart-merge") => {
             with_selector(scanner, |selector| ReviewCommand::RestartMerge { selector })
         }
@@ -429,12 +416,11 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 ),
             }
         }
-        Some("base") => ReviewCommand::Base(parse_base(&scanner.remaining())),
+        Some("upstream") => ReviewCommand::Upstream(parse_upstream(&scanner.remaining())),
         Some("pr") => ReviewCommand::Pr(parse_pr(&scanner.remaining())),
         Some("branch") => ReviewCommand::Branch(parse_branch(&scanner.remaining())),
         Some("checks") => ReviewCommand::Checks(parse_checks(&scanner.remaining())),
         Some("action") => ReviewCommand::Action(parse_action(&scanner.remaining())),
-        Some("chat") => ReviewCommand::Chat(parse_chat(&scanner.remaining())),
         Some(other) => ReviewCommand::UsageError(format!("unknown review subcommand: {other}")),
     }
 }
@@ -492,36 +478,40 @@ fn parse_kv_list(raw: &[String]) -> Result<Vec<(String, String)>, UsageError> {
     raw.iter().map(|s| parse_kv(s)).collect()
 }
 
-fn parse_base(args: &[String]) -> ReviewBaseCommand {
+fn parse_upstream(args: &[String]) -> ReviewUpstreamCommand {
     let scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None | Some("help" | "--help" | "-h") => ReviewBaseCommand::Help,
+        None | Some("help" | "--help" | "-h") => ReviewUpstreamCommand::Help,
         Some("list") => {
-            with_selector_base(scanner, |selector| ReviewBaseCommand::List { selector })
+            with_selector_upstream(scanner, |selector| ReviewUpstreamCommand::List { selector })
         }
         Some("set") => {
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
-                (Some(selector), Some(branch)) => ReviewBaseCommand::Set {
+                (Some(selector), Some(branch)) => ReviewUpstreamCommand::Set {
                     selector: selector.clone(),
                     branch: branch.clone(),
                 },
-                _ => ReviewBaseCommand::UsageError("set requires <selector> <branch>".to_string()),
+                _ => ReviewUpstreamCommand::UsageError(
+                    "set requires <selector> <branch>".to_string(),
+                ),
             }
         }
-        Some(other) => {
-            ReviewBaseCommand::UsageError(format!("unknown review base subcommand: {other}"))
-        }
+        Some(other) => ReviewUpstreamCommand::UsageError(format!(
+            "unknown review upstream subcommand: {other}"
+        )),
     }
 }
 
-fn with_selector_base(
+fn with_selector_upstream(
     scanner: Scanner,
-    make: impl FnOnce(String) -> ReviewBaseCommand,
-) -> ReviewBaseCommand {
+    make: impl FnOnce(String) -> ReviewUpstreamCommand,
+) -> ReviewUpstreamCommand {
     match scanner.remaining().into_iter().next() {
         Some(selector) => make(selector),
-        None => ReviewBaseCommand::UsageError("missing required <selector> argument".to_string()),
+        None => {
+            ReviewUpstreamCommand::UsageError("missing required <selector> argument".to_string())
+        }
     }
 }
 
@@ -781,57 +771,6 @@ fn with_selector_action(
     match scanner.remaining().into_iter().next() {
         Some(selector) => make(selector),
         None => ReviewActionCommand::UsageError("missing required <selector> argument".to_string()),
-    }
-}
-
-fn parse_chat(args: &[String]) -> ReviewChatCommand {
-    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
-    match args.first().map(String::as_str) {
-        None | Some("help" | "--help" | "-h") => ReviewChatCommand::Help,
-        Some("send") => {
-            let rest = scanner.remaining();
-            match (rest.first(), rest.get(1)) {
-                (Some(selector), Some(text)) => ReviewChatCommand::Send {
-                    selector: selector.clone(),
-                    text: text.clone(),
-                },
-                _ => ReviewChatCommand::UsageError("send requires <selector> <text>".to_string()),
-            }
-        }
-        Some("show") => {
-            with_selector_chat(scanner, |selector| ReviewChatCommand::Show { selector })
-        }
-        Some("fork") => {
-            let seq = match scanner.take_parsed::<i64>("--seq") {
-                Ok(Some(v)) => v,
-                Ok(None) => {
-                    return ReviewChatCommand::UsageError("fork requires --seq <n>".to_string());
-                }
-                Err(e) => return ReviewChatCommand::UsageError(e.0),
-            };
-            let rest = scanner.remaining();
-            match (rest.first(), rest.get(1)) {
-                (Some(selector), Some(text)) => ReviewChatCommand::Fork {
-                    selector: selector.clone(),
-                    seq,
-                    text: text.clone(),
-                },
-                _ => ReviewChatCommand::UsageError("fork requires <selector> <text>".to_string()),
-            }
-        }
-        Some(other) => {
-            ReviewChatCommand::UsageError(format!("unknown review chat subcommand: {other}"))
-        }
-    }
-}
-
-fn with_selector_chat(
-    scanner: Scanner,
-    make: impl FnOnce(String) -> ReviewChatCommand,
-) -> ReviewChatCommand {
-    match scanner.remaining().into_iter().next() {
-        Some(selector) => make(selector),
-        None => ReviewChatCommand::UsageError("missing required <selector> argument".to_string()),
     }
 }
 
@@ -1317,6 +1256,14 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, |_| println!("{selector} merge started"));
             Ok(())
         }),
+        ReviewCommand::SyncGithub { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_sync_github(&resolved.guardian_id)?;
+            emit(opts, &result, |_| {
+                println!("{selector} checking the forge for a stack reorder")
+            });
+            Ok(())
+        }),
         ReviewCommand::RestartMerge { selector } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let result = client.guardian_cancel_and_merge(&resolved.guardian_id)?;
@@ -1403,12 +1350,11 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 Err(e) => fail_daemon(opts, e),
             }
         }
-        ReviewCommand::Base(c) => dispatch_base(c, opts, &client),
+        ReviewCommand::Upstream(c) => dispatch_upstream(c, opts, &client),
         ReviewCommand::Pr(c) => dispatch_pr(c, opts, &client),
         ReviewCommand::Branch(c) => dispatch_branch(c, opts, &client),
         ReviewCommand::Checks(c) => dispatch_checks(c, opts, &client),
         ReviewCommand::Action(c) => dispatch_action(c, opts, &client),
-        ReviewCommand::Chat(c) => dispatch_chat(c, opts, &client),
     }
 }
 
@@ -1500,27 +1446,27 @@ fn dispatch_guardian_env(
     })
 }
 
-fn dispatch_base(cmd: ReviewBaseCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
+fn dispatch_upstream(cmd: ReviewUpstreamCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
     match cmd {
-        ReviewBaseCommand::Help => {
+        ReviewUpstreamCommand::Help => {
             println!(
                 "{}",
-                crate::help_map::command_help(&["review", "base"])
-                    .expect("review base help exists")
+                crate::help_map::command_help(&["review", "upstream"])
+                    .expect("review upstream help exists")
             );
             0
         }
-        ReviewBaseCommand::UsageError(m) => {
+        ReviewUpstreamCommand::UsageError(m) => {
             println!("usage error: {m}");
             2
         }
-        ReviewBaseCommand::List { selector } => run_and_report(opts, None, || {
+        ReviewUpstreamCommand::List { selector } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let branches = client.guardian_base_branches(&resolved.guardian_id)?;
             emit(opts, &branches, |bs| {
                 let bs = bs.as_array().cloned().unwrap_or_default();
                 if bs.is_empty() {
-                    println!("no candidate base branches");
+                    println!("no candidate upstream branches");
                     return;
                 }
                 for b in &bs {
@@ -1529,11 +1475,11 @@ fn dispatch_base(cmd: ReviewBaseCommand, opts: &GlobalOpts, client: &DaemonClien
             });
             Ok(())
         }),
-        ReviewBaseCommand::Set { selector, branch } => run_and_report(opts, None, || {
+        ReviewUpstreamCommand::Set { selector, branch } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let result = client.guardian_change_base(&resolved.guardian_id, &branch)?;
             emit(opts, &result, |_| {
-                println!("{selector} base branch -> '{branch}'")
+                println!("{selector} upstream branch -> '{branch}'")
             });
             Ok(())
         }),
@@ -2117,45 +2063,6 @@ fn dispatch_action_run(
     0
 }
 
-fn dispatch_chat(cmd: ReviewChatCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
-    match cmd {
-        ReviewChatCommand::Help => {
-            println!(
-                "{}",
-                crate::help_map::command_help(&["review", "chat"])
-                    .expect("review chat help exists")
-            );
-            0
-        }
-        ReviewChatCommand::UsageError(m) => {
-            println!("usage error: {m}");
-            2
-        }
-        ReviewChatCommand::Send { selector, text } => run_and_report(opts, None, || {
-            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
-            let result = client.guardian_chat(&resolved.guardian_id, &text, None)?;
-            emit(opts, &result, |_| println!("message posted"));
-            Ok(())
-        }),
-        ReviewChatCommand::Show { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
-            let messages = client.guardian_messages(&resolved.guardian_id)?;
-            emit(opts, &messages, render_chat_messages);
-            Ok(())
-        }),
-        ReviewChatCommand::Fork {
-            selector,
-            seq,
-            text,
-        } => run_and_report(opts, None, || {
-            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
-            let result = client.guardian_chat_fork(&resolved.guardian_id, seq, &text, None)?;
-            emit(opts, &result, |_| println!("forked at seq={seq}"));
-            Ok(())
-        }),
-    }
-}
-
 // ---- rendering -------------------------------------------------------------
 
 fn render_review_list(guardians: &Value) {
@@ -2479,17 +2386,6 @@ fn render_pr_comments(rows: &Value) {
     }
 }
 
-fn render_chat_messages(messages: &Value) {
-    let msgs = messages["messages"].as_array().cloned().unwrap_or_default();
-    if msgs.is_empty() {
-        println!("no messages");
-        return;
-    }
-    for m in &msgs {
-        println!("[{}] {}: {}", m["seq"], m["role"], m["text"]);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2713,6 +2609,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_sync_github() {
+        match parse(&v(&["sync-github", "g1"])) {
+            ReviewCommand::SyncGithub { selector } => assert_eq!(selector, "g1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_reorder_with_disable_enable() {
         match parse(&v(&[
             "reorder",
@@ -2764,17 +2668,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_base_list() {
-        match parse(&v(&["base", "list", "g1"])) {
-            ReviewCommand::Base(ReviewBaseCommand::List { selector }) => assert_eq!(selector, "g1"),
+    fn parses_upstream_list() {
+        match parse(&v(&["upstream", "list", "g1"])) {
+            ReviewCommand::Upstream(ReviewUpstreamCommand::List { selector }) => {
+                assert_eq!(selector, "g1");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn parses_base_set() {
-        match parse(&v(&["base", "set", "g1", "main"])) {
-            ReviewCommand::Base(ReviewBaseCommand::Set { selector, branch }) => {
+    fn parses_upstream_set() {
+        match parse(&v(&["upstream", "set", "g1", "main"])) {
+            ReviewCommand::Upstream(ReviewUpstreamCommand::Set { selector, branch }) => {
                 assert_eq!(selector, "g1");
                 assert_eq!(branch, "main");
             }
@@ -2783,10 +2689,10 @@ mod tests {
     }
 
     #[test]
-    fn bare_base_is_help() {
+    fn bare_upstream_is_help() {
         matches!(
-            parse(&v(&["base"])),
-            ReviewCommand::Base(ReviewBaseCommand::Help)
+            parse(&v(&["upstream"])),
+            ReviewCommand::Upstream(ReviewUpstreamCommand::Help)
         );
     }
 
@@ -3013,41 +2919,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_chat_send_show_fork() {
-        match parse(&v(&["chat", "send", "g1", "hello there"])) {
-            ReviewCommand::Chat(ReviewChatCommand::Send { selector, text }) => {
-                assert_eq!(selector, "g1");
-                assert_eq!(text, "hello there");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        matches!(
-            parse(&v(&["chat", "show", "g1"])),
-            ReviewCommand::Chat(ReviewChatCommand::Show { .. })
-        );
-        match parse(&v(&["chat", "fork", "g1", "--seq", "5", "new text"])) {
-            ReviewCommand::Chat(ReviewChatCommand::Fork {
-                selector,
-                seq,
-                text,
-            }) => {
-                assert_eq!(selector, "g1");
-                assert_eq!(seq, 5);
-                assert_eq!(text, "new text");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn chat_fork_requires_seq() {
-        matches!(
-            parse(&v(&["chat", "fork", "g1", "text"])),
-            ReviewCommand::Chat(ReviewChatCommand::UsageError(_))
-        );
-    }
-
-    #[test]
     fn unknown_review_subcommand_is_usage_error() {
         matches!(parse(&v(&["bogus"])), ReviewCommand::UsageError(_));
     }
@@ -3069,10 +2940,6 @@ mod tests {
         matches!(
             parse(&v(&["action", "bogus"])),
             ReviewCommand::Action(ReviewActionCommand::UsageError(_))
-        );
-        matches!(
-            parse(&v(&["chat", "bogus"])),
-            ReviewCommand::Chat(ReviewChatCommand::UsageError(_))
         );
     }
 

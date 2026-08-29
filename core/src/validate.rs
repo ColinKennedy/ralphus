@@ -208,7 +208,7 @@ const REVIEW_KEYS: &[&str] = &[
     "agent",
     "model",
     "machine",
-    "base",
+    "upstream",
     "action",
     "maximum_budget_usd",
 ];
@@ -930,7 +930,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "name", Ty::Str, &rpath, header);
         check_type(ctx, table, "agent", Ty::Str, &rpath, header);
         check_type(ctx, table, "model", Ty::Str, &rpath, header);
-        check_type(ctx, table, "base", Ty::Str, &rpath, header);
+        check_type(ctx, table, "upstream", Ty::Str, &rpath, header);
         check_machine(ctx, table, &rpath, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &rpath, header);
         check_positive_number(ctx, table, "maximum_budget_usd", &rpath, header);

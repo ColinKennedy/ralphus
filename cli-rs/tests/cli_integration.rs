@@ -9,7 +9,7 @@
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct FakeDaemon {
     server: Arc<tiny_http::Server>,
@@ -102,6 +102,50 @@ fn run_cli_with_env(daemon_url: &str, args: &[&str], env: &[(&str, &str)]) -> (i
         .expect("failed to spawn ralphus binary");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     (output.status.code().unwrap_or(-1), stdout)
+}
+
+#[test]
+fn renamed_binary_uses_its_actual_name_in_cli_examples() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "ralphus-renamed-cli-test-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let renamed = dir.join(if cfg!(windows) {
+        "branded-cli.exe"
+    } else {
+        "branded-cli"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_ralphus"), &renamed).unwrap();
+
+    let run = |args: &[&str]| {
+        let output = Command::new(&renamed).args(args).output().unwrap();
+        assert!(output.status.success(), "args: {args:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    assert!(run(&["--version"]).starts_with("branded-cli "));
+    let tutor = run(&["tutor"]);
+    assert!(tutor.contains("branded-cli submit ral-1.toml"));
+    assert!(!tutor.contains("`ralphus "));
+    assert!(tutor.contains("<<ralphus:new-worktree/"));
+    assert!(tutor.contains("ralphus:new-review/<key>"));
+
+    let help_map = run(&["show", "help-map"]);
+    assert!(help_map.contains("- branded-cli "));
+    assert!(help_map.contains("`branded-cli submit`"));
+    assert!(!help_map.contains("- ralphus "));
+    assert!(!help_map.contains("`ralphus "));
+
+    assert!(run(&["quick-start", "manager"]).starts_with("branded-cli quick-start manager "));
+    assert!(run(&["completion"]).starts_with("# branded-cli shell completion"));
+
+    std::fs::remove_file(&renamed).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
 }
 
 #[test]

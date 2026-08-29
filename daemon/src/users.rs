@@ -41,6 +41,18 @@ impl Store {
             rusqlite::params![name, now_ms()],
         )?;
         crate::rlog!(INFO, "ralphus [store] user {name:?} registered");
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "user registered",
+            scope: Some("user"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({ "name": name }),
+        });
         Ok(())
     }
 
@@ -93,6 +105,18 @@ impl Store {
             .execute("DELETE FROM users WHERE name = ?", rusqlite::params![name])?;
         if n > 0 {
             crate::rlog!(INFO, "ralphus [store] user {name:?} removed");
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "store",
+                message: "user removed",
+                scope: Some("user"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "name": name }),
+            });
         }
         Ok(n > 0)
     }

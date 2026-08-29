@@ -2,9 +2,9 @@
 
 A Guardian review takes the branches produced by a squad's tasks and stacks
 them into a single rebased review branch — resolving merge conflicts with an
-agent, running your declared check gates, and giving you a chat channel to
-request changes before anything is approved. The Reviews tab is where you
-watch and steer that process.
+agent, running your declared check gates, and giving you a per-branch
+feedback thread to request changes before anything is approved. The Reviews
+tab is where you watch and steer that process.
 
 ## Branch order — and how it relates to task dependencies
 
@@ -36,14 +36,13 @@ branch is rebuilt). **▶ Run all** launches every suggested command at once in
 a new terminal in the repository root; the **▾** next to it opens the
 individual commands so you can run just one.
 
-## Feedback chat
+## Feedback
 
 ![A feedback thread with one reviewer note and one guardian reply describing an amend + push](../screenshots/reviews-chat.png)
 
-The chat at the bottom of a review is a live channel to the guardian agent.
-Post a note — pointed at the whole review or, from a branch's expanded
-detail, at one specific branch — and the agent applies it directly in the
-review worktree, amends the affected commit, and pushes the update. The
-branch's merge status and the change summary refresh automatically once
-that lands, so you see the result of your feedback without triggering
-anything yourself.
+Expand a branch's detail view to see its own read-only feedback thread and
+post a note. The guardian agent applies your feedback directly in that
+branch's review worktree, amends the affected commit, and pushes the update,
+posting a short acknowledgment back to the thread. The branch's merge status
+and the change summary refresh automatically once that lands, so you see the
+result of your feedback without triggering anything yourself.

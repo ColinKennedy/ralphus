@@ -133,6 +133,7 @@ fn write_attempt_in(
 ) {
     let dir = session_dir_in(root, session_name);
     if let Err(e) = std::fs::create_dir_all(&dir) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [terminal_log] could not create dir {}: {e}",
@@ -161,6 +162,7 @@ fn write_attempt_in(
     );
     let path = attempt_path_in(root, session_name, attempt);
     if let Err(e) = std::fs::write(&path, format!("{header}{truncated}")) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [terminal_log] could not write attempt log {}: {e}",

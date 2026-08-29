@@ -70,67 +70,6 @@ pub(crate) enum StartMergeOutcome {
     AlreadyInProgress,
 }
 
-// ---------------------------------------------------------------------------
-// XML route-block helpers (RAL-35)
-// ---------------------------------------------------------------------------
-
-/// Parse `<route branch="BRANCH">...instructions...</route>` blocks from text.
-/// Returns `(branch_name, instructions)` pairs in document order.
-fn parse_route_blocks(text: &str) -> Vec<(String, String)> {
-    let mut routes = Vec::new();
-    let mut pos = 0;
-    let close = "</route>";
-    while let Some(tag_start) = text[pos..].find("<route ").map(|i| pos + i) {
-        let Some(tag_end) = text[tag_start..].find('>').map(|i| tag_start + i) else {
-            break;
-        };
-        let tag = &text[tag_start..=tag_end];
-        let Some(branch) = extract_xml_attr(tag, "branch") else {
-            pos = tag_end + 1;
-            continue;
-        };
-        let content_start = tag_end + 1;
-        let Some(close_offset) = text[content_start..].find(close) else {
-            break;
-        };
-        let instructions = text[content_start..content_start + close_offset]
-            .trim()
-            .to_string();
-        routes.push((branch, instructions));
-        pos = content_start + close_offset + close.len();
-    }
-    routes
-}
-
-/// Extract the value of an XML attribute (`name="value"`) from a tag string.
-fn extract_xml_attr(tag: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = tag.find(needle.as_str())? + needle.len();
-    let end = tag[start..].find('"')? + start;
-    Some(tag[start..end].to_string())
-}
-
-/// Remove all `<route ...>...</route>` blocks from text; return the remainder,
-/// trimmed. The resulting string is what is shown to the reviewer.
-fn strip_route_blocks(text: &str) -> String {
-    let mut result = String::new();
-    let mut pos = 0;
-    let close = "</route>";
-    loop {
-        let Some(tag_start) = text[pos..].find("<route ").map(|i| pos + i) else {
-            result.push_str(&text[pos..]);
-            break;
-        };
-        result.push_str(&text[pos..tag_start]);
-        let Some(close_offset) = text[tag_start..].find(close).map(|i| tag_start + i) else {
-            result.push_str(&text[tag_start..]);
-            break;
-        };
-        pos = close_offset + close.len();
-    }
-    result.trim().to_string()
-}
-
 /// Return `true` when the user message expresses intent to skip committing.
 ///
 /// Matches phrases like "don't commit", "do not commit", "don't add", and
@@ -154,13 +93,6 @@ fn is_no_commit_intent(text: &str) -> bool {
         "do not stage",
     ];
     phrases.iter().any(|p| lower.contains(p))
-}
-
-/// Get the current HEAD commit hash in a worktree. Returns `None` if git fails.
-fn head_hash(wt: &Workspace) -> Option<String> {
-    wt.git(&["rev-parse", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
 }
 
 /// Marker the conflict-resolver agent outputs after `git add -A` to signal the
@@ -515,6 +447,7 @@ fn regen_from_feature_worktree(
                         feature_wt.display()
                     )
                 })?;
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] worktree recovery: feature branch '{branch}' is absent; \
@@ -612,6 +545,7 @@ fn worktree_add_or_reset(
         let _ = root.git(&["worktree", "unlock", &wt_str]);
         let _ = wt.git(&["rebase", "--abort"]);
         if worktree_has_changes(wt) {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] worktree recovery: discarding uncommitted changes in {wt_str} \
@@ -652,6 +586,7 @@ fn worktree_add_or_reset(
     // rather than a linked worktree — wipe and recreate. Otherwise the `.git`
     // file is absent, malformed, or stale; `relink_worktree` will fix it.
     if !is_valid_linked_worktree(wt) && wt.exists(".git") {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [guardian] worktree recovery: directory at {wt_str} is a main git \
@@ -677,6 +612,7 @@ fn worktree_add_or_reset(
 
     // Warn before discarding local changes.
     if worktree_has_changes(wt) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [guardian] worktree recovery: discarding uncommitted changes in {wt_str} \
@@ -702,6 +638,25 @@ fn worktree_add_or_reset(
                     .map_err(|e| format!("{checkout_err}; regen: {e}"))
             }
         }
+    }
+}
+
+fn log_worktree_remove_attempt(
+    wt: &str,
+    force_count: u8,
+    result: &std::result::Result<String, String>,
+) {
+    match result {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        Ok(_) => crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] worktree recovery: remove path={wt:?} forces={force_count} outcome=ok"
+        ),
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        Err(error) => crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] worktree recovery: remove path={wt:?} forces={force_count} outcome=error error={error:?}"
+        ),
     }
 }
 
@@ -2062,9 +2017,9 @@ fn run_commit_checks(
 /// Deterministic short worktree-directory names (RAL-211) for every currently
 /// enabled branch a guardian is building in `project` (or, when `project` is
 /// `None`, every enabled branch regardless of project -- used by the
-/// feedback-routing paths, which only ever operate on single-project
-/// guardians, the same assumption `dispatch_routes` already makes when it
-/// resolves `wt_base` from the guardian's primary `git_root`).
+/// feedback-routing path, which only ever operates on single-project
+/// guardians and resolves `wt_base` from the guardian's primary `git_root`
+/// under that same assumption).
 ///
 /// Computed fresh from the store's current branch rows every time, in
 /// position order, rather than threaded through as state: as long as every
@@ -2118,8 +2073,8 @@ fn branch_wt_dir(
 /// at `from_position` (which is assumed to already have the desired HEAD). Runs
 /// check gates on each branch; finalises the combined worktree at the end.
 ///
-/// Extracted so both [`run_feedback`] and [`dispatch_routes`] can share the
-/// downstream-rebase logic without duplication.
+/// Used by [`run_feedback`] to apply the downstream-rebase logic after a
+/// routed change lands on one branch.
 #[allow(clippy::too_many_arguments)]
 fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     store: &Arc<Mutex<Store>>,
@@ -2266,254 +2221,6 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
-}
-
-/// Dispatch a list of `(branch_name, instructions)` route blocks to fresh agents
-/// in their respective review worktrees (RAL-35). Blocks until every agent
-/// finishes, then re-stacks all branches downstream of the lowest modified
-/// position and rebuilds the combined worktree.
-fn dispatch_routes(
-    store: &Arc<Mutex<Store>>,
-    runner: Arc<dyn Runner>,
-    id: &str,
-    routes: &[(String, String)],
-    guardian: &crate::guardian::GuardianView,
-    no_commit: bool,
-) {
-    if routes.is_empty() {
-        return;
-    }
-    crate::rlog!(
-        INFO,
-        "ralphus [guardian] review {id} routing feedback to {} branch(es) no_commit={no_commit}",
-        routes.len()
-    );
-    {
-        let guard = store.lock().expect("poisoned");
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "routing feedback to branches",
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"routes": routes.len(), "no_commit": no_commit}),
-        });
-    }
-    let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
-    let wt_base = git_root.at(worktree_dir(&guardian.git_root, id));
-    let resolved = match resolve_resolver_agent(
-        guardian.resolver_agent.as_deref(),
-        guardian.resolver_model.as_deref(),
-        Path::new(&guardian.git_root),
-    ) {
-        Ok(r) => r,
-        Err(message) => {
-            crate::rlog!(
-                ERROR,
-                "ralphus [guardian] review {id} feedback routing: unresolvable resolver agent: {message}"
-            );
-            let guard = store.lock().expect("poisoned");
-            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::ERROR,
-                source: "guardian",
-                message: "feedback routing skipped: unresolvable resolver agent",
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"error": message}),
-            });
-            return;
-        }
-    };
-
-    struct Target {
-        position: i64,
-        branch: String,
-        wt: Workspace,
-        pre_hash: String,
-        instructions: String,
-        /// RAL-191: the branch's resolved environment, captured here (from the
-        /// already-hydrated `BranchView`) rather than re-read inside the
-        /// spawned thread, which must not touch the store lock.
-        env: std::collections::BTreeMap<String, String>,
-    }
-
-    // Map each route block to a branch that has a review worktree, recording the
-    // pre-dispatch HEAD hash so changes can be detected after the agent finishes.
-    let targets: Vec<Target> = routes
-        .iter()
-        .filter_map(|(branch_name, instructions)| {
-            let bv = guardian
-                .branches
-                .iter()
-                .find(|b| &b.branch == branch_name)?;
-            let wt_str = bv.worktree.as_ref()?;
-            let wt = Workspace::for_guardian(store, id, PathBuf::from(wt_str));
-            let pre_hash = head_hash(&wt)?;
-            Some(Target {
-                position: bv.position,
-                branch: branch_name.clone(),
-                wt,
-                pre_hash,
-                instructions: instructions.clone(),
-                env: bv.resolved_env.clone(),
-            })
-        })
-        .collect();
-
-    if targets.is_empty() {
-        return;
-    }
-
-    // Spawn one thread per target; each thread uses a clone of the shared runner.
-    let handles: Vec<std::thread::JoinHandle<()>> = targets
-        .iter()
-        .map(|t| {
-            let guardian_id = id.to_string();
-            let position = t.position;
-            let branch = t.branch.clone();
-            let wt_cwd = t.wt.root().to_string_lossy().into_owned();
-            let wt_machine = t.wt.machine().map(str::to_string);
-            let wt_for_thread = t.wt.clone();
-            let instructions = t.instructions.clone();
-            let r_agent = resolved.backend.clone();
-            let r_executable = resolved.executable.clone();
-            let r_model = resolved.model.clone();
-            let branch_env = {
-                let mut env = resolved.env.clone();
-                env.extend(t.env.clone());
-                env
-            };
-            let runner_clone = runner.clone();
-            std::thread::spawn(move || {
-                // Stash any pre-existing dirty state so we only commit agent-made
-                // changes (not leftovers from a prior no-commit turn).
-                let stashed = if !no_commit {
-                    let pre = wt_for_thread
-                        .git(&["status", "--porcelain"])
-                        .unwrap_or_default();
-                    if !pre.trim().is_empty() {
-                        wt_for_thread.git(&["stash", "--include-untracked"]).is_ok()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                let prompt = if no_commit {
-                    format!(
-                        "You are implementing reviewer feedback on the feature branch \
-                         '{branch}' in its review worktree.\n\n\
-                         Task:\n{instructions}\n\n\
-                         Apply the required changes to the files. \
-                         Do not run any git commands.",
-                    )
-                } else {
-                    format!(
-                        "You are implementing reviewer feedback on the feature branch \
-                         '{branch}' in its review worktree.\n\n\
-                         Task:\n{instructions}\n\n\
-                         After making the required changes, commit them with:\n\
-                           git add -A && git commit --amend --no-edit\n\
-                         Amend the existing HEAD commit — do NOT create a new commit on \
-                         top. Do not push.",
-                    )
-                };
-                let spec = RunnerSpec {
-                    // RAL-102: unique per (guardian, branch position) — see the
-                    // comment on the resolver `RunnerSpec` above.
-                    squad_id: format!("guardian-{guardian_id}"),
-                    task: "route".to_string(),
-                    cell_id: format!("route-{position}-{}", branch.replace(['/', '.'], "-")),
-                    cwd: wt_cwd,
-                    prompt: Some(prompt),
-                    command: None,
-                    agent: r_agent,
-                    executable: r_executable,
-                    model: r_model,
-                    system_prompt: None,
-                    system_prompt_position: None,
-                    timeout_sec: None,
-                    budget_tokens: None,
-                    maximum_budget_usd: None,
-                    proof: false,
-                    trace_context: None,
-                    resume_agent_session_id: None,
-                    // RAL-191: feedback is implemented in the branch's own
-                    // review worktree, so it runs under that branch's env.
-                    env_overrides: branch_env,
-                    // RAL-201: route to the same machine `wt_cwd` is actually
-                    // on -- see the identical fix in
-                    // `resolve_conflicts_with_agent`.
-                    machine: wt_machine,
-                };
-                let _ = runner_clone.run(&spec);
-                // Defensive amend: if the agent left uncommitted changes and we are
-                // allowed to commit, finalize them now.
-                if !no_commit {
-                    let status = wt_for_thread
-                        .git(&["status", "--porcelain"])
-                        .unwrap_or_default();
-                    if !status.trim().is_empty() {
-                        let _ = wt_for_thread.git(&["add", "-A"]);
-                        let _ = wt_for_thread.git(&["commit", "--amend", "--no-edit"]);
-                    }
-                }
-                // Restore any pre-existing (no-commit) changes to the working tree.
-                if stashed {
-                    let _ = wt_for_thread.git(&["stash", "pop"]);
-                }
-            })
-        })
-        .collect();
-
-    // Block until ALL dispatched agents finish before touching the git graph.
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    // Detect which review branches changed (agent committed/amended).
-    let mut dirty_positions: Vec<i64> = Vec::new();
-    for t in &targets {
-        let post_hash = head_hash(&t.wt).unwrap_or_default();
-        if post_hash != t.pre_hash {
-            dirty_positions.push(t.position);
-        }
-    }
-
-    if dirty_positions.is_empty() {
-        return;
-    }
-
-    let from_position = *dirty_positions.iter().min().expect("non-empty");
-    let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, detail);
-    };
-    set_status(GuardianStatus::Merging, Some("applying routed feedback"));
-    // RAL-213: route dispatch is a separate reviewer-feedback flow, not a
-    // cancellable merge -- see `run_merge_cancellable`'s doc comment for the
-    // feature this token type serves.
-    restack_from_position(
-        store,
-        runner.as_ref(),
-        id,
-        &git_root,
-        &wt_base,
-        &guardian.base_branch,
-        from_position,
-        &set_status,
-        &CancelToken::never(),
-    );
 }
 
 /// The worktree directory a guardian's review stack is built in:
@@ -2748,6 +2455,25 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) {
     }
 }
 
+/// Stop any in-flight merge worker for `id` (cancel token + the same bounded
+/// wait as [`restart_guardian_merge`]/[`stop_guardian_merge`]) before a plain
+/// cancel writes `cancelled` to the DB.
+///
+/// Without this, `Store::cancel_guardian` only flips the DB column: a live
+/// merge worker's `cancel: &CancelToken` is never tripped, so it never kills
+/// its resolver agent's tmux session, keeps running every remaining branch to
+/// completion, and its own end-of-pass `set_guardian_status(InReview, ...)`
+/// (unconditional -- there's no `WHERE status='cancelled'` guard) overwrites
+/// the `cancelled` status straight back to `in_review`. Call this first so
+/// the worker has already exited (or been given its best bounded chance to)
+/// by the time the DB write happens, mirroring why `restart_guardian_merge`/
+/// `stop_guardian_merge` both cancel-and-wait before touching guardian state.
+pub fn stop_merge_worker_for_cancel(cancellations: &Cancellations, id: &str) {
+    let key = format!("guardian:{id}");
+    cancellations.cancel(&key);
+    wait_for_merge_worker_stop(cancellations, &key);
+}
+
 /// Stop an in-flight merge for `id` (if any) and start a fresh one, safely.
 ///
 /// RAL-213: this is the safe replacement for the old "reset to collecting,
@@ -2803,6 +2529,7 @@ pub fn stop_guardian_merge(
         .stop_guardian_merge(id)
     {
         Ok(status) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
                 "ralphus [guardian] review {id} merge stopped → {}",
@@ -2972,6 +2699,7 @@ fn record_feedback_reply(
     ) {
         Ok(r) => r,
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} branch {branch_id} feedback reply skipped: \
@@ -2983,9 +2711,8 @@ fn record_feedback_reply(
     if resolved.custom_profile {
         // `call_direct` reads provider credentials straight from the daemon's
         // own environment and has no way to honor a custom profile's env
-        // (e.g. an OpenRouter base URL/key) -- same limitation `run_chat`'s
-        // direct-call path has, so skip rather than silently hit the wrong
-        // endpoint/key.
+        // (e.g. an OpenRouter base URL/key), so skip rather than silently
+        // hit the wrong endpoint/key.
         return;
     }
     let system = format!(
@@ -3008,6 +2735,7 @@ fn record_feedback_reply(
     ) {
         Ok(text) => text,
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} branch {branch_id} feedback reply skipped: {e}"
@@ -3017,410 +2745,6 @@ fn record_feedback_reply(
     };
     let guard = store.lock().expect("poisoned");
     let _ = guard.add_guardian_message(id, "guardian", &reply_text, None, Some(branch_id));
-}
-
-/// Run the global feedback triage agent for a guardian (RAL-22). It works in
-/// the COMBINED (all-branches-rebased) review worktree so it can see the whole
-/// stack, then replies in the thread — asking a clarifying question, or stating
-/// which branch(es) it is routing each reviewer instruction to. Synchronous;
-/// spawned by [`start_chat`].
-///
-/// RAL-33: for `claude`/`anthropic` and `ollama` backends the LLM API is called
-/// directly (no subprocess spawn), eliminating the 1–3 s Python cold-start that
-/// was the dominant per-message latency cost. Other backends fall back to the
-/// subprocess runner unchanged. The conversation history is passed as a proper
-/// messages array rather than a flat concatenated prompt.
-pub fn run_chat(
-    store: &Arc<Mutex<Store>>,
-    runner: Arc<dyn Runner>,
-    id: &str,
-    message: &str,
-    image: Option<&str>,
-) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let branches = guardian
-        .branches
-        .iter()
-        .map(|b| b.branch.clone())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // RAL-35: the triage prompt documents the XML route-block convention.  When
-    // the Guardian is confident about which branch needs a change, it embeds one
-    // or more <route> blocks in its reply.  The daemon strips those blocks before
-    // storing the message, so the reviewer never sees the raw XML.
-    let system = format!(
-        "You are the review Guardian, triaging reviewer feedback for a stacked \
-         set of feature branches: [{branches}]. You are in the COMBINED review \
-         worktree, which has every branch rebased together, so you can see the \
-         whole change at once.\n\n\
-         TRIAGE the reviewer's latest message: work out which branch(es) each \
-         request applies to. Then EITHER ask one concise clarifying question if \
-         it is ambiguous, OR describe which branch(es) you are routing each \
-         instruction to and include a <route> block for each one.\n\n\
-         Route-block convention (blocks are hidden from the reviewer — only your \
-         plain-text reply is shown):\n\
-         <route branch=\"EXACT_BRANCH_NAME\">\n\
-         Precise, self-contained instructions for the agent implementing this \
-         change on that branch. Say exactly which files to edit and what to \
-         change.\n\
-         </route>\n\n\
-         Rules:\n\
-         • Only emit a <route> block when you are certain which branch needs the \
-           change and what change is required.\n\
-         • You may include multiple <route> blocks — one per branch — in a single \
-           reply.\n\
-         • Do NOT run git commands yourself."
-    );
-
-    // RAL-?: resolve the review's resolver agent against configured
-    // `.ralphus.toml` custom agent profiles (as opposed to using the raw
-    // stored string directly) -- see `resolve_resolver_agent`'s doc comment.
-    let resolution = resolve_resolver_agent(
-        guardian.resolver_agent.as_deref(),
-        guardian.resolver_model.as_deref(),
-        Path::new(&guardian.git_root),
-    );
-    let r_agent = resolution
-        .as_ref()
-        .map(|r| r.backend.clone())
-        .unwrap_or_else(|_| {
-            resolver_agent(
-                guardian.resolver_agent.as_deref(),
-                Path::new(&guardian.git_root),
-            )
-        });
-    let r_model = resolution.as_ref().ok().and_then(|r| r.model.clone());
-
-    // RAL-88: capture the resolved agent/model actually used for this reply so the
-    // reviewer can inspect it. When no model is configured, `call_direct` applies a
-    // backend default (below) — mirror it so the recorded model matches what ran.
-    let chat_agent_used = r_agent.clone();
-    let chat_model_used = r_model
-        .clone()
-        .or_else(|| match r_agent.to_lowercase().as_str() {
-            "claude" | "anthropic" => Some("claude-haiku-4-5".to_string()),
-            "ollama" => Some("qwen3:8b".to_string()),
-            _ => None,
-        });
-
-    // Fetch the full thread. `start_chat` already persisted the latest reviewer
-    // message before spawning this thread, so the history ends with it — we do
-    // not need to append it separately (doing so was a double-send bug in the
-    // original flat-prompt approach).
-    let history = store
-        .lock()
-        .expect("poisoned")
-        .guardian_messages(id)
-        .unwrap_or_default();
-
-    crate::rlog!(
-        DEBUG,
-        "ralphus [guardian] review {id} chat triage start backend={r_agent:?} \
-         model={r_model:?} messages={} has_image={}",
-        history.len(),
-        image.is_some()
-    );
-    {
-        let guard = store.lock().expect("poisoned");
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::DEBUG,
-            source: "guardian",
-            message: "chat triage start",
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({
-                "backend": r_agent,
-                "model": r_model,
-                "messages": history.len(),
-                "has_image": image.is_some(),
-            }),
-        });
-    }
-
-    // Map DB roles to API roles for the direct call.
-    let chat_messages: Vec<crate::chat_client::ChatMessage> = history
-        .iter()
-        .map(|m| crate::chat_client::ChatMessage {
-            role: if m.role == "reviewer" {
-                "user"
-            } else {
-                "assistant"
-            },
-            content: m.text.clone(),
-            image: m.image.clone(),
-        })
-        .collect();
-
-    let raw_reply = if let Err(message) = &resolution {
-        crate::rlog!(
-            WARNING,
-            "ralphus [guardian] review {id} chat triage: unresolvable resolver agent: {message}"
-        );
-        let guard = store.lock().expect("poisoned");
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::WARNING,
-            source: "guardian",
-            message: "chat triage skipped: unresolvable resolver agent",
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"error": message}),
-        });
-        "This review's resolver agent isn't configured correctly, so I can't reply right \
-         now — check the resolver setting for this review."
-            .to_string()
-    } else {
-        // Safe: the `Err` case was handled above.
-        let resolved = resolution.as_ref().expect("checked above");
-        // A custom agent profile's env overrides (e.g. an OpenRouter base URL/key)
-        // can only be applied via the subprocess runner -- `call_direct` reads
-        // `ANTHROPIC_API_KEY` straight from the daemon process's own environment
-        // and has no way to honor a profile's env, so skip it entirely for a
-        // custom profile rather than silently hitting the wrong endpoint/key.
-        let direct_result = if resolved.custom_profile {
-            Err("custom agent profile requires the subprocess runner".to_string())
-        } else {
-            crate::chat_client::call_direct(&r_agent, r_model.as_deref(), &system, &chat_messages)
-        };
-        // Try a direct HTTP call first (no subprocess). Falls back to the subprocess
-        // runner for unsupported agent types (e.g. claude-code, codex-cli, harness backends).
-        match direct_result {
-            Ok(text) => text,
-            Err(direct_err) => {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [guardian] review {id} chat-api fallback to subprocess: {direct_err}"
-                );
-                {
-                    let guard = store.lock().expect("poisoned");
-                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                        level: crate::logging::LogLevel::WARNING,
-                        source: "guardian",
-                        message: "chat-api fallback to subprocess",
-                        scope: Some("guardian"),
-                        squad_id: None,
-                        guardian_id: Some(id),
-                        cell_id: None,
-                        task: None,
-                        log_path: None,
-                        payload: serde_json::json!({"error": direct_err}),
-                    });
-                }
-                // Subprocess fallback: build the old flat-text prompt and spawn the runner.
-                // `message` is re-appended here because the subprocess backend does not
-                // receive the structured messages array.
-                let transcript = history
-                    .iter()
-                    .map(|m| format!("{}: {}", m.role, m.text))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let cwd = guardian
-                    .combined_worktree
-                    .clone()
-                    .unwrap_or_else(|| guardian.git_root.clone());
-
-                // RAL-169: the combined review worktree is torn down and rebuilt
-                // while a merge/rebase is running (see `run_merge`'s
-                // `cleanup_review_worktrees` call), and `combined_worktree` in the
-                // DB isn't cleared/updated until the rebuild finishes — so `cwd`
-                // can point at a directory that transiently doesn't exist for the
-                // whole duration of a merge. Spawning the subprocess runner
-                // against a missing cwd fails with a raw filesystem error
-                // ("workspace directory does not exist: ...") that would
-                // otherwise be stored verbatim as the guardian's chat reply.
-                // Detect that up front and reply with a friendly status message
-                // instead, so chat stays usable while a merge is in progress.
-                if !std::path::Path::new(&cwd).is_dir() {
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [guardian] review {id} chat workspace unavailable, \
-                     skipping subprocess: cwd={cwd}"
-                    );
-                    {
-                        let guard = store.lock().expect("poisoned");
-                        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                            level: crate::logging::LogLevel::WARNING,
-                            source: "guardian",
-                            message: "chat workspace unavailable",
-                            scope: Some("guardian"),
-                            squad_id: None,
-                            guardian_id: Some(id),
-                            cell_id: None,
-                            task: None,
-                            log_path: None,
-                            payload: serde_json::json!({"cwd": cwd, "status": guardian.status}),
-                        });
-                    }
-                    "A merge is currently rebuilding this review's workspace, so I can't look \
-                 anything up right now. This is usually quick — please try again in a \
-                 moment."
-                        .to_string()
-                } else {
-                    let prompt = format!(
-                        "{system}\n\nConversation so far:\n{transcript}\n\nReviewer: {message}"
-                    );
-                    let spec = RunnerSpec {
-                        // RAL-102: unique per guardian — see the comment on the
-                        // resolver `RunnerSpec` in `resolve_conflicts_with_agent`.
-                        squad_id: format!("guardian-{id}"),
-                        task: "chat".to_string(),
-                        cell_id: "triage".to_string(),
-                        cwd,
-                        prompt: Some(prompt),
-                        command: None,
-                        agent: r_agent,
-                        executable: resolved.executable.clone(),
-                        model: r_model,
-                        system_prompt: None,
-                        system_prompt_position: None,
-                        timeout_sec: None,
-                        budget_tokens: None,
-                        maximum_budget_usd: None,
-                        proof: false,
-                        trace_context: None,
-                        resume_agent_session_id: None,
-                        // RAL-191/RAL-203: the triage agent works in the COMBINED
-                        // worktree, which holds every enabled branch's work
-                        // rebased onto the last one -- `combined_env` is already
-                        // that last enabled branch's resolved env
-                        // (see `guardian::combined_env_from_branches`). Profile
-                        // env is the base layer; the combined env wins.
-                        env_overrides: {
-                            let mut env = resolved.env.clone();
-                            env.extend(guardian.combined_env.clone());
-                            env
-                        },
-                        // RAL-201: route to the review's assigned machine (if
-                        // any) instead of always the daemon's own host -- `cwd`
-                        // above already names the combined worktree on that
-                        // machine.
-                        machine: guardian.machine.clone(),
-                    };
-                    let result = runner.run(&spec);
-                    let _ = record_guardian_call_cost(store, id, None, "chat", &result);
-                    if result.is_done() && !result.summary.trim().is_empty() {
-                        result.summary
-                    } else {
-                        // RAL-169: don't surface a raw internal/subprocess error
-                        // (e.g. a filesystem or backend failure message) directly
-                        // in the reviewer-facing chat thread. Log the real detail
-                        // for diagnosis and reply with a friendly message.
-                        if let Some(err) = &result.error {
-                            crate::rlog!(
-                                WARNING,
-                                "ralphus [guardian] review {id} chat triage failed: {err}"
-                            );
-                        }
-                        "Sorry, I ran into a problem answering that — please try again in a \
-                     moment."
-                            .to_string()
-                    }
-                }
-            }
-        }
-    };
-
-    // Parse route blocks from the raw reply, then strip them so only the
-    // human-readable text lands in the feedback thread.
-    let routes = parse_route_blocks(&raw_reply);
-    let visible_text = if routes.is_empty() {
-        raw_reply
-    } else {
-        strip_route_blocks(&raw_reply)
-    };
-
-    {
-        let guard = store.lock().expect("poisoned");
-        let _ = guard.add_guardian_message(id, "guardian", &visible_text, None, None);
-        // RAL-88: record which resolved agent/model produced this reply.
-        let _ = guard.set_guardian_chat_agent(id, &chat_agent_used, chat_model_used.as_deref());
-        // RAL-167: the reviewer-facing content the chat UI's post-send poll is
-        // actually waiting on -- push a guardian-scoped event now so a
-        // connected SSE client refreshes the thread immediately instead of
-        // relying solely on that bounded poll.
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "chat reply posted",
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"has_routes": !routes.is_empty()}),
-        });
-    }
-
-    // Dispatch each route block to a fresh agent in the target review worktree,
-    // wait for all agents to finish, then restack downstream branches.
-    if !routes.is_empty() {
-        let route_branches: Vec<&str> = routes.iter().map(|(b, _)| b.as_str()).collect();
-        crate::rlog!(
-            INFO,
-            "ralphus [guardian] review {id} chat routes={} branches=[{}]",
-            routes.len(),
-            route_branches.join(", ")
-        );
-        {
-            let guard = store.lock().expect("poisoned");
-            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::INFO,
-                source: "guardian",
-                message: "chat routes dispatched",
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"routes": routes.len(), "branches": route_branches}),
-            });
-        }
-        let no_commit = is_no_commit_intent(message);
-        dispatch_routes(store, runner, id, &routes, &guardian, no_commit);
-    }
-}
-
-/// Append the reviewer's message to the thread and kick off the triage agent's
-/// reply in the background. Returns immediately (RAL-22).
-///
-/// `image` is an optional base64 data-URI attached to this message (RAL-59).
-pub fn start_chat(
-    store: Arc<Mutex<Store>>,
-    runner: Arc<dyn Runner>,
-    id: &str,
-    message: String,
-    image: Option<String>,
-) -> Reply {
-    if let Err(e) = store.lock().expect("poisoned").get_guardian(id) {
-        return reply(404, &error_body("not_found", &e.to_string()));
-    }
-    // Persist the reviewer's message synchronously so the UI shows it at once.
-    if let Err(e) = store.lock().expect("poisoned").add_guardian_message(
-        id,
-        "reviewer",
-        &message,
-        image.as_deref(),
-        None,
-    ) {
-        return reply(500, &error_body("internal", &e.to_string()));
-    }
-    let sid = id.to_string();
-    let img = image.clone();
-    std::thread::spawn(move || run_chat(&store, runner, &sid, &message, img.as_deref()));
-    reply(202, "{\"status\":\"triaging\"}")
 }
 
 /// [`run_merge`] with no way to stop early -- for tests and any caller with no
@@ -4776,15 +4100,25 @@ pub fn run_feedback(
     let no_commit = is_no_commit_intent(feedback);
     // Stash any pre-existing dirty state so we only include the agent's own
     // changes in the new commit (not leftovers from a prior no-commit turn).
-    let stashed = if !no_commit {
+    // RAL-283: named + uniquified, not a bare `git stash` — this worktree's
+    // stash lives on the shared `refs/stash` stack of the whole repo (git has
+    // no per-worktree stash), so a bare push/pop here could collide with
+    // another branch's feedback/rebase window on the same repo.
+    let stash_name = if !no_commit {
         let pre = wt.git(&["status", "--porcelain"]).unwrap_or_default();
-        if !pre.trim().is_empty() {
-            wt.git(&["stash", "--include-untracked"]).is_ok()
+        if pre.trim().is_empty() {
+            None
         } else {
-            false
+            let name = crate::stash::unique_stash_name(
+                &format!("guardian/{id}/{review_branch}"),
+                "feedback",
+            );
+            wt.git(&["stash", "push", "--include-untracked", "-m", &name])
+                .ok()
+                .map(|_| name)
         }
     } else {
-        false
+        None
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
@@ -4825,14 +4159,20 @@ pub fn run_feedback(
 
         // RAL-<new>: extend the branch's single squashed commit in place
         // rather than adding a new one when the project has squash-to-one-
-        // commit enabled, mirroring `dispatch_routes`'s identical amend
-        // fallback.
+        // commit enabled.
         if squash {
             let _ = wt.git(&["commit", "--amend", "--no-edit"]);
         } else {
             // RAL-201: was `git(wt.root(), ...)`, a direct bypass of `wt`'s
             // machine sitting right next to the correctly-routed calls above.
-            let _ = wt.git(&["commit", "-m", &format!("review feedback: {feedback}")]);
+            // RAL-<new>: subject line stays short (this repo's conventional
+            // `type: summary` commit style) with the raw reviewer feedback --
+            // which routinely runs to several sentences -- relegated to the
+            // commit body via a second `-m`, instead of dumping the whole
+            // feedback text into the subject line where it makes
+            // `git log --oneline` and rebase-todo listings unreadable.
+            let subject = format!("fix: apply review feedback ({feature})");
+            let _ = wt.git(&["commit", "-m", &subject, "-m", feedback]);
         }
 
         // RAL-<new>: push the review branch itself -- force only when we did
@@ -4855,8 +4195,13 @@ pub fn run_feedback(
         None
     };
     // Restore any pre-existing (no-commit) changes to the working tree.
-    if stashed {
-        let _ = wt.git(&["stash", "pop"]);
+    if let Some(name) = &stash_name {
+        if let Err(e) = crate::stash::pop_named(|args| wt.git(args), name) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} feedback: stash restore failed: {e}"
+            );
+        }
     }
     // RAL-241 follow-up: every path here previously reported the same
     // "feedback applied" detail regardless of what actually happened --
@@ -5577,8 +4922,8 @@ pub fn rebuild_on_base_shift(
     }
     // RAL-250: when this review has opted out of base-branch auto-updates, the
     // maintenance sweep must not rebuild it on a base shift. This gates ONLY
-    // this automatic pass -- a manual `review base set` / merge goes through
-    // its own explicit path and is unaffected.
+    // this automatic pass -- a manual `review upstream set` / merge goes
+    // through its own explicit path and is unaffected.
     if guardian.effective_skip_base_updates {
         return false;
     }
@@ -5741,10 +5086,13 @@ fn finalize_review(
     final_checks(store, id, root, &combined_str)
 }
 
+/// The URL a remote machine should clone a *project* from. This is the one
+/// remote-name resolution with no review branch in scope -- it provisions a
+/// project checkout, not a review's PR -- so it uses only the
+/// branch-independent tail of the shared precedence
+/// ([`crate::forge::default_remote_name`]), never `@{u}`.
 pub(crate) fn remote_clone_url(root: &Path) -> std::result::Result<String, String> {
-    let remote_name = crate::config::resolve_forge(root)
-        .remote
-        .unwrap_or_else(|| "origin".to_string());
+    let remote_name = crate::forge::default_remote_name(&crate::config::resolve_forge(root));
     git(root, &["remote", "get-url", &remote_name]).map(|s| s.trim().to_string())
 }
 
@@ -5842,22 +5190,26 @@ fn fetch_branch_for_remote_cell(
     else {
         return Ok(());
     };
+    let review = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(guardian_id)
+        .ok();
     let root = branch
         .project
         .clone()
-        .or_else(|| {
-            store
-                .lock()
-                .expect("poisoned")
-                .get_guardian(guardian_id)
-                .ok()
-                .map(|g| g.git_root)
-        })
+        .or_else(|| review.as_ref().map(|g| g.git_root.clone()))
         .ok_or_else(|| format!("branch {} has no project root to fetch into", branch.branch))?;
     let root = Path::new(&root);
-    let remote = crate::config::resolve_forge(root)
-        .remote
-        .unwrap_or_else(|| "origin".to_string());
+    // Same remote the review's PRs resolve against (RAL-282), keyed off its own
+    // base branch -- fetching a remote-produced branch from a different remote
+    // than the one the review targets is how a stale/absent branch slips through.
+    let base_branch = review
+        .as_ref()
+        .map(|g| g.base_branch.as_str())
+        .unwrap_or_default();
+    let remote =
+        crate::forge::resolve_remote_name(root, base_branch, &crate::config::resolve_forge(root));
     let vcs = {
         let guard = store.lock().expect("poisoned");
         crate::vcs::for_project_root(&guard, root)?
@@ -6433,6 +5785,7 @@ fn squash_review_commits(
         let _ = wt.git(&["reset", "--soft", "ORIG_HEAD"]);
         return Err(e);
     }
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         INFO,
         "ralphus [guardian] squashed branch={feature:?} {count} commits → 1 over {newbase}"
@@ -7275,6 +6628,7 @@ pub(crate) fn resolve_check_input(
     ) {
         Ok(r) => r,
         Err(message) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {guardian_id} check-input resolution: \
@@ -8312,80 +7666,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // -----------------------------------------------------------------------
-    // XML route-block parsing (pre-existing tests)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_route_blocks_extracts_branch_and_instructions() {
-        let text = r#"I'll route this.
-<route branch="feature/foo">
-Rename the variable in src/lib.rs.
-</route>
-Let me know if you need anything else."#;
-        let routes = parse_route_blocks(text);
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].0, "feature/foo");
-        assert!(routes[0].1.contains("Rename the variable"));
-    }
-
-    #[test]
-    fn parse_route_blocks_handles_multiple_blocks() {
-        let text = concat!(
-            r#"<route branch="feat/a">Fix A.</route>"#,
-            "\n",
-            r#"<route branch="feat/b">Fix B.</route>"#
-        );
-        let routes = parse_route_blocks(text);
-        assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0].0, "feat/a");
-        assert_eq!(routes[1].0, "feat/b");
-        assert_eq!(routes[0].1, "Fix A.");
-        assert_eq!(routes[1].1, "Fix B.");
-    }
-
-    #[test]
-    fn parse_route_blocks_empty_when_no_blocks() {
-        assert!(parse_route_blocks("Nothing here.").is_empty());
-    }
-
-    #[test]
-    fn parse_route_blocks_ignores_unclosed_block() {
-        let text = "<route branch=\"feat/x\">Missing close tag";
-        assert!(parse_route_blocks(text).is_empty());
-    }
-
-    #[test]
-    fn strip_route_blocks_removes_blocks_and_trims() {
-        let text = "Plain text.\n<route branch=\"feat/a\">Do something.</route>\nMore text.";
-        assert_eq!(strip_route_blocks(text), "Plain text.\n\nMore text.");
-    }
-
-    #[test]
-    fn strip_route_blocks_leaves_no_route_text_unchanged() {
-        let text = "No route blocks here.";
-        assert_eq!(strip_route_blocks(text), text);
-    }
-
-    #[test]
-    fn strip_route_blocks_handles_multiple_blocks() {
-        let text = "A<route branch=\"x\">1</route>B<route branch=\"y\">2</route>C";
-        assert_eq!(strip_route_blocks(text), "ABC");
-    }
-
-    #[test]
-    fn extract_xml_attr_returns_value() {
-        assert_eq!(
-            extract_xml_attr(r#"<route branch="main">"#, "branch"),
-            Some("main".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_xml_attr_returns_none_when_missing() {
-        assert_eq!(extract_xml_attr("<route>", "branch"), None);
-    }
-
     /// Regression test for the production failure:
     ///   "git checkout -f -B <rev> <branch> failed: fatal: not a git
     ///   repository: .git/worktrees/<name>"
@@ -8890,12 +8170,9 @@ Let me know if you need anything else."#;
         // (`chat_client::call_direct` only supports claude/anthropic/ollama)
         // must not panic or leak an error into the branch's feedback thread
         // -- the reply generation is best-effort only, with no subprocess
-        // fallback (unlike the global chat's `run_chat`). "claude-code" is
-        // resolvable but unsupported, so this is deterministic and
-        // network-free regardless of whether ANTHROPIC_API_KEY is set in the
-        // environment (see the identical reasoning in
-        // `chat_no_commit_leaves_working_tree_dirty` in
-        // daemon/tests/guardian_merge.rs).
+        // fallback. "claude-code" is resolvable but unsupported, so this is
+        // deterministic and network-free regardless of whether
+        // ANTHROPIC_API_KEY is set in the environment.
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
         let id = {
             let g = store.lock().unwrap();

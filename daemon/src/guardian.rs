@@ -400,7 +400,7 @@ pub struct BranchView {
     pub started_at_ms: Option<i64>,
 }
 
-/// One message in a guardian's global feedback thread (RAL-22).
+/// One message in a guardian's feedback thread (RAL-22, scoped per-branch by RAL-272).
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     /// Auto-increment primary key — used by the client to reference a specific
@@ -524,11 +524,6 @@ pub struct GuardianView {
     /// generation pass, for its "Open Agent" terminal action. `None` when the
     /// resolved agent isn't claude-code, or generation hasn't run yet.
     pub manual_commands_agent_session_id: Option<String>,
-    /// RAL-88: the resolved agent/model that produced the latest feedback-chat
-    /// reply. `None` until the guardian has answered at least one chat message.
-    pub chat_agent: Option<String>,
-    /// Model behind the latest chat reply (see [`Self::chat_agent`]).
-    pub chat_model: Option<String>,
     /// Git project roots whose task branches are squashed to a single commit in
     /// the review worktree during the stacked rebase (RAL-91). Scoped per-project:
     /// a review spanning N projects honours each project's setting independently.
@@ -659,6 +654,18 @@ pub struct GuardianView {
     /// [`Self::maximum_budget_usd`] is enforced against. See
     /// [`Self::cumulative_tokens_in`].
     pub cumulative_cost_usd: f64,
+    /// RAL-273: a one-shot, GUI-facing notice, e.g. `"forge_reorder_interrupted_local"`
+    /// when an incoming GitHub/GitLab stack reorder interrupted a local
+    /// reorder in flight. `None` when there is nothing to show. The board
+    /// shows [`Self::notice_message`] as a toast the first time it observes
+    /// [`Self::notice_at_ms`] newer than what it last displayed for this
+    /// guardian -- there is no server-side "seen" tracking or expiry.
+    pub notice_kind: Option<String>,
+    /// Human-readable text for [`Self::notice_kind`].
+    pub notice_message: Option<String>,
+    /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
+    /// `notice_kind: None`.
+    pub notice_at_ms: Option<i64>,
 }
 
 /// Aggregated merge progress across a guardian's branches, ported from
@@ -798,9 +805,9 @@ impl Store {
         let id = self.next_id("guardian_seq", "guardian")?;
         let now = crate::store::now_ms();
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms)
-             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?)",
-            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now],
+            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms)
+             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?)",
+            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now],
         )?;
         Ok(id)
     }
@@ -1439,8 +1446,7 @@ impl Store {
     /// Append a message to a guardian's feedback thread. `role` is
     /// `"reviewer"` (the human) or `"guardian"` (the triage agent). `image` is
     /// an optional base64 data-URI attached to the message (RAL-59).
-    /// `branch_id` scopes the message to one review branch (RAL-272); `None`
-    /// keeps it in the old global thread (RAL-22).
+    /// `branch_id` scopes the message to one review branch (RAL-272).
     pub fn add_guardian_message(
         &self,
         guardian_id: &str,
@@ -1456,42 +1462,9 @@ impl Store {
         Ok(())
     }
 
-    /// Delete all messages with `seq >= from_seq` for the given guardian.
-    /// Used by the conversation-branching fork operation (RAL-59).
-    pub fn delete_guardian_messages_from_seq(
-        &self,
-        guardian_id: &str,
-        from_seq: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM guardian_messages WHERE guardian_id=? AND seq>=?",
-            params![guardian_id, from_seq],
-        )?;
-        Ok(())
-    }
-
-    /// A guardian's global feedback thread, oldest first (RAL-22).
-    pub fn guardian_messages(&self, guardian_id: &str) -> Result<Vec<MessageView>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, role, text, at_ms, image FROM guardian_messages WHERE guardian_id=? ORDER BY seq",
-        )?;
-        let rows = stmt
-            .query_map(params![guardian_id], |r| {
-                Ok(MessageView {
-                    seq: r.get(0)?,
-                    role: r.get(1)?,
-                    text: r.get(2)?,
-                    at_ms: r.get(3)?,
-                    image: r.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
     /// One review branch's feedback thread, oldest first (RAL-272). Only
-    /// messages explicitly scoped to `branch_id` are returned -- the old
-    /// global thread (`branch_id IS NULL`) never appears here.
+    /// messages explicitly scoped to `branch_id` are returned -- an
+    /// unscoped message (`branch_id IS NULL`) never appears here.
     pub fn guardian_branch_messages(
         &self,
         guardian_id: &str,
@@ -1550,6 +1523,22 @@ impl Store {
                 None => format!("review → {}", status.as_str()),
             };
             let _ = self.log_event(None, Some(id), "guardian", None, &msg);
+            Ok(())
+        }
+    }
+
+    /// Record a one-shot, GUI-facing notice for this guardian (RAL-273) --
+    /// see [`GuardianView::notice_kind`]. Overwrites any previous notice;
+    /// there is no queue, since the board only ever needs to show whichever
+    /// one is newest.
+    pub fn set_guardian_notice(&self, id: &str, kind: &str, message: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET notice_kind=?, notice_message=?, notice_at_ms=? WHERE id=?",
+            params![kind, message, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
             Ok(())
         }
     }
@@ -1931,14 +1920,73 @@ impl Store {
     /// next merge detects a fresh base rather than comparing against the old branch's
     /// tip. Returns [`StoreError::NotFound`] if the guardian does not exist.
     pub fn set_guardian_base_branch(&self, id: &str, base_branch: &str) -> Result<()> {
+        self.set_guardian_base_branch_at(id, base_branch, crate::store::now_ms())
+    }
+
+    /// Set the review base using the source edit's timestamp. Forge polling
+    /// uses the PR/MR's `updated_at`; local API calls use the daemon clock.
+    pub fn set_guardian_base_branch_at(
+        &self,
+        id: &str,
+        base_branch: &str,
+        changed_at_ms: i64,
+    ) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardians SET base_branch=?, base_commit=NULL, updated_at_ms=? WHERE id=?",
-            params![base_branch, crate::store::now_ms(), id],
+            "UPDATE guardians SET base_branch=?, base_commit=NULL, updated_at_ms=?, base_changed_at_ms=? WHERE id=?",
+            params![base_branch, crate::store::now_ms(), changed_at_ms, id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
             Ok(())
+        }
+    }
+
+    /// Timestamp used by RAL-277's last-write-wins base-ref reconciliation.
+    pub fn guardian_base_changed_at_ms(&self, id: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT base_changed_at_ms FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Apply a forge-authored base only if it is strictly newer. An exact tie
+    /// deliberately loses to ralphus. The comparison and write share one SQL
+    /// statement so a local edit arriving after the poll's GET cannot be
+    /// overwritten by stale forge state.
+    pub fn set_guardian_base_branch_if_newer(
+        &self,
+        id: &str,
+        base_branch: &str,
+        changed_at_ms: i64,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_branch=?, base_commit=NULL, updated_at_ms=?, base_changed_at_ms=? \
+             WHERE id=? AND base_changed_at_ms < ?",
+            params![
+                base_branch,
+                crate::store::now_ms(),
+                changed_at_ms,
+                id,
+                changed_at_ms
+            ],
+        )?;
+        if n > 0 {
+            return Ok(true);
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guardians WHERE id=?)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound)
         }
     }
 
@@ -2189,9 +2237,9 @@ impl Store {
 
     /// Fetch a guardian's recorded manual-commands agent_session_id, for its
     /// "Open Agent" terminal action, plus the cwd generation ran/runs in
-    /// (mirrors the chat fallback's own cwd choice — see
-    /// `guardian_merge.rs::resolve_guardian_chat`). `None` in either position
-    /// means the corresponding action isn't available yet.
+    /// (the combined review worktree, falling back to `git_root` before one
+    /// exists). `None` in either position means the corresponding action
+    /// isn't available yet.
     pub fn get_guardian_manual_commands_agent_resume(
         &self,
         id: &str,
@@ -2201,21 +2249,6 @@ impl Store {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)
-    }
-
-    /// Record which resolved `agent`/`model` produced the latest feedback-chat
-    /// reply, so the reviewer can inspect it (RAL-88). Overwritten on each reply.
-    pub fn set_guardian_chat_agent(
-        &self,
-        id: &str,
-        agent: &str,
-        model: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE guardians SET chat_agent=?, chat_model=?, updated_at_ms=? WHERE id=?",
-            params![agent, model, crate::store::now_ms(), id],
-        )?;
-        Ok(())
     }
 
     /// Persist user-declared action hints from `[[review.action]]` (RAL-77).
@@ -2709,7 +2742,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms
                  FROM guardians WHERE id=?",
                 params![id],
                 Self::map_guardian_row,
@@ -2722,7 +2755,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, chat_agent, chat_model, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms
              FROM guardians ORDER BY created_at_ms DESC",
         )?;
         let rows = stmt
@@ -2763,20 +2796,21 @@ impl Store {
             manual_commands_agent: r.get(27)?,
             manual_commands_model: r.get(28)?,
             manual_commands_agent_session_id: r.get(29)?,
-            chat_agent: r.get(30)?,
-            chat_model: r.get(31)?,
-            squash_projects: r.get(32)?,
-            auto_pr_feedback: r.get(33)?,
-            input_values: r.get(34)?,
-            proof_scope: r.get(35)?,
-            proof_skip_auto_clean: r.get::<_, Option<i64>>(36)?.map(|v| v != 0),
-            machine: r.get(37)?,
-            build_env_overrides: r.get(38)?,
-            manual_checks_env_overrides: r.get(39)?,
-            maximum_budget_usd: r.get(40)?,
-            merge_attempt: r.get(41)?,
-            skip_base_updates: r.get::<_, Option<i64>>(42)?.map(|v| v != 0),
-            manual_checks_started_at_ms: r.get(43)?,
+            squash_projects: r.get(30)?,
+            auto_pr_feedback: r.get(31)?,
+            input_values: r.get(32)?,
+            proof_scope: r.get(33)?,
+            proof_skip_auto_clean: r.get::<_, Option<i64>>(34)?.map(|v| v != 0),
+            machine: r.get(35)?,
+            build_env_overrides: r.get(36)?,
+            manual_checks_env_overrides: r.get(37)?,
+            maximum_budget_usd: r.get(38)?,
+            merge_attempt: r.get(39)?,
+            skip_base_updates: r.get::<_, Option<i64>>(40)?.map(|v| v != 0),
+            manual_checks_started_at_ms: r.get(41)?,
+            notice_kind: r.get(42)?,
+            notice_message: r.get(43)?,
+            notice_at_ms: r.get(44)?,
         })
     }
 
@@ -3078,8 +3112,6 @@ impl Store {
             manual_commands_agent: row.manual_commands_agent,
             manual_commands_model: row.manual_commands_model,
             manual_commands_agent_session_id: row.manual_commands_agent_session_id,
-            chat_agent: row.chat_agent,
-            chat_model: row.chat_model,
             squash_projects: crate::store::from_json(
                 row.squash_projects.as_deref().unwrap_or("[]"),
             ),
@@ -3103,6 +3135,9 @@ impl Store {
             maximum_budget_usd: row.maximum_budget_usd,
             merge_attempt: row.merge_attempt,
             manual_checks_started_at_ms: row.manual_checks_started_at_ms,
+            notice_kind: row.notice_kind,
+            notice_message: row.notice_message,
+            notice_at_ms: row.notice_at_ms,
             attempt_tokens_in,
             attempt_tokens_out,
             attempt_cost_usd,
@@ -3352,8 +3387,6 @@ struct GuardianRow {
     manual_commands_agent: Option<String>,
     manual_commands_model: Option<String>,
     manual_commands_agent_session_id: Option<String>,
-    chat_agent: Option<String>,
-    chat_model: Option<String>,
     /// JSON array of project roots with squash enabled (RAL-91).
     squash_projects: Option<String>,
     /// RAL-117: opts this review into auto-incorporating PR feedback.
@@ -3384,6 +3417,10 @@ struct GuardianRow {
     merge_attempt: i64,
     /// RAL-259: when the manual-checks generation agent most recently began work.
     manual_checks_started_at_ms: Option<i64>,
+    /// RAL-273: see [`GuardianView::notice_kind`].
+    notice_kind: Option<String>,
+    notice_message: Option<String>,
+    notice_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
@@ -4220,99 +4257,30 @@ mod tests {
     }
 
     #[test]
-    fn guardian_messages_thread_persists_in_order() {
-        // RAL-22: the global feedback thread stores messages oldest-first with
-        // their roles, and starts empty.
-        let store = Store::open_in_memory().unwrap();
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        assert!(store.guardian_messages(&id).unwrap().is_empty());
-        store
-            .add_guardian_message(&id, "reviewer", "please fix the naming", None, None)
-            .unwrap();
-        store
-            .add_guardian_message(
-                &id,
-                "guardian",
-                "that lands on branch feature/a",
-                None,
-                None,
-            )
-            .unwrap();
-        let thread = store.guardian_messages(&id).unwrap();
-        assert_eq!(thread.len(), 2);
-        assert_eq!(thread[0].role, "reviewer");
-        assert_eq!(thread[0].text, "please fix the naming");
-        assert_eq!(thread[1].role, "guardian");
-    }
-
-    #[test]
     fn deleting_a_guardian_clears_its_messages() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "hi", None, None)
+            .add_guardian_message(&id, "reviewer", "hi", None, Some("branch-a"))
             .unwrap();
         store.delete_guardian(&id).unwrap();
-        assert!(store.guardian_messages(&id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn delete_guardian_messages_from_seq_truncates_thread() {
-        let store = Store::open_in_memory().unwrap();
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store
-            .add_guardian_message(&id, "reviewer", "msg1", None, None)
-            .unwrap();
-        store
-            .add_guardian_message(&id, "guardian", "msg2", None, None)
-            .unwrap();
-        store
-            .add_guardian_message(&id, "reviewer", "msg3", None, None)
-            .unwrap();
-        let thread = store.guardian_messages(&id).unwrap();
-        assert_eq!(thread.len(), 3);
-        let fork_seq = thread[1].seq;
-        store
-            .delete_guardian_messages_from_seq(&id, fork_seq)
-            .unwrap();
-        let after = store.guardian_messages(&id).unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].text, "msg1");
-    }
-
-    #[test]
-    fn delete_guardian_messages_from_seq_prunes_from_that_point() {
-        // RAL-59: conversation branching prunes everything from the fork seq onwards.
-        let store = Store::open_in_memory().unwrap();
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store
-            .add_guardian_message(&id, "reviewer", "a", None, None)
-            .unwrap();
-        store
-            .add_guardian_message(&id, "guardian", "b", None, None)
-            .unwrap();
-        store
-            .add_guardian_message(&id, "reviewer", "c", None, None)
-            .unwrap();
-        let msgs = store.guardian_messages(&id).unwrap();
-        assert_eq!(msgs.len(), 3);
-        let seq_b = msgs[1].seq;
-        store.delete_guardian_messages_from_seq(&id, seq_b).unwrap();
-        let after = store.guardian_messages(&id).unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].text, "a");
-        assert_eq!(after[0].role, "reviewer");
+        assert!(
+            store
+                .guardian_branch_messages(&id, "branch-a")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn guardian_branch_messages_are_isolated_per_branch() {
         // RAL-272: a branch-scoped message only shows up under its own
-        // branch_id, and the old global thread (branch_id=None) never leaks
+        // branch_id, and an unscoped message (branch_id=None) never leaks
         // into a per-branch query.
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "global", None, None)
+            .add_guardian_message(&id, "reviewer", "unscoped", None, None)
             .unwrap();
         store
             .add_guardian_message(&id, "reviewer", "feedback on a", None, Some("branch-a"))
@@ -4339,8 +4307,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // The global thread still contains every row, scoped or not.
-        assert_eq!(store.guardian_messages(&id).unwrap().len(), 4);
     }
 
     #[test]
@@ -5080,6 +5046,89 @@ mod tests {
         assert_eq!(g.cumulative_tokens_in, 0);
         assert_eq!(g.cumulative_tokens_out, 0);
         assert_eq!(g.cumulative_cost_usd, 0.0);
+    }
+
+    // ── RAL-273: guardian notice (GitHub reorder toast) ──────────────────
+
+    #[test]
+    fn guardian_notice_defaults_to_none() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.notice_kind, None);
+        assert_eq!(g.notice_message, None);
+        assert_eq!(g.notice_at_ms, None);
+    }
+
+    #[test]
+    fn set_guardian_notice_round_trips_and_overwrites() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_notice(
+                &id,
+                "forge_reorder_interrupted_local",
+                "GitHub reorder interrupted your local reorder",
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.notice_kind.as_deref(),
+            Some("forge_reorder_interrupted_local")
+        );
+        assert_eq!(
+            g.notice_message.as_deref(),
+            Some("GitHub reorder interrupted your local reorder")
+        );
+        assert!(g.notice_at_ms.is_some());
+
+        // A later notice overwrites the earlier one -- no queue.
+        store
+            .set_guardian_notice(&id, "other_kind", "a different message")
+            .unwrap();
+        let g2 = store.get_guardian(&id).unwrap();
+        assert_eq!(g2.notice_kind.as_deref(), Some("other_kind"));
+        assert_eq!(g2.notice_message.as_deref(), Some("a different message"));
+    }
+
+    #[test]
+    fn set_guardian_notice_on_missing_guardian_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        let err = store
+            .set_guardian_notice("guardian-does-not-exist", "kind", "message")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    // ── RAL-277: review/forge base last-write-wins ───────────────────────
+
+    #[test]
+    fn forge_base_change_only_wins_when_strictly_newer() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_base_branch_at(&id, "local-base", 2_000)
+            .unwrap();
+
+        assert!(
+            !store
+                .set_guardian_base_branch_if_newer(&id, "older-forge", 1_999)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_guardian_base_branch_if_newer(&id, "tied-forge", 2_000)
+                .unwrap()
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().base_branch, "local-base");
+
+        assert!(
+            store
+                .set_guardian_base_branch_if_newer(&id, "newer-forge", 2_001)
+                .unwrap()
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().base_branch, "newer-forge");
+        assert_eq!(store.guardian_base_changed_at_ms(&id).unwrap(), 2_001);
     }
 
     #[test]

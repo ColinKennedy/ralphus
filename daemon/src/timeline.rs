@@ -296,6 +296,7 @@ fn write_temp_file(squad_id: &str, text: &str) -> String {
     if let Err(e) = std::fs::write(&tmp_path, text).and_then(|()| std::fs::rename(&tmp_path, &path))
     {
         let _ = std::fs::remove_file(&tmp_path);
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [timeline] could not write {}: {e}",

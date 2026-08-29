@@ -8,9 +8,7 @@ use std::process::{Child, Command, Stdio};
 use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
-use crate::cli_agent_common::{
-    RESUME_CONTINUATION_PROMPT, live_session_path, write_live_session_id,
-};
+use crate::cli_agent_common::{live_session_path, write_live_session_id};
 use crate::shellcmd::{self, Env, SpawnArgs};
 use crate::tools::Workspace;
 
@@ -34,12 +32,10 @@ impl ModelBackend for PiBackend {
         });
         let compound = crate::cli_agent_common::is_compound_command(&program);
 
-        let effective_prompt = if options.resume_agent_session_id.is_some() {
-            RESUME_CONTINUATION_PROMPT
-        } else {
-            prompt
-        };
-        let args = build_args(effective_prompt, options);
+        // Always send the cell's own prompt, even on resume -- matches
+        // claude-code/codex (RAL-248 AC3): cross-cell session sharing needs
+        // the new cell's task text, not a generic "continue".
+        let args = build_args(prompt, options);
 
         let mut child = spawn(&program, compound, &args, workspace)
             .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;

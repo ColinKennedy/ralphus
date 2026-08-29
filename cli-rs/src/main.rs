@@ -23,7 +23,11 @@ fn main() -> std::process::ExitCode {
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "--version")
     {
-        println!("ralphus {}", ralphus_core::version());
+        println!(
+            "{} {}",
+            ralphus_cli::program_name::resolve_program_name(),
+            ralphus_core::version()
+        );
         return std::process::ExitCode::SUCCESS;
     }
     if let Err(message) = ralphus_cli::help_map::validate_invocation(&raw_args) {
@@ -32,7 +36,10 @@ fn main() -> std::process::ExitCode {
     }
     let (opts, args) = extract_global_opts(&raw_args);
     let cmd = parse_args(&args);
-    eprintln!("ralphus [cli] {cmd:?}");
+    eprintln!(
+        "{} [cli] {cmd:?}",
+        ralphus_cli::program_name::resolve_program_name()
+    );
     let code = dispatch(cmd, &opts);
     match u8::try_from(code) {
         Ok(c) => std::process::ExitCode::from(c),

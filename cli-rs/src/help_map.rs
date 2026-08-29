@@ -91,10 +91,14 @@ otherwise best run inside a subagent (e.g. Claude Code's Task tool) rather than 
 your main context -- everything else is cheap enough to invoke directly.";
 
 pub const READ_ONLY_NOTE: &str = "Commands tagged `(read-only-safe)` below (the tag appears \
-before the command name, never as one of its own flags) perform no mutation -- they are the \
-commands a `quick-start manager --read-only` / `quick-start reviewer --read-only` session (see \
-`ralphus quick-start manager --help` / `ralphus quick-start reviewer --help`) is restricted to. \
-Everything else below is assumed mutating unless proven otherwise.";
+before the command name, never as one of its own flags) describe a property of the command \
+itself: it performs no mutation, so it is safe to run even under a read-only restriction. The \
+tag is not a permission grant -- in a normal session you may call ANY command below, tagged or \
+not. It becomes a restriction only when THIS session was itself launched with `--read-only` \
+(`quick-start manager --read-only` / `quick-start reviewer --read-only`; see `ralphus \
+quick-start manager --help` / `ralphus quick-start reviewer --help`), in which case the tree \
+below has already been filtered down to only `(read-only-safe)` commands, and calling anything \
+outside it is off-limits. Everything below is assumed mutating unless tagged.";
 
 pub const PROJECT_LOOKUP_NOTE: &str = "A user will often name a project instead of giving a \
 path, e.g. \"in {project_a}, do X\", \"add a new feature to {project_b}\", \"fix {project_c}\" \
@@ -114,6 +118,15 @@ author TOML so each `ralphus submit` call produces ONE Guardian review. Multiple
 fine when intentional; otherwise keep one shared `ralphus:new-review/<key>` across the file(s) \
 in that submit instead of fragmenting the batch into per-task reviews.";
 
+pub const SUBMIT_RETRY_NOTE: &str = "If `submit` (or any other mutating command) errors out with \
+a client-side network/timeout error -- not a real error message returned by the daemon -- that \
+does NOT mean the request was rejected: the daemon may have already accepted it and started work \
+before the response was lost. Never blindly retry in that situation. First run `ralphus status` \
+or `ralphus queue list --all` and look for a squad/entity matching what you just tried to create \
+that's already `pending`/`running`. Only resubmit once you've confirmed no such entity exists -- \
+otherwise you create a genuine duplicate (e.g. two copies of every task in a batch running in \
+parallel) that then has to be manually cancelled.";
+
 pub const JSON_NOTE: &str = "`--json` (emit raw daemon JSON instead of human-readable text) \
 works for every command below, even though it's only listed on the root `ralphus` line of the \
 tree -- it's a global flag, not a per-command one. Unlike other global flags, it works BOTH \
@@ -122,21 +135,21 @@ equivalent.";
 
 // ---- review subgroups (defined separately to keep REVIEW_CHILDREN readable) --
 
-const REVIEW_BASE_CHILDREN: &[HelpNode] = &[
+const REVIEW_UPSTREAM_CHILDREN: &[HelpNode] = &[
     node(
         "list",
         &["selector [str]"],
         &[],
-        "List candidate base branches.",
+        "List candidate upstream branches.",
         false,
-        true, // ("review", "base", "list")
+        true, // ("review", "upstream", "list")
         &[],
     ),
     node(
         "set",
         &["selector [str]", "branch [str]"],
         &[],
-        "Change the base branch.",
+        "Change the upstream branch.",
         false,
         false,
         &[],
@@ -302,36 +315,6 @@ const REVIEW_ACTION_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
-const REVIEW_CHAT_CHILDREN: &[HelpNode] = &[
-    node(
-        "fork",
-        &["selector [str]", "text [str]"],
-        &["--seq [integer]"],
-        "Fork the thread at a message, replacing it with new text.",
-        false,
-        false,
-        &[],
-    ),
-    node(
-        "send",
-        &["selector [str]", "text [str]"],
-        &[],
-        "Post a message.",
-        false,
-        false,
-        &[],
-    ),
-    node(
-        "show",
-        &["selector [str]"],
-        &[],
-        "Show the thread.",
-        false,
-        true, // ("review", "chat", "show")
-        &[],
-    ),
-];
-
 const REVIEW_CHILDREN: &[HelpNode] = &[
     node(
         "action",
@@ -361,13 +344,13 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
-        "base",
+        "upstream",
         &[],
         &[],
-        "Inspect/change a review's base branch.",
+        "Inspect/change a review's upstream branch.",
         false,
         false,
-        REVIEW_BASE_CHILDREN,
+        REVIEW_UPSTREAM_CHILDREN,
     ),
     node(
         "branch",
@@ -399,15 +382,6 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         false,
         false,
         &[],
-    ),
-    node(
-        "chat",
-        &[],
-        &[],
-        "The review's global feedback thread.",
-        false,
-        false,
-        REVIEW_CHAT_CHILDREN,
     ),
     node(
         "checks",
@@ -609,6 +583,15 @@ the review worktree.",
         "Per-branch readiness + a summary verdict ('is this review ready?').",
         false,
         true, // ("review", "status")
+        &[],
+    ),
+    node(
+        "sync-github",
+        &["selector [str]"],
+        &[],
+        "Check the forge for a stack reorder made outside ralphus and apply it if found.",
+        false,
+        false,
         &[],
     ),
     node(
@@ -1471,16 +1454,21 @@ Python's `task show-tutor` to this top-level command.)",
 /// (declared order) then sorted optional chips, an optional `(subagent)`
 /// trailing tag, an optional `(read-only-safe) ` leading prefix, and finally
 /// a `{description}` suffix. Children are alphabetized by name.
-fn render(n: &HelpNode, depth: usize, out: &mut String) {
+fn render(n: &HelpNode, depth: usize, root_name: Option<&str>, out: &mut String) {
     let indent = "    ".repeat(depth);
     let mut chips: Vec<&str> = n.positionals.to_vec();
     let mut opts: Vec<&str> = n.options.to_vec();
     opts.sort_unstable();
     chips.extend(opts);
-    let head = if chips.is_empty() {
-        n.name.to_string()
+    let display_name = if depth == 0 {
+        root_name.unwrap_or(n.name)
     } else {
-        format!("{} {}", n.name, chips.join(" "))
+        n.name
+    };
+    let head = if chips.is_empty() {
+        display_name.to_string()
+    } else {
+        format!("{} {}", display_name, chips.join(" "))
     };
     let marker = if n.subagent { " (subagent)" } else { "" };
     let prefix = if n.read_only_safe {
@@ -1495,7 +1483,58 @@ fn render(n: &HelpNode, depth: usize, out: &mut String) {
     let mut children: Vec<&HelpNode> = n.children.iter().collect();
     children.sort_by_key(|c| c.name);
     for child in children {
-        render(child, depth + 1, out);
+        render(child, depth + 1, root_name, out);
+    }
+}
+
+/// True if `n` itself is `(read-only-safe)`, or any descendant is -- a group
+/// header (e.g. `review`, `cell`) is never tagged itself but must still be
+/// printed by [`render_read_only_safe`] when it has tagged descendants, so
+/// the filtered tree keeps the path prefix those subcommands need.
+fn subtree_has_read_only_safe(n: &HelpNode) -> bool {
+    n.read_only_safe || n.children.iter().any(subtree_has_read_only_safe)
+}
+
+/// Same output shape as [`render`], but prunes every branch that contains no
+/// `(read-only-safe)` command -- the tree shown to a `--read-only`
+/// quick-start session, so it only ever sees commands it's allowed to run.
+fn render_read_only_safe(n: &HelpNode, depth: usize, root_name: Option<&str>, out: &mut String) {
+    if !subtree_has_read_only_safe(n) {
+        return;
+    }
+    let indent = "    ".repeat(depth);
+    let mut chips: Vec<&str> = n.positionals.to_vec();
+    let mut opts: Vec<&str> = n.options.to_vec();
+    opts.sort_unstable();
+    chips.extend(opts);
+    let display_name = if depth == 0 {
+        root_name.unwrap_or(n.name)
+    } else {
+        n.name
+    };
+    let head = if chips.is_empty() {
+        display_name.to_string()
+    } else {
+        format!("{} {}", display_name, chips.join(" "))
+    };
+    let marker = if n.subagent { " (subagent)" } else { "" };
+    let prefix = if n.read_only_safe {
+        "(read-only-safe) "
+    } else {
+        ""
+    };
+    out.push_str(&format!(
+        "{indent}- {prefix}{head}{marker}  {{{}}}\n",
+        n.description
+    ));
+    let mut children: Vec<&HelpNode> = n
+        .children
+        .iter()
+        .filter(|c| subtree_has_read_only_safe(c))
+        .collect();
+    children.sort_by_key(|c| c.name);
+    for child in children {
+        render_read_only_safe(child, depth + 1, root_name, out);
     }
 }
 
@@ -1530,10 +1569,11 @@ fn signature(n: &HelpNode) -> String {
 }
 
 fn command_path(path: &[&str]) -> String {
+    let program = crate::program_name::resolve_program_name();
     if path.is_empty() {
-        "ralphus".to_string()
+        program
     } else {
-        format!("ralphus {}", path.join(" "))
+        format!("{program} {}", path.join(" "))
     }
 }
 
@@ -1731,7 +1771,8 @@ pub fn registered_paths() -> Vec<Vec<&'static str>> {
 #[must_use]
 pub fn generate() -> String {
     let mut out = String::new();
-    render(&ROOT, 0, &mut out);
+    let program = crate::program_name::resolve_program_name();
+    render(&ROOT, 0, Some(&program), &mut out);
     // `render` appends a trailing "\n" after every line (including the
     // last); Python's `"\n".join(lines)` has no trailing newline, so trim it
     // to match exactly.
@@ -1741,16 +1782,32 @@ pub fn generate() -> String {
     out
 }
 
-/// The six guidance notes, blank-line separated, followed by [`generate()`]'s
-/// tree -- ports `helpmap.py::main()`'s exact print sequence. This is what
+/// [`generate()`]'s tree, pruned to only `(read-only-safe)` commands (and the
+/// group headers needed to reach them) -- what a `--read-only` quick-start
+/// session is shown, so it can't discover a mutating command it isn't
+/// allowed to call in the first place.
+#[must_use]
+pub fn generate_read_only_safe() -> String {
+    let mut out = String::new();
+    let program = crate::program_name::resolve_program_name();
+    render_read_only_safe(&ROOT, 0, Some(&program), &mut out);
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// The seven guidance notes, blank-line separated, followed by [`generate()`]'s
+/// tree -- ports `helpmap.py::main()`'s exact print sequence (plus
+/// [`SUBMIT_RETRY_NOTE`], added after the Python port). This is what
 /// `ralphus show help-map` prints.
 #[must_use]
 pub fn full_output() -> String {
-    format!(
+    crate::program_name::substitute_backticked_invocations(&format!(
         "{SUBAGENT_NOTE}\n\n{READ_ONLY_NOTE}\n\n{PROJECT_LOOKUP_NOTE}\n\n{SUBMIT_VALIDATE_NOTE}\n\n\
-{SUBMIT_REVIEW_NOTE}\n\n{JSON_NOTE}\n\n{}",
+{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{}",
         generate()
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -1777,10 +1834,23 @@ mod tests {
         &[SAMPLE_CHILD],
     );
 
+    const MUTATING_CHILD: HelpNode =
+        node("gamma", &[], &[], "does gamma things", false, false, &[]);
+
+    const MIXED_ROOT: HelpNode = node(
+        "root",
+        &[],
+        &[],
+        "root desc",
+        false,
+        false,
+        &[SAMPLE_CHILD, MUTATING_CHILD],
+    );
+
     #[test]
     fn renders_indentation_and_child_nesting() {
         let mut out = String::new();
-        render(&SAMPLE_ROOT, 0, &mut out);
+        render(&SAMPLE_ROOT, 0, None, &mut out);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].starts_with("    - "));
@@ -1789,7 +1859,7 @@ mod tests {
     #[test]
     fn sorts_option_chips_alphabetically_but_keeps_positional_order_first() {
         let mut out = String::new();
-        render(&SAMPLE_CHILD, 0, &mut out);
+        render(&SAMPLE_CHILD, 0, None, &mut out);
         // positional first, then options alphabetized (--beta before --zeta)
         assert!(out.contains("alpha pos1 --beta [val] --zeta"));
     }
@@ -1797,17 +1867,35 @@ mod tests {
     #[test]
     fn read_only_safe_prefix_comes_before_name_subagent_after_chips() {
         let mut out = String::new();
-        render(&SAMPLE_CHILD, 0, &mut out);
+        render(&SAMPLE_CHILD, 0, None, &mut out);
         assert!(out.starts_with("- (read-only-safe) alpha "));
         let mut out2 = String::new();
-        render(&SAMPLE_ROOT, 0, &mut out2);
+        render(&SAMPLE_ROOT, 0, None, &mut out2);
         assert!(out2.starts_with("- root --json (subagent)  {root desc}"));
+    }
+
+    #[test]
+    fn render_read_only_safe_keeps_untagged_group_header_with_tagged_descendant() {
+        let mut out = String::new();
+        render_read_only_safe(&MIXED_ROOT, 0, None, &mut out);
+        // Untagged "root" is kept (it's the path prefix "alpha" needs), tagged
+        // "alpha" is kept, untagged "gamma" (no read-only-safe descendant) is pruned.
+        assert!(out.contains("- root  {root desc}"));
+        assert!(out.contains("(read-only-safe) alpha"));
+        assert!(!out.contains("gamma"));
+    }
+
+    #[test]
+    fn render_read_only_safe_drops_whole_subtree_with_no_tagged_descendant() {
+        let mut out = String::new();
+        render_read_only_safe(&MUTATING_CHILD, 0, None, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
     fn description_is_wrapped_in_braces() {
         let mut out = String::new();
-        render(&SAMPLE_CHILD, 0, &mut out);
+        render(&SAMPLE_CHILD, 0, None, &mut out);
         assert!(out.contains("{does alpha things}"));
     }
 
@@ -1819,7 +1907,22 @@ mod tests {
     }
 
     #[test]
-    fn full_output_prints_all_six_notes_before_the_tree() {
+    fn generate_read_only_safe_excludes_mutating_leaves_but_keeps_their_group_headers() {
+        let text = generate_read_only_safe();
+        assert!(!text.ends_with('\n'));
+        assert!(text.starts_with("- ralphus"));
+        // "review show" is read-only-safe; "review" itself never carries the tag
+        // but must still appear as the path prefix "show" needs.
+        assert!(text.contains("- review "));
+        assert!(text.contains("(read-only-safe) show"));
+        // "submit" and "review merge" are mutating and have no read-only-safe
+        // sibling reachable through them, so they're pruned entirely.
+        assert!(!text.contains("submit "));
+        assert!(!text.contains("merge selector"));
+    }
+
+    #[test]
+    fn full_output_prints_all_seven_notes_before_the_tree() {
         let text = full_output();
         assert!(text.starts_with(SUBAGENT_NOTE));
         for note in [
@@ -1828,9 +1931,14 @@ mod tests {
             PROJECT_LOOKUP_NOTE,
             SUBMIT_VALIDATE_NOTE,
             SUBMIT_REVIEW_NOTE,
+            SUBMIT_RETRY_NOTE,
             JSON_NOTE,
         ] {
-            assert!(text.contains(note));
+            assert!(
+                text.contains(&crate::program_name::substitute_backticked_invocations(
+                    note
+                ))
+            );
         }
         assert!(text.contains("- ralphus"));
     }
@@ -1919,7 +2027,10 @@ mod tests {
     #[test]
     fn command_help_lists_root_subcommands_alphabetically() {
         let text = command_help(&[]).expect("root help");
-        assert!(text.contains("USAGE:\n    ralphus [OPTIONS] <SUBCOMMAND> [ARGS...]"));
+        let program = crate::program_name::resolve_program_name();
+        assert!(text.contains(&format!(
+            "USAGE:\n    {program} [OPTIONS] <SUBCOMMAND> [ARGS...]"
+        )));
         let lines: Vec<&str> = text
             .lines()
             .filter(|line| line.starts_with("    "))
@@ -1943,7 +2054,10 @@ mod tests {
     #[test]
     fn command_help_for_nested_group_lists_immediate_children() {
         let text = command_help(&["review", "pr"]).expect("review pr help");
-        assert!(text.contains("ralphus review pr --"));
+        assert!(text.contains(&format!(
+            "{} review pr --",
+            crate::program_name::resolve_program_name()
+        )));
         assert!(text.contains("SUBCOMMANDS:"));
         assert!(text.contains("comments"));
         assert!(text.contains("pull-feedback"));
@@ -1988,7 +2102,10 @@ mod tests {
         let mut with_help = argv;
         with_help.push("--help".to_string());
         let text = requested_help(&with_help).expect("parent help");
-        assert!(text.starts_with("ralphus quick-start manager --"));
+        assert!(text.starts_with(&format!(
+            "{} quick-start manager --",
+            crate::program_name::resolve_program_name()
+        )));
     }
 
     #[test]

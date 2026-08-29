@@ -41,6 +41,7 @@ mod imp {
         let job = match Job::create() {
             Ok(job) => job,
             Err(e) => {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(WARNING, "ralphus [runner] could not create job object: {e}");
                 return None;
             }
@@ -48,6 +49,7 @@ mod imp {
         let mut info = ExtendedLimitInfo::new();
         info.limit_kill_on_job_close();
         if let Err(e) = job.set_extended_limit_info(&info) {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [runner] could not set job object kill-on-close limit: {e}"
@@ -55,12 +57,14 @@ mod imp {
             return None;
         }
         if let Err(e) = job.assign_current_process() {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [runner] could not assign daemon process to job object: {e}"
             );
             return None;
         }
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [runner] daemon process tree confined to a job object (kill-on-close); \

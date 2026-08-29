@@ -718,8 +718,6 @@
        * @property {Record<string,InputResolution>} [input_resolutions]
        * @property {string} [resolver_agent]
        * @property {string} [resolver_model]
-       * @property {string} [chat_agent]
-       * @property {string} [chat_model]
        * @property {string} [summary_agent]
        * @property {string} [summary_model]
        * @property {string} [summary_state]
@@ -749,6 +747,9 @@
        * @property {number} [cumulative_tokens_in] - RAL-193: input tokens spent on this review's own resolver/proof calls, cumulative across every rebase/re-merge attempt.
        * @property {number} [cumulative_tokens_out] - RAL-193: output tokens, cumulative across every attempt.
        * @property {number} [cumulative_cost_usd] - RAL-193: USD cost, cumulative across every attempt -- what maximum_budget_usd is enforced against.
+       * @property {string|null} [notice_kind] - RAL-273: a one-shot, GUI-facing notice, e.g. "forge_reorder_interrupted_local". Null when there is nothing to show.
+       * @property {string|null} [notice_message] - RAL-273: human-readable text for `notice_kind`.
+       * @property {number|null} [notice_at_ms] - RAL-273: when `notice_kind` was recorded (epoch ms); the board toasts once per new value it observes.
        */
       /**
        * A pull/merge request submitted for one of a review's branches, or for
@@ -1072,6 +1073,7 @@
       CLICK_HANDLERS.stopMerge = (e, ds) => stopMerge(ds.guardianId || "");
       CLICK_HANDLERS.forceStartReview = (e, ds) => forceStartReview(ds.guardianId || "");
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
+      CLICK_HANDLERS.syncGithubReview = (e, ds) => syncGithubReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");
       CLICK_HANDLERS.toggleManualMenu = (e, ds) => toggleManualMenu(ds.guardianId || "");
       CLICK_HANDLERS.copyChatAs = (e, ds) => copyChatAs(ds.guardianId || "", ds.branchId || "", ds.format || "");
@@ -7548,7 +7550,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Tasks tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
           ${g.status === "collecting" && g.squad_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its squad finishes — or start it now below"}</span></div>` : ""}
           <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
-          <div class="kv-row"><span class="k">base</span>${["approved","deployed"].includes(g.status) ? `<span class="mono">${esc(g.base_branch)}</span>` : `<div style="display:flex;flex-direction:column;gap:4px"><div style="display:flex;align-items:center;gap:4px"><input type="text" id="base-input" class="mono" list="base-datalist" value="${esc(g.base_branch)}" data-guardian-id="${esc(g.id)}" onfocus="loadBaseBranches(this.dataset.guardianId)" oninput="onBaseBranchInput(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="The branch every submitted branch is rebased onto.\nUsually 'main' or 'master'.\nType or use ▾ to pick from remote."><datalist id="base-datalist">${(baseBranchCache[g.id]||[]).map(b=>`<option value="${esc(b)}"></option>`).join('')}</datalist><button class="btn" style="padding:2px 6px;font-size:13px;line-height:1" data-click="loadBaseBranchesShowPicker" data-guardian-id="${esc(g.id)}" data-tip="Load all branches from the remote and show them as a pick list.\nClick a branch name to fill in the base field.">▾</button></div><div id="base-error" style="display:none;color:var(--failed);font-size:11px;margin-top:2px"></div><div id="base-pending" class="row" style="display:none;gap:4px;margin-top:2px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveBase" data-guardian-id="${esc(g.id)}" data-tip="Save the new base branch and trigger a full rebase of the review stack.\nReruns even if the branch name is unchanged — useful when the base has new commits.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelBase" data-guardian-id="${esc(g.id)}" data-tip="Cancel — revert the base branch input to its last saved value.">Cancel</button></div></div>`}</div>
+          <div class="kv-row"><span class="k">upstream</span>${["approved","deployed"].includes(g.status) ? `<span class="mono">${esc(g.base_branch)}</span>` : `<div style="display:flex;flex-direction:column;gap:4px"><div style="display:flex;align-items:center;gap:4px"><input type="text" id="base-input" class="mono" list="base-datalist" value="${esc(g.base_branch)}" data-guardian-id="${esc(g.id)}" onfocus="loadBaseBranches(this.dataset.guardianId)" oninput="onBaseBranchInput(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="The branch every submitted branch is rebased onto.\nUsually 'main' or 'master'.\nType or use ▾ to pick from remote."><datalist id="base-datalist">${(baseBranchCache[g.id]||[]).map(b=>`<option value="${esc(b)}"></option>`).join('')}</datalist><button class="btn" style="padding:2px 6px;font-size:13px;line-height:1" data-click="loadBaseBranchesShowPicker" data-guardian-id="${esc(g.id)}" data-tip="Load all branches from the remote and show them as a pick list.\nClick a branch name to fill in the upstream field.">▾</button></div><div id="base-error" style="display:none;color:var(--failed);font-size:11px;margin-top:2px"></div><div id="base-pending" class="row" style="display:none;gap:4px;margin-top:2px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveBase" data-guardian-id="${esc(g.id)}" data-tip="Save the new upstream branch and trigger a full rebase of the review stack.\nReruns even if the branch name is unchanged — useful when the upstream has new commits.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelBase" data-guardian-id="${esc(g.id)}" data-tip="Cancel — revert the upstream branch input to its last saved value.">Cancel</button></div></div>`}</div>
           ${resolverRow}
           ${proofScopeRow}
           ${isMultiProject
@@ -7642,6 +7644,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                   : (approveDisabledReason[g.status] || `Not available — this review's status is currently "${esc(g.status)}".\nApprove is only available once the review reaches in_review.`);
               const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${(canApprove && !isPending) ? "" : "disabled"} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
               return (canApprove && !isPending) ? approveBtn : `<span data-tip="${approveTip}">${approveBtn}</span>`;
+            })()}
+            ${(() => {
+              // RAL-273: only meaningful once a stack is actually built and
+              // open against the forge -- same scope as the 5-minute
+              // background poll (in_review/merging).
+              const canSync = ["in_review", "merging"].includes(g.status);
+              const syncTip = canSync
+                ? "Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack."
+                : "Not available — a stack reorder can only be detected once this review has an open PR stack (status in_review or merging).";
+              const syncBtn = `<button class="btn" data-click="syncGithubReview" data-guardian-id="${esc(g.id)}" ${canSync ? "" : "disabled"}${canSync ? ` data-tip="${syncTip}"` : ""}>Sync with GitHub</button>`;
+              return canSync ? syncBtn : `<span data-tip="${syncTip}">${syncBtn}</span>`;
             })()}
           </div>
           ${(() => {
@@ -8414,7 +8427,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <label data-tip="Display name for this review — shown in the sidebar list.">name<input id="cr-name" value="my review"></label>
               <label data-tip="Review type. 'git' stacks branches via rebase with AI conflict resolution. Other types are placeholders.">type<select id="cr-type" onchange="onReviewTypeChange()"><option value="git">git</option><option value="document">document (placeholder)</option></select></label>
               <div id="cr-git-fields">
-                <label data-tip="The branch that every submitted branch is ultimately rebased onto. Usually 'main' or 'master'.">base branch<input id="cr-base" value="main"></label>
+                <label data-tip="The branch that every submitted branch is ultimately rebased onto. Usually 'main' or 'master'.">upstream branch<input id="cr-base" value="main"></label>
                 <label data-tip="Absolute path to the git repository root on this machine. The daemon checks out worktrees here.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
                 <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nGates are still stored — you can re-enable this later."><input type="checkbox" id="cr-skip-auto-build" style="width:auto;margin:0">skip auto-build</label>
@@ -8594,6 +8607,33 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         root.appendChild(el);
         setTimeout(() => el.remove(), 8000);
       }
+
+      // ---- Guardian notices -> toast (RAL-273) ----
+      // A guardian notice (`notice_kind`/`notice_message`/`notice_at_ms`) is
+      // server-recorded, one-shot, purely informational state -- today only
+      // ever set when an incoming GitHub/GitLab stack reorder interrupts a
+      // local reorder in flight (`Store::set_guardian_notice`). There is no
+      // server-side "seen" tracking: each poll of `/api/guardians` re-sends
+      // whatever the last notice was, so the board itself remembers which
+      // `notice_at_ms` it already showed per guardian and only toasts once
+      // per new one.
+      /** @type {Map<string, number>} guardian id -> last-shown notice_at_ms */
+      const _guardianNoticeShown = new Map();
+      /**
+       * Shows a toast for any guardian whose `notice_at_ms` is newer than
+       * what was last shown for it (RAL-273).
+       * @param {GuardianView[]} list
+       * @returns {void}
+       */
+      function checkGuardianNotices(list) {
+        for (const g of list) {
+          if (!g.notice_kind || !g.notice_at_ms) continue;
+          const lastShown = _guardianNoticeShown.get(g.id) || 0;
+          if (g.notice_at_ms <= lastShown) continue;
+          _guardianNoticeShown.set(g.id, g.notice_at_ms);
+          showInfoToast(`${g.name}: ${g.notice_message || g.notice_kind}`);
+        }
+      }
       // POST to a guardian/review action endpoint; on failure, surfaces a
       // deduped toast instead of silently no-oping. `body`, when given, is
       // JSON-encoded. Returns the Response (or null on a network error) so
@@ -8668,6 +8708,22 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           pendingGuardianActions.delete(id);
           if (!userIsSelecting()) renderReviewDetail();
         }
+      }
+
+      /**
+       * Explicit "Sync with GitHub" (RAL-273): asks the daemon to check this
+       * review's open PRs' live forge bases for a reorder made outside
+       * ralphus and apply it if found. Fires and forgets -- the daemon runs
+       * detection/apply in the background, so the result (a new branch
+       * order, a rebuild, or nothing at all) shows up through the normal
+       * `tick()` refresh, same as the 5-minute background poll.
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function syncGithubReview(id) {
+        await guardianAction(`/api/guardians/${id}/sync-github`);
+        showInfoToast("Checking GitHub/GitLab for a stack reorder…");
+        tick();
       }
 
       // ---------- force-start review (RAL-69) ----------
@@ -9267,6 +9323,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       async function pollReviews() {
         try {
           guardians = await (await fetch("/api/guardians")).json();
+          checkGuardianNotices(guardians);
           byId("conn").className = "dot on";
           if (pendingHash && pendingHash.tab === "reviews") {
             const want = pendingHash; pendingHash = null;

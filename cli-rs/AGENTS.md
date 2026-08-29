@@ -9,10 +9,15 @@ the module map and the disclosed `ralphus author` gap.
 
 Each `HelpNode` in `cli-rs/src/help_map.rs`'s command tree (`ROOT` and its
 children) carries a `read_only_safe: bool` field — the allowlist a
-`--read-only` quick-start session (manager/reviewer) is told it may call. It
-drives the `(read-only-safe)` tag shown in the injected help-map (see
-`READ_ONLY_NOTE` in that same file) and the model is instructed to only
-invoke tagged commands while mutating ones stay off-limits.
+`--read-only` quick-start session (manager/reviewer/watcher) is told it may
+call. The tag describes a property of the command itself (it performs no
+mutation under any of its own flags), not a permission gate — a normal
+(non-read-only) session may call any command, tagged or not. Only a
+`--read-only` session is restricted, and for that session the injected
+help-map tree is pruned down to `(read-only-safe)` commands only (plus the
+group headers needed to reach them) via `help_map::generate_read_only_safe`
+— see `quick_start.rs`'s `help_map_tree` — rather than merely tagging
+everything and trusting the model to self-filter.
 
 **Whenever you add a new `ralphus` CLI subcommand, decide whether it is safe
 to run under `--read-only`, and if so, set its `HelpNode`'s `read_only_safe`

@@ -4,10 +4,16 @@
 //! provider HTTP APIs straight with `ureq` (see `chat_client.rs`).
 //!
 //! Routing is config-driven: [`crate::config::ForgeConfig`] (the `[forge]`
-//! TOML table, global or per-project) can pin the forge kind, remote name, API
-//! base URL, and token env var explicitly. Any field left unset falls back to
+//! TOML table, global or per-project) can pin the forge kind, API base URL,
+//! and token env var explicitly. Any field left unset falls back to
 //! autodetection from the repository's `git remote get-url` (see
 //! [`resolve_remote`]).
+//!
+//! `[forge].remote` is the one field that is a *fallback*, not an override:
+//! which remote a review resolves against is decided by the review's own
+//! `base_branch` first — see [`resolve_remote_name`] for the full four-step
+//! precedence — so a repo with a fork plus an upstream opens each review's PR
+//! against whichever host that review is actually based on (RAL-282).
 //!
 //! ## Auth (RAL-117 Q8)
 //!
@@ -106,6 +112,13 @@ pub struct PrComment {
     pub created_at: String,
 }
 
+/// Live base-ref metadata used to reconcile forge-authored base edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestBaseState {
+    pub base: String,
+    pub updated_at_ms: i64,
+}
+
 /// A created pull/merge request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPr {
@@ -166,6 +179,10 @@ impl ForgeClient {
     }
 
     fn require_token(&self) -> Result<&str, String> {
+        #[cfg(test)]
+        if self.token.is_none() && self.api_base.starts_with("http://127.0.0.1:") {
+            return Ok("test-token");
+        }
         self.token.as_deref().ok_or_else(|| {
             format!(
                 "no {} token configured (set ${})",
@@ -187,6 +204,7 @@ impl ForgeClient {
         head: &str,
         base: &str,
     ) -> Result<CreatedPr, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [forge] create pr start kind={} repo={} head={head} base={base}",
@@ -195,6 +213,7 @@ impl ForgeClient {
         );
         let result = self.create_pull_request_inner(title, body, head, base);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(pr) => crate::rlog!(
                 INFO,
                 "ralphus [forge] create pr done kind={} repo={} number={} url={}",
@@ -203,6 +222,7 @@ impl ForgeClient {
                 pr.number,
                 pr.url
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] create pr failed kind={} repo={}: {e}",
@@ -273,6 +293,7 @@ impl ForgeClient {
     /// silently does nothing). Logs the outbound call (start/done/error) via
     /// `rlog!`.
     pub fn get_pull_request_state(&self, number: i64) -> Result<String, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] get pr state start kind={} repo={} number={number}",
@@ -281,12 +302,14 @@ impl ForgeClient {
         );
         let result = self.get_pull_request_state_inner(number);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(state) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get pr state done kind={} repo={} number={number} state={state}",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] get pr state failed kind={} repo={} number={number}: {e}",
@@ -324,6 +347,91 @@ impl ForgeClient {
         }
     }
 
+    /// Fetch a PR/MR's *live* base/target branch from the forge (RAL-273) --
+    /// so a stack reordered on the forge's own UI (dragging PRs into a new
+    /// order, which retargets each PR's base) can be detected instead of only
+    /// ever pushing ralphus's local order out via [`Self::update_pull_request_base`].
+    /// Logs the outbound call (start/done/error) via `rlog!`.
+    pub fn get_pull_request_base(&self, number: i64) -> Result<String, String> {
+        self.get_pull_request_base_state(number).map(|s| s.base)
+    }
+
+    /// Fetch the live base and the forge timestamp of the edit. The timestamp
+    /// is required for RAL-277's cross-system last-write-wins rule.
+    pub fn get_pull_request_base_state(&self, number: i64) -> Result<PullRequestBaseState, String> {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] get pr base start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.get_pull_request_base_state_inner(number);
+        match &result {
+            Ok(state) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] get pr base done kind={} repo={} number={number} base={} updated_at_ms={}",
+                self.kind.as_str(),
+                self.repo_path,
+                state.base,
+                state.updated_at_ms
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] get pr base failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn get_pull_request_base_state_inner(
+        &self,
+        number: i64,
+    ) -> Result<PullRequestBaseState, String> {
+        let token = self.require_token()?;
+        let (base, updated_at) = match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let resp = get(ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json"))?;
+                let base = resp["base"]["ref"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "forge response missing base.ref".to_string())?;
+                let updated_at = resp["updated_at"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "forge response missing updated_at".to_string())?;
+                (base, updated_at)
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let base = resp["target_branch"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "forge response missing target_branch".to_string())?;
+                let updated_at = resp["updated_at"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "forge response missing updated_at".to_string())?;
+                (base, updated_at)
+            }
+        };
+        let updated_at_ms = chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .map_err(|e| format!("forge response has invalid updated_at {updated_at:?}: {e}"))?
+            .timestamp_millis();
+        Ok(PullRequestBaseState {
+            base,
+            updated_at_ms,
+        })
+    }
+
     /// Retarget an already-open PR/MR's base/target branch (RAL-190: keeps a
     /// stacked PR's base in sync after its review is reordered). Best-effort
     /// from the caller's point of view -- callers should log-and-continue on
@@ -331,6 +439,7 @@ impl ForgeClient {
     /// the local `base_ref` record is updated regardless. Logs the outbound
     /// call (start/done/error) via `rlog!`.
     pub fn update_pull_request_base(&self, number: i64, new_base: &str) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [forge] update pr base start kind={} repo={} number={number} new_base={new_base}",
@@ -339,12 +448,14 @@ impl ForgeClient {
         );
         let result = self.update_pull_request_base_inner(number, new_base);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(()) => crate::rlog!(
                 INFO,
                 "ralphus [forge] update pr base done kind={} repo={} number={number}",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] update pr base failed kind={} repo={} number={number}: {e}",
@@ -396,6 +507,7 @@ impl ForgeClient {
         if self.kind != ForgeKind::GitHub {
             return Ok(None);
         }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [forge] create stack start kind={} repo={} pull_requests={pr_numbers:?}",
@@ -404,6 +516,7 @@ impl ForgeClient {
         );
         let result = self.create_stack_inner(pr_numbers);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(stack) => crate::rlog!(
                 INFO,
                 "ralphus [forge] create stack done kind={} repo={} number={}",
@@ -411,6 +524,7 @@ impl ForgeClient {
                 self.repo_path,
                 stack.number
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] create stack failed kind={} repo={}: {e}",
@@ -448,6 +562,7 @@ impl ForgeClient {
         if self.kind != ForgeKind::GitHub {
             return Ok(());
         }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [forge] add to stack start kind={} repo={} stack={stack_number} pull_requests={pr_numbers:?}",
@@ -456,12 +571,14 @@ impl ForgeClient {
         );
         let result = self.add_to_stack_inner(stack_number, pr_numbers);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(()) => crate::rlog!(
                 INFO,
                 "ralphus [forge] add to stack done kind={} repo={} stack={stack_number}",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] add to stack failed kind={} repo={} stack={stack_number}: {e}",
@@ -501,6 +618,10 @@ impl ForgeClient {
     /// returns `Ok(())` as a documented no-op rather than an error. Logs the
     /// outbound call (start/done/error) via `rlog!`.
     pub fn unstack(&self, stack_number: i64) -> Result<(), String> {
+        if self.kind != ForgeKind::GitHub {
+            return Ok(());
+        }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [forge] unstack start kind={} repo={} stack={stack_number}",
@@ -509,12 +630,14 @@ impl ForgeClient {
         );
         let result = self.unstack_inner(stack_number);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(()) => crate::rlog!(
                 INFO,
                 "ralphus [forge] unstack done kind={} repo={} stack={stack_number}",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] unstack failed kind={} repo={} stack={stack_number}: {e}",
@@ -545,6 +668,7 @@ impl ForgeClient {
     /// they are never actionable feedback. Logs the outbound call
     /// (start/done/error) via `rlog!`.
     pub fn list_pr_comments(&self, number: i64) -> Result<Vec<PrComment>, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] list pr comments start kind={} repo={} number={number}",
@@ -553,6 +677,7 @@ impl ForgeClient {
         );
         let result = self.list_pr_comments_inner(number);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(comments) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] list pr comments done kind={} repo={} number={number} count={}",
@@ -560,6 +685,7 @@ impl ForgeClient {
                 self.repo_path,
                 comments.len()
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] list pr comments failed kind={} repo={} number={number}: {e}",
@@ -628,6 +754,7 @@ impl ForgeClient {
     /// best-effort and failing to find a template is not itself an error).
     #[must_use]
     pub fn fetch_pr_template(&self) -> Option<String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] fetch pr template start kind={} repo={}",
@@ -635,6 +762,7 @@ impl ForgeClient {
             self.repo_path
         );
         let result = self.fetch_pr_template_inner();
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] fetch pr template {} kind={} repo={}",
@@ -858,16 +986,96 @@ fn extract_glab_token(text: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// Resolve which git remote a review's own `base_branch` designates (RAL-190,
+/// extended by RAL-282 to also honor a bare branch's own `@{u}` upstream) —
+/// the single shared precedence used both to pick which forge host a PR is
+/// submitted against ([`resolve_remote`]) and which remote PR-branch
+/// pushes/pulls target (`pr.rs`):
+///
+/// 1. `base_branch` in `<remote>/<branch>` form, where `<remote>` names a
+///    real configured remote (e.g. `"origin/main"`, `"alt/beta"`) -> that
+///    remote.
+/// 2. Else `base_branch` names a bare local branch with its own `@{u}`
+///    upstream tracking configured -> that upstream's remote.
+/// 3. `[forge].remote` config, if set.
+/// 4. `"origin"`.
+///
+/// `[forge].remote` never wins over what `base_branch` itself resolves to —
+/// it is a fallback only, consulted when neither of the above resolves.
+#[must_use]
+pub(crate) fn resolve_remote_name(root: &Path, base_branch: &str, cfg: &ForgeConfig) -> String {
+    remote_from_base_branch(root, base_branch)
+        .or_else(|| remote_from_branch_upstream(root, base_branch))
+        .unwrap_or_else(|| default_remote_name(cfg))
+}
+
+/// Steps 3-4 of [`resolve_remote_name`] on their own: the branch-independent
+/// fallback, `[forge].remote` else `"origin"`. Exposed separately for the
+/// callers that have no review branch to key steps 1-2 off at all (see
+/// `guardian_merge::remote_clone_url`, which resolves a *project's* clone URL
+/// for remote-machine provisioning), so they share this crate's one definition
+/// of the default rather than open-coding `unwrap_or("origin")` again.
+#[must_use]
+pub(crate) fn default_remote_name(cfg: &ForgeConfig) -> String {
+    cfg.remote.clone().unwrap_or_else(|| "origin".to_string())
+}
+
+/// Step 1 of [`resolve_remote_name`]: `base_branch` written in
+/// `<remote>/<branch>` form and that leading segment names a real configured
+/// remote. Returns `None` when `base_branch` has no `/` at all, or its
+/// leading segment isn't a real remote (so it's read as a literal branch name
+/// that happens to contain a slash, e.g. a personal `colin/main`).
+fn remote_from_base_branch(root: &Path, base_branch: &str) -> Option<String> {
+    let (candidate, _) = base_branch.split_once('/')?;
+    crate::guardian_merge::git(root, &["remote", "get-url", candidate]).ok()?;
+    Some(candidate.to_string())
+}
+
+/// Step 2 of [`resolve_remote_name`]: `base_branch` read as a bare local
+/// branch name, resolved via its own `@{u}` upstream tracking — not the
+/// current checkout's `@{u}` (a bare `@{u}` reflects whatever happens to be
+/// checked out in the shared guardian repo at call time, not the review's own
+/// base branch). Returns `None` when the branch doesn't exist locally or has
+/// no upstream configured.
+///
+/// An empty `base_branch` returns `None` without shelling out: `format!`ing it
+/// into the rev-parse argument would leave a bare `@{u}`, i.e. exactly the
+/// current-checkout reading this function exists to avoid.
+fn remote_from_branch_upstream(root: &Path, base_branch: &str) -> Option<String> {
+    if base_branch.trim().is_empty() {
+        return None;
+    }
+    let upstream = crate::guardian_merge::git(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &format!("{base_branch}@{{u}}"),
+        ],
+    )
+    .ok()?;
+    let (remote, _branch) = upstream.trim().split_once('/')?;
+    Some(remote.to_string())
+}
+
 /// Resolve the effective forge client for a git repository at `root`,
 /// combining the layered [`ForgeConfig`] (explicit overrides) with
 /// autodetection from `git remote get-url <remote>` (host → kind, path →
-/// repo). Fails only when the remote can't be read/parsed or no forge kind
-/// can be determined — a missing token is not an error here (see
+/// repo). The remote itself is resolved via [`resolve_remote_name`], keyed
+/// off the review's own `base_branch` rather than `[forge].remote` directly
+/// (RAL-282). Fails only when the remote can't be read/parsed or no forge
+/// kind can be determined — a missing token is not an error here (see
 /// [`ForgeClient::require_token`]). Logs the resolved kind/repo/api_base (or
 /// the failure reason) via `rlog!`.
-pub fn resolve_remote(root: &Path, cfg: &ForgeConfig) -> Result<ForgeClient, String> {
-    let result = resolve_remote_inner(root, cfg);
+pub fn resolve_remote(
+    root: &Path,
+    base_branch: &str,
+    cfg: &ForgeConfig,
+) -> Result<ForgeClient, String> {
+    let result = resolve_remote_inner(root, base_branch, cfg);
     match &result {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Ok(client) => crate::rlog!(
             DEBUG,
             "ralphus [forge] resolved kind={} repo={} api_base={}",
@@ -875,14 +1083,19 @@ pub fn resolve_remote(root: &Path, cfg: &ForgeConfig) -> Result<ForgeClient, Str
             client.repo_path,
             client.api_base
         ),
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Err(e) => crate::rlog!(WARNING, "ralphus [forge] resolve remote failed: {e}"),
     }
     result
 }
 
-fn resolve_remote_inner(root: &Path, cfg: &ForgeConfig) -> Result<ForgeClient, String> {
-    let remote_name = cfg.remote.as_deref().unwrap_or("origin");
-    let url = crate::guardian_merge::git(root, &["remote", "get-url", remote_name])
+fn resolve_remote_inner(
+    root: &Path,
+    base_branch: &str,
+    cfg: &ForgeConfig,
+) -> Result<ForgeClient, String> {
+    let remote_name = resolve_remote_name(root, base_branch, cfg);
+    let url = crate::guardian_merge::git(root, &["remote", "get-url", &remote_name])
         .map_err(|e| format!("could not read remote '{remote_name}': {e}"))?;
     let (host, path) = parse_remote_url(url.trim())
         .ok_or_else(|| format!("could not parse remote url: {}", url.trim()))?;
@@ -912,6 +1125,7 @@ fn resolve_remote_inner(root: &Path, cfg: &ForgeConfig) -> Result<ForgeClient, S
         .ok()
         .or_else(|| resolve_cli_token(kind, &host));
     if token.is_some() && std::env::var(&token_env).is_err() {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] resolved token via CLI fallback kind={} host={host}",
@@ -1095,6 +1309,97 @@ mod tests {
         let text =
             "gitlab.com\n  Not logged in to gitlab.com. Use `glab auth login` to authenticate.\n";
         assert_eq!(extract_glab_token(text), None);
+    }
+
+    #[test]
+    fn get_pull_request_base_reads_github_base_ref() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/5");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"base": {"ref": "feature-a"}, "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.get_pull_request_base_state(5).unwrap();
+        assert_eq!(state.base, "feature-a");
+        assert_eq!(
+            state.updated_at_ms,
+            chrono::DateTime::parse_from_rfc3339("2026-08-29T12:34:56.789Z")
+                .unwrap()
+                .timestamp_millis()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_base_reads_gitlab_target_branch() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/6");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"target_branch": "feature-a", "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_base(6).unwrap(), "feature-a");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_base_errors_when_the_forge_response_omits_it() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let err = client.get_pull_request_base(7).unwrap_err();
+        assert!(err.contains("base.ref"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_base_requires_token() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "https://api.github.com".to_string(),
+            "acme/widget".to_string(),
+            None,
+        );
+        let err = client.get_pull_request_base(1).unwrap_err();
+        assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
     }
 
     #[test]
@@ -1324,5 +1629,334 @@ mod tests {
                 .is_none(),
             "no stack endpoint may be called on GitLab"
         );
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-forge-test-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn g(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn remote_from_base_branch_detects_a_real_configured_remote() {
+        let root = tmp_dir("remote-detect");
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+        g(
+            &root,
+            &["remote", "add", "gitlab", "https://gitlab.com/a/b.git"],
+        );
+
+        assert_eq!(
+            remote_from_base_branch(&root, "gitlab/main"),
+            Some("gitlab".to_string())
+        );
+        assert_eq!(
+            remote_from_base_branch(&root, "origin/main"),
+            Some("origin".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remote_from_base_branch_is_none_for_a_plain_branch_or_unknown_remote() {
+        let root = tmp_dir("remote-detect-none");
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+
+        assert_eq!(remote_from_base_branch(&root, "main"), None);
+        assert_eq!(
+            remote_from_base_branch(&root, "colin/feature"),
+            None,
+            "a personal branch name that happens to contain a slash must not be mistaken for a remote"
+        );
+        assert_eq!(
+            remote_from_base_branch(&root, "features/foo/bar"),
+            None,
+            "a slash-namespaced branch name (e.g. features/foo/bar) whose leading segment isn't a \
+             configured remote must not be mistaken for one either"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_name_falls_back_to_default_for_a_slash_namespaced_branch_name() {
+        let root = tmp_dir("effective-remote-namespaced");
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+
+        let cfg = ForgeConfig::default();
+        assert_eq!(
+            resolve_remote_name(&root, "features/foo/bar", &cfg),
+            "origin",
+            "the leading segment ('features') isn't a real remote, and 'features/foo/bar' has no \
+             @{{u}} of its own either, so this must fall back to the config/origin default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_name_prefers_base_branchs_own_remote_prefix_over_the_config_default() {
+        let root = tmp_dir("effective-remote");
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+        g(
+            &root,
+            &["remote", "add", "gitlab", "https://gitlab.com/a/b.git"],
+        );
+
+        let cfg = ForgeConfig::default();
+        assert_eq!(
+            resolve_remote_name(&root, "gitlab/main", &cfg),
+            "gitlab",
+            "the base branch's own remote prefix must win over the project config default"
+        );
+        assert_eq!(
+            resolve_remote_name(&root, "main", &cfg),
+            "origin",
+            "falls back to the config/origin default when base_branch names no remote and has no \
+             @{{u}} of its own"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_name_honors_a_bare_local_branchs_own_at_u_upstream() {
+        let root = tmp_dir("effective-remote-at-u");
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+        g(
+            &root,
+            &["remote", "add", "alt", "https://alt.example.com/a/b.git"],
+        );
+        g(&root, &["commit", "--allow-empty", "-m", "init"]);
+        g(&root, &["branch", "foo_branch_name"]);
+        g(&root, &["config", "branch.foo_branch_name.remote", "alt"]);
+        g(
+            &root,
+            &[
+                "config",
+                "branch.foo_branch_name.merge",
+                "refs/heads/foo_branch_name",
+            ],
+        );
+        // `@{u}` only resolves once the remote-tracking ref it points at
+        // actually exists (as a real prior `git push -u alt foo_branch_name`
+        // would have created) -- config alone isn't enough.
+        let sha = g(&root, &["rev-parse", "foo_branch_name"]);
+        g(
+            &root,
+            &["update-ref", "refs/remotes/alt/foo_branch_name", sha.trim()],
+        );
+
+        let cfg = ForgeConfig::default();
+        assert_eq!(
+            resolve_remote_name(&root, "foo_branch_name", &cfg),
+            "alt",
+            "a bare local branch name with no remote prefix must still resolve via its own @{{u}} \
+             upstream rather than falling straight through to the config/origin default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Set up a repo with `origin` on GitHub and a second remote on GitLab, so
+    /// a wrong remote choice shows up as the wrong *forge host*, not just a
+    /// different name -- the failure RAL-282 is actually about (a PR silently
+    /// opened against the wrong forge instance).
+    fn two_forge_repo(tag: &str, alt_remote: &str) -> std::path::PathBuf {
+        let root = tmp_dir(tag);
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/gh-owner/gh-repo.git",
+            ],
+        );
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                alt_remote,
+                "https://gitlab.com/gl-owner/gl-repo.git",
+            ],
+        );
+        root
+    }
+
+    #[test]
+    fn resolve_remote_resolves_the_forge_host_from_a_remote_prefixed_base_branch() {
+        let root = two_forge_repo("forge-host-prefix", "alternativeremote");
+
+        let client = resolve_remote_inner(&root, "alternativeremote/foo", &ForgeConfig::default())
+            .expect("resolve");
+        assert_eq!(
+            client.kind,
+            ForgeKind::GitLab,
+            "base_branch \"alternativeremote/foo\" must pick alternativeremote's URL\n             (GitLab), not origin's (GitHub), even with no [forge].remote configured"
+        );
+        assert_eq!(client.repo_path, "gl-owner%2Fgl-repo");
+        assert_eq!(client.api_base, "https://gitlab.com/api/v4");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_resolves_the_forge_host_from_a_bare_branchs_at_u_upstream() {
+        let root = two_forge_repo("forge-host-at-u", "alt");
+        g(&root, &["commit", "--allow-empty", "-m", "init"]);
+        g(&root, &["branch", "foo_branch_name"]);
+        g(&root, &["config", "branch.foo_branch_name.remote", "alt"]);
+        g(
+            &root,
+            &[
+                "config",
+                "branch.foo_branch_name.merge",
+                "refs/heads/foo_branch_name",
+            ],
+        );
+        let sha = g(&root, &["rev-parse", "foo_branch_name"]);
+        g(
+            &root,
+            &["update-ref", "refs/remotes/alt/foo_branch_name", sha.trim()],
+        );
+
+        let client = resolve_remote_inner(&root, "foo_branch_name", &ForgeConfig::default())
+            .expect("resolve");
+        assert_eq!(
+            client.kind,
+            ForgeKind::GitLab,
+            "a bare local base_branch tracking alt via @{{u}} must resolve the forge \n             against alt (GitLab), not fall through to origin (GitHub)"
+        );
+        assert_eq!(client.repo_path, "gl-owner%2Fgl-repo");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_still_honors_forge_cfg_remote_when_the_base_branch_resolves_to_nothing() {
+        let root = two_forge_repo("forge-host-cfg-fallback", "alt");
+
+        let cfg = ForgeConfig {
+            remote: Some("alt".to_string()),
+            ..ForgeConfig::default()
+        };
+        let client = resolve_remote_inner(&root, "main", &cfg).expect("resolve");
+        assert_eq!(
+            client.kind,
+            ForgeKind::GitLab,
+            "with no remote prefix and no @{{u}} upstream on \"main\", [forge].remote still decides"
+        );
+
+        let client = resolve_remote_inner(&root, "main", &ForgeConfig::default()).expect("resolve");
+        assert_eq!(
+            client.kind,
+            ForgeKind::GitHub,
+            "and with nothing configured at all it lands on origin"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remote_from_branch_upstream_never_reads_the_current_checkouts_upstream() {
+        let root = two_forge_repo("at-u-empty-guard", "alt");
+        g(&root, &["commit", "--allow-empty", "-m", "init"]);
+        // Give the *checked-out* branch an upstream on `alt`. An empty
+        // base_branch must not pick that up: `format!("{base_branch}@{{u}}")`
+        // would otherwise degrade to a bare `@{u}`.
+        g(&root, &["config", "branch.main.remote", "alt"]);
+        g(&root, &["config", "branch.main.merge", "refs/heads/main"]);
+        let sha = g(&root, &["rev-parse", "main"]);
+        g(&root, &["update-ref", "refs/remotes/alt/main", sha.trim()]);
+        assert_eq!(
+            remote_from_branch_upstream(&root, "main"),
+            Some("alt".to_string()),
+            "sanity: main really does track alt, so a bare @{{u}} here would resolve"
+        );
+
+        assert_eq!(
+            remote_from_branch_upstream(&root, ""),
+            None,
+            "an empty base_branch must resolve to nothing rather than silently adopting\n             whatever the shared guardian repo happens to have checked out"
+        );
+        assert_eq!(
+            resolve_remote_name(&root, "", &ForgeConfig::default()),
+            "origin",
+            "and it therefore falls through to the config/origin default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_name_falls_back_to_forge_cfg_remote_when_base_branch_has_no_remote_and_no_at_u()
+     {
+        let root = tmp_dir("effective-remote-cfg-fallback");
+        g(&root, &["init", "-b", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "configured",
+                "https://configured.example.com/a/b.git",
+            ],
+        );
+
+        let cfg = ForgeConfig {
+            remote: Some("configured".to_string()),
+            ..ForgeConfig::default()
+        };
+        assert_eq!(
+            resolve_remote_name(&root, "main", &cfg),
+            "configured",
+            "with no remote prefix and no @{{u}} upstream, [forge].remote is still the fallback \
+             before origin"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -37,6 +37,7 @@ pub fn call_direct(
     messages: &[ChatMessage],
 ) -> Result<String, String> {
     let msg_count = messages.len();
+    // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus [guardian] chat-api start backend={agent:?} model={model:?} messages={msg_count}"
@@ -55,7 +56,9 @@ pub fn call_direct(
         )),
     };
     match &result {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Ok(_) => crate::rlog!(DEBUG, "ralphus [guardian] chat-api done backend={agent:?}"),
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Err(e) => crate::rlog!(
             ERROR,
             "ralphus [guardian] chat-api error backend={agent:?}: {e}"
