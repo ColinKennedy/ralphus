@@ -523,6 +523,7 @@ pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<Path
         }
         BranchMaterialization::NewFromHead { warning } => {
             if let Some(warning) = warning {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(WARNING, "ralphus [scheduler] {warning}");
             }
             preflight_worktree_budget(root, &wt, "HEAD", path_budget_limit())?;

@@ -270,6 +270,7 @@ impl RunnerSpec {
         let system_prompt = match (row.system_prompt.clone(), subproject_addendum) {
             (Some(existing), Some(addendum)) => {
                 let combined = format!("{existing}\n\n{addendum}");
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(
                     DEBUG,
                     "ralphus [spec] cell {} system-prompt: user-supplied ({} chars) + subproject addendum → combined ({} chars)",
@@ -280,6 +281,7 @@ impl RunnerSpec {
                 Some(combined)
             }
             (Some(existing), None) => {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(
                     DEBUG,
                     "ralphus [spec] cell {} system-prompt: borrowed from cell config ({} chars)",
@@ -289,6 +291,7 @@ impl RunnerSpec {
                 Some(existing)
             }
             (None, Some(addendum)) => {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(
                     DEBUG,
                     "ralphus [spec] cell {} system-prompt: synthesised from subprojects ({} chars, {:?})",

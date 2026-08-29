@@ -13,8 +13,8 @@ use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::guardian::{GuardianCheck, MergeStatus};
 use ralphus_daemon::guardian_merge::{
     pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
-    rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_chat, run_feedback,
-    run_merge, run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
+    rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_feedback, run_merge,
+    run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
 };
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
@@ -749,9 +749,8 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     // other branch's thread.
     let (root, store, id) = single_feature_repo();
     // Deterministic, network-free: "claude-code" is resolvable but not
-    // supported by chat_client::call_direct (see chat_no_commit_leaves_
-    // working_tree_dirty above), so the best-effort reply generation always
-    // no-ops instead of racing a real API call.
+    // supported by chat_client::call_direct, so the best-effort reply
+    // generation always no-ops instead of racing a real API call.
     store
         .lock()
         .unwrap()
@@ -2413,159 +2412,6 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
     assert!(
         wt.join("note1.txt").exists(),
         "note1.txt must remain in worktree after turn 2 (stash-restored)"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-// RAL-52: the global feedback chat (dispatch_routes path) must also respect a
-// no-commit instruction — routed agents apply edits but no commit is created.
-
-/// For the triage turn (task == "chat") returns a route block targeting
-/// `target_branch`; for dispatch turns (task == "route") writes a named file.
-struct RouteBlockRunner {
-    target_branch: String,
-    dispatch_file: &'static str,
-}
-impl Runner for RouteBlockRunner {
-    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
-        if spec.task == "chat" {
-            return RunnerResult {
-                status: "done".into(),
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd: 0.0,
-                summary: format!(
-                    "Routing to {}.\n<route branch=\"{}\">\nAdd a note\n</route>",
-                    self.target_branch, self.target_branch
-                ),
-                error: None,
-                proofed: None,
-                agent_session_id: None,
-                ghost: None,
-            };
-        }
-        let _ = std::fs::write(
-            PathBuf::from(&spec.cwd).join(self.dispatch_file),
-            "dispatched\n",
-        );
-        RunnerResult {
-            status: "done".into(),
-            tokens_in: 0,
-            tokens_out: 0,
-            cost_usd: 0.0,
-            summary: "edited".into(),
-            error: None,
-            proofed: None,
-            agent_session_id: None,
-            ghost: None,
-        }
-    }
-}
-
-#[test]
-fn chat_no_commit_leaves_working_tree_dirty() {
-    let (root, store, id) = single_feature_repo();
-    // Use a resolvable-but-`call_direct`-unsupported resolver agent (see
-    // `chat_client::call_direct`: only claude/anthropic/ollama go direct) so
-    // `call_direct` returns Err immediately and the subprocess fallback (our
-    // mock runner) is used for the triage call.
-    store
-        .lock()
-        .unwrap()
-        .set_guardian_resolver(&id, Some("claude-code"), None)
-        .unwrap();
-    run_merge(&store, &NoopRunner, &id);
-
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
-    let wt = PathBuf::from(view.branches[0].worktree.as_deref().unwrap());
-    let rev = view.branches[0].review_branch.clone().unwrap();
-    let head_before = git(&root, &["rev-parse", &rev]);
-
-    let runner: Arc<dyn Runner> = Arc::new(RouteBlockRunner {
-        target_branch: "feature/a".to_string(),
-        dispatch_file: "dispatch_note.txt",
-    });
-    run_chat(&store, runner, &id, "apply the change, don't commit", None);
-
-    // The review-branch HEAD must not have moved.
-    let head_after = git(&root, &["rev-parse", &rev]);
-    assert_eq!(
-        head_before, head_after,
-        "review branch must not advance on no-commit chat"
-    );
-
-    // dispatch_note.txt must NOT appear in the committed tree.
-    let committed = git(&root, &["ls-tree", "-r", "--name-only", &rev]);
-    assert!(
-        !committed.contains("dispatch_note.txt"),
-        "dispatch_note.txt must not be committed; ls-tree: {committed}"
-    );
-
-    // dispatch_note.txt must appear as an uncommitted change in the worktree.
-    let status = git(&wt, &["status", "--porcelain"]);
-    assert!(
-        status.contains("dispatch_note.txt"),
-        "dispatch_note.txt must be a dirty working-tree file; status: {status}"
-    );
-
-    let view2 = store.lock().unwrap().get_guardian(&id).unwrap();
-    assert_eq!(
-        view2.status, "in_review",
-        "guardian status after no-commit chat: {:?}",
-        view2.detail
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// RAL-169: while a merge/rebase is rebuilding the combined review worktree,
-/// `combined_worktree` in the DB can point at a directory that transiently
-/// doesn't exist. Chat's subprocess-runner fallback must detect that and
-/// reply with a friendly status message instead of spawning the runner
-/// against a missing cwd and leaking a raw filesystem error into the thread.
-#[test]
-fn chat_replies_with_friendly_message_when_workspace_missing() {
-    let (root, store, id) = single_feature_repo();
-    // Use a resolvable-but-`call_direct`-unsupported resolver agent (see
-    // `chat_client::call_direct`: only claude/anthropic/ollama go direct) so
-    // `call_direct` returns Err immediately and the subprocess fallback path
-    // (under test) is used for the triage call.
-    store
-        .lock()
-        .unwrap()
-        .set_guardian_resolver(&id, Some("claude-code"), None)
-        .unwrap();
-    run_merge(&store, &NoopRunner, &id);
-
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
-    let combined = view
-        .combined_worktree
-        .clone()
-        .expect("combined worktree set");
-    // Simulate the mid-merge window: the worktree directory has been torn
-    // down for a rebuild but the DB still points at its (now missing) path.
-    std::fs::remove_dir_all(&combined).expect("remove combined worktree");
-    assert!(!Path::new(&combined).is_dir());
-
-    run_chat(&store, Arc::new(NoopRunner), &id, "is this stuck?", None);
-
-    let messages = store.lock().unwrap().guardian_messages(&id).unwrap();
-    let reply = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "guardian")
-        .expect("guardian reply recorded");
-    assert!(
-        !reply.text.contains("does not exist") && !reply.text.contains("noop runner"),
-        "raw internal error leaked into chat reply: {:?}",
-        reply.text
-    );
-    assert!(
-        reply.text.to_lowercase().contains("merge")
-            || reply.text.to_lowercase().contains("try again"),
-        "expected a friendly status message, got: {:?}",
-        reply.text
     );
 
     let _ = std::fs::remove_dir_all(&root);

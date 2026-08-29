@@ -616,15 +616,13 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "guardians", id, "branches", "arrange"]) => {
             guardian_arrange(daemon, id, body)
         }
+        ("POST", ["api", "guardians", id, "sync-github"]) => guardian_sync_github(daemon, id),
         ("POST", ["api", "guardians", id, "branches", branch_id, "feedback"]) => {
             guardian_feedback(daemon, id, branch_id, body)
         }
-        ("GET", ["api", "guardians", id, "messages"]) => guardian_messages(daemon, id),
         ("GET", ["api", "guardians", id, "branches", branch_id, "messages"]) => {
             guardian_branch_messages(daemon, id, branch_id)
         }
-        ("POST", ["api", "guardians", id, "chat"]) => guardian_chat(daemon, id, body),
-        ("POST", ["api", "guardians", id, "chat", "fork"]) => guardian_chat_fork(daemon, id, body),
         ("GET", ["api", "guardians", id, "base-branches"]) => guardian_base_branches(daemon, id),
         ("POST", ["api", "guardians", id, "base"]) => guardian_change_base(daemon, id, body),
         ("POST", ["api", "guardians", id, "force_start"]) => guardian_force_start(daemon, id),
@@ -1019,18 +1017,18 @@ fn validate_projects_registered(
 /// Require the declarative inputs a remote-fed review needs, before anything is
 /// provisioned (RAL-185 Phase 3b).
 ///
-/// A review normally *infers* each contributing branch and its base by running
-/// the VCS against the cell's worktree. That read only works on the machine
-/// holding it, so a review fed by a remote cell must instead be told:
+/// A review normally *infers* each contributing branch and its upstream by
+/// running the VCS against the cell's worktree. That read only works on the
+/// machine holding it, so a review fed by a remote cell must instead be told:
 ///
 /// - the branch, via a `ralphus:new-worktree/<branch>` cwd, and
-/// - the base, via `[[review]] base`.
+/// - the upstream, via `[[review]] upstream`.
 ///
 /// Checked here rather than inside `crate::reviews::derive_reviews` so it fails
-/// before the provider is asked to provision a workspace — a missing `base` is
-/// a static authoring mistake, and there is no reason to spend a remote
-/// checkout discovering it. `derive_reviews` keeps its own equivalent errors as
-/// a backstop for paths that don't come through submit.
+/// before the provider is asked to provision a workspace — a missing
+/// `upstream` is a static authoring mistake, and there is no reason to spend a
+/// remote checkout discovering it. `derive_reviews` keeps its own equivalent
+/// errors as a backstop for paths that don't come through submit.
 fn validate_remote_reviews_are_declarative(
     store: &Store,
     file: &ralphus_core::schema::TaskFile,
@@ -1067,12 +1065,12 @@ fn validate_remote_reviews_are_declarative(
                 .review
                 .iter()
                 .find(|r| r.id.as_deref() == Some(review_id))
-                .and_then(|r| r.base.as_deref())
+                .and_then(|r| r.upstream.as_deref())
                 .map(str::trim)
                 .filter(|b| !b.is_empty());
             if declared.is_none() {
                 return Err(format!(
-                    "review \"{review_id}\" is fed by cell \"{sid}\" running on machine                      \"{machine_label}\", so its base branch cannot be read from that worktree's                      upstream — this daemon cannot see another machine's filesystem. Declare it                      explicitly: [[review]] base = \"main\"."
+                    "review \"{review_id}\" is fed by cell \"{sid}\" running on machine                      \"{machine_label}\", so its upstream branch cannot be read from that worktree's                      git upstream — this daemon cannot see another machine's filesystem. Declare it                      explicitly: [[review]] upstream = \"main\"."
                 ));
             }
         }
@@ -5185,9 +5183,9 @@ struct ShutdownResponse {
     cancelled_guardians: Vec<String>,
 }
 
-/// Kill every process this daemon has spawned — cell/proof/review/chat/
-/// summary subprocesses, tmux panes, everything — and request that the
-/// daemon exit once this response is sent.
+/// Kill every process this daemon has spawned — cell/proof/review/summary
+/// subprocesses, tmux panes, everything — and request that the daemon exit
+/// once this response is sent.
 ///
 /// Unconditionally (regardless of `auto_cancel`): trips every registered
 /// cancellation token (stops scheduler-squad cells' subprocesses via their
@@ -6331,11 +6329,19 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let status = store.get_guardian(id).map(|g| g.status).ok();
     let base_changed = req.base_branch.as_deref().is_some_and(|s| !s.is_empty());
     drop(store);
-    // RAL-285: the lowest stacked PR targets the review's base branch by name,
-    // so moving the base leaves that PR pointed at the old branch until the
-    // bases are recomputed.
+    // RAL-277: a local base edit is not complete until every open PR/MR base
+    // has been verified on the forge. Keep this inside the request so callers
+    // never observe a successful response while the forge still targets the
+    // old chain.
     if base_changed {
-        crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
+        if let Err(e) = crate::pr::resync_pr_bases_synchronously(&daemon.store_handle(), id) {
+            return error(
+                502,
+                "forge_error",
+                &format!("base saved locally but PR/MR base sync failed: {e}"),
+                vec![],
+            );
+        }
     }
     if status.as_deref() == Some("merging") {
         let runner = guardian_agent_runner(daemon);
@@ -6347,6 +6353,7 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             daemon.semaphore_handle(),
         );
         if restarted.status >= 400 {
+            // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} settings-triggered merge restart failed: {}",
@@ -6495,7 +6502,7 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
     };
     let root = Path::new(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(root);
-    let client = match crate::forge::resolve_remote(root, &forge_cfg) {
+    let client = match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
@@ -6631,6 +6638,45 @@ fn guardian_add_branch(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
+/// Fire a [`crate::pr::check_and_apply_forge_reorder`] check in the
+/// background for `id` (RAL-273) -- used by the explicit `sync-github`
+/// endpoint ([`guardian_sync_github`]) only. The 5-minute background sweep is
+/// [`crate::pr::poll_forge_reorders`], wired into `scheduler::run_loop`
+/// instead, since it must run regardless of any HTTP activity.
+/// [`guardian_reorder`]/[`guardian_arrange`] deliberately don't call this
+/// too -- see the comment in [`guardian_reorder`] for why.
+fn trigger_forge_reorder_check(daemon: &Daemon, id: &str) {
+    let store = daemon.store_handle();
+    let sem = daemon.semaphore_handle();
+    let cancellations = daemon.cancellations_handle();
+    let sid = id.to_string();
+    std::thread::spawn(move || {
+        let runner: Arc<dyn Runner> =
+            Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)));
+        crate::pr::check_and_apply_forge_reorder(
+            &store,
+            runner.as_ref(),
+            &sid,
+            &sem,
+            &cancellations,
+        );
+    });
+}
+
+/// Explicit "Sync with GitHub"/"Sync with GitLab" action (RAL-273): trigger
+/// the same forge-reorder check the 5-minute poll uses, on demand. Runs in
+/// the background -- detection itself makes forge
+/// network calls, and applying a detected reorder runs a full rebase -- so
+/// the caller watches the guardian view (and its notice fields) for the
+/// result, the same as every other guardian action that returns 202.
+fn guardian_sync_github(daemon: &Daemon, id: &str) -> Reply {
+    if let Err(e) = daemon.lock().get_guardian(id) {
+        return store_error(&e);
+    }
+    trigger_forge_reorder_check(daemon, id);
+    json(202, &StateResponse { state: "checking" })
+}
+
 fn guardian_reorder(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<ReorderBody>(body) else {
         return error(400, "bad_request", "body must be {order:[...]}", vec![]);
@@ -6653,14 +6699,20 @@ fn guardian_reorder(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // RAL-190: a reorder can change which branch precedes a stacked PR, so
     // its forge base needs to follow -- backgrounded since it makes network
     // calls (see pr::resync_pr_bases's doc comment).
-    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
+    //
+    // Deliberately NOT also firing `trigger_forge_reorder_check` here
+    // (RAL-273): it reads the forge's *live* PR bases back, and racing that
+    // against this same resync's in-flight PATCH could read the pre-PATCH
+    // base and misread this review's own just-applied local reorder as
+    // external drift, undoing it. `guardian_approve`/`guardian_merge` cover
+    // the "on every change to a ralphus review" path for changes that don't
+    // themselves touch PR bases.
     result
 }
 
 /// The runner for a guardian review's own agent invocations -- the merge's
 /// conflict resolver, proof-instruction synthesis, summary/manual-commands
-/// generation, chat triage, feedback and "set it for me" input resolution
-/// (RAL-201).
+/// generation, feedback and "set it for me" input resolution (RAL-201).
 ///
 /// Wrapped in [`crate::remote_runner::MachineRouter`] rather than handed the
 /// bare local runner directly: every `RunnerSpec` these call sites build
@@ -6728,6 +6780,11 @@ fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
 }
 
 fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
+    // Stop any live merge worker first -- otherwise it keeps running
+    // in-flight resolver agents to completion and its own end-of-pass
+    // status write clobbers `cancelled` back to `in_review`. See
+    // `stop_merge_worker_for_cancel`'s doc comment.
+    crate::guardian_merge::stop_merge_worker_for_cancel(&daemon.cancellations, id);
     match daemon.lock().cancel_guardian(id) {
         Ok(status) => json(
             200,
@@ -7144,9 +7201,16 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let has_branches = !guardian.branches.is_empty();
     let was_merging = guardian.status == "merging";
     drop(store);
-    // RAL-285: see `guardian_settings` -- the lowest stacked PR names the base
-    // branch directly and has to follow it here too.
-    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
+    // RAL-277: synchronous by contract; a 2xx response means the complete
+    // multi-branch PR/MR chain has already been retargeted on the forge.
+    if let Err(e) = crate::pr::resync_pr_bases_synchronously(&daemon.store_handle(), id) {
+        return error(
+            502,
+            "forge_error",
+            &format!("base saved locally but PR/MR base sync failed: {e}"),
+            vec![],
+        );
+    }
     let updated_guardian = match daemon.lock().get_guardian(id) {
         Ok(g) => g,
         Err(e) => return store_error(&e),
@@ -7436,91 +7500,13 @@ struct MessagesResponse {
     messages: Vec<crate::guardian::MessageView>,
 }
 
-/// The guardian's global feedback thread (RAL-22).
-fn guardian_messages(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().guardian_messages(id) {
-        Ok(messages) => json(200, &MessagesResponse { messages }),
-        Err(e) => store_error(&e),
-    }
-}
-
 /// One review branch's read-only feedback thread (RAL-272) -- populated by
-/// `POST .../branches/{branch_id}/feedback`, distinct from the old global
-/// thread `guardian_messages` above.
+/// `POST .../branches/{branch_id}/feedback`.
 fn guardian_branch_messages(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     match daemon.lock().guardian_branch_messages(id, branch_id) {
         Ok(messages) => json(200, &MessagesResponse { messages }),
         Err(e) => store_error(&e),
     }
-}
-
-#[derive(Deserialize)]
-struct ChatBody {
-    #[serde(default)]
-    text: String,
-    /// Optional base64 data-URI image attached to this message (RAL-59).
-    image: Option<String>,
-}
-
-/// Post a reviewer message to the global feedback thread; the triage agent
-/// replies in the background (RAL-22).
-fn guardian_chat(daemon: &Daemon, id: &str, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<ChatBody>(body) else {
-        return error(400, "bad_request", "body must be {text}", vec![]);
-    };
-    if req.text.trim().is_empty() {
-        return error(400, "bad_request", "message text must not be empty", vec![]);
-    }
-    let runner = guardian_agent_runner(daemon);
-    crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text, req.image)
-}
-
-#[derive(Deserialize)]
-struct ForkBody {
-    /// The `seq` of the message to fork from: all messages with seq ≥ this
-    /// value are deleted and the new text is posted in their place (RAL-59).
-    seq: i64,
-    #[serde(default)]
-    text: String,
-    /// Optional base64 data-URI image (RAL-59).
-    image: Option<String>,
-}
-
-/// Fork the conversation at `seq`: delete everything from that message
-/// onwards, post the new reviewer message, and re-trigger the triage agent
-/// (RAL-59).
-fn guardian_chat_fork(daemon: &Daemon, id: &str, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<ForkBody>(body) else {
-        return error(400, "bad_request", "body must be {seq, text}", vec![]);
-    };
-    if req.text.trim().is_empty() {
-        return error(400, "bad_request", "message text must not be empty", vec![]);
-    }
-    crate::rlog!(
-        INFO,
-        "ralphus [guardian] review {id} chat fork from seq={}",
-        req.seq
-    );
-    {
-        let guard = daemon.lock();
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "chat fork",
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"seq": req.seq}),
-        });
-    }
-    if let Err(e) = daemon.lock().delete_guardian_messages_from_seq(id, req.seq) {
-        return store_error(&e);
-    }
-    let runner = guardian_agent_runner(daemon);
-    crate::guardian_merge::start_chat(daemon.store_handle(), runner, id, req.text, req.image)
 }
 
 // ── blocking server ──────────────────────────────────────────────────────────
@@ -7862,6 +7848,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
         // traffic, or any non-browser caller) is unaffected.
         let cors = resolve_cors(&request);
         if cors == ralphus_core::cors::CorsDecision::Denied {
+            // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
             crate::rlog!(
                 WARNING,
                 "ralphus [http] {method} {url} blocked: cross-origin request denied"
@@ -8020,6 +8007,7 @@ fn serve_events_stream(
     allow_origin: Option<&str>,
 ) {
     let (sub_id, rx) = store.lock().unwrap().event_bus().subscribe();
+    // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
     crate::rlog!(DEBUG, "ralphus [http] SSE client connected sub_id={sub_id}");
     let mut writer = request.into_writer();
     let cors_lines = match allow_origin {
@@ -8048,6 +8036,7 @@ X-Accel-Buffering: no\r\n\
         } && writer.flush().is_ok();
     }
     store.lock().unwrap().event_bus().unsubscribe(sub_id);
+    // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
     crate::rlog!(
         DEBUG,
         "ralphus [http] SSE client disconnected sub_id={sub_id}"
@@ -9101,13 +9090,13 @@ machine=\"incredibuild:B\"
     }
 
     #[test]
-    fn a_remote_cell_feeding_a_review_must_declare_the_reviews_base() {
-        // A remote cell's worktree lives on another machine, so its base
+    fn a_remote_cell_feeding_a_review_must_declare_the_reviews_upstream() {
+        // A remote cell's worktree lives on another machine, so its upstream
         // cannot be read from that worktree's git upstream. Declaring it is the
         // only honest option -- guessing the project default would silently
-        // review against the wrong base.
+        // review against the wrong upstream.
         let d = daemon();
-        let repo = tmp_git_repo("remote-review-base");
+        let repo = tmp_git_repo("remote-review-upstream");
         route(
             &d,
             "POST",
@@ -9126,8 +9115,8 @@ machine=\"incredibuild:B\"
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(
-            r.body.contains("base = ") || r.body.contains("base branch"),
-            "the error must point at the missing [[review]] base: {}",
+            r.body.contains("upstream = ") || r.body.contains("upstream branch"),
+            "the error must point at the missing [[review]] upstream: {}",
             r.body
         );
     }
@@ -9153,7 +9142,7 @@ machine=\"incredibuild:B\"
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
                     [[task.cell]]\nid=\"work\"\ncwd=\"/remote/wt\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
-                    [[review]]\nid=\"r\"\nbase=\"main\"\n";
+                    [[review]]\nid=\"r\"\nupstream=\"main\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("new-worktree"), "{}", r.body);
@@ -11993,22 +11982,6 @@ command = "true"
     }
 
     #[test]
-    fn guardian_messages_endpoint_starts_empty() {
-        let d = daemon();
-        let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
-        route(&d, "POST", "/api/guardians", &body);
-        let r = route(
-            &d,
-            "GET",
-            "/api/guardians/guardian-000000000001/messages",
-            "",
-        );
-        assert_eq!(r.status, 200);
-        assert!(r.body.contains("\"messages\":[]"));
-    }
-
-    #[test]
     fn guardian_branch_messages_endpoint_starts_empty() {
         let d = daemon();
         let body =
@@ -12027,7 +12000,7 @@ command = "true"
     #[test]
     fn guardian_branch_messages_endpoint_is_scoped_per_branch() {
         // RAL-272: a branch's own thread only contains messages posted with
-        // that branch_id -- the old global thread never leaks in, and one
+        // that branch_id -- an unscoped message never leaks in, and one
         // branch never sees another's feedback.
         let d = daemon();
         let body =
@@ -12037,7 +12010,7 @@ command = "true"
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
         let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
         d.lock()
-            .add_guardian_message(gid, "reviewer", "global msg", None, None)
+            .add_guardian_message(gid, "reviewer", "unscoped msg", None, None)
             .unwrap();
         d.lock()
             .add_guardian_message(gid, "reviewer", "branch feedback", None, Some(&branch_id))
@@ -12055,54 +12028,7 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("branch feedback"));
         assert!(r.body.contains("branch reply"));
-        assert!(!r.body.contains("global msg"));
-
-        // The old global endpoint still returns every row, scoped or not.
-        let global = route(&d, "GET", &format!("/api/guardians/{gid}/messages"), "");
-        assert!(global.body.contains("global msg"));
-        assert!(global.body.contains("branch feedback"));
-    }
-
-    #[test]
-    fn guardian_chat_fork_empty_text_is_400() {
-        let d = daemon();
-        let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
-        route(&d, "POST", "/api/guardians", &body);
-        let r = route(
-            &d,
-            "POST",
-            "/api/guardians/guardian-000000000001/chat/fork",
-            "{\"seq\":1,\"text\":\"  \"}",
-        );
-        assert_eq!(r.status, 400);
-    }
-
-    #[test]
-    fn guardian_chat_fork_missing_guardian_is_404() {
-        let d = daemon();
-        let r = route(
-            &d,
-            "POST",
-            "/api/guardians/guardian-000000000099/chat/fork",
-            "{\"seq\":1,\"text\":\"retry\"}",
-        );
-        assert_eq!(r.status, 404);
-    }
-
-    #[test]
-    fn guardian_chat_empty_text_is_400() {
-        let d = daemon();
-        let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
-        route(&d, "POST", "/api/guardians", &body);
-        let r = route(
-            &d,
-            "POST",
-            "/api/guardians/guardian-000000000001/chat",
-            "{\"text\":\"  \"}",
-        );
-        assert_eq!(r.status, 400);
+        assert!(!r.body.contains("unscoped msg"));
     }
 
     #[test]

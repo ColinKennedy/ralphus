@@ -230,6 +230,7 @@ aborts the remaining batch).
 | `review reorder <selector> <b1,b2,...> [--disable b,b] [--enable b,b]` | Reorder branches + rebase, atomically |
 | `review branch enable\|disable <selector#branch>` | Enable/disable one branch + rebase |
 | `review merge <selector>` | Start/continue the stacked rebase |
+| `review sync-github <selector>` | Check the forge for a stack reorder made outside ralphus and apply it if found (RAL-273) |
 | `review restart-merge <selector>` | Cancel an in-progress rebase, start fresh |
 | `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
@@ -237,15 +238,12 @@ aborts the remaining batch).
 | `review feedback <selector#branch> <text>` | Post feedback on a branch |
 | `review dismiss-reenable <selector#branch>` | Dismiss the "can re-enable" notice |
 | `review move-branch <selector#branch> <to_review>` | Move a branch to another review + rebuild both (RAL-118) |
-| `review base list <selector>` | Candidate base branches |
-| `review base set <selector> <branch>` | Change base branch + rebuild |
+| `review upstream list <selector>` | Candidate upstream branches |
+| `review upstream set <selector> <branch>` | Change upstream branch + rebuild |
 | `review checks list <selector>` | List LLM-synthesized manual review-verification commands |
 | `review checks run <selector> [--index N...] [--all] [--input NAME=VALUE...]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
 | `review action list <selector>` | List user-declared `[[review.action]]` hints |
 | `review action run <selector> --index N [--input NAME=VALUE...]` | Print the command + cwd for a `command`-kind hint |
-| `review chat send <selector> <text>` | Post to the global feedback thread |
-| `review chat show <selector>` | Show the feedback thread |
-| `review chat fork <selector> --seq N <text>` | Fork the thread at a message |
 | `review pr submit <selector> (--position N \| --combined) [--alias] [--title] [--description]` | Submit a PR/MR (RAL-117); title/description default to an LLM suggestion |
 | `review pr list <selector>` | List PRs submitted for a review |
 | `review pr show <pr_id>` | Show one PR row |
@@ -589,10 +587,6 @@ use; see `READ_ONLY_NOTE`.
             - terminal selector [str] --mode [open|readonly]  {Print the command to resume a branch's conflict-resolver conversation locally.}
         - build-env selector [str] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's build/check-gate step environment overrides.}
         - cancel selector [str]  {Cancel a review.}
-        - chat  {The review's global feedback thread.}
-            - fork selector [str] text [str] --seq [integer]  {Fork the thread at a message, replacing it with new text.}
-            - send selector [str] text [str]  {Post a message.}
-            - (read-only-safe) show selector [str]  {Show the thread.}
         - checks  {LLM-synthesized manual review-verification commands.}
             - (read-only-safe) list selector [str]  {List the manual checks.}
             - (read-only-safe) run selector [str] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}

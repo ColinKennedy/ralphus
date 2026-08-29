@@ -13,6 +13,7 @@ pub mod graphview;
 pub mod health;
 pub mod help_map;
 pub mod output;
+pub mod program_name;
 pub mod selector;
 pub mod tutor;
 

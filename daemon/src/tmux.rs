@@ -161,6 +161,7 @@ pub(crate) fn sweep_dead_test_sessions_once() {
     ONCE.call_once(|| {
         let killed = sweep_dead_test_sessions();
         if killed > 0 {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [tmux] swept {killed} orphaned live-tmux TEST session(s) left behind by a killed/timed-out prior test run (RAL-177)"
@@ -295,6 +296,7 @@ const PANE_SNAPSHOT_MAX_LINES: usize = 4000;
 /// `state_dir()`.
 fn write_pane_snapshot_in(dir: &std::path::Path, session_name: &str, content: &str) {
     if let Err(e) = std::fs::create_dir_all(dir) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [tmux] could not create pane snapshot dir {}: {e}",
@@ -314,6 +316,7 @@ fn write_pane_snapshot_in(dir: &std::path::Path, session_name: &str, content: &s
     let redacted = ralphus_core::redact::redact_secrets(&content);
     let truncated = crate::runner::tail_lines(&redacted, PANE_SNAPSHOT_MAX_LINES);
     if let Err(e) = std::fs::write(pane_snapshot_path_in(dir, session_name), truncated) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [tmux] could not write pane snapshot for {session_name}: {e}"
@@ -803,6 +806,7 @@ impl Tmux {
         // need -- safe to force-terminate directly.
         let killed = force_kill_tmux_processes(name);
         if killed > 0 {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [tmux] force-killed {killed} zombie tmux.exe process(es) left behind by kill-session for {name}"
@@ -959,10 +963,12 @@ pub fn find_server_pid(name: &str) -> Option<u32> {
     // script) even when `watch_for_exit`'s own diagnostic later comes back
     // `Unknown`.
     match pid {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         Some(p) => crate::rlog!(
             DEBUG,
             "ralphus [runner] found tmux server pid={p} for session={name}"
         ),
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         None => crate::rlog!(
             DEBUG,
             "ralphus [runner] could not find tmux server pid for session={name} (no matching process)"

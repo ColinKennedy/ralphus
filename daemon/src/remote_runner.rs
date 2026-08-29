@@ -302,6 +302,7 @@ impl ProviderRunner {
                 self.scheme, self.program
             )
         })?;
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [remote] provider {} verb={verb} uri={} squad={} cell={}",
@@ -786,6 +787,7 @@ impl ProviderRunner {
             Ok(line) => match serde_json::from_str::<ProviderResponse>(&line) {
                 Ok(resp) => Some(resp),
                 Err(e) => {
+                    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
                         WARNING,
                         "ralphus [remote] provider {} channel returned unparseable JSON ({e}); falling back to a one-shot spawn",
@@ -795,6 +797,7 @@ impl ProviderRunner {
                 }
             },
             Err(e) => {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(
                     WARNING,
                     "ralphus [remote] provider {} channel unavailable ({e}); falling back to a one-shot spawn",

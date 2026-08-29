@@ -490,7 +490,12 @@ pub struct ForgeConfig {
     /// `"github"` or `"gitlab"`. `None` means autodetect from the remote URL's host.
     #[serde(default)]
     pub kind: Option<String>,
-    /// Git remote name to read the repository URL from. Defaults to `"origin"`.
+    /// Git remote name to read the repository URL from — a *fallback*, not an
+    /// override: a review resolves its remote from its own `base_branch`
+    /// first (its `<remote>/` prefix, else that branch's `@{u}` upstream),
+    /// and only reaches this field when neither resolves. Defaults to
+    /// `"origin"`. See [`crate::forge::resolve_remote_name`] for the full
+    /// precedence.
     #[serde(default)]
     pub remote: Option<String>,
     /// Override API base URL, for self-hosted GitHub Enterprise / GitLab instances.

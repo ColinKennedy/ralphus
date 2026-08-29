@@ -306,13 +306,16 @@ pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
 ///
 /// This is a *worktree tracking* upstream -- the `git branch
 /// --set-upstream-to` target that `derive_reviews` needs to determine a
-/// review's base and that drives resync-on-reuse (fetch + rebase) for a
+/// review's upstream and that drives resync-on-reuse (fetch + rebase) for a
 /// remote-tracking branch. It is unrelated to a cell's own top-level
 /// `upstream = "<<task:...>>"` field ([`CellDef::upstream`]), which rebases
 /// this cell's branch onto another task/cell's tip immediately before the
-/// cell runs -- a content operation, not a tracking-configuration one. A cell
-/// can set both: the `cwd` placeholder's `?upstream=` for tracking, and its
-/// own `upstream` field for a pre-run rebase.
+/// cell runs -- a content operation, not a tracking-configuration one. It is
+/// also unrelated to a `[[review]]` block's own `upstream` field
+/// ([`ReviewDef::upstream`]), which declares the branch a review's stack
+/// rebases onto rather than a worktree tracking target. A cell can set both
+/// of the cell-level fields: the `cwd` placeholder's `?upstream=` for
+/// tracking, and its own `upstream` field for a pre-run rebase.
 #[must_use]
 pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
     let rest = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
@@ -596,17 +599,17 @@ pub struct ReviewDef {
     /// The branch this review's stack rebases onto, declared rather than
     /// discovered (RAL-185).
     ///
-    /// A local review normally infers its base from each contributing
+    /// A local review normally infers its upstream from each contributing
     /// worktree's git upstream. That read only works on the machine holding
     /// the worktree, so a review fed by a **remote** cell must state its
-    /// base here — the daemon has no way to look it up across machines, and
-    /// guessing the project's default branch would silently produce a review
-    /// against the wrong base.
+    /// upstream here — the daemon has no way to look it up across machines,
+    /// and guessing the project's default branch would silently produce a
+    /// review against the wrong upstream.
     ///
     /// Optional for an all-local review, where inference still applies and
     /// this simply overrides it.
     #[serde(default)]
-    pub base: Option<String>,
+    pub upstream: Option<String>,
     /// The machine this review's worktrees and merge live on (RAL-185),
     /// written `scheme:uri`. Independent of any task's machine — a review may
     /// run somewhere none of its contributing tasks did. Unset means

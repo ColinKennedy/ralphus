@@ -35,6 +35,7 @@ pub mod runner;
 pub mod scheduler;
 pub mod server;
 pub(crate) mod short_paths;
+pub(crate) mod stash;
 pub mod store;
 pub mod summary_worker;
 pub mod terminal_log;

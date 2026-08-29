@@ -4,8 +4,8 @@
 //! on the cell) are grouped by the *project* their worktree belongs to (its shared
 //! git dir, so linked worktrees of one repo collapse together). Each project
 //! becomes one guardian, whose branch list is the cells' worktree branches in
-//! topological order. The base branch is always the worktree's upstream tracking
-//! branch — a hard error if the worktree has none.
+//! topological order. The upstream branch is always the worktree's git
+//! upstream tracking branch — a hard error if the worktree has none.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -114,33 +114,39 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
     // Detect any working-tree or index changes (tracked or untracked).
     let has_changes = !git(cwd, &["status", "--porcelain"])?.is_empty();
 
-    if has_changes {
-        git(
-            cwd,
-            &[
-                "stash",
-                "push",
-                "--include-untracked",
-                "-m",
-                "ralphus-rebase-stash",
-            ],
-        )
-        .map_err(|e| format!("git stash before rebase failed: {e}"))?;
-    }
+    // RAL-283: named + uniquified, not a bare `git stash` — this worktree's
+    // stash lives on the shared `refs/stash` stack of the whole repo (git
+    // has no per-worktree stash), so a bare push/pop here could restore a
+    // different concurrently-rebasing worktree's stashed changes instead of
+    // this one's. No guardian id is available at this call site (it also
+    // runs from the scheduler's plain cell-dependency rebase), so the scope
+    // is just the worktree's own branch, which this repo's linked worktrees
+    // never share.
+    let stash_name = if has_changes {
+        // A detached HEAD has no branch to name the scope after; the name is
+        // unique either way, so fall back rather than refusing to rebase.
+        let scope = worktree_branch(cwd).unwrap_or_else(|_| "detached-head".to_string());
+        let name = crate::stash::unique_stash_name(&scope, "rebase");
+        git(cwd, &["stash", "push", "--include-untracked", "-m", &name])
+            .map_err(|e| format!("git stash before rebase failed: {e}"))?;
+        Some(name)
+    } else {
+        None
+    };
 
     if let Err(e) = git(cwd, &["rebase", target_branch]) {
         // Abort the incomplete rebase so the worktree stays usable.
         let _ = git(cwd, &["rebase", "--abort"]);
         // Restore stashed work so nothing is lost.
-        if has_changes {
-            let _ = git(cwd, &["stash", "pop"]);
+        if let Some(name) = &stash_name {
+            let _ = crate::stash::pop_named(|args| git(cwd, args), name);
         }
         return Err(format!("git rebase {target_branch} failed: {e}"));
     }
 
     // Rebase succeeded — restore any stashed work.
-    if has_changes {
-        git(cwd, &["stash", "pop"]).map_err(|e| {
+    if let Some(name) = &stash_name {
+        crate::stash::pop_named(|args| git(cwd, args), name).map_err(|e| {
             format!("rebase succeeded but git stash pop failed (stash preserved): {e}")
         })?;
     }
@@ -206,7 +212,7 @@ pub(crate) fn cell_upstream_display(
 struct Membership {
     project: PathBuf,
     branch: String,
-    base: String,
+    upstream: String,
     name: String,
     order: usize,
     /// The stable link key when the review id is `ralphus:new-review/<key>`; the
@@ -309,8 +315,8 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
 /// for it — this host has no view of that directory. Every piece is instead
 /// recoverable from what was already declared: the branch from the cell's
 /// `ralphus:new-worktree/<branch>` cwd, and the project root from the owning
-/// task's registered `project`. The base is the one thing with no declarative
-/// source, which is why `[[review]] base` exists.
+/// task's registered `project`. The upstream is the one thing with no
+/// declarative source, which is why `[[review]] upstream` exists.
 ///
 /// `None` for a local cell, which keeps the original inference path.
 struct RemoteDerivation {
@@ -451,53 +457,53 @@ pub fn derive_reviews(
             .as_deref()
             .ok_or_else(|| ReviewError::new("a cell declaring a review has no cwd"))?;
         let cwd_path = Path::new(cwd);
-        let declared_base = review_map
+        let declared_upstream = review_map
             .get(rev_id)
             .copied()
-            .and_then(|r| r.base.clone())
+            .and_then(|r| r.upstream.clone())
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
         // RAL-185: a cell that ran on another machine keeps its worktree
         // there, so none of the filesystem reads below can answer for it.
         // Everything needed is already known declaratively instead: the branch
-        // from its `ralphus:new-worktree/<branch>` cwd, the base from the
-        // review's own `base`, and the project from the owning task.
+        // from its `ralphus:new-worktree/<branch>` cwd, the upstream from the
+        // review's own `upstream`, and the project from the owning task.
         let remote = remote_cell_derivation(
             store,
             &cells[pos],
             cell_info[pos].0.as_deref(),
             tasks_by_idx.get(&cells[pos].task_idx).copied().flatten(),
         )?;
-        let (project, branch, base) = if let Some(rd) = &remote {
-            let base = declared_base.clone().ok_or_else(|| {
+        let (project, branch, upstream) = if let Some(rd) = &remote {
+            let upstream = declared_upstream.clone().ok_or_else(|| {
                 ReviewError::new(format!(
                     "review \"{rev_id}\" is fed by cell \"{}\" running on machine \"{}\", so \
-                     its base branch cannot be read from that worktree's git upstream — this \
-                     daemon cannot see another machine's filesystem. Declare it explicitly on \
-                     the review: [[review]] base = \"main\".",
+                     its upstream branch cannot be read from that worktree's git upstream — \
+                     this daemon cannot see another machine's filesystem. Declare it explicitly \
+                     on the review: [[review]] upstream = \"main\".",
                     rd.cell_id, rd.machine
                 ))
             })?;
-            (PathBuf::from(&rd.project_root), rd.branch.clone(), base)
+            (PathBuf::from(&rd.project_root), rd.branch.clone(), upstream)
         } else {
             let project =
                 worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
             let branch =
                 worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            // A declared base wins; otherwise infer it from the worktree's own
-            // upstream, exactly as an all-local review always has.
-            let base = match declared_base.clone() {
+            // A declared upstream wins; otherwise infer it from the worktree's
+            // own git upstream, exactly as an all-local review always has.
+            let upstream = match declared_upstream.clone() {
                 Some(b) => b,
                 None => worktree_upstream(cwd_path).map_err(|_| {
                     ReviewError::new(format!(
-                        "{cwd}: review base requires an upstream tracking branch for '{branch}', \
-                         but none is configured (set one with \
+                        "{cwd}: review upstream requires a git upstream tracking branch for \
+                         '{branch}', but none is configured (set one with \
                          'git branch --set-upstream-to=<branch>', or declare it on the review \
-                         as [[review]] base = \"<branch>\")"
+                         as [[review]] upstream = \"<branch>\")"
                     ))
                 })?,
             };
-            (project, branch, base)
+            (project, branch, upstream)
         };
         // Record this cell's review branch so the board can link the cell
         // back to its review(s) (RAL-17).
@@ -520,7 +526,7 @@ pub fn derive_reviews(
         memberships.push(Membership {
             project: project.clone(),
             branch: branch.clone(),
-            base,
+            upstream,
             name: rv
                 .and_then(|r| r.name.clone())
                 .or_else(|| link_key.clone())
@@ -610,9 +616,9 @@ pub fn derive_reviews(
     for (k, (project, members)) in proj_groups.iter().enumerate() {
         let mut members = members.clone();
         members.sort_by_key(|m| m.order);
-        let base = members
+        let upstream = members
             .first()
-            .map_or_else(|| "main".to_string(), |m| m.base.clone());
+            .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
         let suggested = members
             .iter()
             .find(|m| !m.name.is_empty())
@@ -623,7 +629,7 @@ pub fn derive_reviews(
             suggested
         };
         let gid = store
-            .create_guardian_for_squad(&name, &base, project, Some(squad_id))
+            .create_guardian_for_squad(&name, &upstream, project, Some(squad_id))
             .map_err(|e| ReviewError::new(e.to_string()))?;
         apply_skip_worktrees(store, &gid, project)?;
         apply_resolver(store, &gid, &members)?;
@@ -651,15 +657,15 @@ pub fn derive_reviews(
             .first()
             .map(|m| m.project.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let base = members
+        let upstream = members
             .first()
-            .map_or_else(|| "main".to_string(), |m| m.base.clone());
+            .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
         let name = members
             .iter()
             .find(|m| !m.name.is_empty())
             .map_or_else(|| key.clone(), |m| m.name.clone());
         let gid = store
-            .create_guardian_keyed(&name, &base, &project, Some(squad_id), Some(key))
+            .create_guardian_keyed(&name, &upstream, &project, Some(squad_id), Some(key))
             .map_err(|e| ReviewError::new(e.to_string()))?;
         // Apply skip_worktrees for every distinct project in the group.
         let distinct_projects: Vec<String> = {
@@ -1051,7 +1057,7 @@ mod tests {
         Membership {
             project: PathBuf::from("/repo"),
             branch: "feat".to_string(),
-            base: "main".to_string(),
+            upstream: "main".to_string(),
             name: "r".to_string(),
             order: 0,
             link_key: None,

@@ -325,6 +325,18 @@ impl Store {
         )?;
         if n > 0 {
             crate::rlog!(INFO, "ralphus [store] machine provider {scheme:?} removed");
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "store",
+                message: "machine provider removed",
+                scope: Some("machine"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "scheme": scheme }),
+            });
         }
         Ok(n > 0)
     }

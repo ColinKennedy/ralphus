@@ -40,6 +40,21 @@ pub const CARTOGRAPHER_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 /// here too.
 pub const TERMINAL_LOG_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
+/// RAL-288: the sole turn content sent when resuming via resume-automation
+/// -- deliberately generic (not the cell's own task text, which the
+/// resumed session already has from its first turn) since `claude -p`/
+/// `codex exec`/etc. all require *some* prompt to run at all.
+const RESUME_AUTOMATION_PROMPT: &str = "Continue the task from exactly where \
+    you left off, using everything already in this conversation -- \
+    including anything a human did in your interactive session before \
+    handing it back.";
+
+/// How often to poll active reviews' forge PRs for a stack reorder made
+/// outside ralphus (RAL-273). Five minutes, scoped (by
+/// [`crate::pr::poll_forge_reorders`]) to guardians with an active stack
+/// (`in_review`/`merging` only) to keep GitHub/GitLab API usage trivial.
+pub const FORGE_REORDER_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
 fn resolve_agent_selection(
     agent: &str,
     cwd: &str,
@@ -254,6 +269,7 @@ pub fn run_loop(
     let mut last_summary_sweep = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
     let mut last_terminal_log_prune = std::time::Instant::now();
+    let mut last_forge_reorder_poll = std::time::Instant::now();
     // Recovery: restart merges that were interrupted by a daemon shutdown.
     // Guardians stuck in `merging` have no live background thread; reset them to
     // `collecting` so `claim_guardian_merge` can claim them again. Notably we do
@@ -354,6 +370,10 @@ pub fn run_loop(
                 );
             }
             last_terminal_log_prune = std::time::Instant::now();
+        }
+        if last_forge_reorder_poll.elapsed() >= FORGE_REORDER_POLL_INTERVAL {
+            crate::pr::poll_forge_reorders(&store, &sem, &cancellations);
+            last_forge_reorder_poll = std::time::Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -1203,6 +1223,7 @@ fn try_upstream_rebase(
     let a_cwd = std::path::Path::new(dep.cwd.as_deref()?);
 
     if !crate::reviews::same_git_repo(a_cwd, b_cwd) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus: upstream rebase skipped — '{}' and '{}' are in different repositories; \
@@ -1230,6 +1251,7 @@ fn try_upstream_rebase(
         // can never run it until they manually fix the branch — even though the
         // cell's own code is unaffected.  Log the conflict and let the cell
         // run on its current branch instead.
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus: upstream rebase of cell '{}' onto '{a_branch}' has a conflict; \
@@ -1239,6 +1261,7 @@ fn try_upstream_rebase(
         return None;
     }
 
+    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
         "ralphus: rebased cell '{}' onto upstream branch '{a_branch}'",
@@ -2493,6 +2516,7 @@ fn run_proofs(
     let selection = match resolve_agent_selection(cell_agent, cwd) {
         Ok(selection) => selection,
         Err(message) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [scheduler] proof scope {squad_id}/t{task_idx}/{scope} cannot resolve agent {cell_agent:?}: {message}"

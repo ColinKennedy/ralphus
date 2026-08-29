@@ -754,7 +754,8 @@ impl Store {
                 proof_skip_auto_clean INTEGER,
                 skip_base_updates INTEGER,
                 created_at_ms     INTEGER NOT NULL,
-                updated_at_ms     INTEGER NOT NULL
+                updated_at_ms     INTEGER NOT NULL,
+                base_changed_at_ms INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS guardian_branches (
                 guardian_id         TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
@@ -1362,6 +1363,46 @@ impl Store {
             // thread) -- those rows simply never match a branch-scoped query,
             // which is fine since this ticket doesn't migrate old history.
             "ALTER TABLE guardian_messages ADD COLUMN branch_id TEXT",
+            // RAL-288 Stage 6: set by `resume_automation` (an explicit human
+            // trigger, never by a generic `restart_cell`) right before it
+            // resets the cell to `pending`, so the scheduler's next dispatch
+            // of this specific cell resumes the *cell's own* previously
+            // recorded `agent_session_id` instead of starting a fresh
+            // conversation -- the normal dispatch path only ever looks at a
+            // *dependency's* session (RAL-248 cross-cell sharing), never a
+            // cell's own prior one. Consumed and cleared by
+            // `run_cell_worker` the moment it's read, so it can never leak
+            // into a later, unrelated restart of the same cell.
+            "ALTER TABLE cells ADD COLUMN force_resume_own_session INTEGER NOT NULL DEFAULT 0",
+            // RAL-288: when this cell was cleanly stopped ("Open Agent" on a
+            // still-running cell) for a real interactive agent session to
+            // take over. NULL means not detached. The cell's own `state`
+            // stays `running` throughout -- this is a separate, additive
+            // signal so the board can tell "paused for a human" apart from
+            // "actively executing headlessly" without a new NodeState.
+            // Cleared the moment the cell is next dispatched (a restart, or
+            // the explicit resume-automation trigger), at the same point
+            // `state` is set back to `Running` for a fresh attempt.
+            "ALTER TABLE cells ADD COLUMN detached_at_ms INTEGER",
+            // RAL-291: failure detail for a task-level failure with no
+            // underlying cell/proof error to point to (e.g. the RAL-156
+            // no-commits-since-baseline guard) -- mirrors the `cells.error`
+            // column at task granularity. NULL for a task that never failed
+            // this way, including one that failed because a child cell/proof
+            // did (that failure is already visible on the cell/proof itself).
+            "ALTER TABLE tasks ADD COLUMN error TEXT",
+            // RAL-273: a one-shot, GUI-facing notice (e.g. "a GitHub reorder
+            // interrupted your in-flight local reorder") surfaced once and
+            // cleared by whichever poll first observes `notice_at_ms` newer
+            // than what it last showed -- see `Store::set_guardian_notice`.
+            "ALTER TABLE guardians ADD COLUMN notice_kind TEXT",
+            "ALTER TABLE guardians ADD COLUMN notice_message TEXT",
+            "ALTER TABLE guardians ADD COLUMN notice_at_ms INTEGER",
+            // RAL-277: source timestamp of the last base-ref edit. This is
+            // separate from `updated_at_ms`, which changes for unrelated
+            // review activity and cannot arbitrate base edits correctly.
+            "ALTER TABLE guardians ADD COLUMN base_changed_at_ms INTEGER NOT NULL DEFAULT 0",
+            "UPDATE guardians SET base_changed_at_ms=updated_at_ms WHERE base_changed_at_ms=0",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

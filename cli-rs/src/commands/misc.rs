@@ -1151,7 +1151,10 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
 // ---- completion / configuration / initialize --------------------------------
 
 pub fn cmd_completion() -> i32 {
-    println!("# ralphus shell completion is not yet ported in this Rust build.");
+    println!(
+        "# {} shell completion is not yet ported in this Rust build.",
+        crate::program_name::resolve_program_name()
+    );
     0
 }
 

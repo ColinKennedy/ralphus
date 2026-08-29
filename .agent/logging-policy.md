@@ -27,11 +27,35 @@ event log:
 
 **Cartographer formally replaces `rlog!` as the primary logging mechanism.**
 `rlog!` itself is unchanged (see below) and many call sites now emit both — a
-full mechanical conversion of every remaining `rlog!` site is tracked as
-ongoing/follow-up work rather than a hard gate on new code; new code should
-prefer emitting a Cartographer record over introducing another `rlog!`-only
-call site, especially for anything a user would want to query later (state
-transitions, LLM calls, manual actions).
+daemon-wide lint now prevents an unpaired `rlog!` from being introduced. New
+code should prefer emitting a Cartographer record over introducing another
+`rlog!`-only call site, especially for anything a user would want to query
+later (state transitions, LLM calls, manual actions).
+
+### `rlog!` / Cartographer pairing lint
+
+Run `python scripts/check_rlog_cartographer_pairs.py` from the repository root.
+The stdlib-only checker scans every tracked Rust source under `daemon/src/` and
+runs as the `rlog / Cartographer pairing lint` CI job. It ignores mentions in
+comments and string literals. A real `rlog!` invocation passes when a nearby
+(within 80 lines) structured emitter shares a brace-delimited Rust block with
+it. Recognized emitters are `Store::cartographer_log`, `Store::log_event*`,
+`Note::emit`, and same-file helper functions which wrap one of those emitters.
+Statements and match branches may intervene; strict adjacency is not required.
+
+When an infrastructure boundary genuinely cannot reach a `Store`, put this
+comment immediately above the call (or after it on the same line):
+
+```rust
+// ralphus[ignore-rlog-pair]: provider boundary has no Store; caller records the structured outcome
+crate::rlog!(WARNING, "ralphus [remote] provider fallback");
+```
+
+The colon and explanation are required. To prevent marker-only bypasses, the
+checker rejects explanations shorter than 12 characters or three words. An
+exemption documents why a structured row is impossible or already owned at
+another layer; it is not a substitute for adding an emitter when a `Store` is
+available.
 
 **Runner subprocess → daemon channel:** the runner cannot write Cartographer
 rows directly (it has no DB access and stdout is reserved — see below), so it

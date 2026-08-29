@@ -131,6 +131,19 @@ jobs:
       - name: Check bench patience comments
         run: python scripts/check_bench_patience_comments.py
 
+  rlog-cartographer:
+    name: rlog / Cartographer pairing lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Test rlog / Cartographer checker
+        run: python -m unittest scripts/test_check_rlog_cartographer_pairs.py
+      - name: Check daemon rlog / Cartographer pairs
+        run: python scripts/check_rlog_cartographer_pairs.py
+
   docs:
     name: Docs (screenshot coverage lint)
     runs-on: ubuntu-latest
