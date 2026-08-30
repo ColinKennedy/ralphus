@@ -643,11 +643,10 @@ fn expand_placeholder_text(
         let open = offset + open_rel;
         out.push_str(&raw[offset..open]);
         let body_start = open + 2;
-        let Some(close_rel) = raw[body_start..].find(">>") else {
+        let Some(close) = ralphus_core::schema::placeholder_close(raw, body_start) else {
             out.push_str(&raw[open..]);
             return Ok(out);
         };
-        let close = body_start + close_rel;
         let body = &raw[body_start..close];
         if let Some(resolved) = resolve(body)? {
             out.push_str(&resolved);

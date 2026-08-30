@@ -922,11 +922,6 @@ struct ProofGate {
     /// Whether this branch is the last (by position) enabled branch in the
     /// stack -- the only branch `"final_branch"` scope proves.
     is_final_branch: bool,
-    /// RAL-110's per-worktree-checks opt-out (`skip_worktree_checks`). Kept as
-    /// a second, independent axis alongside `scope`/`skip_auto_clean` so that
-    /// disabling worktree checks also suppresses the dedicated final-proof
-    /// call itself, not just the quality-bar instructions handed to it.
-    skip_worktree_checks: bool,
 }
 
 impl ProofGate {
@@ -946,7 +941,6 @@ impl ProofGate {
                 .as_ref()
                 .is_some_and(|g| g.effective_proof_skip_auto_clean),
             is_final_branch,
-            skip_worktree_checks: guard.guardian_skip_worktree_checks(id).unwrap_or(false),
         }
     }
 
@@ -954,12 +948,8 @@ impl ProofGate {
     /// the agent just resolved. A branch that hit real conflicts is never
     /// "auto-clean" (`skip_auto_clean` is irrelevant here, matching RAL-168's
     /// own Q2 resolution: "if a rebase occurred [with conflicts], ... under
-    /// Each branch verification must happen"). `skip_worktree_checks` still
-    /// overrides this, same as it overrides `allows_for_clean_branch`.
+    /// Each branch verification must happen").
     fn allows_after_conflict(&self) -> bool {
-        if self.skip_worktree_checks {
-            return false;
-        }
         match self.scope.as_str() {
             "nothing" => false,
             "final_branch" => self.is_final_branch,
@@ -970,12 +960,8 @@ impl ProofGate {
     /// Whether [`run_final_proof`] should fire for a branch that rebased
     /// cleanly (no conflict at all) but contributed real changes -- the new
     /// RAL-168 "each_branch" behavior, unless `skip_auto_clean` opts back
-    /// into the old lighter-weight default. `skip_worktree_checks` (RAL-110)
-    /// is an independent opt-out that also suppresses this call entirely.
+    /// into the old lighter-weight default.
     fn allows_for_clean_branch(&self) -> bool {
-        if self.skip_worktree_checks {
-            return false;
-        }
         match self.scope.as_str() {
             "nothing" => false,
             "final_branch" => self.is_final_branch,
@@ -1083,21 +1069,26 @@ fn synthesize_proof_instructions(
         );
     };
 
-    let (skip_worktree_checks, explicit_checks, git_root, review_machine) = {
+    let (explicit_checks, git_root, review_machine, proof_scope_is_nothing) = {
         let guard = store.lock().expect("poisoned");
-        let skip = guard.guardian_skip_worktree_checks(id).unwrap_or(false);
         let checks = guard.guardian_checks(id).unwrap_or_default();
         let guardian = guard.get_guardian(id).ok();
         let root = guardian
             .as_ref()
             .map(|g| g.git_root.clone())
             .unwrap_or_default();
+        let is_nothing = guardian
+            .as_ref()
+            .is_some_and(|g| g.effective_proof_scope == "nothing");
         let machine = guardian.and_then(|g| g.machine);
-        (skip, checks, root, machine)
+        (checks, root, machine, is_nothing)
     };
 
-    // Opt-out: user has disabled the per-worktree quality-bar prompt (RAL-110).
-    if skip_worktree_checks {
+    // Opt-out: Proof scope is "nothing" -- the dedicated final-proof call
+    // never fires for this branch (RAL-168's `ProofGate`), so the quality-bar
+    // instructions built below would be handed to the resolver agent for
+    // nothing (RAL-285: closes the gap where this ran regardless of scope).
+    if proof_scope_is_nothing {
         return String::new();
     }
 
@@ -1200,6 +1191,7 @@ fn synthesize_proof_instructions(
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         // RAL-191: this call only writes an instruction paragraph, but it runs
         // the branch's own agent -- keep it on the same environment as every
         // other per-branch invocation so a custom API base/proxy applies here
@@ -1422,25 +1414,16 @@ fn resolve_conflicts_with_agent(
             }
             // RAL-168: gated by Proof scope -- a branch that just had real
             // conflicts resolved is never "auto-clean", so only `scope`
-            // (not `skip_auto_clean`) matters here. RAL-110's
-            // `skip_worktree_checks` is a separate, independent opt-out that
-            // also suppresses this call.
+            // (not `skip_auto_clean`) matters here.
             if !gate.allows_after_conflict() {
-                let reason = if gate.skip_worktree_checks {
-                    "worktree checks disabled"
-                } else {
-                    "Proof scope"
-                };
                 crate::rlog!(
                     INFO,
-                    "ralphus [guardian] review {id} final proof skipped branch={branch:?} \
-                     scope={:?} skip_worktree_checks={}",
-                    gate.scope,
-                    gate.skip_worktree_checks
+                    "ralphus [guardian] review {id} final proof skipped branch={branch:?} scope={:?}",
+                    gate.scope
                 );
                 return Ok((
                     last_session_id,
-                    format!("resolved by agent; final proof skipped ({reason})"),
+                    "resolved by agent; final proof skipped (Proof scope)".to_string(),
                 ));
             }
             let (quality_note, ghost_prefix) =
@@ -1566,6 +1549,7 @@ fn resolve_conflicts_with_agent(
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             // RAL-191: the resolver edits this branch's own worktree, so it
             // runs under the branch's resolved environment. Profile env is
             // the base layer; the branch's own overrides win.
@@ -1879,6 +1863,7 @@ fn run_final_proof(
         proof: true,
         trace_context: None,
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         // RAL-191: same worktree, same environment as the fix pass above.
         // Profile env is the base layer; the branch's own overrides win.
         env_overrides: {
@@ -2311,6 +2296,40 @@ pub(crate) enum StartMergeError {
     Store(String),
 }
 
+/// Take the global store lock, logging how long the wait took.
+///
+/// Every acquisition on the merge-kickoff path goes through here. Kicking off
+/// a rebase is a DB state transition plus a thread spawn, so any wall time it
+/// spends is almost entirely time queued behind another holder of this mutex;
+/// naming the wait in the log is what turns "the button did nothing for
+/// twenty seconds" into a locatable cause.
+fn lock_timed<'a>(
+    store: &'a Arc<Mutex<Store>>,
+    id: &str,
+    what: &str,
+) -> std::sync::MutexGuard<'a, Store> {
+    let waiting = std::time::Instant::now();
+    let guard = store.lock().expect("store mutex poisoned");
+    let waited_ms = waiting.elapsed().as_millis();
+    if waited_ms >= KICKOFF_SLOW_LOCK_MS {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} merge kickoff waited {waited_ms}ms for the store lock ({what})"
+        );
+    } else {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] review {id} merge kickoff store lock ({what}) after {waited_ms}ms"
+        );
+    }
+    guard
+}
+
+/// Store-lock wait at or above which [`lock_timed`] escalates to `WARNING`.
+/// A kickoff that waits this long is queued behind a holder doing real work
+/// (a git subprocess, a forge call), which is the thing worth finding.
+const KICKOFF_SLOW_LOCK_MS: u128 = 250;
+
 pub(crate) fn kickoff_merge(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
@@ -2318,58 +2337,62 @@ pub(crate) fn kickoff_merge(
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
 ) -> Result<StartMergeOutcome, StartMergeError> {
-    let guardian = {
-        let guard = store.lock().expect("store mutex poisoned");
-        guard.get_guardian(id)
-    };
-    let guardian = match guardian {
-        Ok(g) => g,
-        Err(e) => {
-            return Err(StartMergeError::NotFound(e.to_string()));
-        }
-    };
-    if guardian.branches.is_empty() {
-        return Err(StartMergeError::NoBranches);
-    }
-    // Only a still-`collecting` guardian can have a branch genuinely waiting
-    // on its upstream Cell -- once a guardian has left `collecting` (reached
-    // `in_review`/`merge_failed`, or is already `merging`), every enabled
-    // branch has already gone through a full merge pass at least once, and a
-    // re-trigger (the "Merge / rebase" button, a settings-change restart, a
-    // base-branch shift on an already-built review) is a deliberate re-run
-    // that must not silently no-op just because some cell's `cells.state`
-    // still reads back non-`done` (e.g. it was never wired to a real task,
-    // like a manually added test branch, or the review outlived its squad).
-    if guardian.status == GuardianStatus::Collecting.as_str() {
-        let unfinished = {
-            let guard = store.lock().expect("store mutex poisoned");
+    let kickoff_started = std::time::Instant::now();
+    // The guardian read and the "is any branch still waiting on its cell?"
+    // check share one lock acquisition: they are two reads of the same
+    // snapshot, and every extra acquisition is another chance to queue behind
+    // a long-running holder.
+    let (guardian, unfinished) = {
+        let guard = lock_timed(&store, id, "read");
+        let guardian = match guard.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => return Err(StartMergeError::NotFound(e.to_string())),
+        };
+        // Only a still-`collecting` guardian can have a branch genuinely
+        // waiting on its upstream Cell -- see the check below for why.
+        let unfinished = if guardian.status == GuardianStatus::Collecting.as_str() {
             match guard.guardian_unfinished_linked_branches(id) {
                 Ok(b) => b,
                 Err(e) => return Err(StartMergeError::Store(e.to_string())),
             }
+        } else {
+            Vec::new()
         };
-        if !unfinished.is_empty() {
-            crate::rlog!(
-                INFO,
-                "ralphus [guardian] review {id} merge deferred: pending branches remain"
-            );
-            {
-                let guard = store.lock().expect("store mutex poisoned");
-                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::INFO,
-                    source: "guardian",
-                    message: "merge deferred: pending branches remain",
-                    scope: Some("guardian"),
-                    squad_id: None,
-                    guardian_id: Some(id),
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({ "pending_branches": unfinished }),
-                });
-            }
-            return Ok(StartMergeOutcome::Deferred);
+        (guardian, unfinished)
+    };
+    if guardian.branches.is_empty() {
+        return Err(StartMergeError::NoBranches);
+    }
+    // A non-`collecting` guardian never reports unfinished branches (see
+    // above): once it has left `collecting` -- reached `in_review`/
+    // `merge_failed`, or is already `merging` -- every enabled branch has
+    // gone through a full merge pass at least once, and a re-trigger (the
+    // "Merge / rebase" button, a settings-change restart, a base-branch shift
+    // on an already-built review) is a deliberate re-run that must not
+    // silently no-op just because some cell's `cells.state` still reads back
+    // non-`done` (e.g. it was never wired to a real task, like a manually
+    // added test branch, or the review outlived its squad).
+    if !unfinished.is_empty() {
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {id} merge deferred: pending branches remain"
+        );
+        {
+            let guard = lock_timed(&store, id, "defer log");
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "guardian",
+                message: "merge deferred: pending branches remain",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "pending_branches": unfinished }),
+            });
         }
+        return Ok(StartMergeOutcome::Deferred);
     }
 
     // Atomically transition collecting, merge_failed, or in_review → merging
@@ -2377,22 +2400,30 @@ pub(crate) fn kickoff_merge(
     // even on an already-done review). Two concurrent requests can both pass
     // the guardian-exists check above, but only one can win this SQL UPDATE;
     // the other gets false and a 409.
-    let claimed = match store
-        .lock()
-        .expect("store mutex poisoned")
-        .claim_guardian_merge(id)
-    {
-        Ok(c) => c,
-        Err(e) => return Err(StartMergeError::Store(e.to_string())),
-    };
-    if !claimed {
-        crate::rlog!(
-            DEBUG,
-            "ralphus [guardian] review {id} merge claim rejected (already merging, or in a terminal state)"
-        );
-        {
-            let guard = store.lock().expect("store mutex poisoned");
-            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+    // Claim and its Cartographer row share one acquisition -- the row records
+    // the outcome of the claim that just happened under this same guard, so
+    // splitting them only adds a second chance to queue behind a slow holder.
+    let claimed = {
+        let guard = lock_timed(&store, id, "claim");
+        let claimed = match guard.claim_guardian_merge(id) {
+            Ok(c) => c,
+            Err(e) => return Err(StartMergeError::Store(e.to_string())),
+        };
+        let entry = if claimed {
+            crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "guardian",
+                message: "merge starting",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"branches": guardian.branches.len()}),
+            }
+        } else {
+            crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::DEBUG,
                 source: "guardian",
                 message: "merge claim rejected (already merging, or in a terminal state)",
@@ -2403,30 +2434,25 @@ pub(crate) fn kickoff_merge(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
-            });
-        }
+            }
+        };
+        let _ = guard.cartographer_log(entry);
+        claimed
+    };
+    if !claimed {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] review {id} merge claim rejected (already merging, or in a terminal state) in {}ms",
+            kickoff_started.elapsed().as_millis()
+        );
         return Ok(StartMergeOutcome::AlreadyInProgress);
     }
     crate::rlog!(
         INFO,
-        "ralphus [guardian] review {id} merge starting branches={}",
-        guardian.branches.len()
+        "ralphus [guardian] review {id} merge starting branches={} (kickoff {}ms)",
+        guardian.branches.len(),
+        kickoff_started.elapsed().as_millis()
     );
-    {
-        let guard = store.lock().expect("store mutex poisoned");
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "merge starting",
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"branches": guardian.branches.len()}),
-        });
-    }
     let sid = id.to_string();
     std::thread::spawn(move || {
         let _permit = sem.acquire();
@@ -4091,6 +4117,7 @@ pub fn run_feedback(
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         env_overrides: resolved.env.clone(),
         // RAL-201: route to the same machine `wt` (and thus `cwd` above) is
         // actually on -- see the identical fix in
@@ -4135,8 +4162,7 @@ pub fn run_feedback(
         // final-proof pass a cleanly-rebased branch already gets during a
         // restack (see `drive_rebase`'s identical `allows_for_clean_branch`
         // call) -- a feedback revision is a routine edit, not a conflict
-        // resolution, so `skip_auto_clean` applies here too, and
-        // `skip_worktree_checks` still suppresses it entirely either way.
+        // resolution, so `skip_auto_clean` applies here too.
         let gate = ProofGate::resolve(store, id, is_final_branch);
         if gate.allows_for_clean_branch() {
             let (quality_note, ghost_prefix) =
@@ -6170,6 +6196,7 @@ fn generate_final_summary(
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         env_overrides: resolved.env.clone(),
         // RAL-201: route to the same machine `cwd` (derived from `ws_root`)
         // is actually on -- see the identical fix in
@@ -6477,6 +6504,7 @@ fn generate_manual_commands(
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         env_overrides: resolved.env.clone(),
         // RAL-201: matches whichever workspace `cwd` above was derived from.
         machine,
@@ -6661,6 +6689,7 @@ pub(crate) fn resolve_check_input(
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         env_overrides: resolved.env.clone(),
         // RAL-201: route to the review's assigned machine, matching `cwd`.
         machine,
@@ -7836,7 +7865,6 @@ mod tests {
             scope: "nothing".to_string(),
             skip_auto_clean: false,
             is_final_branch: false,
-            skip_worktree_checks: false,
         };
         let result = drive_rebase(
             &store,

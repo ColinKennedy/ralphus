@@ -121,12 +121,23 @@ impl ModelBackend for AgentBackend {
         let tools = tool_specs();
         let timeout = options.timeout_sec.map(std::time::Duration::from_secs);
 
-        eprintln!(
-            "ralphus [llm-invoke] start agent={:?} model={:?} prompt_len={} prompt_hash={}",
-            self.agent,
-            options.model,
-            prompt.len(),
-            short_prompt_hash(prompt.as_bytes())
+        // RAL-288 Stage 5: Cartographer-only, not a plain `eprintln!` -- see
+        // `execute.rs::log_llm_start`'s doc comment for why. No `CellSpec`
+        // is in scope here (`ModelBackend::run` doesn't take one), so this
+        // relies on the daemon's own squad/task/cell fallback when
+        // forwarding, same as `main.rs::finish`'s result-file-write-failure
+        // diagnostic.
+        crate::cartographer::emit(
+            "llm-invoke",
+            "start",
+            "info",
+            crate::cartographer::EventContext::default(),
+            serde_json::json!({
+                "agent": self.agent,
+                "model": options.model,
+                "prompt_len": prompt.len(),
+                "prompt_hash": short_prompt_hash(prompt.as_bytes()),
+            }),
         );
         let started = std::time::Instant::now();
         let result = llm_client::run_agent(
@@ -140,16 +151,27 @@ impl ModelBackend for AgentBackend {
         let elapsed = started.elapsed().as_secs_f64();
         let result = match result {
             Ok(r) => {
-                eprintln!(
-                    "ralphus [llm-invoke] done agent={:?} elapsed={elapsed:.2}s tokens_in={} tokens_out={}",
-                    self.agent, r.tokens_in, r.tokens_out
+                crate::cartographer::emit(
+                    "llm-invoke",
+                    "done",
+                    "info",
+                    crate::cartographer::EventContext::default(),
+                    serde_json::json!({
+                        "agent": self.agent,
+                        "elapsed_s": elapsed,
+                        "tokens_in": r.tokens_in,
+                        "tokens_out": r.tokens_out,
+                    }),
                 );
                 r
             }
             Err(e) => {
-                eprintln!(
-                    "ralphus [llm-invoke] error agent={:?} elapsed={elapsed:.2}s: {e}",
-                    self.agent
+                crate::cartographer::emit(
+                    "llm-invoke",
+                    "error",
+                    "warning",
+                    crate::cartographer::EventContext::default(),
+                    serde_json::json!({"agent": self.agent, "elapsed_s": elapsed, "error": e.to_string()}),
                 );
                 return Err(e.into());
             }

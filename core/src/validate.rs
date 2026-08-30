@@ -2774,6 +2774,29 @@ command = "cargo build"
     }
 
     #[test]
+    fn wrapped_placeholder_cwd_with_a_nested_upstream_sentinel_is_valid() {
+        for sentinel in crate::schema::WORKTREE_UPSTREAM_SENTINELS {
+            let src = format!(
+                "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream={sentinel}>>\"\nprompt=\"p\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{sentinel}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn wrapped_placeholder_cwd_with_a_nested_bogus_sentinel_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=<<wat>>>>\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("not a supported sentinel")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn wrapped_placeholder_cwd_without_upstream_is_rejected() {
         let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat>>/more/text\"\nprompt=\"p\"\n";
         let r = validate_toml(src);

@@ -63,7 +63,11 @@ fn resolve_agent_selection(
 }
 
 /// Whether a resolved backend name is Claude Code (`claude-code`, `claude-cli`).
-fn is_claude_code_backend(backend: &str) -> bool {
+///
+/// `pub(crate)`, not private: also used below (RAL-288 Stage 1) to decide
+/// whether to pre-assign a fresh Claude session id before dispatch, and by
+/// [`sharing_blocked_reason`]'s cross-backend-mismatch check.
+pub(crate) fn is_claude_code_backend(backend: &str) -> bool {
     backend == "claude-code" || backend == "claude-cli"
 }
 
@@ -561,6 +565,18 @@ enum CellState {
     /// and — unlike [`CellState::Failed`] — never folded into
     /// `Progress.failed`, so cancelling a task does not mislabel it as failed.
     Cancelled,
+    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task. Resolved
+    /// *for this dispatcher run* — like `Done`/`Failed`/`Cancelled`, it stops
+    /// counting toward `active` so the worker thread can exit instead of
+    /// polling forever for a resolution that will only ever come from an
+    /// explicit resume-automation call, not on its own — but unlike `Done`,
+    /// it never satisfies a dependent's `cells_ready` check, since the cell's
+    /// actual work is nowhere near finished. The cell's *store* row stays
+    /// `Running` throughout (see `scheduler::run_cell_worker`'s detach
+    /// branch) — this variant only exists in the dispatcher's own in-memory
+    /// bookkeeping, which has no other way to represent "not active, but
+    /// also not really done" for a single dispatcher pass.
+    Detached,
 }
 
 /// Shared progress for a squad's cells, behind one mutex.
@@ -970,7 +986,10 @@ fn execute_squad_inner(
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..n {
                     match prog.status[i] {
-                        CellState::Done | CellState::Failed | CellState::Cancelled => {}
+                        CellState::Done
+                        | CellState::Failed
+                        | CellState::Cancelled
+                        | CellState::Detached => {}
                         CellState::Running => active = true,
                         CellState::Pending => {
                             let deps = &plan.deps[i];
@@ -1017,7 +1036,35 @@ fn execute_squad_inner(
                                     to_dispatch.push(i);
                                     active = true;
                                 } else {
-                                    active = true;
+                                    // RAL-288: a dependency (direct, or within a
+                                    // dependency task) that is merely `Detached`
+                                    // -- paused for manual takeover, not still
+                                    // executing -- must not count as `active`,
+                                    // or this loop spins forever waiting for a
+                                    // `Done` that can only ever arrive via an
+                                    // explicit resume-automation call. That
+                                    // would permanently block this worker's
+                                    // dispatch loop from ever exiting to reach
+                                    // the `any_detached` early return below
+                                    // (see its doc comment), orphaning this
+                                    // worker's slot in the shared cancellation
+                                    // registry and silently blocking every
+                                    // future re-claim of this squad too — the
+                                    // exact failure mode a live "Open Agent"
+                                    // then "Resume Automation" test on a
+                                    // multi-cell squad surfaced.
+                                    let cell_dep_detached =
+                                        deps.iter().any(|&d| prog.status[d] == CellState::Detached);
+                                    let task_dep_detached = task_deps.iter().any(|&t| {
+                                        task_cells
+                                            .get(&t)
+                                            .into_iter()
+                                            .flatten()
+                                            .any(|&d| prog.status[d] == CellState::Detached)
+                                    });
+                                    if !cell_dep_detached && !task_dep_detached {
+                                        active = true;
+                                    }
                                 }
                             }
                         }
@@ -1158,15 +1205,21 @@ fn execute_squad_inner(
     }
     // All cell workers and per-task finalizers have joined at the end of the
     // scope, so `failed` is final and every task's state has been written.
-    let failed_tasks = progress
-        .into_inner()
-        .expect("progress mutex poisoned")
-        .failed;
+    let progress = progress.into_inner().expect("progress mutex poisoned");
+    let failed_tasks = progress.failed;
+    // RAL-288 Stage 6: a detached cell resolved the *dispatcher's* wait loop
+    // (see `CellState::Detached`) without resolving the cell's actual work —
+    // the squad did not complete, it's paused for manual takeover, and must
+    // not be reported Done just because nothing is left to poll.
+    let any_detached = progress.status.contains(&CellState::Detached);
 
     let guard = store.lock().expect("store mutex poisoned");
     // If an edit reset this squad to Pending mid-flight, don't clobber it with a
     // terminal state — leave it Pending so it re-runs with the new values.
     if !matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
+        return;
+    }
+    if any_detached {
         return;
     }
     // A task left `cancelled` never ran, so the squad did not actually complete —
@@ -1429,6 +1482,11 @@ fn run_cell_worker(
         let guard = store.lock().expect("store mutex poisoned");
         let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Running);
         let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Running);
+        // RAL-288: a fresh dispatch clears any stale `detached_at_ms` from a
+        // previous attempt -- covers both a plain restart and a
+        // resume-automation-triggered one, without either needing to know
+        // about the other's bookkeeping.
+        let _ = guard.clear_cell_detached(squad_id, row.task_idx, row.idx);
     }
     capture_task_baseline_if_needed(store, squad_id, row);
 
@@ -1531,35 +1589,102 @@ fn run_cell_worker(
     merged_profile_env.extend(spec.env_overrides.clone());
     spec.env_overrides = merged_profile_env;
 
-    // RAL-248: continue from a completed dependency's agent session when safe
-    // (cross-cell session sharing), so this cell resumes with the context the
-    // prior cell already built instead of re-reading files from scratch.
-    // Start fresh otherwise, logging why (model mismatch / no session to resume).
-    match resolve_shared_session_id(store, squad_id, row, cells, plan, i, &selection.backend) {
-        SessionShare::Resume {
+    // RAL-288 Stage 6: an explicit resume-automation trigger takes priority
+    // over dependency-based sharing below -- it means a human just finished
+    // working in this exact cell's own real interactive session and wants
+    // automation to continue *that* conversation, not borrow one from a
+    // sibling. `take_...` clears the flag as it reads it, so it can only
+    // ever fire once per resume-automation call.
+    let own_resume = {
+        let guard = store.lock().expect("store mutex poisoned");
+        if guard.take_force_resume_own_session(squad_id, row.task_idx, row.idx) {
+            guard
+                .get_cell_agent_resume(squad_id, row.task_idx, row.idx)
+                .ok()
+                .and_then(|(_, _, sid)| sid)
+        } else {
+            None
+        }
+    };
+    if let Some(session_id) = own_resume {
+        crate::rlog!(
+            INFO,
+            "ralphus [scheduler] cell {squad_id}/{} resuming its own agent session {} (resume-automation)",
+            row.cell_id,
             session_id,
-            from_cell,
-            from_task,
-        } => {
-            crate::rlog!(
-                INFO,
-                "ralphus [scheduler] cell {squad_id}/{} resuming agent session {} from {}/{}",
-                row.cell_id,
+        );
+        spec.resume_agent_session_id = Some(session_id);
+        // RAL-288: `claude -p`/`codex exec`/etc. need *some* turn content to
+        // run at all -- an external constraint of headless invocation, not
+        // something ralphus chooses. The backend's normal behavior
+        // otherwise resends the cell's full original task prompt as that
+        // turn (see `ClaudeCodeBackend::run`'s doc comment) -- correct for
+        // RAL-248 cross-cell resume, where the next cell's task genuinely
+        // differs, but wrong here: same cell, same task, already fully
+        // present in the resumed session's own history since turn one.
+        // Resending it duplicates the task instruction with nothing marking
+        // it as old, which is what was observed reading as "started over."
+        // A short, fixed, task-blind nudge replaces it outright rather than
+        // layering more text onto the same redundant resend.
+        spec.prompt = Some(RESUME_AUTOMATION_PROMPT.to_string());
+    } else {
+        // RAL-248: continue from a completed dependency's agent session when safe
+        // (cross-cell session sharing), so this cell resumes with the context the
+        // prior cell already built instead of re-reading files from scratch.
+        // Start fresh otherwise, logging why (model mismatch / no session to resume).
+        match resolve_shared_session_id(store, squad_id, row, cells, plan, i, &selection.backend) {
+            SessionShare::Resume {
                 session_id,
-                from_task,
                 from_cell,
-            );
-            spec.resume_agent_session_id = Some(session_id);
+                from_task,
+            } => {
+                crate::rlog!(
+                    INFO,
+                    "ralphus [scheduler] cell {squad_id}/{} resuming agent session {} from {}/{}",
+                    row.cell_id,
+                    session_id,
+                    from_task,
+                    from_cell,
+                );
+                spec.resume_agent_session_id = Some(session_id);
+            }
+            SessionShare::Skip { reason } => {
+                crate::rlog!(
+                    INFO,
+                    "ralphus [scheduler] cell {squad_id}/{} NOT sharing agent session (fresh cell): {reason}",
+                    row.cell_id,
+                );
+            }
+            SessionShare::None => {}
         }
-        SessionShare::Skip { reason } => {
-            crate::rlog!(
-                INFO,
-                "ralphus [scheduler] cell {squad_id}/{} NOT sharing agent session (fresh cell): {reason}",
-                row.cell_id,
-            );
-        }
-        SessionShare::None => {}
     }
+
+    // RAL-288 Stage 1: pre-assign a fresh session id for a fresh claude-code
+    // *prompt* cell (not resuming one, and not a `command`-kind cell -- those
+    // never reach `ClaudeCodeBackend::run` at all, see `execute.rs`'s dispatch
+    // comment, so there is no Claude session to attach to) and persist it
+    // *before* the runner starts, so the board's "Open Agent" action can
+    // attach from t=0 instead of waiting on Claude's own `system/init` event
+    // to report an id. Reuses the same write path as the Stage 0 live-capture
+    // code (`set_cell_agent_session_id_live`) — a spawn failure just leaves a
+    // harmless, never-confirmed id on the row rather than blocking dispatch.
+    if spec.resume_agent_session_id.is_none()
+        && spec.prompt.is_some()
+        && is_claude_code_backend(&selection.backend)
+    {
+        let assigned = crate::runner::generate_agent_session_id();
+        {
+            let guard = store.lock().expect("store mutex poisoned");
+            let _ = guard.set_cell_agent_session_id_live(
+                squad_id,
+                &row.task_name,
+                &row.cell_id,
+                &assigned,
+            );
+        }
+        spec.assigned_agent_session_id = Some(assigned);
+    }
+
     {
         let guard = store.lock().expect("store mutex poisoned");
         let _ = guard.set_cell_effective_system_prompt(
@@ -1614,6 +1739,59 @@ fn run_cell_worker(
     // A cancellation that landed while the runner was working: leave the
     // (already `cancelled`) node as the store set it and abandon this cell.
     if cancel.is_cancelled() {
+        return;
+    }
+    // RAL-288 Stage 6: a deliberate human-triggered detach mid-task is
+    // neither success nor failure -- record whatever usage/session-id was
+    // captured live (so the board's numbers don't regress), but never run
+    // this cell's proof steps and never touch `prog.status`/`prog.failed`,
+    // the same "abandon this cell, leave it as the store already reflects"
+    // treatment cancellation gets just above. A real interactive session is
+    // about to take over; automation picks back up only via the explicit
+    // resume-automation trigger, not by falling through to the normal
+    // done/failed path below.
+    if result.is_detached() {
+        crate::rlog!(
+            INFO,
+            "ralphus [scheduler] cell {squad_id}/{} detached tokens_in={} tokens_out={}",
+            row.cell_id,
+            result.tokens_in,
+            result.tokens_out,
+        );
+        // Resolves this cell for *this dispatcher pass* (see
+        // `CellState::Detached`'s doc comment) so the squad's worker thread
+        // can exit instead of polling forever -- the cell's actual work
+        // stays unresolved until an explicit resume-automation call, this
+        // just stops the in-memory dispatch loop from waiting on it.
+        progress.lock().expect("progress mutex poisoned").status[i] = CellState::Detached;
+        let outcome = CellOutcome {
+            state: result.node_state(),
+            tokens_in: result.tokens_in,
+            tokens_out: result.tokens_out,
+            cost_usd: result.cost_usd,
+            error: None,
+            agent_session_id: result.agent_session_id.clone(),
+        };
+        let guard = store.lock().expect("store mutex poisoned");
+        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        let _ = guard.mark_cell_detached(squad_id, row.task_idx, row.idx);
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "scheduler",
+            message: "cell detached for manual takeover",
+            scope: Some("cell"),
+            squad_id: Some(squad_id),
+            guardian_id: None,
+            cell_id: Some(&row.cell_id),
+            task: Some(&row.task_name),
+            log_path: None,
+            payload: serde_json::json!({
+                "tokens_in": result.tokens_in,
+                "tokens_out": result.tokens_out,
+                "cost_usd": result.cost_usd,
+                "agent_session_id": result.agent_session_id,
+            }),
+        });
         return;
     }
     crate::rlog!(
@@ -2971,6 +3149,237 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// RAL-288 Stage 6: records whatever `resume_agent_session_id` (and, for
+    /// the resume-automation preamble regression below, `prompt`) it was
+    /// dispatched with, so a test can assert the scheduler actually resolved
+    /// it to a specific value rather than just checking the cell finished.
+    struct SpyResumeRunner {
+        seen_resume_agent_session_id: Arc<Mutex<Option<String>>>,
+        #[allow(clippy::type_complexity)]
+        seen_prompt: Option<Arc<Mutex<Option<String>>>>,
+    }
+
+    impl Runner for SpyResumeRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            *self.seen_resume_agent_session_id.lock().unwrap() =
+                spec.resume_agent_session_id.clone();
+            if let Some(seen_prompt) = &self.seen_prompt {
+                *seen_prompt.lock().unwrap() = spec.prompt.clone();
+            }
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.1,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: spec.proof.then_some(true),
+                agent_session_id: spec.resume_agent_session_id.clone(),
+                ghost: None,
+            }
+        }
+    }
+
+    #[test]
+    fn resume_automation_makes_the_scheduler_resume_the_cells_own_prior_session() {
+        let (store, id) = store_with(ONE_CELL);
+        // Seed the cell with a prior agent session, the way a real detach
+        // outcome would have (`CellOutcome.agent_session_id`) -- reusing the
+        // detach path itself is the most realistic way to get there.
+        execute_squad(&store, &DetachRunner, &id);
+        {
+            let guard = store.lock().unwrap();
+            let squad = guard.get_squad(&id).unwrap();
+            assert_eq!(
+                squad.tasks[0].cells[0].agent_session_id.as_deref(),
+                Some("sess-detach-1")
+            );
+            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let runner = SpyResumeRunner {
+            seen_resume_agent_session_id: Arc::clone(&seen),
+            seen_prompt: None,
+        };
+        execute_squad(&store, &runner, &id);
+
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("sess-detach-1"));
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
+    }
+
+    #[test]
+    fn resume_automation_flag_is_consumed_and_never_reused_by_a_later_restart() {
+        let (store, id) = store_with(ONE_CELL);
+        execute_squad(&store, &DetachRunner, &id);
+        {
+            let guard = store.lock().unwrap();
+            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
+        }
+        let seen = Arc::new(Mutex::new(None));
+        execute_squad(
+            &store,
+            &SpyResumeRunner {
+                seen_resume_agent_session_id: Arc::clone(&seen),
+                seen_prompt: None,
+            },
+            &id,
+        );
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("sess-detach-1"));
+
+        // A later, unrelated restart must NOT still be treated as a resume
+        // -- the flag was a one-shot hint, not a durable "always resume this
+        // cell" toggle.
+        store.lock().unwrap().restart_cell(&id, 0, 0).unwrap();
+        let seen2 = Arc::new(Mutex::new(Some("unset".to_string())));
+        execute_squad(
+            &store,
+            &SpyResumeRunner {
+                seen_resume_agent_session_id: Arc::clone(&seen2),
+                seen_prompt: None,
+            },
+            &id,
+        );
+        assert_eq!(*seen2.lock().unwrap(), None);
+    }
+
+    const ONE_PROMPT_CELL: &str =
+        "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do-thing\"\n";
+
+    /// RAL-288: caught live (RAL-239 verification pass) -- a human reported
+    /// that resuming after "Open Agent"/"Resume Automation" looked like the
+    /// agent "started from scratch" despite the session id genuinely being
+    /// resumed (confirmed correct separately: same id, `--resume` not
+    /// `--session-id`). Root cause: the backend resends the cell's raw
+    /// original task prompt as a fresh user turn on *every* resume (by
+    /// design, see `ClaudeCodeBackend::run`'s doc comment) -- correct for
+    /// RAL-248 cross-cell resume, where the next cell's task genuinely
+    /// differs, but redundant here since it's the same cell's same task,
+    /// already fully present in the resumed session's own history. Asserts
+    /// the resume-automation path replaces the prompt outright with the
+    /// fixed, task-blind [`RESUME_AUTOMATION_PROMPT`] rather than resending
+    /// the original task text, and that a plain (non-resume-automation)
+    /// dispatch's prompt is untouched.
+    #[test]
+    fn resume_automation_replaces_the_prompt_with_a_fixed_continuation_nudge() {
+        let (store, id) = store_with(ONE_PROMPT_CELL);
+        execute_squad(&store, &DetachRunner, &id);
+        {
+            let guard = store.lock().unwrap();
+            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
+        }
+        let seen_prompt = Arc::new(Mutex::new(None));
+        execute_squad(
+            &store,
+            &SpyResumeRunner {
+                seen_resume_agent_session_id: Arc::new(Mutex::new(None)),
+                seen_prompt: Some(Arc::clone(&seen_prompt)),
+            },
+            &id,
+        );
+        assert_eq!(
+            seen_prompt.lock().unwrap().as_deref(),
+            Some(RESUME_AUTOMATION_PROMPT)
+        );
+
+        // A plain restart (no resume-automation flag set) must not pick up
+        // the nudge -- it's specific to "a human just handed this back",
+        // not every resumed/restarted dispatch.
+        store.lock().unwrap().restart_cell(&id, 0, 0).unwrap();
+        let seen_plain_prompt = Arc::new(Mutex::new(None));
+        execute_squad(
+            &store,
+            &SpyResumeRunner {
+                seen_resume_agent_session_id: Arc::new(Mutex::new(None)),
+                seen_prompt: Some(Arc::clone(&seen_plain_prompt)),
+            },
+            &id,
+        );
+        assert_eq!(
+            seen_plain_prompt.lock().unwrap().as_deref(),
+            Some("do-thing")
+        );
+    }
+
+    /// RAL-288 Stage 6: always reports a deliberate detach, carrying fixed
+    /// usage figures so the test can assert they were actually persisted.
+    struct DetachRunner;
+
+    impl Runner for DetachRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult::detached(3, 7, 0.25, Some("sess-detach-1".to_string()))
+        }
+    }
+
+    #[test]
+    fn a_detached_cell_stays_running_and_never_reaches_proof_or_the_task_finalizer() {
+        let (store, id) = store_with(ONE_CELL);
+        execute_squad(&store, &DetachRunner, &id);
+
+        let guard = store.lock().unwrap();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "running");
+        assert_eq!(squad.tasks[0].cells[0].tokens_in, 3);
+        assert_eq!(squad.tasks[0].cells[0].tokens_out, 7);
+        assert_eq!(
+            squad.tasks[0].cells[0].agent_session_id.as_deref(),
+            Some("sess-detach-1")
+        );
+        // Neither the task nor the squad ever reached a terminal state --
+        // a detach must not be mistaken for completion at any level above
+        // the cell either.
+        assert_eq!(squad.tasks[0].state, "running");
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+    }
+
+    const WORK_THEN_FINALIZE: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\".\"\ncommand=\"do-work\"\n[[task.cell]]\nid=\"finalize\"\ncwd=\".\"\ncommand=\"do-finalize\"\ndepends_on=[\"work\"]\n";
+
+    /// RAL-288 regression: caught live (RAL-239 verification pass) when a
+    /// real squad shaped exactly like `WORK_THEN_FINALIZE` -- "work" then a
+    /// dependent "finalize" -- got detached via "Open Agent". "finalize"
+    /// stayed `Pending`, blocked on "work" (now `Detached`, not `Done`), and
+    /// the pre-fix dispatch loop's `else { active = true; }` fallback
+    /// treated that block-on-Detached exactly like "might still become
+    /// ready this pass", spinning forever instead of ever reaching the
+    /// `any_detached` early return. `execute_squad_inner` never returned,
+    /// so its caller's `cancellations.remove(squad_id)` never ran either --
+    /// permanently orphaning the squad's slot in the shared cancellation
+    /// registry and silently blocking every future re-claim (including the
+    /// one `resume-automation` needs to hand the cell back to headless
+    /// execution). This test fails by hanging (via the bounded join below)
+    /// rather than a plain assertion if the bug ever comes back.
+    #[test]
+    fn a_detached_cell_with_a_pending_dependent_still_lets_the_worker_exit() {
+        let (store, id) = store_with(WORK_THEN_FINALIZE);
+        let store_for_thread = Arc::clone(&store);
+        let id_for_thread = id.clone();
+        let handle = std::thread::spawn(move || {
+            execute_squad(&store_for_thread, &DetachRunner, &id_for_thread);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "execute_squad never returned -- the dispatch loop is spinning \
+                 forever on a Pending cell blocked by a Detached dependency"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        handle.join().unwrap();
+
+        let guard = store.lock().unwrap();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "running");
+        assert!(squad.tasks[0].cells[0].detached_at_ms.is_some());
+        // "finalize" was correctly never dispatched -- it stayed blocked on
+        // its still-Detached dependency, not silently run out of order.
+        assert_eq!(squad.tasks[0].cells[1].state, "pending");
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
     }
 
     fn store_with(toml: &str) -> (Arc<Mutex<Store>>, String) {
@@ -5702,5 +6111,119 @@ mod tests {
         };
         execute_squad(&store, &runner, &id);
         assert_eq!(session_share_recorded(&seen, "consumer"), None);
+    }
+
+    /// One `(cell_id, assigned_agent_session_id)` record per cell launch.
+    type AssignedSeen = Vec<(String, Option<String>)>;
+
+    /// RAL-288 Stage 1 test runner: records the `assigned_agent_session_id`
+    /// each cell saw at launch. When `report_fresh_session` is set, `fresh`
+    /// also reports a real `agent_session_id` back — used to exercise the
+    /// mutual-exclusivity rule that a resuming cell must NOT also get a
+    /// fresh pre-assigned id. Left unset when a test instead wants to check
+    /// that the pre-assigned id survives untouched to the final DB row (a
+    /// real reported id would win via `record_cell_result`'s `COALESCE`,
+    /// which is the correct, separate "trust Claude's own report" behavior
+    /// — not what this runner's `report_fresh_session=false` mode tests).
+    struct AssignedSessionRunner {
+        seen: Arc<Mutex<AssignedSeen>>,
+        report_fresh_session: bool,
+    }
+
+    impl Runner for AssignedSessionRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((spec.cell_id.clone(), spec.assigned_agent_session_id.clone()));
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 2,
+                cost_usd: 0.5,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: if self.report_fresh_session && spec.cell_id == "fresh" {
+                    Some("real-sess-from-fresh".to_string())
+                } else {
+                    None
+                },
+                ghost: None,
+            }
+        }
+    }
+
+    fn assigned_recorded(seen: &Arc<Mutex<AssignedSeen>>, cell: &str) -> Option<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|(c, _)| c == cell)
+            .and_then(|(_, a)| a.clone())
+    }
+
+    #[test]
+    fn a_fresh_claude_code_prompt_cell_is_pre_assigned_a_session_id() {
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"fresh\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\nprompt=\"do work\"\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = AssignedSessionRunner {
+            seen: Arc::clone(&seen),
+            report_fresh_session: false,
+        };
+        execute_squad(&store, &runner, &id);
+        let assigned = assigned_recorded(&seen, "fresh").expect("must be pre-assigned");
+        assert_eq!(
+            assigned.len(),
+            36,
+            "must look like a UUID (8-4-4-4-12), got {assigned:?}"
+        );
+        // Persisted before the runner ever ran, not just handed to it in-memory.
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_cell_agent_resume(&id, 0, 0)
+                .unwrap()
+                .2,
+            Some(assigned)
+        );
+    }
+
+    #[test]
+    fn a_resuming_cell_is_not_also_pre_assigned_a_fresh_session_id() {
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"fresh\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\nprompt=\"do work\"\n\
+            [[task.cell]]\nid=\"resumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\nprompt=\"continue\"\ndepends_on=[\"fresh\"]\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = AssignedSessionRunner {
+            seen: Arc::clone(&seen),
+            report_fresh_session: true,
+        };
+        execute_squad(&store, &runner, &id);
+        assert!(assigned_recorded(&seen, "fresh").is_some());
+        assert_eq!(
+            assigned_recorded(&seen, "resumer"),
+            None,
+            "a cell that resumes a shared session must not also get a fresh assigned id"
+        );
+    }
+
+    #[test]
+    fn non_claude_code_and_command_cells_are_never_pre_assigned_a_session_id() {
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"other_backend\"\ncwd=\".\"\nagent=\"claude\"\nprompt=\"do it\"\n\
+            [[task.cell]]\nid=\"command_cell\"\ncwd=\".\"\nagent=\"claude-code\"\ncommand=\"echo hi\"\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = AssignedSessionRunner {
+            seen: Arc::clone(&seen),
+            report_fresh_session: false,
+        };
+        execute_squad(&store, &runner, &id);
+        assert_eq!(assigned_recorded(&seen, "other_backend"), None);
+        assert_eq!(assigned_recorded(&seen, "command_cell"), None);
     }
 }

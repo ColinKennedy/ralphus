@@ -150,33 +150,60 @@ fn short_prompt_hash(data: &[u8]) -> String {
         .collect::<String>()
 }
 
+/// RAL-288 Stage 5: emitted via Cartographer only, not a plain `eprintln!` —
+/// this information had no Cartographer counterpart before Stage 5 (an
+/// `eprintln!` alone only ever existed in the live tmux pane, gone the
+/// moment the pane closes), so simply removing the print to clean up the
+/// pane would have silently lost it rather than just relocating it. Uses
+/// the same `RALPHUS_EVENT:` marker/context shape every other runner
+/// diagnostic does, so the daemon-side pane-cleaning strip
+/// (`daemon/src/server.rs::capture_pane_reply`) covers it identically.
 fn log_llm_start(spec: &CellSpec, prompt: &str) {
-    let kind = if spec.proof { "proof " } else { "" };
-    eprintln!(
-        "ralphus [llm] {kind}start squad={} cell={} agent={:?} model={:?} prompt_len={} prompt_hash={}",
-        spec.squad_id,
-        spec.cell_id,
-        spec.agent,
-        spec.model,
-        prompt.len(),
-        short_prompt_hash(prompt.as_bytes())
+    let kind = if spec.proof { "proof-" } else { "" };
+    crate::cartographer::emit(
+        "runner",
+        &format!("{kind}llm start"),
+        "info",
+        event_context(spec),
+        serde_json::json!({
+            "agent": spec.agent,
+            "model": spec.model,
+            "prompt_len": prompt.len(),
+            "prompt_hash": short_prompt_hash(prompt.as_bytes()),
+        }),
     );
 }
 
 fn log_llm_done(spec: &CellSpec, result: &CellResult) {
-    let kind = if spec.proof { "proof " } else { "" };
+    let kind = if spec.proof { "proof-" } else { "" };
     if result.ok() {
-        eprintln!(
-            "ralphus [llm] {kind}done squad={} cell={} tokens_in={} tokens_out={} cost_usd={:.4}",
-            spec.squad_id, spec.cell_id, result.tokens_in, result.tokens_out, result.cost_usd
+        crate::cartographer::emit(
+            "runner",
+            &format!("{kind}llm done"),
+            "info",
+            event_context(spec),
+            serde_json::json!({
+                "tokens_in": result.tokens_in,
+                "tokens_out": result.tokens_out,
+                "cost_usd": result.cost_usd,
+            }),
         );
     } else {
-        eprintln!(
-            "ralphus [llm] {kind}error squad={} cell={}: {}",
-            spec.squad_id,
-            spec.cell_id,
-            result.error.as_deref().unwrap_or("unknown error")
+        crate::cartographer::emit(
+            "runner",
+            &format!("{kind}llm error"),
+            "warning",
+            event_context(spec),
+            serde_json::json!({"error": result.error.as_deref().unwrap_or("unknown error")}),
         );
+    }
+}
+
+fn event_context(spec: &CellSpec) -> crate::cartographer::EventContext<'_> {
+    crate::cartographer::EventContext {
+        squad_id: Some(&spec.squad_id),
+        cell_id: Some(&spec.cell_id),
+        task: Some(&spec.task),
     }
 }
 
@@ -205,10 +232,12 @@ fn run_prompt_inner(
         }),
     ]);
     if let Some(sp) = &system_prompt {
-        eprintln!(
-            "ralphus [llm] system-prompt applied len={} position={:?}",
-            sp.len(),
-            spec.system_prompt_position
+        crate::cartographer::emit(
+            "runner",
+            "system-prompt applied",
+            "info",
+            event_context(spec),
+            serde_json::json!({"len": sp.len(), "position": spec.system_prompt_position}),
         );
     }
 
@@ -224,6 +253,7 @@ fn run_prompt_inner(
             model: spec.model.as_deref(),
             append_system_prompt: system_prompt.as_deref(),
             resume_agent_session_id: resume_id.as_deref(),
+            assigned_agent_session_id: spec.assigned_agent_session_id.as_deref(),
             timeout_sec: spec.timeout_sec,
         };
         let outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
@@ -510,6 +540,7 @@ mod tests {
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
         };
         let result = run_cell(&spec, false);
         assert!(!result.ok());

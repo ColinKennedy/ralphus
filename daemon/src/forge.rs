@@ -347,10 +347,16 @@ impl ForgeClient {
         }
     }
 
-    /// Fetch a PR/MR's *live* base/target branch from the forge (RAL-273) --
-    /// so a stack reordered on the forge's own UI (dragging PRs into a new
-    /// order, which retargets each PR's base) can be detected instead of only
-    /// ever pushing ralphus's local order out via [`Self::update_pull_request_base`].
+    /// Fetch a PR/MR's *live* base/target branch from the forge (RAL-273,
+    /// RAL-279), unprefixed (GitHub's `base.ref` / GitLab's `target_branch`
+    /// are both already bare branch names, matching the convention
+    /// [`Self::update_pull_request_base`] writes and `base_ref` is stored
+    /// under). Used both to detect a stack reordered on the forge's own UI
+    /// (dragging PRs into a new order, which retargets each PR's base)
+    /// instead of only ever pushing ralphus's local order out via
+    /// [`Self::update_pull_request_base`], and by the forge-to-ralphus drift
+    /// poll to detect a base retargeted directly on the forge (a reviewer
+    /// changed it, or an intervening branch's PR was closed/merged there).
     /// Logs the outbound call (start/done/error) via `rlog!`.
     pub fn get_pull_request_base(&self, number: i64) -> Result<String, String> {
         self.get_pull_request_base_state(number).map(|s| s.base)
@@ -1446,6 +1452,66 @@ mod tests {
         );
         assert_eq!(client.get_pull_request_state(3).unwrap(), "merged");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_base_reads_github_base_ref() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/5");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"base": {"ref": "trunk"}}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_base(5).unwrap(), "trunk");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_base_reads_gitlab_target_branch() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/11");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"target_branch": "trunk"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_base(11).unwrap(), "trunk");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_base_requires_token() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "https://api.github.com".to_string(),
+            "acme/widget".to_string(),
+            None,
+        );
+        let err = client.get_pull_request_base(1).unwrap_err();
+        assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
     }
 
     #[test]

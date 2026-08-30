@@ -286,11 +286,17 @@ pub struct CellView {
     /// Reviews (guardians) this cell participates in — those whose stack
     /// includes the cell's review branch (RAL-17). Empty for most cells.
     pub reviews: Vec<SquadReviewRef>,
-    /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex exec
+    /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex
     /// resume`), captured from the owning backend's output. `None` for other
     /// agents or cells that have not yet completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    /// The `machine` this cell is routed to (RAL-185), if any -- `None`
+    /// means the daemon's own host. Exposed so the board can tell a cell
+    /// running on a remote machine provider (no local tmux session to
+    /// detach yet, RAL-288) apart from one that simply hasn't started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// Persistent environment-variable overrides set directly on this cell
     /// (hierarchical env overrides, extending RAL-150): merged on top of the
     /// owning task's/squad's when the cell's own subprocess is spawned. See
@@ -316,6 +322,15 @@ pub struct CellView {
     /// [`Store::set_cell_env_overrides`].
     #[serde(default)]
     pub env_out_of_date: bool,
+    /// RAL-288: when this cell was cleanly stopped ("Open Agent" on a
+    /// still-running cell) for a real interactive agent session to take
+    /// over. `None` while not detached. `state` stays `"running"`
+    /// throughout — this is an additive signal so the board can tell
+    /// "paused for a human" apart from "actively executing headlessly"
+    /// without a new terminal `NodeState`. Cleared automatically the next
+    /// time the cell is dispatched (a restart, or resume-automation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detached_at_ms: Option<i64>,
 }
 
 /// A task as shown in the board.
@@ -743,6 +758,10 @@ impl Store {
                 conflicts_fixed     INTEGER,
                 conflicts_committed INTEGER,
                 skip_auto_build   INTEGER NOT NULL DEFAULT 0,
+                -- Read-only legacy data (RAL-285): nothing writes this column
+                -- anymore. `hydrate_guardian` reads it only to resolve a row
+                -- carrying the bit with no explicit `proof_scope` to an
+                -- `effective_proof_scope` of 'nothing'.
                 skip_worktree_checks INTEGER NOT NULL DEFAULT 0,
                 review_type       TEXT NOT NULL DEFAULT 'git',
                 skip_worktrees    INTEGER NOT NULL DEFAULT 0,
@@ -1112,6 +1131,8 @@ impl Store {
             // opt-outs -- see the backfill-and-drop block below, which carries
             // forward any existing `skip_checks` value into both.
             "ALTER TABLE guardians ADD COLUMN skip_auto_build INTEGER NOT NULL DEFAULT 0",
+            // Read-only legacy data (RAL-285) -- see the `CREATE TABLE guardians`
+            // comment on this column.
             "ALTER TABLE guardians ADD COLUMN skip_worktree_checks INTEGER NOT NULL DEFAULT 0",
             // RAL-117: opts a review into automatically incorporating PR feedback
             // comments without the manual "Pull in PR feedback" button. The data
@@ -1403,6 +1424,17 @@ impl Store {
             // review activity and cannot arbitrate base edits correctly.
             "ALTER TABLE guardians ADD COLUMN base_changed_at_ms INTEGER NOT NULL DEFAULT 0",
             "UPDATE guardians SET base_changed_at_ms=updated_at_ms WHERE base_changed_at_ms=0",
+            // RAL-279: the base ref this daemon last confirmed the forge
+            // actually accepted for this PR (set only after a successful
+            // `update_pull_request_base` forge call, mirroring
+            // `last_pushed_sha`'s "last state both sides are known to have
+            // agreed on" role but for the base ref instead of the branch
+            // tip). The forge-side drift poll uses this alongside `base_ref`
+            // to tell "the forge genuinely retargeted this PR" apart from
+            // "our own last resync's forge PATCH just hasn't landed/failed",
+            // so neither direction thrashes the other on its next pass — see
+            // `pr::poll_pr_base_drift`.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN last_pushed_base_ref TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -2573,7 +2605,7 @@ impl Store {
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -2611,6 +2643,8 @@ impl Store {
                         started_at_ms: r.get::<_, Option<i64>>(21)?,
                         finished_at_ms: r.get::<_, Option<i64>>(22)?,
                         env_out_of_date: r.get::<_, bool>(23)?,
+                        machine: r.get::<_, Option<String>>(24)?,
+                        detached_at_ms: r.get::<_, Option<i64>>(25)?,
                     },
                 ))
             })?
@@ -5328,7 +5362,7 @@ impl Store {
 
     /// Fetch a cell's cwd, agent, and (if any) recorded CLI-agent session
     /// id, for the "Open Agent" terminal action — resuming the real CLI
-    /// (`claude --resume <id>` or `codex exec resume <id>`, depending on
+    /// (`claude --resume <id>` or `codex resume <id>`, depending on
     /// which agent the cell actually ran under) rather than re-attaching
     /// to the runner's tmux wrapper, which only shows its log/event stream
     /// (see `crate::server::open_agent_terminal`). The `agent` column is
@@ -5360,14 +5394,132 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Records that a cell was just cleanly stopped for a real interactive
+    /// agent session to take over (RAL-288 Stage 6) -- called from
+    /// `scheduler::run_cell_worker`'s detached-outcome branch, right where
+    /// `record_cell_result` persists the (still-`Running`) `NodeState`. See
+    /// [`CellView::detached_at_ms`] for what this drives on the board.
+    pub fn mark_cell_detached(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET detached_at_ms=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![now_ms(), squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Clears a cell's `detached_at_ms`, called at the same point
+    /// `run_cell_worker` sets the cell's `NodeState` back to `Running` for a
+    /// fresh dispatch -- a restart, or a resume-automation-triggered one.
+    /// Unconditional (no-op if it was already clear) so every fresh dispatch
+    /// clears any stale flag regardless of how the cell got here.
+    pub fn clear_cell_detached(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET detached_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a cell so its *next* dispatch resumes its own previously
+    /// recorded `agent_session_id` instead of starting fresh (RAL-288 Stage
+    /// 6) -- see `force_resume_own_session`'s migration comment for why this
+    /// needs to be explicit rather than a blanket change to how every
+    /// restart behaves. Set by `server::resume_automation` right before it
+    /// resets the cell to `pending`; a cell without an `agent_session_id` at
+    /// all has nothing to resume, so the caller is expected to check that
+    /// first (`get_cell_agent_resume`) rather than this method silently
+    /// no-op'ing on one.
+    pub fn set_force_resume_own_session(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET force_resume_own_session=1 WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Reads and clears `force_resume_own_session` for one cell in a single
+    /// call, so a hint is consumed at most once -- called from
+    /// `scheduler::run_cell_worker` right before it would otherwise fall
+    /// through to the normal (dependency-only) session-sharing resolution.
+    /// Returns `false` (never errors) for a cell row that no longer exists,
+    /// matching how a vanished cell should just fall through to a fresh
+    /// dispatch rather than fail the whole worker.
+    pub fn take_force_resume_own_session(&self, squad_id: &str, task_idx: i64, idx: i64) -> bool {
+        let was_set = self
+            .conn
+            .query_row(
+                "SELECT force_resume_own_session FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            == 1;
+        if was_set {
+            let _ = self.conn.execute(
+                "UPDATE cells SET force_resume_own_session=0 WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+            );
+        }
+        was_set
+    }
+
+    /// The three pieces of a cell row `server::open_agent_terminal`'s
+    /// `mode=agent` path (RAL-288 Stage 6) needs to decide whether a still-
+    /// running cell can be cleanly detached at all, gathered in one query
+    /// rather than three round trips: `machine` (RAL-185 routing; `Some`
+    /// means a remote provider, which has no local tmux session to detach
+    /// yet -- see FIX_AGENT.local.md's open decision on this), whether this
+    /// is a `command`-kind cell (which never reaches `ClaudeCodeBackend::run`
+    /// at all, so there is no live agent session to hand off), and its
+    /// current run [`NodeState`] (detach only makes sense while genuinely
+    /// `Running` -- a finished cell has no process left to detach).
+    ///
+    /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
+    /// not exist, matching [`Self::get_cell_agent_resume`]'s convention.
+    pub fn get_cell_input_gate(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<(Option<String>, bool, NodeState)> {
+        self.conn
+            .query_row(
+                "SELECT machine, command IS NOT NULL, state FROM cells \
+                 WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
+                |r| {
+                    let machine: Option<String> = r.get(0)?;
+                    let is_command_cell: bool = r.get(1)?;
+                    let state_raw: Option<String> = r.get(2)?;
+                    Ok((machine, is_command_cell, state_raw))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+            .map(|(machine, is_command_cell, state_raw)| {
+                let state = state_raw
+                    .and_then(|s| NodeState::parse(&s))
+                    .unwrap_or(NodeState::Pending);
+                (machine, is_command_cell, state)
+            })
+    }
+
     /// Persist a cell's CLI-agent session/thread id as soon as it's known —
     /// before the cell finishes — so "Open Agent" activates immediately
     /// rather than only once the whole cell completes. Called from
-    /// `runner::forward_runner_event` when the runner subprocess emits an
-    /// `llm-invoke` event carrying `agent_session_id` in its payload (RAL-102
-    /// follow-up; mirrors `guardian::set_branch_resolver_session_id`'s "Watch
-    /// Live" idea, applied to plain task cells instead of a side-channel
-    /// file + watcher thread).
+    /// `runner::forward_runner_event` for any event whose payload carries an
+    /// `agent_session_id`, whichever backend emitted it (RAL-102 follow-up;
+    /// mirrors `guardian::set_branch_resolver_session_id`'s "Watch Live" idea,
+    /// applied to plain task cells instead of a side-channel file + watcher
+    /// thread).
     ///
     /// Best-effort and silently a no-op when `(squad_id, task_name, cell_sid)`
     /// doesn't match a cell row — e.g. a proof step or a Guardian

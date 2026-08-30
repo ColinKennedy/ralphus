@@ -45,6 +45,12 @@ pub enum CellCommand {
         selector: String,
         mode: String,
     },
+    OpenAgent {
+        selector: String,
+    },
+    ResumeAutomation {
+        selector: String,
+    },
     UsageError(String),
 }
 
@@ -105,6 +111,12 @@ pub fn parse(args: &[String]) -> CellCommand {
             };
             with_selector(scanner, |selector| CellCommand::Terminal { selector, mode })
         }
+        Some("open-agent") => {
+            with_selector(scanner, |selector| CellCommand::OpenAgent { selector })
+        }
+        Some("resume-automation") => with_selector(scanner, |selector| {
+            CellCommand::ResumeAutomation { selector }
+        }),
         Some(other) => CellCommand::UsageError(format!("unknown cell subcommand: {other}")),
     }
 }
@@ -155,6 +167,11 @@ edit, delete, commit, or push anything.";
 fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str) -> Vec<String> {
     let mut cmd: Vec<String>;
     if matches!(agent, Some("codex") | Some("codex-cli")) {
+        // The top-level interactive `codex resume`, not `codex exec resume`
+        // (Codex's non-interactive headless mode, which requires a prompt
+        // argument or piped stdin and fails immediately with "No prompt
+        // provided" otherwise -- exactly the reported symptom of resuming
+        // this way into an interactive terminal with nothing to pipe in).
         cmd = vec!["codex".to_string()];
         if mode == "readonly" {
             cmd.push("-c".to_string());
@@ -162,7 +179,6 @@ fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str)
                 "developer_instructions={READONLY_RESUME_INSTRUCTIONS}"
             ));
         }
-        cmd.push("exec".to_string());
         cmd.push("resume".to_string());
         cmd.push(agent_session_id.to_string());
     } else if matches!(agent, Some("pi")) {
@@ -344,6 +360,30 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
+        CellCommand::OpenAgent { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let result = client.open_agent_terminal(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+            )?;
+            emit(opts, &result, |_| {
+                println!("{selector}: agent terminal opened")
+            });
+            Ok(())
+        }),
+        CellCommand::ResumeAutomation { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let result = client.resume_automation(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+            )?;
+            emit(opts, &result, |_| {
+                println!("{selector}: automation resumed")
+            });
+            Ok(())
+        }),
     }
 }
 
@@ -404,6 +444,30 @@ mod tests {
     fn parses_worktree() {
         match parse(&v(&["worktree", "squad-1/build/0"])) {
             CellCommand::Worktree { selector } => assert_eq!(selector, "squad-1/build/0"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_open_agent_with_selector() {
+        match parse(&v(&["open-agent", "squad-1/build/0"])) {
+            CellCommand::OpenAgent { selector } => assert_eq!(selector, "squad-1/build/0"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_agent_without_selector_is_usage_error() {
+        match parse(&v(&["open-agent"])) {
+            CellCommand::UsageError(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_resume_automation_with_selector() {
+        match parse(&v(&["resume-automation", "squad-1/build/0"])) {
+            CellCommand::ResumeAutomation { selector } => assert_eq!(selector, "squad-1/build/0"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -484,7 +548,7 @@ mod tests {
     #[test]
     fn agent_resume_command_uses_codex_for_codex_agents() {
         let cmd = agent_resume_command(Some("codex"), "sess-1", "open");
-        assert_eq!(cmd, vec!["codex", "exec", "resume", "sess-1"]);
+        assert_eq!(cmd, vec!["codex", "resume", "sess-1"]);
     }
 
     #[test]

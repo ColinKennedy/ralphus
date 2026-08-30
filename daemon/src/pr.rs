@@ -93,6 +93,11 @@ pub struct PullRequestView {
     /// row created before this column existed or whose push has not
     /// completed yet.
     pub last_pushed_sha: Option<String>,
+    /// The base ref this daemon last confirmed the forge actually accepted
+    /// for this PR (RAL-279), used as the second anti-thrash baseline in
+    /// [`poll_pr_base_drift`] alongside `base_ref`. `None` until a
+    /// [`resync_pr_bases`] forge PATCH has ever succeeded for this row.
+    pub last_pushed_base_ref: Option<String>,
 }
 
 struct PrRow {
@@ -111,6 +116,7 @@ struct PrRow {
     created_at_ms: i64,
     updated_at_ms: i64,
     last_pushed_sha: Option<String>,
+    last_pushed_base_ref: Option<String>,
 }
 
 impl From<PrRow> for PullRequestView {
@@ -131,11 +137,12 @@ impl From<PrRow> for PullRequestView {
             created_at_ms: r.created_at_ms,
             updated_at_ms: r.updated_at_ms,
             last_pushed_sha: r.last_pushed_sha,
+            last_pushed_base_ref: r.last_pushed_base_ref,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -154,6 +161,7 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         created_at_ms: r.get(12)?,
         updated_at_ms: r.get(13)?,
         last_pushed_sha: r.get(14)?,
+        last_pushed_base_ref: r.get(15)?,
     })
 }
 
@@ -226,6 +234,21 @@ impl Store {
         Ok(rows.into_iter().map(PullRequestView::from).collect())
     }
 
+    /// Ids of every guardian with at least one open, forge-numbered PR
+    /// (RAL-279) — the poll target list for [`poll_pr_base_drift`], so it
+    /// never makes forge calls for a review that was never submitted as a
+    /// PR stack.
+    pub fn guardian_ids_with_open_pull_requests(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT guardian_id FROM guardian_pull_requests
+             WHERE state='open' AND pr_number IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Find the ralphus PR row for a given forge PR/MR number (PR → worktree
     /// direction), if one has been recorded.
     pub fn find_pull_request_by_number(
@@ -260,14 +283,17 @@ impl Store {
         branch_alias: Option<&str>,
         state: Option<&str>,
     ) -> Result<()> {
-        self.update_pull_request_ex(id, pr_number, pr_url, branch_alias, state, None, None)
+        self.update_pull_request_ex(id, pr_number, pr_url, branch_alias, state, None, None, None)
     }
 
     /// Full form of [`Self::update_pull_request`] that also allows updating
-    /// `base_ref` (RAL-190: recomputed after a branch reorder) and
+    /// `base_ref` (RAL-190: recomputed after a branch reorder),
     /// `last_pushed_sha` (RAL-190: recorded after every push to the alias, the
-    /// baseline [`compute_sync_status`] drifts against). Only fields passed as
-    /// `Some` are changed; `last_pushed_sha` follows the same
+    /// baseline [`compute_sync_status`] drifts against), and
+    /// `last_pushed_base_ref` (RAL-279: recorded after every forge base PATCH
+    /// this daemon confirms succeeded, the second anti-thrash baseline
+    /// [`poll_pr_base_drift`] drifts against). Only fields passed as `Some`
+    /// are changed; `last_pushed_sha`/`last_pushed_base_ref` follow the same
     /// `Option<Option<..>>` "clear vs leave alone" convention as `pr_number`.
     #[allow(clippy::too_many_arguments)]
     pub fn update_pull_request_ex(
@@ -279,6 +305,7 @@ impl Store {
         state: Option<&str>,
         base_ref: Option<&str>,
         last_pushed_sha: Option<Option<&str>>,
+        last_pushed_base_ref: Option<Option<&str>>,
     ) -> Result<()> {
         let existing = self.get_pull_request(id)?;
         let new_pr_number = pr_number.unwrap_or(existing.pr_number);
@@ -291,9 +318,12 @@ impl Store {
         let new_last_pushed_sha = last_pushed_sha
             .map(|o| o.map(str::to_string))
             .unwrap_or(existing.last_pushed_sha);
+        let new_last_pushed_base_ref = last_pushed_base_ref
+            .map(|o| o.map(str::to_string))
+            .unwrap_or(existing.last_pushed_base_ref);
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests
-             SET pr_number=?, pr_url=?, branch_alias=?, state=?, base_ref=?, last_pushed_sha=?, updated_at_ms=?
+             SET pr_number=?, pr_url=?, branch_alias=?, state=?, base_ref=?, last_pushed_sha=?, last_pushed_base_ref=?, updated_at_ms=?
              WHERE id=?",
             params![
                 new_pr_number,
@@ -302,6 +332,7 @@ impl Store {
                 new_state,
                 new_base_ref,
                 new_last_pushed_sha,
+                new_last_pushed_base_ref,
                 now_ms(),
                 id
             ],
@@ -691,6 +722,7 @@ fn synthesize_pr_text(
         proof: false,
         trace_context: trace_context.map(str::to_string),
         resume_agent_session_id: None,
+        assigned_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
         machine: None,
     };
@@ -894,22 +926,30 @@ fn resync_pr_bases_inner(
                     None,
                     Some(&new_base),
                     None,
+                    None,
                 );
             }
             changed += 1;
             if let (Some(c), Some(num)) = (&client, pr.pr_number) {
-                if let Err(e) = c.update_pull_request_base(num, &new_base) {
-                    if is_stack_base_restriction(&e) {
-                        blocked_by_stack.push((pr.id.clone(), num, new_base.clone()));
-                    } else {
-                        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
-                        crate::rlog!(
-                            WARNING,
-                            "ralphus [pr] review {id} resync base forge update failed pr={}: {e}",
-                            pr.id
+                match c.update_pull_request_base(num, &new_base) {
+                    // RAL-279: only record `last_pushed_base_ref` once the
+                    // forge has actually confirmed the new base -- this is
+                    // exactly the "last state both sides are known to have
+                    // agreed on" baseline `poll_pr_base_drift` needs to tell
+                    // a genuine forge-side retarget apart from a PATCH that
+                    // silently failed here and never landed.
+                    Ok(()) => {
+                        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                            &pr.id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(&new_base),
+                            None,
+                            Some(Some(&new_base)),
                         );
                     }
-                    Ok(()) => {}
                     Err(e) => {
                         if is_stack_base_restriction(&e) {
                             blocked_by_stack.push((pr.id.clone(), num, new_base.clone()));
@@ -2269,6 +2309,7 @@ fn submit_stacked_branch_pr(
             None,
             None,
             Some(Some(sha.as_str())),
+            None,
         );
     }
     {
@@ -2425,6 +2466,7 @@ fn refresh_open_prs<'a>(
                         None,
                         None,
                         Some(&state),
+                        None,
                         None,
                         None,
                     );
@@ -2700,6 +2742,32 @@ fn submit_pull_requests_inner(
 // Bidirectional sync (RAL-190)
 // ---------------------------------------------------------------------------
 
+/// One lock per repository root, serializing the `git fetch` +
+/// `rev-parse FETCH_HEAD` pair in [`compute_sync_status`].
+///
+/// `FETCH_HEAD` is a single file shared by the whole repository, so two
+/// fetches running in it at once can have either one's `rev-parse` read the
+/// other's result -- reporting a PR as ahead/behind against a sibling PR's
+/// tip. That pairing is reachable: the board fetches every open PR's
+/// sync-status for a review concurrently (`pollPullRequests` in board.html),
+/// and the daemon answers read-only requests on a pool of threads
+/// (`server::ReadPool`), so a stacked review's PRs land here at the same time
+/// in the same repository.
+static SYNC_FETCH_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+
+/// The [`SYNC_FETCH_LOCKS`] entry for `root`, creating it on first use.
+fn sync_fetch_lock(root: &Path) -> Arc<Mutex<()>> {
+    let mut locks = SYNC_FETCH_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        locks
+            .get_or_insert_with(HashMap::new)
+            .entry(root.to_path_buf())
+            .or_default(),
+    )
+}
+
 /// Drift between a PR's remote branch and its owning review worktree
 /// (RAL-190), as returned by [`compute_sync_status`].
 #[derive(Debug, Clone, Serialize)]
@@ -2758,10 +2826,18 @@ pub fn compute_sync_status(
         .as_deref()
         .and_then(|r| git(&root, &["rev-parse", r]).ok())
         .map(|s| s.trim().to_string());
-    let remote_sha = git(&root, &["fetch", &remote_name, &pr.branch_alias])
-        .ok()
-        .and_then(|_| git(&root, &["rev-parse", "FETCH_HEAD"]).ok())
-        .map(|s| s.trim().to_string());
+    // Held across both commands: the `rev-parse` has to read back the
+    // `FETCH_HEAD` this very fetch wrote. See `SYNC_FETCH_LOCKS`.
+    let remote_sha = {
+        let fetch_lock = sync_fetch_lock(&root);
+        let _fetching = fetch_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        git(&root, &["fetch", &remote_name, &pr.branch_alias])
+            .ok()
+            .and_then(|_| git(&root, &["rev-parse", "FETCH_HEAD"]).ok())
+            .map(|s| s.trim().to_string())
+    };
 
     let is_ancestor = |ancestor: &str, descendant: &str| {
         git(
@@ -2880,6 +2956,7 @@ pub fn pull_pr_commits(
             None,
             None,
             Some(Some(sha.trim())),
+            None,
         );
     }
     {
@@ -3110,6 +3187,7 @@ fn action_pr_feedback_inner(
                 None,
                 None,
                 Some(Some(sha.as_str())),
+                None,
             );
         } else if outcome.committed {
             return Err("feedback applied but push back to the PR branch failed".to_string());
@@ -3150,6 +3228,7 @@ fn action_pr_feedback_inner(
                 None,
                 None,
                 Some(Some(sha.trim())),
+                None,
             );
         }
     }
@@ -3422,6 +3501,101 @@ mod tests {
     }
 
     #[test]
+    fn classify_base_drift_in_sync_when_forge_matches_recorded_base() {
+        assert_eq!(
+            classify_base_drift("main", Some("main"), "main"),
+            BaseDriftKind::InSync
+        );
+        // Even with no last_pushed_base_ref recorded yet (a row from before
+        // this poll ever ran), a forge base matching `base_ref` is in sync.
+        assert_eq!(
+            classify_base_drift("main", None, "main"),
+            BaseDriftKind::InSync
+        );
+    }
+
+    #[test]
+    fn classify_base_drift_pending_local_push_when_forge_matches_last_confirmed_push() {
+        // `base_ref` already moved on to "b" locally (e.g. a resync just
+        // ran), but the forge still reports the last base ralphus itself
+        // confirmed pushing ("a") -- the PATCH for the new value hasn't
+        // landed yet, or failed. Not a forge-side change.
+        assert_eq!(
+            classify_base_drift("b", Some("a"), "a"),
+            BaseDriftKind::PendingLocalPush
+        );
+    }
+
+    #[test]
+    fn classify_base_drift_drifted_when_forge_disagrees_with_both_baselines() {
+        assert_eq!(
+            classify_base_drift("a", Some("a"), "c"),
+            BaseDriftKind::Drifted
+        );
+        assert_eq!(classify_base_drift("a", None, "c"), BaseDriftKind::Drifted);
+    }
+
+    #[test]
+    fn branches_skipped_by_drift_drops_the_intervening_branch() {
+        // a -> b -> c; forge retargeted c's PR onto a's alias directly, so b
+        // must have left the stack.
+        let a = test_branch("b-a", 0);
+        let b = test_branch("b-b", 1);
+        let c = test_branch("b-c", 2);
+        let ordered: Vec<&BranchView> = vec![&a, &b, &c];
+        let mut aliases = HashMap::new();
+        aliases.insert("b-a".to_string(), "alias-a".to_string());
+        aliases.insert("b-b".to_string(), "alias-b".to_string());
+
+        let skipped = branches_skipped_by_drift(&ordered, &aliases, 2, "main", "alias-a").unwrap();
+        assert_eq!(
+            skipped.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["b-b"]
+        );
+    }
+
+    #[test]
+    fn branches_skipped_by_drift_drops_every_preceding_branch_when_forge_base_is_the_review_base() {
+        let a = test_branch("b-a", 0);
+        let b = test_branch("b-b", 1);
+        let ordered: Vec<&BranchView> = vec![&a, &b];
+        let mut aliases = HashMap::new();
+        aliases.insert("b-a".to_string(), "alias-a".to_string());
+
+        let skipped = branches_skipped_by_drift(&ordered, &aliases, 1, "main", "main").unwrap();
+        assert_eq!(
+            skipped.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["b-a"]
+        );
+    }
+
+    #[test]
+    fn branches_skipped_by_drift_is_empty_when_forge_base_already_names_the_immediate_predecessor()
+    {
+        let a = test_branch("b-a", 0);
+        let b = test_branch("b-b", 1);
+        let ordered: Vec<&BranchView> = vec![&a, &b];
+        let mut aliases = HashMap::new();
+        aliases.insert("b-a".to_string(), "alias-a".to_string());
+
+        let skipped = branches_skipped_by_drift(&ordered, &aliases, 1, "main", "alias-a").unwrap();
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn branches_skipped_by_drift_is_none_for_an_unrecognized_forge_base() {
+        let a = test_branch("b-a", 0);
+        let b = test_branch("b-b", 1);
+        let ordered: Vec<&BranchView> = vec![&a, &b];
+        let mut aliases = HashMap::new();
+        aliases.insert("b-a".to_string(), "alias-a".to_string());
+
+        assert!(
+            branches_skipped_by_drift(&ordered, &aliases, 1, "main", "some-other-branch").is_none()
+        );
+    }
+
+    #[test]
     fn decide_stack_action_creates_once_two_prs_exist() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
         let new_ids: std::collections::HashSet<String> = ["b-b".to_string()].into_iter().collect();
@@ -3677,7 +3851,16 @@ mod tests {
         {
             let guard = store.lock().unwrap();
             guard
-                .update_pull_request_ex(&pr_id, None, None, None, None, None, Some(Some(&sha)))
+                .update_pull_request_ex(
+                    &pr_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Some(&sha)),
+                    None,
+                )
                 .unwrap();
             // A review with an open PR has settled; `sync_open_pr_branches`
             // only reconciles one that has.
@@ -3743,7 +3926,7 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .update_pull_request_ex(&pr_id, None, None, None, None, None, Some(Some(&sha)))
+            .update_pull_request_ex(&pr_id, None, None, None, None, None, Some(Some(&sha)), None)
             .unwrap();
         (root, remote_dir, store, pr_id)
     }
@@ -4811,6 +4994,104 @@ mod tests {
     }
 
     #[test]
+    fn poll_pr_base_drift_is_a_noop_for_a_review_with_no_submitted_prs() {
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "a")
+            .unwrap();
+        assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
+    }
+
+    #[test]
+    fn poll_pr_base_drift_is_a_noop_when_the_forge_remote_cannot_be_resolved() {
+        // "/repo" is not a real git repository, so `forge::resolve_remote`
+        // fails to read a remote from it -- same fixture other resync_pr_bases
+        // tests above use to exercise the local-bookkeeping-only path without
+        // any network access.
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "a")
+            .unwrap();
+        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some(&branch_id),
+                "github",
+                "acme/w",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
+    }
+
+    #[test]
+    fn guardian_ids_with_open_pull_requests_only_returns_guardians_with_a_numbered_open_pr() {
+        let s = store();
+        let with_pr = s.create_guardian("has-pr", "main", "/repo").unwrap();
+        let never_submitted = s.create_guardian("no-pr", "main", "/repo").unwrap();
+        let unsubmitted_row = s
+            .create_guardian("unsubmitted-row", "main", "/repo")
+            .unwrap();
+        let _ = never_submitted;
+
+        s.create_pull_request(
+            &with_pr,
+            None,
+            "github",
+            "acme/w",
+            "alias",
+            "main",
+            "T",
+            "",
+            Some(1),
+            None,
+        )
+        .unwrap();
+        // A row can exist locally before the forge call that assigns
+        // `pr_number` ever succeeds -- shouldn't count as "submitted" yet.
+        s.create_pull_request(
+            &unsubmitted_row,
+            None,
+            "github",
+            "acme/w",
+            "alias",
+            "main",
+            "T",
+            "",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ids = s.guardian_ids_with_open_pull_requests().unwrap();
+        assert_eq!(ids, vec![with_pr]);
+    }
+
+    #[test]
     fn resolve_unique_pr_alias_is_identity_when_free() {
         let s = store();
         let alias = s
@@ -4914,11 +5195,13 @@ mod tests {
             None,
             Some("other-base"),
             Some(Some("deadbeef")),
+            Some(Some("other-base")),
         )
         .unwrap();
         let pr = s.get_pull_request(&id).unwrap();
         assert_eq!(pr.base_ref, "other-base");
         assert_eq!(pr.last_pushed_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(pr.last_pushed_base_ref.as_deref(), Some("other-base"));
     }
 
     #[test]

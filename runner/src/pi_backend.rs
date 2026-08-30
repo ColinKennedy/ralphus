@@ -202,7 +202,7 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                 state.cost_usd = cost_usd;
                 crate::cartographer::emit(
                     "pi",
-                    "live usage",
+                    crate::cartographer::LIVE_USAGE_MESSAGE,
                     "info",
                     crate::cartographer::EventContext::default(),
                     serde_json::json!({
@@ -323,6 +323,7 @@ mod tests {
                 model: Some("openrouter/deepseek"),
                 append_system_prompt: Some("be terse"),
                 resume_agent_session_id: Some("sess-123"),
+                assigned_agent_session_id: None,
                 timeout_sec: None,
             },
         );

@@ -125,7 +125,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         one only configures git tracking). A cell may need
                                         both.
                                         Examples:
-                                          cwd = "ralphus:new-worktree/RAL-123-fix?upstream=<<default>>"
+                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=<<default>>>>"
                                           cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=beta>>"
                                           cwd = "<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>"
                                         ALTERNATIVE: an absolute path to an
@@ -407,7 +407,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  name:
 
    [[task.cell]]
-   cwd    = "ralphus:new-worktree/RAL-124-other_feature?upstream=<<default>>"
+   cwd    = "<<ralphus:new-worktree/RAL-124-other_feature?upstream=<<default>>>>"
    prompt = "..."
 
  ralphus resolves "<<default>>" to the project's default branch at run time.
@@ -758,12 +758,16 @@ mod tests {
     fn tutor_uses_wrapped_worktree_placeholders_for_cwd_examples() {
         assert!(TASK_TUTOR.contains("cwd    = \"<<ralphus:new-worktree/hello?upstream=main>>\""));
         assert!(
-            !TASK_TUTOR.lines().any(|line| line.contains("cwd")
-                && line.contains("= \"ralphus:new-worktree/")
-                && !line.contains("upstream=<<")),
-            "cwd examples must teach the wrapped <<...>> expansion syntax, except \
-             when the ?upstream= value is itself a reserved <<...>> sentinel -- \
-             that can't be nested inside an outer <<...>> wrap"
+            TASK_TUTOR
+                .contains("cwd = \"<<ralphus:new-worktree/RAL-123-fix?upstream=<<default>>>>\"")
+        );
+        assert!(
+            !TASK_TUTOR
+                .lines()
+                .any(|line| line.contains("cwd") && line.contains("= \"ralphus:new-worktree/")),
+            "cwd examples must teach the wrapped <<...>> expansion syntax -- including \
+             when the ?upstream= value is itself a reserved <<...>> sentinel, which \
+             nests inside the outer <<...>> wrap"
         );
     }
 

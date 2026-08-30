@@ -23,6 +23,16 @@ use crate::tmux::Tmux;
 /// Mirrors the existing `RALPHUS_PROOF: PASS/FAIL` marker-parsing pattern.
 pub const EVENT_MARKER: &str = "RALPHUS_EVENT: ";
 
+/// The message every agent backend gives its per-turn token/cost snapshot
+/// (RAL-161), mirrored from `runner/src/cartographer.rs::LIVE_USAGE_MESSAGE`.
+/// [`forward_runner_event`] folds such an event's payload onto the cell row
+/// and hands it to the live cost-cap check, then drops it rather than
+/// persisting a Cartographer row: the agent emits one per assistant turn, so
+/// keeping them buried a squad's timeline (`ralphus squad timeline`) under
+/// hundreds of `INFO claude-code live usage` lines carrying nothing the
+/// cell's own `tokens_in`/`tokens_out`/`cost_usd` columns don't already hold.
+const LIVE_USAGE_MESSAGE: &str = "live usage";
+
 /// One structured event forwarded from the runner subprocess over the
 /// `RALPHUS_EVENT:` stderr marker (RAL-98). `squad_id`/`cell_id`/`task` fall
 /// back to the owning [`RunnerSpec`] when the event itself omits them.
@@ -44,8 +54,8 @@ struct RunnerEvent {
     payload: serde_json::Value,
 }
 
-/// Live token/cost usage extracted from an `llm-invoke` event's payload
-/// (RAL-161), mirroring the existing `agent_session_id` capture.
+/// Live token/cost usage extracted from a runner event's payload (RAL-161),
+/// mirroring the `agent_session_id` capture alongside it.
 ///
 /// `pub(crate)` (not private): [`crate::remote_runner::ProviderRunner`] needs
 /// this too, to drive the same live cost-cap kill for a remote session that
@@ -134,6 +144,20 @@ pub struct RunnerSpec {
     /// (mirrors `system_prompt`'s precedent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_agent_session_id: Option<String>,
+    /// A session id the daemon generated and persisted to the cell's row
+    /// *before* the runner subprocess was spawned (RAL-288 Stage 1), so the
+    /// claude-code backend can pass `--session-id <id>` at launch instead of
+    /// waiting on Claude's own `system/init` event to learn it. Closes the
+    /// window where "Open Agent" is disabled for the very start of a run.
+    /// Mutually exclusive with `resume_agent_session_id` in practice (the
+    /// scheduler only generates one when that field is `None`); the
+    /// claude-code backend prefers `--resume` when both happen to be set.
+    /// `None` for anything that isn't a fresh claude-code cell dispatch —
+    /// proof steps, Guardian resolver invocations, and non-claude-code
+    /// backends (which have no equivalent pre-assignment flag and ignore
+    /// this field, mirroring `resume_agent_session_id`'s precedent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_agent_session_id: Option<String>,
     /// Persistent, user-set environment-variable overrides for the owning
     /// squad (RAL-150), applied to the spawned `ralphus-runner` subprocess's
     /// own environment — never sent over the stdin wire contract itself (the
@@ -158,6 +182,39 @@ pub struct RunnerSpec {
     /// an extra key is inert).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+}
+
+/// Generate a fresh RFC 4122 version-4 (random) UUID, formatted as the
+/// standard 8-4-4-4-12 hex string Claude Code's `--session-id` expects
+/// (RAL-288 Stage 1). Uses `getrandom` directly rather than pulling in the
+/// `uuid` crate for one id format — mirrors `token.rs::generate`'s precedent
+/// for the daemon's other from-scratch random-id need.
+pub(crate) fn generate_agent_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS randomness source available");
+    // RFC 4122 §4.4: stamp the version (4) and variant (10) bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+         {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
 }
 
 // Keep these strings in sync with `runner/src/execute.rs`, which
@@ -328,6 +385,7 @@ impl RunnerSpec {
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             // RAL-185: carried from the row so the router can dispatch this
             // cell to its machine. `None` for every pre-RAL-185 row.
@@ -384,6 +442,7 @@ impl RunnerSpec {
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
         }
@@ -441,6 +500,7 @@ impl RunnerSpec {
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
         }
@@ -527,10 +587,45 @@ impl RunnerResult {
         }
     }
 
+    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task, so a
+    /// real interactive session can safely take over. Carries whatever
+    /// usage/session-id was captured live up to the detach point, mirroring
+    /// [`Self::cost_exceeded`]'s reasoning -- the board's numbers must not
+    /// regress to zero just because the cell paused rather than finished.
+    #[must_use]
+    pub fn detached(
+        tokens_in: i64,
+        tokens_out: i64,
+        cost_usd: f64,
+        agent_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            status: "detached".to_string(),
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            summary: String::new(),
+            error: None,
+            proofed: None,
+            agent_session_id,
+            ghost: None,
+        }
+    }
+
     /// Whether the cell succeeded.
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.status == "done"
+    }
+
+    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task --
+    /// neither success nor failure. The scheduler special-cases this before
+    /// it would otherwise reach [`Self::node_state`] (mirroring how a
+    /// cancellation landing mid-run is handled), so this mapping only
+    /// matters as a safety net against a future caller that doesn't.
+    #[must_use]
+    pub fn is_detached(&self) -> bool {
+        self.status == "detached"
     }
 
     /// Map to a node state.
@@ -538,6 +633,8 @@ impl RunnerResult {
     pub fn node_state(&self) -> NodeState {
         if self.is_done() {
             NodeState::Done
+        } else if self.is_detached() {
+            NodeState::Running
         } else {
             NodeState::Failed
         }
@@ -578,6 +675,11 @@ pub struct SubprocessRunner {
     /// When set, `RALPHUS_EVENT:` marker lines on the child's stderr are
     /// parsed and forwarded into Cartographer (RAL-98).
     cartographer: Option<Arc<Mutex<Store>>>,
+    /// When set, a per-cell detach token is registered for the lifetime of
+    /// each tmux-wrapped attempt so an HTTP handler can request a clean
+    /// mid-task detach (RAL-288 Stage 6) via the same registry, without
+    /// touching the rest of that cell's squad.
+    detachments: Option<crate::cancel::Detachments>,
 }
 
 impl SubprocessRunner {
@@ -591,6 +693,7 @@ impl SubprocessRunner {
             args: parts.collect(),
             registry: None,
             cartographer: None,
+            detachments: None,
         }
     }
 
@@ -618,6 +721,15 @@ impl SubprocessRunner {
         self.cartographer = Some(store);
         self
     }
+
+    /// Attach the shared per-cell detach registry (RAL-288 Stage 6) so a
+    /// tmux-wrapped cell can be cleanly detached mid-task via an HTTP
+    /// handler holding the same registry.
+    #[must_use]
+    pub fn with_detachments(mut self, detachments: crate::cancel::Detachments) -> Self {
+        self.detachments = Some(detachments);
+        self
+    }
 }
 
 /// Registers a cell's subprocess PID on construction and unregisters it on
@@ -632,6 +744,23 @@ struct PidGuard<'a> {
 impl Drop for PidGuard<'_> {
     fn drop(&mut self) {
         self.registry.unregister(self.squad_id, self.cell_id);
+    }
+}
+
+/// Removes a cell's detach-token registration on every return path out of
+/// [`SubprocessRunner::run_via_tmux`] (RAL-288 Stage 6), the same way
+/// [`PidGuard`] removes a PID registration -- a token left registered after
+/// its run finished would let a stale HTTP detach request silently no-op
+/// against a run that already ended, never against something still live,
+/// but there's no reason to let the registry grow unbounded either.
+struct DetachGuard<'a> {
+    detachments: &'a crate::cancel::Detachments,
+    session_name: &'a str,
+}
+
+impl Drop for DetachGuard<'_> {
+    fn drop(&mut self) {
+        self.detachments.remove(self.session_name);
     }
 }
 
@@ -780,6 +909,19 @@ impl SubprocessRunner {
         let mut resumable_agent_session_id: Option<String> = None;
         let mut attempt: u32 = 0;
 
+        // RAL-288 Stage 6: registered for the lifetime of this whole cell run
+        // (every reattach attempt below shares it, not a fresh one per
+        // attempt) so an HTTP handler can request a clean mid-task detach via
+        // the same registry at any point, keyed by the same deterministic
+        // `session_name` the board's live-view/attach endpoints already use.
+        // `_detach_guard` removes it on every return path via `Drop`, the
+        // same pattern `PidGuard` already uses below for the same reason.
+        let detach_token = self.detachments.as_ref().map(|d| d.register(&session_name));
+        let _detach_guard = self.detachments.as_ref().map(|d| DetachGuard {
+            detachments: d,
+            session_name: &session_name,
+        });
+
         loop {
             let attempt_spec: std::borrow::Cow<'_, RunnerSpec> = if attempt == 0 {
                 std::borrow::Cow::Borrowed(spec)
@@ -814,6 +956,7 @@ impl SubprocessRunner {
             let (result, session_died_unexpectedly) = self.run_via_tmux_attempt(
                 &attempt_spec,
                 cancel,
+                detach_token.as_ref(),
                 &tmux,
                 &session_name,
                 &spec_path,
@@ -928,7 +1071,7 @@ impl SubprocessRunner {
     /// configured timeout budget), or is confirmed dead
     /// (`MISSING_SESSION_STRIKE_LIMIT` consecutive `has-session` misses).
     ///
-    /// Every `llm-invoke` "session-id known" event seen in the pane updates
+    /// Every "session-id known" event seen in the pane updates
     /// `resumable_agent_session_id` in place, so a subsequent attempt can
     /// resume the latest known conversation even if this one never finished.
     ///
@@ -943,6 +1086,7 @@ impl SubprocessRunner {
         &self,
         attempt_spec: &RunnerSpec,
         cancel: &CancelToken,
+        detach: Option<&crate::cancel::DetachToken>,
         tmux: &Tmux,
         session_name: &str,
         spec_path: &std::path::Path,
@@ -1099,9 +1243,9 @@ impl SubprocessRunner {
         // should never get "tmux server process exit code: ..." appended to
         // their message.
         let mut session_died_unexpectedly = false;
-        // RAL-161: the last live usage snapshot seen from an `llm-invoke`
-        // event, so an over-budget kill can carry the real tokens/cost
-        // through to `record_cell_result` instead of zeroing them out.
+        // RAL-161: the last live usage snapshot seen from a runner event, so
+        // an over-budget kill can carry the real tokens/cost through to
+        // `record_cell_result` instead of zeroing them out.
         let mut current_usage = LiveUsage {
             tokens_in: 0,
             tokens_out: 0,
@@ -1129,6 +1273,21 @@ impl SubprocessRunner {
                     attempt_spec.cell_id
                 );
                 break RunnerResult::failure("cancelled");
+            }
+            if detach.is_some_and(crate::cancel::DetachToken::is_cancelled) {
+                let _ = tmux.kill_session(session_name);
+                crate::rlog!(
+                    INFO,
+                    "ralphus [runner] detached squad={} cell={}",
+                    attempt_spec.squad_id,
+                    attempt_spec.cell_id
+                );
+                break RunnerResult::detached(
+                    current_usage.tokens_in,
+                    current_usage.tokens_out,
+                    current_usage.cost_usd,
+                    resumable_agent_session_id.clone(),
+                );
             }
             if timed_out(started.elapsed(), deadline) {
                 let _ = tmux.kill_session(session_name);
@@ -1525,10 +1684,9 @@ impl SubprocessRunner {
 /// Parse and persist one `RALPHUS_EVENT:` JSON payload from the runner
 /// subprocess. Missing `squad_id`/`cell_id`/`task` fall back to the owning
 /// cell's spec. Returns the `agent_session_id` it just persisted, if the
-/// event carried one (an `llm-invoke` "session-id known"/"RESUME" event) —
-/// so a caller tracking a resumable session id locally (see
-/// `SubprocessRunner::run_via_tmux`'s auto-reattach retry) can pick it up
-/// without a second JSON parse.
+/// event's payload carried one — so a caller tracking a resumable session id
+/// locally (see `SubprocessRunner::run_via_tmux`'s auto-reattach retry) can
+/// pick it up without a second JSON parse.
 pub(crate) fn forward_runner_event(
     cartographer: Option<&Arc<Mutex<Store>>>,
     squad_id: &str,
@@ -1557,75 +1715,83 @@ pub(crate) fn forward_runner_event(
     let Ok(guard) = store.lock() else {
         return ForwardedEvent::default();
     };
-    // RAL-102 follow-up: as soon as the runner reports the Claude Code session
-    // id (from the claude-code backend's `stream-json` init event), persist
-    // it immediately rather than waiting for the whole cell to finish, so
-    // the board's "Open Agent" action activates right away. A no-op for any
-    // event whose (squad_id, task, cell_id) isn't a session row — proof
-    // steps and Guardian resolver invocations share this same forwarding path
-    // but aren't rows in the `sessions` table.
+    // RAL-102 follow-up: as soon as the runner reports the agent's session id
+    // — the claude-code backend's `stream-json` init event, codex's
+    // `thread.started`, pi's equivalent — persist it immediately rather than
+    // waiting for the whole cell to finish, so the board's "Open Agent" action
+    // activates right away. A no-op for any event whose
+    // (squad_id, task, cell_id) isn't a cell row — proof steps and Guardian
+    // resolver invocations share this same forwarding path but aren't rows in
+    // the `cells` table.
+    //
+    // Keyed on the *payload* carrying `agent_session_id`, never on the event's
+    // `source`: each CLI-agent backend names its own source (`claude-code`,
+    // `codex`, `pi`) while the machine providers forward a generic
+    // `llm-invoke`, so the payload key is the only thing all of them agree on.
+    // A new backend gets this for free by emitting the same key, and renaming
+    // a source cannot silently sever the capture.
     let mut captured_agent_session_id = None;
-    // RAL-161: likewise, persist live token/cost usage as soon as an
-    // `llm-invoke` event carries it, and hand it back so the tmux poll loop
-    // can compare it against the cell's `maximum_budget_usd` cap without
-    // a second JSON parse or DB round-trip.
+    // RAL-161: likewise, persist live token/cost usage as soon as an event's
+    // payload carries `cost_usd`, and hand it back so the tmux poll loop can
+    // compare it against the cell's `maximum_budget_usd` cap without a second
+    // JSON parse or DB round-trip.
     let mut live_usage = None;
-    if event.source == "llm-invoke" {
-        if let Some(sid) = event
-            .payload
-            .get("agent_session_id")
-            .and_then(|v| v.as_str())
-        {
-            let _ = guard.set_cell_agent_session_id_live(
-                event.squad_id.as_deref().unwrap_or(squad_id),
-                event.task.as_deref().unwrap_or(task),
-                event.cell_id.as_deref().unwrap_or(cell_id),
-                sid,
-            );
-            captured_agent_session_id = Some(sid.to_string());
-        }
-        if let Some(cost_usd) = event
-            .payload
-            .get("cost_usd")
-            .and_then(serde_json::Value::as_f64)
-        {
-            let tokens_in = event
-                .payload
-                .get("tokens_in")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let tokens_out = event
-                .payload
-                .get("tokens_out")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let _ = guard.set_cell_live_usage(
-                event.squad_id.as_deref().unwrap_or(squad_id),
-                event.task.as_deref().unwrap_or(task),
-                event.cell_id.as_deref().unwrap_or(cell_id),
-                tokens_in,
-                tokens_out,
-                cost_usd,
-            );
-            live_usage = Some(LiveUsage {
-                tokens_in,
-                tokens_out,
-                cost_usd,
-            });
-        }
+    if let Some(sid) = event
+        .payload
+        .get("agent_session_id")
+        .and_then(|v| v.as_str())
+    {
+        let _ = guard.set_cell_agent_session_id_live(
+            event.squad_id.as_deref().unwrap_or(squad_id),
+            event.task.as_deref().unwrap_or(task),
+            event.cell_id.as_deref().unwrap_or(cell_id),
+            sid,
+        );
+        captured_agent_session_id = Some(sid.to_string());
     }
-    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-        level,
-        source: &event.source,
-        message: &event.message,
-        scope: event.scope.as_deref(),
-        squad_id: Some(event.squad_id.as_deref().unwrap_or(squad_id)),
-        guardian_id: None,
-        cell_id: Some(event.cell_id.as_deref().unwrap_or(cell_id)),
-        task: Some(event.task.as_deref().unwrap_or(task)),
-        log_path: None,
-        payload: event.payload,
-    });
+    if let Some(cost_usd) = event
+        .payload
+        .get("cost_usd")
+        .and_then(serde_json::Value::as_f64)
+    {
+        let tokens_in = event
+            .payload
+            .get("tokens_in")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let tokens_out = event
+            .payload
+            .get("tokens_out")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let _ = guard.set_cell_live_usage(
+            event.squad_id.as_deref().unwrap_or(squad_id),
+            event.task.as_deref().unwrap_or(task),
+            event.cell_id.as_deref().unwrap_or(cell_id),
+            tokens_in,
+            tokens_out,
+            cost_usd,
+        );
+        live_usage = Some(LiveUsage {
+            tokens_in,
+            tokens_out,
+            cost_usd,
+        });
+    }
+    if event.message != LIVE_USAGE_MESSAGE {
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level,
+            source: &event.source,
+            message: &event.message,
+            scope: event.scope.as_deref(),
+            squad_id: Some(event.squad_id.as_deref().unwrap_or(squad_id)),
+            guardian_id: None,
+            cell_id: Some(event.cell_id.as_deref().unwrap_or(cell_id)),
+            task: Some(event.task.as_deref().unwrap_or(task)),
+            log_path: None,
+            payload: event.payload,
+        });
+    }
     ForwardedEvent {
         agent_session_id: captured_agent_session_id,
         live_usage,
@@ -1805,6 +1971,7 @@ mod tests {
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
         }
@@ -2226,6 +2393,181 @@ mod tests {
         assert_eq!(row.payload, serde_json::json!({"prompt_len": 42}));
     }
 
+    /// A task file with one `build` task holding one `worker` cell — the
+    /// (task, cell_id) pair the live-capture tests below address their events
+    /// to, since `Store::set_cell_agent_session_id_live` matches on both.
+    const LIVE_CAPTURE_SAMPLE: &str = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+id = "worker"
+cwd = "/repo"
+prompt = "make it build"
+"#;
+
+    fn store_with_one_cell() -> (Arc<Mutex<Store>>, String) {
+        let mut store = Store::open_in_memory().unwrap();
+        let file: ralphus_core::schema::TaskFile =
+            toml::from_str(LIVE_CAPTURE_SAMPLE).expect("valid toml");
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        (Arc::new(Mutex::new(store)), squad_id)
+    }
+
+    /// Every CLI-agent backend names its own event source (`claude-code`,
+    /// `codex`, `pi`) while the machine providers forward a generic
+    /// `llm-invoke`. The capture keys on the payload rather than the source so
+    /// all four land, and so renaming a backend cannot silently sever it —
+    /// without this, "Open Agent" stays disabled for the whole life of a
+    /// running cell and `resumable_agent_session_id` never reaches the tmux
+    /// auto-reattach retry.
+    #[test]
+    fn forward_runner_event_captures_session_id_from_every_backend_source() {
+        for (i, source) in ["claude-code", "codex", "pi", "llm-invoke"]
+            .into_iter()
+            .enumerate()
+        {
+            let (store, squad_id) = store_with_one_cell();
+            let sid = format!("sid-{i}");
+            let json = serde_json::json!({
+                "source": source,
+                "message": "session-id known",
+                "level": "info",
+                "payload": {"agent_session_id": sid},
+            })
+            .to_string();
+
+            let fwd = forward_runner_event(Some(&store), &squad_id, "worker", "build", &json);
+
+            assert_eq!(
+                fwd.agent_session_id.as_deref(),
+                Some(sid.as_str()),
+                "{source}: the id must be handed back for the reattach retry"
+            );
+            let (_, _, persisted) = store
+                .lock()
+                .unwrap()
+                .get_cell_agent_resume(&squad_id, 0, 0)
+                .unwrap();
+            assert_eq!(
+                persisted.as_deref(),
+                Some(sid.as_str()),
+                "{source}: the id must be persisted while the cell is still running"
+            );
+        }
+    }
+
+    /// The live-usage half of the same capture (RAL-161). The returned
+    /// snapshot is what `run_via_tmux_attempt`'s cost-cap check compares
+    /// against `maximum_budget_usd`, so a miss here silently disables every
+    /// configured cost cap.
+    #[test]
+    fn forward_runner_event_captures_live_usage_from_every_backend_source() {
+        for (i, source) in ["claude-code", "codex", "pi", "llm-invoke"]
+            .into_iter()
+            .enumerate()
+        {
+            let (store, squad_id) = store_with_one_cell();
+            let tokens_in = i64::try_from(i).unwrap() + 1;
+            let json = serde_json::json!({
+                "source": source,
+                "message": "live usage",
+                "level": "info",
+                "payload": {"tokens_in": tokens_in, "tokens_out": 7, "cost_usd": 1.25},
+            })
+            .to_string();
+
+            let fwd = forward_runner_event(Some(&store), &squad_id, "worker", "build", &json);
+
+            assert_eq!(
+                fwd.live_usage,
+                Some(LiveUsage {
+                    tokens_in,
+                    tokens_out: 7,
+                    cost_usd: 1.25,
+                }),
+                "{source}: the snapshot the cost cap reads must be returned"
+            );
+            let squad = store.lock().unwrap().get_squad(&squad_id).unwrap();
+            let cell = &squad.tasks[0].cells[0];
+            assert_eq!(cell.tokens_in, tokens_in, "{source}: tokens_in persisted");
+            assert_eq!(cell.tokens_out, 7, "{source}: tokens_out persisted");
+            assert!(
+                (cell.cost_usd - 1.25).abs() < f64::EPSILON,
+                "{source}: cost_usd persisted, got {}",
+                cell.cost_usd
+            );
+        }
+    }
+
+    /// ...and does so *without* leaving a Cartographer row behind: a backend
+    /// emits one of these per assistant turn, so persisting them drowns
+    /// `ralphus squad timeline` in `INFO <backend> live usage` lines that say
+    /// nothing the cell's own usage columns (asserted above) don't already.
+    #[test]
+    fn forward_runner_event_does_not_persist_a_live_usage_row() {
+        let (store, squad_id) = store_with_one_cell();
+        let usage = serde_json::json!({
+            "source": "claude-code",
+            "message": LIVE_USAGE_MESSAGE,
+            "level": "info",
+            "payload": {"tokens_in": 3, "tokens_out": 7, "cost_usd": 1.25},
+        })
+        .to_string();
+
+        for _ in 0..5 {
+            forward_runner_event(Some(&store), &squad_id, "worker", "build", &usage);
+        }
+        // A usage payload riding along with a *different* message is a real
+        // event and must still be recorded — only the heartbeat is dropped.
+        forward_runner_event(
+            Some(&store),
+            &squad_id,
+            "worker",
+            "build",
+            &serde_json::json!({
+                "source": "claude-code",
+                "message": "cell finished",
+                "level": "info",
+                "payload": {"tokens_in": 3, "tokens_out": 7, "cost_usd": 1.25},
+            })
+            .to_string(),
+        );
+
+        let page = store
+            .lock()
+            .unwrap()
+            .cartographer_query(&crate::cartographer::CartographerFilter::recent(50))
+            .unwrap();
+        let messages: Vec<&str> = page.rows.iter().map(|r| r.message.as_str()).collect();
+        assert!(
+            !messages.contains(&LIVE_USAGE_MESSAGE),
+            "the per-turn usage heartbeat must not reach Cartographer: {messages:?}"
+        );
+        assert!(
+            messages.contains(&"cell finished"),
+            "a real event carrying usage must still be recorded: {messages:?}"
+        );
+    }
+
+    /// An event carrying neither key is still logged to Cartographer but must
+    /// not fabricate a session id or a zeroed usage snapshot — a `Some(0.0)`
+    /// cost would read as a real reading and reset the cap's running total.
+    #[test]
+    fn forward_runner_event_reports_nothing_for_an_ordinary_event() {
+        let (store, squad_id) = store_with_one_cell();
+        let json = serde_json::json!({
+            "source": "claude-code",
+            "message": "some diagnostic",
+            "level": "debug",
+            "payload": {"note": "no ids here"},
+        })
+        .to_string();
+
+        let fwd = forward_runner_event(Some(&store), &squad_id, "worker", "build", &json);
+
+        assert_eq!(fwd, ForwardedEvent::default());
+    }
+
     #[test]
     fn forward_runner_event_without_cartographer_handle_is_a_noop() {
         // Must not panic when no store handle is attached (e.g. test fakes).
@@ -2239,6 +2581,39 @@ mod tests {
             ),
             ForwardedEvent::default()
         );
+    }
+
+    #[test]
+    fn generate_agent_session_id_looks_like_a_uuid_v4() {
+        let id = generate_agent_session_id();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "must be 8-4-4-4-12 hex groups, got {id:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit())),
+            "every group must be hex, got {id:?}"
+        );
+        assert_eq!(
+            parts[2].chars().next(),
+            Some('4'),
+            "RFC 4122 version nibble must be 4, got {id:?}"
+        );
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "RFC 4122 variant nibble must be 8/9/a/b, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn generate_agent_session_id_is_not_reused() {
+        let a = generate_agent_session_id();
+        let b = generate_agent_session_id();
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -2424,6 +2799,7 @@ mod tests {
             ],
             registry: Some(reg.clone()),
             cartographer: None,
+            detachments: None,
         };
         #[cfg(not(target_os = "windows"))]
         let runner = SubprocessRunner {
@@ -2431,6 +2807,7 @@ mod tests {
             args: vec!["1".to_string()],
             registry: Some(reg.clone()),
             cartographer: None,
+            detachments: None,
         };
         let row = CellRow {
             task_idx: 0,
@@ -2693,6 +3070,7 @@ mod tests {
             args: vec!["-c".to_string(), FAKE_RUNNER_SCRIPT.to_string()],
             registry: None,
             cartographer: None,
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -2744,6 +3122,7 @@ mod tests {
             args: vec!["-c".to_string(), FAKE_RUNNER_SCRIPT.to_string()],
             registry: None,
             cartographer: None,
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_proof(
@@ -2793,6 +3172,7 @@ mod tests {
             args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
             registry: Some(reg.clone()),
             cartographer: None,
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         // Backstop only — see the identical note on
@@ -2909,6 +3289,7 @@ mod tests {
             args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
             registry: None,
             cartographer: None,
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -2962,6 +3343,7 @@ mod tests {
             args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
             registry: None,
             cartographer: None,
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -2984,6 +3366,54 @@ mod tests {
         let result = runner.run_cancellable(&spec, &cancel);
         assert!(!result.is_done());
         assert_eq!(result.error.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn live_tmux_run_via_tmux_is_detachable() {
+        if !tmux_and_python_available() {
+            println!("SKIP: tmux and/or python not found on PATH");
+            return;
+        }
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-detach");
+        let _cleanup = SnapshotCleanup {
+            squad_id: run_id.clone(),
+            task: "build".to_string(),
+            cell_id: "detach-session".to_string(),
+        };
+        let detachments = crate::cancel::Detachments::new();
+        let runner = SubprocessRunner {
+            program: "python".to_string(),
+            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
+            registry: None,
+            cartographer: None,
+            detachments: Some(detachments.clone()),
+        };
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let spec = RunnerSpec::for_proof(
+            &run_id,
+            "build",
+            "detach-session",
+            &cwd,
+            "do something",
+            "claude",
+            None,
+            None,
+            None,
+        );
+        // RAL-288 Stage 6: an HTTP handler doesn't have the runner's own
+        // computed session name -- it only knows (squad_id, task, cell_id),
+        // same as every other tmux-keyed endpoint (`attach_tmux_terminal`,
+        // `capture_pane_reply`) already recomputes it.
+        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            detachments.cancel(&session_name);
+        });
+        let result = runner.run_cancellable(&spec, &CancelToken::never());
+        assert!(!result.is_done());
+        assert!(result.is_detached());
+        assert_eq!(result.error, None);
     }
 
     /// A fake runner for the auto-reattach test (RAL-102 follow-up): reads
@@ -3047,6 +3477,7 @@ mod tests {
             args: vec!["-c".to_string(), REATTACH_RUNNER_SCRIPT.to_string()],
             registry: None,
             cartographer: Some(Arc::new(Mutex::new(store))),
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -3067,6 +3498,7 @@ mod tests {
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
         };
@@ -3174,6 +3606,7 @@ mod tests {
             args: vec!["-c".to_string(), REATTACH_RUNNER_SCRIPT.to_string()],
             registry: None,
             cartographer: Some(Arc::new(Mutex::new(store))),
+            detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -3194,6 +3627,7 @@ mod tests {
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
         };

@@ -93,6 +93,7 @@ RAL-252 is done` comments at each one.
 | **gating** | Cross-squad dependency: a squad waiting on another squad's completion. |
 | **sentinel** | A `<<…>>` value resolved at squad time rather than authored literally — e.g. `upstream = "<<task:name>>"` rebases this cell's branch onto that dependency's tip. `[[task.cell]].review` is another: `<<review:<id>>>` or `<<ralphus:new-review/<key>>>` (RAL-269) — the bare, unwrapped form is a validation error. The reserved `?upstream=` sentinels on a `ralphus:new-worktree/<branch>` placeholder cwd are `<<default>>` (resolve to the repository's default branch — recommended) and `<<current_branch>>` (resolve to whatever branch the project currently has checked out — riskier, since it can change between runs). These `<<…>>` values are reserved: they are never treated as literal branch names, and any other `<<…>>` value is rejected at validation time. `depends_on` is deliberately NOT a sentinel: it's a bare-string lookup into IDs that already exist in the file, nothing about it is resolved or modified later. |
 | **restart_on** | A proof step's declaration that another step firing should re-run this cell's proof cursor. Grammar: `task/cell/proof?on=pass\|fail\|both`. |
+| **detach** | (RAL-288) Cleanly stopping a still-running cell's live process — without reporting it `Done` or `Failed` — so a real interactive agent session can safely take over the same conversation. The cell stays `Running`, paused, until an explicit **resume automation** call hands it back to unattended execution. |
 
 ## Components
 
@@ -109,6 +110,7 @@ RAL-252 is done` comments at each one.
 | **harness** | Internal name for the generic external-CLI `ModelBackend` (`HarnessBackend`, `runner/src/harness_backend.rs`) that drives any executable as a subprocess with no protocol-specific stream parsing. Only reachable as a backend under the reserved name **raw** — not itself a valid `backend`/`agent` value. |
 | **raw** | The explicit generic external-executable backend (implemented by the **harness** `ModelBackend`). Equivalent to the old implicit fallback, but now only valid when a profile also supplies `executable`. |
 | **prism** | A desktop handoff ("Open in Prism"). Declared, not built. |
+| **read pool** | The daemon's fixed set of threads answering read-only (`GET`) HTTP requests off the accept loop (`daemon/src/server.rs`). `tiny_http` is otherwise one-request-at-a-time, so a `GET` that shells out to git or calls a **forge** would hold up every other request behind it — including a state transition like starting a review's rebase. Mutating methods deliberately stay on the accept loop, so they remain totally ordered with respect to each other. |
 
 ## Benchmarking (RAL-94)
 

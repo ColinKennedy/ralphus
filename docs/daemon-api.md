@@ -74,7 +74,8 @@ where one exists.
 | POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/env` | Set/unset env overrides on **one** cell-scoped proof step (RAL-191) |
 | POST | `/api/squads/{id}/tasks/{ti}/solo` | [Solo a task](#post-apisquadsidtaskstisolo) (RAL-157) — pauses every other task in the squad until un-soloed |
 | POST | `/api/squads/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apisquadsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
-| POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | Spawn a resume terminal (`claude --resume` or `codex exec resume`, depending on which agent the cell ran under) **on the daemon host** (`?mode=readonly\|open`) |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | `?mode=open\|readonly`: spawn a resume terminal (`claude --resume`, `codex resume`, or `pi --session`, depending on the cell's agent) **on the daemon host**. `?mode=agent` on a **finished** cell does the same; on a **still-running** cell (RAL-288 Stage 6) it detaches the cell cleanly first, waits for it to genuinely stop, then opens the real agent inside a tmux session that survives closing the terminal — see [below](#post-apisquadsidcellstisiopen-terminalmodeagent) |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/resume-automation` | Hand a detached cell back to unattended execution, continuing its exact same agent session rather than starting fresh (RAL-288 Stage 6) — see [below](#post-apisquadsidcellstisiresume-automation) |
 | POST | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/open-terminal` | Same, for a proof step's resolved cell |
 | DELETE | `/api/squads/{id}` | Permanently delete a squad |
 
@@ -681,6 +682,43 @@ shape. A non-integer index is a `400`; an unknown task index is a `404`.
 Accepts the optional `note`/`apply_to_all` body documented under
 [`POST /api/squads/{id}/restart`](#post-apisquadsidrestart) above (RAL-174) — here
 the exact target is the task's own (directly-owned) cells.
+
+### `POST /api/squads/{id}/cells/{ti}/{si}/open-terminal?mode=agent`
+On a **finished** cell, spawns a resume terminal (`claude --resume`, `codex
+resume`, or `pi --session`, depending on the cell's agent) on the daemon
+host — unchanged from before RAL-288 Stage 6.
+
+On a cell that is **still running**, this instead (RAL-288 Stage 6):
+1. Requests a clean detach — the cell's live process is stopped without
+   reporting it as `Done` or `Failed`; it stays paused (still `Running`),
+   not resolved.
+2. Blocks (bounded, a few seconds) until the cell's tmux session is
+   confirmed genuinely gone. "Detach requested" is not the same guarantee
+   as "detach happened" — a second process touching the same conversation
+   before the first one has actually released it is what corrupts a
+   session, so this wait is not optional.
+3. Opens the *real* interactive agent — the actual CLI, not a relay — inside
+   a new, named tmux session, so closing the terminal window doesn't kill
+   it; reattach later the same way as any other tmux-backed session.
+
+A `409 still_running`-style response (surfaced via whatever the daemon's
+error path returns) means the detach didn't complete in time; retry. A
+`409 no_claude_session` means the cell has no recorded agent session to
+resume from yet. Backend-agnostic — the same flow applies to claude, codex,
+and pi. Cell-scoped only, same as before — no equivalent route reaches a
+proof step or a review branch resolver.
+
+### `POST /api/squads/{id}/cells/{ti}/{si}/resume-automation`
+Hands a detached cell (see above) back to unattended execution, continuing
+the *exact same* agent conversation rather than starting fresh — unlike a
+generic `restart_cell`. No body.
+
+Marks the cell to resume its own recorded `agent_session_id` on its next
+dispatch, then resets it to `pending` the same way `restart_cell` does. A
+`409 no_claude_session` means there's no recorded session to resume. A
+`409 still_running` means the cell's own tmux session is still alive —
+calling this on a genuinely still-running cell would start a second process
+racing the live one, so it's rejected rather than attempted.
 
 ### `POST /api/squads/{id}/env`
 Set (`set`) and/or remove (`unset`) persistent environment-variable overrides

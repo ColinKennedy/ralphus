@@ -35,6 +35,10 @@ pub struct RunOptions<'a> {
     pub model: Option<&'a str>,
     pub append_system_prompt: Option<&'a str>,
     pub resume_agent_session_id: Option<&'a str>,
+    /// A session id the daemon pre-generated before this cell started
+    /// (RAL-288 Stage 1). The claude-code backend passes it as
+    /// `--session-id` when not resuming; other backends ignore it.
+    pub assigned_agent_session_id: Option<&'a str>,
     pub timeout_sec: Option<u64>,
 }
 

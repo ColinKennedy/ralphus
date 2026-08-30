@@ -1,5 +1,5 @@
 //! Builds the local CLI command line that resumes a CLI-agent conversation
-//! (`claude --resume <id>` / `codex exec resume <id>` / `pi --session <id>`).
+//! (`claude --resume <id>` / `codex resume <id>` / `pi --session <id>`).
 //!
 //! Shared by the daemon (which prints this command for its `open-terminal`
 //! HTTP endpoints) and the CLI (`ralphus session terminal` / `ralphus review
@@ -20,15 +20,23 @@ pub fn resume_agent_command(program: &str, session_id: &str) -> String {
 }
 
 /// The Codex analog of [`resume_agent_command`] -- Codex resumes via a
-/// subcommand (`exec resume <id>`), not a flag, and its permission-bypass
-/// flag is spelled differently.
+/// subcommand (`resume <id>`), not a flag, and its permission-bypass flag is
+/// spelled differently.
+///
+/// This is the top-level, *interactive* `codex resume` (TUI), not `codex
+/// exec resume` -- the latter is Codex's non-interactive headless mode and
+/// requires a prompt argument (or piped stdin) or it fails immediately with
+/// "No prompt provided", which is exactly the reported symptom of using it
+/// here for an interactive terminal resume with nothing to pipe in. `codex
+/// exec resume <id> <prompt>` remains correct and unchanged for the
+/// runner's own headless cross-cell session sharing (RAL-248,
+/// `runner/src/codex_backend.rs`), which always has a real prompt to send —
+/// a different code path from this one.
 #[must_use]
 pub fn resume_codex_agent_command(program: &str, session_id: &str) -> String {
     let safe_program = program.replace('\'', "''");
     let safe_session = session_id.replace('\'', "''");
-    format!(
-        "& '{safe_program}' exec resume '{safe_session}' --dangerously-bypass-approvals-and-sandbox"
-    )
+    format!("& '{safe_program}' resume '{safe_session}' --dangerously-bypass-approvals-and-sandbox")
 }
 
 /// Pi resumes a concrete session via `--session <id>` and uses `--approve`
@@ -75,7 +83,11 @@ mod tests {
     fn resume_codex_agent_command_always_bypasses_approvals() {
         let cmd = resume_codex_agent_command("codex", "thread-abc-123");
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(cmd.contains("exec resume 'thread-abc-123'"));
+        // The top-level interactive `codex resume`, not `codex exec resume`
+        // (the non-interactive mode, which requires a prompt argument or
+        // piped stdin and fails immediately without one).
+        assert!(cmd.contains("resume 'thread-abc-123'"));
+        assert!(!cmd.contains("exec"));
         assert!(cmd.contains("& 'codex'"));
     }
 

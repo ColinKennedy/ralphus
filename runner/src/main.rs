@@ -114,9 +114,20 @@ fn send(spec_path: Option<&str>, result_file: Option<&str>) -> std::process::Exi
         }
     };
 
-    eprintln!(
-        "ralphus [runner] invoked squad={} cell={} agent={:?} model={:?} proof={}",
-        spec.squad_id, spec.cell_id, spec.agent, spec.model, spec.proof
+    // RAL-288 Stage 5: Cartographer-only, not a plain `eprintln!` -- see
+    // `execute.rs::log_llm_start`'s doc comment for why (no counterpart
+    // existed before Stage 5; a bare print would only ever have lived in the
+    // vanishing tmux pane).
+    ralphus_runner::cartographer::emit(
+        "runner",
+        "invoked",
+        "info",
+        ralphus_runner::cartographer::EventContext {
+            squad_id: Some(&spec.squad_id),
+            cell_id: Some(&spec.cell_id),
+            task: Some(&spec.task),
+        },
+        serde_json::json!({"agent": spec.agent, "model": spec.model, "proof": spec.proof}),
     );
 
     let runner_config = config::load(std::path::Path::new(&spec.cwd));
@@ -252,7 +263,17 @@ fn finish(result: &CellResult, result_file: Option<&str>) -> std::process::ExitC
     match result_file {
         Some(path) => {
             if let Err(e) = std::fs::write(path, result.to_json()) {
-                eprintln!("ralphus [runner] could not write result file {path}: {e}");
+                // No `CellSpec` in scope here to attach squad/task/cell
+                // context to -- the daemon's own forwarding fills those in
+                // from what it already knows about this invocation (see
+                // `daemon/src/runner.rs::forward_runner_event`'s fallback).
+                ralphus_runner::cartographer::emit(
+                    "runner",
+                    "could not write result file",
+                    "error",
+                    ralphus_runner::cartographer::EventContext::default(),
+                    serde_json::json!({"path": path, "error": e.to_string()}),
+                );
             }
             println!("{TMUX_DONE_MARKER}: {}", result.status);
         }

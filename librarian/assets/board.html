@@ -21,6 +21,7 @@
         --incomplete: #db6d28;
         --toast-warn: #d29922;
         --out-of-date: #d4a72c;
+        --detached: #d2a8ff;
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -136,6 +137,7 @@
       .p-warn { color: var(--warn); border-color: var(--warn); }
       .p-solo { color: var(--solo); border-color: var(--solo); }
       .p-out-of-date { color: var(--out-of-date); border-color: var(--out-of-date); }
+      .p-detached { color: var(--detached); border-color: var(--detached); }
       .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
       .p-proof_pending { color: var(--running); border-color: var(--running); }
       .p-in_progress { color: var(--running); border-color: var(--running); }
@@ -185,9 +187,10 @@
          state above (--muted) and from any entity-status color. */
       .peek-activity { margin-left: 8px; color: var(--muted); white-space: nowrap; }
       .peek-activity.stale { color: var(--stale); font-weight: 600; }
-      /* RAL-232: per-pane "Show Debug Messages" checkbox in the peek head,
-         toggling whether ralphus's own diagnostic/telemetry lines are
-         stripped from the rendered pane text (stripDebugLines). */
+      /* RAL-232, additive since RAL-288 Stage 5: per-pane "Show Debug
+         Messages" checkbox in the peek head, toggling whether that cell's
+         own Cartographer rows are fetched and appended after the (always
+         agent-only) rendered pane text (currentPeekDisplayText). */
       .peek-debug-toggle { display: flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; color: var(--muted); }
       .peek-debug-toggle input { margin: 0; cursor: pointer; }
       /* Durable terminal-log attempt history (RAL-154): lists every persisted
@@ -571,12 +574,14 @@
        * @property {string} [prompt]
        * @property {string|null} [system_prompt]
        * @property {string} [agent_session_id]
+       * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
        * @property {{id: string, name: string, status: string, branch?: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this cell (hierarchical env overrides, extending RAL-150); merged on top of the owning task's/squad's when the cell's own subprocess is spawned. Empty/absent for the vast majority of cells.
        * @property {{[key: string]: string}} [proof_env_overrides] - Persistent environment-variable overrides applied only to this cell's own proof steps, merged on top of `env_overrides` (and its ancestors).
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this cell's own `env_overrides` has been edited since the cell last ran/retried or had its status explicitly set. No behavioral effect.
+       * @property {number|null} [detached_at_ms] - RAL-288: when this cell was cleanly stopped for a real interactive agent session to take over, or absent/null while it isn't detached. State still reads `running` while this is set — the cell is paused for a human, not stuck. Clears automatically on the cell's next dispatch (a restart, or resume-automation).
        */
       /**
        * @typedef {object} TaskView
@@ -724,7 +729,6 @@
        * @property {string} [change_summary]
        * @property {string} [detail]
        * @property {boolean} [skip_auto_build]
-       * @property {boolean} [skip_worktree_checks]
        * @property {boolean} [skip_worktrees]
        * @property {number} [conflicts_found]
        * @property {number} [conflicts_fixed]
@@ -823,6 +827,22 @@
        * @property {string|null} cell_id
        * @property {string|null} [task]
        * @property {Record<string, *>} payload
+       */
+      /**
+       * @typedef {object} DebugEventEntry - one row from a `.../debug-events`
+       *   endpoint (RAL-288 Stage 5) -- `daemon/src/timeline.rs`'s
+       *   `SquadTimelineEntry`, scoped to one cell. Deliberately a distinct
+       *   shape from {@link CartographerRow} (no `id`/`squad_id`/
+       *   `guardian_id`/`payload`; adds `log_path`/`log_excerpt`).
+       * @property {number} at_ms
+       * @property {string} level
+       * @property {string} source
+       * @property {string|null} scope
+       * @property {string|null} task
+       * @property {string|null} cell_id
+       * @property {string} message
+       * @property {string|null} log_path
+       * @property {string|null} log_excerpt
        */
       /**
        * @typedef {object} EntityRef
@@ -981,6 +1001,7 @@
         openProofTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openProofTerminal(ds.squadId || "", Number(ds.ti), ds.scope || "", Number(ds.si), Number(ds.vi)); },
         toggleHistoryMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); toggleHistory(ds.key || ""); },
         openAgentTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openAgentTerminal(ds.squadId || "", Number(ds.ti), Number(ds.si)); },
+        resumeAutomationMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); resumeAutomation(ds.squadId || "", Number(ds.ti), Number(ds.si)); },
         openTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openTerminal(ds.squadId || "", Number(ds.ti), Number(ds.si)); },
         openGuardianBranchTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openGuardianBranchTerminal(ds.gid || "", ds.bid || "", ds.mode || ""); },
         openGuardianManualChecksTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openGuardianManualChecksTerminal(ds.gid || "", ds.mode || ""); },
@@ -1366,8 +1387,10 @@
       let historyAttempts = {};
       /** @type {{[key: string]: {attempt: number, content: string}|null}} peek key -> the one historical attempt currently being viewed in full, if any */
       let historyViewing = {};
-      /** @type {Set<string>} gid -> a Merge/Approve action is in flight, so the button shows a pending/disabled state until it resolves (RAL-234) */
+      /** @type {Set<string>} gid -> an Approve is in flight, so the button shows a pending/disabled state until it resolves (RAL-234) */
       let pendingGuardianActions = new Set();
+      /** @type {Set<string>} gid -> a Merge / rebase kickoff is in flight, so the button shows a pending/disabled state until the daemon has answered and the board has reloaded */
+      let pendingMergeActions = new Set();
 
       // ---------- helpers ----------
       /**
@@ -1727,6 +1750,28 @@
       const outOfDateBadge = (flag) => flag
         ? ` <span class="pill p-out-of-date" data-tip="This item's environment-variable overrides changed since it last ran/retried — a purely cosmetic signal, nothing is blocked or invalidated.\nWho/when: notice this before trusting an old run's results as still reflecting the current overrides.\nClears automatically the next time this item runs/retries, or when its status is set explicitly (e.g. via Set Status).">⚠ env out of date</span>`
         : "";
+      /**
+       * Renders a "detached" badge (RAL-288) for a cell that reads `running`
+       * but has actually been cleanly stopped for a real interactive agent
+       * session to take over — not stuck, not stalled, and not Done/Failed/
+       * Cancelled either. `detachedAtMs` is the cell's own `detached_at_ms`
+       * field (present only while genuinely detached).
+       * @param {number|null|undefined} detachedAtMs
+       * @returns {string}
+       */
+      const detachedBadge = (detachedAtMs) => detachedAtMs
+        ? ` <span class="pill p-detached" data-tip="This cell cleanly stopped so a real interactive agent session could take over — it is not stuck, and its Live View below now shows the historical record of that stopped process, not a hang.\nWho/when: you (or someone else) clicked 'Open Agent' and the live conversation continues in a separate terminal (tmux session), outside this board.\nUse 'Open Agent' again to reattach a terminal to that live session, or 'Resume Automation' once you are done with it to continue unattended from where it left off.">⏸ detached — open agent to reattach</span>`
+        : "";
+      /**
+       * Compact "detached" badge (RAL-288) for the graph tree's cell node,
+       * where space is tight — same signal and tooltip as {@link detachedBadge},
+       * just the bare word instead of the full explanatory label.
+       * @param {number|null|undefined} detachedAtMs
+       * @returns {string}
+       */
+      const detachedGraphBadge = (detachedAtMs) => detachedAtMs
+        ? ` <span class="pill p-detached" data-tip="This cell cleanly stopped so a real interactive agent session could take over — it is not stuck.\nWho/when: 'Open Agent' was clicked and the live conversation continues in a separate terminal (tmux session), outside this board.\nUse 'Open Agent' again to reattach, or 'Resume Automation' to continue unattended from where it left off.">detached</span>`
+        : "";
       /** @type {{[key: string]: ("task"|"cell"|"proof")[]}} */
       const GRAPH_NODE_ACTION_COMPAT = {
         restart: ["task", "cell", "proof"],
@@ -1894,9 +1939,8 @@
       async function copyPeekText(e, key) {
         e.stopPropagation();
         const btn = /** @type {HTMLElement} */ (e.currentTarget);
-        const raw = peekContent[key] || "";
-        // RAL-232: copy whatever is currently visible, same as this box's own text.
-        const text = peekShowsDebug(key) ? raw : stripDebugLines(raw);
+        // RAL-232/RAL-288: copy whatever is currently visible, same as this box's own text.
+        const text = currentPeekDisplayText(key);
         try {
           if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
           else { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
@@ -2806,6 +2850,28 @@
         }
       }
       /**
+       * Hands a detached cell back to unattended execution (RAL-288 Stage
+       * 6), continuing the exact same agent conversation.
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @returns {Promise<void>}
+       */
+      async function resumeAutomation(squadId, ti, si) {
+        try {
+          const resp = await fetch(`/api/squads/${squadId}/cells/${ti}/${si}/resume-automation`, {method:'POST', headers: traceHeaders()});
+          if (resp.ok) {
+            showInfoToast('Resuming automation on this cell.');
+            tick();
+          } else {
+            const e = await resp.json().catch(() => ({}));
+            alert(`Failed to resume automation: ${((e.error || {}).message) || 'unknown error'}`);
+          }
+        } catch (_) {
+          alert('Failed to resume automation: network error');
+        }
+      }
+      /**
        * Resumes the real CLI agent on a proof step's own conversation,
        * in a new terminal window — see `openAgentTerminal`'s doc comment.
        * @param {string} squadId
@@ -2881,6 +2947,84 @@
         }
         const attrs = Object.entries(clickData).map(([k, v]) => ` data-${k.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase())}="${esc(String(v))}"`).join("");
         return `<div data-click="${esc(clickAction)}" data-key="${esc(key)}"${attrs} style="padding:6px 12px;cursor:pointer;font-size:12px;white-space:nowrap" data-tip="${tip}" onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${label}</div>`;
+      }
+
+      /**
+       * Renders the "Open Agent" terminal-menu item with an accurate
+       * enabled/disabled reason, rather than a single blanket "Not available
+       * yet" tooltip (RAL-288 Stage 6). While running, this is enabled only
+       * where `detachSupported` is passed as `true` -- currently just the
+       * plain task-cell call site, whose `open-terminal?mode=agent` endpoint
+       * (`server::detach_and_open_agent`) cleanly detaches the running cell
+       * first (never a false "Done"), waits for it to genuinely stop, then
+       * opens the real interactive CLI -- the actual harness, not an
+       * imitation -- inside a tmux session that survives closing this
+       * window. Backend-agnostic: claude, codex, and pi all resume the same
+       * way. The guardian branch-resolver and manual-checks-generation call
+       * sites do NOT pass this flag -- their `mode=agent` endpoints still
+       * unconditionally call the old finished-only resume flow, which would
+       * start a second agent process racing the live one on the same
+       * conversation/worktree; leave them on the old "wait until it
+       * finishes" behavior until they get the same detach-aware treatment.
+       * @param {string} key
+       * @param {string} clickAction
+       * @param {{[k: string]: string|number}} clickData
+       * @param {boolean} isRunning
+       * @param {string} [agentSessionId]
+       * @param {string} [agent]
+       * @param {string} [machine] - RAL-185/RAL-288: `undefined` means the
+       *   daemon's own host. A remote machine has no detach channel yet,
+       *   so this earns its own distinct disabled reason while running,
+       *   rather than folding into the generic "still running" one.
+       * @param {boolean} [detachSupported] - Whether this call site's
+       *   backend endpoint actually supports detaching a still-running
+       *   cell (see above). Defaults to `false`.
+       * @returns {string}
+       */
+      function openAgentMenuItem(key, clickAction, clickData, isRunning, agentSessionId, agent, machine, detachSupported) {
+        if (isRunning && machine) {
+          return terminalMenuItem(key, "Open Agent", "", {},
+            `Not available — this is running on the remote machine ${JSON.stringify(machine)}, which has no detach channel yet (RAL-288). Live attach only works for cells on the daemon's own host so far.`,
+            true);
+        }
+        if (isRunning && detachSupported && agentSessionId) {
+          return terminalMenuItem(key, "Open Agent", clickAction, clickData,
+            "Detach this cell and open the real interactive agent, in a new terminal — the actual CLI, not a relay. Stays open even if you close this window.\nWho/when: you want to steer or check in on a cell while it's still working.\nAutomation pauses while you're in there. Use \"Resume Automation\" when you're done to hand it back.");
+        }
+        if (isRunning) {
+          return terminalMenuItem(key, "Open Agent", "", {},
+            "Not available yet — no agent session id has been recorded for this cell yet; it may have only just started.",
+            true);
+        }
+        if (!agentSessionId) {
+          const tip = agent === undefined
+            ? "Not available yet — no resumable agent session has been recorded."
+            : `Not available — ${JSON.stringify(agent)} has no resumable agent session to attach to.`;
+          return terminalMenuItem(key, "Open Agent", "", {}, tip, true);
+        }
+        return terminalMenuItem(key, "Open Agent", clickAction, clickData,
+          "Resume the real CLI agent, attached to this exact conversation, in a new terminal.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nOnly offered once it has finished running — see this tooltip if it's still disabled.");
+      }
+
+      /**
+       * Renders the "Resume Automation" terminal-menu item (RAL-288 Stage
+       * 6) -- only ever shown for a plain task cell that's still marked
+       * running but has a recorded agent session (i.e. was detached at some
+       * point). Hands the cell back to unattended execution, continuing the
+       * exact same conversation rather than starting fresh. Safe to offer
+       * even if the cell is actually still live (not detached): the daemon
+       * rejects with a clear error in that case rather than racing it.
+       * @param {string} key
+       * @param {string} clickAction
+       * @param {{[k: string]: string|number}} clickData
+       * @param {boolean} isRunning
+       * @param {string} [agentSessionId]
+       * @returns {string}
+       */
+      function resumeAutomationMenuItem(key, clickAction, clickData, isRunning, agentSessionId) {
+        if (!isRunning || !agentSessionId) return "";
+        return terminalMenuItem(key, "Resume Automation", clickAction, clickData,
+          "Hand this cell back to unattended execution, continuing the exact same conversation you were just in.\nWho/when: you're done steering it in the real agent terminal and want automation to pick back up.\nIf the cell is actually still live (not detached), this is safely rejected instead of racing it.");
       }
 
       // ---- Live tmux pane peek (RAL-102) ----
@@ -3009,59 +3153,79 @@
       }
       // RALPHUS-PEEK-STATE-MACHINE:END
 
-      // ---- RAL-232: Live View debug-line stripping ----
-      // Ralphus interleaves its own diagnostic/telemetry lines into the same
-      // tmux pane the agent's own output streams through (see
-      // .agent/logging-policy.md's `ralphus [TYPE] message` convention and
-      // the `RALPHUS_EVENT:`/`RALPHUS_TMUX_DONE` markers). This region is
-      // deliberately free of DOM/fetch/module-level state, mirroring the peek
-      // state machine above, so test/board-debug-strip.mjs can slice it
-      // straight out of this shipped source and exercise it under `node --test`.
-      // RALPHUS-DEBUG-STRIP:BEGIN
+      // ---- RAL-288 Stage 5: Live View debug/agent split ----
+      // The daemon now always strips ralphus's own `RALPHUS_EVENT:`/
+      // `RALPHUS_TMUX_DONE` marker lines before ever serving Live View pane
+      // text (`daemon/src/server.rs::strip_ralphus_pane_markers`), and the
+      // runner's own `ralphus [...]`-prefixed diagnostic prints were
+      // relocated to Cartographer-only (`runner/src/{execute,agent_backend,
+      // main}.rs`) rather than also landing in the pane. So `peekContent`
+      // is pure agent output unconditionally now -- there is nothing left to
+      // strip client-side, replacing the old subtractive design (this
+      // region used to hold `isRalphusDebugLine`/`stripDebugLines`, deleted
+      // along with the `test/debug-strip.test.mjs` coverage that existed only
+      // for them).
+      //
+      // "Show Debug Messages" is additive instead: when checked, it fetches
+      // that cell's own Cartographer rows and appends them as a distinct,
+      // clearly-labeled block after the (unmodified) pane text. This is a
+      // deliberate approximation, not true line-by-line interleaving --
+      // tmux pane captures carry no reliable per-line timestamps to splice
+      // against (`daemon/src/timeline.rs`'s module doc comment already
+      // documents the same limitation for the whole-squad timeline this
+      // reuses).
+      /** @type {{[key: string]: DebugEventEntry[]}} cached debug-event rows per peek key, fetched only while that pane's checkbox is checked. */
+      let peekDebugEvents = {};
       /**
-       * Whether `line` is one of ralphus's own diagnostic/telemetry lines
-       * (RAL-232) rather than agent-produced output (a prompt, a tool
-       * call/result, or the agent's own text) -- the log-line prefix
-       * documented in `.agent/logging-policy.md` (`ralphus [TYPE] ...`), the
-       * `RALPHUS_EVENT:` Cartographer marker (`runner/src/cartographer.rs`),
-       * and the `RALPHUS_TMUX_DONE` tmux-completion sentinel
-       * (`daemon/src/runner.rs`). The prefix must start the (trimmed) line,
-       * not merely appear in it -- otherwise an agent reading/grepping this
-       * exact source (which contains these strings verbatim) would have its
-       * own tool output misclassified as a ralphus line, the same
-       * false-positive `daemon/src/runner.rs::pane_shows_done_sentinel`
-       * already guards against for the done-sentinel specifically.
-       * @param {string} line
-       * @returns {boolean}
+       * The `/debug-events` endpoint for peek key `key`, or `null` when this
+       * kind has no such endpoint yet (proof steps and guardian resolvers/
+       * manual-checks generation -- only plain task cells are wired so far).
+       * @param {string} key
+       * @returns {string|null}
        */
-      function isRalphusDebugLine(line) {
-        const trimmed = line.trimStart();
-        return (
-          trimmed.startsWith("RALPHUS_EVENT: ") ||
-          trimmed.startsWith("RALPHUS_TMUX_DONE") ||
-          trimmed.startsWith("ralphus [")
-        );
+      function debugEventsUrlFor(key) {
+        const [kind, ...rest] = key.split("|");
+        if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/debug-events`; }
+        return null;
       }
       /**
-       * Strips ralphus's own diagnostic/telemetry lines (RAL-232) out of raw
-       * Live View pane text, leaving only agent-produced output. Classifies
-       * line by line via {@link isRalphusDebugLine} rather than as a
-       * whole-text transformation, so a ralphus line emitted mid-tool-call is
-       * dropped without disturbing the agent lines immediately around it.
-       * Display-only: this never touches what the daemon persists (the
-       * Cartographer event log or the durable terminal-log attempt files) --
-       * see this function's callers, all of which apply it only to text
-       * already rendered in a Live View pane.
-       * @param {string} text
+       * One cached debug-event row rendered as a single human-readable line.
+       * @param {DebugEventEntry} e
        * @returns {string}
        */
-      function stripDebugLines(text) {
-        return text
-          .split("\n")
-          .filter((line) => !isRalphusDebugLine(line))
-          .join("\n");
+      function formatDebugEvent(e) {
+        return `[${new Date(e.at_ms).toLocaleTimeString()}] ${e.source}: ${e.message}`;
       }
-      // RALPHUS-DEBUG-STRIP:END
+      /**
+       * Peek key `key`'s current display text (RAL-288 Stage 5): the clean
+       * base pane content, plus a trailing block of cached debug events when
+       * "Show Debug Messages" is checked and any are cached for this key.
+       * @param {string} key
+       * @returns {string}
+       */
+      function currentPeekDisplayText(key) {
+        const base = peekContent[key] || "";
+        if (!peekShowsDebug(key)) return base;
+        const events = peekDebugEvents[key];
+        if (!events || !events.length) return base;
+        return `${base}\n\n---- ralphus debug events ----\n${events.map(formatDebugEvent).join("\n")}`;
+      }
+      /**
+       * Fetches and caches peek key `key`'s debug events, if its checkbox is
+       * currently checked and this kind has an endpoint for it. Best-effort:
+       * a failed fetch just leaves whatever was cached before untouched.
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function maybeRefreshDebugEvents(key) {
+        if (!peekShowsDebug(key)) return;
+        const url = debugEventsUrlFor(key);
+        if (!url) return;
+        try {
+          const resp = await fetch(url);
+          if (resp.ok) peekDebugEvents[key] = await resp.json();
+        } catch (_) { /* best-effort; keep the prior cache */ }
+      }
 
       // ---- RAL-247: credential env-var redaction (defense-in-depth) ----
       /**
@@ -3140,19 +3304,23 @@
         return key in peekShowDebug ? peekShowDebug[key] : showDebugMessagesDefault;
       }
       /**
-       * Toggles Live View pane `key`'s "Show Debug Messages" checkbox and
-       * repaints its already-cached content in place (RAL-232) -- no refetch
-       * needed, since `peekContent` always holds the raw, unfiltered pane
-       * text and only rendering ever applies `stripDebugLines`.
+       * Toggles Live View pane `key`'s "Show Debug Messages" checkbox
+       * (RAL-232). Repaints immediately with whatever's cached (instant, no
+       * flash of "Loading…"), then — when just turned on — fetches that
+       * cell's debug events (RAL-288 Stage 5) and repaints again once they
+       * land, since the additive block can't be shown before it's fetched.
        * @param {string} key
        * @param {boolean} checked
        * @returns {void}
        */
       function toggleShowDebugMessages(key, checked) {
         peekShowDebug[key] = checked;
-        const cached = peekContent[key];
-        if (cached === undefined) return;
-        setPeekPreText(`peek-pre-${peekCssKey(key)}`, checked ? cached : stripDebugLines(cached));
+        const preId = `peek-pre-${peekCssKey(key)}`;
+        if (peekContent[key] === undefined) return;
+        setPeekPreText(preId, currentPeekDisplayText(key));
+        if (checked) {
+          maybeRefreshDebugEvents(key).then(() => setPeekPreText(preId, currentPeekDisplayText(key)));
+        }
       }
       /**
        * Fetches the operator-configured default for the "Show Debug
@@ -3253,9 +3421,13 @@
        *   a task cell's run, a review branch's conflict-resolver/final-proof
        *   cell, or a review's manual-checks generation pass. Shown in the
        *   header when given.
+       * @param {number|null} [detachedAtMs] - RAL-288: set only for a task
+       *   cell that is cleanly detached (see `detachedBadge`) rather than
+       *   genuinely done/failed/cancelled — swaps the "cell ended" wording
+       *   below for one that doesn't misread as stuck/stalled.
        * @returns {string}
        */
-      function peekBox(key, startedAtMs) {
+      function peekBox(key, startedAtMs, detachedAtMs) {
         if (!peekOpen[key]) return "";
         // Reuse the last-fetched content (if any) instead of always starting from
         // "Loading…" — the details pane fully re-renders on every pushed event
@@ -3270,10 +3442,17 @@
         // docs/colors.md's "read-only field indicator" convention: --muted,
         // never the caution-reserved --ignored or --danger/--failed.
         const ended = !!peekEnded[key];
-        const headLabel = ended ? "Historical record (read-only) — cell ended" : "Live terminal (read-only)";
-        const headTip = ended
-          ? "This tmux cell has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within a poll tick or two on its own. You never need to navigate away and back."
-          : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux cell ends.";
+        const detached = ended && !!detachedAtMs;
+        const headLabel = detached
+          ? "Historical record (read-only) — cell detached"
+          : ended
+            ? "Historical record (read-only) — cell ended"
+            : "Live terminal (read-only)";
+        const headTip = detached
+          ? "This tmux cell was cleanly stopped so a real interactive agent session could take over — not a hang. What's shown is the daemon's persisted record of the stopped process's last captured output, not live output; the live conversation now continues in a separate terminal outside this board.\nRead-only — there was never anything to send to here.\nUse 'Open Agent' to reattach a terminal to that live session, or 'Resume Automation' once done with it — this box switches back to auto-refreshing live output within a poll tick or two once headless execution resumes."
+          : ended
+            ? "This tmux cell has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within a poll tick or two on its own. You never need to navigate away and back."
+            : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux cell ends.";
         // RAL-170: last-activity label, seeded from cached state (if any) so
         // it doesn't blank out on every full re-render -- fetchPeek patches
         // it in place afterward via updatePeekActivityLabel.
@@ -3287,14 +3466,13 @@
         const startedHtml = startedAtMs
           ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently started running.\nUpdates to a new time if it is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
           : "";
-        // RAL-232: ralphus's own diagnostic/telemetry lines are hidden from
-        // this rendering by default -- peekContent always caches the raw,
-        // unfiltered pane text (fetchPeek/nextPeekPaneState never call
-        // stripDebugLines), so toggling the checkbox can repaint in place
-        // with no refetch. Never affects what the daemon persists.
+        // RAL-288 Stage 5: the pane itself is always pure agent output now
+        // (the daemon strips ralphus's own marker lines before ever serving
+        // it) -- "Show Debug Messages" additively appends that cell's own
+        // Cartographer rows instead of revealing anything already inline.
         const showDebug = peekShowsDebug(key);
-        const shown = cached ? (showDebug ? cached : stripDebugLines(cached)) : undefined;
-        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry lines (session lifecycle, token/cost, RALPHUS_EVENT markers) interleaved with the agent's actual output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep both."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        const shown = cached !== undefined ? currentPeekDisplayText(key) : undefined;
+        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Append ralphus's own diagnostic/telemetry events (session lifecycle, token/cost, RALPHUS_EVENT markers) after the agent's actual output, fetched from Cartographer.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep both.\nOnly available for plain task cells today (not proof steps or review resolvers)."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
         return `<div class="peek-box" data-tip="${headTip}">
             <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             <div class="peek-pre-wrap">
@@ -3386,11 +3564,14 @@
             if (sel.kind) renderDetails();
             if (selectedGuardian) renderReviewDetail();
           }
+          // RAL-288 Stage 5: refreshed on the same poll cycle as the pane
+          // itself, so an open "Show Debug Messages" block keeps catching up
+          // with new events for as long as the box stays open -- re-resolve
+          // `pre` after, per this function's own RAL-186 rule above.
+          await maybeRefreshDebugEvents(key);
           const pre = document.getElementById(preId);
           if (!pre) return;
-          // RAL-232: peekContent always holds the raw text (above); only this
-          // rendered patch applies the "Show Debug Messages" filter.
-          pre.textContent = peekShowsDebug(key) ? next.state.text : stripDebugLines(next.state.text);
+          pre.textContent = currentPeekDisplayText(key);
           // A just-revived (or just-ended) box gets pinned to the bottom
           // regardless of where it was scrolled: its content is a different
           // log now, so the old offset means nothing.
@@ -4485,7 +4666,7 @@
           const cells = t.cells.map((s, si) => `
             <div class="cell selectable ${selCls("cell", ti, si)}" id="n-${ti}-${si}" data-click="onGraphNodeClick" data-ctx="openCellNodeMenu" data-squad-id="${esc(squad.id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1"
                  data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details; Shift/Ctrl-click to multi-select; right-click for actions.">
-              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${s.error ? failLogBtn(s.error) : ""}</div>
+              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${detachedGraphBadge(s.detached_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
               <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
               ${cellProof(s, ti, si, selCls, squad.id)}
             </div>`).join("");
@@ -5309,11 +5490,9 @@
           const key = `proof|${r.id}|${ti}|${scope}|${si}|${vi}`;
           const previewBtn = `<button class="btn primary" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px" data-tip="Peek at this proof step's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the proof step isn't running.">${peekOpen[key] ? "Hide Live View" : "Show Live View"}</button>`;
           const openAgentItem = v.kind === "prompt"
-            ? (v.agent_session_id
-                ? terminalMenuItem(key, "Open Agent",
-                    "openAgentProofTerminalMenuItem", { squadId: r.id, ti, scope, si, vi },
-                    "Resume the real CLI agent, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the step is still running or already finished.")
-                : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this proof step.", true))
+            ? openAgentMenuItem(key, "openAgentProofTerminalMenuItem",
+                { squadId: r.id, ti, scope, si, vi },
+                v.state === "running", v.agent_session_id, v.agent)
             : "";
           const items = terminalMenuItem(key, "Open Terminal Log",
               "openProofTerminalMenuItem", { squadId: r.id, ti, scope, si, vi },
@@ -5408,7 +5587,7 @@
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${outOfDateBadge(s.env_out_of_date)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${outOfDateBadge(s.env_out_of_date)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
@@ -5441,19 +5620,23 @@
             const previewBtn = `<button class="btn primary" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px" data-tip="Peek at this cell's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the cell isn't running.">${peekOpen[key] ? "Hide Live View" : "Show Live View"}</button>`;
             const openAgentItem = s.command
               ? ""
-              : (s.agent_session_id
-                  ? terminalMenuItem(key, "Open Agent",
-                      "openAgentTerminalMenuItem", { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                      "Resume the real CLI agent, attached to this exact conversation.\nWho/when: you want to keep working with the agent interactively, picking up right where it left off.\nWorks whether the cell is still running or already finished.")
-                  : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this cell.", true));
+              : openAgentMenuItem(key, "openAgentTerminalMenuItem",
+                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
+                  s.state === "running", s.agent_session_id, s.agent, s.machine, true);
+            const resumeAutomationItem = s.command
+              ? ""
+              : resumeAutomationMenuItem(key, "resumeAutomationMenuItem",
+                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
+                  s.state === "running", s.agent_session_id);
             const items = terminalMenuItem(key, "Open Terminal Log",
                 "openTerminalMenuItem", { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
                 "Attach an interactive terminal to this cell's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the cell is actively running — fails gracefully otherwise.")
               + openAgentItem
+              + resumeAutomationItem
               + terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
-            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms)}${historyBox(key)}`;
+            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms, s.detached_at_ms)}${historyBox(key)}`;
           })()}`;
       }
       // CCTL-115: render each command line elided in a fixed-height box; a
@@ -6760,15 +6943,13 @@
         const openLabel = isLive ? "Open Live Terminal Log" : "Open Terminal Log";
         const previewTip = "Peek at the conflict resolver's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the resolver isn't running.";
         const openTip = "Attach an interactive terminal to the conflict resolver's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the resolver is actively running — fails gracefully otherwise.";
-        const agentTip = "Resume the real CLI agent, attached to this exact conflict-resolution conversation.\nWho/when: you want to keep working with the resolver interactively, picking up right where it left off.\nWorks whether the resolver is still running or already finished.";
         const wtTip = isLive
           ? "Open a shell in the review worktree while the resolver is working.\nRun 'git diff' or 'git status' to watch files change in real time."
           : "Open a shell in the review worktree to manually inspect or fix merge conflicts.";
         const previewBtn = `<button class="btn primary" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px" data-tip="${previewTip}">${previewLabel}</button>`;
         const items = terminalMenuItem(key, openLabel, "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "open" }, openTip)
-          + (b.resolver_agent_session_id
-            ? terminalMenuItem(key, "Open Agent", "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "agent" }, agentTip)
-            : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this resolver.", true))
+          + openAgentMenuItem(key, "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "agent" },
+              isLive, b.resolver_agent_session_id, resolverOf(g))
           + terminalMenuItem(key, "Open Worktree Shell", "openGuardianBranchTerminalMenuItem", { gid: g.id, bid: b.id, mode: "worktree" }, wtTip)
           + terminalMenuItem(key, "View Attempt History",
               "toggleHistoryMenuItem", {},
@@ -6814,12 +6995,10 @@
         const openLabel = isLive ? "Open Live Terminal Log" : "Open Terminal Log";
         const previewTip = "Peek at the manual-checks generation's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once generation isn't running.";
         const openTip = "Attach an interactive terminal to the manual-checks generation's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while generation is actively running — fails gracefully otherwise.";
-        const agentTip = "Resume the real CLI agent, attached to this exact manual-checks generation conversation.\nWho/when: you want to inspect or continue the reasoning behind the suggested commands.\nWorks whether generation is still running or already finished.";
         const previewBtn = `<button class="btn" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px;font-size:11px;padding:1px 7px" data-tip="${previewTip}">${previewLabel}</button>`;
         const items = terminalMenuItem(key, openLabel, "openGuardianManualChecksTerminalMenuItem", { gid: g.id, mode: "open" }, openTip)
-          + (g.manual_commands_agent_session_id
-            ? terminalMenuItem(key, "Open Agent", "openGuardianManualChecksTerminalMenuItem", { gid: g.id, mode: "agent" }, agentTip)
-            : terminalMenuItem(key, "Open Agent", "", {}, "Not available yet — no resumable agent cell has started for this generation pass.", true))
+          + openAgentMenuItem(key, "openGuardianManualChecksTerminalMenuItem", { gid: g.id, mode: "agent" },
+              isLive, g.manual_commands_agent_session_id, g.manual_commands_agent || resolverOf(g))
           + terminalMenuItem(key, "View Attempt History",
               "toggleHistoryMenuItem", {},
               "List every durably-persisted terminal-log attempt for this generation pass, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
@@ -7380,6 +7559,77 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return `<h3 class="section" data-tip="Pull/merge requests submitted for this review on GitHub/GitLab (RAL-117/RAL-190).">pull requests</h3>
             <button class="btn primary" style="padding:3px 10px;font-size:11px" data-click="submitPrStack" data-guardian-id="${esc(g.id)}" data-tip="Push every enabled branch in this review as its own PR, each based on the branch below it -- never one squashed PR containing everything.\nOn GitHub, also registers/grows a native PR stack so GitHub's own UI shows them as a linked stack.\nWho/when: once the stack looks good, open real PRs for the whole thing without leaving the board.\nSafe to press again after adding a new branch on top -- only the new branch gets its own PR.\nRuns in the background -- each branch's PR card above updates once its forge call completes.">submit PR stack</button>`;
       }
+      // RALPHUS-MERGE-BUTTON:BEGIN
+      // How the "Merge / rebase" button reads, and what the click acknowledges.
+      //
+      // Deliberately pure -- no DOM, no fetch, no module-level state -- so
+      // test/board-merge-button.mjs can slice this region straight out of the
+      // shipped page and exercise it under `node --test`. Keep it that way:
+      // anything reaching for `document` belongs in renderReviewDetail.
+
+      /** @type {Record<string, string>} Why the button is unavailable, keyed by the review's status. */
+      const MERGE_DISABLED_REASON = {
+        merging: "A rebase is already in progress — wait for it to finish, or press Stop to halt it mid-rebase.\nTo restart from scratch, stop then merge, or cancel the running merge first.",
+        approved: "This review has already been approved — merge/rebase locks once a review is approved.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+        cancelled: "This review was cancelled — merge/rebase is not available for a cancelled review.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+        deployed: "This review has already been deployed — merge/rebase is not available once deployed.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+      };
+
+      /** Review statuses a rebase may be started or resumed from. */
+      const MERGE_STARTABLE = ["collecting", "merge_failed", "merge_stopped", "in_review"];
+
+      /**
+       * How the "Merge / rebase" button should read for a review.
+       *
+       * `pending` is true from the moment the button is clicked until the
+       * daemon has answered and the board has reloaded. Starting a rebase is
+       * only a DB state transition plus a thread spawn, but the reload behind
+       * it is a further network round-trip or two; with no pending state the
+       * button sits looking untouched for that whole window, which is what
+       * trains people to click it twice.
+       * @param {string} status the review's current status
+       * @param {boolean} pending whether a kickoff for it is already in flight
+       * @returns {{label: string, enabled: boolean, tip: string}}
+       */
+      function mergeButtonView(status, pending) {
+        const resuming = status === "merge_stopped";
+        if (pending) {
+          return {
+            label: resuming ? "Resuming…" : "Starting…",
+            enabled: false,
+            tip: "The request has been sent — waiting for the daemon to confirm the rebase started.\nThe rebase itself runs in the background and takes far longer than this; watch the review's status for its progress.\nDisabled so the same rebase cannot be submitted twice.",
+          };
+        }
+        if (!MERGE_STARTABLE.includes(status)) {
+          return {
+            label: "Merge / rebase",
+            enabled: false,
+            tip: MERGE_DISABLED_REASON[status] || `Not available — this review's status is currently "${status}".\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.`,
+          };
+        }
+        return {
+          label: resuming ? "Resume rebase" : "Merge / rebase",
+          enabled: true,
+          tip: resuming
+            ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept."
+            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+        };
+      }
+
+      /**
+       * The acknowledgement shown the instant the button is clicked. It
+       * confirms the *request* only — the rebase runs in the background and
+       * finishes long after this toast is gone.
+       * @param {string} status the review's status at the moment of the click
+       * @returns {string}
+       */
+      function mergeRequestedToast(status) {
+        if (status === "merging") return "Restart requested — stopping the running rebase, then starting a fresh one in the background.";
+        if (status === "merge_stopped") return "Resume requested — the rebase is picking up where it stopped, in the background.";
+        return "Rebase requested — the review is starting to rebase in the background.";
+      }
+      // RALPHUS-MERGE-BUTTON:END
+
       /**
        * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
        * @returns {void}
@@ -7497,8 +7747,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               : `<div class="row"><span class="vchip" style="border-color:var(--unverified);color:var(--unverified)" data-tip="No check gates are configured for this review, the project has no auto_build default in .ralphus.toml, and either the resolver agent found no build step to infer or skip auto-build is on.\nWho/when: relevant to anyone relying on 'in review' meaning 'built and tested' — right now this review reached that status with zero build or test verification.\nAdd checks above, or set [review] auto_build in the project's .ralphus.toml, to close this gap.">⚠ no build verification configured</span></div>`;
         const skipToggles = `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nUseful while iterating on check gates, or to avoid an unwanted inferred build.\nManual checks are still generated — only the automatic build/check step is skipped.">
             <input type="checkbox" ${g.skip_auto_build ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSkipAutoBuild(this.dataset.guardianId,this.checked)">skip auto-build${g.skip_auto_build && gChecks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip the dedicated final-proof call (RAL-149) entirely, and omit the quality-bar instructions (run task/cell proof steps, formatters, linters) from the per-branch fix pass.\nUseful when the resolver agent's self-proofing pass is slow or unreliable for this review.\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts and the final-proof call, not the finalize-time build.">
-            <input type="checkbox" ${g.skip_worktree_checks ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSkipWorktreeChecks(this.dataset.guardianId,this.checked)">skip per-worktree checks</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees.\nFaster for large repos but gives less isolation between branches.">
             <input type="checkbox" ${g.skip_worktrees ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSkipWorktrees(this.dataset.guardianId,this.checked)">skip per-branch worktrees (build the stack in one shared worktree)</label>`;
         // RAL-91: per-(git-project) squash toggle. Scope is each git project in the
@@ -7593,21 +7841,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               // global `.btn[disabled]` rule, so the tooltip engine's
               // mouseover listener never sees it — data-tip must live on a
               // wrapping <span> instead whenever the button may be disabled.
-              const canMerge = ["collecting", "merge_failed", "merge_stopped", "in_review"].includes(g.status);
-              /** @type {Record<string, string>} */
-              const mergeDisabledReason = {
-                merging: "A rebase is already in progress — wait for it to finish, or press Stop to halt it mid-rebase.\nTo restart from scratch, stop then merge, or cancel the running merge first.",
-                approved: "This review has already been approved — merge/rebase locks once a review is approved.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
-                cancelled: "This review was cancelled — merge/rebase is not available for a cancelled review.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
-                deployed: "This review has already been deployed — merge/rebase is not available once deployed.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
-              };
-              const mergeTip = canMerge
-                ? (g.status === "merge_stopped"
-                    ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept."
-                    : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, or merge_failed.")
-                : (mergeDisabledReason[g.status] || `Not available — this review's status is currently "${esc(g.status)}".\nOnly available when status is collecting, in_review, or merge_failed.`);
-              const mergeBtn = `<button class="btn primary" data-click="mergeReview" data-guardian-id="${esc(g.id)}" data-status="${esc(g.status)}" ${canMerge ? "" : "disabled"}${canMerge ? ` data-tip="${mergeTip}"` : ""}>${g.status === "merge_stopped" ? "Resume rebase" : "Merge / rebase"}</button>`;
-              return canMerge ? mergeBtn : `<span data-tip="${mergeTip}">${mergeBtn}</span>`;
+              const merge = mergeButtonView(g.status, pendingMergeActions.has(g.id));
+              const mergeTip = esc(merge.tip);
+              const mergeBtn = `<button class="btn primary" data-click="mergeReview" data-guardian-id="${esc(g.id)}" data-status="${esc(g.status)}" ${merge.enabled ? "" : "disabled"} data-tip="${mergeTip}">${esc(merge.label)}</button>`;
+              // A disabled <button> swallows mouseover, so the tooltip has to
+              // live on a wrapping <span> whenever the button is unavailable.
+              return merge.enabled ? mergeBtn : `<span data-tip="${mergeTip}">${mergeBtn}</span>`;
             })()}
             ${(() => {
               // RAL-249: halt an in-progress rebase at its next checkpoint,
@@ -7911,50 +8150,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const row = (data.rows || []).find((r) => r.message === "pr stack submission completed");
           return row ? row.payload || {} : null;
         } catch (e) { return null; }
-      }
-      /**
-       * Toggles an inline "submit PR" form's visibility (RAL-190).
-       * @param {string} key - "gid:branchId" or "gid:combined"
-       * @returns {void}
-       */
-      function togglePrForm(key) {
-        if (prFormOpen.has(key)) prFormOpen.delete(key); else prFormOpen.add(key);
-        renderReviewDetail();
-      }
-      /**
-       * Reads a "submit PR" form's three fields for `formKey` into a request
-       * body fragment (RAL-190) -- blank fields are omitted so the daemon
-       * applies its own defaults/auto-generation.
-       * @param {string} formKey
-       * @returns {{branch_alias?: string, title?: string, description?: string}}
-       */
-      function readPrForm(formKey) {
-        const alias = /** @type {HTMLInputElement|null} */ (document.getElementById(`pr-alias-${formKey}`));
-        const title = /** @type {HTMLInputElement|null} */ (document.getElementById(`pr-title-${formKey}`));
-        const desc = /** @type {HTMLTextAreaElement|null} */ (document.getElementById(`pr-desc-${formKey}`));
-        /** @type {{branch_alias?: string, title?: string, description?: string}} */
-        const out = {};
-        const aliasVal = (alias && alias.value || "").trim();
-        const titleVal = (title && title.value || "").trim();
-        const descVal = (desc && desc.value || "").trim();
-        if (aliasVal) out.branch_alias = aliasVal;
-        if (titleVal) out.title = titleVal;
-        if (descVal) out.description = descVal;
-        return out;
-      }
-      /**
-       * Submits a PR for one stacked branch, reading the inline form's fields (RAL-190).
-       * @param {string} gid
-       * @param {string} branchId
-       * @returns {Promise<void>}
-       */
-      async function submitBranchPr(gid, branchId) {
-        const req = { branch_id: branchId, ...readPrForm(`${gid}:${branchId}`) };
-        prFormOpen.delete(`${gid}:${branchId}`);
-        const sinceMs = Date.now();
-        await guardianAction(`/api/guardians/${gid}/pull-requests`, { prs: [req] });
-        await waitForPrOutcome(gid, sinceMs);
-        renderReviewDetail();
       }
       /**
        * Fetches recent Cartographer `source=pr`/`level=error` rows for a
@@ -8431,7 +8626,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 <label data-tip="Absolute path to the git repository root on this machine. The daemon checks out worktrees here.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
                 <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nGates are still stored — you can re-enable this later."><input type="checkbox" id="cr-skip-auto-build" style="width:auto;margin:0">skip auto-build</label>
-                <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Skip the dedicated final-proof call (RAL-149) entirely, and omit the quality-bar instructions (run task/cell proof steps, formatters, linters) from the per-branch fix pass.\nIndependent of 'skip auto-build' — this only affects per-branch resolver prompts and the final-proof call, not the finalize-time build."><input type="checkbox" id="cr-skip-worktree-checks" style="width:auto;margin:0">skip per-worktree checks</label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Use one shared worktree for the entire stack instead of per-branch worktrees. Faster for large repos."><input type="checkbox" id="cr-skip-worktrees" style="width:auto;margin:0">skip per-branch worktrees (large repos)</label>
               </div>
               <div id="cr-other-fields" class="hidden"><div class="empty" style="margin:12px 0">No extra fields for this review type yet.</div></div>
@@ -8468,9 +8662,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         }
         const checks = v("cr-checks") ? v("cr-checks").split(",").map((s) => s.trim()).filter(Boolean) : [];
         const skip_auto_build = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-auto-build")).checked;
-        const skip_worktree_checks = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-worktree-checks")).checked;
         const skip_worktrees = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-worktrees")).checked;
-        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), git_root: v("cr-root"), checks, skip_auto_build, skip_worktree_checks, skip_worktrees };
+        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), git_root: v("cr-root"), checks, skip_auto_build, skip_worktrees };
         if (!body.git_root) { byId("cr-err").textContent = "git root is required"; return; }
         const resp = await fetch("/api/guardians", { method: "POST", body: JSON.stringify(body) });
         if (!resp.ok) { byId("cr-err").textContent = "create failed"; return; }
@@ -8484,16 +8677,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function setSkipAutoBuild(id, skip) {
         await guardianAction(`/api/guardians/${id}/settings`, { skip_auto_build: skip });
-        tick();
-      }
-      /**
-       * Toggles a review's skip-per-worktree-checks setting.
-       * @param {string} id
-       * @param {boolean} skip
-       * @returns {Promise<void>}
-       */
-      async function setSkipWorktreeChecks(id, skip) {
-        await guardianAction(`/api/guardians/${id}/settings`, { skip_worktree_checks: skip });
         tick();
       }
       /**
@@ -8660,19 +8843,43 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       /**
-       * Starts or restarts a review's stacked-rebase merge.
+       * Starts, resumes, or restarts a review's stacked-rebase merge.
+       *
+       * Feedback first, reload second. The daemon answers this in
+       * milliseconds (a DB state transition plus a thread spawn -- see
+       * `guardian_merge::kickoff_merge`), but the `tick()` behind it reloads
+       * the whole board, and the rebase it starts then runs for minutes. So
+       * the button goes pending and the acknowledgement toast goes up before
+       * the request is even sent: neither waits on the round-trip, and
+       * nothing here claims the rebase has finished. The pending state is
+       * held through the reload too, so the button can't be pressed again in
+       * the gap between the daemon's write landing and the board picking up
+       * the new status.
        * @param {string} id
        * @param {string} status
        * @returns {Promise<void>}
        */
       async function mergeReview(id, status) {
-        if (status === "merging") {
-          if (!confirm("There is a rebase currently in progress. Do you want to cancel it and start another?")) return;
-          await guardianAction(`/api/guardians/${id}/cancel_and_merge`);
-        } else {
-          await guardianAction(`/api/guardians/${id}/merge`);
+        // The rendered button is disabled while pending, but this is what
+        // makes double submission impossible rather than merely unlikely --
+        // a re-render can be skipped (see `userIsSelecting`), and the click
+        // handler is reachable regardless of what the pane currently shows.
+        if (pendingMergeActions.has(id)) return;
+        if (status === "merging" && !confirm("There is a rebase currently in progress. Do you want to cancel it and start another?")) return;
+        pendingMergeActions.add(id);
+        if (!userIsSelecting()) renderReviewDetail();
+        showInfoToast(mergeRequestedToast(status));
+        try {
+          const path = status === "merging" ? "cancel_and_merge" : "merge";
+          // A non-2xx already surfaced the red error toast inside
+          // `guardianAction`; the reload and the pending-state clear below
+          // still run, so the button comes back rather than staying stuck.
+          await guardianAction(`/api/guardians/${id}/${path}`);
+          await tick();
+        } finally {
+          pendingMergeActions.delete(id);
+          if (!userIsSelecting()) renderReviewDetail();
         }
-        tick();
       }
       /**
        * Stops an in-progress rebase at its next checkpoint, leaving the review

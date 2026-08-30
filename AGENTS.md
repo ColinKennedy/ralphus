@@ -36,6 +36,25 @@ of what renamed. The Guardian/Review naming split (code says Guardian, users
 see Review) is a separate, unrelated naming decision and is untouched by this
 rename.
 
+## Agent conduct
+
+Hard rules for any agent working in this repo — full reasoning and the
+alternatives to reach for are in
+[`.agent/agent-conduct.md`](.agent/agent-conduct.md):
+
+- **Never start/stop/restart the daemon or librarian** (`scripts/build-debug.sh`,
+  `ralphus-daemon serve`, ...) unless the user asks in that turn. A dev stack
+  is usually already running, and a flaky health probe is not proof it is down.
+- **Never run `git stash` in this repo** — the stash stack is shared across
+  every worktree hanging off the same `.git`, and concurrent tasks collide on
+  it. Use `git diff --stat`, `git show <ref>:path`, or a throwaway
+  `git worktree add` instead.
+- **Comments and docstrings describe the current code only** — no "used to",
+  "originally", removed-`TODO` narration, or port history.
+- **Commit messages omit the `Claude-Session:` trailer**; keep `Co-Authored-By:`.
+- **Say what you could not verify.** A partial test run is never reported as
+  full coverage.
+
 ## Architecture
 
 Eleven Rust workspace members; `cli/` is a Python project kept only for `docsgen/` (doc screenshot generation, dev-only, never shipped) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML graphs) — see `cli/AGENTS.md`. The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
@@ -88,6 +107,9 @@ Every commit must pass all checks. **Rust is strict**: `[workspace.lints]` sets 
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets            # run one: cargo test -p ralphus-daemon scheduler::
+# ...but while the dev daemon/librarian are running, their exes are locked and
+# --all-targets can't relink them: use `cargo test -p ralphus-daemon --lib`
+# for those two packages. See .agent/gotchas.md.
 
 # Python (from cli/, uv-managed) — see cli/AGENTS.md for the test-file table
 uv sync --dev && uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
@@ -197,6 +219,7 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 
 `.agent/` files for content that doesn't belong to one component:
 
+- [`.agent/agent-conduct.md`](.agent/agent-conduct.md) — hard rules for agents working here (daemon, stash, comments, commits)
 - [`.agent/logging-policy.md`](.agent/logging-policy.md) — stderr+Cartographer logging rules, log-type table
 - [`.agent/otel-tracing.md`](.agent/otel-tracing.md) — opt-in end-to-end OpenTelemetry tracing design
 - [`.agent/gotchas.md`](.agent/gotchas.md) — cross-component pitfalls learned the hard way

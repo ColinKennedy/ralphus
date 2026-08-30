@@ -20,9 +20,11 @@ mkdir -p "$dist"
 
 # Remove stale PyInstaller/onefile artifacts from a previous build so a
 # leftover dist/ralphus/ (dir) or dist/ralphus[.exe] (old onefile) never
-# gets shipped alongside the new plain exe.
+# gets shipped alongside the new plain exe. `ralphus-attach` is cleaned up
+# here too (RAL-288's relay design, superseded and removed) even though
+# nothing below builds it anymore, so a stale one never lingers.
 rm -rf "$dist/ralphus" "$dist/ralphus-runner"
-for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian; do
+for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-attach; do
   for ext in "" ".exe"; do
     [ -f "$dist/${stale}${ext}" ] && rm -f "$dist/${stale}${ext}"
   done

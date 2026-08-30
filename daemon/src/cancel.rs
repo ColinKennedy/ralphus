@@ -103,6 +103,20 @@ impl Cancellations {
     }
 }
 
+/// A per-cell "please detach cleanly" signal (RAL-288 Stage 6). Structurally
+/// identical to [`Cancellations`]/[`CancelToken`] -- register a token when a
+/// cell's subprocess starts, poll it in the same loop that already polls the
+/// cancel token, trip it externally via the registry -- but a *separate*
+/// registry, keyed per-cell rather than per-squad, and checked for a
+/// different reason: a detach must stop exactly one running cell so a real
+/// interactive `claude --resume`/`codex resume`/`pi --session` can safely
+/// take over its session, without touching the rest of that cell's squad,
+/// and the runner must report a `"detached"` outcome rather than
+/// `"cancelled"` when it trips.
+pub type Detachments = Cancellations;
+/// See [`Detachments`].
+pub type DetachToken = CancelToken;
+
 #[cfg(test)]
 mod tests {
     use super::*;
