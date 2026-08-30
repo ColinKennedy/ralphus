@@ -591,7 +591,7 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) list selector [str]  {List the manual checks.}
             - (read-only-safe) run selector [str] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
             - terminal selector [str] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
-        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-auto-build --skip-worktree-checks --skip-worktrees  {Create a new review.}
+        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-auto-build --skip-worktrees  {Create a new review.}
         - delete selector [str] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
         - feedback selector [str] text [str]  {Post feedback on one branch, triggering a resolver re-attempt.}
@@ -612,7 +612,7 @@ use; see `READ_ONLY_NOTE`.
         - rename selector [str] name [str]  {Rename a review.}
         - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktree-checks/--no-skip-worktree-checks --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [str]  {Show a single review's detail.}
         - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}

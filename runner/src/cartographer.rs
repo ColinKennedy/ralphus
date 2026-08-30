@@ -13,6 +13,15 @@ use serde_json::json;
 /// Must match `daemon/src/runner.rs::EVENT_MARKER` exactly.
 const EVENT_MARKER: &str = "RALPHUS_EVENT: ";
 
+/// The message every agent backend uses for its per-turn token/cost snapshot
+/// (RAL-161). It is a heartbeat, not a notable event: the daemon folds the
+/// payload onto the cell row (`tokens_in`/`tokens_out`/`cost_usd`) and feeds
+/// it to the live cost-cap check, then deliberately drops the event instead
+/// of persisting a Cartographer row for it -- one row per assistant turn
+/// buried a squad's timeline in noise. `daemon/src/runner.rs::LIVE_USAGE_MESSAGE`
+/// keys that suppression on this exact string, so the two must stay in sync.
+pub const LIVE_USAGE_MESSAGE: &str = "live usage";
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EventContext<'a> {
     pub squad_id: Option<&'a str>,
@@ -56,5 +65,12 @@ mod tests {
     #[test]
     fn marker_matches_daemon_constant() {
         assert_eq!(EVENT_MARKER, "RALPHUS_EVENT: ");
+    }
+
+    /// The daemon drops these rows by matching this literal, so a rename here
+    /// alone would silently refill every squad timeline with per-turn usage.
+    #[test]
+    fn live_usage_message_matches_daemon_constant() {
+        assert_eq!(LIVE_USAGE_MESSAGE, "live usage");
     }
 }

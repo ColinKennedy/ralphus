@@ -40,6 +40,14 @@ pub struct CellSpec {
     pub proof: bool,
     pub trace_context: Option<String>,
     pub resume_agent_session_id: Option<String>,
+    /// A session id the daemon pre-generated and persisted before this cell
+    /// started (RAL-288 Stage 1). The claude-code backend passes it as
+    /// `--session-id` when not resuming, so "Open Agent" has something to
+    /// attach to from the very first moment of a run instead of waiting on
+    /// the backend's own init event. Other backends ignore it (mirrors
+    /// `resume_agent_session_id`'s "hand-rolled backends accept and ignore
+    /// it" precedent).
+    pub assigned_agent_session_id: Option<String>,
 }
 
 impl CellSpec {
@@ -72,6 +80,7 @@ impl CellSpec {
         let proof = opt_bool(obj, "proof")?.unwrap_or(false);
         let trace_context = opt_str(obj, "trace_context")?;
         let resume_agent_session_id = opt_str(obj, "resume_agent_session_id")?;
+        let assigned_agent_session_id = opt_str(obj, "assigned_agent_session_id")?;
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -97,6 +106,7 @@ impl CellSpec {
             proof,
             trace_context,
             resume_agent_session_id,
+            assigned_agent_session_id,
         })
     }
 }
@@ -209,9 +219,41 @@ impl CellResult {
         }
     }
 
+    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task, so a
+    /// real interactive session can take over. Neither success nor failure
+    /// -- the cell's actual goal may be nowhere near finished. Carries
+    /// whatever usage/session-id was captured live up to the detach point,
+    /// the same way [`Self::done`]'s caller fills those in, so the board's
+    /// numbers don't regress to zero.
+    #[must_use]
+    pub fn detached(
+        tokens_in: i64,
+        tokens_out: i64,
+        cost_usd: f64,
+        agent_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            status: "detached".to_string(),
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            summary: String::new(),
+            error: None,
+            proofed: None,
+            agent_session_id,
+            ghost: None,
+        }
+    }
+
     #[must_use]
     pub fn ok(&self) -> bool {
         self.status == "done"
+    }
+
+    /// RAL-288 Stage 6.
+    #[must_use]
+    pub fn is_detached(&self) -> bool {
+        self.status == "detached"
     }
 
     /// Serializes all fields unconditionally (including `None`s) -- the

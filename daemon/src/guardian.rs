@@ -452,13 +452,8 @@ pub struct GuardianView {
     /// When true, the finalize-time build/check step against the combined
     /// worktree is skipped entirely: explicit `checks`, the project's
     /// `.ralphus.toml [review] auto_build`, and the AI-inferred build command
-    /// (RAL-110) are all skipped. Independent of [`Self::skip_worktree_checks`].
+    /// (RAL-110) are all skipped. Independent of [`Self::effective_proof_scope`].
     pub skip_auto_build: bool,
-    /// When true, the quality-bar system prompt normally folded into each
-    /// per-branch conflict-resolution agent call is omitted (RAL-110) — the
-    /// resolver is not told to run task/cell proof steps while fixing
-    /// conflicts. Independent of [`Self::skip_auto_build`].
-    pub skip_worktree_checks: bool,
     /// The machine this review's worktrees, rebase and conflict resolution run
     /// on (RAL-185). `None` means the daemon's own host — every pre-RAL-185
     /// review, and any review that never declared one.
@@ -1778,32 +1773,6 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Set whether the per-branch conflict-resolution quality-bar system prompt
-    /// is omitted (RAL-110). Independent of `skip_auto_build`.
-    pub fn set_guardian_skip_worktree_checks(&self, id: &str, skip: bool) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE guardians SET skip_worktree_checks=?, updated_at_ms=? WHERE id=?",
-            params![i64::from(skip), crate::store::now_ms(), id],
-        )?;
-        if n == 0 {
-            Err(StoreError::NotFound)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Whether the per-branch conflict-resolution quality-bar prompt is opted out.
-    pub fn guardian_skip_worktree_checks(&self, id: &str) -> Result<bool> {
-        self.conn
-            .query_row(
-                "SELECT skip_worktree_checks FROM guardians WHERE id=?",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
-    }
-
     /// Set this review's own Proof-scope override (RAL-168): one of
     /// `"each_branch"`/`"final_branch"`/`"nothing"`. `None` resets it to
     /// "inherit the project-level default".
@@ -2743,7 +2712,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms
-                 FROM guardians WHERE id=?",
+                 FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
             )
@@ -2756,7 +2725,7 @@ impl Store {
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms
-             FROM guardians ORDER BY created_at_ms DESC",
+             FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
             .query_map([], Self::map_guardian_row)?
@@ -2780,7 +2749,7 @@ impl Store {
             conflicts_fixed: r.get(11)?,
             conflicts_committed: r.get(12)?,
             skip_auto_build: r.get(13)?,
-            skip_worktree_checks: r.get(14)?,
+            legacy_skip_worktree_checks: r.get(14)?,
             review_type: r.get(15)?,
             skip_worktrees: r.get(16)?,
             created_at_ms: r.get(17)?,
@@ -3036,12 +3005,21 @@ impl Store {
         // the merge engine (`guardian_merge.rs`) has a single, always-populated
         // field to gate on.
         let project_review_config = crate::config::resolve(Path::new(&row.git_root));
-        let effective_proof_scope = row
-            .proof_scope
-            .as_deref()
-            .filter(|s| matches!(*s, "each_branch" | "final_branch" | "nothing"))
-            .unwrap_or_else(|| project_review_config.verify_scope())
-            .to_string();
+        // RAL-285: `skip_worktree_checks` was retired in favor of `proof_scope`
+        // alone, but a row persisted before this change may still have the old
+        // flag set with no explicit `proof_scope` override -- read-time
+        // migration (not a bulk data migration) resolves that combination to
+        // "nothing" so existing reviews keep their prior behavior.
+        let effective_proof_scope = if row.proof_scope.is_none() && row.legacy_skip_worktree_checks
+        {
+            "nothing".to_string()
+        } else {
+            row.proof_scope
+                .as_deref()
+                .filter(|s| matches!(*s, "each_branch" | "final_branch" | "nothing"))
+                .unwrap_or_else(|| project_review_config.verify_scope())
+                .to_string()
+        };
         let effective_proof_skip_auto_clean = row
             .proof_skip_auto_clean
             .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
@@ -3090,7 +3068,6 @@ impl Store {
             conflicts_fixed: row.conflicts_fixed,
             conflicts_committed: row.conflicts_committed,
             skip_auto_build: row.skip_auto_build,
-            skip_worktree_checks: row.skip_worktree_checks,
             review_type: row.review_type,
             skip_worktrees: row.skip_worktrees,
             resolver_agent: row.resolver_agent,
@@ -3373,7 +3350,13 @@ struct GuardianRow {
     conflicts_fixed: Option<i64>,
     conflicts_committed: Option<i64>,
     skip_auto_build: bool,
-    skip_worktree_checks: bool,
+    /// RAL-110's retired `skip_worktree_checks` column (RAL-285 removed the
+    /// setting itself). No runtime path writes it -- only `Store::migrate`'s
+    /// pre-RAL-110 `skip_checks` backfill does. Kept solely so
+    /// `hydrate_guardian` can resolve a row carrying
+    /// `skip_worktree_checks=1` with no explicit `proof_scope` to
+    /// `effective_proof_scope="nothing"`, preserving its prior behavior.
+    legacy_skip_worktree_checks: bool,
     review_type: String,
     skip_worktrees: bool,
     resolver_agent: Option<String>,
@@ -4411,22 +4394,34 @@ mod tests {
     }
 
     #[test]
-    fn skip_worktree_checks_defaults_off_and_toggles_independently() {
+    fn legacy_skip_worktree_checks_column_migrates_to_nothing_scope_at_read_time() {
+        // RAL-285: `skip_worktree_checks` is retired -- no code can set this
+        // column anymore -- but a row persisted before this change may still
+        // have it set with no explicit `proof_scope`. Simulate that with a raw
+        // write (the only way to reach this state now) and confirm the
+        // read-time migration resolves `effective_proof_scope` to "nothing".
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
-        assert!(!store.get_guardian(&id).unwrap().skip_worktree_checks);
-        assert!(!store.guardian_skip_worktree_checks(&id).unwrap());
-        store.set_guardian_skip_worktree_checks(&id, true).unwrap();
-        assert!(store.get_guardian(&id).unwrap().skip_worktree_checks);
-        assert!(store.guardian_skip_worktree_checks(&id).unwrap());
-        // Independent axis: toggling skip_worktree_checks must not affect
-        // skip_auto_build (RAL-110 split the old single skip_checks flag).
-        assert!(!store.get_guardian(&id).unwrap().skip_auto_build);
-        assert!(
-            store
-                .set_guardian_skip_worktree_checks("nope", true)
-                .is_err()
-        );
+        store
+            .conn
+            .execute(
+                "UPDATE guardians SET skip_worktree_checks=1 WHERE id=?",
+                params![id],
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.proof_scope, None);
+        assert_eq!(g.effective_proof_scope, "nothing");
+        // Independent axis: the legacy flag must not affect skip_auto_build
+        // (RAL-110 split the old single skip_checks flag).
+        assert!(!g.skip_auto_build);
+
+        // An explicit `proof_scope` override takes precedence over the legacy flag.
+        store
+            .set_guardian_proof_scope(&id, Some("each_branch"))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.effective_proof_scope, "each_branch");
     }
 
     #[test]

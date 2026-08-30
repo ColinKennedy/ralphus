@@ -21,10 +21,12 @@ if not exist "%dist%" mkdir "%dist%"
 
 rem Remove stale PyInstaller/onefile artifacts from a previous build so a
 rem leftover dist\ralphus\ (dir) or dist\ralphus.exe (old onefile) never
-rem gets shipped alongside the new plain exe.
+rem gets shipped alongside the new plain exe. `ralphus-attach` is cleaned up
+rem here too (RAL-288's relay design, superseded and removed) even though
+rem nothing below builds it anymore, so a stale one never lingers.
 if exist "%dist%\ralphus" rmdir /s /q "%dist%\ralphus"
 if exist "%dist%\ralphus-runner" rmdir /s /q "%dist%\ralphus-runner"
-for %%B in (ralphus ralphus-runner ralphus-daemon ralphus-librarian) do (
+for %%B in (ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-attach) do (
   if exist "%dist%\%%B.exe" del /f /q "%dist%\%%B.exe"
 )
 

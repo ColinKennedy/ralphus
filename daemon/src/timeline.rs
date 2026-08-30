@@ -192,6 +192,65 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
     })
 }
 
+/// Fetches one cell's own Cartographer rows, ascending by time (RAL-288
+/// Stage 5) -- the "additive" half of the Live View pane's "Show Debug
+/// Messages" toggle. `daemon/src/server.rs`'s pane-serving endpoints now
+/// always strip ralphus's own marker lines out of the raw pane text (see
+/// `strip_ralphus_pane_markers`), so this is how a human opts back into
+/// seeing ralphus's own diagnostics for that same cell, without needing them
+/// spliced into the live pane byte stream at all (tmux pane captures carry
+/// no reliable per-line timestamps to splice against in the first place --
+/// see this module's own top-level doc comment). Reuses the same paginated
+/// Cartographer fetch [`build_squad_timeline`] does, scoped to one
+/// `(task, cell_id)` pair via the query filter directly, rather than
+/// fetching the whole squad's rows and filtering client-side -- and skips
+/// that function's log-excerpt-inlining and temp-file-writing, neither of
+/// which fit a call meant to be polled every couple of seconds alongside the
+/// pane itself.
+pub fn cell_debug_entries(
+    store: &Store,
+    squad_id: &str,
+    task: &str,
+    cell_id: &str,
+) -> Result<Vec<SquadTimelineEntry>> {
+    let mut rows = Vec::new();
+    let mut offset = 0i64;
+    loop {
+        let filter = CartographerFilter {
+            squad_id: Some(squad_id.to_string()),
+            task: Some(task.to_string()),
+            cell_id: Some(cell_id.to_string()),
+            limit: PAGE_SIZE,
+            offset,
+            ascending: true,
+            ..CartographerFilter::default()
+        };
+        let page = store.cartographer_query(&filter)?;
+        let got = page.rows.len() as i64;
+        let total = page.total;
+        rows.extend(page.rows);
+        offset += PAGE_SIZE;
+        if got < PAGE_SIZE || rows.len() as i64 >= MAX_EVENTS || offset >= total {
+            break;
+        }
+    }
+    rows.truncate(MAX_EVENTS as usize);
+    Ok(rows
+        .into_iter()
+        .map(|r| SquadTimelineEntry {
+            at_ms: r.at_ms,
+            level: r.level,
+            source: r.source,
+            scope: r.scope,
+            task: r.task,
+            cell_id: r.cell_id,
+            message: r.message,
+            log_path: r.log_path,
+            log_excerpt: None,
+        })
+        .collect())
+}
+
 /// Read the tail of a referenced terminal-log file, or `None` if it's
 /// unreadable (already pruned, moved, permissions — best-effort, never an
 /// error).

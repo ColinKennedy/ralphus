@@ -564,6 +564,40 @@ impl DaemonClient {
         )
     }
 
+    /// `POST .../cells/{ti}/{si}/open-terminal?mode=agent` (RAL-288 Stage
+    /// 6): while the cell is running, cleanly detaches it and opens the
+    /// real interactive agent in a new terminal (tmux-wrapped, survives
+    /// closing this window); once finished, resumes it the old way. Same
+    /// endpoint either way -- the daemon decides which based on the cell's
+    /// current state.
+    pub fn open_agent_terminal(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/open-terminal?mode=agent"),
+            None,
+        )
+    }
+
+    /// `POST .../cells/{ti}/{si}/resume-automation` (RAL-288 Stage 6): hands
+    /// a detached cell back to unattended execution, continuing the exact
+    /// same agent conversation rather than starting fresh. Rejected if the
+    /// cell is actually still live (not detached), rather than racing it.
+    pub fn resume_automation(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/resume-automation"),
+            None,
+        )
+    }
+
     pub fn restart_cell_proof(
         &self,
         squad_id: &str,
@@ -833,13 +867,12 @@ impl DaemonClient {
         git_root: &str,
         checks: Option<&[String]>,
         skip_auto_build: bool,
-        skip_worktree_checks: bool,
         skip_worktrees: bool,
         review_type: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
             "name": name, "base_branch": base_branch, "git_root": git_root,
-            "skip_auto_build": skip_auto_build, "skip_worktree_checks": skip_worktree_checks,
+            "skip_auto_build": skip_auto_build,
             "skip_worktrees": skip_worktrees,
         });
         set_if_some(&mut body, "checks", checks.map(|c| json!(c)));
@@ -863,11 +896,6 @@ impl DaemonClient {
     ) -> Result<Value, DaemonError> {
         let mut body = json!({});
         set_if_some(&mut body, "skip_auto_build", settings.skip_auto_build);
-        set_if_some(
-            &mut body,
-            "skip_worktree_checks",
-            settings.skip_worktree_checks,
-        );
         set_if_some(&mut body, "skip_worktrees", settings.skip_worktrees);
         set_if_some(
             &mut body,
@@ -1114,7 +1142,6 @@ impl Default for CartographerFilters<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct GuardianSettings<'a> {
     pub skip_auto_build: Option<bool>,
-    pub skip_worktree_checks: Option<bool>,
     pub skip_worktrees: Option<bool>,
     pub resolver_agent: Option<&'a str>,
     pub resolver_model: Option<&'a str>,

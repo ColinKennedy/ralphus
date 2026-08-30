@@ -938,6 +938,7 @@ pub fn cors_from_toml_str(s: &str) -> CorsConfig {
 /// (current-dir-based) rather than [`resolve`]/[`resolve_forge`].
 #[must_use]
 pub fn load_cors_config() -> CorsConfig {
+    CORS_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let global = global_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| cors_from_toml_str(&s))
@@ -950,6 +951,62 @@ pub fn load_cors_config() -> CorsConfig {
         .map(|s| cors_from_toml_str(&s))
         .unwrap_or_default();
     global.merge(local)
+}
+
+/// How long a [`load_cors_config_cached`] result stays usable before the
+/// files are consulted again. Short enough that editing `[cors]` in
+/// `.ralphus.toml` takes effect within one board poll, long enough that a
+/// burst of requests shares a single read.
+const CORS_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// The memoized `[cors]` allow-list behind [`load_cors_config_cached`], with
+/// the instant it was read.
+static CORS_CACHE: std::sync::Mutex<Option<(std::time::Instant, CorsConfig)>> =
+    std::sync::Mutex::new(None);
+
+/// How many times [`load_cors_config`] has actually touched the filesystem in
+/// this process. Backs the regression test asserting the cache in front of it
+/// really does collapse a burst of requests into one read.
+static CORS_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The effective CORS allow-list, memoized for [`CORS_CACHE_TTL`].
+///
+/// Every inbound HTTP request needs this decision (see `server::resolve_cors`),
+/// and [`load_cors_config`] is not cheap for something on that path: a global
+/// config read, a `find_project_config` directory walk up from the daemon's
+/// cwd, and two TOML parses -- unconditional filesystem I/O per request, on a
+/// value that changes only when someone edits a config file. The TTL keeps
+/// edits picked up promptly without making the allow-list a restart-only
+/// setting.
+#[must_use]
+pub fn load_cors_config_cached() -> CorsConfig {
+    let mut cache = CORS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((read_at, cfg)) = cache.as_ref() {
+        if read_at.elapsed() < CORS_CACHE_TTL {
+            return cfg.clone();
+        }
+    }
+    let cfg = load_cors_config();
+    *cache = Some((std::time::Instant::now(), cfg.clone()));
+    cfg
+}
+
+/// How many filesystem reads [`load_cors_config`] has performed -- see
+/// [`CORS_LOADS`].
+#[cfg(test)]
+pub(crate) fn cors_config_load_count() -> u64 {
+    CORS_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drop the memoized allow-list so the next [`load_cors_config_cached`] call
+/// reads the files again.
+#[cfg(test)]
+pub(crate) fn reset_cors_cache_for_test() {
+    *CORS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 #[cfg(test)]
@@ -1693,5 +1750,57 @@ mod tests {
         assert!(!is_valid_env_value("tab\ttab"));
         assert!(!is_valid_env_value("esc\x1b[31m"));
         assert!(!is_valid_env_value("nul\0byte"));
+    }
+
+    // -- CORS allow-list caching ------------------------------------------
+
+    /// Serializes the two tests below: both assert on the process-global
+    /// [`CORS_LOADS`] counter, so they cannot run at the same time.
+    static CORS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `resolve_cors` runs for every inbound HTTP request; the uncached
+    /// loader behind it does a global-config read, a `find_project_config`
+    /// directory walk and two TOML parses. A burst of requests must share one
+    /// read, or that filesystem I/O sits on the critical path of every single
+    /// request the daemon answers.
+    #[test]
+    fn cached_cors_config_reads_the_files_once_per_burst() {
+        let _serialized = CORS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_cors_cache_for_test();
+        let before = cors_config_load_count();
+        for _ in 0..50 {
+            let _ = load_cors_config_cached();
+        }
+        assert_eq!(
+            cors_config_load_count() - before,
+            1,
+            "50 requests' worth of CORS decisions must cost one filesystem read"
+        );
+    }
+
+    /// The cache is a TTL, not a freeze: an expired entry is re-read, so an
+    /// edit to `[cors]` takes effect without restarting the daemon.
+    #[test]
+    fn cached_cors_config_re_reads_once_the_ttl_expires() {
+        let _serialized = CORS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_cors_cache_for_test();
+        let before = cors_config_load_count();
+        let _ = load_cors_config_cached();
+        // Backdate the cached entry past the TTL rather than sleeping for it.
+        {
+            let mut cache = CORS_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (read_at, _) = cache.as_mut().expect("just-populated cache entry");
+            *read_at = read_at
+                .checked_sub(CORS_CACHE_TTL + Duration::from_secs(1))
+                .expect("backdate the cache entry past its TTL");
+        }
+        let _ = load_cors_config_cached();
+        assert_eq!(cors_config_load_count() - before, 2);
     }
 }

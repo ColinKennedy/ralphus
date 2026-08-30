@@ -223,7 +223,7 @@ pub struct ProviderRunner {
     /// local run — without this a remote cell is invisible to Cartographer
     /// and, worse, its live cost cap silently stops being enforced.
     cartographer: Option<Arc<Mutex<Store>>>,
-    /// The most recent `llm-invoke` usage snapshot seen on any invocation's
+    /// The most recent usage snapshot seen on any invocation's
     /// stderr (RAL-161/RAL-201), so [`Self::poll_to_completion`] can enforce
     /// `maximum_budget_usd` the same way [`crate::runner::SubprocessRunner`]
     /// does locally. Shared via `Arc` because each provider invocation reads
@@ -1131,6 +1131,7 @@ mod tests {
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
+            assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: machine.map(str::to_string),
         }

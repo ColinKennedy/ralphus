@@ -34,6 +34,11 @@ pub struct Daemon {
     /// Cancel tokens of in-flight squads, shared with the scheduler's workers so a
     /// `cancel` request can stop the running worker and its subprocess.
     cancellations: Cancellations,
+    /// Per-cell detach tokens (RAL-288 Stage 6), shared with the scheduler's
+    /// `SubprocessRunner` so the `open-terminal?mode=agent` handler can stop
+    /// exactly one running cell -- without touching the rest of its squad --
+    /// so a real interactive resume session can safely take over.
+    detachments: crate::cancel::Detachments,
     /// Live registry of cell subprocess PIDs, shared with the runner so the
     /// resource-usage endpoint can attribute OS metrics to running tasks (RAL-11).
     procs: ProcRegistry,
@@ -86,6 +91,7 @@ impl Daemon {
             store: Arc::new(Mutex::new(store)),
             max_concurrent,
             cancellations: Cancellations::new(),
+            detachments: crate::cancel::Detachments::new(),
             procs: ProcRegistry::new(),
             sem: Arc::new(Semaphore::new(max_concurrent)),
             summary_queue: SummaryQueue::new(),
@@ -149,6 +155,13 @@ impl Daemon {
     #[must_use]
     pub fn cancellations_handle(&self) -> Cancellations {
         self.cancellations.clone()
+    }
+
+    /// A cloned handle to the per-cell detach registry (RAL-288 Stage 6),
+    /// for the scheduler's `SubprocessRunner`.
+    #[must_use]
+    pub fn detachments_handle(&self) -> crate::cancel::Detachments {
+        self.detachments.clone()
     }
 
     /// A cloned handle to the subprocess PID registry (for the cell runner).
@@ -515,8 +528,14 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "squads", id, "cells", ti, si, "open-terminal"]) => {
             open_terminal(daemon, id, ti, si, query)
         }
+        ("POST", ["api", "squads", id, "cells", ti, si, "resume-automation"]) => {
+            resume_automation(daemon, id, ti, si)
+        }
         ("GET", ["api", "squads", id, "cells", ti, si, "pane"]) => {
             cell_pane(daemon, id, ti, si, query)
+        }
+        ("GET", ["api", "squads", id, "cells", ti, si, "debug-events"]) => {
+            cell_debug_events(daemon, id, ti, si)
         }
         (
             "GET",
@@ -3562,10 +3581,10 @@ fn restart_cell(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Re
             vec![],
         );
     };
-    if let Ok(impact) = daemon
+    let impact = daemon
         .lock()
-        .compute_cell_restart_impact(id, task_idx, cell_idx)
-    {
+        .compute_cell_restart_impact(id, task_idx, cell_idx);
+    if let Ok(impact) = &impact {
         for dep in &impact.dirtied_squads {
             daemon.cancellations.cancel(&dep.id);
         }
@@ -3573,14 +3592,43 @@ fn restart_cell(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Re
             wait_for_worker_stop(daemon, &dep.id);
         }
     }
-    // Cancel only when we can't positively confirm the target has already
-    // stopped on its own — an unknown/error result stays on the safe
-    // (cancel) side, same as the old unconditional behavior.
-    let target_already_stopped = matches!(
-        daemon.lock().cell_state(id, task_idx, cell_idx),
-        Ok(Some(state)) if state != NodeState::Running
-    );
-    if !target_already_stopped {
+    // Cancel only when something this restart will actually touch (the
+    // target cell itself, or one of its own downstream cells within this
+    // squad, per `impact.cells`) is genuinely still live -- checked at both
+    // the cell-body and cell-scoped-proof granularity, not just the cell's
+    // own coarse `NodeState`. RAL-288 bug this replaced: the old check
+    // inferred "already stopped" purely from the *target cell's own*
+    // `NodeState` (`!= Running` -> skip), which missed the target cell's
+    // body reaching `Done` while its own cell-scoped proof step was still
+    // being actively driven by the same worker -- that combination read as
+    // "already stopped", skipped the cancel+wait entirely, and left the
+    // still-running worker's squad-level cancellation-registry slot
+    // orphaned once `Store::restart_cell` reset the cell underneath it,
+    // permanently blocking every future re-claim of the squad (caught
+    // live: a manual "Restart cell" while a proof step was mid-run left the
+    // cell `pending` forever). The naive opposite fix -- cancel whenever
+    // `cancellations.is_active(id)` at all, i.e. the whole squad's shared
+    // token -- collaterally cancels a genuinely unrelated, still-running
+    // sibling cell elsewhere in the same squad (regression caught by
+    // `restart_cell_does_not_cancel_unrelated_sibling_cell_in_same_squad`
+    // right above this), since that token has only squad-wide granularity.
+    // Scoping the liveness check to `impact.cells` is what avoids both
+    // mistakes at once.
+    let target_still_active = match &impact {
+        Ok(impact) => impact.cells.iter().any(|c| {
+            let guard = daemon.lock();
+            matches!(
+                guard.cell_state(id, c.task_idx, c.idx),
+                Ok(Some(NodeState::Running))
+            ) || guard
+                .cell_proof_running_from(id, c.task_idx, c.idx, 0)
+                .unwrap_or(true)
+        }),
+        // Unknown/error stays on the safe (cancel) side, same as the
+        // original behavior's intent.
+        Err(_) => true,
+    };
+    if target_still_active {
         daemon.cancellations.cancel(id);
         wait_for_worker_stop(daemon, id);
     }
@@ -3937,10 +3985,44 @@ fn inactive_pane_reply(session_name: &str) -> Reply {
         200,
         &PaneResponse {
             active: false,
-            content: crate::tmux::read_pane_snapshot(session_name).unwrap_or_default(),
+            content: strip_ralphus_pane_markers(
+                &crate::tmux::read_pane_snapshot(session_name).unwrap_or_default(),
+            ),
             last_activity_ms: None,
         },
     )
+}
+
+/// Strips ralphus's own `RALPHUS_EVENT:`/`RALPHUS_TMUX_DONE` marker lines out
+/// of raw Live View pane text (RAL-288 Stage 5), so the board's peek pane is
+/// pure agent output unconditionally, by construction — rather than the
+/// previous design of serving the raw (marker-included) text and relying on
+/// fragile client-side JS regex matching (deleted:
+/// `librarian/assets/board.html`'s old `stripDebugLines`/
+/// `isRalphusDebugLine`) to hide them, which both ate genuine agent output
+/// starting with `ralphus [` and leaked anything not matching its three
+/// hardcoded prefixes. `ralphus [...]`-prefixed diagnostic lines are not
+/// filtered here at all, because Stage 5 also relocated every one the
+/// runner used to print — `execute.rs::log_llm_start`/`log_llm_done`,
+/// `main.rs`'s invocation/result-file-write-failure lines,
+/// `agent_backend.rs`'s `llm-invoke` lines — to Cartographer-only, so
+/// nothing should legitimately emit that prefix into a pane anymore.
+///
+/// Classifies line by line, matching the same trimmed-line-start rule the
+/// deleted client-side version used, so a marker emitted mid-tool-call is
+/// dropped without disturbing the agent lines immediately around it. The
+/// live-agent tool/result-labeled lines (`[tool] ...`, `[result] ...`,
+/// `[you] ...`, etc.) are runner-rendered translations of genuine agent
+/// activity, not ralphus diagnostics, and are deliberately left alone.
+#[must_use]
+fn strip_ralphus_pane_markers(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("RALPHUS_EVENT: ") || trimmed.starts_with("RALPHUS_TMUX_DONE"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Capture-pane content for the tmux session keyed by `(squad_id, task,
@@ -3976,7 +4058,11 @@ fn capture_pane_reply(
                 // live pane to the board/CLI. (A live pane is served before
                 // it's ever persisted, so this is the one read path the
                 // snapshot/terminal-log write-time redaction can't cover.)
-                content: ralphus_core::redact::redact_secrets(&content).into_owned(),
+                // RAL-288 Stage 5: also strip ralphus's own event/done marker
+                // lines -- see `strip_ralphus_pane_markers`'s doc comment.
+                content: strip_ralphus_pane_markers(&ralphus_core::redact::redact_secrets(
+                    &content,
+                )),
                 last_activity_ms: daemon.lock().live_activity_ms(&name),
             },
         ),
@@ -4305,6 +4391,39 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
                 Ok(v) => v,
                 Err(e) => return store_error(&e),
             };
+        // RAL-288 Stage 6: while the cell is still genuinely running (local
+        // host, a real prompt cell, a session id already pre-assigned -- see
+        // `scheduler::assign_agent_session_id`), detach it cleanly first,
+        // then open the *real* resume session -- safe now, since the
+        // detach-and-wait below guarantees the original process is
+        // genuinely gone before a second one touches the same conversation.
+        // Backend-agnostic: the detach mechanism (killing the cell's tmux
+        // session) and the resume command both already exist for
+        // claude/codex/pi alike.
+        let (machine, is_command_cell, state) =
+            match daemon.lock().get_cell_input_gate(id, task_idx, cell_idx) {
+                Ok(v) => v,
+                Err(e) => return store_error(&e),
+            };
+        if state == crate::store::NodeState::Running && machine.is_none() && !is_command_cell {
+            let Some(session_id) = agent_session_id.clone() else {
+                return error(
+                    409,
+                    "no_claude_session",
+                    "no resumable agent session recorded yet for this still-running cell",
+                    vec![],
+                );
+            };
+            let task = match daemon.lock().get_task_name(id, task_idx) {
+                Ok(v) => v,
+                Err(e) => return store_error(&e),
+            };
+            let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
+                Ok(v) => v,
+                Err(e) => return store_error(&e),
+            };
+            return detach_and_open_agent(daemon, id, &cwd, &task, &cell_id, &agent, &session_id);
+        }
         return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
     }
     let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
@@ -4316,6 +4435,84 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
         Err(e) => return store_error(&e),
     };
     attach_tmux_terminal(id, &task, &cell_id)
+}
+
+/// RAL-288 Stage 6: "resume automation" -- called once a human is done with
+/// the real interactive session a detach opened, to hand the cell back to
+/// unattended execution. Unlike a generic `restart_cell` (which always
+/// starts fresh), this specifically continues the *same* conversation: it
+/// marks the cell to resume its own recorded `agent_session_id` on its next
+/// dispatch (`Store::set_force_resume_own_session`, consumed by
+/// `scheduler::run_cell_worker`) before resetting it to `pending`, so the
+/// human's work in the real session isn't silently discarded. A cell with
+/// no recorded session has nothing to resume, and is rejected rather than
+/// silently falling through to a fresh run.
+fn resume_automation(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell index must be integers",
+            vec![],
+        );
+    };
+    let agent_session_id = match daemon.lock().get_cell_agent_resume(id, task_idx, cell_idx) {
+        Ok((_, _, sid)) => sid,
+        Err(e) => return store_error(&e),
+    };
+    if agent_session_id.is_none() {
+        return error(
+            409,
+            "no_claude_session",
+            "this cell has no recorded agent session to resume",
+            vec![],
+        );
+    }
+    // Safety guard: this must only ever fire on a genuinely detached cell,
+    // never one that's still actively running headlessly -- calling
+    // `restart_cell` on a live cell would start a second process racing the
+    // one already touching this exact conversation/worktree, the same
+    // corruption risk `detach_and_open_agent`'s wait loop exists to avoid.
+    let task = match daemon.lock().get_task_name(id, task_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let tmux = match crate::tmux::Tmux::resolve() {
+        Ok(t) => t,
+        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
+    };
+    let session_name = crate::tmux::session_name(id, &task, &cell_id);
+    if tmux.has_session(&session_name) {
+        return error(
+            409,
+            "still_running",
+            "this cell is still actively running -- detach it first",
+            vec![],
+        );
+    }
+    // RAL-288: the human may not have closed the interactive resume session
+    // (they clicked "Resume Automation" instead of exiting the CLI, or just
+    // forgot it's open) -- kill it before handing the conversation back to a
+    // fresh headless dispatch, or both processes would touch the exact same
+    // `agent_session_id` at once, the same corruption risk `detach_and_open_
+    // agent`'s wait loop exists to avoid on the way in. Best-effort: a
+    // missing/already-gone session is not an error here.
+    let resume_session_name = crate::tmux::session_name(id, &task, &format!("{cell_id}-resume"));
+    let _ = tmux.kill_session(&resume_session_name);
+    if let Err(e) = daemon
+        .lock()
+        .set_force_resume_own_session(id, task_idx, cell_idx)
+    {
+        return store_error(&e);
+    }
+    match daemon.lock().restart_cell(id, task_idx, cell_idx) {
+        Ok(_) => json(200, &OpenTerminalResponse { ok: true }),
+        Err(e) => store_error(&e),
+    }
 }
 
 /// The live pane content of a task cell's tmux session, for the
@@ -4338,6 +4535,34 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
         Err(e) => return store_error(&e),
     };
     capture_pane_reply(daemon, id, &task, &cell_id, query)
+}
+
+/// This cell's own Cartographer rows (RAL-288 Stage 5), for the Live View
+/// pane's "Show Debug Messages" checkbox to additively merge alongside the
+/// now-always-clean pane text (see `strip_ralphus_pane_markers`) when
+/// checked. Bare JSON array, ascending by time, matching every other
+/// Cartographer-backed list endpoint's response shape.
+fn cell_debug_events(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell index must be integers",
+            vec![],
+        );
+    };
+    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let task = match daemon.lock().get_task_name(id, task_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    match crate::timeline::cell_debug_entries(&daemon.lock(), id, &task, &cell_id) {
+        Ok(entries) => json(200, &entries),
+        Err(e) => store_error(&e),
+    }
 }
 
 /// List a task cell's persisted historical terminal-log attempts (RAL-154)
@@ -4707,7 +4932,7 @@ fn resolver_task_and_cell_id(
 }
 
 /// Spawn a real, interactive resumed CLI cell (`claude --resume <id>
-/// --dangerously-skip-permissions` or `codex exec resume <id>
+/// --dangerously-skip-permissions` or `codex resume <id>
 /// --dangerously-bypass-approvals-and-sandbox`, depending on which agent the
 /// cell actually ran under) in a new terminal window, rooted at `cwd` —
 /// the "Open Agent" terminal action (RAL-102 follow-up). Unlike
@@ -4727,6 +4952,40 @@ use ralphus_core::agent_resume::{
     resume_pi_agent_command,
 };
 
+/// Builds the `pwsh -Command <resume line>` invocation shared by
+/// [`open_agent_terminal`] (bare window, finished cell) and
+/// [`open_agent_terminal_via_tmux`] (RAL-288 Stage 6: tmux-wrapped, just
+/// detached from a live cell) -- both ultimately run the exact same real
+/// CLI resume command, just handed to a different spawn mechanism.
+fn resume_shell_invocation(agent: Option<&str>, agent_session_id: &str) -> (String, Vec<String>) {
+    let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
+    let command = if is_codex_agent(agent) {
+        // Mirrors `RALPHUS_CODEX_COMMAND` in `codex_backend.py` — the same
+        // override point resolves both the headless squad and this resumed
+        // one to the same binary.
+        let program =
+            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
+        resume_codex_agent_command(&program, agent_session_id)
+    } else if is_pi_agent(agent) {
+        let program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
+        resume_pi_agent_command(&program, agent_session_id)
+    } else {
+        // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
+        // same override point resolves both the headless squad and this
+        // resumed one to the same binary.
+        let program =
+            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+        resume_agent_command(&program, agent_session_id)
+    };
+    let shell_args = vec![
+        "-NoExit".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        command,
+    ];
+    (shell_cmd, shell_args)
+}
+
 fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
     let Some(cell_id) = agent_session_id else {
         return error(
@@ -4737,35 +4996,11 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
             vec![],
         );
     };
-    let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
     // No leading `Set-Location ...;` here -- `cwd` is passed as its own
     // argument below so it goes through wt's `-d` flag / `current_dir`
     // instead of a semicolon `wt.exe` can't pass through to the agent (see
     // `spawn_in_terminal`'s doc comment).
-    let command = if is_codex_agent(agent) {
-        // Mirrors `RALPHUS_CODEX_COMMAND` in `codex_backend.py` — the same
-        // override point resolves both the headless squad and this resumed
-        // one to the same binary.
-        let program =
-            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
-        resume_codex_agent_command(&program, cell_id)
-    } else if is_pi_agent(agent) {
-        let program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
-        resume_pi_agent_command(&program, cell_id)
-    } else {
-        // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
-        // same override point resolves both the headless squad and this
-        // resumed one to the same binary.
-        let program =
-            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
-        resume_agent_command(&program, cell_id)
-    };
-    let shell_args = vec![
-        "-NoExit".to_string(),
-        "-NoProfile".to_string(),
-        "-Command".to_string(),
-        command,
-    ];
+    let (shell_cmd, shell_args) = resume_shell_invocation(agent, cell_id);
     match spawn_in_terminal(
         Some(cwd),
         &shell_cmd,
@@ -4775,6 +5010,126 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
         Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
         Err(msg) => error(500, "terminal_error", &msg, vec![]),
     }
+}
+
+/// RAL-288 Stage 6: the real interactive resume session, launched *inside a
+/// named tmux session* rather than a bare terminal window, once a
+/// just-detached cell has been confirmed genuinely stopped (see
+/// `detach_and_open_agent`, this function's only caller). tmux, not this
+/// code, is what makes "close the client terminal, everything the human did
+/// is still there on reattach" work -- it's tmux's own core behavior, not
+/// something built for this. The session name is the cell's own
+/// deterministic name with a `-resume` suffix, so it never collides with
+/// the (now-dead) original cell session and `attach_tmux_terminal`'s
+/// existing "attach a local terminal to a named session" mechanism can
+/// reattach to it later exactly the way it already does for a plain cell.
+/// Idempotent: if the resume session is already alive (a second "Open Agent"
+/// click, or the human closed only their terminal window and not the tmux
+/// session itself), this skips straight to spawning another local terminal
+/// attached to it instead of trying to create a duplicate.
+fn open_agent_terminal_via_tmux(
+    cwd: &str,
+    squad_id: &str,
+    task: &str,
+    cell_id: &str,
+    agent: Option<&str>,
+    agent_session_id: &str,
+) -> Reply {
+    let tmux = match crate::tmux::Tmux::resolve() {
+        Ok(t) => t,
+        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
+    };
+    let resume_session_name =
+        crate::tmux::session_name(squad_id, task, &format!("{cell_id}-resume"));
+    // RAL-288: idempotent by design -- a second "Open Agent" click on an
+    // already-detached cell (the human never closed the resume session, or
+    // just wants another terminal attached to it) must reattach to the
+    // existing live session rather than trying to create a duplicate, which
+    // psmux/tmux both reject outright.
+    if !tmux.has_session(&resume_session_name) {
+        let (shell_cmd, shell_args) = resume_shell_invocation(agent, agent_session_id);
+        if let Err(e) = tmux.new_detached_session_with_command(
+            &resume_session_name,
+            cwd,
+            &std::collections::BTreeMap::new(),
+            &shell_cmd,
+            &shell_args,
+        ) {
+            return error(500, "tmux_error", &e.to_string(), vec![]);
+        }
+    }
+    let tmux_program = tmux.program().to_string();
+    let mut attach_args: Vec<String> = tmux.prefix_args().to_vec();
+    attach_args.extend([
+        "attach-session".to_string(),
+        "-t".to_string(),
+        resume_session_name,
+    ]);
+    match spawn_in_terminal(
+        None,
+        &tmux_program,
+        &attach_args,
+        &std::collections::BTreeMap::new(),
+    ) {
+        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+        Err(msg) => error(500, "terminal_error", &msg, vec![]),
+    }
+}
+
+/// How long [`detach_and_open_agent`] waits for a just-requested detach to
+/// actually finish (the runner's poll loop notices within
+/// `TMUX_POLL_INTERVAL` and kills the tmux session almost immediately, so
+/// this is a generous upper bound, not an expected wait) before giving up
+/// and telling the caller to retry, rather than opening a second session
+/// against a conversation that might still be live.
+const DETACH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DETACH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+/// Live-observed (RAL-288): creating a new tmux session immediately after
+/// `has-session` first reports the old one gone can still transiently fail
+/// ("psmux: failed to create session") -- psmux needs a beat to finish
+/// releasing whatever it was still holding. A short unconditional settle
+/// delay before creating the resume session clears this reliably; a bare
+/// retry a few seconds later also worked when this was hit live, which is
+/// roughly this order of magnitude.
+const DETACH_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// RAL-288 Stage 6: the "Open Agent" action for a cell that's still
+/// genuinely running. Requests a clean detach via the shared
+/// [`crate::cancel::Detachments`] registry, then blocks -- bounded by
+/// [`DETACH_WAIT_TIMEOUT`], since this daemon's HTTP loop is otherwise
+/// synchronous -- until the original tmux session is confirmed gone, before
+/// opening the real resume session. "Detach requested" is not the same
+/// guarantee as "detach happened"; two processes on one conversation
+/// transcript is exactly what corrupts it, so the wait is not optional.
+fn detach_and_open_agent(
+    daemon: &Daemon,
+    squad_id: &str,
+    cwd: &str,
+    task: &str,
+    cell_id: &str,
+    agent: &str,
+    agent_session_id: &str,
+) -> Reply {
+    let tmux = match crate::tmux::Tmux::resolve() {
+        Ok(t) => t,
+        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
+    };
+    let session_name = crate::tmux::session_name(squad_id, task, cell_id);
+    daemon.detachments_handle().cancel(&session_name);
+    let deadline = std::time::Instant::now() + DETACH_WAIT_TIMEOUT;
+    while tmux.has_session(&session_name) {
+        if std::time::Instant::now() >= deadline {
+            return error(
+                503,
+                "detach_in_progress",
+                "still shutting down the live session -- try again in a moment",
+                vec![],
+            );
+        }
+        std::thread::sleep(DETACH_POLL_INTERVAL);
+    }
+    std::thread::sleep(DETACH_SETTLE_DELAY);
+    open_agent_terminal_via_tmux(cwd, squad_id, task, cell_id, Some(agent), agent_session_id)
 }
 
 /// The live pane content of a review branch's conflict-resolver tmux
@@ -6095,8 +6450,6 @@ struct CreateGuardianBody {
     #[serde(default)]
     skip_auto_build: bool,
     #[serde(default)]
-    skip_worktree_checks: bool,
-    #[serde(default)]
     skip_worktrees: bool,
     #[serde(default)]
     review_type: Option<String>,
@@ -6106,8 +6459,6 @@ struct CreateGuardianBody {
 struct GuardianSettingsBody {
     #[serde(default)]
     skip_auto_build: Option<bool>,
-    #[serde(default)]
-    skip_worktree_checks: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
     #[serde(default)]
@@ -6204,9 +6555,6 @@ fn guardian_create(daemon: &Daemon, body: &str) -> Reply {
             if req.skip_auto_build {
                 let _ = store.set_guardian_skip_auto_build(&id, true);
             }
-            if req.skip_worktree_checks {
-                let _ = store.set_guardian_skip_worktree_checks(&id, true);
-            }
             if req.skip_worktrees {
                 let _ = store.set_guardian_skip_worktrees(&id, true);
             }
@@ -6267,18 +6615,13 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(
             400,
             "bad_request",
-            "body must be {skip_auto_build?, skip_worktree_checks?}",
+            "body must be {skip_auto_build?, proof_scope?}",
             vec![],
         );
     };
     let store = daemon.lock();
     if let Some(skip) = req.skip_auto_build {
         if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
-            return store_error(&e);
-        }
-    }
-    if let Some(skip) = req.skip_worktree_checks {
-        if let Err(e) = store.set_guardian_skip_worktree_checks(id, skip) {
             return store_error(&e);
         }
     }
@@ -7332,6 +7675,11 @@ fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
         return store_error(&e);
     }
     drop(store);
+    // RAL-279: force_start only fires while status == "collecting", which
+    // precedes PR submission, so this is a no-op today -- kept for
+    // correctness/future-proofing if that invariant ever changes (see the
+    // identical call in `guardian_reorder`).
+    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_merge(
         daemon.store_handle(),
@@ -7409,6 +7757,13 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
     // instead of replaying stale history that still contains the moved
     // branch's commits (see `guardian_merge::purge_worktrees`).
     crate::guardian_merge::purge_worktrees(&daemon.store_handle(), &source_git_root, id);
+
+    // RAL-279: the moved branch may have had PRs stacked on top of it in the
+    // source review; retarget those onto the nearest remaining branch (or the
+    // source's own base branch). The destination's newly-added branch is
+    // handled by the normal new-PR-submission flow instead, since it has no
+    // PR yet.
+    crate::pr::start_resync_pr_bases(daemon.store_handle(), id);
 
     let runner = guardian_agent_runner(daemon);
     if source_remaining > 0 {
@@ -7712,7 +8067,7 @@ pub fn serve<A: ToSocketAddrs>(
         "ralphus [token] auth token ready at {}",
         crate::token_path().display()
     );
-    let daemon = Daemon::new(store, max_concurrent).with_token(token);
+    let daemon = Arc::new(Daemon::new(store, max_concurrent).with_token(token));
 
     // Scheduler runs on its own thread, sharing the store via Arc<Mutex> and the
     // cancellation registry so a `cancel` request can reach its workers. The
@@ -7721,7 +8076,8 @@ pub fn serve<A: ToSocketAddrs>(
     let local_runner: Arc<dyn Runner> = Arc::new(
         SubprocessRunner::from_env()
             .with_registry(daemon.procs_handle())
-            .with_cartographer(daemon.store_handle()),
+            .with_cartographer(daemon.store_handle())
+            .with_detachments(daemon.detachments_handle()),
     );
     // RAL-185: the scheduler holds a router rather than the local runner
     // directly, so a cell carrying a `machine` is dispatched to its provider
@@ -7741,6 +8097,12 @@ pub fn serve<A: ToSocketAddrs>(
     // queue's own High/Low ordering (not thread count) is what keeps the
     // currently-viewed review responsive.
     crate::summary_worker::spawn_workers(&summary_queue, &daemon.store_handle(), 2);
+    // RAL-279: periodically reconcile a PR stack's base(s) against what the
+    // forge actually has recorded, so a base retargeted (or an intervening
+    // branch's PR closed/merged) directly on GitHub/GitLab -- outside
+    // ralphus entirely -- still gets pulled back into this guardian's branch
+    // order instead of silently drifting forever.
+    crate::pr::spawn_pr_base_drift_poller(daemon.store_handle());
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,
@@ -7760,7 +8122,7 @@ pub fn serve<A: ToSocketAddrs>(
 /// Does NOT start the scheduler — exposed so tests can bind an ephemeral port
 /// and drive the API without squads executing underneath them.
 pub fn serve_with(server: tiny_http::Server, store: Store, max_concurrent: i64) {
-    let daemon = Daemon::new(store, max_concurrent);
+    let daemon = Arc::new(Daemon::new(store, max_concurrent));
     run_http_loop(server, &daemon);
 }
 
@@ -7773,7 +8135,7 @@ pub fn serve_with_token(
     max_concurrent: i64,
     token: String,
 ) {
-    let daemon = Daemon::new(store, max_concurrent).with_token(token);
+    let daemon = Arc::new(Daemon::new(store, max_concurrent).with_token(token));
     run_http_loop(server, &daemon);
 }
 
@@ -7825,14 +8187,172 @@ fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
 
 /// Resolve the CORS decision for one incoming request against the effective
 /// (global + per-project `.ralphus.toml`) `[cors]` allow-list.
+///
+/// Reads the allow-list through [`crate::config::load_cors_config_cached`]
+/// rather than [`crate::config::load_cors_config`]: this runs for every
+/// inbound request, and the uncached loader does a global-config read, a
+/// `find_project_config` directory walk, and two TOML parses each time.
 fn resolve_cors(request: &tiny_http::Request) -> ralphus_core::cors::CorsDecision {
     let origin = header_value(request, "Origin");
     let host = header_value(request, "Host");
-    let allowed = crate::config::load_cors_config().allowed_origins;
+    let allowed = crate::config::load_cors_config_cached().allowed_origins;
     ralphus_core::cors::decide(origin.as_deref(), host.as_deref(), &allowed)
 }
 
-fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
+/// How many read-only (`GET`) requests the daemon answers concurrently.
+///
+/// Small on purpose: the point is that one slow read cannot stall the accept
+/// loop, not that reads scale out. Four is enough to cover the board's
+/// fan-out of independent per-review GETs on a single poll while keeping
+/// pressure on the global `Mutex<Store>` low.
+const READ_WORKERS: usize = 4;
+
+/// Handler wall time at or above which a request is logged as slow.
+///
+/// One second is well past anything the API is expected to take -- the
+/// endpoints that legitimately exceed it are the ones that shell out to git
+/// or call a forge over the network, and naming them in the log is the point.
+const SLOW_REQUEST_MS: u128 = 1000;
+
+/// One accepted request, with everything read off the wire, waiting to be
+/// answered either inline on the accept loop or on a [`ReadPool`] worker.
+struct PendingRequest {
+    request: tiny_http::Request,
+    method: String,
+    url: String,
+    body: String,
+    traceparent: Option<String>,
+    auth_header: Option<String>,
+    cors: ralphus_core::cors::CorsDecision,
+    /// When the accept loop finished reading this request, so the time it
+    /// then spent waiting for a worker is reportable separately from the
+    /// time its handler took.
+    accepted_at: Instant,
+}
+
+/// A fixed pool of threads answering read-only requests off the accept loop.
+///
+/// `tiny_http` is a synchronous, one-request-at-a-time server, so without
+/// this every request -- including a `POST /api/guardians/{id}/merge`, which
+/// is just a DB state transition plus a thread spawn -- waits for whatever
+/// handler the accept loop is already inside. Several board endpoints
+/// legitimately take seconds: `GET /api/pull-requests/{id}/sync-status` runs
+/// `git fetch` against the remote, `GET /api/pull-requests/{id}/comments`
+/// calls the forge HTTP API, `GET /api/guardians/{id}/base-branches` shells
+/// out to git. The Reviews tab polls several of them per refresh, so a click
+/// landing mid-poll queues behind all of them.
+///
+/// Only `GET` is dispatched here. Every mutating method stays on the accept
+/// loop, which keeps the invariant the mutating handlers were written under:
+/// **no two state-changing requests ever run at the same time**, so a handler
+/// that reads then writes across separate `Store` lock acquisitions still
+/// cannot be interleaved by another request. Concurrency is therefore bounded
+/// to read-only handlers, which take the store lock only to read and can
+/// safely observe a mutation mid-flight -- the board already tolerates that,
+/// since the scheduler and merge workers mutate the store underneath it
+/// constantly.
+struct ReadPool {
+    tx: std::sync::mpsc::Sender<PendingRequest>,
+}
+
+impl ReadPool {
+    /// Spawn `workers` threads draining a shared queue of read requests.
+    fn new(daemon: &Arc<Daemon>, workers: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PendingRequest>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..workers {
+            let rx = Arc::clone(&rx);
+            let daemon = Arc::clone(daemon);
+            std::thread::spawn(move || {
+                loop {
+                    // The guard is dropped as this `let` statement ends, so
+                    // exactly one idle worker blocks in `recv()` at a time
+                    // and the rest are free the instant it takes a job.
+                    let job = rx.lock().expect("read pool mutex poisoned").recv();
+                    match job {
+                        Ok(pending) => answer_request(&daemon, pending),
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        Self { tx }
+    }
+
+    /// Queue `pending` for a worker, or hand it back if every worker thread
+    /// has died (the channel is closed) so the caller can answer it inline.
+    fn dispatch(&self, pending: PendingRequest) -> Option<PendingRequest> {
+        self.tx.send(pending).err().map(|e| e.0)
+    }
+}
+
+/// Authorize, route, and respond to one already-read request.
+///
+/// Runs either on the accept loop (mutating methods) or on a [`ReadPool`]
+/// worker (`GET`), so it must not touch anything the accept loop owns
+/// exclusively -- notably `Daemon::events_tickets`, which is consumed before
+/// dispatch.
+fn answer_request(daemon: &Daemon, pending: PendingRequest) {
+    let PendingRequest {
+        request,
+        method,
+        url,
+        body,
+        traceparent,
+        auth_header,
+        cors,
+        accepted_at,
+    } = pending;
+    let queued_ms = accepted_at.elapsed().as_millis();
+    let handler_started = Instant::now();
+    // RAL-219: every route requires the configured bearer token (when
+    // one is configured - see `Daemon::authorized`), checked here at the
+    // HTTP boundary rather than inside `route()` so its ~100 in-process
+    // unit tests stay auth-agnostic. `/api/events` never reaches this
+    // point (handled in the accept loop); RAL-222 owns its auth separately.
+    let reply = if daemon.authorized(auth_header.as_deref()) {
+        route_with_trace(daemon, &method, &url, &body, traceparent.as_deref())
+    } else {
+        error(
+            401,
+            "unauthorized",
+            "missing or invalid bearer token",
+            vec![],
+        )
+    };
+    let handler_ms = handler_started.elapsed().as_millis();
+    let status = reply.status;
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("valid header");
+    let mut response = tiny_http::Response::from_string(reply.body)
+        .with_status_code(status)
+        .with_header(header);
+    if let ralphus_core::cors::CorsDecision::Allowed(origin) = &cors {
+        for h in cors_response_headers(origin) {
+            response = response.with_header(h);
+        }
+    }
+    let _ = request.respond(response);
+    // Logged after responding so the measurement never adds to the latency it
+    // measures. Deliberately `rlog!`-only rather than a Cartographer row:
+    // every Cartographer write publishes an SSE event, the board refreshes on
+    // one, and that refresh issues more requests -- a per-request slow record
+    // would feed itself.
+    if handler_ms >= SLOW_REQUEST_MS {
+        crate::rlog!(
+            WARNING,
+            "ralphus [http] {method} {url} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms)"
+        );
+    } else {
+        crate::rlog!(
+            DEBUG,
+            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms)"
+        );
+    }
+}
+
+fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) {
+    let read_pool = ReadPool::new(daemon, READ_WORKERS);
     for mut request in server.incoming_requests() {
         let method = request.method().as_str().to_string();
         // `route()` splits `path` on `?` itself (it needs the query string for
@@ -7934,33 +8454,29 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Daemon) {
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
 
-        // RAL-219: every route requires the configured bearer token (when
-        // one is configured — see `Daemon::authorized`), checked here at the
-        // HTTP boundary rather than inside `route()` so its ~100 in-process
-        // unit tests stay auth-agnostic. `/api/events` never reaches this
-        // point (handled above); RAL-222 owns its auth separately.
-        let reply = if daemon.authorized(auth_header.as_deref()) {
-            route_with_trace(daemon, &method, &url, &body, traceparent.as_deref())
-        } else {
-            error(
-                401,
-                "unauthorized",
-                "missing or invalid bearer token",
-                vec![],
-            )
+        let pending = PendingRequest {
+            request,
+            method,
+            url,
+            body,
+            traceparent,
+            auth_header,
+            cors,
+            accepted_at: Instant::now(),
         };
-        crate::rlog!(DEBUG, "ralphus [http] {method} {url} → {}", reply.status);
-        let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-            .expect("valid header");
-        let mut response = tiny_http::Response::from_string(reply.body)
-            .with_status_code(reply.status)
-            .with_header(header);
-        if let ralphus_core::cors::CorsDecision::Allowed(origin) = &cors {
-            for h in cors_response_headers(origin) {
-                response = response.with_header(h);
+        // Read-only requests go to the pool so a slow one cannot stall the
+        // accept loop; everything that mutates state is answered right here,
+        // keeping mutating requests totally ordered. See `ReadPool`.
+        if pending.method == "GET" {
+            // `dispatch` only hands the request back if every worker thread
+            // is gone (they all panicked); answering it inline then is
+            // better than dropping the connection on the floor.
+            if let Some(returned) = read_pool.dispatch(pending) {
+                answer_request(daemon, returned);
             }
+        } else {
+            answer_request(daemon, pending);
         }
-        let _ = request.respond(response);
         // Requested by `POST /api/daemon/shutdown` (`shutdown()` above).
         // Breaking here — rather than calling `server.unblock()` — is
         // sufficient: this request has already been answered and we simply
@@ -9508,7 +10024,8 @@ machine=\"incredibuild:B\"
     fn resume_codex_agent_command_always_bypasses_approvals() {
         let cmd = resume_codex_agent_command("codex", "thread-abc-123");
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(cmd.contains("exec resume 'thread-abc-123'"));
+        assert!(cmd.contains("resume 'thread-abc-123'"));
+        assert!(!cmd.contains("exec"));
         assert!(cmd.contains("& 'codex'"));
     }
 
@@ -11767,6 +12284,141 @@ command = "true"
         );
     }
 
+    /// RAL-288 regression, the inverse mistake from the test above: caught
+    /// live (RAL-239 verification pass) when a human's manual "Restart
+    /// cell" on a cell whose *own* body had already reached `Done` --
+    /// while that exact cell's own cell-scoped proof step was still being
+    /// actively driven by the squad's live worker -- silently skipped
+    /// cancelling that worker entirely. The old check inferred "no live
+    /// worker to disturb" purely from the target cell's own `NodeState`
+    /// (`!= Running` -> skip), which doesn't hold once a squad's worker can
+    /// legitimately still be busy on that same cell's proof steps (or
+    /// anything else in the squad) after the cell body itself finishes.
+    /// `Store::restart_cell` then reset the cell to `pending` underneath
+    /// the still-running, now-orphaned worker, which never noticed and
+    /// never released its slot in the shared cancellation registry --
+    /// permanently blocking every future re-claim of the squad. Simulates
+    /// the same shape without needing real cell-then-proof sequencing: the
+    /// cell's own row is manually forced to `Done` while the squad's
+    /// worker (registered under the same squad id) is still genuinely
+    /// blocked inside it, then asserts the restart route still cancels it.
+    #[test]
+    fn restart_cell_still_cancels_the_squads_worker_even_when_the_target_cells_own_row_already_reads_done()
+     {
+        use crate::cancel::CancelToken;
+        use crate::runner::{RunnerResult, RunnerSpec};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\ncommand=\"check\"\n";
+
+        /// Blocks in `run_cancellable`, polling `cancel` like a real
+        /// subprocess-backed cell would, so the test can observe whether
+        /// the restart route actually cancels the still-live worker.
+        struct BlockingRunner {
+            started: Arc<AtomicBool>,
+            observed_cancel: Arc<AtomicBool>,
+        }
+
+        impl Runner for BlockingRunner {
+            fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+                RunnerResult::failure("unused")
+            }
+            fn run_cancellable(&self, _spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+                self.started.store(true, Ordering::SeqCst);
+                for _ in 0..1000 {
+                    if cancel.is_cancelled() {
+                        self.observed_cancel.store(true, Ordering::SeqCst);
+                        return RunnerResult::failure("cancelled");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                RunnerResult {
+                    status: "done".to_string(),
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cost_usd: 0.0,
+                    summary: "never cancelled".to_string(),
+                    error: None,
+                    proofed: None,
+                    agent_session_id: None,
+                    ghost: None,
+                }
+            }
+        }
+
+        let d = daemon();
+        let r = route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        assert_eq!(r.status, 201);
+        let squad_id = "squad-000000000001".to_string();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn Runner> = Arc::new(BlockingRunner {
+            started: Arc::clone(&started),
+            observed_cancel: Arc::clone(&observed_cancel),
+        });
+
+        let store = d.store_handle();
+        let cancellations = d.cancellations_handle();
+        let worker = {
+            let (store, runner, cancellations, squad_id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                cancellations.clone(),
+                squad_id.clone(),
+            );
+            std::thread::spawn(move || {
+                let token = cancellations.register(&squad_id);
+                crate::scheduler::execute_squad_with(
+                    &store,
+                    runner.as_ref(),
+                    &squad_id,
+                    &token,
+                    &cancellations,
+                );
+                cancellations.remove(&squad_id);
+            })
+        };
+
+        while !started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // The exact blind spot: force the target cell's own row to `Done`
+        // and its cell-scoped proof step's row to `Running` -- standing in
+        // for "the cell body finished but its own proof step, driven by
+        // the same still-blocked worker, is still running" -- which the
+        // old cell-state-only heuristic misread as safe to skip
+        // cancellation for entirely.
+        {
+            let guard = d.lock();
+            guard
+                .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+                .unwrap();
+            guard
+                .set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Running)
+                .unwrap();
+        }
+
+        let rr = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/restart"),
+            "",
+        );
+        assert_eq!(rr.status, 200);
+
+        worker.join().unwrap();
+
+        assert!(
+            observed_cancel.load(Ordering::SeqCst),
+            "restarting a cell must still cancel the squad's own live \
+             worker even when the target cell's own row already reads a \
+             non-Running state"
+        );
+    }
+
     #[test]
     fn add_dependency_route_appends_and_gates_readiness() {
         let d = daemon();
@@ -12126,27 +12778,6 @@ command = "true"
         );
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"skip_auto_build\":false"));
-    }
-
-    #[test]
-    fn guardian_skip_worktree_checks_via_create_and_settings() {
-        // RAL-110: the two split flags round-trip independently.
-        let d = daemon();
-        let body = serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo","skip_worktree_checks":true})
-            .to_string();
-        route(&d, "POST", "/api/guardians", &body);
-        let gid = "guardian-000000000001";
-        let get_body = route(&d, "GET", &format!("/api/guardians/{gid}"), "").body;
-        assert!(get_body.contains("\"skip_worktree_checks\":true"));
-        assert!(get_body.contains("\"skip_auto_build\":false"));
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/guardians/{gid}/settings"),
-            "{\"skip_worktree_checks\":false}",
-        );
-        assert_eq!(r.status, 200);
-        assert!(r.body.contains("\"skip_worktree_checks\":false"));
     }
 
     #[test]
@@ -12983,6 +13614,98 @@ command = "true"
         let body = serde_json::json!({"set": {"A": "1"}}).to_string();
         let r = route(&d, "POST", "/api/squads/squad-1/cells/x/0/env", &body);
         assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn strip_ralphus_pane_markers_drops_event_and_done_lines_only() {
+        let text = "Claude Code · model=sonnet\n\
+             RALPHUS_EVENT: {\"source\":\"claude-code\",\"message\":\"hi\"}\n\
+             [tool] Bash(command=\"ls\")\n\
+             RALPHUS_TMUX_DONE: done\n\
+             final assistant text";
+        assert_eq!(
+            strip_ralphus_pane_markers(text),
+            "Claude Code · model=sonnet\n[tool] Bash(command=\"ls\")\nfinal assistant text"
+        );
+    }
+
+    #[test]
+    fn strip_ralphus_pane_markers_matches_only_a_line_start_not_a_mid_line_occurrence() {
+        // An agent quoting/grepping these exact strings in its own output
+        // must not have that output misclassified as a ralphus marker.
+        let text = "the code searches for RALPHUS_EVENT: prefixed lines";
+        assert_eq!(strip_ralphus_pane_markers(text), text);
+    }
+
+    #[test]
+    fn strip_ralphus_pane_markers_tolerates_leading_whitespace() {
+        let text = "  RALPHUS_EVENT: {}\nkept line";
+        assert_eq!(strip_ralphus_pane_markers(text), "kept line");
+    }
+
+    #[test]
+    fn strip_ralphus_pane_markers_empty_input_stays_empty() {
+        assert_eq!(strip_ralphus_pane_markers(""), "");
+    }
+
+    #[test]
+    fn cell_debug_events_lists_only_this_cells_cartographer_rows() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nagent=\"claude-code\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"b\"\ncwd=\"/r2\"\nagent=\"claude-code\"\nprompt=\"p2\"\n";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        {
+            let store = d.lock();
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "llm start",
+                scope: Some("cell"),
+                squad_id: Some("squad-000000000001"),
+                guardian_id: None,
+                cell_id: Some("a"),
+                task: Some("t"),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "llm start (other cell)",
+                scope: Some("cell"),
+                squad_id: Some("squad-000000000001"),
+                guardian_id: None,
+                cell_id: Some("b"),
+                task: Some("t"),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+        }
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/0/debug-events",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let entries: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["message"], "llm start");
+    }
+
+    #[test]
+    fn cell_debug_events_missing_cell_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/9/debug-events",
+            "",
+        );
+        assert_eq!(r.status, 404);
     }
 
     #[test]

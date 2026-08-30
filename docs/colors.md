@@ -46,6 +46,7 @@ role in the table below, then use it.
 | `--drift` | `#f0883e` | *(shared)* | semantic (a submitted PR's remote branch and its review worktree have diverged, RAL-190) |
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
 | `--out-of-date` | `#d4a72c` | *(shared)* | semantic (a task/cell/proof step's env overrides changed since it last ran, RAL-271) |
+| `--detached` | `#d2a8ff` | *(shared)* | semantic (a cell cleanly stopped mid-task for a real interactive agent session to take over, not Done/Failed/Cancelled, RAL-288) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -209,6 +210,22 @@ status), or `--drift` (reserved for PR/worktree divergence, RAL-190,
 a different concept even though both are "stored state diverged from
 current"); `--out-of-date` exists only because no existing role fit this
 new concept (see "Adding a new UI element" below).
+
+### Detached cell — `--detached` only (RAL-288)
+A task cell's status pill grows a `⏸ detached` badge while it reads `running`
+but has actually been cleanly stopped for a human's real interactive agent
+session to take over (the "Open Agent" action). The cell is not stuck or
+stalled — its Live View pane legitimately goes quiet and shows the historical
+record of the now-ended headless process, since the live conversation moved
+to a separate tmux session outside the daemon's own polling — but the cell
+itself has not failed, finished, or been cancelled either, so it deliberately
+does not reuse `--stale` (reserved for a *still headlessly running* cell that
+has gone quiet, a different and more alarming situation), `--ignored`
+(reserved for the real `ignored` status), or `--muted` (would read as "just a
+normal read-only field", losing the signal entirely); `--detached` exists
+only because no existing role fit this new concept (see "Adding a new UI
+element" below). Clears automatically the next time the cell is dispatched
+(a restart, or the explicit resume-automation trigger).
 
 ### Inherited resolved value — italic text only (no new color)
 A detail-pane field whose displayed value is a resolved fallback from a parent

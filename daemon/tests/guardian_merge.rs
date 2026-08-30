@@ -1083,15 +1083,15 @@ fn skip_auto_build_opts_out_of_ai_inferred_build_too() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// RAL-110: `skip_worktree_checks` is an independent axis from `skip_auto_build`
+// RAL-285: Proof scope "nothing" is an independent axis from `skip_auto_build`
 // -- it must not affect the finalize-time AI-inferred auto-build.
 #[test]
-fn skip_worktree_checks_does_not_affect_auto_build() {
+fn proof_scope_nothing_does_not_affect_auto_build() {
     let (root, store, id) = single_feature_repo();
     store
         .lock()
         .unwrap()
-        .set_guardian_skip_worktree_checks(&id, true)
+        .set_guardian_proof_scope(&id, Some("nothing"))
         .unwrap();
     run_merge(&store, &InferredBuildRunner, &id);
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
@@ -1099,22 +1099,22 @@ fn skip_worktree_checks_does_not_affect_auto_build() {
     assert_eq!(
         view.detail.as_deref(),
         Some("auto-built via inferred build command: echo built > built_marker.txt"),
-        "skip_worktree_checks must not suppress the auto-build tier"
+        "proof_scope=\"nothing\" must not suppress the auto-build tier"
     );
     let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
     assert!(combined.join("built_marker.txt").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Regression: `skip_worktree_checks` must suppress the dedicated
+// Regression: Proof scope "nothing" must suppress the dedicated
 // `run_final_proof` call itself, not just the quality-bar instructions
-// handed to it (RAL-110 vs RAL-168/RAL-149 were previously independent
-// axes). Exercises both `ProofGate` call sites in one pass:
-// feature/x rebases cleanly onto main but contributes real changes
-// (`allows_for_clean_branch`), and feature/y then conflicts against it and is
-// resolved by the fake agent (`allows_after_conflict`).
+// handed to it (RAL-285 closed the gap where the quality-bar prompt was
+// still synthesized regardless of scope). Exercises both `ProofGate` call
+// sites in one pass: feature/x rebases cleanly onto main but contributes
+// real changes (`allows_for_clean_branch`), and feature/y then conflicts
+// against it and is resolved by the fake agent (`allows_after_conflict`).
 #[test]
-fn skip_worktree_checks_suppresses_final_verify() {
+fn proof_scope_nothing_suppresses_final_verify() {
     let root = temp_repo();
     init_repo(&root);
     write(&root, "conflict.txt", "line1\nBASE\nline3\n");
@@ -1139,7 +1139,7 @@ fn skip_worktree_checks_suppresses_final_verify() {
             .unwrap();
         g.add_guardian_branch(&id, "feature/x").unwrap();
         g.add_guardian_branch(&id, "feature/y").unwrap();
-        g.set_guardian_skip_worktree_checks(&id, true).unwrap();
+        g.set_guardian_proof_scope(&id, Some("nothing")).unwrap();
         id
     };
 
@@ -1217,7 +1217,7 @@ fn skip_worktree_checks_suppresses_final_verify() {
     let specs = captured.lock().unwrap();
     assert!(
         specs.iter().all(|s| s.task != "resolve-proof"),
-        "skip_worktree_checks must suppress the dedicated final-proof call, \
+        "proof_scope=\"nothing\" must suppress the dedicated final-proof call, \
          but a resolve-proof spec was issued: {specs:?}"
     );
 
@@ -3885,14 +3885,12 @@ fn pull_pr_commits_is_a_noop_when_already_up_to_date() {
 /// call behaves like the plain marker-stripping runner used elsewhere in this
 /// file, so the restarted attempt actually completes.
 ///
-/// `proof_scope` (not `skip_worktree_checks` — that setting only trims the
-/// resolver's quality-bar note, it does not gate whether the dedicated
-/// "resolve-proof" call runs at all) is the setting flipped mid-flight here,
-/// to "nothing": the first (stuck) attempt never gets far enough to invoke
-/// "resolve-proof" for `feature/y` at all (it is still blocked resolving
-/// markers), so the only way this test's "no resolve-proof call ever ran"
-/// assertion can pass is if the *restarted* attempt actually observed the new
-/// setting rather than the "each_branch" default it started with.
+/// `proof_scope` is the setting flipped mid-flight here, to "nothing": the
+/// first (stuck) attempt never gets far enough to invoke "resolve-proof" for
+/// `feature/y` at all (it is still blocked resolving markers), so the only
+/// way this test's "no resolve-proof call ever ran" assertion can pass is if
+/// the *restarted* attempt actually observed the new setting rather than the
+/// "each_branch" default it started with.
 #[test]
 fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
     let root = temp_repo();

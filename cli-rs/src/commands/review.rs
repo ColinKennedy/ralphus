@@ -62,7 +62,6 @@ pub enum ReviewCommand {
         git_root: String,
         checks: Option<String>,
         skip_auto_build: bool,
-        skip_worktree_checks: bool,
         skip_worktrees: bool,
         review_type: Option<String>,
     },
@@ -80,7 +79,6 @@ pub enum ReviewCommand {
     Settings {
         selector: String,
         skip_auto_build: Option<bool>,
-        skip_worktree_checks: Option<bool>,
         skip_worktrees: Option<bool>,
         resolver_agent: Option<String>,
         resolver_model: Option<String>,
@@ -262,7 +260,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("create") => {
             let checks = scanner.take_value("--checks").ok().flatten();
             let skip_auto_build = scanner.take_bool("--skip-auto-build");
-            let skip_worktree_checks = scanner.take_bool("--skip-worktree-checks");
             let skip_worktrees = scanner.take_bool("--skip-worktrees");
             let review_type = scanner.take_value("--review-type").ok().flatten();
             let rest = scanner.remaining();
@@ -273,7 +270,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                     git_root: git_root.clone(),
                     checks,
                     skip_auto_build,
-                    skip_worktree_checks,
                     skip_worktrees,
                     review_type,
                 },
@@ -299,7 +295,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         }
         Some("settings") => {
             let skip_auto_build = take_tri_bool(&mut scanner, "--skip-auto-build");
-            let skip_worktree_checks = take_tri_bool(&mut scanner, "--skip-worktree-checks");
             let skip_worktrees = take_tri_bool(&mut scanner, "--skip-worktrees");
             let resolver_agent = scanner.take_value("--resolver-agent").ok().flatten();
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
@@ -311,7 +306,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
-                skip_worktree_checks,
                 skip_worktrees,
                 resolver_agent,
                 resolver_model,
@@ -903,6 +897,11 @@ edit, delete, commit, or push anything.";
 fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str) -> Vec<String> {
     let mut cmd: Vec<String>;
     if matches!(agent, Some("codex") | Some("codex-cli")) {
+        // The top-level interactive `codex resume`, not `codex exec resume`
+        // (Codex's non-interactive headless mode, which requires a prompt
+        // argument or piped stdin and fails immediately with "No prompt
+        // provided" otherwise -- exactly the reported symptom of resuming
+        // this way into an interactive terminal with nothing to pipe in).
         cmd = vec!["codex".to_string()];
         if mode == "readonly" {
             cmd.push("-c".to_string());
@@ -910,7 +909,6 @@ fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str)
                 "developer_instructions={READONLY_RESUME_INSTRUCTIONS}"
             ));
         }
-        cmd.push("exec".to_string());
         cmd.push("resume".to_string());
         cmd.push(agent_session_id.to_string());
     } else if matches!(agent, Some("pi")) {
@@ -1101,7 +1099,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             git_root,
             checks,
             skip_auto_build,
-            skip_worktree_checks,
             skip_worktrees,
             review_type,
         } => run_and_report(opts, None, || {
@@ -1119,7 +1116,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 &git_root,
                 Some(&checks_vec),
                 skip_auto_build,
-                skip_worktree_checks,
                 skip_worktrees,
                 review_type.as_deref(),
             )?;
@@ -1158,7 +1154,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         ReviewCommand::Settings {
             selector,
             skip_auto_build,
-            skip_worktree_checks,
             skip_worktrees,
             resolver_agent,
             resolver_model,
@@ -1171,7 +1166,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
                 skip_auto_build,
-                skip_worktree_checks,
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
@@ -2189,13 +2183,6 @@ fn render_review_detail(g: &Value) {
         g["skip_auto_build"].as_bool().unwrap_or(false).to_string(),
     ));
     rows.push((
-        "skip_worktree_checks",
-        g["skip_worktree_checks"]
-            .as_bool()
-            .unwrap_or(false)
-            .to_string(),
-    ));
-    rows.push((
         "skip_worktrees",
         g["skip_worktrees"].as_bool().unwrap_or(false).to_string(),
     ));
@@ -2992,7 +2979,7 @@ mod tests {
     fn agent_resume_command_matches_session_rs_behavior() {
         assert_eq!(
             agent_resume_command(Some("codex"), "s1", "open"),
-            vec!["codex", "exec", "resume", "s1"]
+            vec!["codex", "resume", "s1"]
         );
         assert_eq!(
             agent_resume_command(Some("pi"), "s1", "open"),

@@ -328,10 +328,53 @@ pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
     Some(value)
 }
 
+/// Byte offset of the `>>` that closes the `<<` whose body starts at
+/// `body_start`, or `None` when the run is unterminated.
+///
+/// Nested `<<...>>` pairs inside the body are matched and skipped, so
+/// `<<ralphus:new-worktree/feat?upstream=<<default>>>>` yields a body of
+/// `ralphus:new-worktree/feat?upstream=<<default>>` rather than stopping at
+/// the inner sentinel's `>>`. When the body contains a `<<` that is never
+/// balanced, the scan falls back to the first `>>` so that a lone stray `<<`
+/// inside otherwise-literal text still terminates the placeholder where it
+/// always did.
+#[must_use]
+pub fn placeholder_close(text: &str, body_start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut cursor = body_start;
+    let mut first_close = None;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let open_at = rest.find("<<").map(|i| cursor + i);
+        let Some(close_at) = rest.find(">>").map(|i| cursor + i) else {
+            break;
+        };
+        if first_close.is_none() {
+            first_close = Some(close_at);
+        }
+        match open_at {
+            Some(open) if open < close_at => {
+                depth += 1;
+                cursor = open + 2;
+            }
+            _ => {
+                if depth == 0 {
+                    return Some(close_at);
+                }
+                depth -= 1;
+                cursor = close_at + 2;
+            }
+        }
+    }
+    first_close
+}
+
 /// Find every `<<...>>` placeholder body embedded in `text`, in order.
 ///
 /// Unterminated `<<...` runs are ignored and left to callers as literal text.
-/// The returned slices exclude the surrounding `<<` / `>>` delimiters.
+/// The returned slices exclude the surrounding `<<` / `>>` delimiters, and a
+/// nested `<<...>>` (e.g. a `?upstream=<<default>>` sentinel inside a wrapped
+/// worktree marker) stays part of the outer body -- see [`placeholder_close`].
 #[must_use]
 pub fn text_placeholders(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -339,10 +382,9 @@ pub fn text_placeholders(text: &str) -> Vec<&str> {
     while let Some(open_rel) = text[offset..].find("<<") {
         let open = offset + open_rel;
         let body_start = open + 2;
-        let Some(close_rel) = text[body_start..].find(">>") else {
+        let Some(close) = placeholder_close(text, body_start) else {
             break;
         };
-        let close = body_start + close_rel;
         out.push(&text[body_start..close]);
         offset = close + 2;
     }
@@ -1290,6 +1332,41 @@ mod tests {
         );
         assert_eq!(text_placeholders("<<one>><<two>>"), vec!["one", "two"]);
         assert!(text_placeholders("<<unterminated").is_empty());
+    }
+
+    #[test]
+    fn text_placeholders_keeps_a_nested_sentinel_inside_the_outer_body() {
+        assert_eq!(
+            text_placeholders("<<ralphus:new-worktree/feat?upstream=<<default>>>>"),
+            vec!["ralphus:new-worktree/feat?upstream=<<default>>"]
+        );
+        assert_eq!(
+            text_placeholders(
+                "a <<ralphus:new-worktree/feat?upstream=<<current_branch>>>> b <<task:x>> c"
+            ),
+            vec![
+                "ralphus:new-worktree/feat?upstream=<<current_branch>>",
+                "task:x"
+            ]
+        );
+        // An unbalanced inner `<<` still terminates at the first `>>`, so
+        // stray literal text behaves exactly as it did before nesting.
+        assert_eq!(text_placeholders("<<a<<b>>"), vec!["a<<b"]);
+        assert_eq!(text_placeholders("<<a<<b>>c"), vec!["a<<b"]);
+    }
+
+    #[test]
+    fn first_worktree_placeholder_in_text_finds_a_nested_sentinel_form() {
+        let wrapped = "<<ralphus:new-worktree/feat?upstream=<<default>>>>";
+        assert_eq!(
+            first_worktree_placeholder_in_text(wrapped),
+            Some("ralphus:new-worktree/feat?upstream=<<default>>")
+        );
+        assert_eq!(
+            first_worktree_placeholder_in_text(wrapped)
+                .and_then(parse_worktree_placeholder_upstream),
+            Some(WORKTREE_UPSTREAM_DEFAULT)
+        );
     }
 
     #[test]
