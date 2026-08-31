@@ -42,7 +42,7 @@ branch order relates to task dependencies.
 ## The board
 
 Everything above is visible on one live web board, polling the daemon every
-couple of seconds. It has four tabs:
+couple of seconds. It has eight tabs:
 
 | Tab | What it's for |
 |---|---|
@@ -50,3 +50,7 @@ couple of seconds. It has four tabs:
 | [Queue](views/queue.md) | Reordering priority among everything currently ready to run. |
 | [Reviews](views/reviews.md) | Guardian merge reviews: branch stacking, conflict resolution, check gates, per-branch feedback. |
 | [Resources](views/resources.md) | Live CPU/RAM/GPU usage per running cell. |
+| [Logs](views/cartographer.md) | The unified Cartographer event log, filterable and drillable. |
+| [Projects](views/projects.md) | Registered git repositories a task's cell `cwd` can materialize a worktree under. |
+| [Machines](views/machines.md) | Registered providers that remote tasks, cells, and proof steps run on. |
+| [Users](views/users.md) | Placeholder identities a request can attribute itself to (not authentication). |

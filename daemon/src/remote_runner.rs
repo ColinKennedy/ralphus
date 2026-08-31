@@ -1134,6 +1134,7 @@ mod tests {
             assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: machine.map(str::to_string),
+            tool_arg_truncate_chars: None,
         }
     }
 

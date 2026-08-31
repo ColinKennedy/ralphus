@@ -88,7 +88,7 @@ fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> TaskCommand) -> 
 /// Python -- ported as a plain `Result` since `run_and_report`/`CommandError`
 /// already own the print-and-exit-code step here, rather than each handler
 /// printing inline the way the Python version does.
-fn resolve_scoped(
+pub fn resolve_scoped(
     client: &DaemonClient,
     selector: &str,
     want_kind: &str,
@@ -103,7 +103,7 @@ fn resolve_scoped(
     Ok(resolved)
 }
 
-fn with_uri(mut payload: Value, uri: String) -> Value {
+pub fn with_uri(mut payload: Value, uri: String) -> Value {
     if let Value::Object(map) = &mut payload {
         let mut ordered = serde_json::Map::new();
         ordered.insert("uri".to_string(), Value::String(uri));

@@ -222,6 +222,18 @@ impl Runner for NamedFeedbackRunner {
 
 fn init_repo(root: &Path) {
     git(root, &["init", "-b", "main"]);
+    // The guardian merge engine under test shells out through
+    // `GitVcs::exec_raw`, which (correctly, for real repos) never injects an
+    // identity -- so every one of these throwaway repos needs one in local
+    // config, not just on this file's own `git()` helper's per-invocation
+    // env vars, or a commit created deep inside conflict resolution/rebase
+    // fails identity checks on a CI runner with no global gitconfig. Also
+    // pin core.autocrlf off: a Windows runner's default of `true` would
+    // otherwise silently rewrite fixture file content on checkout/rebase,
+    // corrupting the exact-content assertions throughout this suite.
+    git(root, &["config", "user.name", "ralphus"]);
+    git(root, &["config", "user.email", "ralphus@example.com"]);
+    git(root, &["config", "core.autocrlf", "false"]);
 }
 
 fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String) {
@@ -1417,6 +1429,74 @@ fn base_branch_shift_triggers_rebuild() {
     assert!(
         !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
         "no rebuild when base is unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-300: when the base branch's shift IS the review's own work landing (a
+// fast-forward merge that happened outside any tracked PR), the base
+// shift is not new upstream work to rebase onto -- it must approve the
+// review instead of wasting a rebuild against a base that already has it.
+#[test]
+fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(before.status, "in_review");
+    let review_branch = before.branches[0]
+        .review_branch
+        .clone()
+        .expect("review branch built");
+
+    // Simulate the feature landing on `main` directly (outside any tracked
+    // PR): fast-forward main to the review branch's own tip.
+    git(&root, &["checkout", "main"]);
+    git(&root, &["merge", "--ff-only", &review_branch]);
+
+    let sem = Semaphore::new(4);
+    // `rebuild_on_base_shift` reports `true` here too (it "handled" the base
+    // shift, just by approving instead of rebuilding) -- what actually
+    // matters is the guardian's status below, not this return value.
+    rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        after.status, "approved",
+        "must approve instead of rebuilding: detail {:?}",
+        after.detail
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let branch = &before.branches[0];
+    let review_branch = branch.review_branch.as_deref().expect("review branch");
+    let worktree = branch.worktree.as_deref().expect("review worktree");
+
+    git(Path::new(worktree), &["branch", "landed", "HEAD"]);
+    git(
+        Path::new(worktree),
+        &["branch", "--set-upstream-to=landed", review_branch],
+    );
+
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &id,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert!(reply.body.contains("\"status\":\"approved\""));
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "approved"
     );
 
     let _ = std::fs::remove_dir_all(&root);

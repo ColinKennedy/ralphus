@@ -353,6 +353,13 @@ pub struct TaskView {
     pub model: Option<String>,
     /// Current state string.
     pub state: String,
+    /// Failure detail, for a task that failed for a task-level reason with
+    /// no underlying cell/proof error to point to (RAL-291) -- e.g. the
+    /// RAL-156 no-commits-since-baseline guard. Mirrors [`CellView::error`]'s
+    /// shape and lifecycle exactly. `None` when the task hasn't failed this
+    /// way, including when it failed because one of its own cells/proofs
+    /// did (that failure is already visible on the cell/proof itself).
+    pub error: Option<String>,
     /// Cells in the task.
     pub cells: Vec<CellView>,
     /// Task-level proof steps.
@@ -542,6 +549,15 @@ pub struct Store {
     /// `Store::clear_live_activity`) once the owning `run_via_tmux` call has
     /// a terminal result, so a *new* attempt/cell can be escalated again.
     stall_escalated: HashMap<String, i64>,
+    /// RAL-281: process-lifetime cache of `secret_env_names`, `None` when
+    /// invalidated by a mutation. See `crate::secret_env_names`'s module doc
+    /// comment for why this exists (the scheduler's per-cell/per-proof-step
+    /// env-merge choke point reads it on every dispatch, so it must not cost
+    /// a DB query per call). Scoped to this `Store` instance (not a global
+    /// static) so it can't leak between the daemon's one real DB and the many
+    /// independent in-memory stores each test opens.
+    pub(crate) secret_env_names_cache:
+        std::sync::RwLock<Option<std::collections::BTreeSet<String>>>,
 }
 
 /// RAL-208: see [`Store::guardian_summary_debounce`].
@@ -556,6 +572,10 @@ struct GuardianSummaryDebounce {
     /// enable/disable toggle instead of accumulating separate pending jobs.
     pending_signature: Option<String>,
     pending_requested_at_ms: Option<i64>,
+    /// RAL-303: whether this daemon process has already tried to repair a
+    /// guardian left with no LLM-authored summary. See
+    /// [`Self::claim_final_summary_repair`].
+    repair_attempted: bool,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -622,6 +642,7 @@ impl Store {
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
             stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
         };
         store.init_schema()?;
         #[cfg(unix)]
@@ -638,6 +659,7 @@ impl Store {
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
             stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
         };
         store.init_schema()?;
         Ok(store)
@@ -651,6 +673,19 @@ impl Store {
     }
 
     fn init_schema(&self) -> Result<()> {
+        // RAL-281: captured *before* the `CREATE TABLE IF NOT EXISTS` below so
+        // the default seed (after the batch) runs exactly once, at first-ever
+        // creation -- a user who deletes every default entry must not see them
+        // silently reappear on the next daemon restart.
+        let secret_env_names_preexisting: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='secret_env_names'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -682,7 +717,6 @@ impl Store {
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
                 no_commit_required INTEGER NOT NULL DEFAULT 0,
-                baseline_commit_sha TEXT,
                 PRIMARY KEY (squad_id, idx)
             );
             CREATE TABLE IF NOT EXISTS cells (
@@ -871,6 +905,14 @@ impl Store {
                 name          TEXT PRIMARY KEY,
                 created_at_ms INTEGER NOT NULL
             );
+            -- RAL-281: user-editable list of env-var *names* treated as secret,
+            -- additive to the value-based `crate::redact` registry (RAL-264).
+            -- See `crate::secret_env_names`'s module doc comment for how this is
+            -- consulted and cached.
+            CREATE TABLE IF NOT EXISTS secret_env_names (
+                name          TEXT PRIMARY KEY,
+                created_at_ms INTEGER NOT NULL
+            );
             -- RAL-185: the machine provider registry. A machine value of the form
             -- scheme:uri looks `scheme` up here to find the executable the daemon
             -- runs; `uri` is opaque and handed to that executable verbatim.
@@ -1023,6 +1065,14 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_mailbox_drains_client ON mailbox_drains(client_id);
             ",
         )?;
+        if !secret_env_names_preexisting {
+            for name in crate::secret_env_names::DEFAULT_SECRET_ENV_NAMES {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO secret_env_names(name, created_at_ms) VALUES(?,?)",
+                    params![name, now_ms()],
+                )?;
+            }
+        }
         // Best-effort migrations for databases created before these columns
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
@@ -1213,12 +1263,9 @@ impl Store {
             // whose push has not completed yet -- both fall back to a
             // merge-base computation instead of a recorded baseline.
             "ALTER TABLE guardian_pull_requests ADD COLUMN last_pushed_sha TEXT",
-            // RAL-156: opt-out from the automatic no-new-commits-since-baseline
-            // guard the finalizer runs for git-backed tasks, and the baseline
-            // commit sha captured at task start (first cell to reach
-            // Running) that guard compares each cell's cwd HEAD against.
+            // RAL-156: opt-out from the automatic no-new-commits guard the
+            // finalizer runs for git-backed tasks.
             "ALTER TABLE tasks ADD COLUMN no_commit_required INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE tasks ADD COLUMN baseline_commit_sha TEXT",
             // The GitHub-native PR stack number registered for this guardian's
             // chain of stacked PRs (`pr::submit_stack_for_guardian`), once 2+
             // branches have been submitted. NULL for GitLab reviews (no
@@ -1435,6 +1482,17 @@ impl Store {
             // so neither direction thrashes the other on its next pass — see
             // `pr::poll_pr_base_drift`.
             "ALTER TABLE guardian_pull_requests ADD COLUMN last_pushed_base_ref TEXT",
+            // RAL-302: identifies which single "submit a stack" call created a
+            // PR row, so a past submission's sibling branches are queryable as
+            // one group instead of guessed at via timestamp proximity. NULL
+            // for a row created before this column existed.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN stack_id TEXT",
+            // RAL-302: `settle_pr_merge_states` used to hard-DELETE a PR row
+            // once its linked PR merged out-of-band mid-flight (RAL-300),
+            // which lost the history a "view past PR stacks" screen needs.
+            // It now soft-deletes by setting `state='dropped'` and recording
+            // why here, leaving the row (and its `stack_id` grouping) queryable.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN dropped_reason TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1558,6 +1616,27 @@ impl Store {
                 "ALTER TABLE guardian_pull_requests DROP COLUMN branch_position",
                 [],
             );
+        }
+        // RAL-293: the no-new-commits guard now reads a worktree's own
+        // `@{upstream}` live (`crate::reviews::worktree_has_commits_ahead_of_upstream`)
+        // instead of comparing HEAD against a squad-run-scoped baseline sha
+        // captured once at cell-start -- the baseline approach falsely failed
+        // a task whose worktree was reused across squad runs, since the
+        // baseline was captured *after* an earlier run's real commit already
+        // landed. No backfill needed: the column held only a transient,
+        // run-scoped value, never anything worth preserving. Same
+        // guard-on-column-existing idiom as the `skip_checks` block above, so
+        // the DROP runs exactly once.
+        let has_old_baseline_commit_sha = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='baseline_commit_sha'")
+            .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+            .unwrap_or(None)
+            .is_some();
+        if has_old_baseline_commit_sha {
+            let _ = self
+                .conn
+                .execute("ALTER TABLE tasks DROP COLUMN baseline_commit_sha", []);
         }
         Ok(())
     }
@@ -2184,6 +2263,23 @@ impl Store {
         Ok(())
     }
 
+    /// Set (or clear) a task's failure-detail message (RAL-291), mirroring
+    /// [`Store::record_cell_outcome`]'s `error` write at task granularity.
+    /// Callers are task-level failure paths with no underlying cell/proof
+    /// error to point to (e.g. `check_task_no_commits_guard` in the
+    /// scheduler); a task failed by a child cell/proof failure never calls
+    /// this. Cleared back to `None` by every "reset this task to Pending"
+    /// site (`restart_task`, `restart_cell`, `restart_cell_proof`,
+    /// `restart_task_proof`, `revive_failed_downstream_cells`,
+    /// `reset_squad_to_pending`), same lifecycle as `cells.error`.
+    pub fn set_task_error(&self, squad_id: &str, task_idx: i64, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET error=? WHERE squad_id=? AND idx=?",
+            params![error, squad_id, task_idx],
+        )?;
+        Ok(())
+    }
+
     /// Solo a task within a squad (RAL-157): while any task in the squad is
     /// soloed, the scheduler's dispatcher only starts cells belonging to a
     /// soloed task — every other task's not-yet-started cells stay
@@ -2483,7 +2579,7 @@ impl Store {
         env_overrides: BTreeMap<String, String>,
     ) -> Result<SquadView> {
         let mut tstmt = self.conn.prepare(
-            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date
+            "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date, error
              FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
         let task_rows = tstmt
@@ -2502,6 +2598,7 @@ impl Store {
                     r.get::<_, Option<i64>>(10)?,
                     r.get::<_, Option<i64>>(11)?,
                     r.get::<_, bool>(12)?,
+                    r.get::<_, Option<String>>(13)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2532,6 +2629,7 @@ impl Store {
             t_started,
             t_finished,
             t_env_out_of_date,
+            t_error,
         ) in task_rows
         {
             let cells = cells_by_task.remove(&t_idx).unwrap_or_default();
@@ -2548,6 +2646,7 @@ impl Store {
                 agent,
                 model,
                 state: tstate,
+                error: t_error,
                 cells,
                 proof,
                 depends_on: from_json(&deps),
@@ -3384,10 +3483,10 @@ pub struct TaskRow {
     pub soloed: bool,
 }
 
-/// What the finalizer's no-new-commits-since-baseline guard (RAL-156) needs
-/// to decide whether a task passes: its registered project (to check
-/// git-ness), its `no_commit_required` opt-out, and the baseline commit sha
-/// captured at task start. See [`Store::task_commit_guard_info`].
+/// What the finalizer's no-new-commits guard (RAL-156, RAL-293-amended)
+/// needs to decide whether a task passes: its registered project (to check
+/// git-ness) and its `no_commit_required` opt-out. See
+/// [`Store::task_commit_guard_info`].
 #[derive(Debug, Clone)]
 pub struct TaskCommitGuardInfo {
     /// Registered project name, if any. `None` means the task isn't
@@ -3395,10 +3494,6 @@ pub struct TaskCommitGuardInfo {
     pub project: Option<String>,
     /// Opts the task out of the guard entirely (RAL-156 Q4).
     pub no_commit_required: bool,
-    /// The task-scoped baseline commit sha captured at task start, or `None`
-    /// if no cell has captured one yet (e.g. no cell has started, or
-    /// none could resolve a `HEAD`).
-    pub baseline_commit_sha: Option<String>,
 }
 
 /// The full set of entities a restart would dirty (RAL-104): cells/tasks
@@ -3526,30 +3621,17 @@ impl Store {
     ) -> Result<Option<TaskCommitGuardInfo>> {
         self.conn
             .query_row(
-                "SELECT project, no_commit_required, baseline_commit_sha FROM tasks WHERE squad_id=? AND idx=?",
+                "SELECT project, no_commit_required FROM tasks WHERE squad_id=? AND idx=?",
                 params![squad_id, task_idx],
                 |r| {
                     Ok(TaskCommitGuardInfo {
                         project: r.get(0)?,
                         no_commit_required: r.get::<_, i64>(1)? != 0,
-                        baseline_commit_sha: r.get(2)?,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
-    }
-
-    /// Capture a task's RAL-156 baseline commit sha, the first time only:
-    /// a no-op if this task already has one (`baseline_commit_sha IS NULL` in
-    /// the WHERE clause), so whichever of the task's cells reaches
-    /// `Running` first wins and later cells never clobber it.
-    pub fn set_task_baseline_commit(&self, squad_id: &str, task_idx: i64, sha: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tasks SET baseline_commit_sha=?1 WHERE squad_id=?2 AND idx=?3 AND baseline_commit_sha IS NULL",
-            params![sha, squad_id, task_idx],
-        )?;
-        Ok(())
     }
 
     /// The cross-squad dependency references declared in the squad's `[[default]]`.
@@ -4444,7 +4526,7 @@ impl Store {
             params![now_ms(), squad_id],
         )?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
+            "UPDATE tasks SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         self.conn.execute(
@@ -4835,7 +4917,7 @@ impl Store {
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending', started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND idx=?",
+                "UPDATE tasks SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND idx=?",
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
@@ -4962,7 +5044,7 @@ impl Store {
         }
         for t in &impact.tasks {
             self.conn.execute(
-                "UPDATE tasks SET state='pending', env_out_of_date=0 WHERE squad_id=? AND idx=?",
+                "UPDATE tasks SET state='pending', error=NULL, env_out_of_date=0 WHERE squad_id=? AND idx=?",
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
@@ -5420,6 +5502,43 @@ impl Store {
         Ok(())
     }
 
+    /// Hands a `Detached` cell back to headless automation
+    /// (`server::resume_automation`, RAL-288 Stage 6) by resetting *only*
+    /// that cell's own row to `pending` -- deliberately not
+    /// [`Store::restart_cell`]'s squad/task/downstream-impact machinery,
+    /// which exists for a genuine restart-from-scratch and would incorrectly
+    /// touch sibling tasks, the squad's own row, and cross-squad dependents
+    /// for what is really just handing a still-in-progress conversation back
+    /// to automation. A detach never reaches `run_proofs` or records an
+    /// `error`, so neither needs resetting here; `detached_at_ms` is cleared
+    /// separately, at actual re-dispatch time (see
+    /// [`Store::clear_cell_detached`]).
+    pub fn resume_detached_cell(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT idx FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        self.conn.execute(
+            "UPDATE cells SET state='pending' WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        let _ = self.log_event(
+            Some(squad_id),
+            None,
+            "cell",
+            Some(&format!("{task_idx}/{idx}")),
+            "resumed (resume-automation)",
+        );
+        Ok(())
+    }
+
     /// Marks a cell so its *next* dispatch resumes its own previously
     /// recorded `agent_session_id` instead of starting fresh (RAL-288 Stage
     /// 6) -- see `force_resume_own_session`'s migration comment for why this
@@ -5652,12 +5771,18 @@ impl Store {
     /// from re-firing the LLM: none of those change which branches are
     /// enabled). Otherwise (re)starts this guardian's debounce clock; see
     /// [`Self::take_due_final_summary_requests`].
-    pub fn request_final_summary(&mut self, id: &str, signature: &str, now_ms: i64) {
+    /// RAL-303: `force` overrides that no-op. The signature check assumes the
+    /// stored summary is the LLM one this guardian's branch set last produced,
+    /// which is false while `change_summary` still holds the deterministic
+    /// git-log preliminary — there the branch set is unchanged but the summary
+    /// has never been through the LLM at all, so the caller passes `force` to
+    /// get the handoff it would otherwise be denied.
+    pub fn request_final_summary(&mut self, id: &str, signature: &str, now_ms: i64, force: bool) {
         let d = self
             .guardian_summary_debounce
             .entry(id.to_string())
             .or_default();
-        if d.generated_signature.as_deref() == Some(signature) {
+        if !force && d.generated_signature.as_deref() == Some(signature) {
             return;
         }
         d.pending_signature = Some(signature.to_string());
@@ -5699,6 +5824,29 @@ impl Store {
             .entry(id.to_string())
             .or_default();
         d.generated_signature = Some(signature.to_string());
+    }
+
+    /// RAL-303: claim the one repair attempt this daemon process gets at a
+    /// guardian whose change summary is missing or was never upgraded past the
+    /// git-log preliminary one. Returns `true` for the first caller only.
+    ///
+    /// The bookkeeping above is in-memory, so a daemon restart between
+    /// [`Self::request_final_summary`] and the sweep that would have fired it
+    /// drops the pending request — and since only an enabled-branch change
+    /// re-requests one, a review that is otherwise settled keeps whatever
+    /// summary it had at restart forever. This lets the review-maintenance
+    /// sweep re-request exactly once rather than re-firing the LLM on every
+    /// tick when generation is failing for some other reason.
+    pub fn claim_final_summary_repair(&mut self, id: &str) -> bool {
+        let d = self
+            .guardian_summary_debounce
+            .entry(id.to_string())
+            .or_default();
+        if d.repair_attempted || d.generated_signature.is_some() {
+            return false;
+        }
+        d.repair_attempted = true;
+        true
     }
 
     /// Fetch a task's first (lowest-`idx`) cell's cwd — the cwd a
@@ -5792,7 +5940,7 @@ impl Store {
                 params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
-                "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+                "UPDATE tasks SET state='pending', error=NULL WHERE squad_id=? AND idx=?",
                 params![squad_id, task_idx],
             )?;
         }
@@ -5836,7 +5984,7 @@ impl Store {
         )?;
         self.revive_failed_downstream_cells(squad_id, &[(task_idx, cell_idx)])?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+            "UPDATE tasks SET state='pending', error=NULL WHERE squad_id=? AND idx=?",
             params![squad_id, task_idx],
         )?;
         self.conn.execute(
@@ -5895,7 +6043,7 @@ impl Store {
             .collect();
         self.revive_failed_downstream_cells(squad_id, &roots)?;
         self.conn.execute(
-            "UPDATE tasks SET state='pending' WHERE squad_id=? AND idx=?",
+            "UPDATE tasks SET state='pending', error=NULL WHERE squad_id=? AND idx=?",
             params![squad_id, task_idx],
         )?;
         self.conn.execute(
@@ -6688,6 +6836,7 @@ command = "cargo test"
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
             stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
         };
         store
             .init_schema()
@@ -6779,6 +6928,7 @@ command = "cargo test"
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
             stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
         };
         store
             .init_schema()
@@ -9862,13 +10012,29 @@ command = "check-c"
     // -----------------------------------------------------------------------
 
     #[test]
+    fn claim_final_summary_repair_fires_once_per_guardian() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(store.claim_final_summary_repair("g1"));
+        assert!(!store.claim_final_summary_repair("g1"));
+        // Independent per guardian.
+        assert!(store.claim_final_summary_repair("g2"));
+    }
+
+    #[test]
+    fn claim_final_summary_repair_declines_a_guardian_already_summarized() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.mark_final_summary_generated("g1", "sig-a");
+        assert!(!store.claim_final_summary_repair("g1"));
+    }
+
+    #[test]
     fn request_final_summary_is_noop_when_signature_already_generated() {
         let mut store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         // A rebuild that didn't change the enabled-branch set (a feedback
         // restack, a manual-push rebase, a base-branch shift) requests the
         // same signature again -- this must not queue anything.
-        store.request_final_summary("g1", "sig-a", 1_000);
+        store.request_final_summary("g1", "sig-a", 1_000, false);
         assert!(
             store
                 .take_due_final_summary_requests(1_000 + 60_000, 0)
@@ -9876,11 +10042,24 @@ command = "check-c"
         );
     }
 
+    /// RAL-303: the handoff from the deterministic git-log summary to the LLM
+    /// one happens when the stack finishes rebuilding, which usually leaves
+    /// the enabled-branch set untouched -- so the signature check alone would
+    /// deny it and the review would keep showing raw commit subjects forever.
+    #[test]
+    fn request_final_summary_forced_queues_even_for_an_already_generated_signature() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.mark_final_summary_generated("g1", "sig-a");
+        store.request_final_summary("g1", "sig-a", 1_000, true);
+        let due = store.take_due_final_summary_requests(1_000 + 60_000, 0);
+        assert_eq!(due, vec![("g1".to_string(), "sig-a".to_string())]);
+    }
+
     #[test]
     fn request_final_summary_queues_when_signature_differs_from_generated() {
         let mut store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
-        store.request_final_summary("g1", "sig-b", 1_000);
+        store.request_final_summary("g1", "sig-b", 1_000, false);
         let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
         assert_eq!(due, vec![("g1".to_string(), "sig-b".to_string())]);
     }
@@ -9888,7 +10067,7 @@ command = "check-c"
     #[test]
     fn take_due_final_summary_requests_respects_debounce_window() {
         let mut store = Store::open_in_memory().unwrap();
-        store.request_final_summary("g1", "sig-a", 1_000);
+        store.request_final_summary("g1", "sig-a", 1_000, false);
         // Not due yet -- the quiet period hasn't elapsed.
         assert!(
             store
@@ -9906,9 +10085,9 @@ command = "check-c"
         // Simulates rapid enable/disable toggling: each toggle rebuilds and
         // requests a different enabled-branch signature before the previous
         // request's debounce window has elapsed.
-        store.request_final_summary("g1", "sig-a", 0);
-        store.request_final_summary("g1", "sig-b", 1_000);
-        store.request_final_summary("g1", "sig-c", 2_000);
+        store.request_final_summary("g1", "sig-a", 0, false);
+        store.request_final_summary("g1", "sig-b", 1_000, false);
+        store.request_final_summary("g1", "sig-c", 2_000, false);
         // 5s after the FIRST request, but only 3s after the last -- still
         // not due, proving the clock restarted rather than accumulating from
         // the first request.
@@ -9926,7 +10105,7 @@ command = "check-c"
     #[test]
     fn take_due_final_summary_requests_clears_pending_so_it_is_claimed_once() {
         let mut store = Store::open_in_memory().unwrap();
-        store.request_final_summary("g1", "sig-a", 0);
+        store.request_final_summary("g1", "sig-a", 0, false);
         let first = store.take_due_final_summary_requests(10_000, 5_000);
         assert_eq!(first, vec![("g1".to_string(), "sig-a".to_string())]);
         // A concurrent/subsequent sweep at the same instant finds nothing

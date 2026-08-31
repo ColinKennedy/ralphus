@@ -365,6 +365,7 @@ impl ForgeClient {
     /// Fetch the live base and the forge timestamp of the edit. The timestamp
     /// is required for RAL-277's cross-system last-write-wins rule.
     pub fn get_pull_request_base_state(&self, number: i64) -> Result<PullRequestBaseState, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] get pr base start kind={} repo={} number={number}",
@@ -373,6 +374,7 @@ impl ForgeClient {
         );
         let result = self.get_pull_request_base_state_inner(number);
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(state) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get pr base done kind={} repo={} number={number} base={} updated_at_ms={}",
@@ -381,6 +383,7 @@ impl ForgeClient {
                 state.base,
                 state.updated_at_ms
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 ERROR,
                 "ralphus [forge] get pr base failed kind={} repo={} number={number}: {e}",
@@ -906,14 +909,12 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
         let rest = rest.split('@').next_back().unwrap_or(rest);
         let mut parts = rest.splitn(2, '/');
         (parts.next()?, parts.next()?)
-    } else if let Some(colon) = url.strip_prefix("git@").and_then(|r| {
-        let idx = r.find(':')?;
-        Some((r, idx))
-    }) {
-        let (rest, idx) = colon;
-        (&rest[..idx], &rest[idx + 1..])
     } else {
-        return None;
+        let (rest, idx) = url.strip_prefix("git@").and_then(|r| {
+            let idx = r.find(':')?;
+            Some((r, idx))
+        })?;
+        (&rest[..idx], &rest[idx + 1..])
     };
     let path = path.trim_end_matches('/').trim_end_matches(".git");
     if host.is_empty() || path.is_empty() {

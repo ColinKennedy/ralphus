@@ -351,6 +351,22 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// writing `branch.<branch>.remote`/`.merge` directly sidesteps that ambiguity
 /// entirely. A remote-tracking match is preferred over a same-named local
 /// branch, since tracking a remote is `?upstream=`'s primary purpose.
+///
+/// Also mirrors the resolved ref into a dedicated `ralphus.<branch>.baseline`
+/// git config key (branch name as subsection, like `branch.<branch>.merge`,
+/// rather than as the key itself -- git config keys reject `/`, which slash-
+/// containing branch names would otherwise trip over). `branch.<branch>.remote`/`.merge` (i.e. `@{upstream}`) is
+/// exactly the pair `git push -u`/`--set-upstream` overwrites -- a `finalize`
+/// cell that pushes a brand-new branch for the first time routinely triggers
+/// that (git refuses a bare `git push` with no upstream configured yet, so an
+/// agent reaches for `-u`), silently retargeting `@{upstream}` from the
+/// intended base branch onto the branch's own just-pushed remote copy. Once
+/// that happens `@{upstream}` always equals `HEAD`, which is exactly what
+/// `reviews::worktree_has_commits_ahead_of_upstream` (the no-new-commits
+/// guard) reads as "no progress" even though the branch is genuinely ahead of
+/// its real base. `ralphus.<branch>.baseline` lives in a config namespace
+/// git itself never writes to, so it survives that push untouched and gives
+/// the guard something durable to fall back on.
 fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
     // RAL-258: the reserved `<<...>>` sentinels are never literal branch names.
     // They must be expanded by `resolve_upstream` before materialization; a
@@ -384,6 +400,11 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
                 ],
             )
             .map_err(fail)?;
+            git(
+                wt,
+                &["config", &format!("ralphus.{branch}.baseline"), &remote_ref],
+            )
+            .map_err(fail)?;
             return Ok(());
         }
     }
@@ -393,6 +414,11 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
         git(
             wt,
             &["config", &format!("branch.{branch}.merge"), &local_ref],
+        )
+        .map_err(fail)?;
+        git(
+            wt,
+            &["config", &format!("ralphus.{branch}.baseline"), &local_ref],
         )
         .map_err(fail)?;
         return Ok(());
@@ -1069,6 +1095,16 @@ mod tests {
                 clone.to_str().expect("clone path"),
             ],
         );
+        // `ensure_worktree`'s internal resync-rebase shells out through
+        // `GitVcs::exec_raw`, which (correctly, for real repos) never
+        // injects an identity -- so this clone (and the worktrees it grows)
+        // need one in local config, not just on this file's `g()` helper's
+        // own per-invocation env vars, or a replayed commit fails identity
+        // checks on a CI runner with no global gitconfig. A fresh `clone`
+        // does not inherit the source repo's local config, so this can't be
+        // set once upstream and skipped here.
+        g(&clone, &["config", "user.name", "t"]);
+        g(&clone, &["config", "user.email", "t@t"]);
         (clone, branch_sha)
     }
 
@@ -1185,6 +1221,20 @@ mod tests {
         )
         .expect("new branch must have an upstream configured");
         assert_eq!(upstream.trim(), "main");
+    }
+
+    #[test]
+    fn ensure_worktree_mirrors_the_explicit_upstream_into_a_durable_baseline_marker() {
+        // reviews.rs::worktree_baseline_ref reads `ralphus.<branch>.baseline`
+        // as a push-immune fallback for the no-new-commits guard: unlike
+        // `branch.<branch>.merge` (i.e. `@{upstream}`), a `finalize` cell's
+        // own `git push -u` never touches this key, so it must be written
+        // alongside the real upstream, not only as a UI-facing side effect.
+        let repo = init_repo("new-branch-baseline");
+        let wt = ensure_worktree(&repo, "feature-y", "main").expect("materialize");
+        let baseline = git(&wt, &["config", "--get", "ralphus.feature-y.baseline"])
+            .expect("baseline marker must be recorded");
+        assert_eq!(baseline.trim(), "refs/heads/main");
     }
 
     #[test]

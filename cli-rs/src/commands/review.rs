@@ -108,7 +108,7 @@ pub enum ReviewCommand {
     Merge {
         selector: String,
     },
-    SyncGithub {
+    SyncPr {
         selector: String,
     },
     RestartMerge {
@@ -372,9 +372,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             }
         }
         Some("merge") => with_selector(scanner, |selector| ReviewCommand::Merge { selector }),
-        Some("sync-github") => {
-            with_selector(scanner, |selector| ReviewCommand::SyncGithub { selector })
-        }
+        Some("sync-pr") => with_selector(scanner, |selector| ReviewCommand::SyncPr { selector }),
         Some("restart-merge") => {
             with_selector(scanner, |selector| ReviewCommand::RestartMerge { selector })
         }
@@ -772,7 +770,7 @@ fn with_selector_action(
 
 /// Whether `guardian` (a `GuardianView` from `GET /api/guardians`) is a
 /// plausible PR-submission candidate -- `--pr-ready`'s filter predicate.
-fn is_pr_ready(guardian: &Value) -> bool {
+pub fn is_pr_ready(guardian: &Value) -> bool {
     const PR_READY_STATUSES: [&str; 2] = ["in_review", "approved"];
     let status = guardian["status"].as_str().unwrap_or_default();
     if !PR_READY_STATUSES.contains(&status) {
@@ -867,7 +865,7 @@ fn resolve_branch(
 /// Parses repeated `--set KEY=VALUE`-style flags into a map -- a later
 /// duplicate key overwrites an earlier one. Ported from Python's
 /// `_parse_environment_flags`.
-fn parse_environment_flags(
+pub fn parse_environment_flags(
     raw: &[String],
     flag_name: &str,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -894,7 +892,11 @@ edit, delete, commit, or push anything.";
 /// `cell.rs::agent_resume_command` (identical logic, kept as its own copy
 /// per-module -- Python's own `_agent_resume_command` is likewise a
 /// hand-mirrored duplicate with no shared boundary to call into).
-fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str) -> Vec<String> {
+pub fn agent_resume_command(
+    agent: Option<&str>,
+    agent_session_id: &str,
+    mode: &str,
+) -> Vec<String> {
     let mut cmd: Vec<String>;
     if matches!(agent, Some("codex") | Some("codex-cli")) {
         // The top-level interactive `codex resume`, not `codex exec resume`
@@ -961,7 +963,7 @@ fn print_command_with_cwd(cwd: &str, command: &str, env_keys: Option<&[String]>)
 /// occurrence wins), then the guardian's stored `input_values`, then the
 /// input's own literal default. Returns `(resolved, missing)`. Ported from
 /// Python's `_resolve_check_inputs`.
-fn resolve_check_inputs(
+pub fn resolve_check_inputs(
     command: &str,
     check: &Value,
     input_values: &Value,
@@ -1250,9 +1252,9 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, |_| println!("{selector} merge started"));
             Ok(())
         }),
-        ReviewCommand::SyncGithub { selector } => run_and_report(opts, None, || {
+        ReviewCommand::SyncPr { selector } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
-            let result = client.guardian_sync_github(&resolved.guardian_id)?;
+            let result = client.guardian_sync_pr(&resolved.guardian_id)?;
             emit(opts, &result, |_| {
                 println!("{selector} checking the forge for a stack reorder")
             });
@@ -2596,9 +2598,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_sync_github() {
-        match parse(&v(&["sync-github", "g1"])) {
-            ReviewCommand::SyncGithub { selector } => assert_eq!(selector, "g1"),
+    fn parses_sync_pr() {
+        match parse(&v(&["sync-pr", "g1"])) {
+            ReviewCommand::SyncPr { selector } => assert_eq!(selector, "g1"),
             other => panic!("unexpected: {other:?}"),
         }
     }

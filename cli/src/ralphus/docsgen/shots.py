@@ -142,12 +142,62 @@ def _resources_overview(page: Page) -> None:
         _shoot(page, "resources-overview")
 
 
+def _cartographer_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.CARTOGRAPHER_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/cartographer")
+        page.wait_for_selector("#cartographer-body table")
+        _shoot(page, "cartographer-overview")
+
+
+def _projects_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.PROJECTS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/projects")
+        page.wait_for_selector("#projects .proj-table")
+        _shoot(page, "projects-overview")
+
+
+def _machines_overview(page: Page) -> None:
+    # The Machines tab has no dedicated URL hash (unlike tasks/queue/reviews/
+    # resources/cartographer/projects) — land on the default tab, then switch
+    # with the same `showTab` the tab button's onclick calls.
+    with (
+        fixture_server(fixtures.MACHINES_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('machines', true)")
+        page.wait_for_selector("#machines .proj-table")
+        _shoot(page, "machines-overview")
+
+
+def _users_overview(page: Page) -> None:
+    # Same no-dedicated-hash situation as Machines above.
+    with (
+        fixture_server(fixtures.USERS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('users', true)")
+        page.wait_for_selector("#users .proj-table")
+        _shoot(page, "users-overview")
+
+
 SCENARIOS = (
     _tasks_overview,
     _tasks_session_detail,
     _queue_overview,
     _reviews,
     _resources_overview,
+    _cartographer_overview,
+    _projects_overview,
+    _machines_overview,
+    _users_overview,
 )
 
 

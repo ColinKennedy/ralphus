@@ -140,13 +140,13 @@ pub fn dispatch(cmd: QueueCommand, opts: &GlobalOpts) -> i32 {
 
 /// Set-status fields for one queue item -- mirrors Python's `_PathParts`
 /// TypedDict (`_parse_queue_path`/`_resolve_queue_path`).
-struct PathParts {
-    kind: String,
-    squad_id: String,
-    task_idx: i64,
-    cell_idx: i64,
-    proof_idx: i64,
-    proof_scope: String,
+pub struct PathParts {
+    pub kind: String,
+    pub squad_id: String,
+    pub task_idx: i64,
+    pub cell_idx: i64,
+    pub proof_idx: i64,
+    pub proof_scope: String,
 }
 
 /// Parses a queue item path (`squad`, `squad/t<ti>/s<si>`,
@@ -206,7 +206,7 @@ fn parse_queue_path(path: &str) -> Option<PathParts> {
 
 /// Resolves `path` -- a RAL-155 URI or a positional queue item path -- to
 /// set-status fields, ports Python's `_resolve_queue_path`.
-fn resolve_queue_path(client: &DaemonClient, path: &str) -> Result<PathParts, CommandError> {
+pub fn resolve_queue_path(client: &DaemonClient, path: &str) -> Result<PathParts, CommandError> {
     if ralphus_core::uri::looks_like_uri(path) {
         let resolved = selector::resolve_squad_selector(client, path)?;
         return Ok(PathParts {
@@ -251,7 +251,7 @@ fn queue_path_for(resolved: &ResolvedSelector) -> Result<String, SelectorError> 
 /// Converts any RAL-155 URI in `paths` to the daemon's queue-item path,
 /// leaving an already-positional path untouched -- ports Python's
 /// `_normalize_queue_paths`.
-fn normalize_queue_paths(
+pub fn normalize_queue_paths(
     client: &DaemonClient,
     paths: &[String],
 ) -> Result<Vec<String>, CommandError> {

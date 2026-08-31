@@ -23,6 +23,7 @@
 //! build is not resolved again — no `git rerere` required. The feature branches
 //! stay untouched throughout.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,12 +63,33 @@ pub(crate) const MANUAL_COMMANDS_SESSION: &str = "manual-reviewer";
 /// [`resolve_check_input`].
 pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
 
+/// The `RunnerSpec.task` value used for every reviewer-feedback-actioning
+/// invocation ([`run_feedback`], RAL-298). Mirrors [`RESOLVER_TASK`]'s
+/// rationale -- `server.rs`'s `resolver_task_and_cell_id` must pass this
+/// exact string into `crate::tmux::session_name` to recompute the tmux
+/// session name a feedback pass actually runs under, both live and after
+/// the fact.
+pub(crate) const FEEDBACK_TASK: &str = "feedback";
+
+/// The `RunnerSpec.cell_id` for one branch's feedback-actioning session --
+/// branch-scoped (RAL-298) the same way [`RESOLVER_TASK`]'s `resolver-
+/// {branch_id}` is, so two branches under the same guardian actioning
+/// feedback concurrently don't collide on the same tmux session (the
+/// squad_id `guardian-{id}` alone is shared by every branch in the
+/// guardian).
+pub(crate) fn feedback_cell_id(branch_id: &str) -> String {
+    format!("reviewer-{branch_id}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartMergeOutcome {
     Merging,
     Deferred,
     AlreadyInProgress,
+    /// RAL-300: every linked PR had already merged, so this trigger approved
+    /// the review outright instead of starting a rebuild.
+    AlreadyMerged,
 }
 
 /// Return `true` when the user message expresses intent to skip committing.
@@ -505,6 +527,12 @@ fn worktree_add_or_reset(
 
     if !wt.root().exists() {
         // [State 1] Directory missing — fast path.
+        // [State 7] Unlock first: a locked tracking entry survives both the
+        // `remove` below (single `-f` does not override a lock) and `prune`
+        // (which skips locked entries by design), leaving the branch "already
+        // used by worktree" at this exact path forever even though nothing is
+        // actually checked out there. No-op when not locked.
+        let _ = root.git(&["worktree", "unlock", &wt_str]);
         // Remove any stale tracking entry for this path (quick no-op when not
         // registered). This handles [State 4] when git's remove succeeds on a
         // ghost entry; if it does not, the lazy prune below is the fallback.
@@ -1205,6 +1233,7 @@ fn synthesize_proof_instructions(
         // `git_root` here is a bare string, not a `Workspace` -- resolve it
         // from the guardian row directly rather than always defaulting local.
         machine: review_machine,
+        tool_arg_truncate_chars: None,
     };
     let result = runner.run(&spec);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
@@ -1565,6 +1594,7 @@ fn resolve_conflicts_with_agent(
             // cannot find a `cwd` that only exists on another host) rather
             // than silently running in the wrong place, but is still wrong.
             machine: wt.machine().map(str::to_string),
+            tool_arg_truncate_chars: None,
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -1874,6 +1904,7 @@ fn run_final_proof(
         // RAL-201: route to the same machine `wt` is actually on -- see the
         // identical fix in `resolve_conflicts_with_agent` above.
         machine: wt.machine().map(str::to_string),
+        tool_arg_truncate_chars: None,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
     // branch's Live-View start time. COALESCE means a branch that already
@@ -2280,6 +2311,10 @@ pub fn start_merge(
                 "a rebase is already in progress; cancel it before starting a new one",
             ),
         ),
+        Ok(StartMergeOutcome::AlreadyMerged) => reply(
+            200,
+            "{\"status\":\"approved\",\"message\":\"this review's work was already merged\"}",
+        ),
         Err(StartMergeError::NotFound(message)) => reply(404, &error_body("not_found", &message)),
         Err(StartMergeError::NoBranches) => reply(
             400,
@@ -2312,11 +2347,13 @@ fn lock_timed<'a>(
     let guard = store.lock().expect("store mutex poisoned");
     let waited_ms = waiting.elapsed().as_millis();
     if waited_ms >= KICKOFF_SLOW_LOCK_MS {
+        // ralphus[ignore-rlog-pair]: internal lock-wait perf diagnostic, not a queryable domain event
         crate::rlog!(
             WARNING,
             "ralphus [guardian] review {id} merge kickoff waited {waited_ms}ms for the store lock ({what})"
         );
     } else {
+        // ralphus[ignore-rlog-pair]: internal lock-wait perf diagnostic, not a queryable domain event
         crate::rlog!(
             DEBUG,
             "ralphus [guardian] review {id} merge kickoff store lock ({what}) after {waited_ms}ms"
@@ -2338,6 +2375,38 @@ pub(crate) fn kickoff_merge(
     cancellations: Cancellations,
 ) -> Result<StartMergeOutcome, StartMergeError> {
     let kickoff_started = std::time::Instant::now();
+    // RAL-300: a manual "Merge / rebase" trigger must not waste a rebuild
+    // when every linked PR has already merged -- ask first, exactly like the
+    // periodic sweep (`review_maintenance`) does. When this settles the
+    // review by approving it outright, report that instead of falling
+    // through to the ordinary claim/rebuild path below (which would just
+    // find nothing left to claim and 409). A mid-flight PR drop (guardian
+    // status unchanged) falls straight through to the normal path.
+    if crate::pr::check_pr_merges(&store, id) {
+        let now_approved = matches!(
+            store.lock().expect("store mutex poisoned").get_guardian(id),
+            Ok(g) if g.status.as_str() == GuardianStatus::Approved.as_str()
+        );
+        if now_approved {
+            return Ok(StartMergeOutcome::AlreadyMerged);
+        }
+    }
+    // RAL-300: same idea, but via git ancestry rather than the forge -- a
+    // review whose base branch already contains every enabled branch's
+    // commits (e.g. a fast-forward merge outside any tracked PR) has
+    // nothing left to rebuild either.
+    let guardian_snapshot = {
+        let guard = store.lock().expect("store mutex poisoned");
+        guard.get_guardian(id).ok()
+    };
+    if let Some(guardian_snapshot) = guardian_snapshot {
+        if guardian_snapshot.status.as_str() == GuardianStatus::InReview.as_str()
+            && guardian_base_already_has_every_branch(&store, id, &guardian_snapshot)
+            && approve_base_already_landed(&store, id)
+        {
+            return Ok(StartMergeOutcome::AlreadyMerged);
+        }
+    }
     // The guardian read and the "is any branch still waiting on its cell?"
     // check share one lock acquisition: they are two reads of the same
     // snapshot, and every extra acquisition is another chance to queue behind
@@ -4101,8 +4170,8 @@ pub fn run_feedback(
         // with every other guardian's tmux session name (see the identical
         // fix on `generate_final_summary`'s spec).
         squad_id: format!("guardian-{id}"),
-        task: "feedback".to_string(),
-        cell_id: "reviewer".to_string(),
+        task: FEEDBACK_TASK.to_string(),
+        cell_id: feedback_cell_id(branch_id),
         cwd: wt_str,
         prompt: Some(prompt),
         command: None,
@@ -4123,6 +4192,7 @@ pub fn run_feedback(
         // actually on -- see the identical fix in
         // `resolve_conflicts_with_agent`.
         machine: wt.machine().map(str::to_string),
+        tool_arg_truncate_chars: None,
     };
     let no_commit = is_no_commit_intent(feedback);
     // Stash any pre-existing dirty state so we only include the agent's own
@@ -4662,7 +4732,19 @@ pub fn review_maintenance(
             .list_guardians()
             .unwrap_or_default()
             .into_iter()
-            .filter(|g| matches!(g.status.as_str(), "in_review" | "merge_failed"))
+            // RAL-300: `merging`/`merge_stopped` are included too (beyond the
+            // base-shift/manual-push targets below) purely so the PR-merge
+            // check just below can catch a PR that merged out-of-band while
+            // this review's own rebase/feedback pass is what's using its
+            // worktrees right now -- `rebuild_on_base_shift`/
+            // `rebase_on_manual_push` already self-gate on `in_review`/
+            // `merge_failed` and simply no-op for the other two.
+            .filter(|g| {
+                matches!(
+                    g.status.as_str(),
+                    "in_review" | "merge_failed" | "merging" | "merge_stopped"
+                )
+            })
             .map(|g| g.id)
             .collect()
     };
@@ -4678,6 +4760,14 @@ pub fn review_maintenance(
             // that didn't run) the manual-push restack below -- either may
             // trigger a merge for this guardian id.
             let token = cancellations.register(&format!("guardian:{id}"));
+            // RAL-300: ask "have the linked PRs merged?" before deciding to
+            // rebase at all. When this approves the review outright (every
+            // linked PR merged, review was idle in `in_review`) or drops a
+            // stale mid-flight PR, it already updated guardian/PR state --
+            // the base-shift/manual-push calls below re-read guardian.status
+            // themselves and naturally no-op once it's no longer
+            // `in_review`/`merge_failed`, so no extra branching is needed here.
+            crate::pr::check_pr_merges(&store, &id);
             // A base-shift rebuild (full re-derive) subsumes any manual push via
             // carry-forward, so only look for a manual push when no rebuild ran.
             if !rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem, &token) {
@@ -4692,6 +4782,7 @@ pub fn review_maintenance(
             // settled review here on the sweep that already visits it. Skips
             // out before any network call when nothing drifted.
             crate::pr::sync_open_pr_branches(&store, &id);
+            repair_missing_final_summary(&store, &id);
             cancellations.remove(&format!("guardian:{id}"));
         });
     }
@@ -4924,6 +5015,97 @@ pub fn rebase_on_manual_push(
     true
 }
 
+/// Whether every enabled branch under `project` already has its review-branch
+/// tip as an ancestor of `base_sha` (RAL-300) -- i.e. the base already
+/// contains that branch's work, so rebasing onto it would have nothing left
+/// to do. `false` (never "already merged") when there is nothing to check
+/// (no enabled branches for this project) or any branch has no review-branch
+/// tip yet -- missing information must never read as "safe to skip".
+fn project_already_in_base(
+    root: &Workspace,
+    guardian: &crate::guardian::GuardianView,
+    project: &str,
+    base_sha: &str,
+) -> bool {
+    let branches: Vec<&crate::guardian::BranchView> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled)
+        .filter(|b| b.project.as_deref().unwrap_or(guardian.git_root.as_str()) == project)
+        .collect();
+    if branches.is_empty() {
+        return false;
+    }
+    branches.iter().all(|b| {
+        let review_ref_is_in_base = b
+            .review_branch
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_some_and(|rev| {
+                root.git(&["merge-base", "--is-ancestor", rev, base_sha])
+                    .is_ok()
+            });
+        let worktree_is_in_upstream = b.worktree.as_deref().is_some_and(|worktree| {
+            crate::reviews::workspace_head_is_ancestor_of_upstream(
+                &root.at(PathBuf::from(worktree)),
+            )
+        });
+        review_ref_is_in_base || worktree_is_in_upstream
+    })
+}
+
+/// Whether every project of `guardian` already has [`project_already_in_base`]
+/// true against that project's *current* base (RAL-300) -- i.e. the base has
+/// already absorbed every enabled branch's commits, whether or not a shift
+/// was otherwise detected. `false` when there are no projects, or any
+/// project's current base can't even be resolved.
+fn guardian_base_already_has_every_branch(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    guardian: &crate::guardian::GuardianView,
+) -> bool {
+    if guardian.projects.is_empty() {
+        return false;
+    }
+    guardian.projects.iter().all(|proj| {
+        let root = Workspace::for_guardian(store, id, Path::new(proj));
+        match resolve_base(&root, &guardian.base_branch) {
+            Ok(sha) => project_already_in_base(&root, guardian, proj, &sha),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Approve `id` because [`guardian_base_already_has_every_branch`] (or the
+/// equivalent per-project check inline in [`rebuild_on_base_shift`]) found
+/// every enabled branch already landed on its base (RAL-300) -- shared so the
+/// periodic sweep and a manual "Merge / rebase" trigger log/approve
+/// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
+/// legal transition); returns whether it approved.
+fn approve_base_already_landed(store: &Arc<Mutex<Store>>, id: &str) -> bool {
+    let approved = store.lock().expect("poisoned").approve_guardian(id).is_ok();
+    if approved {
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {id} approved: base branch already contains every branch's commits"
+        );
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "guardian",
+            message: "approved: base branch already contains every branch's commits",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({}),
+        });
+    }
+    approved
+}
+
 /// If the guardian's base branch has moved in ANY of its projects since the stack
 /// was last built, rebuild it against the new base. Returns whether a rebuild ran.
 ///
@@ -4954,16 +5136,25 @@ pub fn rebuild_on_base_shift(
         return false;
     }
 
-    // Check every project in the guardian for a base-branch shift.
+    // Check every project in the guardian for a base-branch shift. Also track
+    // (RAL-300) whether every project's own enabled branches are already an
+    // ancestor of that project's *current* base -- the inverse direction from
+    // a shift: not "the base moved past us" but "the base already contains
+    // us" (e.g. a fast-forward merge that landed the stack's work
+    // outside any tracked PR). `fully_landed` starts true and is cleared by
+    // any project this can't positively confirm for, so an unresolvable
+    // project never silently counts as "safe to skip".
     let mut any_shifted = false;
     let mut all_have_baseline = true;
+    let mut fully_landed = !guardian.projects.is_empty();
     for proj in &guardian.projects {
-        let current = match resolve_base(
-            &Workspace::for_guardian(store, id, Path::new(proj)),
-            &guardian.base_branch,
-        ) {
+        let root = Workspace::for_guardian(store, id, Path::new(proj));
+        let current = match resolve_base(&root, &guardian.base_branch) {
             Ok(s) => s,
-            Err(_) => continue, // branch gone/unresolvable: skip this project
+            Err(_) => {
+                fully_landed = false;
+                continue; // branch gone/unresolvable: skip this project
+            }
         };
         match guardian.base_commits.get(proj) {
             None => {
@@ -4979,6 +5170,9 @@ pub fn rebuild_on_base_shift(
                 any_shifted = true;
             }
         }
+        if !project_already_in_base(&root, &guardian, proj, &current) {
+            fully_landed = false;
+        }
     }
 
     // Also fall back to the legacy single-project base_commit for existing rows
@@ -4989,6 +5183,19 @@ pub fn rebuild_on_base_shift(
     }
     if !any_shifted {
         return false;
+    }
+    // RAL-300: a base shift alone doesn't mean this review has new upstream
+    // work to rebase onto -- if the shift itself is every project absorbing
+    // this review's own branches (already-ancestor for all of them), then the
+    // shift IS this review landing, not something to rebuild against.
+    // Approve outright instead of wasting a rebuild on a base that already
+    // has us; only from `in_review` -- `approve_guardian` has no other
+    // transition, and a `merge_failed` review still needs a human regardless.
+    if guardian.status.as_str() == "in_review"
+        && fully_landed
+        && approve_base_already_landed(store, id)
+    {
+        return true;
     }
     // Claim the review under one lock (flip to Merging) so a concurrent
     // maintenance pass cannot also start rebuilding it.
@@ -5830,21 +6037,38 @@ fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
         .is_some_and(|n| n == 0)
 }
 
-/// RAL-103: Recompute a preliminary, git-log-only change summary from each
-/// not-yet-reviewed ready branch's OWN task worktree (the source cell's
-/// `cwd` — never a review-owned worktree). Unlike [`generate_final_summary`],
-/// this never calls an LLM, so it is cheap enough to recompute synchronously
-/// every time another branch reaches `Ready`, while the guardian is still
-/// `collecting` (before any review worktree exists for those branches).
+/// RAL-103: Recompute a preliminary, git-log-only change summary covering
+/// EVERY enabled branch that has left `pending`. Unlike
+/// [`generate_final_summary`], this never calls an LLM, so it is cheap enough
+/// to recompute every time another branch reaches `Ready`, while the guardian
+/// is still `collecting`.
 ///
-/// A branch stops contributing here — and starts being covered by
-/// [`generate_final_summary`]'s agent-authored final summary instead — once
-/// it has a review worktree (`BranchView.worktree.is_some()`), i.e. once its
-/// stacked rebase has run at least once.
+/// Each branch contributes exactly one section, read from whichever ref
+/// actually holds its commits: its review ref (`guardian/<id>/wt-<branch>`)
+/// once its stacked rebase has run, otherwise its producing task cell's own
+/// worktree HEAD. RAL-303: this used to look at *only* the branches with no
+/// review worktree, which meant that as soon as part of the stack had been
+/// rebased, a recompute rewrote the whole summary down to just the branches
+/// that hadn't — a seven-branch review whose newest branch was the only
+/// un-rebased one ended up with a change summary describing that one branch.
+/// A branch this cannot read at all (no review ref and no known producing
+/// worktree) contributes nothing rather than being guessed at.
+///
+/// Every commit subject appears exactly once across the whole summary,
+/// attributed to the earliest branch in stack order that carries it. The
+/// `prev..next` ranges below already keep a stacked branch from re-listing the
+/// commits of the branch beneath it, but that only holds *within* one chain:
+/// a review ref is a rebased copy of the producing worktree's commits, so the
+/// same commit has one sha on the review side and a different sha on the task
+/// side, and a partly-rebased stack reads from both. RAL-303: the subject-level
+/// pass below is what actually guarantees uniqueness across that seam.
 ///
 /// A no-op (leaves `change_summary` untouched) when no qualifying branch has
 /// any commits to show — that "nothing ready yet" state is instead surfaced
-/// by `summary_state == "waiting"`.
+/// by `summary_state == "waiting"` — and likewise when every enabled branch
+/// has already been rebased and an LLM-authored final summary exists, since
+/// there is nothing this pass can add that [`generate_final_summary`] hasn't
+/// already said better.
 ///
 /// RAL-121: only the DB reads/writes below take the store lock; the `git log`
 /// subprocess calls run with it released. This used to run entirely under a
@@ -5856,16 +6080,23 @@ fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
 pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str) {
     struct Candidate {
         branch: String,
-        cwd: String,
-        // RAL-201: the *producing task cell's* machine, not the review's
-        // -- this function explicitly reads each branch's own task worktree
-        // (see the doc comment above), which per RAL-185 D3/D4 may be a
-        // different machine than the review this guardian will eventually
-        // run on, or no machine at all when the review itself is remote but
-        // this task ran locally.
+        project: String,
+        /// The producing task cell's worktree, when the store still knows one.
+        cwd: Option<String>,
+        // RAL-201: the *producing task cell's* machine, not the review's --
+        // reading a branch's own task worktree per RAL-185 D3/D4 may mean a
+        // different machine than the review this guardian will eventually run
+        // on, or no machine at all when the review itself is remote but this
+        // task ran locally.
         machine: Option<String>,
+        /// Whether the stacked rebase has already produced a review ref.
+        rebased: bool,
+        /// Whether this branch contributes a section at all. A disabled branch
+        /// is carried here purely to advance the task-side base past it (see
+        /// the loop below), never to be reported.
+        reported: bool,
     }
-    let (base_branch, candidates) = {
+    let (git_root, base_branch, base_commits, has_final_summary, candidates) = {
         let guard = store.lock().expect("store mutex poisoned");
         let Ok(guardian) = guard.get_guardian(id) else {
             return;
@@ -5873,52 +6104,139 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
         let candidates = guardian
             .branches
             .iter()
-            .filter(|b| b.enabled && b.worktree.is_none() && b.merge_status != "pending")
-            .filter_map(|b| {
-                guard
-                    .cell_cwd_for_branch(&b.branch)
-                    .ok()
-                    .flatten()
-                    .map(|cwd| Candidate {
-                        branch: b.branch.clone(),
-                        cwd,
-                        machine: b.source_cell_machine.clone(),
-                    })
+            // A disabled branch is kept (see `reported`) but a `pending` one is
+            // dropped outright -- it has no commits anywhere yet to skip past.
+            .filter(|b| !b.enabled || b.merge_status != "pending")
+            .map(|b| Candidate {
+                branch: b.branch.clone(),
+                project: b
+                    .project
+                    .clone()
+                    .unwrap_or_else(|| guardian.git_root.clone()),
+                cwd: guard.cell_cwd_for_branch(&b.branch).ok().flatten(),
+                machine: b.source_cell_machine.clone(),
+                rebased: b.worktree.is_some(),
+                reported: b.enabled,
             })
             .collect::<Vec<_>>();
-        (guardian.base_branch, candidates)
+        (
+            guardian.git_root,
+            guardian.base_branch,
+            guardian.base_commits,
+            guardian.summary_agent.is_some(),
+            candidates,
+        )
     };
+    if !candidates.iter().any(|c| c.reported) {
+        return;
+    }
+    // Every enabled branch is already in the review worktree, so the final
+    // summary (if one exists) is strictly more informed than anything this
+    // git-log pass can produce -- leave it alone rather than downgrading it.
+    let all_rebased = candidates.iter().filter(|c| c.reported).all(|c| c.rebased);
+    if all_rebased && has_final_summary {
+        return;
+    }
 
-    // RAL-147: each candidate's worktree HEAD is built on top of every
-    // earlier branch in the stack (a stacked review rebases branch N onto
-    // branch N-1), so diffing every branch against the shared `base_branch`
-    // makes each subsequent section accumulate all prior branches' commits
-    // too. Diff against a running `prev_sha` instead -- seeded to
-    // `base_branch`, then advanced to each candidate's own HEAD after it's
-    // processed -- mirroring `generate_final_summary`'s `prev..branch_ref` dedup.
-    let mut sections: Vec<String> = Vec::new();
-    let mut prev_sha = base_branch.clone();
+    let ws_root = Workspace::for_guardian(store, id, PathBuf::from(&git_root));
+    // Group by project, preserving stack order within each and the order the
+    // projects first appear -- mirrors `generate_final_summary`'s grouping.
+    let mut project_order: Vec<String> = Vec::new();
     for c in &candidates {
-        // RAL-201: was `git(Path::new(&c.cwd), ...)`, a direct bypass of this
-        // branch's own producing machine -- built once and reused for both
-        // calls below, rather than only for the `rev-parse` that already
-        // used it. Deliberately `Workspace::on` + this branch's own
-        // `source_cell_machine`, not `Workspace::for_guardian` -- the
-        // review's own machine assignment does not apply to a branch that
-        // has no review worktree yet.
-        let cwd =
-            Workspace::on(Path::new(&c.cwd), c.machine.as_deref()).with_store(Arc::clone(store));
-        let log = cwd
-            .git(&["log", "--format=%s", &format!("{prev_sha}..HEAD")])
-            .unwrap_or_default();
-        let log = log.trim();
-        if !log.is_empty() {
-            sections.push(format!("{}:\n{log}", c.branch));
-        }
-        if let Ok(head_sha) = cwd.git(&["rev-parse", "HEAD"]) {
-            prev_sha = head_sha.trim().to_string();
+        if !project_order.contains(&c.project) {
+            project_order.push(c.project.clone());
         }
     }
+
+    // (branch, its own commit subjects) in stack order, deduped below.
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for proj in &project_order {
+        let root = ws_root.at(PathBuf::from(proj));
+        // Two independent running bases, one per ref source. `prev_review` is
+        // seeded at the commit this project's review was cut from and walks
+        // the review refs; `prev_task` is seeded at the base branch and walks
+        // the producing worktrees' HEADs. RAL-147: each branch's worktree is
+        // built on top of the previous branch in the stack, so diffing every
+        // branch against a fixed base would make each section accumulate all
+        // the earlier branches' commits.
+        let mut prev_review = base_commits.get(proj).cloned();
+        let mut prev_task = base_branch.clone();
+        for c in candidates.iter().filter(|c| &c.project == proj) {
+            let task_ws = c.cwd.as_ref().map(|cwd| {
+                Workspace::on(Path::new(cwd), c.machine.as_deref()).with_store(Arc::clone(store))
+            });
+            // A disabled branch is not in the review, so it contributes no
+            // section -- but the producing worktrees are stacked on disk
+            // regardless of what is enabled, so the branch above it still
+            // carries its commits. Step the task-side base over it (the review
+            // side already skips it, since the rebase drops it from the stack)
+            // or those commits surface under whichever branch comes next.
+            if !c.reported {
+                if let Some(Ok(head_sha)) =
+                    task_ws.as_ref().map(|ws| ws.git(&["rev-parse", "HEAD"]))
+                {
+                    prev_task = head_sha.trim().to_string();
+                }
+                continue;
+            }
+            let review_ref = format!("guardian/{id}/wt-{}", c.branch);
+            // A `skip_worktrees` project never gets per-branch refs, so this
+            // read fails and the branch falls back to its task worktree --
+            // which still gives it its own section, rather than being lumped
+            // in with its siblings the way the final summary has to do.
+            let from_review = if c.rebased {
+                prev_review.as_ref().and_then(|prev| {
+                    root.git(&["log", "--format=%s", &format!("{prev}..{review_ref}")])
+                        .ok()
+                })
+            } else {
+                None
+            };
+            let log = match from_review {
+                Some(log) => {
+                    prev_review = Some(review_ref);
+                    log
+                }
+                None => {
+                    let Some(ws) = task_ws.as_ref() else {
+                        continue;
+                    };
+                    ws.git(&["log", "--format=%s", &format!("{prev_task}..HEAD")])
+                        .unwrap_or_default()
+                }
+            };
+            // Advance the task-side base even for a branch reported from its
+            // review ref, so a later un-rebased branch stacked on this one's
+            // worktree still reports only its own commits.
+            if let Some(Ok(head_sha)) = task_ws.as_ref().map(|ws| ws.git(&["rev-parse", "HEAD"])) {
+                prev_task = head_sha.trim().to_string();
+            }
+            let subjects: Vec<String> = log
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !subjects.is_empty() {
+                sections.push((c.branch.clone(), subjects));
+            }
+        }
+    }
+
+    // Strip duplicate commits: the first branch in stack order to carry a
+    // subject keeps it, later branches drop it. A branch left with nothing of
+    // its own drops out entirely rather than showing an empty heading.
+    let mut seen: HashSet<String> = HashSet::new();
+    let sections: Vec<String> = sections
+        .into_iter()
+        .filter_map(|(branch, subjects)| {
+            let unique: Vec<String> = subjects
+                .into_iter()
+                .filter(|s| seen.insert(s.clone()))
+                .collect();
+            (!unique.is_empty()).then(|| format!("{branch}:\n{}", unique.join("\n")))
+        })
+        .collect();
     if sections.is_empty() {
         return;
     }
@@ -5944,6 +6262,43 @@ fn branch_summary_label(branch: &str) -> String {
         }
     }
     branch.to_string()
+}
+
+/// RAL-303: a settled review whose `change_summary` was never upgraded past
+/// the git-log preliminary one (`summary_agent` unset) is stuck — the only
+/// thing that requests an LLM summary is a change to the enabled-branch set,
+/// so nothing will ever ask again on its own. That happens whenever the daemon
+/// restarts between [`queue_final_summary_regen`] and the
+/// [`sweep_pending_summaries`] tick that would have fired it, since the
+/// debounce bookkeeping is in-memory.
+///
+/// Recompute the preliminary summary first so the review immediately shows one
+/// section per branch rather than whatever partial snapshot it was left with,
+/// then request the LLM summary that supersedes it.
+/// [`Store::claim_final_summary_repair`] bounds this to one attempt per
+/// guardian per daemon process.
+fn repair_missing_final_summary(store: &Arc<Mutex<Store>>, id: &str) {
+    let needs_repair = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .is_ok_and(|g| g.summary_agent.is_none());
+    if !needs_repair {
+        return;
+    }
+    if !store
+        .lock()
+        .expect("poisoned")
+        .claim_final_summary_repair(id)
+    {
+        return;
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} has no agent-authored change summary: recomputing"
+    );
+    recompute_preliminary_summary(store, id);
+    queue_final_summary_regen(store, id);
 }
 
 /// RAL-208: minimum quiet period after the last [`queue_final_summary_regen`]
@@ -5983,10 +6338,18 @@ pub(crate) fn queue_final_summary_regen(store: &Arc<Mutex<Store>>, id: &str) {
         return;
     };
     let signature = enabled_branch_signature(&guardian.branches);
-    store
-        .lock()
-        .expect("poisoned")
-        .request_final_summary(id, &signature, crate::store::now_ms());
+    // RAL-303: a review still showing the deterministic git-log preliminary
+    // summary has never had the LLM pass run over it, so the signature check
+    // has nothing meaningful to compare against and would wrongly decide the
+    // summary is already up to date. That is the whole handoff this call
+    // exists to perform once the stack has finished rebuilding -- force it.
+    let force = guardian.summary_agent.is_none();
+    store.lock().expect("poisoned").request_final_summary(
+        id,
+        &signature,
+        crate::store::now_ms(),
+        force,
+    );
 }
 
 /// RAL-208: fire the LLM change-summary call for every guardian whose
@@ -6202,6 +6565,7 @@ fn generate_final_summary(
         // is actually on -- see the identical fix in
         // `resolve_conflicts_with_agent`.
         machine: ws_root.machine().map(str::to_string),
+        tool_arg_truncate_chars: None,
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
@@ -6211,6 +6575,15 @@ fn generate_final_summary(
         let _ =
             guard.set_guardian_summary(id, &result.summary, Some(agent.as_str()), model.as_deref());
         guard.mark_final_summary_generated(id, signature);
+    } else {
+        // RAL-303: the review is left showing its git-log preliminary summary,
+        // which reads as a legitimately-generated one -- say why in the log
+        // rather than failing silently.
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} summary generation produced nothing ({agent}, status {}): keeping the preliminary summary",
+            result.status
+        );
     }
 }
 
@@ -6508,6 +6881,7 @@ fn generate_manual_commands(
         env_overrides: resolved.env.clone(),
         // RAL-201: matches whichever workspace `cwd` above was derived from.
         machine,
+        tool_arg_truncate_chars: None,
     };
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -6693,6 +7067,7 @@ pub(crate) fn resolve_check_input(
         env_overrides: resolved.env.clone(),
         // RAL-201: route to the review's assigned machine, matching `cwd`.
         machine,
+        tool_arg_truncate_chars: None,
     };
 
     let result = runner.run(&spec);
@@ -7135,6 +7510,51 @@ mod tests {
             &Workspace::local(&repo),
             "guardian/g/wt-feature-a"
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// State 1 combined with state 7: the worktree directory is gone (e.g. an
+    /// external cleanup deleted it) but its tracking entry was left locked, so
+    /// the still-registered branch blocks a plain `worktree add -B` at that
+    /// path with `fatal: '<branch>' is already used by worktree at '<path>'`
+    /// even though nothing is actually checked out there anymore. The
+    /// directory-missing branch of `worktree_add_or_reset_with_faults` did not
+    /// call `worktree unlock` before its `remove`/`prune` cleanup (unlike the
+    /// directory-survives branch just below it, which does), so `remove -f`
+    /// (single force) left the locked entry in place and `prune` silently
+    /// skips locked entries by design — the retry-after-prune inside the
+    /// state-1 branch could never clear it. Reproduces the exact failure seen
+    /// live during a guardian's combined-review-worktree rebuild.
+    #[test]
+    fn worktree_recovery_state1_directory_missing_while_locked() {
+        let (base, repo, _fwt) = make_repo("s1locked");
+        let rwt = base.join("rwt");
+
+        // Initial setup.
+        worktree_add_or_reset(
+            &Workspace::local(&repo),
+            "guardian/g/wt-feature-a",
+            &Workspace::local(&rwt),
+            "feature/a",
+        )
+        .expect("initial setup");
+
+        // Lock the worktree, then delete its directory out from under git —
+        // simulating an external cleanup racing the daemon's own recovery.
+        g(&repo, &["worktree", "lock", rwt.to_str().unwrap()]);
+        std::fs::remove_dir_all(&rwt).unwrap();
+        assert!(!rwt.exists(), "precondition: rwt must not exist");
+
+        worktree_add_or_reset(
+            &Workspace::local(&repo),
+            "guardian/g/wt-feature-a",
+            &Workspace::local(&rwt),
+            "feature/a",
+        )
+        .expect("state 1 + locked recovery");
+
+        assert!(rwt.exists());
+        assert_on_branch(&rwt, "guardian/g/wt-feature-a");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -7789,6 +8209,14 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         g(&repo, &["init", "-b", "main"]);
+        // `drive_rebase` below shells out through `GitVcs::exec_raw`, which
+        // (correctly, for real repos) never injects an identity -- so this
+        // throwaway repo needs one in its own local config, not just on the
+        // `g()` helper's own per-invocation env vars, or a commit created
+        // deep inside `drive_rebase` fails identity checks on a CI runner
+        // with no global gitconfig.
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["config", "user.email", "t@t"]);
 
         // Initial base commit — no blocker.txt yet.
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
@@ -8591,6 +9019,322 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// RAL-303: a partly-rebased stack must still produce one section per
+    /// enabled branch. Branch A has been rebased into the review (so its
+    /// commits live on `guardian/<id>/wt-feature/a`, not in any un-reviewed
+    /// worktree) while branch B has not; the summary previously dropped every
+    /// rebased branch, so a seven-branch review whose newest branch was the
+    /// only un-rebased one ended up describing that one branch alone.
+    #[test]
+    fn recompute_preliminary_summary_covers_already_rebased_branches() {
+        let (base, repo, awt) = make_repo("prelim-rebased");
+        let base_sha = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // feature/b is stacked on feature/a, exactly as the real merge flow
+        // leaves it.
+        let bwt = base.join("bwt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/b",
+                bwt.to_str().unwrap(),
+                "feature/a",
+            ],
+        );
+        std::fs::write(bwt.join("b.txt"), "b\n").unwrap();
+        g(&bwt, &["add", "."]);
+        g(&bwt, &["commit", "-m", "commit-b-only"]);
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.add_guardian_branch(&id, "feature/b").unwrap();
+            insert_done_cell(&guard, "squad-a", &awt, "feature/a");
+            insert_done_cell(&guard, "squad-b", &bwt, "feature/b");
+            guard
+                .set_guardian_project_base_commit(&id, repo.to_str().unwrap(), &base_sha)
+                .unwrap();
+            id
+        };
+        let branch_ids: Vec<String> = store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+
+        // feature/a has been rebased into the review: its review ref exists
+        // and its BranchView carries a worktree.
+        let review_ref = format!("guardian/{id}/wt-feature/a");
+        g(&repo, &["update-ref", &review_ref, "feature/a"]);
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .set_branch_review(&id, &branch_ids[0], &review_ref, "/some/review/wt")
+                .unwrap();
+            for branch_id in &branch_ids {
+                guard
+                    .set_branch_status(&id, branch_id, MergeStatus::Ready, None)
+                    .unwrap();
+            }
+        }
+
+        recompute_preliminary_summary(&store, &id);
+        let summary = store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .change_summary
+            .expect("preliminary summary computed");
+
+        let sections: std::collections::HashMap<&str, &str> = summary
+            .split("\n\n")
+            .filter_map(|s| s.split_once(":\n"))
+            .collect();
+        // feature/a is read from its review ref, feature/b from its own
+        // worktree -- and feature/b still reports only its own commit.
+        assert_eq!(sections.get("feature/a"), Some(&"feature"));
+        assert_eq!(sections.get("feature/b"), Some(&"commit-b-only"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RAL-303: a disabled branch is not part of the review, so none of its
+    /// commits may reach the change summary — and disabling it must not leak
+    /// its commits into the next branch's section either, since the running
+    /// base skips straight over it.
+    #[test]
+    fn recompute_preliminary_summary_skips_disabled_branches() {
+        let (base, repo, awt) = make_repo("prelim-disabled");
+
+        // feature/b stacks on feature/a, feature/c stacks on feature/b.
+        let mut prev = "feature/a".to_string();
+        let mut worktrees = vec![("feature/a".to_string(), awt)];
+        for name in ["feature/b", "feature/c"] {
+            let wt = base.join(name.replace('/', "-"));
+            g(
+                &repo,
+                &["worktree", "add", "-b", name, wt.to_str().unwrap(), &prev],
+            );
+            std::fs::write(wt.join(format!("{}.txt", name.replace('/', "-"))), "x\n").unwrap();
+            g(&wt, &["add", "."]);
+            g(&wt, &["commit", "-m", &format!("commit-{name}-only")]);
+            worktrees.push((name.to_string(), wt));
+            prev = name.to_string();
+        }
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            for (i, (branch, wt)) in worktrees.iter().enumerate() {
+                guard.add_guardian_branch(&id, branch).unwrap();
+                insert_done_cell(&guard, &format!("squad-{i}"), wt, branch);
+            }
+            id
+        };
+        {
+            let guard = store.lock().unwrap();
+            for b in &guard.get_guardian(&id).unwrap().branches {
+                guard
+                    .set_branch_status(&id, &b.id, MergeStatus::Ready, None)
+                    .unwrap();
+            }
+            guard
+                .set_branch_enabled_by_name(&id, "feature/b", false)
+                .unwrap();
+        }
+
+        recompute_preliminary_summary(&store, &id);
+        let summary = store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .change_summary
+            .expect("preliminary summary computed");
+
+        assert!(
+            !summary.contains("feature/b"),
+            "disabled branch must not appear at all: {summary:?}"
+        );
+        assert!(
+            !summary.contains("commit-feature/b-only"),
+            "a disabled branch's commits must not leak into a sibling: {summary:?}"
+        );
+        let sections: std::collections::HashMap<&str, &str> = summary
+            .split("\n\n")
+            .filter_map(|s| s.split_once(":\n"))
+            .collect();
+        assert_eq!(sections.get("feature/a"), Some(&"feature"));
+        assert_eq!(sections.get("feature/c"), Some(&"commit-feature/c-only"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RAL-303: a rebased branch's review ref is a *copy* of the producing
+    /// worktree's commits under different shas, so a partly-rebased stack
+    /// reads the same commit twice — once by its review sha, once by its
+    /// original. Assert the summary lists each commit exactly once, attributed
+    /// to the earliest branch that carries it, even when the branch beneath is
+    /// read from a side the range-chaining can't bridge (its producing
+    /// worktree is no longer known to the store).
+    #[test]
+    fn recompute_preliminary_summary_strips_commits_duplicated_across_the_rebase_seam() {
+        let (base, repo, _awt) = make_repo("prelim-dupes");
+        let base_sha = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // feature/b is stacked on feature/a, so its worktree carries feature/a's
+        // "feature" commit as well as its own.
+        let bwt = base.join("bwt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/b",
+                bwt.to_str().unwrap(),
+                "feature/a",
+            ],
+        );
+        std::fs::write(bwt.join("b.txt"), "b\n").unwrap();
+        g(&bwt, &["add", "."]);
+        g(&bwt, &["commit", "-m", "commit-b-only"]);
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.add_guardian_branch(&id, "feature/b").unwrap();
+            // Only feature/b has a producing cell on record: feature/a is
+            // readable solely through its review ref, so the task-side chain
+            // has no HEAD to advance past and would otherwise re-list
+            // feature/a's commit under feature/b.
+            insert_done_cell(&guard, "squad-b", &bwt, "feature/b");
+            guard
+                .set_guardian_project_base_commit(&id, repo.to_str().unwrap(), &base_sha)
+                .unwrap();
+            id
+        };
+        let branch_ids: Vec<String> = store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+
+        let review_ref = format!("guardian/{id}/wt-feature/a");
+        g(&repo, &["update-ref", &review_ref, "feature/a"]);
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .set_branch_review(&id, &branch_ids[0], &review_ref, "/some/review/wt")
+                .unwrap();
+            for branch_id in &branch_ids {
+                guard
+                    .set_branch_status(&id, branch_id, MergeStatus::Ready, None)
+                    .unwrap();
+            }
+        }
+
+        recompute_preliminary_summary(&store, &id);
+        let summary = store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .change_summary
+            .expect("preliminary summary computed");
+
+        assert_eq!(
+            summary.lines().filter(|l| *l == "feature").count(),
+            1,
+            "the shared commit must appear once, under feature/a: {summary:?}"
+        );
+        let sections: std::collections::HashMap<&str, &str> = summary
+            .split("\n\n")
+            .filter_map(|s| s.split_once(":\n"))
+            .collect();
+        assert_eq!(sections.get("feature/a"), Some(&"feature"));
+        assert_eq!(sections.get("feature/b"), Some(&"commit-b-only"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RAL-303: once every enabled branch is in the review worktree there is
+    /// nothing the git-log pass can add, so it must not overwrite the
+    /// agent-authored summary with its own raw commit subjects.
+    #[test]
+    fn recompute_preliminary_summary_never_downgrades_a_final_summary() {
+        let (base, repo, awt) = make_repo("prelim-no-downgrade");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            insert_done_cell(&guard, "squad-a", &awt, "feature/a");
+            id
+        };
+        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .set_branch_status(&id, &branch_id, MergeStatus::Ready, None)
+                .unwrap();
+            guard
+                .set_branch_review(
+                    &id,
+                    &branch_id,
+                    "guardian/x/wt-feature-a",
+                    "/some/review/wt",
+                )
+                .unwrap();
+            guard
+                .set_guardian_summary(&id, "final summary from the agent", Some("ollama"), None)
+                .unwrap();
+        }
+
+        recompute_preliminary_summary(&store, &id);
+        let g_row = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(
+            g_row.change_summary.as_deref(),
+            Some("final summary from the agent")
+        );
+        assert_eq!(g_row.summary_agent.as_deref(), Some("ollama"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn recompute_preliminary_summary_is_noop_with_no_ready_branches() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
@@ -8807,7 +9551,7 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .request_final_summary(&id, "sig-1", crate::store::now_ms());
+            .request_final_summary(&id, "sig-1", crate::store::now_ms(), false);
         assert!(
             store
                 .lock()
@@ -8873,6 +9617,10 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["rebase", "--continue"])
             .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true")
             .status()

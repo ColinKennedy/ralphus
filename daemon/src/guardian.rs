@@ -1003,14 +1003,22 @@ impl Store {
 
     /// Ids of collecting guardians that are ready to start: every enabled branch
     /// that has a contributing cell (matched by `cells.review_branch =
-    /// guardian_branches.branch`) is in the `done` state. Guardians with no
-    /// cell-linked branches are excluded (they haven't been triggered yet).
-    /// Used at daemon startup to recover guardians that were left `collecting`
-    /// because the daemon was restarted after the squad completed.
+    /// guardian_branches.branch`) has its *most recently created* such cell in
+    /// the `done` state. Guardians with no cell-linked branches are excluded
+    /// (they haven't been triggered yet). Used at daemon startup to recover
+    /// guardians that were left `collecting` because the daemon was restarted
+    /// after the squad completed.
     ///
-    /// This already requires ALL matching cells done, not just one — which,
+    /// This requires the latest matching cell done, not just one — which,
     /// since RAL-159, includes implicit worktree-sharing siblings alongside the
     /// explicitly review-linked cell (see `mark_ready_branches_with_done_cells`).
+    /// "Latest" (highest `rowid`, mirroring `force_start_disable_branches`) matters
+    /// because a branch name is stable across resubmissions: a squad retried
+    /// under a new squad id reuses the same `review_branch`, leaving the earlier
+    /// attempt's non-`done` cell row (failed, or superseded mid-run) still in the
+    /// table. Requiring *every* historical row done, as a plain `!= 'done'`
+    /// filter over the full join would, means a stale row from a superseded
+    /// attempt blocks readiness forever even after a fresh attempt succeeds.
     pub fn collecting_guardians_ready(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM guardians WHERE status = 'collecting'
@@ -1021,9 +1029,12 @@ impl Store {
              )
              AND NOT EXISTS (
                  SELECT 1 FROM guardian_branches gb
-                 JOIN cells s ON s.review_branch = gb.branch
                  WHERE gb.guardian_id = guardians.id AND gb.enabled = 1
-                   AND s.state != 'done'
+                   AND (
+                       SELECT s.state FROM cells s
+                       WHERE s.review_branch = gb.branch
+                       ORDER BY s.rowid DESC LIMIT 1
+                   ) != 'done'
              )
              ORDER BY created_at_ms, id",
         )?;
@@ -1033,24 +1044,39 @@ impl Store {
         Ok(ids)
     }
 
-    /// Names of `guardian_id`'s enabled branches whose linked cell(s)
-    /// (`cells.review_branch = guardian_branches.branch`) are not all `done`
-    /// yet -- i.e. branches a merge started right now would run ahead of,
-    /// because they're still waiting on their upstream Cell (RAL-255).
-    /// Mirrors [`Self::collecting_guardians_ready`]'s own `NOT EXISTS`
-    /// clause but as a single-guardian query callable from
+    /// Names of `guardian_id`'s enabled branches whose *most recently created*
+    /// linked cell (`cells.review_branch = guardian_branches.branch`, highest
+    /// `rowid`) is not `done` yet -- i.e. branches a merge started right now
+    /// would run ahead of, because they're still waiting on their upstream Cell
+    /// (RAL-255). Mirrors [`Self::collecting_guardians_ready`]'s own `NOT
+    /// EXISTS` clause but as a single-guardian query callable from
     /// [`crate::guardian_merge::start_merge`] itself, so every caller is
     /// protected, not just the ones that already route through
     /// `collecting_guardians_ready`.
+    ///
+    /// Uses the latest cell row per branch, not "all matching rows done", for
+    /// the same reason [`Self::force_start_disable_branches`] already does:
+    /// a branch name is stable across resubmissions (a squad retried under a
+    /// new squad id reuses the same `review_branch`), so an older, superseded
+    /// attempt's non-`done` cell row must not block a branch whose current
+    /// attempt has actually finished.
     ///
     /// A branch with no linked cell at all (e.g. manually added, never
     /// wired to a task) never appears here -- there's nothing to wait for.
     pub fn guardian_unfinished_linked_branches(&self, guardian_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT gb.branch FROM guardian_branches gb
-             JOIN cells s ON s.review_branch = gb.branch
-             WHERE gb.guardian_id = ?1 AND gb.enabled = 1 AND s.state != 'done'
-             ORDER BY gb.branch",
+            "SELECT branch FROM (
+                 SELECT gb.branch AS branch,
+                        (
+                            SELECT s.state FROM cells s
+                            WHERE s.review_branch = gb.branch
+                            ORDER BY s.rowid DESC LIMIT 1
+                        ) AS latest_state
+                 FROM guardian_branches gb
+                 WHERE gb.guardian_id = ?1 AND gb.enabled = 1
+             )
+             WHERE latest_state != 'done'
+             ORDER BY branch",
         )?;
         let branches = stmt
             .query_map(params![guardian_id], |r| r.get::<_, String>(0))?
@@ -1113,6 +1139,79 @@ impl Store {
             params![guardian_id],
         )?;
         Ok(n)
+    }
+
+    /// RAL-280 dispatch-priority signal for one cell: is it the first
+    /// not-yet-contributed branch of a Review it feeds, and if so how many
+    /// enabled branches does that Review have? Reuses the same "enabled +
+    /// contributing cell not done" notion as
+    /// [`Self::mark_ready_branches_with_done_cells`]/
+    /// [`Self::guardian_unfinished_linked_branches`] — an earlier-position
+    /// enabled branch with no linked cell at all never blocks (nothing to
+    /// wait for), matching those.
+    ///
+    /// Returns `None` when the cell has no `review_branch`, or its branch
+    /// isn't (yet) the earliest unfinished one in any guardian stack it
+    /// belongs to — callers treat that as "no scheduling boost", never as
+    /// "unschedulable". When the branch is the first-in-line for more than
+    /// one guardian (a branch name reused across stacks), the largest
+    /// enabled-branch count wins, so the scheduler always front-loads the
+    /// longest critical path it can unblock.
+    ///
+    /// The caller (`scheduler.rs`'s dispatch loop) computes this once, at the
+    /// moment a cell becomes ready to dispatch, and never recomputes it later
+    /// as branches are added/reordered/dropped — deliberately, so the
+    /// scheduler doesn't pay for a recompute on every tick.
+    pub fn cell_review_dispatch_priority(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<usize>> {
+        let branch: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT review_branch FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(branch) = branch else {
+            return Ok(None);
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT guardian_id, position FROM guardian_branches WHERE branch=? AND enabled=1",
+        )?;
+        let candidates: Vec<(String, i64)> = stmt
+            .query_map(params![branch], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut best: Option<usize> = None;
+        for (guardian_id, position) in candidates {
+            let has_unfinished_earlier: i64 = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM guardian_branches gb
+                     JOIN cells s ON s.review_branch = gb.branch
+                     WHERE gb.guardian_id = ?1 AND gb.enabled = 1 AND gb.position < ?2
+                       AND s.state != 'done'
+                 )",
+                params![guardian_id, position],
+                |r| r.get(0),
+            )?;
+            if has_unfinished_earlier != 0 {
+                continue;
+            }
+            let enabled_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM guardian_branches WHERE guardian_id=? AND enabled=1",
+                params![guardian_id],
+                |r| r.get(0),
+            )?;
+            let enabled_count = enabled_count.max(0) as usize;
+            best = Some(best.map_or(enabled_count, |b| b.max(enabled_count)));
+        }
+        Ok(best)
     }
 
     /// Record the stack configuration a staged merge pass built against (RAL-265):
@@ -3409,6 +3508,7 @@ struct GuardianRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NodeState;
 
     // ── CLI_PARITY_PLAN.local.md Phase 5: ported board.html domain logic ────────
 
@@ -5205,6 +5305,149 @@ mod tests {
         assert_eq!(
             store.guardian_cost_total("guardian-nope").unwrap(),
             (0, 0, 0.0)
+        );
+    }
+
+    // ── stale-cell-row regression: a superseded attempt must not block a
+    // branch whose current attempt has finished ─────────────────────────
+
+    fn insert_cell_for_branch(store: &mut Store, branch: &str, state: NodeState) -> String {
+        let src = "[[task]]\nname=\"t0\"\n[[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(src).expect("valid fixture");
+        let squad_id = store.insert_squad(&tf, None, false).unwrap();
+        store
+            .set_cell_review_branch(&squad_id, 0, 0, branch)
+            .unwrap();
+        store.set_cell_state(&squad_id, 0, 0, state).unwrap();
+        squad_id
+    }
+
+    #[test]
+    fn guardian_unfinished_linked_branches_ignores_a_stale_superseded_cell_row() {
+        // Same scenario the merge-deferral bug hit live (RAL-295): a branch
+        // gets a failed cell from an earlier attempt, then a fresh attempt
+        // (a new squad reusing the same branch name) finishes `done`. Only
+        // the *latest* cell should decide readiness -- the old failed row
+        // must not haunt the branch forever.
+        let mut store = Store::open_in_memory().unwrap();
+        insert_cell_for_branch(&mut store, "feat", NodeState::Failed);
+        insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert_eq!(
+            store.guardian_unfinished_linked_branches(&id).unwrap(),
+            Vec::<String>::new(),
+            "the branch's latest cell is done -- the earlier attempt's failed \
+             row must not count against it"
+        );
+    }
+
+    #[test]
+    fn guardian_unfinished_linked_branches_still_blocks_on_a_genuinely_unfinished_latest_cell() {
+        // Guards the fix above from over-correcting: if the *latest* cell for
+        // a branch is not done, it must still be reported, even though an
+        // earlier attempt at the same branch name happened to succeed.
+        let mut store = Store::open_in_memory().unwrap();
+        insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+        insert_cell_for_branch(&mut store, "feat", NodeState::Running);
+
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert_eq!(
+            store.guardian_unfinished_linked_branches(&id).unwrap(),
+            vec!["feat".to_string()]
+        );
+    }
+
+    #[test]
+    fn collecting_guardians_ready_ignores_a_stale_superseded_cell_row() {
+        let mut store = Store::open_in_memory().unwrap();
+        insert_cell_for_branch(&mut store, "feat", NodeState::Failed);
+        insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert_eq!(store.collecting_guardians_ready().unwrap(), vec![id]);
+    }
+
+    // ── RAL-280: dispatch-priority signal for the scheduler ──────────────────
+
+    const TWO_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+                              [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"y\"\n";
+
+    #[test]
+    fn cell_review_dispatch_priority_is_none_without_a_review_branch() {
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        assert_eq!(
+            store.cell_review_dispatch_priority(&squad, 0, 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cell_review_dispatch_priority_favors_the_first_unfinished_branch_in_position_order() {
+        // Two branches, stacked in position order "a" then "b", each fed by a
+        // different task's single cell.
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        let gid = store
+            .create_guardian_for_squad("Stack", "main", "/repo", Some(&squad))
+            .unwrap();
+        store.add_guardian_branch(&gid, "a").unwrap();
+        store.add_guardian_branch(&gid, "b").unwrap();
+        store.set_cell_review_branch(&squad, 0, 0, "a").unwrap();
+        store.set_cell_review_branch(&squad, 1, 0, "b").unwrap();
+
+        // "a" has no earlier branch, so it's already first-in-line: priority
+        // boost equal to the stack's 2 enabled branches.
+        assert_eq!(
+            store.cell_review_dispatch_priority(&squad, 0, 0).unwrap(),
+            Some(2)
+        );
+        // "b" is blocked behind "a", whose cell hasn't finished yet -- no boost.
+        assert_eq!(
+            store.cell_review_dispatch_priority(&squad, 1, 0).unwrap(),
+            None
+        );
+
+        // Once "a"'s cell finishes, "b" becomes the first not-yet-contributed
+        // branch and picks up the same boost.
+        store
+            .set_cell_state(&squad, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        assert_eq!(
+            store.cell_review_dispatch_priority(&squad, 1, 0).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cell_review_dispatch_priority_skips_disabled_earlier_branches() {
+        // A disabled earlier branch never blocks -- "b" is first-in-line
+        // despite "a" (position 0) never having finished, because "a" is
+        // disabled. The enabled-branch count (1) excludes the disabled branch.
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        let gid = store
+            .create_guardian_for_squad("Stack", "main", "/repo", Some(&squad))
+            .unwrap();
+        store.add_guardian_branch(&gid, "a").unwrap();
+        store.add_guardian_branch(&gid, "b").unwrap();
+        store.set_cell_review_branch(&squad, 0, 0, "a").unwrap();
+        store.set_cell_review_branch(&squad, 1, 0, "b").unwrap();
+        store.set_branch_enabled_by_name(&gid, "a", false).unwrap();
+
+        assert_eq!(
+            store.cell_review_dispatch_priority(&squad, 1, 0).unwrap(),
+            Some(1)
         );
     }
 }

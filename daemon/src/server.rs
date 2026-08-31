@@ -81,6 +81,11 @@ pub struct Daemon {
     /// the handler) so a real "User adapter" is a one-line swap here once
     /// RAL-252 lands.
     agent_access: Arc<dyn crate::agent_access::AgentAccess>,
+    /// RAL-297: in-flight/completed "generation step" jobs backing the
+    /// Simple task form's opt-in "Generate Proofs"/"Generate Manual Checks"
+    /// buttons -- see `crate::generation`'s module doc comment for why this
+    /// is fire-and-forget-plus-poll rather than a blocking HTTP call.
+    generation_jobs: crate::generation::GenerationJobs,
 }
 
 impl Daemon {
@@ -99,6 +104,7 @@ impl Daemon {
             token: None,
             events_tickets: crate::token::TicketStore::new(),
             agent_access: Arc::new(crate::agent_access::DefaultAgentAccess),
+            generation_jobs: crate::generation::GenerationJobs::new(),
         }
     }
 
@@ -303,6 +309,18 @@ struct CreateUserBody {
     name: String,
 }
 
+#[derive(Serialize)]
+struct SecretEnvNamesResponse {
+    names: Vec<crate::secret_env_names::SecretEnvNameView>,
+}
+
+/// `POST /api/secret-env-names` body (RAL-281) -- see
+/// `crate::secret_env_names`'s module doc comment.
+#[derive(Deserialize)]
+struct AddSecretEnvNameBody {
+    name: String,
+}
+
 /// `POST /api/machines` body (RAL-185). Registering a machine provider is an
 /// administrative action, deliberately reachable only over this endpoint (and
 /// the CLI wrapping it) and never declarable inside a submitted task file —
@@ -435,6 +453,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "projects"]) => register_project(daemon, body),
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
+        ("GET", ["api", "projects", name, "branches"]) => project_branches(daemon, name),
         // Machine provider registry (RAL-185).
         ("GET", ["api", "machines"]) => list_machines(daemon),
         ("POST", ["api", "machines"]) => register_machine(daemon, body),
@@ -445,13 +464,26 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "agents"]) => list_agents(daemon, query),
+        // RAL-297: cwd-independent agent+model catalog for the Simple task
+        // form's agent picker -- see `crate::agent_catalog`.
+        ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(),
         // Minimal user registry (RAL-?) -- see `crate::users`'s module doc
         // comment: this is a placeholder identity layer, not authentication.
         // TODO: Replace with user auth once RAL-252 is done.
         ("GET", ["api", "users"]) => list_users(daemon),
         ("POST", ["api", "users"]) => create_user(daemon, body),
-        ("DELETE", ["api", "users", name]) => delete_user(daemon, name),
+        ("DELETE", ["api", "users", name]) => delete_user(daemon, &url_decode(name)),
+        ("POST", ["api", "users", name, "rename"]) => user_rename(daemon, &url_decode(name), body),
+        // RAL-281: user-editable list of env-var names treated as secret --
+        // see `crate::secret_env_names`'s module doc comment.
+        ("GET", ["api", "secret-env-names"]) => list_secret_env_names(daemon),
+        ("POST", ["api", "secret-env-names"]) => add_secret_env_name(daemon, body),
+        ("POST", ["api", "secret-env-names", name, "rename"]) => {
+            rename_secret_env_name(daemon, name, body)
+        }
+        ("DELETE", ["api", "secret-env-names", name]) => delete_secret_env_name(daemon, name),
         ("GET", ["api", "config", "live-view"]) => live_view_config_reply(),
+        ("GET", ["api", "config", "templates"]) => templates_config_reply(),
         ("GET", ["api", "cartographer"]) => cartographer_query(daemon, query),
         ("GET", ["api", "cartographer", id]) => cartographer_get(daemon, id),
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
@@ -463,6 +495,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "mailbox", client_id, "drain"]) => mailbox_drain(daemon, client_id, body),
         ("POST", ["api", "squads", "validate"]) => validate_endpoint(daemon, body),
         ("POST", ["api", "squads"]) => submit(daemon, body),
+        // RAL-297: Simple task form's opt-in "generation step" primitive.
+        ("POST", ["api", "generate"]) => generate_start(daemon, body),
+        ("GET", ["api", "generate", id]) => generate_status(daemon, id),
         ("POST", ["api", "clear"]) => clear_all(daemon, body),
         ("GET", ["api", "queue"]) => queue(daemon),
         ("POST", ["api", "queue", "reorder"]) => queue_reorder(daemon, body),
@@ -601,6 +636,20 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
                 scope,
                 cell_idx,
                 proof_idx,
+                "debug-events",
+            ],
+        ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx),
+        (
+            "GET",
+            [
+                "api",
+                "squads",
+                id,
+                "proofs",
+                task_idx,
+                scope,
+                cell_idx,
+                proof_idx,
                 "terminal-log-attempts",
             ],
         ) => proof_terminal_log_attempts(daemon, id, task_idx, scope, cell_idx, proof_idx),
@@ -635,7 +684,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "guardians", id, "branches", "arrange"]) => {
             guardian_arrange(daemon, id, body)
         }
-        ("POST", ["api", "guardians", id, "sync-github"]) => guardian_sync_github(daemon, id),
+        ("POST", ["api", "guardians", id, "sync-pr"]) => guardian_sync_pr(daemon, id),
         ("POST", ["api", "guardians", id, "branches", branch_id, "feedback"]) => {
             guardian_feedback(daemon, id, branch_id, body)
         }
@@ -691,6 +740,17 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
                 id,
                 "branches",
                 branch_id,
+                "debug-events",
+            ],
+        ) => guardian_branch_debug_events(daemon, id, branch_id),
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
                 "terminal-log-attempts",
             ],
         ) => guardian_branch_terminal_log_attempts(daemon, id, branch_id),
@@ -711,6 +771,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         }
         ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
             guardian_manual_checks_pane(daemon, id, query)
+        }
+        ("GET", ["api", "guardians", id, "manual-checks", "debug-events"]) => {
+            guardian_manual_checks_debug_events(daemon, id)
         }
         (
             "GET",
@@ -753,6 +816,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             guardian_submit_prs(daemon, id, body)
         }
         ("GET", ["api", "guardians", id, "pull-requests"]) => guardian_list_prs(daemon, id),
+        ("GET", ["api", "guardians", id, "pull-request-stacks"]) => {
+            guardian_list_pr_stacks(daemon, id)
+        }
         ("GET", ["api", "pull-requests"]) => pr_find(daemon, query),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
@@ -1593,6 +1659,22 @@ fn create_user(daemon: &Daemon, body: &str) -> Reply {
     }
 }
 
+/// Rename a registered user (RAL-?). Reuses [`RenameBody`] (`{name}`), the
+/// same shape `guardian_rename` uses.
+fn user_rename(daemon: &Daemon, name: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<RenameBody>(body) else {
+        return error(400, "bad_request", "body must be {name}", vec![]);
+    };
+    let new_name = req.name.trim();
+    if new_name.is_empty() {
+        return error(400, "bad_request", "name must not be empty", vec![]);
+    }
+    match daemon.lock().rename_user(name, new_name) {
+        Ok(()) => json(200, &serde_json::json!({"name": new_name})),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Remove a registered user by exact name (RAL-?).
 fn delete_user(daemon: &Daemon, name: &str) -> Reply {
     match daemon.lock().delete_user(name) {
@@ -1601,6 +1683,77 @@ fn delete_user(daemon: &Daemon, name: &str) -> Reply {
             404,
             "not_found",
             &format!("user \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/secret-env-names` (RAL-281) -- see `crate::secret_env_names`'s
+/// module doc comment.
+fn list_secret_env_names(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_secret_env_names() {
+        Ok(names) => json(200, &SecretEnvNamesResponse { names }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Register a new secret env-var name (RAL-281). `409` if already
+/// registered -- adding a duplicate is rejected, not silently merged.
+fn add_secret_env_name(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddSecretEnvNameBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include a \"name\" string",
+            vec![],
+        );
+    };
+    let name = req.name.trim();
+    if !crate::config::is_valid_env_key(name) {
+        return error(
+            400,
+            "invalid_value",
+            "\"name\" must be a valid environment-variable identifier ([A-Za-z_][A-Za-z0-9_]*)",
+            vec![],
+        );
+    }
+    match daemon.lock().add_secret_env_name(name) {
+        Ok(()) => json(201, &serde_json::json!({"name": name})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Rename a registered secret env-var name (RAL-281). `404` if `name` isn't
+/// registered, `409` if the new name is already registered by a different
+/// entry.
+fn rename_secret_env_name(daemon: &Daemon, name: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<RenameBody>(body) else {
+        return error(400, "bad_request", "body must be {name}", vec![]);
+    };
+    let new_name = req.name.trim();
+    if !crate::config::is_valid_env_key(new_name) {
+        return error(
+            400,
+            "invalid_value",
+            "\"name\" must be a valid environment-variable identifier ([A-Za-z_][A-Za-z0-9_]*)",
+            vec![],
+        );
+    }
+    match daemon.lock().rename_secret_env_name(name, new_name) {
+        Ok(()) => json(200, &serde_json::json!({"name": new_name})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Remove a registered secret env-var name (RAL-281).
+fn delete_secret_env_name(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().delete_secret_env_name(name) {
+        Ok(true) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("secret env-var name {name:?} is not registered"),
             vec![],
         ),
         Err(e) => store_error(&e),
@@ -1649,6 +1802,93 @@ fn validate_project(daemon: &Daemon, name: &str) -> Reply {
             vec![],
         ),
         Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/projects/{name}/branches` (RAL-297): local and `origin`
+/// remote-tracking branch names for a registered git project, so the Simple
+/// task form can validate a user-typed upstream branch at submit time
+/// before generating a `ralphus:new-worktree/...?upstream=...` placeholder
+/// that would otherwise only fail much later, at worktree-materialization
+/// time (`daemon/src/worktrees.rs::resolve_upstream`). Reuses
+/// `guardian_merge::list_base_branches`, the same git-shelling-out helper
+/// the Reviews tab's base-branch picker already relies on. Non-git projects,
+/// or ones whose path no longer resolves, get an empty list rather than an
+/// error -- the branch field is only ever shown for a git project in the
+/// first place.
+#[derive(Serialize)]
+struct ProjectBranchesResponse {
+    branches: Vec<String>,
+}
+
+fn project_branches(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_project(name) {
+        Ok(Some(p)) if p.vcs == "git" => {
+            let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
+            for b in crate::guardian_merge::list_base_branches(&p.path, "origin/HEAD") {
+                if !branches.contains(&b) {
+                    branches.push(b);
+                }
+            }
+            json(200, &ProjectBranchesResponse { branches })
+        }
+        Ok(Some(_)) => json(200, &ProjectBranchesResponse { branches: vec![] }),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("project \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Serialize)]
+struct GenerateStartResponse {
+    id: String,
+}
+
+/// `POST /api/generate` (RAL-297): kicks off one "generation step" (Simple
+/// form's opt-in "Generate Proofs"/"Generate Manual Checks") on a background
+/// thread and returns `202` immediately with a job id -- see
+/// `crate::generation`'s module doc comment for why this can't block the
+/// accept loop. Poll `GET /api/generate/{id}` for the result.
+fn generate_start(daemon: &Daemon, body: &str) -> Reply {
+    let req: crate::generation::GenerateRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid generation request body: {e}"),
+                vec![],
+            );
+        }
+    };
+    if crate::generation::GenerationKind::parse(&req.kind).is_none() {
+        return error(
+            400,
+            "bad_request",
+            "kind must be \"proof_steps\" or \"manual_checks\"",
+            vec![],
+        );
+    }
+    let id = daemon.generation_jobs.start();
+    let jobs = daemon.generation_jobs.clone();
+    let job_id = id.clone();
+    std::thread::spawn(move || {
+        let result = crate::generation::run_generation(&req);
+        jobs.finish(&job_id, result);
+    });
+    json(202, &GenerateStartResponse { id })
+}
+
+/// `GET /api/generate/{id}` (RAL-297): poll a generation job started by
+/// [`generate_start`].
+fn generate_status(daemon: &Daemon, id: &str) -> Reply {
+    match daemon.generation_jobs.get(id) {
+        Some(job) => json(200, &job),
+        None => error(404, "not_found", "no such generation job", vec![]),
     }
 }
 
@@ -3943,6 +4183,58 @@ fn live_view_config_reply() -> Reply {
     )
 }
 
+/// The Simple task form's template picker (RAL-297): the effective
+/// `[[templates]]` list (falling back to the built-in
+/// [`crate::config::default_template`] when nothing valid is configured) and
+/// the `[ui] new_task_default_tab` default. Cwd-independent, following
+/// [`live_view_config_reply`]'s precedent -- there is no per-project layer
+/// today since the daemon's HTTP handlers have no per-request project root
+/// (see `crate::config::load_templates_config`'s doc comment).
+#[derive(Serialize)]
+struct TemplatesResponse {
+    templates: Vec<crate::config::TemplateDef>,
+    default_new_task_tab: String,
+    /// `true` when zero valid `[[templates]]` are configured and `templates`
+    /// is therefore just the built-in fallback -- the board uses this to
+    /// disable the template picker and show an explanatory tooltip.
+    using_fallback: bool,
+}
+
+fn templates_config_reply() -> Reply {
+    let (templates, using_fallback) = crate::config::effective_templates();
+    let default_new_task_tab = crate::config::load_ui_config()
+        .new_task_default_tab()
+        .to_string();
+    json(
+        200,
+        &TemplatesResponse {
+            templates,
+            default_new_task_tab,
+            using_fallback,
+        },
+    )
+}
+
+/// `GET /api/agents/catalog` (RAL-297): the Simple task form's agent picker
+/// -- unlike `GET /api/agents`, this is deliberately cwd-independent (see
+/// `crate::agent_catalog`'s module doc comment) and carries each agent's
+/// known model list so the board can scope its model dropdown.
+#[derive(Serialize)]
+struct AgentCatalogResponse {
+    agents: Vec<crate::agent_catalog::CatalogAgent>,
+    default_agent: String,
+}
+
+fn agent_catalog_reply() -> Reply {
+    json(
+        200,
+        &AgentCatalogResponse {
+            agents: crate::agent_catalog::agent_catalog(),
+            default_agent: ralphus_core::schema::DEFAULT_AGENT.to_string(),
+        },
+    )
+}
+
 /// A pane's current content for the live "read-only terminal" peek view
 /// (RAL-102). `active` is `false` once the underlying tmux session has ended
 /// (the cell/proof/resolver finished and the daemon tore it down, or it was
@@ -4509,10 +4801,29 @@ fn resume_automation(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     {
         return store_error(&e);
     }
-    match daemon.lock().restart_cell(id, task_idx, cell_idx) {
-        Ok(_) => json(200, &OpenTerminalResponse { ok: true }),
-        Err(e) => store_error(&e),
+    // Deliberately `resume_detached_cell`, not `restart_cell`: this is
+    // handing one still-in-progress cell back to automation, not restarting
+    // a squad. It must never touch the squad's own row, sibling tasks, or
+    // cross-squad dependents -- none of that is relevant to "let this exact
+    // conversation continue."
+    if let Err(e) = daemon.lock().resume_detached_cell(id, task_idx, cell_idx) {
+        return store_error(&e);
     }
+    // The common case: this squad's own dispatcher worker is still alive
+    // (driving this cell's siblings, or just polling) -- its own loop
+    // reclaims a cell that goes back to `pending` under it without any
+    // squad-level signal (see `scheduler::execute_squad_inner`'s Detached
+    // revival). Only when that worker has already exited entirely (e.g. this
+    // was the squad's last live cell) does nothing remain to notice the
+    // reset cell at all, so the squad needs to be handed back to
+    // `scheduler::tick` the same way `restart_cell` would -- but only that,
+    // never the cell/task-level resets `restart_cell` also does.
+    if !daemon.cancellations.is_active(id) {
+        if let Err(e) = daemon.lock().set_squad_state(id, SquadState::Pending) {
+            return store_error(&e);
+        }
+    }
+    json(200, &OpenTerminalResponse { ok: true })
 }
 
 /// The live pane content of a task cell's tmux session, for the
@@ -4537,11 +4848,23 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
     capture_pane_reply(daemon, id, &task, &cell_id, query)
 }
 
-/// This cell's own Cartographer rows (RAL-288 Stage 5), for the Live View
-/// pane's "Show Debug Messages" checkbox to additively merge alongside the
-/// now-always-clean pane text (see `strip_ralphus_pane_markers`) when
-/// checked. Bare JSON array, ascending by time, matching every other
-/// Cartographer-backed list endpoint's response shape.
+/// This entity's own chronologically-merged, current-attempt-only debug
+/// stream (RAL-296) -- backs both the Live View pane's "Show Debug Messages"
+/// checkbox and the "Open Terminal Log" attempt-history popup, for whichever
+/// of the four terminal-log contexts `terminal_log_attempts_reply`'s doc
+/// comment already lists (task cell, proof step, guardian branch resolver,
+/// guardian manual-checks). Bare JSON array, ascending by time, matching
+/// every other Cartographer-backed list endpoint's response shape. See
+/// `crate::timeline::entity_debug_timeline`'s doc comment for the merge and
+/// current-attempt-trim rules.
+fn debug_events_reply(daemon: &Daemon, squad_id: &str, task: &str, cell_id: &str) -> Reply {
+    match crate::timeline::entity_debug_timeline(&daemon.lock(), squad_id, task, cell_id) {
+        Ok(entries) => json(200, &entries),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// This task cell's own debug stream (RAL-288 Stage 5 / RAL-296).
 fn cell_debug_events(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
         return error(
@@ -4559,10 +4882,7 @@ fn cell_debug_events(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    match crate::timeline::cell_debug_entries(&daemon.lock(), id, &task, &cell_id) {
-        Ok(entries) => json(200, &entries),
-        Err(e) => store_error(&e),
-    }
+    debug_events_reply(daemon, id, &task, &cell_id)
 }
 
 /// List a task cell's persisted historical terminal-log attempts (RAL-154)
@@ -4760,6 +5080,39 @@ fn proof_terminal_log_attempts(
     terminal_log_attempts_reply(&squad_id, &task, &cell_id)
 }
 
+/// This `prompt`-kind proof step's own debug stream (RAL-296).
+#[allow(clippy::too_many_arguments)]
+fn proof_debug_events(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    cell_idx: &str,
+    proof_idx: &str,
+) -> Reply {
+    let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
+        task_idx.parse::<i64>(),
+        cell_idx.parse::<i64>(),
+        proof_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell/proof index must be integers",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon.lock().proof_specs(id, task_idx_n, scope, cell_idx_n) {
+        return store_error(&e);
+    }
+    let task = match daemon.lock().get_task_name(id, task_idx_n) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    debug_events_reply(daemon, &squad_id, &task, &cell_id)
+}
+
 /// Content of one of a `prompt`-kind proof step's historical terminal-log
 /// attempts (RAL-154).
 #[allow(clippy::too_many_arguments)]
@@ -4902,10 +5255,10 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
 
 /// The `(task, cell_id)` pair addressing a review branch's conflict-resolver
 /// tmux session -- live or historical (RAL-102, extended for RAL-149's
-/// fix/proof split and RAL-192's stable-id keying) -- shared by
-/// [`open_guardian_branch_terminal`] (attach) and [`guardian_branch_pane`]
-/// (read-only peek) so the two never drift on which call's cell they
-/// resolve to.
+/// fix/proof split, RAL-192's stable-id keying, and RAL-298's
+/// feedback-actioning session) -- shared by [`open_guardian_branch_terminal`]
+/// (attach) and [`guardian_branch_pane`] (read-only peek) so the two never
+/// drift on which call's cell they resolve to.
 fn resolver_task_and_cell_id(
     daemon: &Daemon,
     id: &str,
@@ -4918,17 +5271,89 @@ fn resolver_task_and_cell_id(
     let Some(b) = g.branches.iter().find(|b| b.id == branch_id) else {
         return Err(error(404, "not_found", "no such branch", vec![]));
     };
-    Ok(if b.merge_status == "proof_pending" {
-        (
+    // RAL-298: while reviewer feedback is being actioned, that resolver
+    // agent's own session is the live one to show -- distinct from (and not
+    // reachable through) the merge/rebase resolver below.
+    if b.merge_status == "actioning" {
+        return Ok((
+            crate::guardian_merge::FEEDBACK_TASK,
+            crate::guardian_merge::feedback_cell_id(&b.id),
+        ));
+    }
+    if b.merge_status == "proof_pending" {
+        return Ok((
             crate::guardian_merge::RESOLVER_PROOF_TASK,
             format!("resolver-proof-{}", b.id),
-        )
-    } else {
-        (
+        ));
+    }
+    // RAL-149: `in_progress` means the merge/rebase resolver is live right
+    // now -- always the right answer regardless of any earlier feedback
+    // pass's snapshot recency.
+    if b.merge_status == "in_progress" {
+        return Ok((
             crate::guardian_merge::RESOLVER_TASK,
             format!("resolver-{}", b.id),
-        )
-    })
+        ));
+    }
+    // Settled (done/conflict_resolved/failed/ready/pending): neither session
+    // is live, so fall back to whichever of the merge/rebase resolver or a
+    // feedback-actioning pass most recently actually ran (RAL-298) -- so a
+    // completed feedback revision doesn't get shadowed by a stale, earlier
+    // merge/rebase log the way it did before this resolved feedback's own
+    // session at all.
+    Ok(freshest_resolver_or_feedback(id, &b.id))
+}
+
+/// Picks whichever of the merge/rebase resolver's or a feedback-actioning
+/// pass's persisted pane snapshot was written more recently for `branch_id`,
+/// falling back to the merge/rebase resolver when neither has ever run (the
+/// pre-RAL-298 default, and the common case for a branch feedback was never
+/// given on). Both candidates are settled (never live) whenever this is
+/// called -- see [`resolver_task_and_cell_id`]'s callers.
+fn freshest_resolver_or_feedback(id: &str, branch_id: &str) -> (&'static str, String) {
+    let resolver = (
+        crate::guardian_merge::RESOLVER_TASK,
+        format!("resolver-{branch_id}"),
+    );
+    let feedback = (
+        crate::guardian_merge::FEEDBACK_TASK,
+        crate::guardian_merge::feedback_cell_id(branch_id),
+    );
+    let squad = format!("guardian-{id}");
+    let resolver_mtime =
+        pane_snapshot_mtime(&crate::tmux::session_name(&squad, resolver.0, &resolver.1));
+    let feedback_mtime =
+        pane_snapshot_mtime(&crate::tmux::session_name(&squad, feedback.0, &feedback.1));
+    pick_freshest(resolver, feedback, resolver_mtime, feedback_mtime)
+}
+
+/// Pure decision behind [`freshest_resolver_or_feedback`], split out so the
+/// "which of the two ran more recently" logic is unit-testable without
+/// touching the filesystem: `resolver`/`feedback` are the two candidate
+/// values, `resolver_mtime`/`feedback_mtime` their snapshots' last-write
+/// times (`None` when that candidate never wrote one). Ties and "neither has
+/// a snapshot" both default to `resolver`, matching the pre-RAL-298 behavior
+/// for a branch that has never had feedback actioned on it.
+fn pick_freshest<T>(
+    resolver: T,
+    feedback: T,
+    resolver_mtime: Option<std::time::SystemTime>,
+    feedback_mtime: Option<std::time::SystemTime>,
+) -> T {
+    match (resolver_mtime, feedback_mtime) {
+        (Some(r), Some(f)) if f > r => feedback,
+        (None, Some(_)) => feedback,
+        _ => resolver,
+    }
+}
+
+/// Last-modified time of a tmux session's persisted pane snapshot (see
+/// `crate::tmux::write_pane_snapshot`), or `None` when that session never
+/// wrote one (never ran under tmux, or every attempt produced no output).
+fn pane_snapshot_mtime(session_name: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::tmux::pane_snapshot_path(session_name))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 /// Spawn a real, interactive resumed CLI cell (`claude --resume <id>
@@ -5218,34 +5643,39 @@ fn guardian_branch_conflicts(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
     )
 }
 
-/// List a review branch's conflict-resolver's persisted historical
-/// terminal-log attempts (RAL-154).
+/// List a review branch's currently-relevant resolver session's persisted
+/// historical terminal-log attempts (RAL-154; RAL-298: shares
+/// [`resolver_task_and_cell_id`] so this always lists attempts for the same
+/// session the pane/attach endpoints show -- the merge/rebase resolver, the
+/// final-proof pass, or a feedback-actioning pass, whichever last actually
+/// ran on this branch -- instead of the merge/rebase resolver
+/// unconditionally, which used to leave a completed feedback pass's own
+/// attempts unreachable here).
 fn guardian_branch_terminal_log_attempts(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
-    if daemon.lock().get_guardian(id).is_err() {
-        return error(404, "not_found", "no such guardian", vec![]);
-    }
-    let position = match daemon.lock().guardian_branches(id) {
-        Ok(branches) => match branches.iter().find(|b| b.id == branch_id) {
-            Some(b) => b.position,
-            None => return error(404, "not_found", "no such branch", vec![]),
-        },
-        Err(e) => return store_error(&e),
+    let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    terminal_log_attempts_reply(
-        &format!("guardian-{id}"),
-        crate::guardian_merge::RESOLVER_TASK,
-        &format!("resolver-{position}"),
-    )
+    terminal_log_attempts_reply(&format!("guardian-{id}"), task, &cell_id)
 }
 
-/// Content of one of a review branch's conflict-resolver's historical
-/// terminal-log attempts (RAL-154).
+/// Content of one of [`guardian_branch_terminal_log_attempts`]'s persisted
+/// terminal-log attempts (RAL-154, RAL-298).
 fn guardian_branch_terminal_log_attempt(
     daemon: &Daemon,
     id: &str,
     branch_id: &str,
     attempt: &str,
 ) -> Reply {
+    let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    terminal_log_attempt_content_reply(&format!("guardian-{id}"), task, &cell_id, attempt)
+}
+
+/// This review branch's conflict-resolver's own debug stream (RAL-296).
+fn guardian_branch_debug_events(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     if daemon.lock().get_guardian(id).is_err() {
         return error(404, "not_found", "no such guardian", vec![]);
     }
@@ -5256,11 +5686,11 @@ fn guardian_branch_terminal_log_attempt(
         },
         Err(e) => return store_error(&e),
     };
-    terminal_log_attempt_content_reply(
+    debug_events_reply(
+        daemon,
         &format!("guardian-{id}"),
         crate::guardian_merge::RESOLVER_TASK,
         &format!("resolver-{position}"),
-        attempt,
     )
 }
 
@@ -5332,6 +5762,19 @@ fn guardian_manual_checks_terminal_log_attempt(daemon: &Daemon, id: &str, attemp
         crate::guardian_merge::MANUAL_COMMANDS_TASK,
         crate::guardian_merge::MANUAL_COMMANDS_SESSION,
         attempt,
+    )
+}
+
+/// This review's manual-checks generation pass's own debug stream (RAL-296).
+fn guardian_manual_checks_debug_events(daemon: &Daemon, id: &str) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    debug_events_reply(
+        daemon,
+        &format!("guardian-{id}"),
+        crate::guardian_merge::MANUAL_COMMANDS_TASK,
+        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
     )
 }
 
@@ -6579,7 +7022,17 @@ fn guardian_get(daemon: &Daemon, id: &str) -> Reply {
             // user is looking at this one now" signal -- promote its summary
             // job to High priority (or wake a cold one) rather than ever
             // computing it inline on this request thread.
-            daemon.summary_queue_handle().promote(id);
+            //
+            // RAL-303: gated on `collecting`, matching `guardian_list`. The
+            // preliminary summary only describes branches whose stacked rebase
+            // hasn't run yet, so a settled review has nothing for it to add --
+            // and since the review page polls this endpoint, an ungated
+            // promote spent a `git log` per branch on every poll for the rest
+            // of the review's life. `repair_missing_final_summary` covers the
+            // settled review that is genuinely missing a summary.
+            if g.status == "collecting" {
+                daemon.summary_queue_handle().promote(id);
+            }
             json(200, &g)
         }
         Err(e) => store_error(&e),
@@ -6734,6 +7187,17 @@ fn guardian_submit_prs(daemon: &Daemon, id: &str, body: &str) -> Reply {
 fn guardian_list_prs(daemon: &Daemon, id: &str) -> Reply {
     match daemon.lock().list_pull_requests_for_guardian(id) {
         Ok(prs) => json(200, &prs),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// List every past PR stack submitted for a guardian (RAL-302), most recent
+/// first -- every PR row ralphus has ever created for this review, in any
+/// state (open/merged/closed/dropped), grouped by the single "submit a
+/// stack" call that created it. Bare JSON array of [`crate::pr::PrStackView`].
+fn guardian_list_pr_stacks(daemon: &Daemon, id: &str) -> Reply {
+    match daemon.lock().list_pull_requests_for_guardian(id) {
+        Ok(prs) => json(200, &crate::pr::group_into_stacks(prs)),
         Err(e) => store_error(&e),
     }
 }
@@ -6982,8 +7446,8 @@ fn guardian_add_branch(daemon: &Daemon, id: &str, body: &str) -> Reply {
 }
 
 /// Fire a [`crate::pr::check_and_apply_forge_reorder`] check in the
-/// background for `id` (RAL-273) -- used by the explicit `sync-github`
-/// endpoint ([`guardian_sync_github`]) only. The 5-minute background sweep is
+/// background for `id` (RAL-273) -- used by the explicit `sync-pr`
+/// endpoint ([`guardian_sync_pr`]) only. The 5-minute background sweep is
 /// [`crate::pr::poll_forge_reorders`], wired into `scheduler::run_loop`
 /// instead, since it must run regardless of any HTTP activity.
 /// [`guardian_reorder`]/[`guardian_arrange`] deliberately don't call this
@@ -7006,13 +7470,13 @@ fn trigger_forge_reorder_check(daemon: &Daemon, id: &str) {
     });
 }
 
-/// Explicit "Sync with GitHub"/"Sync with GitLab" action (RAL-273): trigger
-/// the same forge-reorder check the 5-minute poll uses, on demand. Runs in
-/// the background -- detection itself makes forge
-/// network calls, and applying a detected reorder runs a full rebase -- so
-/// the caller watches the guardian view (and its notice fields) for the
-/// result, the same as every other guardian action that returns 202.
-fn guardian_sync_github(daemon: &Daemon, id: &str) -> Reply {
+/// Explicit "sync PR" action (RAL-273): trigger the same forge-reorder check
+/// the 5-minute poll uses, on demand, for either forge (GitHub or GitLab).
+/// Runs in the background -- detection itself makes forge network calls,
+/// and applying a detected reorder runs a full rebase -- so the caller
+/// watches the guardian view (and its notice fields) for the result, the
+/// same as every other guardian action that returns 202.
+fn guardian_sync_pr(daemon: &Daemon, id: &str) -> Reply {
     if let Err(e) = daemon.lock().get_guardian(id) {
         return store_error(&e);
     }
@@ -7634,6 +8098,20 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 },
             },
         ),
+        Ok(crate::guardian_merge::StartMergeOutcome::AlreadyMerged) => {
+            let approved_guardian = daemon.lock().get_guardian(id).unwrap_or(updated_guardian);
+            json(
+                200,
+                &ChangeBaseReply {
+                    guardian: approved_guardian,
+                    base_change: ChangeBaseStatus {
+                        status: "approved".to_string(),
+                        message: "This review's work was already merged, so it was approved instead of rebased.".to_string(),
+                        action: None,
+                    },
+                },
+            )
+        }
         Err(crate::guardian_merge::StartMergeError::NotFound(message)) => {
             error(404, "not_found", &message, vec![])
         }
@@ -9222,6 +9700,47 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     }
 
     #[test]
+    fn project_branches_route_lists_local_branches_for_a_registered_git_project() {
+        let d = daemon();
+        let repo = tmp_git_repo("branches");
+        let status = std::process::Command::new("git")
+            .args(["branch", "feature"])
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success());
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(&d, "GET", "/api/projects/proj/branches", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"main\""), "{}", r.body);
+        assert!(r.body.contains("\"feature\""), "{}", r.body);
+    }
+
+    #[test]
+    fn project_branches_route_is_empty_for_a_non_git_project() {
+        let d = daemon();
+        d.lock()
+            .register_project("proj", "", "C:/wherever", "none")
+            .unwrap();
+        let r = route(&d, "GET", "/api/projects/proj/branches", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"branches\":[]"), "{}", r.body);
+    }
+
+    #[test]
+    fn project_branches_route_unregistered_name_is_404() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/projects/nope/branches", "");
+        assert_eq!(r.status, 404);
+        assert!(r.body.contains("not_found"));
+    }
+
+    #[test]
     fn submit_rejects_placeholder_cwd_with_unregistered_project() {
         let d = daemon();
         let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
@@ -9308,6 +9827,96 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         let r = route(&d, "POST", "/api/machines", &machine_body("local", "/x.sh"));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("built-in"), "{}", r.body);
+    }
+
+    #[test]
+    fn secret_env_name_add_list_rename_and_delete_roundtrip() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/secret-env-names",
+            r#"{"name":"MY_TOKEN"}"#,
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/secret-env-names", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("MY_TOKEN"), "{}", r.body);
+        // Seeded defaults should show up alongside the freshly added name.
+        assert!(r.body.contains("ANTHROPIC_API_KEY"), "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/secret-env-names/MY_TOKEN/rename",
+            r#"{"name":"MY_RENAMED_TOKEN"}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/secret-env-names", "");
+        assert!(r.body.contains("MY_RENAMED_TOKEN"), "{}", r.body);
+        assert!(!r.body.contains("\"MY_TOKEN\""), "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/secret-env-names/MY_RENAMED_TOKEN", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "DELETE", "/api/secret-env-names/MY_RENAMED_TOKEN", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn secret_env_name_add_rejects_a_duplicate() {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/secret-env-names",
+            r#"{"name":"DUP_TOKEN"}"#,
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/secret-env-names",
+            r#"{"name":"DUP_TOKEN"}"#,
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+    }
+
+    #[test]
+    fn secret_env_name_add_rejects_an_invalid_identifier() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/secret-env-names",
+            r#"{"name":"not a valid key"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn secret_env_name_rename_rejects_colliding_with_an_existing_name() {
+        let d = daemon();
+        route(&d, "POST", "/api/secret-env-names", r#"{"name":"A_NAME"}"#);
+        route(&d, "POST", "/api/secret-env-names", r#"{"name":"B_NAME"}"#);
+        let r = route(
+            &d,
+            "POST",
+            "/api/secret-env-names/A_NAME/rename",
+            r#"{"name":"B_NAME"}"#,
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+    }
+
+    #[test]
+    fn secret_env_name_rename_of_unregistered_name_is_not_found() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/secret-env-names/NOPE/rename",
+            r#"{"name":"ALSO_NOPE"}"#,
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
     }
 
     #[test]
@@ -10606,6 +11215,74 @@ machine=\"incredibuild:B\"
         assert_eq!(
             before, after,
             "cell id for branch a must not change on reorder"
+        );
+    }
+
+    #[test]
+    fn resolver_task_and_cell_id_picks_the_feedback_session_while_actioning() {
+        // RAL-298: while reviewer feedback is being actioned, Live View must
+        // show the feedback resolver's own session, not the merge/rebase
+        // resolver's (stale, unrelated) one.
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+        d.lock()
+            .set_branch_status(
+                &id,
+                &branch_id,
+                crate::guardian::MergeStatus::Actioning,
+                Some("applying reviewer feedback"),
+            )
+            .unwrap();
+
+        let (task, cell_id) = resolver_task_and_cell_id(&d, &id, &branch_id).unwrap();
+        assert_eq!(task, crate::guardian_merge::FEEDBACK_TASK);
+        assert_eq!(cell_id, crate::guardian_merge::feedback_cell_id(&branch_id));
+    }
+
+    #[test]
+    fn pick_freshest_prefers_the_more_recently_written_feedback_snapshot() {
+        // RAL-298: once a feedback pass has ended, its historical record must
+        // not be shadowed by an earlier, now-stale merge/rebase resolver log.
+        use std::time::{Duration, SystemTime};
+        let earlier = SystemTime::UNIX_EPOCH;
+        let later = earlier + Duration::from_secs(60);
+        assert_eq!(
+            pick_freshest("resolver", "feedback", Some(earlier), Some(later)),
+            "feedback"
+        );
+    }
+
+    #[test]
+    fn pick_freshest_prefers_resolver_when_it_is_more_recent() {
+        use std::time::{Duration, SystemTime};
+        let earlier = SystemTime::UNIX_EPOCH;
+        let later = earlier + Duration::from_secs(60);
+        assert_eq!(
+            pick_freshest("resolver", "feedback", Some(later), Some(earlier)),
+            "resolver"
+        );
+    }
+
+    #[test]
+    fn pick_freshest_defaults_to_resolver_when_feedback_never_ran() {
+        assert_eq!(
+            pick_freshest(
+                "resolver",
+                "feedback",
+                Some(std::time::SystemTime::UNIX_EPOCH),
+                None
+            ),
+            "resolver"
+        );
+    }
+
+    #[test]
+    fn pick_freshest_defaults_to_resolver_when_neither_ever_ran() {
+        assert_eq!(
+            pick_freshest("resolver", "feedback", None, None),
+            "resolver"
         );
     }
 
@@ -12736,6 +13413,44 @@ command = "true"
     }
 
     #[test]
+    fn user_registry_rename_and_delete_with_spaces_in_the_name() {
+        let d = daemon();
+        let create = route(&d, "POST", "/api/users", "{\"name\":\"Colin Kennedy\"}");
+        assert_eq!(create.status, 200);
+        let list = route(&d, "GET", "/api/users", "");
+        assert!(list.body.contains("Colin Kennedy"));
+
+        // rename, with the old name percent-encoded in the path the way the
+        // board's `fetch` calls encode it
+        let rn = route(
+            &d,
+            "POST",
+            "/api/users/Colin%20Kennedy/rename",
+            "{\"name\":\"Colin K.\"}",
+        );
+        assert_eq!(rn.status, 200, "{}", rn.body);
+        assert!(rn.body.contains("\"name\":\"Colin K.\""));
+
+        // renaming onto an existing user is a conflict, not a crash
+        route(&d, "POST", "/api/users", "{\"name\":\"taken\"}");
+        let clash = route(
+            &d,
+            "POST",
+            "/api/users/Colin%20K./rename",
+            "{\"name\":\"taken\"}",
+        );
+        assert_eq!(clash.status, 409, "{}", clash.body);
+
+        // RAL-? regression: a percent-encoded space in the DELETE path used
+        // to be looked up verbatim (including the "%20"), so removing a user
+        // whose name has a space in it always 404'd.
+        let del = route(&d, "DELETE", "/api/users/Colin%20K.", "");
+        assert_eq!(del.status, 200, "{}", del.body);
+        let list_after = route(&d, "GET", "/api/users", "");
+        assert!(!list_after.body.contains("Colin K."));
+    }
+
+    #[test]
     fn deleting_a_guardian_deletes_its_terminal_logs() {
         let d = daemon();
         let _troot = isolated_terminal_root();
@@ -13703,6 +14418,177 @@ command = "true"
             &d,
             "GET",
             "/api/squads/squad-000000000001/cells/0/9/debug-events",
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn proof_debug_events_lists_only_this_proof_steps_cartographer_rows() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell.proof]]\ncommand=\"c\"\n";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        {
+            let store = d.lock();
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "invoked",
+                scope: Some("proof"),
+                squad_id: Some("squad-000000000001"),
+                guardian_id: None,
+                cell_id: Some("proof-cell-0"),
+                task: Some("t"),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "invoked (other cell's own cell-level event)",
+                scope: Some("cell"),
+                squad_id: Some("squad-000000000001"),
+                guardian_id: None,
+                cell_id: Some("cell-0"),
+                task: Some("t"),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+        }
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/proofs/0/cell/0/0/debug-events",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let entries: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["message"], "invoked");
+    }
+
+    #[test]
+    fn proof_debug_events_missing_squad_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-999/proofs/0/cell/0/0/debug-events",
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_branch_debug_events_lists_only_this_branchs_cartographer_rows() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/a").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/b").unwrap();
+        let branches = d.lock().guardian_branches(&id).unwrap();
+        let branch_a = branches[0].id.clone();
+        let branch_b = branches[1].id.clone();
+        {
+            let store = d.lock();
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "invoked",
+                scope: Some("cell"),
+                squad_id: Some(&format!("guardian-{id}")),
+                guardian_id: None,
+                cell_id: Some(&format!(
+                    "resolver-{}",
+                    branches.iter().find(|b| b.id == branch_a).unwrap().position
+                )),
+                task: Some(crate::guardian_merge::RESOLVER_TASK),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "invoked (other branch)",
+                scope: Some("cell"),
+                squad_id: Some(&format!("guardian-{id}")),
+                guardian_id: None,
+                cell_id: Some(&format!(
+                    "resolver-{}",
+                    branches.iter().find(|b| b.id == branch_b).unwrap().position
+                )),
+                task: Some(crate::guardian_merge::RESOLVER_TASK),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+        }
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{branch_a}/debug-events"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let entries: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["message"], "invoked");
+    }
+
+    #[test]
+    fn guardian_branch_debug_events_missing_branch_is_404() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/branch-999/debug-events"),
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_manual_checks_debug_events_lists_this_guardians_rows() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        {
+            let store = d.lock();
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "runner",
+                message: "invoked",
+                scope: Some("cell"),
+                squad_id: Some(&format!("guardian-{id}")),
+                guardian_id: None,
+                cell_id: Some(crate::guardian_merge::MANUAL_COMMANDS_SESSION),
+                task: Some(crate::guardian_merge::MANUAL_COMMANDS_TASK),
+                log_path: None,
+                payload: serde_json::json!({}),
+            });
+        }
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/manual-checks/debug-events"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let entries: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let entries = entries.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["message"], "invoked");
+    }
+
+    #[test]
+    fn guardian_manual_checks_debug_events_missing_guardian_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "GET",
+            "/api/guardians/guardian-999/manual-checks/debug-events",
             "",
         );
         assert_eq!(r.status, 404);

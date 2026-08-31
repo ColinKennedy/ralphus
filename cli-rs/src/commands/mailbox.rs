@@ -84,7 +84,7 @@ pub fn ensure_client_id(client: &DaemonClient) -> Result<String, CommandError> {
     Ok(client_id)
 }
 
-fn message_ids(messages: &Value) -> Vec<String> {
+pub fn message_ids(messages: &Value) -> Vec<String> {
     messages
         .as_array()
         .into_iter()

@@ -1,0 +1,27 @@
+[package]
+name = "ralphus-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MCP server exposing ralphus's daemon HTTP API as MCP tools -- mirrors the ralphus CLI's command surface without depending on the compiled CLI binary."
+
+[[bin]]
+name = "ralphus-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_mcp"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ralphus-cli = { path = "../cli-rs" }
+ralphus-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tiny_http = { workspace = true }

@@ -51,6 +51,10 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "You are running unattended in a non
      continue until the task is complete.";
 
 const MAX_ASYNC_ATTEMPTS: u32 = 3;
+/// RAL-292: how many times a turn that ended with an unresolved backgrounded
+/// job gets nudged (via [`ModelBackend::nudge`]) before the cell is failed
+/// outright.
+const MAX_BACKGROUND_JOB_NUDGE_ATTEMPTS: u32 = 3;
 const GHOST_MAX_CHARS: usize = 4000;
 const COMMAND_TAIL_CHARS: usize = 2000;
 
@@ -221,6 +225,19 @@ fn run_prompt_inner(
         Ok(backend) => backend,
         Err(e) => return CellResult::failed(e, ""),
     };
+    run_with_backend(spec, original_prompt, workspace, backend.as_ref())
+}
+
+/// The backend-agnostic half of [`run_prompt_inner`], split out so the
+/// still-working retry loop and the RAL-292 background-job nudge loop can be
+/// exercised in tests against a stub [`ModelBackend`] instead of a real CLI
+/// subprocess.
+fn run_with_backend(
+    spec: &CellSpec,
+    original_prompt: &str,
+    workspace: &Workspace,
+    backend: &dyn ModelBackend,
+) -> CellResult {
     let system_prompt = combine_system_prompts(&[
         spec.system_prompt.as_deref(),
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
@@ -255,8 +272,9 @@ fn run_prompt_inner(
             resume_agent_session_id: resume_id.as_deref(),
             assigned_agent_session_id: spec.assigned_agent_session_id.as_deref(),
             timeout_sec: spec.timeout_sec,
+            tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
         };
-        let outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
+        let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
             Err(e) => return CellResult::failed(e.to_string(), ""),
         };
@@ -265,6 +283,104 @@ fn run_prompt_inner(
         total_tokens_out += outcome.tokens_out;
         total_cost_usd += outcome.cost_usd;
         agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
+
+        // RAL-292: a turn that ended with an unresolved backgrounded job
+        // (launched but never checked) is a silent-completion bug, not a
+        // sanctioned `RALPHUS_STILL_WORKING:` escape hatch -- give the same
+        // session a bounded number of nudges to check the job's real result
+        // and finish, before giving up on the cell entirely.
+        let mut bg_nudge_attempt = 0u32;
+        while outcome.abandoned_background_job.is_some()
+            && parse_still_working(&outcome.summary).is_none()
+        {
+            let job = outcome.abandoned_background_job.clone().unwrap_or_default();
+            if bg_nudge_attempt >= MAX_BACKGROUND_JOB_NUDGE_ATTEMPTS {
+                crate::cartographer::emit_scoped(
+                    "runner",
+                    "background-job nudge exhausted",
+                    "warning",
+                    Some("cell"),
+                    event_context(spec),
+                    serde_json::json!({"attempts": bg_nudge_attempt, "job": job}),
+                );
+                return CellResult {
+                    status: "failed".to_string(),
+                    tokens_in: total_tokens_in,
+                    tokens_out: total_tokens_out,
+                    cost_usd: total_cost_usd,
+                    summary: outcome.summary,
+                    error: Some(format!(
+                        "abandoned background job: agent ended its turn without checking the result of a backgrounded job (\"{job}\") after {bg_nudge_attempt} nudge attempts"
+                    )),
+                    proofed: None,
+                    agent_session_id,
+                    ghost: None,
+                };
+            }
+            bg_nudge_attempt += 1;
+            crate::cartographer::emit_scoped(
+                "runner",
+                "background-job nudge sent",
+                "warning",
+                Some("cell"),
+                event_context(spec),
+                serde_json::json!({
+                    "attempt": bg_nudge_attempt,
+                    "max_attempts": MAX_BACKGROUND_JOB_NUDGE_ATTEMPTS,
+                    "job": job,
+                }),
+            );
+            let nudge_options = RunOptions {
+                model: spec.model.as_deref(),
+                append_system_prompt: system_prompt.as_deref(),
+                resume_agent_session_id: agent_session_id.as_deref(),
+                assigned_agent_session_id: None,
+                timeout_sec: spec.timeout_sec,
+                tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
+            };
+            outcome = match backend.nudge(workspace, &nudge_options) {
+                Ok(Some(o)) => o,
+                Ok(None) => {
+                    crate::cartographer::emit_scoped(
+                        "runner",
+                        "background-job nudge unsupported",
+                        "warning",
+                        Some("cell"),
+                        event_context(spec),
+                        serde_json::json!({"job": job}),
+                    );
+                    return CellResult {
+                        status: "failed".to_string(),
+                        tokens_in: total_tokens_in,
+                        tokens_out: total_tokens_out,
+                        cost_usd: total_cost_usd,
+                        summary: outcome.summary,
+                        error: Some(format!(
+                            "abandoned background job: agent ended its turn without checking the result of a backgrounded job (\"{job}\"); this backend does not support nudging"
+                        )),
+                        proofed: None,
+                        agent_session_id,
+                        ghost: None,
+                    };
+                }
+                Err(e) => return CellResult::failed(e.to_string(), ""),
+            };
+            total_tokens_in += outcome.tokens_in;
+            total_tokens_out += outcome.tokens_out;
+            total_cost_usd += outcome.cost_usd;
+            agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
+            crate::cartographer::emit_scoped(
+                "runner",
+                "background-job nudge outcome",
+                "info",
+                Some("cell"),
+                event_context(spec),
+                serde_json::json!({
+                    "attempt": bg_nudge_attempt,
+                    "still_abandoned": outcome.abandoned_background_job.is_some(),
+                }),
+            );
+        }
 
         if let Some(reason) = parse_still_working(&outcome.summary) {
             if attempt + 1 < MAX_ASYNC_ATTEMPTS {
@@ -448,6 +564,7 @@ fn tail(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendError;
 
     #[test]
     fn short_prompt_hash_matches_known_vector_prefix() {
@@ -515,6 +632,146 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A [`ModelBackend`] stub whose `run`/`nudge` outcomes are scripted in
+    /// advance, so the RAL-292 background-job nudge loop in
+    /// [`run_with_backend`] can be exercised without a real CLI subprocess.
+    struct ScriptedBackend {
+        run_outcomes:
+            std::cell::RefCell<std::collections::VecDeque<Result<BackendOutcome, BackendError>>>,
+        nudge_outcomes: std::cell::RefCell<
+            std::collections::VecDeque<Result<Option<BackendOutcome>, BackendError>>,
+        >,
+        nudge_calls: std::cell::Cell<u32>,
+    }
+
+    impl ScriptedBackend {
+        fn new(
+            run_outcomes: Vec<Result<BackendOutcome, BackendError>>,
+            nudge_outcomes: Vec<Result<Option<BackendOutcome>, BackendError>>,
+        ) -> Self {
+            Self {
+                run_outcomes: std::cell::RefCell::new(run_outcomes.into()),
+                nudge_outcomes: std::cell::RefCell::new(nudge_outcomes.into()),
+                nudge_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ModelBackend for ScriptedBackend {
+        fn run(
+            &self,
+            _prompt: &str,
+            _workspace: &Workspace,
+            _options: &RunOptions<'_>,
+        ) -> Result<BackendOutcome, BackendError> {
+            self.run_outcomes
+                .borrow_mut()
+                .pop_front()
+                .expect("run() called more times than scripted")
+        }
+
+        fn nudge(
+            &self,
+            _workspace: &Workspace,
+            _options: &RunOptions<'_>,
+        ) -> Result<Option<BackendOutcome>, BackendError> {
+            self.nudge_calls.set(self.nudge_calls.get() + 1);
+            self.nudge_outcomes
+                .borrow_mut()
+                .pop_front()
+                .expect("nudge() called more times than scripted")
+        }
+    }
+
+    fn abandoned_outcome(job: &str) -> BackendOutcome {
+        BackendOutcome {
+            summary: "did some work".to_string(),
+            abandoned_background_job: Some(job.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn test_spec(proof: bool) -> CellSpec {
+        CellSpec {
+            squad_id: "sq".into(),
+            task: "t".into(),
+            cell_id: "c".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            prompt: Some("do the thing".into()),
+            command: None,
+            agent: "claude".into(),
+            executable: None,
+            model: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            args: vec![],
+            budget_tokens: None,
+            timeout_sec: None,
+            proof,
+            trace_context: None,
+            resume_agent_session_id: None,
+            assigned_agent_session_id: None,
+            tool_arg_truncate_chars: None,
+        }
+    }
+
+    #[test]
+    fn background_job_nudge_loop_fails_the_cell_after_the_per_cell_try_cap() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![Ok(abandoned_outcome("bash job"))],
+            vec![
+                Ok(Some(abandoned_outcome("bash job"))),
+                Ok(Some(abandoned_outcome("bash job"))),
+                Ok(Some(abandoned_outcome("bash job"))),
+            ],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert_eq!(backend.nudge_calls.get(), MAX_BACKGROUND_JOB_NUDGE_ATTEMPTS);
+        assert!(!result.ok());
+        let error = result.error.unwrap();
+        assert!(error.contains("abandoned background job"), "{error}");
+        assert!(error.contains("bash job"), "{error}");
+        assert!(error.contains("3 nudge attempts"), "{error}");
+    }
+
+    #[test]
+    fn background_job_nudge_loop_recovers_when_a_later_nudge_resolves_the_job() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![Ok(abandoned_outcome("bash job"))],
+            vec![Ok(Some(BackendOutcome {
+                summary: "checked the job, all good".to_string(),
+                abandoned_background_job: None,
+                ..Default::default()
+            }))],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert_eq!(backend.nudge_calls.get(), 1);
+        assert!(result.ok());
+        assert_eq!(result.summary, "checked the job, all good");
+    }
+
+    #[test]
+    fn background_job_nudge_loop_fails_immediately_when_the_backend_cannot_nudge() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(vec![Ok(abandoned_outcome("bash job"))], vec![Ok(None)]);
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert_eq!(backend.nudge_calls.get(), 1);
+        assert!(!result.ok());
+        let error = result.error.unwrap();
+        assert!(error.contains("does not support nudging"), "{error}");
+    }
+
     #[test]
     fn run_cell_fails_closed_when_neither_prompt_nor_command() {
         let dir = std::env::temp_dir().join(format!(
@@ -541,6 +798,7 @@ mod tests {
             trace_context: None,
             resume_agent_session_id: None,
             assigned_agent_session_id: None,
+            tool_arg_truncate_chars: None,
         };
         let result = run_cell(&spec, false);
         assert!(!result.ok());

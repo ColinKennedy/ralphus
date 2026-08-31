@@ -866,6 +866,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ralphus-mcp"
+version = "0.1.0"
+dependencies = [
+ "ralphus-cli",
+ "ralphus-core",
+ "serde",
+ "serde_json",
+ "tiny_http",
+]
+
+[[package]]
 name = "ralphus-runner"
 version = "0.1.0"
 dependencies = [

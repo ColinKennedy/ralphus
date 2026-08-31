@@ -65,6 +65,7 @@ Eleven Rust workspace members; `cli/` is a Python project kept only for `docsgen
 | `ralphus-daemon` | `daemon/` | Rust bin+lib | SQLite store (WAL), HTTP API, scheduler; spawns the runner per cell. | `daemon/AGENTS.md` |
 | `ralphus-librarian` | `librarian/` | Rust bin+lib | Web board; serves static HTML and proxies `/api/*` GETs to the daemon. | `librarian/AGENTS.md` |
 | `ralphus-cli` | `cli-rs/` | Rust bin (`ralphus`) | The CLI: validate/submit/status/squad/task/cell/proof/review/queue/project/machine/agent/show/check/quick-start/... — a thin HTTP client over the daemon's API, ~105 leaf subcommands. | `cli-rs/AGENTS.md` |
+| `ralphus-mcp` | `mcp/` | Rust bin+lib (`ralphus-mcp`) | MCP server (RAL-301) exposing the same ~105-command surface as MCP tools, over stdio JSON-RPC — talks to the daemon's HTTP API directly via `ralphus-cli`'s `DaemonClient` (reused as a library), no dependency on the compiled `ralphus` binary. Tool listing/schemas are derived from `cli-rs/src/help_map.rs`'s tree; `--read-only` preserves the CLI's read-only-safe/mutating split. `mcp/tests/parity.rs` enforces bidirectional CLI↔tool parity (every non-excluded leaf has a tool and vice versa) as a normal `cargo test`, with a documented-reason-required exclusion list in `mcp/src/exclusions.rs` for the handful of commands (`cell open-agent`, `quick-start` backends) that spawn an interactive TTY session and have no single-request/response shape. | |
 | `ralphus-runner` | `runner/` | Rust bin+lib | The cell runner: executes one `CellSpec` (command/prompt/proof), reports a `CellResult`. Spawned per-cell by the daemon over the same stdin/stdout JSON contract the old Python runner used. | see `.agent/cli-runner-port.md` |
 | `ralphus-auth` | `auth/` | Rust lib | Ed25519 license verification (no-op without `--features secure-dist`). | `auth/AGENTS.md` |
 | `ralphus-keygen` | `keygen/` | Rust bin | Author-only tool: generate keypair + sign licenses. Never shipped to users. | `keygen/AGENTS.md` |
@@ -209,6 +210,7 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 - [`daemon/AGENTS.md`](daemon/AGENTS.md) — store/scheduler/API detail, Rust integration test table
 - [`librarian/AGENTS.md`](librarian/AGENTS.md) — board.html JSDoc/lint/knip/tooltip/color rules
 - [`cli-rs/AGENTS.md`](cli-rs/AGENTS.md) — CLI module map, Read-Only Quick-Start Safety List
+- [`mcp/AGENTS.md`](mcp/AGENTS.md) — MCP server module map, tool-generation/exclusion/parity-check detail
 - [`cli/AGENTS.md`](cli/AGENTS.md) — Python docsgen/bench-graph project, its test table
 - [`auth/AGENTS.md`](auth/AGENTS.md) — secure-dist license format and signing workflow
 - [`keygen/AGENTS.md`](keygen/AGENTS.md) — pointer to `auth/AGENTS.md`

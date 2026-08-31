@@ -6,6 +6,7 @@
 //! `main.rs` binary on top) keeps it unit-testable.
 
 pub mod agent_access;
+pub mod agent_catalog;
 pub mod agent_profiles;
 pub mod cancel;
 pub mod cartographer;
@@ -15,6 +16,7 @@ pub mod config;
 pub mod entity_uri;
 pub mod events;
 pub mod forge;
+pub mod generation;
 pub mod ghost;
 pub mod guardian;
 pub mod guardian_merge;
@@ -33,6 +35,7 @@ pub mod resources;
 pub mod reviews;
 pub mod runner;
 pub mod scheduler;
+pub mod secret_env_names;
 pub mod server;
 pub(crate) mod short_paths;
 pub(crate) mod stash;
@@ -53,7 +56,7 @@ use std::path::PathBuf;
 pub const DEFAULT_PORT: u16 = 7890;
 
 /// Default maximum number of concurrently running squads.
-pub const DEFAULT_MAX_CONCURRENT: i64 = 12;
+pub const DEFAULT_MAX_CONCURRENT: i64 = 20;
 
 /// Overrides the host the daemon's HTTP listener binds to.
 pub const BIND_ADDR_ENV: &str = "RALPHUS_BIND_ADDR";

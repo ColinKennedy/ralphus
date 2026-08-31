@@ -87,37 +87,21 @@ pub fn run_command_proof_capture(
     result
 }
 
-/// Resolve the current `HEAD` commit sha of `cwd`, or `None` if `cwd` isn't a
-/// git working tree, has no commits yet, or `git` isn't available. Used by the
-/// finalizer's no-new-commits guard (RAL-156): to capture a git-backed task's
-/// baseline at cell start, and to compare each cell's `cwd` against it
-/// at finalize time.
+/// Whether any of `cwds` has at least one commit its own `@{upstream}`
+/// tracking ref doesn't (RAL-293): the deterministic "did this task produce
+/// real, durable progress" check the finalizer runs for git-backed tasks, in
+/// place of trusting the agent's own self-report. Delegates the per-`cwd`
+/// question to [`crate::reviews::worktree_has_commits_ahead_of_upstream`],
+/// which reads live git state rather than a squad-run-scoped baseline sha —
+/// so it answers the same way whether the commit was made just now or by an
+/// earlier run that reused this same worktree. Fails closed per-`cwd`: one
+/// with no resolvable upstream counts as "no progress" for that cell, never
+/// as a pass.
 #[must_use]
-pub fn git_head_sha(cwd: &str) -> Option<String> {
-    let out = Command::new("git")
-        .arg("rev-parse")
-        .arg("HEAD")
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
-}
-
-/// Whether any of `cwds` has moved its `HEAD` past `baseline` (RAL-156): the
-/// deterministic "did this task produce at least one commit" check the
-/// finalizer runs for git-backed tasks, in place of trusting the agent's own
-/// self-report. Fails closed per-`cwd` — one whose `HEAD` can't be resolved
-/// (bad path, not a git repo, no commits) counts as "no new commit" for that
-/// cell, never as a pass.
-#[must_use]
-pub fn any_cwd_has_new_commit(cwds: &[&str], baseline: &str) -> bool {
-    cwds.iter()
-        .any(|cwd| git_head_sha(cwd).is_some_and(|head| head != baseline))
+pub fn any_cwd_ahead_of_upstream(cwds: &[&str]) -> bool {
+    cwds.iter().any(|cwd| {
+        crate::reviews::worktree_has_commits_ahead_of_upstream(std::path::Path::new(cwd))
+    })
 }
 
 /// Cap captured output so a runaway verifier can't bloat the DB / UI.
@@ -187,7 +171,7 @@ mod tests {
         assert_eq!(truncate_output("short"), "short");
     }
 
-    // ── RAL-156: no-new-commits guard helpers ────────────────────────────────
+    // ── RAL-293: no-new-commits guard helpers ────────────────────────────────
 
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -219,81 +203,69 @@ mod tests {
         );
     }
 
-    /// A fresh repo with one commit on `main`.
+    /// A fresh repo with one commit on `main`, tracking a local `base` branch
+    /// pinned to that same commit -- standing in for the `?upstream=` tracking
+    /// ref every real worktree materializes (`worktrees::set_explicit_upstream`).
     fn init_repo(tag: &str) -> std::path::PathBuf {
         let repo = tmp_dir(tag);
         g(&repo, &["init", "-b", "main"]);
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
         g(&repo, &["commit", "-m", "base"]);
+        g(&repo, &["branch", "base"]);
+        g(&repo, &["branch", "--set-upstream-to=base", "main"]);
         repo
     }
 
     #[test]
-    fn git_head_sha_resolves_in_a_real_repo() {
-        let repo = init_repo("head");
-        let sha = git_head_sha(&repo.to_string_lossy()).expect("HEAD sha");
-        assert_eq!(sha.len(), 40, "expected a full sha: {sha:?}");
-    }
-
-    #[test]
-    fn git_head_sha_none_for_non_repo() {
-        let dir = tmp_dir("not-a-repo");
-        assert!(git_head_sha(&dir.to_string_lossy()).is_none());
-    }
-
-    #[test]
-    fn git_head_sha_none_for_bad_cwd() {
-        assert!(git_head_sha("/no/such/dir/ralphus-xyz").is_none());
-    }
-
-    #[test]
-    fn any_cwd_has_new_commit_false_when_head_unchanged() {
+    fn any_cwd_ahead_of_upstream_false_when_head_equals_upstream() {
         let repo = init_repo("unchanged");
-        let baseline = git_head_sha(&repo.to_string_lossy()).expect("HEAD sha");
         let cwd = repo.to_string_lossy().to_string();
-        assert!(!any_cwd_has_new_commit(&[&cwd], &baseline));
+        assert!(!any_cwd_ahead_of_upstream(&[&cwd]));
     }
 
     #[test]
-    fn any_cwd_has_new_commit_true_after_a_commit() {
+    fn any_cwd_ahead_of_upstream_true_after_a_commit() {
         let repo = init_repo("changed");
-        let baseline = git_head_sha(&repo.to_string_lossy()).expect("HEAD sha");
         std::fs::write(repo.join("more.txt"), "more\n").unwrap();
         g(&repo, &["add", "."]);
         g(&repo, &["commit", "-m", "more"]);
         let cwd = repo.to_string_lossy().to_string();
-        assert!(any_cwd_has_new_commit(&[&cwd], &baseline));
+        assert!(any_cwd_ahead_of_upstream(&[&cwd]));
     }
 
     #[test]
-    fn any_cwd_has_new_commit_true_when_any_of_several_changed() {
-        // Two cells of the same task: the first's cwd never moved past the
-        // baseline; the second's got an extra commit on top -- standing in for
-        // "this cell made progress since the task started." (Deliberately
-        // *not* two independent single-commit repos: with identical tree,
-        // message, and author/committer env, two repos created in the same
-        // second can hash to the same commit sha, making the "changed" repo
-        // indistinguishable from the baseline by fluke.)
+    fn any_cwd_ahead_of_upstream_true_when_any_of_several_changed() {
+        // Two cells of the same task: the first's cwd never moved past its
+        // upstream; the second's got an extra commit on top -- standing in
+        // for "this cell made progress."
         let unchanged = init_repo("multi-unchanged");
-        let baseline = git_head_sha(&unchanged.to_string_lossy()).expect("HEAD sha");
         let changed = init_repo("multi-changed");
         std::fs::write(changed.join("more.txt"), "more\n").unwrap();
         g(&changed, &["add", "."]);
         g(&changed, &["commit", "-m", "more"]);
         let unchanged_cwd = unchanged.to_string_lossy().to_string();
         let changed_cwd = changed.to_string_lossy().to_string();
-        assert!(any_cwd_has_new_commit(
-            &[&unchanged_cwd, &changed_cwd],
-            &baseline
-        ));
+        assert!(any_cwd_ahead_of_upstream(&[&unchanged_cwd, &changed_cwd]));
     }
 
     #[test]
-    fn any_cwd_has_new_commit_false_when_no_cwd_resolves() {
-        assert!(!any_cwd_has_new_commit(
-            &["/no/such/dir/ralphus-xyz"],
-            "deadbeef"
-        ));
+    fn any_cwd_ahead_of_upstream_false_when_no_cwd_resolves() {
+        assert!(!any_cwd_ahead_of_upstream(&["/no/such/dir/ralphus-xyz"]));
+    }
+
+    #[test]
+    fn any_cwd_ahead_of_upstream_true_regardless_of_which_run_made_the_commit() {
+        // RAL-293's actual repro: the commit already existed before this
+        // check ever ran (e.g. made by an earlier squad run that reused this
+        // worktree) -- @{upstream} must still see it as progress, unlike the
+        // old squad-run-scoped baseline sha which only saw commits made
+        // *during* the run capturing it.
+        let repo = init_repo("prior-run");
+        std::fs::write(repo.join("prior-run.txt"), "already done\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-m", "prior run's work"]);
+        let cwd = repo.to_string_lossy().to_string();
+        assert!(any_cwd_ahead_of_upstream(&[&cwd]));
     }
 }

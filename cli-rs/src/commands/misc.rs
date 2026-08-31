@@ -16,7 +16,7 @@ use crate::entity_uri::from_resolved_selector;
 use crate::flags::Scanner;
 use crate::selector::{self, ResolvedSelector, SelectorError};
 
-const SQUAD_STATES: [&str; 6] = [
+pub const SQUAD_STATES: [&str; 6] = [
     "queued",
     "pending",
     "running",
@@ -145,7 +145,7 @@ pub fn parse_submit(scanner: &mut Scanner) -> super::Command {
 /// true when any argument was a directory or glob -- each resolved file then
 /// becomes its own separate squad, rather than combining into one (the
 /// existing behavior for explicit file paths).
-fn resolve_submit_sources(raw_args: &[String]) -> Result<(Vec<String>, bool), String> {
+pub fn resolve_submit_sources(raw_args: &[String]) -> Result<(Vec<String>, bool), String> {
     let mut sources = Vec::new();
     let mut is_batch = false;
     for raw in raw_args {
@@ -244,7 +244,7 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     rec(&p, &n)
 }
 
-fn read_submit_source(source: &str) -> Result<String, String> {
+pub fn read_submit_source(source: &str) -> Result<String, String> {
     if source == STDIN_SOURCE {
         use std::io::Read as _;
         let mut text = String::new();
@@ -550,7 +550,7 @@ pub fn cmd_graph(opts: &GlobalOpts, squad_id: Option<String>, dot: bool, global:
 
 // ---- get ------------------------------------------------------------------
 
-fn looks_like_guardian_selector(selector: &str) -> bool {
+pub fn looks_like_guardian_selector(selector: &str) -> bool {
     if ralphus_core::uri::looks_like_uri(selector) {
         return ralphus_core::uri::parse_uri(selector)
             .map(|u| u.kinds().first() == Some(&"REVIEW"))
@@ -562,7 +562,7 @@ fn looks_like_guardian_selector(selector: &str) -> bool {
         || selector.starts_with("guardian")
 }
 
-fn proof_step_for<'a>(squad: &'a Value, resolved: &ResolvedSelector) -> &'a Value {
+pub fn proof_step_for<'a>(squad: &'a Value, resolved: &ResolvedSelector) -> &'a Value {
     let task = &squad["tasks"][resolved.task_idx as usize];
     if resolved.proof_scope == "cell" {
         &task["cells"][resolved.cell_idx as usize]["proof"][resolved.proof_idx as usize]
@@ -620,14 +620,14 @@ pub fn cmd_get(opts: &GlobalOpts, selector: &str, field: Option<&str>) -> i32 {
     })
 }
 
-fn plain(v: &Value) -> String {
+pub fn plain(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
 }
 
-fn walk_field(data: &Value, field: &str) -> Result<Value, SelectorError> {
+pub fn walk_field(data: &Value, field: &str) -> Result<Value, SelectorError> {
     let mut current = data.clone();
     for part in field.split('.') {
         current = match &current {
@@ -790,7 +790,7 @@ pub fn cmd_history(opts: &GlobalOpts, selector: &str) -> i32 {
             let content = pane["content"].as_str().unwrap_or_default();
             print_history_content(content);
         } else {
-            let (content, _found) = history_ghost_or_output(&client, &resolved)?;
+            let (content, _found) = history_debug_events(&client, &resolved)?;
             print_history_content(&content);
         }
         Ok(())
@@ -813,7 +813,10 @@ fn print_history_content(content: &str) {
     }
 }
 
-fn history_pane(client: &DaemonClient, resolved: &ResolvedSelector) -> Result<Value, DaemonError> {
+pub fn history_pane(
+    client: &DaemonClient,
+    resolved: &ResolvedSelector,
+) -> Result<Value, DaemonError> {
     if resolved.kind == "cell" {
         client.cell_pane(
             &resolved.squad_id,
@@ -833,31 +836,57 @@ fn history_pane(client: &DaemonClient, resolved: &ResolvedSelector) -> Result<Va
     }
 }
 
-fn history_ghost_or_output(
+/// Once a cell/proof step's live pane is gone, RAL-296 routes the fallback
+/// through the same merged, current-attempt-only debug stream (lifecycle
+/// events plus inlined terminal-log excerpts) the board's "Show Debug
+/// Messages"/"Open Terminal Log" views share — rather than the ghost note or
+/// bare proof `output` field this used to read, a third, divergent source.
+pub fn history_debug_events(
     client: &DaemonClient,
     resolved: &ResolvedSelector,
 ) -> Result<(String, bool), DaemonError> {
-    if resolved.kind == "cell" {
-        let uri = format!(
-            "cell:{}:{}:{}",
-            resolved.squad_id, resolved.task_idx, resolved.cell_idx
-        );
-        match client.ghost_get(&uri) {
-            Ok(ghost) => Ok((
-                ghost["content"].as_str().unwrap_or_default().to_string(),
-                true,
-            )),
-            Err(e) if e.status_code == Some(404) => Ok((String::new(), false)),
-            Err(e) => Err(e),
-        }
+    let entries = if resolved.kind == "cell" {
+        client.cell_debug_events(&resolved.squad_id, resolved.task_idx, resolved.cell_idx)?
     } else {
-        let squad = client.squad(&resolved.squad_id)?;
-        let output = proof_step_for(&squad, resolved)["output"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let found = !output.is_empty();
-        Ok((output, found))
+        client.proof_debug_events(
+            &resolved.squad_id,
+            resolved.task_idx,
+            &resolved.proof_scope,
+            resolved.cell_idx,
+            resolved.proof_idx,
+        )?
+    };
+    let entries = entries.as_array().cloned().unwrap_or_default();
+    let found = !entries.is_empty();
+    let content = entries
+        .iter()
+        .map(format_debug_event_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((content, found))
+}
+
+/// One `SquadTimelineEntry` (RAL-296) rendered as a human-readable line,
+/// with its inlined terminal-log excerpt (if any) indented beneath it —
+/// mirrors `daemon/src/timeline.rs::render_entry`'s plain-text rendering and
+/// `board.html`'s `formatDebugEvent`.
+fn format_debug_event_line(e: &Value) -> String {
+    let head = format!(
+        "[{}] {}: {}",
+        e["at_ms"],
+        e["source"].as_str().unwrap_or_default(),
+        e["message"].as_str().unwrap_or_default()
+    );
+    match e["log_excerpt"].as_str() {
+        Some(excerpt) if !excerpt.is_empty() => {
+            let body = excerpt
+                .lines()
+                .map(|l| format!("    | {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{head}\n{body}")
+        }
+        _ => head,
     }
 }
 
@@ -919,7 +948,10 @@ pub fn cmd_listen(opts: &GlobalOpts, selector: &str, until: &str, timeout: Optio
     }
 }
 
-fn listen_status(client: &DaemonClient, selector: &str) -> Result<(String, String), CommandError> {
+pub fn listen_status(
+    client: &DaemonClient,
+    selector: &str,
+) -> Result<(String, String), CommandError> {
     if looks_like_guardian_selector(selector) {
         let resolved = selector::resolve_guardian_selector(
             client,
@@ -1304,5 +1336,33 @@ mod tests {
             resolve_submit_sources(&["a.toml".to_string(), "b.toml".to_string()]).unwrap();
         assert_eq!(sources, vec!["a.toml".to_string(), "b.toml".to_string()]);
         assert!(!is_batch);
+    }
+
+    #[test]
+    fn format_debug_event_line_without_excerpt_is_one_line() {
+        let e = serde_json::json!({
+            "at_ms": 1732300000000i64,
+            "source": "runner",
+            "message": "tmux session started",
+            "log_excerpt": null,
+        });
+        assert_eq!(
+            format_debug_event_line(&e),
+            "[1732300000000] runner: tmux session started"
+        );
+    }
+
+    #[test]
+    fn format_debug_event_line_indents_its_log_excerpt() {
+        let e = serde_json::json!({
+            "at_ms": 1732300000000i64,
+            "source": "runner",
+            "message": "terminal log attempt 0 written",
+            "log_excerpt": "line one\nline two",
+        });
+        assert_eq!(
+            format_debug_event_line(&e),
+            "[1732300000000] runner: terminal log attempt 0 written\n    | line one\n    | line two"
+        );
     }
 }

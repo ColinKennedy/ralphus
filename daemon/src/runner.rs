@@ -182,6 +182,17 @@ pub struct RunnerSpec {
     /// an extra key is inert).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// RAL-303: the resolved `[live_view] tool_arg_truncate_chars` value
+    /// (`crate::config::LiveViewConfig::tool_arg_truncate_chars`), forwarded
+    /// over the stdin wire contract so the claude-code backend's
+    /// `format_tool_input` knows how much of a `tool_use` argument to render
+    /// into the Live View tmux pane before truncating. Resolved once here
+    /// (daemon-side, the sole owner of `.ralphus.toml`) rather than read by
+    /// the runner subprocess itself -- the runner has no per-cell cwd config
+    /// resolution of its own. `None` means the runner falls back to its own
+    /// default (200).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_arg_truncate_chars: Option<u32>,
 }
 
 /// Generate a fresh RFC 4122 version-4 (random) UUID, formatted as the
@@ -315,6 +326,15 @@ pub(crate) fn effective_proof_system_prompt(spec_system_prompt: Option<&str>) ->
     .expect("proof prompts always include ralphus system instructions")
 }
 
+/// RAL-303: the effective `[live_view] tool_arg_truncate_chars`
+/// (global-under-project, current-dir-based -- same convention
+/// `crate::config::load_live_view_config` itself documents), read fresh at
+/// spec-construction time so a config change takes effect on a squad's next
+/// cell without a daemon restart.
+fn resolved_tool_arg_truncate_chars() -> u32 {
+    crate::config::load_live_view_config().tool_arg_truncate_chars()
+}
+
 impl RunnerSpec {
     /// Build a spec from a stored cell row.
     ///
@@ -390,6 +410,7 @@ impl RunnerSpec {
             // RAL-185: carried from the row so the router can dispatch this
             // cell to its machine. `None` for every pre-RAL-185 row.
             machine: row.machine.clone(),
+            tool_arg_truncate_chars: Some(resolved_tool_arg_truncate_chars()),
         }
     }
 
@@ -445,6 +466,7 @@ impl RunnerSpec {
             assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
+            tool_arg_truncate_chars: Some(resolved_tool_arg_truncate_chars()),
         }
     }
 
@@ -503,6 +525,10 @@ impl RunnerSpec {
             assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
+            // Command-kind proof steps never reach a `ModelBackend` (see
+            // `runner::execute::run_cell`'s `command` branch), so there is no
+            // tool-call rendering here to configure.
+            tool_arg_truncate_chars: None,
         }
     }
 }
@@ -1916,6 +1942,42 @@ mod tests {
         assert!(json.contains("\"cwd\":\"/repo\""));
     }
 
+    /// RAL-303: `from_row` must actually resolve and forward
+    /// `[live_view] tool_arg_truncate_chars` -- catches a regression where
+    /// the field is added to the wire struct but never populated, which
+    /// would silently leave the runner on its own hardcoded fallback forever.
+    #[test]
+    fn spec_from_row_resolves_tool_arg_truncate_chars() {
+        let row = CellRow {
+            task_idx: 0,
+            idx: 0,
+            task_name: "build".to_string(),
+            cell_id: "s0".to_string(),
+            cwd: Some("/repo".to_string()),
+            subprojects: vec![],
+            prompt: Some("do work".to_string()),
+            command: None,
+            agent: "claude-code".to_string(),
+            model: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            maximum_budget_usd: None,
+            upstream: None,
+            machine: None,
+        };
+        let spec = RunnerSpec::from_row("run-1", &row);
+        // No `[live_view]` config file in the test environment, so this
+        // exercises the resolved default (200) rather than `None` --
+        // `from_row` must always resolve *some* value, never leave the
+        // field unset for a normal cell dispatch.
+        assert_eq!(spec.tool_arg_truncate_chars, Some(200));
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"tool_arg_truncate_chars\":200"));
+    }
+
     #[test]
     fn spec_carries_system_prompt_from_row() {
         let row = CellRow {
@@ -1974,6 +2036,7 @@ mod tests {
             assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
+            tool_arg_truncate_chars: None,
         }
     }
 
@@ -2020,10 +2083,20 @@ mod tests {
         assert!(messages[0].message.contains("stalled"));
 
         // Fresh activity, then a *new* stall onset, must escalate again.
+        // `is_stall_escalated` dedupes by exact `last_activity_ms`, so this
+        // must be a value that provably differs from the first escalation's
+        // (which fell back to `attempt_started_ms`) -- two real `now_ms()`
+        // calls a few lines apart can land in the same millisecond on a fast
+        // CI runner and collide, making this a flaky no-op instead of a new
+        // escalation. `attempt_started_ms - 1` is guaranteed both distinct
+        // and no later than any subsequent `now_ms()` reading, so the
+        // elapsed-since-activity check below reliably clears the (zero)
+        // threshold instead.
+        let fresh_activity_ms = attempt_started_ms - 1;
         store
             .lock()
             .unwrap()
-            .note_live_activity(session_name, crate::store::now_ms());
+            .note_live_activity(session_name, fresh_activity_ms);
         runner.check_stall_escalation(&spec, session_name, attempt_started_ms, zero_threshold);
         let messages_after = store
             .lock()
@@ -3501,6 +3574,7 @@ prompt = "make it build"
             assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
+            tool_arg_truncate_chars: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 
@@ -3630,6 +3704,7 @@ prompt = "make it build"
             assigned_agent_session_id: None,
             env_overrides: BTreeMap::new(),
             machine: None,
+            tool_arg_truncate_chars: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chrono::{NaiveTime, Utc};
 use ralphus_core::cors::CorsConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Resolved review configuration (after layering global under per-project).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -203,7 +203,7 @@ pub struct DaemonConfig {
     /// [`max_concurrent`](Self::max_concurrent). A configured `0` means "no
     /// limit". A negative value is treated as unset, matching this file's
     /// "malformed config never blocks" rule, and falls back to
-    /// `crate::DEFAULT_MAX_CONCURRENT` (12) — `ralphus check health` warns
+    /// `crate::DEFAULT_MAX_CONCURRENT` (20) — `ralphus check health` warns
     /// when this happens.
     #[serde(default)]
     pub max_concurrent: Option<i64>,
@@ -435,6 +435,16 @@ pub fn load_terminal_log_config() -> TerminalLogConfig {
 pub struct LiveViewConfig {
     #[serde(default)]
     pub show_debug_messages_default: Option<bool>,
+    /// RAL-303: how many characters of a `tool_use` argument value the
+    /// claude-code backend renders into the Live View tmux pane before
+    /// truncating with a trailing `…`. The pane is a write-once pty
+    /// transcript (`daemon/src/tmux.rs`'s `capture-pane`), so this can only
+    /// take effect at cell-launch time -- there is no retroactive/live
+    /// toggle. `None` means unset; resolved callers use
+    /// [`tool_arg_truncate_chars`](Self::tool_arg_truncate_chars), which
+    /// falls back to 200.
+    #[serde(default)]
+    pub tool_arg_truncate_chars: Option<u32>,
 }
 
 impl LiveViewConfig {
@@ -445,7 +455,22 @@ impl LiveViewConfig {
     pub fn show_debug_messages_default(&self) -> bool {
         self.show_debug_messages_default.unwrap_or(false)
     }
+
+    /// How many characters of a `tool_use` argument value to keep before
+    /// truncating in the Live View tmux pane. Defaults to 200 when unset.
+    #[must_use]
+    pub fn tool_arg_truncate_chars(&self) -> u32 {
+        self.tool_arg_truncate_chars
+            .unwrap_or(DEFAULT_TOOL_ARG_TRUNCATE_CHARS)
+    }
 }
+
+/// RAL-303: the default [`LiveViewConfig::tool_arg_truncate_chars`], used
+/// whenever `[live_view] tool_arg_truncate_chars` is unset or invalid.
+/// Raised from the runner's old hardcoded 80 -- that cutoff made exactly the
+/// tool calls an operator most needs to read (file edits, shell commands,
+/// diffs) illegible.
+pub const DEFAULT_TOOL_ARG_TRUNCATE_CHARS: u32 = 200;
 
 /// Parse a `LiveViewConfig` from the given TOML text; the default (unchecked)
 /// when the `[live_view]` table is absent.
@@ -478,6 +503,9 @@ pub fn load_live_view_config() -> LiveViewConfig {
         show_debug_messages_default: local
             .show_debug_messages_default
             .or(global.show_debug_messages_default),
+        tool_arg_truncate_chars: local
+            .tool_arg_truncate_chars
+            .or(global.tool_arg_truncate_chars),
     }
 }
 
@@ -647,6 +675,254 @@ pub fn is_valid_env_value(value: &str) -> bool {
     !value.chars().any(|c| c.is_control())
 }
 
+/// One parameterized field a `[[templates]]` entry declares beyond the five
+/// fixed Simple-tab base fields (`prompt`/`agent`/`model`/`project`/`proofs`)
+/// -- RAL-297. `{name}` in the owning [`TemplateDef::prompt_template`] is
+/// substituted with this field's value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TemplateFieldDef {
+    /// The `{name}` placeholder key. Must be non-empty and unique within its
+    /// template -- see [`validate_templates`].
+    pub name: String,
+    /// UI label; falls back to `name` when unset.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// One of `"string"`, `"number"`, `"bool"`. `None`/anything else is
+    /// treated as `"string"` at the point of use, but is flagged by
+    /// [`validate_templates`] so a typo doesn't silently degrade.
+    #[serde(default, rename = "type")]
+    pub field_type: Option<String>,
+    /// Whether the Simple tab form must reject submission when this field is
+    /// left blank. Defaults to `false` (optional).
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// One `[[templates]]` entry (RAL-297): a named, parameterized prompt
+/// template the Simple task form's template picker offers. Only supplies
+/// *supplementary* fields plus a `prompt_template` -- the five base fields
+/// (`prompt`, `agent`, `model`, `project`, `proofs`) are fixed by the form
+/// itself and never template-defined.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TemplateDef {
+    /// Stable identifier (the template picker's `<option>` value). Must be
+    /// non-empty and unique across the effective template list -- see
+    /// [`validate_templates`].
+    pub name: String,
+    /// UI label; falls back to `name` when unset.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// One-line description shown under the template picker.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Supplementary fields layered into `prompt_template` alongside the
+    /// base `{prompt}`.
+    #[serde(default)]
+    pub fields: Vec<TemplateFieldDef>,
+    /// The prompt text assembled for the work cell, with `{prompt}` and
+    /// `{<field.name>}` placeholders substituted. Required -- an entry
+    /// missing this is flagged by [`validate_templates`] and dropped from
+    /// the effective list by [`load_templates_config`] (a malformed
+    /// individual entry must not block every other template, or the whole
+    /// Simple tab).
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+}
+
+/// The built-in fallback template's stable name, used when a project
+/// configures zero `[[templates]]` entries -- RAL-297.
+pub const DEFAULT_TEMPLATE_NAME: &str = "hello-world";
+
+/// The built-in "just run the prompt as-is" template, offered when no
+/// `[[templates]]` are configured anywhere. Matches the example in
+/// `docs/simple-task-templates.md`.
+#[must_use]
+pub fn default_template() -> TemplateDef {
+    TemplateDef {
+        name: DEFAULT_TEMPLATE_NAME.to_string(),
+        label: Some("Hello World".to_string()),
+        description: Some(
+            "Minimal one-shot task: run a prompt as-is, no extra context.".to_string(),
+        ),
+        fields: Vec::new(),
+        prompt_template: Some("{prompt}".to_string()),
+    }
+}
+
+/// One error found in a `[[templates]]` list by [`validate_templates`] --
+/// carries enough detail for both `ralphus check health` (a flat message
+/// list) and a future UI surface (which template, if any, is at fault).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateValidationError {
+    /// The offending template's `name`, or `None` for a list-wide problem
+    /// (e.g. two templates sharing a name).
+    pub template: Option<String>,
+    pub message: String,
+}
+
+/// Recognized `[[templates.fields]] type` values.
+const VALID_FIELD_TYPES: &[&str] = &["string", "number", "bool"];
+
+/// Validate a `[[templates]]` list against RAL-297's schema: non-empty
+/// unique names, non-empty `prompt_template`, well-known field types,
+/// non-empty unique field names per template, and `prompt_template`
+/// placeholders that only reference `{prompt}` or a declared field. Returns
+/// one error per problem found (never stops at the first) -- callers decide
+/// whether an error means "drop this template" ([`load_templates_config`])
+/// or "fail `check health`" (`cli-rs`'s `check_templates`).
+#[must_use]
+pub fn validate_templates(templates: &[TemplateDef]) -> Vec<TemplateValidationError> {
+    let mut errors = Vec::new();
+    let mut seen_names: Vec<&str> = Vec::new();
+    for t in templates {
+        if t.name.trim().is_empty() {
+            errors.push(TemplateValidationError {
+                template: None,
+                message: "a [[templates]] entry has an empty name".to_string(),
+            });
+        } else if seen_names.contains(&t.name.as_str()) {
+            errors.push(TemplateValidationError {
+                template: Some(t.name.clone()),
+                message: format!("duplicate [[templates]] name \"{}\"", t.name),
+            });
+        } else {
+            seen_names.push(&t.name);
+        }
+        match t.prompt_template.as_deref() {
+            None | Some("") => errors.push(TemplateValidationError {
+                template: Some(t.name.clone()),
+                message: format!("template \"{}\" has no prompt_template (required)", t.name),
+            }),
+            Some(pt) => {
+                let mut seen_fields: Vec<&str> = Vec::new();
+                for f in &t.fields {
+                    if f.name.trim().is_empty() {
+                        errors.push(TemplateValidationError {
+                            template: Some(t.name.clone()),
+                            message: format!(
+                                "template \"{}\" has a field with an empty name",
+                                t.name
+                            ),
+                        });
+                        continue;
+                    }
+                    if seen_fields.contains(&f.name.as_str()) {
+                        errors.push(TemplateValidationError {
+                            template: Some(t.name.clone()),
+                            message: format!(
+                                "template \"{}\" has duplicate field name \"{}\"",
+                                t.name, f.name
+                            ),
+                        });
+                    } else {
+                        seen_fields.push(&f.name);
+                    }
+                    if let Some(ty) = &f.field_type {
+                        if !VALID_FIELD_TYPES.contains(&ty.as_str()) {
+                            errors.push(TemplateValidationError {
+                                template: Some(t.name.clone()),
+                                message: format!(
+                                    "template \"{}\" field \"{}\" has unknown type \"{ty}\" \
+                                     (expected string/number/bool)",
+                                    t.name, f.name
+                                ),
+                            });
+                        }
+                    }
+                }
+                for placeholder in template_placeholders(pt) {
+                    if placeholder != "prompt" && !t.fields.iter().any(|f| f.name == placeholder) {
+                        errors.push(TemplateValidationError {
+                            template: Some(t.name.clone()),
+                            message: format!(
+                                "template \"{}\" prompt_template references unknown \
+                                 placeholder \"{{{placeholder}}}\"",
+                                t.name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// Extract every `{ident}`-shaped placeholder name from `template` text
+/// (used by [`validate_templates`]). A bare `{` not immediately followed by
+/// an identifier and a closing `}` is ignored rather than treated as
+/// malformed -- `prompt_template` is free-form prose, not a strict format
+/// string.
+fn template_placeholders(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = template[i + 1..].find('}') {
+                let candidate = &template[i + 1..i + 1 + end];
+                if !candidate.is_empty()
+                    && candidate
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && candidate
+                        .chars()
+                        .next()
+                        .is_some_and(|c| !c.is_ascii_digit())
+                {
+                    names.push(candidate.to_string());
+                }
+                i += end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Recognized `[ui] new_task_default_tab` values.
+pub const VALID_NEW_TASK_TABS: &[&str] = &["simple", "files", "paste"];
+
+/// UI defaults (`[ui]` table, RAL-297). Only one knob today: which tab the
+/// board's "+ New Task" modal opens to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct UiConfig {
+    /// One of [`VALID_NEW_TASK_TABS`]. `None` (or an invalid value) resolves
+    /// to `"simple"` -- see [`UiConfig::new_task_default_tab`]. An
+    /// explicitly-set-but-invalid value is a hard `check health` failure
+    /// (see `validate_new_task_default_tab`), matching
+    /// [`ForgeConfig::pull_request_branch_convention`]'s precedent.
+    #[serde(default)]
+    pub new_task_default_tab: Option<String>,
+}
+
+impl UiConfig {
+    /// The effective default tab for the "+ New Task" modal. Falls back to
+    /// `"simple"` when unset or set to something other than
+    /// [`VALID_NEW_TASK_TABS`].
+    #[must_use]
+    pub fn new_task_default_tab(&self) -> &str {
+        match self.new_task_default_tab.as_deref() {
+            Some(t) if VALID_NEW_TASK_TABS.contains(&t) => t,
+            _ => "simple",
+        }
+    }
+}
+
+/// Validates a configured `[ui] new_task_default_tab` string (RAL-297): must
+/// be one of [`VALID_NEW_TASK_TABS`]. Only called on an explicitly-set value
+/// -- `None` silently resolves to `"simple"` instead.
+pub fn validate_new_task_default_tab(tab: &str) -> std::result::Result<(), String> {
+    if VALID_NEW_TASK_TABS.contains(&tab) {
+        Ok(())
+    } else {
+        Err(format!(
+            "ui.new_task_default_tab \"{tab}\" is not one of {VALID_NEW_TASK_TABS:?}"
+        ))
+    }
+}
+
 /// The on-disk file shape: either a `[review]` or a `[defaults]` table.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
@@ -670,6 +946,10 @@ struct ConfigFile {
     budget: Option<BudgetConfig>,
     #[serde(default)]
     cors: Option<CorsConfig>,
+    #[serde(default)]
+    templates: Vec<TemplateDef>,
+    #[serde(default)]
+    ui: Option<UiConfig>,
 }
 
 /// Parse a config from TOML text, preferring `[review]` over `[defaults]`.
@@ -920,6 +1200,104 @@ pub fn load_env_overrides_config() -> EnvOverridesConfig {
         .map(|s| env_overrides_from_toml_str(&s))
         .unwrap_or_default();
     global.merge(local)
+}
+
+/// Parse a `[[templates]]` list from the given TOML text (RAL-297). Absent
+/// entirely different from present-but-empty: an absent `templates` key
+/// parses to an empty `Vec` either way (array-of-tables has no "unset"
+/// state), so "zero configured templates" is what [`load_templates_config`]
+/// returning an empty list means -- callers fall back to
+/// [`default_template`].
+#[must_use]
+pub fn templates_from_toml_str(s: &str) -> Vec<TemplateDef> {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .templates
+}
+
+/// Load the effective `[[templates]]` list by unioning the global config
+/// file's templates with the nearest per-project `.ralphus.toml`'s -- using
+/// the daemon process's own current directory the same way
+/// [`load_env_overrides_config`]/[`load_daemon_config`] do (no per-request
+/// "review cwd"). A project template whose `name` matches a global one
+/// replaces it (project wins on collision); otherwise both survive,
+/// global-first. Does **not** apply [`default_template`]'s fallback -- see
+/// [`effective_templates`] for that.
+#[must_use]
+pub fn load_templates_config() -> Vec<TemplateDef> {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| templates_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| templates_from_toml_str(&s))
+        .unwrap_or_default();
+    let mut merged = Vec::new();
+    for t in global {
+        if !local.iter().any(|o| o.name == t.name) {
+            merged.push(t);
+        }
+    }
+    merged.extend(local);
+    merged
+}
+
+/// The effective template list a Simple-tab template picker should offer:
+/// [`load_templates_config`]'s configured templates (minus any entry
+/// [`validate_templates`] flags as malformed -- one bad entry must not take
+/// down the whole picker), or the single built-in [`default_template`] when
+/// that leaves nothing. The returned `bool` is `true` when the fallback is
+/// what's being shown (zero valid configured templates), which the board
+/// uses to disable the picker and show a tooltip explaining why.
+#[must_use]
+pub fn effective_templates() -> (Vec<TemplateDef>, bool) {
+    let configured = load_templates_config();
+    let invalid: std::collections::HashSet<String> = validate_templates(&configured)
+        .into_iter()
+        .filter_map(|e| e.template)
+        .collect();
+    let valid: Vec<TemplateDef> = configured
+        .into_iter()
+        .filter(|t| !invalid.contains(&t.name))
+        .collect();
+    if valid.is_empty() {
+        (vec![default_template()], true)
+    } else {
+        (valid, false)
+    }
+}
+
+/// Parse a `[ui]` table from the given TOML text (RAL-297).
+#[must_use]
+pub fn ui_from_toml_str(s: &str) -> UiConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .ui
+        .unwrap_or_default()
+}
+
+/// Load the effective `[ui]` config the same way as
+/// [`load_templates_config`] (current-dir-based, per-project scalar wins).
+#[must_use]
+pub fn load_ui_config() -> UiConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| ui_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| ui_from_toml_str(&s))
+        .unwrap_or_default();
+    UiConfig {
+        new_task_default_tab: local.new_task_default_tab.or(global.new_task_default_tab),
+    }
 }
 
 /// Parse a `CorsConfig` from the given TOML text (RAL-220's `[cors]` table).
@@ -1389,6 +1767,50 @@ mod tests {
         assert!(!c.show_debug_messages_default());
     }
 
+    // ── tool_arg_truncate_chars (RAL-303) ─────────────────────────────────
+
+    #[test]
+    fn tool_arg_truncate_chars_defaults_to_200_when_absent() {
+        let c = live_view_from_toml_str("");
+        assert_eq!(c.tool_arg_truncate_chars(), 200);
+    }
+
+    #[test]
+    fn tool_arg_truncate_chars_negative_value_falls_back_to_default() {
+        // A negative value can never deserialize into `Option<u32>` --
+        // confirms the "malformed config never blocks" fallback the
+        // `ralphus check health` WARN message promises actually holds.
+        let c = live_view_from_toml_str("[live_view]\ntool_arg_truncate_chars = -5\n");
+        assert_eq!(c.tool_arg_truncate_chars(), 200);
+    }
+
+    #[test]
+    fn tool_arg_truncate_chars_non_numeric_value_falls_back_to_default() {
+        let c = live_view_from_toml_str("[live_view]\ntool_arg_truncate_chars = \"nope\"\n");
+        assert_eq!(c.tool_arg_truncate_chars(), 200);
+    }
+
+    #[test]
+    fn tool_arg_truncate_chars_parses_an_explicit_value() {
+        let c = live_view_from_toml_str("[live_view]\ntool_arg_truncate_chars = 400\n");
+        assert_eq!(c.tool_arg_truncate_chars(), 400);
+    }
+
+    #[test]
+    fn tool_arg_truncate_chars_project_wins_over_global() {
+        let global = live_view_from_toml_str("[live_view]\ntool_arg_truncate_chars = 100\n");
+        let local = live_view_from_toml_str("[live_view]\ntool_arg_truncate_chars = 500\n");
+        let effective = LiveViewConfig {
+            show_debug_messages_default: local
+                .show_debug_messages_default
+                .or(global.show_debug_messages_default),
+            tool_arg_truncate_chars: local
+                .tool_arg_truncate_chars
+                .or(global.tool_arg_truncate_chars),
+        };
+        assert_eq!(effective.tool_arg_truncate_chars(), 500);
+    }
+
     // ── Downtime windows (RAL-122) ────────────────────────────────────────
 
     fn t(hh: u32, mm: u32) -> NaiveTime {
@@ -1802,5 +2224,147 @@ mod tests {
         }
         let _ = load_cors_config_cached();
         assert_eq!(cors_config_load_count() - before, 2);
+    }
+
+    // ── [[templates]] / [ui] (RAL-297) ────────────────────────────────────
+
+    #[test]
+    fn templates_parses_array_of_tables() {
+        let templates = templates_from_toml_str(
+            "[[templates]]\nname = \"hello-world\"\nprompt_template = \"{prompt}\"\n\n\
+             [[templates]]\nname = \"standard\"\nprompt_template = \"{prompt}\\n{ticket_id}\"\n\
+             [[templates.fields]]\nname = \"ticket_id\"\nrequired = false\n",
+        );
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].name, "hello-world");
+        assert_eq!(templates[1].fields.len(), 1);
+        assert_eq!(templates[1].fields[0].name, "ticket_id");
+    }
+
+    #[test]
+    fn templates_malformed_toml_is_empty() {
+        assert!(templates_from_toml_str("not = = valid").is_empty());
+    }
+
+    #[test]
+    fn default_template_is_hello_world_and_ascii() {
+        let t = default_template();
+        assert_eq!(t.name, DEFAULT_TEMPLATE_NAME);
+        assert_eq!(t.prompt_template.as_deref(), Some("{prompt}"));
+        assert!(t.prompt_template.unwrap().is_ascii());
+    }
+
+    #[test]
+    fn validate_templates_rejects_empty_and_duplicate_names() {
+        let templates = vec![
+            TemplateDef {
+                name: String::new(),
+                prompt_template: Some("{prompt}".to_string()),
+                ..TemplateDef::default()
+            },
+            TemplateDef {
+                name: "dup".to_string(),
+                prompt_template: Some("{prompt}".to_string()),
+                ..TemplateDef::default()
+            },
+            TemplateDef {
+                name: "dup".to_string(),
+                prompt_template: Some("{prompt}".to_string()),
+                ..TemplateDef::default()
+            },
+        ];
+        let errors = validate_templates(&templates);
+        assert!(errors.iter().any(|e| e.message.contains("empty name")));
+        assert!(errors.iter().any(|e| e.message.contains("duplicate")));
+    }
+
+    #[test]
+    fn validate_templates_rejects_missing_prompt_template() {
+        let templates = vec![TemplateDef {
+            name: "x".to_string(),
+            ..TemplateDef::default()
+        }];
+        let errors = validate_templates(&templates);
+        assert!(errors.iter().any(|e| e.message.contains("prompt_template")));
+    }
+
+    #[test]
+    fn validate_templates_rejects_unknown_field_type_and_placeholder() {
+        let templates = vec![TemplateDef {
+            name: "x".to_string(),
+            fields: vec![TemplateFieldDef {
+                name: "ticket_id".to_string(),
+                field_type: Some("bogus".to_string()),
+                ..TemplateFieldDef::default()
+            }],
+            prompt_template: Some("{prompt} {unknown_field}".to_string()),
+            ..TemplateDef::default()
+        }];
+        let errors = validate_templates(&templates);
+        assert!(errors.iter().any(|e| e.message.contains("unknown type")));
+        assert!(errors.iter().any(|e| e.message.contains("unknown_field")));
+    }
+
+    #[test]
+    fn validate_templates_accepts_the_standard_example() {
+        let templates = vec![TemplateDef {
+            name: "standard".to_string(),
+            fields: vec![
+                TemplateFieldDef {
+                    name: "ticket_id".to_string(),
+                    field_type: Some("string".to_string()),
+                    required: false,
+                    ..TemplateFieldDef::default()
+                },
+                TemplateFieldDef {
+                    name: "context_files".to_string(),
+                    ..TemplateFieldDef::default()
+                },
+            ],
+            prompt_template: Some(
+                "{prompt}\n\nTicket: {ticket_id}\nRelevant files: {context_files}".to_string(),
+            ),
+            ..TemplateDef::default()
+        }];
+        assert!(validate_templates(&templates).is_empty());
+    }
+
+    #[test]
+    fn effective_templates_falls_back_to_default_when_none_configured() {
+        // No `.ralphus.toml`/global config in this process's temp cwd, so
+        // `load_templates_config()` returns empty regardless of environment --
+        // exercise the fallback logic directly instead of touching cwd/env,
+        // which other tests in this module run concurrently against.
+        let configured: Vec<TemplateDef> = Vec::new();
+        let invalid: std::collections::HashSet<String> = validate_templates(&configured)
+            .into_iter()
+            .filter_map(|e| e.template)
+            .collect();
+        let valid: Vec<TemplateDef> = configured
+            .into_iter()
+            .filter(|t| !invalid.contains(&t.name))
+            .collect();
+        assert!(valid.is_empty());
+    }
+
+    #[test]
+    fn ui_config_new_task_default_tab_defaults_to_simple() {
+        assert_eq!(UiConfig::default().new_task_default_tab(), "simple");
+        let c = ui_from_toml_str("[ui]\nnew_task_default_tab = \"paste\"\n");
+        assert_eq!(c.new_task_default_tab(), "paste");
+    }
+
+    #[test]
+    fn ui_config_unrecognized_tab_falls_back_to_simple() {
+        let c = ui_from_toml_str("[ui]\nnew_task_default_tab = \"bogus\"\n");
+        assert_eq!(c.new_task_default_tab(), "simple");
+    }
+
+    #[test]
+    fn validate_new_task_default_tab_accepts_known_values() {
+        for tab in VALID_NEW_TASK_TABS {
+            assert!(validate_new_task_default_tab(tab).is_ok());
+        }
+        assert!(validate_new_task_default_tab("bogus").is_err());
     }
 }

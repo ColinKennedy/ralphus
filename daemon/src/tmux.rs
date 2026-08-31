@@ -1491,8 +1491,15 @@ mod tests {
         )
         .unwrap();
 
+        // `cargo test`'s default harness runs hundreds of tests concurrently
+        // across a CI runner's small core count, so this real tmux
+        // subprocess (session start + respawn-pane + first successful
+        // capture) can take much longer to be scheduled than on a
+        // lightly-loaded dev machine -- 150 polls/30s gives real headroom
+        // under that contention without slowing the common case, since the
+        // loop still breaks the moment the marker appears.
         let mut seen = String::new();
-        for _ in 0..50 {
+        for _ in 0..150 {
             std::thread::sleep(Duration::from_millis(200));
             seen = tmux.capture_pane(&name, 50).unwrap_or_default();
             if seen.contains("tmux-roundtrip-ok") {

@@ -230,7 +230,7 @@ aborts the remaining batch).
 | `review reorder <selector> <b1,b2,...> [--disable b,b] [--enable b,b]` | Reorder branches + rebase, atomically |
 | `review branch enable\|disable <selector#branch>` | Enable/disable one branch + rebase |
 | `review merge <selector>` | Start/continue the stacked rebase |
-| `review sync-github <selector>` | Check the forge for a stack reorder made outside ralphus and apply it if found (RAL-273) |
+| `review sync-pr <selector>` | Check the forge (GitHub or GitLab) for a stack reorder made outside ralphus and apply it if found (RAL-273) |
 | `review restart-merge <selector>` | Cancel an in-progress rebase, start fresh |
 | `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
@@ -530,8 +530,10 @@ use; see `READ_ONLY_NOTE`.
     - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
         - edit selector [str] --agent [name] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a cell's fields.}
+        - open-agent selector [str]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - restart selector [str]  {Restart a cell (and its downstream), dirtying dependent squads.}
         - restart-proof selector [str] --from [index]  {Restart a cell's proof steps from an index onwards.}
+        - resume-automation selector [str]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
         - (read-only-safe) reviews selector [str]  {The reviews this cell's branch participates in.}
         - set-status selector [str] state [str]  {Manually override a cell's status.}
         - (read-only-safe) show selector [str]  {Show a single cell's detail.}
@@ -617,6 +619,7 @@ use; see `READ_ONLY_NOTE`.
         - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
         - stop-merge selector [str]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
+        - sync-pr selector [str]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
         - (read-only-safe) worktrees selector [str]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}

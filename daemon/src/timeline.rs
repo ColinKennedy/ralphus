@@ -192,22 +192,30 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
     })
 }
 
-/// Fetches one cell's own Cartographer rows, ascending by time (RAL-288
-/// Stage 5) -- the "additive" half of the Live View pane's "Show Debug
-/// Messages" toggle. `daemon/src/server.rs`'s pane-serving endpoints now
-/// always strip ralphus's own marker lines out of the raw pane text (see
-/// `strip_ralphus_pane_markers`), so this is how a human opts back into
-/// seeing ralphus's own diagnostics for that same cell, without needing them
-/// spliced into the live pane byte stream at all (tmux pane captures carry
-/// no reliable per-line timestamps to splice against in the first place --
-/// see this module's own top-level doc comment). Reuses the same paginated
-/// Cartographer fetch [`build_squad_timeline`] does, scoped to one
-/// `(task, cell_id)` pair via the query filter directly, rather than
-/// fetching the whole squad's rows and filtering client-side -- and skips
-/// that function's log-excerpt-inlining and temp-file-writing, neither of
-/// which fit a call meant to be polled every couple of seconds alongside the
-/// pane itself.
-pub fn cell_debug_entries(
+/// The current-attempt-only, chronologically-merged debug stream backing
+/// both the Live View pane's "Show Debug Messages" toggle and the "Open
+/// Terminal Log" attempt-history popup (RAL-296), for one cell, proof step,
+/// guardian branch resolver, or guardian manual-checks run -- the four
+/// entity kinds that already share the exact `(squad_id, task, cell_id)` key
+/// convention their tmux session naming uses (see
+/// `server.rs::terminal_log_attempts_reply`'s doc comment, and this
+/// function's own callers in `server.rs`, one per kind).
+///
+/// Reuses [`build_squad_timeline`]'s own merge mechanism -- the same
+/// paginated Cartographer fetch, [`read_log_excerpt`] inlining, and
+/// ordering/volume-cap rules -- scoped down to one entity via the query
+/// filter directly, rather than fetching the whole squad's rows and
+/// filtering client-side. Unlike `build_squad_timeline`, this also trims to
+/// the most recent attempt: every runner/scheduler lifecycle event for any
+/// of these four entity kinds is logged around a `"tmux session started"`
+/// row (`Runner::emit_tmux_note`, entity-kind-agnostic -- see
+/// `runner.rs::run_via_tmux`), so the *last* such row's position is a
+/// reliable, kind-agnostic "this attempt started here" boundary. A detach +
+/// restart cycle's earlier attempt(s) are trimmed off rather than stitched
+/// in, matching the ticket's "current-attempt-only" design decision --
+/// browsing *past* attempts remains the separate Attempt History box's job
+/// (`terminal_log_attempts_reply`), unaffected by this trim.
+pub fn entity_debug_timeline(
     store: &Store,
     squad_id: &str,
     task: &str,
@@ -235,18 +243,28 @@ pub fn cell_debug_entries(
         }
     }
     rows.truncate(MAX_EVENTS as usize);
+
+    let attempt_start = rows
+        .iter()
+        .rposition(|r| r.message == "tmux session started")
+        .unwrap_or(0);
+    rows.drain(..attempt_start);
+
     Ok(rows
         .into_iter()
-        .map(|r| SquadTimelineEntry {
-            at_ms: r.at_ms,
-            level: r.level,
-            source: r.source,
-            scope: r.scope,
-            task: r.task,
-            cell_id: r.cell_id,
-            message: r.message,
-            log_path: r.log_path,
-            log_excerpt: None,
+        .map(|r| {
+            let log_excerpt = r.log_path.as_deref().and_then(read_log_excerpt);
+            SquadTimelineEntry {
+                at_ms: r.at_ms,
+                level: r.level,
+                source: r.source,
+                scope: r.scope,
+                task: r.task,
+                cell_id: r.cell_id,
+                message: r.message,
+                log_path: r.log_path,
+                log_excerpt,
+            }
         })
         .collect())
 }
@@ -517,5 +535,114 @@ prompt = "make it build"
         let mut sorted = at_ms.clone();
         sorted.sort_unstable();
         assert_eq!(at_ms, sorted);
+    }
+
+    #[test]
+    fn entity_debug_timeline_scopes_to_one_task_cell_pair() {
+        let (store, squad_id) = seeded_squad();
+        Note::new("scheduler")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "cell start", serde_json::json!({}));
+        Note::new("scheduler")
+            .squad(&squad_id)
+            .task("build")
+            .cell("other-cell")
+            .emit(&store, "cell start (other)", serde_json::json!({}));
+        let entries = entity_debug_timeline(&store, &squad_id, "build", "worker").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "cell start");
+    }
+
+    #[test]
+    fn entity_debug_timeline_trims_to_the_most_recent_attempt() {
+        let (store, squad_id) = seeded_squad();
+        // First attempt: starts, runs, ends.
+        Note::new("scheduler")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "cell start", serde_json::json!({}));
+        Note::new("runner")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "tmux session started", serde_json::json!({}));
+        Note::new("runner")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "invoked", serde_json::json!({}));
+        // Detach + restart: a second attempt begins.
+        Note::new("scheduler")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(
+                &store,
+                "cell detached for manual takeover",
+                serde_json::json!({}),
+            );
+        Note::new("scheduler")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "cell start", serde_json::json!({}));
+        Note::new("runner")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "tmux session started", serde_json::json!({}));
+        Note::new("runner")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "session-id known", serde_json::json!({}));
+
+        let entries = entity_debug_timeline(&store, &squad_id, "build", "worker").unwrap();
+        let messages: Vec<&str> = entries.iter().map(|e| e.message.as_str()).collect();
+        // Only the second attempt's own boundary onward -- the first
+        // attempt's "cell start"/"invoked" and the intervening detach
+        // event are trimmed off, not stitched into the same stream.
+        assert_eq!(messages, vec!["tmux session started", "session-id known"]);
+    }
+
+    #[test]
+    fn entity_debug_timeline_inlines_terminal_log_excerpt() {
+        let (store, squad_id) = seeded_squad();
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-entity-timeline-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("attempt.log");
+        std::fs::write(&log_file, "hello from the pane").unwrap();
+
+        Note::new("runner")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .emit(&store, "tmux session started", serde_json::json!({}));
+        Note::new("runner")
+            .squad(&squad_id)
+            .task("build")
+            .cell("worker")
+            .scope("terminal_log")
+            .log_path(log_file.to_str().unwrap())
+            .emit(
+                &store,
+                "terminal log attempt 0 written",
+                serde_json::json!({}),
+            );
+
+        let entries = entity_debug_timeline(&store, &squad_id, "build", "worker").unwrap();
+        let written = entries
+            .iter()
+            .find(|e| e.message == "terminal log attempt 0 written")
+            .expect("terminal log entry present");
+        assert_eq!(written.log_excerpt.as_deref(), Some("hello from the pane"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

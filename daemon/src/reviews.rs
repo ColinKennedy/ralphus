@@ -18,6 +18,7 @@ use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
 use crate::store::{CellRow, Store, TaskRow};
 use crate::vcs::{GitOps, GitVcs};
+use crate::workspace::Workspace;
 
 /// A submit-time review preflight / derivation failure (surfaced to the client).
 #[derive(Debug)]
@@ -166,6 +167,83 @@ pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, Strin
         ],
     )
     .map_err(|_| "no upstream".to_string())
+}
+
+/// The durable comparison ref [`worktree_has_commits_ahead_of_upstream`]
+/// reads: prefers the `ralphus.<branch>.baseline` git config key
+/// [`crate::worktrees::set_explicit_upstream`] mirrors the resolved
+/// `?upstream=` ref into, falling back to the live `@{upstream}` tracking ref
+/// when no such marker exists (a worktree materialized before this fix, or a
+/// plain checkout never routed through [`crate::worktrees::ensure_worktree`]).
+///
+/// The fallback-only marker matters because `@{upstream}` itself is exactly
+/// what `git push -u`/`--set-upstream` overwrites: a `finalize` cell pushing a
+/// brand-new branch for the first time routinely needs `-u` (a bare `git
+/// push` fails until *some* upstream is configured), which retargets
+/// `branch.<branch>.remote`/`.merge` from the intended base branch onto the
+/// branch's own just-pushed remote copy — after which `@{upstream}` always
+/// equals `HEAD`, indistinguishable from "no progress". The
+/// `ralphus.<branch>.baseline` key lives in a config namespace git itself
+/// never writes to, so it survives that push untouched.
+fn worktree_baseline_ref(cwd: &Path) -> std::result::Result<String, String> {
+    if let Ok(branch) = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        let branch = branch.trim();
+        if !branch.is_empty() {
+            if let Ok(marker) = git(
+                cwd,
+                &["config", "--get", &format!("ralphus.{branch}.baseline")],
+            ) {
+                let marker = marker.trim();
+                if !marker.is_empty() && git(cwd, &["rev-parse", "--verify", marker]).is_ok() {
+                    return Ok(marker.to_string());
+                }
+            }
+        }
+    }
+    worktree_upstream(cwd)
+}
+
+/// Whether `cwd`'s checked-out branch has at least one commit its durable
+/// baseline ([`worktree_baseline_ref`]) doesn't (RAL-293).
+///
+/// This is the no-new-commits guard's (`crate::scheduler::check_task_no_commits_guard`)
+/// review-independent "did this task make real progress" signal: unlike a
+/// squad-run-scoped baseline sha captured once at cell-start, this baseline is
+/// durable git state that survives worktree reuse across squad resubmissions
+/// and task restarts alike, so it never confuses "this run made no *new*
+/// commits" with "this task never did the work". `false` when the worktree
+/// has no resolvable baseline (e.g. a plain checkout never routed through
+/// [`crate::worktrees::ensure_worktree`]) — mirrors the guard's existing
+/// fail-closed policy of treating an unanswerable question as "no progress"
+/// rather than silently passing.
+#[must_use]
+pub(crate) fn worktree_has_commits_ahead_of_upstream(cwd: &Path) -> bool {
+    let Ok(baseline) = worktree_baseline_ref(cwd) else {
+        return false;
+    };
+    git(cwd, &["rev-list", "--count", &format!("{baseline}..HEAD")])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|n| n > 0)
+}
+
+/// Whether the checked-out `HEAD` is already contained in its configured
+/// upstream. Missing or unresolvable upstream state returns `false` so callers
+/// never treat an uncertain git state as merged. `Workspace` keeps the check
+/// valid for review worktrees on configured remote machines too.
+#[must_use]
+pub(crate) fn workspace_head_is_ancestor_of_upstream(workspace: &Workspace) -> bool {
+    let Ok(upstream) = workspace.git(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ]) else {
+        return false;
+    };
+    workspace
+        .git(&["merge-base", "--is-ancestor", "HEAD", upstream.trim()])
+        .is_ok()
 }
 
 /// The read-only "upstream" value to show for a cell's git worktree in the
@@ -809,8 +887,12 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{Membership, apply_resolver, rebase_onto};
+    use super::{
+        Membership, apply_resolver, rebase_onto, workspace_head_is_ancestor_of_upstream,
+        worktree_has_commits_ahead_of_upstream,
+    };
     use crate::store::Store;
+    use crate::workspace::Workspace;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -844,6 +926,20 @@ mod tests {
     fn stashes_dirty_changes_before_rebase_and_restores_them_after() {
         let root = temp_repo();
         git(&root, &["init", "-b", "main"]);
+        // `rebase_onto` below shells out through `GitVcs::exec_raw`, which
+        // (correctly, for real repos) never injects an identity -- so this
+        // throwaway repo needs one in its own local config, not just on this
+        // test's own `git()` helper's per-invocation env vars, or the commit
+        // `rebase_onto` creates fails identity checks on a CI runner with no
+        // global gitconfig.
+        git(&root, &["config", "user.name", "ralphus"]);
+        git(&root, &["config", "user.email", "ralphus@example.com"]);
+        // Stash pop runs restored content through the same clean/smudge
+        // filters as a checkout -- on a Windows runner whose git defaults to
+        // `core.autocrlf=true`, that silently turns this LF-written file
+        // into CRLF, which has nothing to do with what's under test here
+        // (whether ralphus's stash/rebase round-trips content at all).
+        git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "base"]);
@@ -887,6 +983,13 @@ mod tests {
     fn restores_stash_after_rebase_failure() {
         let root = temp_repo();
         git(&root, &["init", "-b", "main"]);
+        // See the identical config in `stashes_dirty_changes_before_rebase_and_restores_them_after`
+        // above: `rebase_onto` needs an identity, and stash pop must not let
+        // a Windows runner's `core.autocrlf=true` default mangle line
+        // endings out from under this test's exact-content assertion.
+        git(&root, &["config", "user.name", "ralphus"]);
+        git(&root, &["config", "user.email", "ralphus@example.com"]);
+        git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("conflict.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "base"]);
@@ -1084,5 +1187,174 @@ mod tests {
         let m = membership(None);
         apply_resolver(&store, &gid, &[&m]).unwrap();
         assert_eq!(store.guardian_maximum_budget_usd(&gid).unwrap(), None);
+    }
+
+    // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────
+
+    #[test]
+    fn false_when_head_equals_upstream() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["branch", "base"]);
+        git(&root, &["branch", "--set-upstream-to=base", "main"]);
+
+        assert!(!worktree_has_commits_ahead_of_upstream(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn true_when_head_has_a_commit_the_upstream_lacks() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["branch", "base"]);
+        git(&root, &["branch", "--set-upstream-to=base", "main"]);
+
+        std::fs::write(root.join("more.txt"), "more\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "more"]);
+
+        assert!(worktree_has_commits_ahead_of_upstream(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn true_regardless_of_which_run_made_the_commit() {
+        // RAL-293: the whole point of switching to @{upstream} is that it
+        // doesn't matter *when* the commit landed -- unlike a squad-run-scoped
+        // baseline sha, this must read the same whether the commit was made
+        // just now or by an earlier, unrelated run that reused this worktree.
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["branch", "base"]);
+        git(&root, &["branch", "--set-upstream-to=base", "main"]);
+
+        // Simulate a commit made by a prior squad run against this same
+        // worktree, well before this check ever runs.
+        std::fs::write(root.join("prior-run.txt"), "already done\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "prior run's work"]);
+
+        assert!(worktree_has_commits_ahead_of_upstream(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn false_when_no_upstream_is_configured() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+
+        assert!(
+            !worktree_has_commits_ahead_of_upstream(&root),
+            "no upstream must fail closed, not silently pass"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── ralphus.<branch>.baseline: survives a finalize cell's `git push -u` ──
+
+    #[test]
+    fn true_after_push_dash_u_retargets_upstream_onto_the_branchs_own_remote() {
+        // Reproduces the real-world false failure: a `finalize` cell's own
+        // first-time `git push -u origin <branch>` (needed because a bare
+        // `git push` refuses until *some* upstream exists) retargets
+        // `branch.<branch>.remote`/`.merge` from the daemon-configured base
+        // branch onto the branch's own just-pushed remote copy. Once that
+        // happens `@{upstream}` always equals `HEAD`, which the guard would
+        // read as "no progress" -- unless it consults the durable
+        // `ralphus.<branch>.baseline` marker `set_explicit_upstream` writes
+        // alongside `@{upstream}`, which this push never touches.
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        // Stand in for `ensure_worktree("feature-x", "main")`: a feature
+        // branch forked from `main`, with the daemon's real config writes
+        // (`branch.<b>.merge` -- i.e. the pre-push `@{upstream}` -- and the
+        // durable `ralphus.<b>.baseline` marker) both pointed at `main`.
+        git(&root, &["checkout", "-b", "feature-x"]);
+        git(&root, &["config", "branch.feature-x.remote", "."]);
+        git(
+            &root,
+            &["config", "branch.feature-x.merge", "refs/heads/main"],
+        );
+        git(
+            &root,
+            &["config", "ralphus.feature-x.baseline", "refs/heads/main"],
+        );
+
+        std::fs::write(root.join("work.txt"), "work\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "real work"]);
+
+        // A bare local "remote" to push to, plus the push itself with `-u`,
+        // exactly as an agent reaches for on a branch with no upstream yet.
+        let remote = temp_repo();
+        git(&remote, &["init", "--bare", "--initial-branch=main"]);
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&root, &["push", "-u", "origin", "feature-x"]);
+
+        // The push must have actually retargeted `@{upstream}` -- otherwise
+        // this test isn't reproducing the bug at all.
+        let upstream_after_push = git(
+            &root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        );
+        assert_eq!(upstream_after_push.trim(), "origin/feature-x");
+
+        assert!(
+            worktree_has_commits_ahead_of_upstream(&root),
+            "the durable ralphus.<branch>.baseline marker must survive `git push -u` \
+             retargeting @{{upstream}}, so real work isn't reported as no progress"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn head_is_ancestor_of_upstream_only_after_upstream_contains_it() {
+        let root = temp_repo();
+        git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["branch", "upstream"]);
+        git(&root, &["branch", "--set-upstream-to=upstream", "main"]);
+
+        let workspace = Workspace::on(&root, None);
+        assert!(workspace_head_is_ancestor_of_upstream(&workspace));
+        std::fs::write(root.join("more.txt"), "more\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "more"]);
+        assert!(!workspace_head_is_ancestor_of_upstream(&workspace));
+        git(&root, &["branch", "-f", "upstream", "HEAD"]);
+        assert!(workspace_head_is_ancestor_of_upstream(&workspace));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

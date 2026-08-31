@@ -17,10 +17,16 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "CARTOGRAPHER_ROUTES",
+    "CARTOGRAPHER_ROWS",
+    "MACHINES_ROUTES",
+    "MACHINES_ROWS",
     "PATH_DEPLOY",
     "PATH_MIGRATE",
     "PATH_PROVISION",
     "PATH_PURGE",
+    "PROJECTS_ROUTES",
+    "PROJECTS_ROWS",
     "QUEUE_ITEMS",
     "QUEUE_ROUTES",
     "QUEUE_RUN_ID",
@@ -33,16 +39,22 @@ __all__ = [
     "REVIEWS_ROUTES",
     "TASKS_ROUTES",
     "TASKS_RUNS",
+    "USERS_ROUTES",
+    "USERS_ROWS",
     "Json",
     "Routes",
     "branch",
+    "carto_row",
     "guardian",
+    "machine_provider",
     "message",
+    "project",
     "queue_item",
     "resource_row",
     "run",
     "session",
     "task",
+    "user_entry",
     "verify_step",
 ]
 
@@ -335,6 +347,84 @@ def resource_row(
         "cpu_percent": cpu_percent,
         "mem_bytes": mem_bytes,
         "gpu_mem_bytes": gpu_mem_bytes,
+    }
+
+
+def carto_row(
+    id_: int,
+    *,
+    at_ms: int,
+    level: str,
+    source: str,
+    message: str,
+    scope: str | None = None,
+    squad_id: str | None = None,
+    guardian_id: str | None = None,
+    cell_id: str | None = None,
+    task: str | None = None,
+    payload: Json | None = None,
+) -> Json:
+    return {
+        "id": id_,
+        "at_ms": at_ms,
+        "level": level,
+        "source": source,
+        "message": message,
+        "scope": scope,
+        "squad_id": squad_id,
+        "guardian_id": guardian_id,
+        "cell_id": cell_id,
+        "task": task,
+        "log_path": None,
+        "payload": payload or {},
+    }
+
+
+def machine_provider(
+    scheme: str,
+    *,
+    description: str,
+    program: str,
+    created_at_ms: int,
+    args: tuple[str, ...] = (),
+    protocol_version: int = 1,
+    supports_channel: bool = False,
+    last_check_ms: int | None = None,
+    last_check_ok: bool | None = None,
+    last_check_note: str | None = None,
+) -> Json:
+    return {
+        "scheme": scheme,
+        "description": description,
+        "program": program,
+        "args": list(args),
+        "protocol_version": protocol_version,
+        "created_at_ms": created_at_ms,
+        "last_check_ms": last_check_ms,
+        "last_check_ok": last_check_ok,
+        "last_check_note": last_check_note,
+        "supports_channel": supports_channel,
+    }
+
+
+def user_entry(name: str, *, created_at_ms: int) -> Json:
+    return {"name": name, "created_at_ms": created_at_ms}
+
+
+def project(
+    name: str,
+    *,
+    description: str,
+    path: str,
+    created_at_ms: int,
+    vcs: str = "git",
+) -> Json:
+    return {
+        "name": name,
+        "description": description,
+        "path": path,
+        "vcs": vcs,
+        "created_at_ms": created_at_ms,
     }
 
 
@@ -739,4 +829,165 @@ RESOURCES_ROUTES: Routes = {
     "/api/guardians": [],
     "/api/resources": {"resources": list(RESOURCES_ROWS)},
     "/api/queue": {"items": []},
+}
+
+# ---------------------------------------------------------------------------
+# Cartographer scenario — a handful of events spanning info/warning/error
+# levels and squad/cell/guardian scopes, newest first.
+# ---------------------------------------------------------------------------
+
+CARTOGRAPHER_ROWS: tuple[Json, ...] = (
+    carto_row(
+        1005,
+        at_ms=1_783_142_500_000,
+        level="info",
+        source="runner",
+        message="cell completed",
+        scope="cell",
+        squad_id="run-000000000004",
+        cell_id="session-0",
+        task="frontend",
+        payload={"tokens_in": 8214, "tokens_out": 1032, "cost_usd": 0.041},
+    ),
+    carto_row(
+        1004,
+        at_ms=1_783_142_400_000,
+        level="error",
+        source="runner",
+        message="cell extract-token-parser failed: cargo build exited 101",
+        scope="cell",
+        squad_id="run-000000000002",
+        cell_id="session-0",
+        task="auth",
+    ),
+    carto_row(
+        1003,
+        at_ms=1_783_142_300_000,
+        level="warning",
+        source="guardian_merge",
+        message="resolved 2 conflicts in board.html",
+        scope="guardian",
+        guardian_id="guardian-000000000007",
+    ),
+    carto_row(
+        1002,
+        at_ms=1_783_142_200_000,
+        level="info",
+        source="runner",
+        message="cell wire-theme-toggle started",
+        scope="cell",
+        squad_id="run-000000000004",
+        cell_id="session-0",
+        task="frontend",
+    ),
+    carto_row(
+        1001,
+        at_ms=1_783_142_100_000,
+        level="info",
+        source="scheduler",
+        message="squad run-000000000004 claimed → running",
+        scope="squad",
+        squad_id="run-000000000004",
+    ),
+)
+
+CARTOGRAPHER_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/cartographer?limit=50&offset=0&sort=desc": {
+        "rows": list(CARTOGRAPHER_ROWS),
+        "total": len(CARTOGRAPHER_ROWS),
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Machines scenario — one reachable, channel-capable provider and one that
+# has never been probed.
+# ---------------------------------------------------------------------------
+
+MACHINES_ROWS: tuple[Json, ...] = (
+    machine_provider(
+        "incredibuild",
+        description="on-prem build farm",
+        program="/opt/ralphus/incredibuild.sh",
+        created_at_ms=1_783_100_000_000,
+        protocol_version=1,
+        supports_channel=True,
+        last_check_ms=1_783_142_000_000,
+        last_check_ok=True,
+        last_check_note="build farm responded to ping in 42ms",
+    ),
+    machine_provider(
+        "lab-gpu-01",
+        description="GPU workstation for local model runs",
+        program="C:/ralphus/providers/ssh_provider.exe",
+        created_at_ms=1_783_110_000_000,
+        args=("--host", "lab-gpu-01"),
+        protocol_version=1,
+    ),
+)
+
+MACHINES_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/machines": {"machines": list(MACHINES_ROWS), "builtin": ["local"]},
+}
+
+# ---------------------------------------------------------------------------
+# Users scenario — a few placeholder identities.
+# ---------------------------------------------------------------------------
+
+USERS_ROWS: tuple[Json, ...] = (
+    user_entry("ci-bot", created_at_ms=1_783_090_000_000),
+    user_entry("colin", created_at_ms=1_783_095_000_000),
+    user_entry("reviewer", created_at_ms=1_783_098_000_000),
+)
+
+USERS_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/users": {"users": list(USERS_ROWS)},
+}
+
+# ---------------------------------------------------------------------------
+# Projects scenario — a few registered git repositories, all validating
+# clean (RAL-101 re-checks each one's on-disk path once per tab-load).
+# ---------------------------------------------------------------------------
+
+PROJECTS_ROWS: tuple[Json, ...] = (
+    project(
+        "ralphus",
+        description="the ralphus repo",
+        path=_REPO,
+        created_at_ms=1_783_080_000_000,
+    ),
+    project(
+        "docs-site",
+        description="internal docs site",
+        path="C:/repo/docs-site",
+        created_at_ms=1_783_082_000_000,
+    ),
+    project(
+        "incredibuild-scripts",
+        description="build farm provisioning scripts",
+        path="C:/repo/incredibuild-scripts",
+        created_at_ms=1_783_084_000_000,
+    ),
+)
+
+PROJECTS_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/projects": {"projects": list(PROJECTS_ROWS)},
+    "/api/projects/ralphus/validate": {"valid": True},
+    "/api/projects/docs-site/validate": {"valid": True},
+    "/api/projects/incredibuild-scripts/validate": {"valid": True},
 }

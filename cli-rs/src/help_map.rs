@@ -584,7 +584,7 @@ the review worktree.",
         &[],
     ),
     node(
-        "sync-github",
+        "sync-pr",
         &["selector [str]"],
         &[],
         "Check the forge for a stack reorder made outside ralphus and apply it if found.",
@@ -1775,6 +1775,42 @@ pub fn registered_paths() -> Vec<Vec<&'static str>> {
         }
     }
     let mut out = vec![Vec::new()];
+    for child in ROOT.children.iter().chain(std::iter::once(&QUICK_START)) {
+        let mut path = vec![child.name];
+        walk(child, &mut path, &mut out);
+    }
+    out
+}
+
+/// Every *leaf* command path (a node with no children -- i.e. an actual
+/// runnable command, not a group header like bare `task`), paired with its
+/// full [`HelpNode`] (positionals, options, description, `read_only_safe`,
+/// ...). This is the cross-check anchor used by `cli-rs`'s
+/// `commands::parse_args`-drift test and the MCP parity/tool-generation code
+/// in the `ralphus-mcp` crate: `help_map.rs`'s tree is currently
+/// hand-authored in parallel with the real command surface in
+/// `commands/*.rs`'s `parse()` functions, so nothing stops the two from
+/// drifting apart -- a node added here with no matching parser arm, or a
+/// parser arm added with no matching node here, both compile cleanly today.
+/// Walking this list and actually invoking `commands::parse_args` on each
+/// path is how that drift gets caught before it reaches CI, not after.
+#[must_use]
+pub fn registered_leaves() -> Vec<(Vec<&'static str>, &'static HelpNode)> {
+    fn walk(
+        node: &'static HelpNode,
+        path: &mut Vec<&'static str>,
+        out: &mut Vec<(Vec<&'static str>, &'static HelpNode)>,
+    ) {
+        if node.children.is_empty() {
+            out.push((path.clone(), node));
+        }
+        for child in node.children {
+            path.push(child.name);
+            walk(child, path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
     for child in ROOT.children.iter().chain(std::iter::once(&QUICK_START)) {
         let mut path = vec![child.name];
         walk(child, &mut path, &mut out);

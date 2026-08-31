@@ -12,6 +12,10 @@ nav:
       - Queue: views/queue.md
       - Reviews: views/reviews.md
       - Resources: views/resources.md
+      - Logs: views/cartographer.md
+      - Projects: views/projects.md
+      - Machines: views/machines.md
+      - Users: views/users.md
 
 theme:
   name: material

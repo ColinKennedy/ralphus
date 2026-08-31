@@ -27,6 +27,11 @@ where one exists.
 | GET | `/api/tasks` | [Board state](#get-apitasks); `?status=&name=&sort=` filter/sort |
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
 | GET | `/api/config/live-view` | [Live View "Show Debug Messages" default](#get-apiconfiglive-view-ral-232) (RAL-232) |
+| GET | `/api/config/templates` | [Simple task form's template picker](#get-apiconfigtemplates) (RAL-297) |
+| GET | `/api/agents/catalog` | [Cwd-independent agent+model catalog](#get-apiagentscatalog) (RAL-297) |
+| GET | `/api/projects/{name}/branches` | [Local+remote branch names for a git project](#get-apiprojectsnamebranches) (RAL-297) |
+| POST | `/api/generate` | [Kick off a Simple-form generation step](#post-apigenerate) (RAL-297) |
+| GET | `/api/generate/{id}` | [Poll a generation job](#get-apigenerateid) (RAL-297) |
 | GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated; `?entity=` accepts an [entity URI](#entity-uris-ral-155) |
 | GET | `/api/cartographer/{id}` | [One event's full detail](#get-apicartographerid) |
 | POST | `/api/events/ticket` | [Mint a short-lived SSE ticket](#post-apieventsticket-ral-222) |
@@ -77,6 +82,8 @@ where one exists.
 | POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | `?mode=open\|readonly`: spawn a resume terminal (`claude --resume`, `codex resume`, or `pi --session`, depending on the cell's agent) **on the daemon host**. `?mode=agent` on a **finished** cell does the same; on a **still-running** cell (RAL-288 Stage 6) it detaches the cell cleanly first, waits for it to genuinely stop, then opens the real agent inside a tmux session that survives closing the terminal — see [below](#post-apisquadsidcellstisiopen-terminalmodeagent) |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/resume-automation` | Hand a detached cell back to unattended execution, continuing its exact same agent session rather than starting fresh (RAL-288 Stage 6) — see [below](#post-apisquadsidcellstisiresume-automation) |
 | POST | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/open-terminal` | Same, for a proof step's resolved cell |
+| GET | `/api/squads/{id}/cells/{ti}/{si}/debug-events` | [This cell's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
+| GET | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/debug-events` | Same, for a proof step's resolved cell |
 | DELETE | `/api/squads/{id}` | Permanently delete a squad |
 
 **Guardians (reviews)**
@@ -93,7 +100,7 @@ where one exists.
 | POST | `/api/guardians/{id}/branches` | Add a branch |
 | POST | `/api/guardians/{id}/branches/reorder` | [Reorder branches](#post-apiguardiansidbranchesreorder) (does **not** rebase) |
 | POST | `/api/guardians/{id}/branches/arrange` | [Reorder + rebase atomically](#post-apiguardiansidbranchesarrange) |
-| POST | `/api/guardians/{id}/sync-github` | [Check the forge for a stack reorder, on demand](#post-apiguardiansidsync-github) |
+| POST | `/api/guardians/{id}/sync-pr` | [Check the forge for a stack reorder, on demand](#post-apiguardiansidsync-pr) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/feedback` | Feedback on one branch → resolver re-attempt |
 | GET | `/api/guardians/{id}/branches/{branch_id}/messages` | [Per-branch feedback thread](#get-apiguardiansidbranchesbranch_idmessages) |
 | GET | `/api/guardians/{id}/base-branches` | Candidate base branches (same remote) |
@@ -104,7 +111,9 @@ where one exists.
 | POST | `/api/guardians/{id}/branches/{branch_id}/env` | [Set/unset/clear this review worktree's env overrides](#post-apiguardiansidbranchesbidenv--review-worktree-overrides) (RAL-191) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
+| GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
 | POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
+| GET | `/api/guardians/{id}/manual-checks/debug-events` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
@@ -162,6 +171,7 @@ produced no pane output.
 |---|---|---|
 | POST | `/api/guardians/{id}/pull-requests` | [Submit PR(s)](#post-apiguardiansidpull-requests) for stacked/combined worktree(s) |
 | GET | `/api/guardians/{id}/pull-requests` | List every PR submitted for a review (bare array) |
+| GET | `/api/guardians/{id}/pull-request-stacks` | [List past PR stacks](#get-apiguardiansidpull-request-stacks) submitted for a review, most recent first (RAL-302) |
 | GET | `/api/pull-requests` | [Find the PR row](#get-apipull-requests) for a forge PR/MR number; `?forge=&repo=&pr_number=` |
 | GET | `/api/pull-requests/{pr_id}` | One PR row |
 | POST | `/api/pull-requests/{pr_id}` | [Mutate the PR mapping](#post-apipull-requestspr_id) (number/url/alias/state) |
@@ -450,6 +460,18 @@ repo, without re-registering it. Runs the exact same checks as `POST
 ```
 `404` if no project is registered under that exact name.
 
+### `GET /api/projects/{name}/branches`
+Local and `origin` remote-tracking branch names for a registered git
+project (RAL-297) -- lets a client validate a user-typed upstream branch
+before generating a `ralphus:new-worktree/<branch>?upstream=<name>`
+placeholder, rather than only discovering a typo much later, at worktree
+materialization time. Empty list for a non-git project or a path that no
+longer resolves; `404` if no project is registered under that exact name.
+
+```json
+{ "branches": ["main", "origin/staging"] }
+```
+
 ### `GET /api/agents`
 List the agents selectable for a project -- built-in backends plus whatever
 `.ralphus.toml` custom `[agent.profiles.*]` entries apply there (see the
@@ -475,6 +497,63 @@ health` flags that case.
 ], "default_agent": "ollama" }
 ```
 
+### `GET /api/agents/catalog`
+Cwd-independent agent+model catalog for the board's Simple task form
+(RAL-297). Unlike `GET /api/agents`, this takes no `cwd` -- the Simple
+tab's agent/model picker is deliberately independent of its project picker
+(they're chosen side by side, neither blocking the other). Built-in
+backends plus any globally-discoverable `[agent.profiles.*]` entries, each
+with its known model list (empty means "any model accepted" -- the board
+falls back to free-text model entry).
+
+```json
+{ "agents": [
+  { "id": "claude-code", "kind": "builtin", "backend": "claude-code", "models": ["sonnet", "opus", "haiku", "fable"] },
+  { "id": "ollama", "kind": "builtin", "backend": "ollama", "models": [] }
+], "default_agent": "claude" }
+```
+
+### `GET /api/config/templates`
+The Simple task form's template picker (RAL-297): the effective
+`[[templates]]` list (see `docs/simple-task-templates.md` for the schema)
+and the `[ui] new_task_default_tab` default. `using_fallback` is `true` when
+zero valid templates are configured and `templates` is just the built-in
+`hello-world` fallback -- the board disables the picker and shows a tooltip
+in that case.
+
+```json
+{ "templates": [{ "name": "hello-world", "label": "Hello World", "description": "...", "fields": [], "prompt_template": "{prompt}" }],
+  "default_new_task_tab": "simple", "using_fallback": true }
+```
+
+### `POST /api/generate`
+Kicks off one "generation step" (RAL-297: the Simple form's opt-in
+"Generate Proofs"/"Generate Manual Checks" buttons) on a background thread
+and returns `202` immediately with a job id -- a single one-shot LLM call
+whose prompt asks for a short structured JSON list, never blocking on the
+call itself (see `crate::generation`'s module doc comment for why: every
+mutating request runs on the daemon's accept loop one at a time, so a
+multi-second/minute blocking call there would stall every other write).
+
+Request:
+```json
+{ "kind": "proof_steps", "cwd": "C:/repo", "agent": "claude-code", "model": "sonnet", "prompt_context": "Add a login form" }
+```
+`kind` is `"proof_steps"` or `"manual_checks"`. Response `202`:
+```json
+{ "id": "gen-..." }
+```
+
+### `GET /api/generate/{id}`
+Poll a generation job started by `POST /api/generate`.
+
+```json
+{ "status": "running" }
+{ "status": "done", "items": [{ "label": "test", "value": "cargo test" }] }
+{ "status": "error", "message": "..." }
+```
+`404` if `id` names no job this daemon process has ever started.
+
 ### `GET /api/users`
 List every registered placeholder user (see the **User identity** glossary
 section -- this is not authentication; a name grants no permissions).
@@ -499,6 +578,54 @@ Remove a registered user by exact name.
 { "deleted": true }
 ```
 `404` if no user is registered under that exact name.
+
+### `GET /api/secret-env-names`
+List the user-configurable set of env-var **names** treated as secret
+(RAL-281) -- additive to the value-based `from_env` redaction registry
+(RAL-264, see `crate::redact`): a name on this list marks that variable's
+*resolved value* as secret regardless of whether it was sourced via a
+`from_env` agent-profile indirection. Consulted at the point a cell's or
+proof step's final env map is merged (`daemon/src/scheduler.rs`), cached
+in-memory and invalidated on every mutation below, so a change here takes
+effect on the next dispatch without a daemon restart.
+
+```json
+{ "names": [ { "name": "ANTHROPIC_API_KEY", "created_at_ms": 0 } ] }
+```
+
+Seeded with a small default set the first time the underlying table is
+created; never re-seeded afterward, so deleting a default is honored across
+restarts.
+
+### `POST /api/secret-env-names`
+Register a new secret env-var name.
+
+Request: `{ "name": "STRIPE_SECRET_KEY" }`. `400` if `name` is empty or not a
+valid environment-variable identifier (`[A-Za-z_][A-Za-z0-9_]*`, the same
+`is_valid_env_key` check `POST /api/squads/{id}/env` uses). `409` if the name
+is already registered -- unlike `POST /api/users`, this does **not** upsert.
+Response `201`:
+```json
+{ "name": "STRIPE_SECRET_KEY" }
+```
+
+### `POST /api/secret-env-names/{name}/rename`
+Rename a registered secret env-var name in place.
+
+Request: `{ "name": "NEW_NAME" }`. Same identifier validation as above (`400`
+if invalid). `404` if `{name}` isn't registered; `409` if `NEW_NAME` is
+already registered by a different entry. Response `200`:
+```json
+{ "name": "NEW_NAME" }
+```
+
+### `DELETE /api/secret-env-names/{name}`
+Remove a registered secret env-var name by exact name.
+
+```json
+{ "deleted": true }
+```
+`404` if no such name is registered.
 
 ### `POST /api/machines`
 Register (or re-register, updating its fields) a **machine provider** (RAL-185)
@@ -997,11 +1124,11 @@ caller's `reorder` and `merge` was silently clobbered. Body:
 persisted — so the arrangement is visible via `GET /api/guardians/{id}`
 regardless of whether the merge itself then succeeds.
 
-### `POST /api/guardians/{id}/sync-github`
-Explicit "Sync with GitHub"/"Sync with GitLab" (RAL-273): check this review's
-open PRs' *live* base refs on the forge for a reorder made outside ralphus
-(e.g. dragging PRs into a new order on GitHub's own UI), and apply it if
-found. This is the on-demand path alongside the other one that runs without a
+### `POST /api/guardians/{id}/sync-pr`
+Explicit "Sync PR" (RAL-273): check this review's open PRs' *live* base refs
+on the forge (GitHub or GitLab) for a reorder made outside ralphus (e.g.
+dragging PRs into a new order on the forge's own UI), and apply it if found.
+This is the on-demand path alongside the other one that runs without a
 user pressing anything: a background poll every 5 minutes scoped to reviews
 with an active stack (`in_review`/`merging`). `branches/reorder` and
 `branches/arrange` deliberately do *not* also trigger this check -- see the
@@ -1231,6 +1358,28 @@ open PR (or the review's own base branch, if none precedes it). The local
 `base_ref` record always updates; the forge PR's base is best-effort PATCHed
 too (`GET .../pull-requests` reflects the recorded state either way).
 
+### `GET /api/guardians/{id}/pull-request-stacks`
+
+Read-only history (RAL-302): every PR row ralphus has ever created for this
+review, in any state (`open`/`merged`/`closed`/`dropped`), grouped by the
+single "submit a stack" call that created it and returned most-recently-
+submitted first. This is the same underlying data as `GET .../pull-requests`
+(which only ever reflects live rows in practice, since callers filter to
+`state == "open"`) except it is never pruned — in particular it still shows a
+PR [dropped](#post-apiguardiansidpull-requests) because its linked PR merged
+out-of-band while the review was mid-flight (RAL-300), which would otherwise
+disappear with no way to see what was previously submitted. Display-only:
+there is no endpoint to resubmit/replay a past stack from this history.
+
+Bare JSON array, each entry:
+```json
+{ "stack_id": "prstack-000000000003", "submitted_at_ms": 1234567890000, "prs": [ { "...": "a normal pull-request row, see above" } ] }
+```
+`stack_id` groups every PR row created by the same submission call; a row
+recorded before this grouping existed falls back to its own PR id, so it
+still surfaces as a (single-PR) stack rather than being silently dropped from
+history.
+
 ### `POST /api/guardians/{id}/stop`
 
 Halt an in-progress rebase (status `merging`) at its next checkpoint, leaving
@@ -1392,7 +1541,7 @@ keeps the default newest-first order).
 
 ```json
 {
-  "daemon": { "running": 1, "max_concurrent": 12, "running_reviews": [], "downtime_active": false },
+  "daemon": { "running": 1, "max_concurrent": 20, "running_reviews": [], "downtime_active": false },
   "squads": [
     {
       "id": "squad-000000000001",
@@ -1408,6 +1557,7 @@ keeps the default newest-first order).
           "agent": null,
           "model": null,
           "state": "running",
+          "error": null,
           "soloed": false,
           "env_out_of_date": false,
           "started_at_ms": 1783120107300,
@@ -1530,6 +1680,17 @@ levels down. It clears back to `false` when the row is reset to `pending` by
 a restart/retry, or on any `POST /api/squads/{id}/set-status` call
 targeting it (any state, not just a restart). Purely informational -- it has
 no effect on scheduling or proof results.
+
+Each `TaskView` also carries an `error` field (RAL-291), mirroring
+`CellView.error`'s shape and lifecycle exactly: `null` unless the task
+itself failed for a reason with no underlying cell/proof error to point
+to. Today the only writer is the RAL-156 no-commits-since-baseline guard,
+which sets it to the same message it logs to Cartographer, e.g. `"task
+failed: no commits since baseline (baseline a1b2c3d, 2 cells checked)"`. A
+task that failed because one of its own cells or proof steps failed leaves
+this `null` -- that failure is already visible on the cell's own `error` or
+the proof step's `output`. Cleared back to `null` whenever the task is
+reset to `pending` by a restart, same as `CellView.error`.
 
 For prompt-driven cells, each `CellView` may also carry `system_prompt`:
 the read-only effective appended system prompt the agent actually received,
@@ -1899,6 +2060,54 @@ Cartographer's retention pruning has already removed some of this squad's
 earliest history — this endpoint is best-effort (RAL-155 Q6), with no
 obligation to reconstruct pruned history. The board's "⏱ Timeline" button
 (next to "📄 Logs") calls this same endpoint and renders `text` in a modal.
+
+### `GET /api/squads/{id}/cells/{ti}/{si}/debug-events` (and its proof/guardian siblings) (RAL-296)
+The same chronologically-merged Cartographer-row-plus-inlined-terminal-log-
+excerpt stream `GET /api/squads/{id}/timeline` builds for a whole squad
+(`crate::timeline::entity_debug_timeline`, sharing that same merge code),
+scoped down to one cell/proof step/guardian branch resolver/guardian
+manual-checks run and trimmed to its **most recent attempt only** — a
+detach + restart cycle's earlier attempt(s) are not stitched into the same
+stream. This is what backs both the Live View pane's "Show Debug Messages"
+checkbox and the "Open Terminal Log" attempt-history popup, so the two no
+longer disagree with each other. Bare JSON array of `SquadTimelineEntry`
+(the same shape as one entry of `GET /api/squads/{id}/timeline`'s
+`entries`), ascending by time.
+
+Four equivalent routes, one per entity kind, matching the same
+`(squad_id, task, cell_id)` key convention the sibling `GET
+.../terminal-log-attempts` routes already use for "browse past attempts":
+- `GET /api/squads/{id}/cells/{ti}/{si}/debug-events`
+- `GET /api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/debug-events`
+- `GET /api/guardians/{id}/branches/{branch_id}/debug-events`
+- `GET /api/guardians/{id}/manual-checks/debug-events`
+
+```json
+[
+  {
+    "at_ms": 1732300000000,
+    "level": "info",
+    "source": "runner",
+    "scope": "cell",
+    "task": "build",
+    "cell_id": "worker",
+    "message": "tmux session started",
+    "log_path": null,
+    "log_excerpt": null
+  },
+  {
+    "at_ms": 1732300004000,
+    "level": "info",
+    "source": "runner",
+    "scope": "terminal_log",
+    "task": "build",
+    "cell_id": "worker",
+    "message": "terminal log attempt 0 written (ralphus_squad-000000000001_build_worker)",
+    "log_path": "C:\\Users\\...\\terminal_logs\\ralphus_squad-000000000001_build_worker\\0000.log",
+    "log_excerpt": "...tail of that attempt's terminal-log content..."
+  }
+]
+```
 
 ### `GET /api/ghosts/{owner_uri}`
 Fetch one "ghost" (RAL-136) — a short, best-effort handoff note a task

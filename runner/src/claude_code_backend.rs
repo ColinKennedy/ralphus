@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
+use crate::backend::{
+    BACKGROUND_JOB_NUDGE_PROMPT, BackendError, BackendOutcome, ModelBackend, RunOptions,
+};
 use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
 use crate::shellcmd::{self, Env, SpawnArgs};
 use crate::tools::Workspace;
@@ -21,6 +23,13 @@ const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 const DEFAULT_PROGRAM: &str = "claude";
 const RESULT_SUMMARY_TAIL_CHARS: usize = 2000;
+/// Fallback for [`format_tool_input`]'s truncation length (RAL-303) when
+/// `RunOptions::tool_arg_truncate_chars` is unset -- mirrors
+/// `ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS`, but this crate
+/// does not depend on the daemon crate, so the value is duplicated rather
+/// than shared (this only matters for a hand-authored `CellSpec` that omits
+/// the key; a daemon-dispatched cell always sends the resolved value).
+const DEFAULT_TOOL_ARG_TRUNCATE_CHARS: usize = 200;
 
 pub struct ClaudeCodeBackend {
     /// Keeps the prompt file and live-session side-channel file on disk
@@ -135,12 +144,16 @@ impl ModelBackend for ClaudeCodeBackend {
         } else {
             None
         };
+        let tool_arg_truncate_chars = options
+            .tool_arg_truncate_chars
+            .map_or(DEFAULT_TOOL_ARG_TRUNCATE_CHARS, |n| n as usize);
         let outcome = drive_stream_json(
             &mut child,
             workspace,
             options.timeout_sec,
             assigned_session_id,
             &saw_result,
+            tool_arg_truncate_chars,
         );
 
         keep_polling.store(false, Ordering::SeqCst);
@@ -154,6 +167,18 @@ impl ModelBackend for ClaudeCodeBackend {
         }
 
         outcome
+    }
+
+    fn nudge(
+        &self,
+        workspace: &Workspace,
+        options: &RunOptions<'_>,
+    ) -> Result<Option<BackendOutcome>, BackendError> {
+        Ok(Some(self.run(
+            BACKGROUND_JOB_NUDGE_PROMPT,
+            workspace,
+            options,
+        )?))
     }
 }
 
@@ -284,6 +309,7 @@ fn drive_stream_json(
     timeout_sec: Option<u64>,
     assigned_session_id: Option<&str>,
     saw_result_flag: &AtomicBool,
+    tool_arg_truncate_chars: usize,
 ) -> Result<BackendOutcome, BackendError> {
     // Drain stderr on a background thread concurrently with the main-thread
     // stdout reader below -- avoids a pipe-buffer deadlock if Claude Code
@@ -315,7 +341,13 @@ fn drive_stream_json(
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        process_event(&event, &mut state, workspace, assigned_session_id);
+        process_event(
+            &event,
+            &mut state,
+            workspace,
+            assigned_session_id,
+            tool_arg_truncate_chars,
+        );
         // RAL-288: tells the closer thread (`spawn_stdin_closer`) the
         // visible turn's terminal `result` event has been seen, so it may
         // stop polling and close stdin.
@@ -354,6 +386,7 @@ fn drive_stream_json(
         tokens_out: state.tokens_out,
         cost_usd: state.cost_usd,
         agent_session_id: state.agent_session_id,
+        abandoned_background_job: state.open_background_job,
     })
 }
 
@@ -376,17 +409,26 @@ struct ParseState {
     /// rendered that way, so the `assistant` handling doesn't print the same
     /// text twice.
     printed_text_delta: bool,
+    /// RAL-292: the most recent `Bash` tool call's rendered args, launched
+    /// with `run_in_background: true`, that hasn't yet been followed by a
+    /// `BashOutput`/`KillShell` call checking on it. Still `Some` once the
+    /// turn's terminal `result` event fires means the turn ended without
+    /// ever checking that job's actual outcome.
+    open_background_job: Option<String>,
 }
 
 /// Handles one parsed stream-json line, updating `state` and printing to the
 /// live tmux pane (RAL-102) as a side effect. `assigned_session_id` is the id
 /// pre-assigned at spawn time (RAL-288 Stage 1), if any, used only to warn on
-/// a mismatch against Claude's own report.
+/// a mismatch against Claude's own report. `tool_arg_truncate_chars` (RAL-303)
+/// bounds how much of a `tool_use` argument value is rendered before
+/// [`format_tool_input`] truncates it.
 fn process_event(
     event: &Value,
     state: &mut ParseState,
     workspace: &Workspace,
     assigned_session_id: Option<&str>,
+    tool_arg_truncate_chars: usize,
 ) {
     match event["type"].as_str() {
         Some("stream_event") => {
@@ -431,6 +473,28 @@ fn process_event(
                 }
             }
         }
+        Some("system") if event["subtype"] == "compact_boundary" => {
+            // Claude Code auto- (or manually) compacts a session's own
+            // conversation history once it nears its context limit -- this
+            // can happen mid-turn on any `--resume`'d call, headless or not.
+            // Surface it: silently dropping this into the `_ => {}` arm
+            // below made compaction invisible to both the live tmux pane
+            // and Cartographer, indistinguishable from "never happened".
+            let trigger = event["compactMetadata"]["trigger"]
+                .as_str()
+                .unwrap_or("unknown");
+            let pre_tokens = event["compactMetadata"]["preTokens"].as_i64().unwrap_or(0);
+            print_line(&format!(
+                "[compact] conversation history compacted (trigger={trigger}, preTokens={pre_tokens})"
+            ));
+            crate::cartographer::emit(
+                "claude-code",
+                "conversation history compacted",
+                "warning",
+                crate::cartographer::EventContext::default(),
+                serde_json::json!({"trigger": trigger, "pre_tokens": pre_tokens}),
+            );
+        }
         Some("assistant") => {
             // Claude's own text/tool-call activity -- the whole point of the
             // live tmux pane (RAL-102) is to let a human read this, so print
@@ -455,8 +519,15 @@ fn process_event(
                         }
                         Some("tool_use") => {
                             let name = block["name"].as_str().unwrap_or("tool");
-                            let args = format_tool_input(&block["input"]);
+                            let args = format_tool_input(&block["input"], tool_arg_truncate_chars);
                             eprintln!("[tool] {name}({args})");
+                            if name == "Bash"
+                                && block["input"]["run_in_background"].as_bool() == Some(true)
+                            {
+                                state.open_background_job = Some(args);
+                            } else if name == "BashOutput" || name == "KillShell" {
+                                state.open_background_job = None;
+                            }
                         }
                         _ => {}
                     }
@@ -612,8 +683,13 @@ fn finish_delta_line() {
 }
 
 /// Renders a `tool_use` block's input compactly for the live tmux pane
-/// (RAL-102), mirroring the old `claude_code_backend.py`'s `_format_tool_input`.
-fn format_tool_input(input: &Value) -> String {
+/// (RAL-102), mirroring the old `claude_code_backend.py`'s
+/// `_format_tool_input`. `truncate_chars` (RAL-303) is the per-value
+/// character budget before a trailing `…` is appended -- configurable via
+/// `[live_view] tool_arg_truncate_chars`, since the fixed 80-char cutoff this
+/// used to hardcode made exactly the tool calls an operator most needs to
+/// read (file edits, shell commands, diffs) illegible.
+fn format_tool_input(input: &Value, truncate_chars: usize) -> String {
     let Some(obj) = input.as_object() else {
         return String::new();
     };
@@ -623,8 +699,8 @@ fn format_tool_input(input: &Value) -> String {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let text = if text.chars().count() > 80 {
-                let truncated: String = text.chars().take(80).collect();
+            let text = if text.chars().count() > truncate_chars {
+                let truncated: String = text.chars().take(truncate_chars).collect();
                 format!("{truncated}…")
             } else {
                 text
@@ -681,6 +757,70 @@ mod tests {
         assert_eq!(tail(&"x".repeat(10), 3), "xxx");
     }
 
+    // ── format_tool_input truncation length (RAL-303) ─────────────────────
+
+    #[test]
+    fn format_tool_input_truncates_at_the_configured_length_not_a_hardcoded_80() {
+        let input = serde_json::json!({"command": "x".repeat(150)});
+        // A length below the old hardcoded 80 must actually take effect --
+        // this is the case that would silently pass if the truncation
+        // length parameter were plumbed through but never read.
+        let short = format_tool_input(&input, 10);
+        assert_eq!(
+            short,
+            format!("command={:?}", format!("{}…", "x".repeat(10)))
+        );
+        // A length above the old hardcoded 80 must also take effect -- the
+        // whole point of RAL-303 was to let an operator raise the cutoff.
+        let long = format_tool_input(&input, 120);
+        assert_eq!(
+            long,
+            format!("command={:?}", format!("{}…", "x".repeat(120)))
+        );
+    }
+
+    #[test]
+    fn format_tool_input_does_not_truncate_a_value_at_or_under_the_configured_length() {
+        let input = serde_json::json!({"command": "short"});
+        assert_eq!(
+            format_tool_input(&input, DEFAULT_TOOL_ARG_TRUNCATE_CHARS),
+            "command=\"short\""
+        );
+    }
+
+    #[test]
+    fn process_event_honors_a_non_default_truncation_length_for_a_tool_use_block() {
+        // End-to-end through `process_event` (not just `format_tool_input`
+        // directly), so a regression that stops threading the parameter down
+        // from `RunOptions` to `format_tool_input` is caught here too.
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &tool_use_event("Bash", serde_json::json!({"command": "x".repeat(50)})),
+            &mut state,
+            &ws,
+            None,
+            5,
+        );
+        // No direct stdout capture here (mirrors this file's other
+        // `process_event` tests), but `open_background_job` is set from the
+        // same rendered `args` string `format_tool_input` produced, so it
+        // doubles as a window into the truncation actually applied when the
+        // call is a backgrounded Bash job.
+        process_event(
+            &tool_use_event(
+                "Bash",
+                serde_json::json!({"command": "x".repeat(50), "run_in_background": true}),
+            ),
+            &mut state,
+            &ws,
+            None,
+            5,
+        );
+        let job = state.open_background_job.expect("background job recorded");
+        assert_eq!(job, "command=\"xxxxx…\", run_in_background=\"true\"");
+    }
+
     fn test_workspace() -> Workspace {
         Workspace::create(std::env::temp_dir()).unwrap()
     }
@@ -698,9 +838,31 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         // No assertion beyond "did not panic and left state untouched" --
         // this event carries no session/usage/result data of its own.
+        assert_eq!(state, ParseState::default());
+    }
+
+    #[test]
+    fn process_event_handles_compact_boundary_without_panicking_or_mutating_state() {
+        // Compaction carries no session/usage/result data of its own -- this
+        // just proves the new arm doesn't panic on a missing/malformed
+        // `compactMetadata` and doesn't fall through to the catch-all.
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"system",
+                "subtype":"compact_boundary",
+                "compactMetadata":{"trigger":"auto","preTokens":164975}
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
         assert_eq!(state, ParseState::default());
     }
 
@@ -713,6 +875,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         process_event(
             &serde_json::json!({
@@ -724,6 +887,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.agent_session_id.as_deref(), Some("sess-1"));
         assert_eq!(state.tokens_in, 12);
@@ -745,6 +909,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert!(
             state.printed_text_delta,
@@ -758,6 +923,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         // The assistant branch must have noticed the already-streamed text and
         // reset the flag (closing the delta line) rather than re-printing the
@@ -783,6 +949,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert!(!state.printed_text_delta);
     }
@@ -805,6 +972,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         process_event(
             &serde_json::json!({
@@ -816,6 +984,7 @@ mod tests {
             &mut state,
             &ws,
             None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(
             state.result_summary,
@@ -824,6 +993,144 @@ mod tests {
         assert_eq!(state.tokens_in, 5);
         assert_eq!(state.tokens_out, 9);
         assert!((state.cost_usd - 0.20).abs() < f64::EPSILON);
+    }
+
+    fn tool_use_event(name: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "name": name, "input": input}],
+                "usage": {},
+            },
+        })
+    }
+
+    #[test]
+    fn process_event_flags_a_backgrounded_bash_call_left_unchecked_at_turn_end() {
+        // RAL-292: the RAL-280/281 bug -- a `Bash` call with
+        // `run_in_background: true` that nothing ever follows up on before
+        // the turn's terminal `result` event fires.
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &tool_use_event(
+                "Bash",
+                serde_json::json!({"command": "cargo build", "run_in_background": true}),
+            ),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &serde_json::json!({
+                "type": "result",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "total_cost_usd": 0.01,
+                "result": "done, build is running in the background"
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.open_background_job.is_some());
+    }
+
+    #[test]
+    fn process_event_does_not_flag_a_foreground_bash_call() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &tool_use_event("Bash", serde_json::json!({"command": "cargo build"})),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.open_background_job.is_none());
+    }
+
+    #[test]
+    fn process_event_clears_the_flag_once_bash_output_is_checked() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &tool_use_event(
+                "Bash",
+                serde_json::json!({"command": "cargo build", "run_in_background": true}),
+            ),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &tool_use_event("BashOutput", serde_json::json!({"bash_id": "1"})),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.open_background_job.is_none());
+    }
+
+    #[test]
+    fn process_event_clears_the_flag_once_the_job_is_killed() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &tool_use_event(
+                "Bash",
+                serde_json::json!({"command": "cargo build", "run_in_background": true}),
+            ),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &tool_use_event("KillShell", serde_json::json!({"shell_id": "1"})),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.open_background_job.is_none());
+    }
+
+    #[test]
+    fn process_event_a_later_background_job_reopens_the_flag_after_a_check() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &tool_use_event(
+                "Bash",
+                serde_json::json!({"command": "cargo build", "run_in_background": true}),
+            ),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &tool_use_event("BashOutput", serde_json::json!({"bash_id": "1"})),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &tool_use_event(
+                "Bash",
+                serde_json::json!({"command": "cargo test", "run_in_background": true}),
+            ),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.open_background_job.is_some());
     }
 
     #[test]
@@ -835,6 +1142,7 @@ mod tests {
             &mut state,
             &ws,
             Some("assigned-id"),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.agent_session_id.as_deref(), Some("real-id"));
     }
