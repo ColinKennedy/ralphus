@@ -247,6 +247,7 @@ fn drive_thread_events(
         // (RAL-187).
         cost_usd: 0.0,
         agent_session_id,
+        abandoned_background_job: None,
     })
 }
 

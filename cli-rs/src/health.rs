@@ -401,6 +401,98 @@ fn check_max_concurrent(cwd: &Path) -> CheckResult {
     )
 }
 
+/// Reads `[live_view]` as a raw TOML table from `path`, if the file exists,
+/// parses, and declares that table -- used by
+/// [`check_tool_arg_truncate_chars`] instead of `ralphus_daemon::config`'s
+/// typed `LiveViewConfig` loader, since a typed `Option<u32>` deserialize
+/// can't tell "key absent" apart from "key present but invalid" (both
+/// collapse to `None` under `.unwrap_or_default()`), and this check needs to
+/// warn on the latter.
+fn read_live_view_table(path: &Path) -> Option<toml::Table> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let root: toml::Table = text.parse().ok()?;
+    root.get("live_view")?.as_table().cloned()
+}
+
+/// Validates `.ralphus.toml`'s `[live_view] tool_arg_truncate_chars`
+/// (RAL-303) -- how many characters of a `tool_use` argument value the
+/// claude-code backend renders into the Live View tmux pane before
+/// truncating with a trailing `…`. Mirrors `check_max_concurrent`'s shape:
+/// PASS reports the resolved value and its source; a present-but-invalid
+/// value is a WARN, not a FAIL, since `ralphus_daemon::runner::RunnerSpec`
+/// construction never blocks on it -- an invalid value is silently ignored
+/// in favor of the default, same "malformed config never blocks" rule every
+/// other `[live_view]`/`[daemon]` scalar follows.
+fn check_tool_arg_truncate_chars(cwd: &Path) -> CheckResult {
+    let global_path = ralphus_daemon::config::global_config_path();
+    let project_path = ralphus_daemon::config::find_project_config(cwd);
+    let global_table = global_path.as_deref().and_then(read_live_view_table);
+    let project_table = project_path.as_deref().and_then(read_live_view_table);
+    check_tool_arg_truncate_chars_for(
+        global_table.as_ref(),
+        global_path.as_deref(),
+        project_table.as_ref(),
+        project_path.as_deref(),
+    )
+}
+
+/// Pure core of [`check_tool_arg_truncate_chars`], taking already-loaded raw
+/// `[live_view]` tables -- split out so tests can exercise it without
+/// mutating the real `RALPHUS_CONFIG_HOME`/current-directory environment,
+/// same rationale as [`check_pull_request_branch_convention_for`].
+/// Per-project wins over global, same layering as `load_live_view_config`.
+fn check_tool_arg_truncate_chars_for(
+    global_table: Option<&toml::Table>,
+    global_path: Option<&Path>,
+    project_table: Option<&toml::Table>,
+    project_path: Option<&Path>,
+) -> CheckResult {
+    let (raw, src) = if let Some(v) = project_table.and_then(|t| t.get("tool_arg_truncate_chars")) {
+        (Some(v), project_path)
+    } else if let Some(v) = global_table.and_then(|t| t.get("tool_arg_truncate_chars")) {
+        (Some(v), global_path)
+    } else {
+        (None, None)
+    };
+
+    let Some(raw) = raw else {
+        return CheckResult::new(
+            "tool-arg-truncate-chars",
+            PASS,
+            format!(
+                "live_view.tool_arg_truncate_chars unset; using default {}",
+                ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS
+            ),
+        );
+    };
+    let src = src
+        .map(|p| format!(" (from {})", p.display()))
+        .unwrap_or_default();
+    match raw.as_integer() {
+        None => CheckResult::new(
+            "tool-arg-truncate-chars",
+            WARN,
+            format!(
+                "live_view.tool_arg_truncate_chars is not a number{src} -- falling back to the default {}",
+                ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS
+            ),
+        ),
+        Some(n) if n < 0 => CheckResult::new(
+            "tool-arg-truncate-chars",
+            WARN,
+            format!(
+                "live_view.tool_arg_truncate_chars is {n}{src}; must be >= 0 -- falling back to the default {}",
+                ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS
+            ),
+        ),
+        Some(n) => CheckResult::new(
+            "tool-arg-truncate-chars",
+            PASS,
+            format!("live_view.tool_arg_truncate_chars={n}{src}"),
+        ),
+    }
+}
+
 /// Validates `.ralphus.toml`'s `[forge] pull_request_branch_convention`
 /// (RAL-244) for `cwd`, reusing the daemon's own layered resolution
 /// (`ralphus_daemon::config::resolve_forge` -- global config under the
@@ -439,6 +531,72 @@ fn check_pull_request_branch_convention_for(
         Ok(()) => CheckResult::new("pull-request-branch-convention", PASS, convention),
         Err(e) => CheckResult::new("pull-request-branch-convention", FAIL, e),
     }
+}
+
+/// Validates `[[templates]]` and `[ui] new_task_default_tab` (RAL-297: the
+/// Simple task form's template picker and its default-tab config). Local
+/// only (no daemon round-trip) -- reuses `ralphus_daemon::config`'s own
+/// resolver/validator functions directly, the same "check health can never
+/// disagree with what actually gets used" precedent as
+/// [`check_pull_request_branch_convention_for`]. Note these loaders are
+/// current-dir-based (the CLI process's own cwd), the same convention
+/// `ralphus_daemon::config`'s `[daemon]`/`[cartographer]`/`[env_overrides]`/
+/// `[cors]` loaders already use -- there is no per-request-cwd resolver for
+/// this config category yet, so a misconfigured malformed individual
+/// `[[templates]]` entry is reported by name/message rather than silently
+/// dropped, unlike [`crate::config`]'s "malformed config never blocks" rule
+/// for the *file as a whole*.
+fn check_templates() -> Vec<CheckResult> {
+    check_templates_for(
+        &ralphus_daemon::config::load_templates_config(),
+        &ralphus_daemon::config::load_ui_config(),
+    )
+}
+
+/// Pure core of [`check_templates`], taking already-loaded config -- split
+/// out so tests can exercise it without mutating the real
+/// `RALPHUS_CONFIG_HOME`/current-directory environment, same rationale as
+/// [`check_pull_request_branch_convention_for`].
+fn check_templates_for(
+    templates: &[ralphus_daemon::config::TemplateDef],
+    ui: &ralphus_daemon::config::UiConfig,
+) -> Vec<CheckResult> {
+    let mut results = Vec::new();
+    if templates.is_empty() {
+        results.push(CheckResult::new(
+            "templates",
+            PASS,
+            format!(
+                "no [[templates]] configured -- using the built-in \"{}\" fallback",
+                ralphus_daemon::config::DEFAULT_TEMPLATE_NAME
+            ),
+        ));
+    } else {
+        let errors = ralphus_daemon::config::validate_templates(templates);
+        if errors.is_empty() {
+            results.push(CheckResult::new(
+                "templates",
+                PASS,
+                format!("{} template(s) configured", templates.len()),
+            ));
+        } else {
+            for e in errors {
+                results.push(CheckResult::new("templates", FAIL, e.message));
+            }
+        }
+    }
+    match &ui.new_task_default_tab {
+        None => results.push(CheckResult::new(
+            "new-task-default-tab",
+            PASS,
+            "not set (defaults to 'simple')",
+        )),
+        Some(tab) => match ralphus_daemon::config::validate_new_task_default_tab(tab) {
+            Ok(()) => results.push(CheckResult::new("new-task-default-tab", PASS, tab.clone())),
+            Err(e) => results.push(CheckResult::new("new-task-default-tab", FAIL, e)),
+        },
+    }
+    results
 }
 
 /// Delegates to `GET /api/health/agent-profiles`, which runs entirely
@@ -541,7 +699,9 @@ pub fn run_checks(daemon_url: &str, cwd: &Path, enable_developer_checks: bool) -
     results.push(check_nvidia_smi());
     results.push(check_config(cwd));
     results.push(check_max_concurrent(cwd));
+    results.push(check_tool_arg_truncate_chars(cwd));
     results.push(check_pull_request_branch_convention(cwd));
+    results.extend(check_templates());
     results.extend(check_agent_profiles(daemon_url, cwd));
     results.push(check_default_resolver_agent(daemon_url, cwd));
     results.push(check_agent_command(
@@ -636,5 +796,128 @@ mod tests {
         let result = check_pull_request_branch_convention_for(&cfg);
         assert_eq!(result.status, FAIL);
         assert!(result.detail.contains("{name}"));
+    }
+
+    // ── check_tool_arg_truncate_chars (RAL-303) ───────────────────────────
+
+    #[test]
+    fn check_tool_arg_truncate_chars_passes_unset() {
+        let result = check_tool_arg_truncate_chars_for(None, None, None, None);
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("unset"));
+        assert!(
+            result
+                .detail
+                .contains(&ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS.to_string())
+        );
+    }
+
+    #[test]
+    fn check_tool_arg_truncate_chars_passes_with_a_valid_value() {
+        let table: toml::Table = "tool_arg_truncate_chars = 400".parse().unwrap();
+        let path = Path::new("/tmp/.ralphus.toml");
+        let result = check_tool_arg_truncate_chars_for(None, None, Some(&table), Some(path));
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("tool_arg_truncate_chars=400"));
+        assert!(result.detail.contains("/tmp/.ralphus.toml"));
+    }
+
+    #[test]
+    fn check_tool_arg_truncate_chars_warns_on_negative_value() {
+        let table: toml::Table = "tool_arg_truncate_chars = -5".parse().unwrap();
+        let result = check_tool_arg_truncate_chars_for(None, None, Some(&table), None);
+        assert_eq!(result.status, WARN);
+        assert!(result.detail.contains("-5"));
+        assert!(
+            result
+                .detail
+                .contains(&ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS.to_string())
+        );
+    }
+
+    #[test]
+    fn check_tool_arg_truncate_chars_warns_on_non_numeric_value() {
+        let table: toml::Table = "tool_arg_truncate_chars = \"lots\"".parse().unwrap();
+        let result = check_tool_arg_truncate_chars_for(None, None, Some(&table), None);
+        assert_eq!(result.status, WARN);
+        assert!(result.detail.contains("not a number"));
+    }
+
+    #[test]
+    fn check_tool_arg_truncate_chars_prefers_project_over_global() {
+        let global: toml::Table = "tool_arg_truncate_chars = 100".parse().unwrap();
+        let project: toml::Table = "tool_arg_truncate_chars = 500".parse().unwrap();
+        let global_path = Path::new("/global/config.toml");
+        let project_path = Path::new("/project/.ralphus.toml");
+        let result = check_tool_arg_truncate_chars_for(
+            Some(&global),
+            Some(global_path),
+            Some(&project),
+            Some(project_path),
+        );
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("tool_arg_truncate_chars=500"));
+        assert!(result.detail.contains("/project/.ralphus.toml"));
+    }
+
+    // ── check_templates (RAL-297) ─────────────────────────────────────────
+
+    #[test]
+    fn check_templates_passes_with_no_templates_configured() {
+        let results = check_templates_for(&[], &ralphus_daemon::config::UiConfig::default());
+        assert!(results.iter().all(|r| r.status == PASS));
+        assert!(
+            results
+                .iter()
+                .any(|r| r.name == "templates" && r.detail.contains("hello-world"))
+        );
+    }
+
+    #[test]
+    fn check_templates_passes_with_a_valid_template() {
+        let templates = vec![ralphus_daemon::config::TemplateDef {
+            name: "standard".to_string(),
+            prompt_template: Some("{prompt}".to_string()),
+            ..ralphus_daemon::config::TemplateDef::default()
+        }];
+        let results = check_templates_for(&templates, &ralphus_daemon::config::UiConfig::default());
+        let templates_result = results.iter().find(|r| r.name == "templates").unwrap();
+        assert_eq!(templates_result.status, PASS);
+    }
+
+    #[test]
+    fn check_templates_fails_on_a_malformed_entry() {
+        let templates = vec![ralphus_daemon::config::TemplateDef {
+            name: "broken".to_string(),
+            prompt_template: None,
+            ..ralphus_daemon::config::TemplateDef::default()
+        }];
+        let results = check_templates_for(&templates, &ralphus_daemon::config::UiConfig::default());
+        let templates_result = results.iter().find(|r| r.name == "templates").unwrap();
+        assert_eq!(templates_result.status, FAIL);
+        assert!(templates_result.detail.contains("prompt_template"));
+    }
+
+    #[test]
+    fn check_templates_validates_new_task_default_tab() {
+        let ok = ralphus_daemon::config::UiConfig {
+            new_task_default_tab: Some("paste".to_string()),
+        };
+        let results = check_templates_for(&[], &ok);
+        let tab_result = results
+            .iter()
+            .find(|r| r.name == "new-task-default-tab")
+            .unwrap();
+        assert_eq!(tab_result.status, PASS);
+
+        let bad = ralphus_daemon::config::UiConfig {
+            new_task_default_tab: Some("bogus".to_string()),
+        };
+        let results = check_templates_for(&[], &bad);
+        let tab_result = results
+            .iter()
+            .find(|r| r.name == "new-task-default-tab")
+            .unwrap();
+        assert_eq!(tab_result.status, FAIL);
     }
 }

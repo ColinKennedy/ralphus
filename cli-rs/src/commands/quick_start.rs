@@ -1214,6 +1214,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "shellcmd::is_directly_executable only checks the .exe/.ps1 extension on Windows; on Unix it checks the file's execute permission bit instead, which this temp file never has"
+    )]
     fn spawn_plan_directly_executable_program_skips_the_shell() {
         let program = temp_file("prog.exe");
         let (kind, use_shell, mode) =
@@ -1229,6 +1233,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "shellcmd::shell_spawn_args only treats shell==\"cmd\" as cmd.exe's raw-shell-line form on Windows; elsewhere \"cmd\" is looked up as a generic shell prefix, so use_shell comes back false"
+    )]
     fn spawn_plan_non_executable_script_runs_via_shell() {
         let script = temp_file("script.ps1");
         let (_, use_shell, mode) =
@@ -1239,6 +1247,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "shellcmd::shell_spawn_args only treats shell==\"cmd\" as cmd.exe's raw-shell-line form on Windows; elsewhere \"cmd\" is looked up as a generic shell prefix, so use_shell comes back false"
+    )]
     fn spawn_plan_compound_command_runs_via_shell() {
         let (_, use_shell, mode) =
             quick_start_spawn_plan("cd C:\\ ; claude", &v(&["--flag"]), "cmd");

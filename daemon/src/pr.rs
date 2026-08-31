@@ -84,7 +84,9 @@ pub struct PullRequestView {
     /// reopened PR's new number can be recorded via the CLI.
     pub pr_number: Option<i64>,
     pub pr_url: Option<String>,
-    /// `"open"`, `"merged"`, `"closed"` — free-form, mirrors forge state.
+    /// `"open"`, `"merged"`, `"closed"`, `"dropped"` — free-form, mirrors
+    /// forge state except `"dropped"` (RAL-302: this row was soft-deleted,
+    /// e.g. by [`Store::drop_pull_request`]).
     pub state: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -98,6 +100,58 @@ pub struct PullRequestView {
     /// [`poll_pr_base_drift`] alongside `base_ref`. `None` until a
     /// [`resync_pr_bases`] forge PATCH has ever succeeded for this row.
     pub last_pushed_base_ref: Option<String>,
+    /// Groups every PR row created by the same "submit a stack" call
+    /// (RAL-302), so a past submission's sibling branches are queryable as
+    /// one unit. `None` for a row created before this column existed.
+    pub stack_id: Option<String>,
+    /// Why this row was soft-deleted (RAL-302), e.g. the RAL-300 out-of-band
+    /// merge message. `None` unless `state == "dropped"`.
+    pub dropped_reason: Option<String>,
+}
+
+/// One past "submit a stack" call for a review (RAL-302): every PR row that
+/// call created, grouped by [`PullRequestView::stack_id`], in any state
+/// (open/merged/closed/dropped) -- the read-only history behind the board's
+/// "view past PR stacks" screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrStackView {
+    /// The grouping key. For a row predating the `stack_id` column, this
+    /// falls back to that row's own `id`, so it still surfaces as a
+    /// (single-PR) stack rather than being silently dropped from history.
+    pub stack_id: String,
+    /// Earliest `created_at_ms` among this stack's PRs.
+    pub submitted_at_ms: i64,
+    /// Oldest first, mirrors [`Store::list_pull_requests_for_guardian`].
+    pub prs: Vec<PullRequestView>,
+}
+
+/// Groups `prs` (already ordered oldest-first, as returned by
+/// [`Store::list_pull_requests_for_guardian`]) into [`PrStackView`]s by
+/// `stack_id`, most-recently-submitted stack first.
+pub fn group_into_stacks(prs: Vec<PullRequestView>) -> Vec<PrStackView> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_stack: HashMap<String, Vec<PullRequestView>> = HashMap::new();
+    for pr in prs {
+        let key = pr.stack_id.clone().unwrap_or_else(|| pr.id.clone());
+        if !by_stack.contains_key(&key) {
+            order.push(key.clone());
+        }
+        by_stack.entry(key).or_default().push(pr);
+    }
+    let mut stacks: Vec<PrStackView> = order
+        .into_iter()
+        .map(|stack_id| {
+            let prs = by_stack.remove(&stack_id).unwrap_or_default();
+            let submitted_at_ms = prs.iter().map(|p| p.created_at_ms).min().unwrap_or(0);
+            PrStackView {
+                stack_id,
+                submitted_at_ms,
+                prs,
+            }
+        })
+        .collect();
+    stacks.sort_by_key(|s| std::cmp::Reverse(s.submitted_at_ms));
+    stacks
 }
 
 struct PrRow {
@@ -117,6 +171,8 @@ struct PrRow {
     updated_at_ms: i64,
     last_pushed_sha: Option<String>,
     last_pushed_base_ref: Option<String>,
+    stack_id: Option<String>,
+    dropped_reason: Option<String>,
 }
 
 impl From<PrRow> for PullRequestView {
@@ -138,11 +194,13 @@ impl From<PrRow> for PullRequestView {
             updated_at_ms: r.updated_at_ms,
             last_pushed_sha: r.last_pushed_sha,
             last_pushed_base_ref: r.last_pushed_base_ref,
+            stack_id: r.stack_id,
+            dropped_reason: r.dropped_reason,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -162,6 +220,8 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         updated_at_ms: r.get(13)?,
         last_pushed_sha: r.get(14)?,
         last_pushed_base_ref: r.get(15)?,
+        stack_id: r.get(16)?,
+        dropped_reason: r.get(17)?,
     })
 }
 
@@ -181,13 +241,49 @@ impl Store {
         pr_number: Option<i64>,
         pr_url: Option<&str>,
     ) -> Result<String> {
+        self.create_pull_request_ex(
+            guardian_id,
+            branch_id,
+            forge,
+            repo,
+            branch_alias,
+            base_ref,
+            title,
+            description,
+            pr_number,
+            pr_url,
+            None,
+        )
+    }
+
+    /// Full form of [`Self::create_pull_request`] that also stamps `stack_id`
+    /// (RAL-302): the same value passed for every PR row created by one
+    /// "submit a stack" call, so those sibling rows are queryable as a single
+    /// past submission later, even if some of them are since dropped
+    /// (see [`Self::drop_pull_request`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_pull_request_ex(
+        &self,
+        guardian_id: &str,
+        branch_id: Option<&str>,
+        forge: &str,
+        repo: &str,
+        branch_alias: &str,
+        base_ref: &str,
+        title: &str,
+        description: &str,
+        pr_number: Option<i64>,
+        pr_url: Option<&str>,
+        stack_id: Option<&str>,
+    ) -> Result<String> {
         let id = self.next_id("guardian_pr_seq", "pr")?;
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO guardian_pull_requests(
                 id, guardian_id, branch_id, forge, repo, branch_alias, base_ref,
-                title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms
-             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',?,?)",
+                title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms,
+                stack_id
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)",
             params![
                 id,
                 guardian_id,
@@ -201,7 +297,8 @@ impl Store {
                 pr_number,
                 pr_url,
                 now,
-                now
+                now,
+                stack_id,
             ],
         )?;
         Ok(id)
@@ -336,6 +433,26 @@ impl Store {
                 now_ms(),
                 id
             ],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Soft-delete a recorded PR mapping (RAL-300, soft-deleted since
+    /// RAL-302): used when a linked PR merges out-of-band while its review is
+    /// mid-flight (not `in_review`) -- the PR is no longer this review's to
+    /// track, and leaving it counted as `"open"` would keep it in a future
+    /// "are all linked PRs merged" check for whatever review picks this
+    /// branch up next. Sets `state='dropped'` and records `reason` rather
+    /// than deleting the row outright, so a "view past PR stacks" screen can
+    /// still show it happened.
+    pub fn drop_pull_request(&self, id: &str, reason: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET state='dropped', dropped_reason=?, updated_at_ms=? WHERE id=?",
+            params![reason, now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -725,6 +842,7 @@ fn synthesize_pr_text(
         assigned_agent_session_id: None,
         env_overrides: std::collections::BTreeMap::new(),
         machine: None,
+        tool_arg_truncate_chars: None,
     };
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
@@ -954,6 +1072,7 @@ fn resync_pr_bases_inner(
                         if is_stack_base_restriction(&e) {
                             blocked_by_stack.push((pr.id.clone(), num, new_base.clone()));
                         } else {
+                            // ralphus[ignore-rlog-pair]: per-PR retry-loop detail; the batch summary in start_resync_pr_bases records the structured workflow outcome
                             crate::rlog!(
                                 WARNING,
                                 "ralphus [pr] review {id} resync base forge update failed pr={}: {e}",
@@ -1375,8 +1494,15 @@ fn settle_pr_merge_states(
         .unwrap_or_default();
 
     if current_guardian.status.as_str() == "in_review" {
-        let all_merged = !current_prs.is_empty()
-            && current_prs
+        // RAL-302: a dropped row is soft-deleted, not removed, so it stays in
+        // `current_prs` forever -- exclude it here or a review that ever had
+        // one dropped could never satisfy "every linked pr has merged" again.
+        let live_prs: Vec<&PullRequestView> = current_prs
+            .iter()
+            .filter(|pull_request| pull_request.state != "dropped")
+            .collect();
+        let all_merged = !live_prs.is_empty()
+            && live_prs
                 .iter()
                 .all(|pull_request| pull_request.state == "merged");
         if !all_merged {
@@ -1392,42 +1518,68 @@ fn settle_pr_merge_states(
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
-                message: "pull request base(s) resynced after reorder",
+                message: "review approved: every linked pr has merged",
                 scope: Some("guardian"),
                 squad_id: None,
-                guardian_id: Some(&sid),
+                guardian_id: Some(id),
                 cell_id: None,
                 task: None,
                 log_path: None,
-                payload: serde_json::json!({"count": n}),
+                payload: serde_json::json!({
+                    "pr_ids": live_prs.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+                }),
             });
         }
+        return approved;
     }
-    std::thread::spawn(move || {
-        let result = resync_pr_bases(&store, &sid);
-        RESYNCING.lock().expect("poisoned").remove(&sid);
-        match result {
-            Ok(n) if n > 0 => {
-                let guard = store.lock().expect("poisoned");
-                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::INFO,
-                    source: "pr",
-                    message: "pull request base(s) resynced after reorder",
-                    scope: Some("guardian"),
-                    squad_id: None,
-                    guardian_id: Some(&sid),
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({"count": n}),
-                });
-            }
-            Ok(_) => {}
-            Err(e) => {
-                crate::rlog!(ERROR, "ralphus [pr] review {sid} resync bases failed: {e}");
-            }
-        }
-    });
+
+    if freshly_merged.is_empty() {
+        return false;
+    }
+
+    // Mid-flight: not idle in `in_review`, so this review has (or recently
+    // had) a rebase/feedback pass of its own in flight. Drop the stale PR
+    // row(s) rather than force a status change out from under it.
+    for pr in freshly_merged {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.drop_pull_request(
+            &pr.id,
+            "linked pr merged out-of-band while review was mid-flight",
+        );
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "pr",
+            message: "linked pr merged out-of-band while review was mid-flight; dropped",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "pr_id": pr.id,
+                "pr_number": pr.pr_number,
+                "branch_id": pr.branch_id,
+                "guardian_status": current_guardian.status,
+            }),
+        });
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} pr {} (branch_id={:?}) merged out-of-band while \
+             review was {} -- dropped from the review",
+            pr.id,
+            pr.branch_id,
+            current_guardian.status,
+        );
+    }
+    let _ = store.lock().expect("poisoned").set_guardian_notice(
+        id,
+        "pr_merged_mid_flight",
+        "A linked pull request merged on the forge while this review had a merge/feedback pass \
+         in flight. It has been dropped from the review -- check whether any in-flight work still \
+         applies, and resubmit a fresh PR if needed.",
+    );
+    true
 }
 
 /// Reconcile every already-open PR's remote branch with the review branch it
@@ -2235,6 +2387,7 @@ fn submit_stacked_branch_pr(
     req: &PrRequest,
     pr_branch_convention: &str,
     trace_context: Option<&str>,
+    stack_id: &str,
 ) -> std::result::Result<PullRequestView, String> {
     let branch_id = branch.id.as_str();
     let position = branch.position;
@@ -2287,7 +2440,7 @@ fn submit_stacked_branch_pr(
     let row_id = store
         .lock()
         .expect("poisoned")
-        .create_pull_request(
+        .create_pull_request_ex(
             id,
             Some(branch_id),
             client.kind().as_str(),
@@ -2298,6 +2451,7 @@ fn submit_stacked_branch_pr(
             &description,
             Some(created_pr.number),
             Some(&created_pr.url),
+            Some(stack_id),
         )
         .map_err(|e| e.to_string())?;
     if let Some(sha) = &pushed_sha {
@@ -2519,6 +2673,7 @@ fn submit_stack_for_guardian(
     existing_prs: &[PullRequestView],
     pr_branch_convention: &str,
     trace_context: Option<&str>,
+    stack_id: &str,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
     let already_open = refresh_open_prs(store, client, open_prs_by_branch(existing_prs));
     let mut created = Vec::new();
@@ -2549,6 +2704,7 @@ fn submit_stack_for_guardian(
             &req,
             pr_branch_convention,
             trace_context,
+            stack_id,
         )?;
         newly_created_branch_ids.insert(branch.id.clone());
         created.push(pr);
@@ -2689,6 +2845,15 @@ fn submit_pull_requests_inner(
     });
     let submit_whole_stack = requests.iter().any(|r| r.branch_id.is_none());
 
+    // RAL-302: one id per call to `submit_pull_requests_inner`, stamped on
+    // every PR row this call creates (stacked and/or whole-stack), so a past
+    // submission's sibling branches are queryable as one group later.
+    let stack_id = store
+        .lock()
+        .expect("poisoned")
+        .next_id("guardian_pr_stack_seq", "prstack")
+        .map_err(|e| e.to_string())?;
+
     let mut created = Vec::new();
     for req in stacked {
         let branch_id = req.branch_id.as_deref().unwrap_or("");
@@ -2712,6 +2877,7 @@ fn submit_pull_requests_inner(
             req,
             &pr_branch_convention,
             trace_context,
+            &stack_id,
         )?;
         created.push(pr);
     }
@@ -2731,6 +2897,7 @@ fn submit_pull_requests_inner(
             &existing_prs,
             &pr_branch_convention,
             trace_context,
+            &stack_id,
         )?;
         created.extend(stack_prs);
     }
@@ -3394,6 +3561,12 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
+            // `rebase --continue` needs these on a CI runner with no
+            // interactive terminal/EDITOR -- otherwise a conflict resolution
+            // that needs a commit message fails with "Terminal is dumb, but
+            // EDITOR unset" instead of completing.
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true")
             .output()
             .expect("git");
         assert!(
@@ -3980,6 +4153,12 @@ mod tests {
             let out3 = Command::new("git")
                 .args(["rebase", "--continue"])
                 .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_EDITOR", "true")
+                .env("GIT_SEQUENCE_EDITOR", "true")
                 .output()
                 .unwrap();
             assert!(
@@ -5296,6 +5475,260 @@ mod tests {
             "the local row must be corrected to match forge reality"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_merges_approves_when_every_linked_pr_has_merged() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let prs = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+        assert!(changed, "every linked pr merging must report a change");
+
+        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(updated_guardian.status.as_str(), "approved");
+        let updated_pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_eq!(updated_pr.state, "merged");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_merges_approves_when_all_merges_were_already_recorded() {
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .update_pull_request(&pr_id, None, None, None, Some("merged"))
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget".to_string(),
+            None,
+        );
+        let prs = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+
+        assert!(apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(
+            store.lock().unwrap().get_guardian(&gid).unwrap().status,
+            "approved"
+        );
+    }
+
+    #[test]
+    fn check_pr_merges_drops_a_pr_merged_out_of_band_while_mid_flight() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        // A rebase/feedback pass owns this review's worktrees right now.
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, GuardianStatus::Merging, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let prs = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+        assert!(changed, "an out-of-band merge must still report a change");
+
+        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(
+            updated_guardian.status.as_str(),
+            "merging",
+            "a mid-flight review must not be silently force-approved"
+        );
+        assert_eq!(
+            updated_guardian.notice_kind.as_deref(),
+            Some("pr_merged_mid_flight")
+        );
+        let dropped_pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_eq!(
+            dropped_pr.state, "dropped",
+            "the stale pr row must be soft-deleted, not removed"
+        );
+        assert!(
+            dropped_pr.dropped_reason.is_some(),
+            "a dropped pr row must record why"
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_merges_is_fail_safe_when_the_forge_call_fails() {
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+
+        // No token configured -- `get_pull_request_state` fails before any
+        // network call, exercising the "forge unreachable" fail-safe path.
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget".to_string(),
+            None,
+        );
+        let prs = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+        assert!(
+            !changed,
+            "an unreachable forge must never be mistaken for a merged pr"
+        );
+
+        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(updated_guardian.status.as_str(), "in_review");
+        let updated_pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        assert_eq!(updated_pr.state, "open");
     }
 
     #[test]

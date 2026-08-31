@@ -73,6 +73,7 @@ impl ModelBackend for HarnessBackend {
             tokens_out: 0,
             cost_usd: 0.0,
             agent_session_id: None,
+            abandoned_background_job: None,
         })
     }
 }

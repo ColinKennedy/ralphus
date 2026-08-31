@@ -162,6 +162,7 @@ fn drive_json_events(
         tokens_out: state.tokens_out,
         cost_usd: state.cost_usd,
         agent_session_id: state.agent_session_id,
+        abandoned_background_job: None,
     })
 }
 
@@ -325,6 +326,7 @@ mod tests {
                 resume_agent_session_id: Some("sess-123"),
                 assigned_agent_session_id: None,
                 timeout_sec: None,
+                tool_arg_truncate_chars: None,
             },
         );
         assert!(args.windows(2).any(|w| w == ["--session", "sess-123"]));

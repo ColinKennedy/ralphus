@@ -130,7 +130,7 @@ fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> CellCommand) -> 
 
 /// Mirrors `_resolve_selector_or_none`'s kind check; see `task.rs`'s twin for
 /// why this returns a `Result` instead of printing inline.
-fn resolve_scoped(
+pub fn resolve_scoped(
     client: &DaemonClient,
     selector: &str,
     want_kind: &str,
@@ -145,7 +145,7 @@ fn resolve_scoped(
     Ok(resolved)
 }
 
-fn with_uri(mut payload: Value, uri: String) -> Value {
+pub fn with_uri(mut payload: Value, uri: String) -> Value {
     if let Value::Object(map) = &mut payload {
         let mut ordered = serde_json::Map::new();
         ordered.insert("uri".to_string(), Value::String(uri));
@@ -164,7 +164,11 @@ edit, delete, commit, or push anything.";
 /// Python's `_agent_resume_command` (itself a hand-mirrored duplicate of
 /// `daemon/src/server.rs::open_agent_terminal`'s dispatch -- see that
 /// function's docstring for why there is no single shared implementation).
-fn agent_resume_command(agent: Option<&str>, agent_session_id: &str, mode: &str) -> Vec<String> {
+pub fn agent_resume_command(
+    agent: Option<&str>,
+    agent_session_id: &str,
+    mode: &str,
+) -> Vec<String> {
     let mut cmd: Vec<String>;
     if matches!(agent, Some("codex") | Some("codex-cli")) {
         // The top-level interactive `codex resume`, not `codex exec resume`

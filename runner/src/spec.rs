@@ -48,6 +48,12 @@ pub struct CellSpec {
     /// `resume_agent_session_id`'s "hand-rolled backends accept and ignore
     /// it" precedent).
     pub assigned_agent_session_id: Option<String>,
+    /// RAL-303: the daemon's resolved `[live_view] tool_arg_truncate_chars`,
+    /// forwarded so the claude-code backend's `format_tool_input` knows how
+    /// much of a `tool_use` argument to render into the Live View tmux pane
+    /// before truncating. `None` (e.g. a hand-authored spec that omits the
+    /// key) falls back to the backend's own default.
+    pub tool_arg_truncate_chars: Option<u32>,
 }
 
 impl CellSpec {
@@ -81,6 +87,7 @@ impl CellSpec {
         let trace_context = opt_str(obj, "trace_context")?;
         let resume_agent_session_id = opt_str(obj, "resume_agent_session_id")?;
         let assigned_agent_session_id = opt_str(obj, "assigned_agent_session_id")?;
+        let tool_arg_truncate_chars = opt_u32(obj, "tool_arg_truncate_chars")?;
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -107,6 +114,7 @@ impl CellSpec {
             trace_context,
             resume_agent_session_id,
             assigned_agent_session_id,
+            tool_arg_truncate_chars,
         })
     }
 }
@@ -150,6 +158,18 @@ fn opt_uint(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u6
             Some(n) => Ok(Some(n)),
             None => Err(SpecError(format!("{key} must be an integer"))),
         },
+        None => Ok(None),
+    }
+}
+
+/// Like [`opt_uint`], narrowed to `u32` -- used for `tool_arg_truncate_chars`
+/// (RAL-303), which is always a small character count, never a value that
+/// needs the full `u64` range `budget_tokens`/`timeout_sec` allow for.
+fn opt_u32(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u32>, SpecError> {
+    match opt_uint(obj, key)? {
+        Some(n) => u32::try_from(n)
+            .map(Some)
+            .map_err(|_| SpecError(format!("{key} must fit in a 32-bit integer"))),
         None => Ok(None),
     }
 }
@@ -343,6 +363,7 @@ mod tests {
         v["budget_tokens"] = serde_json::json!(1000);
         v["timeout_sec"] = serde_json::json!(60);
         v["proof"] = serde_json::json!(true);
+        v["tool_arg_truncate_chars"] = serde_json::json!(400);
         let spec = CellSpec::from_json(&v.to_string()).unwrap();
         assert_eq!(spec.command.as_deref(), Some("echo hi"));
         assert_eq!(spec.agent, "ollama");
@@ -350,6 +371,21 @@ mod tests {
         assert_eq!(spec.args, vec!["--flag".to_string(), "value".to_string()]);
         assert_eq!(spec.budget_tokens, Some(1000));
         assert!(spec.proof);
+        assert_eq!(spec.tool_arg_truncate_chars, Some(400));
+    }
+
+    #[test]
+    fn tool_arg_truncate_chars_is_none_when_omitted() {
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert_eq!(spec.tool_arg_truncate_chars, None);
+    }
+
+    #[test]
+    fn tool_arg_truncate_chars_rejects_a_value_that_does_not_fit_a_u32() {
+        let mut v = base();
+        v["tool_arg_truncate_chars"] = serde_json::json!(u64::from(u32::MAX) + 1);
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("tool_arg_truncate_chars"));
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use rusqlite::OptionalExtension as _;
 use serde::Serialize;
 
-use crate::store::{Result as StoreResult, Store, now_ms};
+use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 
 /// A registered user placeholder.
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +93,40 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Rename a registered user in place. Unlike e.g. a guardian rename, this
+    /// table's primary key *is* the name, so a rename can collide with an
+    /// existing row -- that case returns [`StoreError::InvalidTransition`]
+    /// rather than a raw SQLite unique-constraint failure. Returns
+    /// [`StoreError::NotFound`] if `old_name` isn't registered.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn rename_user(&self, old_name: &str, new_name: &str) -> StoreResult<()> {
+        if old_name == new_name {
+            return self
+                .get_user(old_name)?
+                .map(|_| ())
+                .ok_or(StoreError::NotFound);
+        }
+        if self.get_user(new_name)?.is_some() {
+            return Err(StoreError::InvalidTransition(format!(
+                "user {new_name:?} is already registered"
+            )));
+        }
+        let n = self.conn.execute(
+            "UPDATE users SET name=? WHERE name=?",
+            rusqlite::params![new_name, old_name],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [store] user {old_name:?} renamed to {new_name:?}"
+        );
+        Ok(())
     }
 
     /// Remove a registered user. Returns `false` if no such user existed.

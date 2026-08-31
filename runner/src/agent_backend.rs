@@ -183,6 +183,7 @@ impl ModelBackend for AgentBackend {
             tokens_out: result.tokens_out,
             cost_usd: 0.0,
             agent_session_id: None,
+            abandoned_background_job: None,
         })
     }
 }

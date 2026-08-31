@@ -5,6 +5,14 @@ The `ralphus` CLI: a thin HTTP client over the daemon's API (`client.rs`, all
 `AGENTS.md`'s Architecture table and "The Rust CLI/runner port" section for
 the module map and the disclosed `ralphus author` gap.
 
+`ralphus-mcp` (`../mcp/`, RAL-301) depends on this crate as a library and
+mirrors `commands/*.rs`'s `dispatch` match arms to build MCP tool responses
+(see `mcp/src/exec/*.rs`) -- that's why a number of otherwise-private
+per-command helpers here (`resolve_scoped`, `with_uri`, `proof_step_for`,
+`agent_resume_command`, and similar) are `pub` despite having exactly one
+call site inside this crate's own `dispatch`. Don't re-privatize one of these
+without checking `mcp/src/exec/` for a caller first.
+
 ## Read-Only Quick-Start Safety List (RAL-194)
 
 Each `HelpNode` in `cli-rs/src/help_map.rs`'s command tree (`ROOT` and its

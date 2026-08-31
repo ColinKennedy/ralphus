@@ -182,6 +182,28 @@ fn resolve_shared_session_id(
     }
 }
 
+/// RAL-281: promote the values of any env var whose *name* is on the
+/// DB-configured secret-name list (`crate::secret_env_names`) into the
+/// RAL-264 value-based redaction registry (`crate::redact`) -- additive to
+/// that registry's existing agent-profile `from_env` registration, so a
+/// literal task/cell `environment=` entry or an API-set env override is
+/// scrubbed too when its name matches. Called at the two points a cell's
+/// (or proof step's) final env map is fully merged, right before dispatch.
+fn register_secret_named_env_values(
+    store: &Arc<Mutex<Store>>,
+    env: &std::collections::BTreeMap<String, String>,
+) {
+    let secret_names = {
+        let guard = store.lock().expect("store mutex poisoned");
+        guard.secret_env_names_cached().unwrap_or_default()
+    };
+    for (key, value) in env {
+        if secret_names.contains(key) {
+            crate::redact::register(value);
+        }
+    }
+}
+
 /// A dependency-free counting semaphore that bounds how many cells execute
 /// at once. One instance is shared across every squad's worker threads, so the
 /// concurrency cap is *global and task-level* — independent tasks (across one
@@ -189,9 +211,26 @@ fn resolve_shared_session_id(
 /// "one squad at a time" limit.
 #[derive(Debug)]
 pub struct Semaphore {
-    permits: Mutex<i64>,
+    state: Mutex<SemaphoreState>,
     available: Condvar,
     capacity: i64,
+}
+
+#[derive(Debug)]
+struct SemaphoreState {
+    permits: i64,
+    /// Monotonic counter handing out a unique tie-break for each
+    /// `acquire_ranked` waiter (RAL-280), so two callers with the same
+    /// priority are still granted a freed permit in arrival order rather than
+    /// whichever the OS happens to wake first.
+    next_seq: u64,
+    /// `(priority, seq)` of every caller currently blocked in
+    /// `acquire_ranked`, lowest-first. Plain `acquire()` callers (guardian
+    /// merges, task-level proofs, proof-only workers) are deliberately never
+    /// added here — they keep grabbing a freed permit on a first-come basis
+    /// exactly as before, so this only orders *ranked* waiters relative to
+    /// each other, not relative to the rest of the semaphore's users.
+    waiting: Vec<(f64, u64)>,
 }
 
 impl Semaphore {
@@ -206,23 +245,62 @@ impl Semaphore {
             permits.max(1)
         };
         Self {
-            permits: Mutex::new(capacity),
+            state: Mutex::new(SemaphoreState {
+                permits: permits.max(1),
+                next_seq: 0,
+                waiting: Vec::new(),
+            }),
             available: Condvar::new(),
             capacity,
         }
     }
 
     /// Block until a slot is free, returning a guard that frees it on drop.
+    /// Unordered relative to other `acquire()` callers, and relative to
+    /// [`Self::acquire_ranked`] waiters — see [`SemaphoreState::waiting`].
     pub(crate) fn acquire(&self) -> SemaphorePermit<'_> {
-        let mut permits = self.permits.lock().expect("semaphore mutex poisoned");
-        while *permits <= 0 {
-            permits = self
+        let mut state = self.state.lock().expect("semaphore mutex poisoned");
+        while state.permits <= 0 {
+            state = self
                 .available
-                .wait(permits)
+                .wait(state)
                 .expect("semaphore mutex poisoned");
         }
-        *permits -= 1;
+        state.permits -= 1;
         SemaphorePermit { sem: self }
+    }
+
+    /// Block until a slot is free AND no other [`Self::acquire_ranked`] waiter
+    /// has a lower `priority` value (ties broken by arrival order) — i.e. the
+    /// scheduler's cell dispatch (RAL-280): among cells contending for the
+    /// same freed machine, the one whose priority sorts lowest wins first,
+    /// deterministically, instead of the old arbitrary OS wakeup order.
+    /// `f64::INFINITY` (no boost) still eventually gets a slot; it's just
+    /// never preferred over a lower value.
+    pub(crate) fn acquire_ranked(&self, priority: f64) -> SemaphorePermit<'_> {
+        let mut state = self.state.lock().expect("semaphore mutex poisoned");
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.waiting.push((priority, seq));
+        loop {
+            let is_front = !state
+                .waiting
+                .iter()
+                .any(|&(p, s)| p < priority || (p == priority && s < seq));
+            if state.permits > 0 && is_front {
+                state.permits -= 1;
+                state.waiting.retain(|&(_, s)| s != seq);
+                // Another ranked waiter may now be the front (the permit
+                // count changed, and our entry just left the queue) — wake
+                // everyone so they can re-check.
+                self.available.notify_all();
+                return SemaphorePermit { sem: self };
+            }
+            state = self
+                .available
+                .wait(state)
+                .expect("semaphore mutex poisoned");
+        }
     }
 
     /// Slots currently held (`capacity - free`) — the ground truth for the
@@ -234,8 +312,8 @@ impl Semaphore {
     /// `pending`) — so counting raw `state='running'` rows undercounts actual
     /// concurrency-slot usage. This is exact regardless of DB row timing.
     pub(crate) fn in_use(&self) -> i64 {
-        let permits = self.permits.lock().expect("semaphore mutex poisoned");
-        self.capacity - *permits
+        let state = self.state.lock().expect("semaphore mutex poisoned");
+        self.capacity - state.permits
     }
 }
 
@@ -246,9 +324,14 @@ pub(crate) struct SemaphorePermit<'a> {
 
 impl Drop for SemaphorePermit<'_> {
     fn drop(&mut self) {
-        let mut permits = self.sem.permits.lock().expect("semaphore mutex poisoned");
-        *permits += 1;
-        self.sem.available.notify_one();
+        let mut state = self.sem.state.lock().expect("semaphore mutex poisoned");
+        state.permits += 1;
+        // `notify_all`, not `notify_one`: an `acquire_ranked` waiter only
+        // proceeds once it confirms it's the front of `waiting`, so waking a
+        // single (possibly non-front) waiter could leave the actual front
+        // waiter asleep indefinitely. Cheap in practice — a permit only frees
+        // when a cell/proof/merge finishes, far from a hot path.
+        self.sem.available.notify_all();
     }
 }
 
@@ -857,6 +940,42 @@ fn execute_squad_inner(
             // instead of sitting Pending until the whole squad drains and a
             // fresh worker gets claimed for it.
             {
+                // RAL-1xx: a `Detached` cell (RAL-288's manual-takeover pause)
+                // never joins `finalized` -- `all_terminal` below only counts
+                // Done/Failed/Cancelled, deliberately excluding Detached (see
+                // its own doc comment) -- so the `reclaimed_tasks` reclaim just
+                // below, keyed off `finalized`, can never see it. Left alone,
+                // a cell resumed via `resume-automation`/`restart_cell` while
+                // this same squad's *other* tasks are still genuinely running
+                // sits Pending in the store but never gets redispatched by
+                // this live worker: it only resurfaces once every other
+                // in-flight cell finishes, this pass exits, and a fresh tick
+                // reclaims the squad from scratch (the exact "forever pending"
+                // report this fix addresses). Reconcile it the same way
+                // `reclaimed_cells` reconciles an ordinary restarted cell,
+                // just keyed off the cell's own Detached-in-progress status
+                // instead of its owning task's finalized-ness.
+                let reclaimed_detached: Vec<usize> = {
+                    let guard = store.lock().expect("store mutex poisoned");
+                    let prog = progress.lock().expect("progress mutex poisoned");
+                    (0..n)
+                        .filter(|&i| prog.status[i] == CellState::Detached)
+                        .filter(|&i| {
+                            let row = &cells[i];
+                            matches!(
+                                guard.cell_state(squad_id, row.task_idx, row.idx),
+                                Ok(Some(NodeState::Pending))
+                            )
+                        })
+                        .collect()
+                };
+                if !reclaimed_detached.is_empty() {
+                    let mut prog = progress.lock().expect("progress mutex poisoned");
+                    for &i in &reclaimed_detached {
+                        prog.status[i] = CellState::Pending;
+                        prog.summaries[i] = None;
+                    }
+                }
                 let (reclaimed_tasks, reclaimed_cells, reclaimed_proof_only): (
                     Vec<i64>,
                     Vec<usize>,
@@ -870,6 +989,37 @@ fn execute_squad_inner(
                             matches!(guard.task_state(squad_id, t), Ok(Some(NodeState::Pending)))
                         })
                         .collect();
+                    // RAL-306: `restart_cell`/`restart_cell_proof`/
+                    // `restart_task_proof` unconditionally flip the *whole
+                    // squad's* row back to `pending` even when (as here) they
+                    // deliberately skip cancelling this still-alive worker
+                    // because the restart target wasn't actually `Running`
+                    // (see those handlers' doc comments in `server.rs`). Left
+                    // uncorrected, that desync starves the two squad-state-
+                    // gated writes below every subsequent pass this worker
+                    // makes: `run_task_finalizer`'s "mark Running before
+                    // proofs" guard and — critically — its terminal
+                    // Done/Failed write, both of which silently no-op unless
+                    // `squad_state == Running`. A task whose cells all
+                    // re-completed cleanly on the retry would then never
+                    // actually flip to a terminal state, sitting at `running`
+                    // until every other task in the squad (unrelated to the
+                    // restart) also finishes and this worker's own end-of-run
+                    // guard (which has the same `Running` check) happens to
+                    // still see it — i.e. by luck, not by design. A genuine
+                    // full-squad reset (`restart_squad`/`restart_task`)
+                    // cannot reach this point instead: those unconditionally
+                    // cancel and wait out this worker *before* touching the
+                    // squad row, so `cancel.is_cancelled()` above would
+                    // already have returned. Seeing `reclaimed_tasks`
+                    // non-empty here therefore only ever means "a scoped
+                    // restart flipped the squad row under a worker that was
+                    // deliberately left alive" — safe to reconcile back to
+                    // `Running`, the same way the initial claim seeds it
+                    // (`execute_squad_inner`'s "Mark Running up front").
+                    if !reclaimed_tasks.is_empty() {
+                        let _ = guard.set_squad_state(squad_id, SquadState::Running);
+                    }
                     let reclaimed_cells: Vec<usize> = reclaimed_tasks
                         .iter()
                         .flat_map(|t| task_cells.get(t).into_iter().flatten().copied())
@@ -1152,7 +1302,14 @@ fn execute_squad_inner(
                 });
             }
 
-            for i in to_dispatch {
+            // RAL-280: priority computed here, the moment each cell is found
+            // ready to dispatch — not later, and not live-recomputed if the
+            // guardian stack it feeds is subsequently reordered/edited.
+            let to_dispatch: Vec<(usize, f64)> = to_dispatch
+                .into_iter()
+                .map(|i| (i, cell_dispatch_priority(store, squad_id, &cells[i])))
+                .collect();
+            for (i, dispatch_priority) in to_dispatch {
                 scope.spawn(move || {
                     run_cell_worker(
                         store,
@@ -1165,6 +1322,7 @@ fn execute_squad_inner(
                         progress_ref,
                         i,
                         trace_ref,
+                        dispatch_priority,
                     );
                 });
             }
@@ -1417,11 +1575,38 @@ fn enqueue_proof_failure_mailbox(
     }
 }
 
+/// RAL-280 dispatch-priority key for a ready cell, fed to
+/// [`Semaphore::acquire_ranked`] so the scheduler prefers Cells that unblock a
+/// Review's staged rebase over Cells that don't, when several are ready and
+/// only one machine slot frees up. Lower sorts first: a cell that is the
+/// first not-yet-contributed branch of a Review (see
+/// [`crate::store::Store::cell_review_dispatch_priority`]) gets a negative
+/// value scaled by that Review's enabled-branch count, so a longer stack's
+/// first branch beats a shorter stack's on a tie; everything else (no Review,
+/// or not first-in-line yet) gets `f64::INFINITY` — deprioritized, never
+/// excluded.
+fn cell_dispatch_priority(
+    store: &Arc<Mutex<Store>>,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+) -> f64 {
+    let guard = store.lock().expect("store mutex poisoned");
+    match guard.cell_review_dispatch_priority(squad_id, row.task_idx, row.idx) {
+        Ok(Some(enabled_branch_count)) => -(enabled_branch_count as f64),
+        _ => f64::INFINITY,
+    }
+}
+
 /// Run one cell — and, on success, its cell-level proofs — while
 /// holding a permit from the shared semaphore, then publish the result into the
 /// shared `progress` (status + failure flag). Dependency-waiting is the
 /// dispatcher's job, so a permit is only ever held during real work, never
 /// while parked.
+///
+/// `dispatch_priority` (RAL-280) is computed once, by the dispatcher, the
+/// moment this cell was added to a pass's `to_dispatch` list — i.e. the
+/// moment it became ready — and threaded through here rather than recomputed;
+/// see [`cell_dispatch_priority`].
 #[allow(clippy::too_many_arguments)]
 fn run_cell_worker(
     store: &Arc<Mutex<Store>>,
@@ -1434,6 +1619,7 @@ fn run_cell_worker(
     progress: &Mutex<Progress>,
     i: usize,
     trace_context: Option<&str>,
+    dispatch_priority: f64,
 ) {
     let row = &cells[i];
     // Held for the worker's whole lifetime so every early return below still
@@ -1474,7 +1660,9 @@ fn run_cell_worker(
         });
     }
     // Acquire a global slot; released when `_permit` drops at function end.
-    let _permit = sem.acquire();
+    // RAL-280: ranked, not plain `acquire()` — cells that unblock a Review's
+    // rebase jump ahead of other ready cells contending for the same freed slot.
+    let _permit = sem.acquire_ranked(dispatch_priority);
     if cancel.is_cancelled() {
         return;
     }
@@ -1488,7 +1676,6 @@ fn run_cell_worker(
         // about the other's bookkeeping.
         let _ = guard.clear_cell_detached(squad_id, row.task_idx, row.idx);
     }
-    capture_task_baseline_if_needed(store, squad_id, row);
 
     // Resolve handoff placeholders against completed upstream summaries.
     let summaries = progress
@@ -1588,6 +1775,7 @@ fn run_cell_worker(
     let mut merged_profile_env = selection.env;
     merged_profile_env.extend(spec.env_overrides.clone());
     spec.env_overrides = merged_profile_env;
+    register_secret_named_env_values(store, &spec.env_overrides);
 
     // RAL-288 Stage 6: an explicit resume-automation trigger takes priority
     // over dependency-based sharing below -- it means a human just finished
@@ -1613,6 +1801,21 @@ fn run_cell_worker(
             row.cell_id,
             session_id,
         );
+        {
+            let guard = store.lock().expect("store mutex poisoned");
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "scheduler",
+                message: "cell resuming its own agent session (resume-automation)",
+                scope: Some("cell"),
+                squad_id: Some(squad_id),
+                guardian_id: None,
+                cell_id: Some(&row.cell_id),
+                task: Some(&row.task_name),
+                log_path: None,
+                payload: serde_json::json!({"agent_session_id": session_id}),
+            });
+        }
         spec.resume_agent_session_id = Some(session_id);
         // RAL-288: `claude -p`/`codex exec`/etc. need *some* turn content to
         // run at all -- an external constraint of headless invocation, not
@@ -2064,53 +2267,31 @@ fn run_proof_only_worker(
     }
 }
 
-/// Capture a git-backed task's RAL-156 baseline commit sha the first time any
-/// of its cells reaches `Running` (a no-op once one is already set — see
-/// [`Store::set_task_baseline_commit`]). Skipped entirely for a task whose
-/// `project` isn't registered as git, or that has no `cwd`, so the common
-/// non-git-backed task never pays for a `git` subprocess call. The `git`
-/// subprocess itself runs outside the store lock, matching this module's
-/// "subprocess waits happen outside the store lock" rule.
-fn capture_task_baseline_if_needed(
-    store: &Arc<Mutex<Store>>,
-    squad_id: &str,
-    row: &crate::store::CellRow,
-) {
-    let Some(cwd) = row.cwd.as_deref() else {
-        return;
-    };
-    let is_git = {
-        let guard = store.lock().expect("store mutex poisoned");
-        let Ok(Some(info)) = guard.task_commit_guard_info(squad_id, row.task_idx) else {
-            return;
-        };
-        if info.baseline_commit_sha.is_some() {
-            return;
-        }
-        info.project
-            .as_deref()
-            .and_then(|name| guard.get_project(name).ok().flatten())
-            .is_some_and(|p| p.vcs == "git")
-    };
-    if !is_git {
-        return;
-    }
-    if let Some(sha) = crate::proof::git_head_sha(cwd) {
-        let guard = store.lock().expect("store mutex poisoned");
-        let _ = guard.set_task_baseline_commit(squad_id, row.task_idx, &sha);
-    }
-}
-
-/// The RAL-156 no-new-commits-since-baseline guard: for a git-backed task
+/// The RAL-156 no-new-commits guard, RAL-293-amended: for a git-backed task
 /// (per [`Store::task_commit_guard_info`]'s registered `project`) that hasn't
 /// opted out via `no_commit_required`, fails closed unless at least one of
-/// the task's cells moved its `cwd`'s `HEAD` past the captured baseline.
+/// the task's cells has a `cwd` whose `HEAD` is ahead of its own
+/// `@{upstream}` tracking ref (`crate::proof::any_cwd_ahead_of_upstream`).
+///
+/// This reads live git state rather than a squad-run-scoped baseline sha
+/// captured once at cell-start, so it doesn't need (and isn't gated on) any
+/// review/guardian existing: `@{upstream}` is recorded durably on the
+/// worktree's branch itself the moment it's materialized
+/// (`worktrees::set_explicit_upstream`), independent of whether that
+/// worktree ever gets attached to a `[[review]]`. That durability is exactly
+/// what fixes RAL-293 — a worktree reused by a later squad run (or restarted
+/// task) already holds its earlier commit ahead of upstream, so the guard
+/// passes regardless of whether *this* run's cells committed anything new.
+///
 /// Returns `true` (pass) whenever the guard doesn't apply — not git-backed,
 /// opted out, or the `(squad_id, task_idx)` row can't be found. On failure,
 /// logs both the `proof`-typed `rlog!` line and a matching Cartographer
-/// event per the Logging Policy. `git` subprocess calls run outside the store
-/// lock, matching this module's "subprocess waits happen outside the store
-/// lock" rule.
+/// event per the Logging Policy, and records the same message on
+/// [`TaskView::error`](crate::store::TaskView::error) via
+/// [`Store::set_task_error`] (RAL-291) so the board can show it without a
+/// human needing to open the Logs modal. `git` subprocess calls run outside
+/// the store lock, matching this module's "subprocess waits happen outside
+/// the store lock" rule.
 fn check_task_no_commits_guard(
     store: &Arc<Mutex<Store>>,
     squad_id: &str,
@@ -2138,11 +2319,7 @@ fn check_task_no_commits_guard(
         .filter(|s| s.task_idx == task_idx)
         .filter_map(|s| s.cwd.as_deref())
         .collect();
-    let has_commit = info
-        .baseline_commit_sha
-        .as_deref()
-        .is_some_and(|baseline| crate::proof::any_cwd_has_new_commit(&cwds, baseline));
-    if has_commit {
+    if crate::proof::any_cwd_ahead_of_upstream(&cwds) {
         return true;
     }
     crate::rlog!(
@@ -2161,10 +2338,15 @@ fn check_task_no_commits_guard(
         task: Some(task_name),
         log_path: None,
         payload: serde_json::json!({
-            "baseline_commit_sha": info.baseline_commit_sha,
             "cells_checked": cwds.len(),
         }),
     });
+    let error = format!(
+        "task failed: no commits since baseline ({} cell{} checked)",
+        cwds.len(),
+        if cwds.len() == 1 { "" } else { "s" }
+    );
+    let _ = guard.set_task_error(squad_id, task_idx, Some(&error));
     false
 }
 
@@ -2797,6 +2979,7 @@ fn run_proofs(
             merged.extend(env_overrides);
             merged
         };
+        register_secret_named_env_values(store, &env_overrides);
         let (passed, output, proof_claude_id, proof_tokens_in, proof_tokens_out, proof_cost_usd) =
             match kind.as_str() {
                 "command" => {
@@ -3382,6 +3565,173 @@ mod tests {
         assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
     }
 
+    /// RAL-288's `Detached` on task "a", genuinely still-running on task "b"
+    /// (independent, no dependency between them). "a" detaches exactly once,
+    /// then reports done if dispatched again; "b" blocks until the test
+    /// releases it, so the squad's worker is provably still alive and
+    /// driving a sibling for the whole window the test cares about.
+    struct DetachThenReviveRunner {
+        detached_once: std::sync::atomic::AtomicBool,
+        release_b: (Mutex<bool>, Condvar),
+        b_started: (Mutex<bool>, Condvar),
+    }
+
+    impl Runner for DetachThenReviveRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            match spec.command.as_deref() {
+                Some("x") => {
+                    use std::sync::atomic::Ordering;
+                    if !self.detached_once.swap(true, Ordering::SeqCst) {
+                        return RunnerResult::detached(1, 1, 0.01, Some("sess-a".to_string()));
+                    }
+                    RunnerResult {
+                        status: "done".to_string(),
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        summary: "ok".to_string(),
+                        error: None,
+                        proofed: None,
+                        agent_session_id: None,
+                        ghost: None,
+                    }
+                }
+                Some("y") => {
+                    {
+                        let (lock, cv) = &self.b_started;
+                        let mut started = lock.lock().expect("mutex poisoned");
+                        *started = true;
+                        cv.notify_all();
+                    }
+                    let (lock, cv) = &self.release_b;
+                    let mut released = lock.lock().expect("mutex poisoned");
+                    while !*released {
+                        released = cv.wait(released).expect("mutex poisoned");
+                    }
+                    RunnerResult {
+                        status: "done".to_string(),
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        summary: "ok".to_string(),
+                        error: None,
+                        proofed: None,
+                        agent_session_id: None,
+                        ghost: None,
+                    }
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
+    }
+
+    /// Regression for the "forever pending" report: `resume-automation` (or
+    /// a plain `restart_cell`) on a `Detached` cell must be picked up by the
+    /// *same* live worker right away, even while an unrelated sibling task in
+    /// the same squad is still genuinely running -- not wait for that
+    /// sibling's whole chain to finish and a fresh tick to reclaim the squad.
+    /// Before this fix, task a's cell only ever transitioned out of
+    /// `Detached` in-memory once task b's blocked runner call returned, which
+    /// this test would catch as a timeout.
+    #[test]
+    fn detached_cell_is_revived_by_the_same_live_worker_while_a_sibling_task_is_still_running() {
+        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
+        let runner = Arc::new(DetachThenReviveRunner {
+            detached_once: std::sync::atomic::AtomicBool::new(false),
+            release_b: (Mutex::new(false), Condvar::new()),
+            b_started: (Mutex::new(false), Condvar::new()),
+        });
+        let store_for_thread = Arc::clone(&store);
+        let id_for_thread = id.clone();
+        let runner_for_thread = Arc::clone(&runner);
+        let handle = std::thread::spawn(move || {
+            execute_squad(
+                &store_for_thread,
+                runner_for_thread.as_ref(),
+                &id_for_thread,
+            );
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        // Wait for b's cell to actually start, proving the worker is still
+        // alive and genuinely driving a sibling.
+        {
+            let (lock, cv) = &runner.b_started;
+            let mut started = lock.lock().expect("mutex poisoned");
+            while !*started {
+                assert!(std::time::Instant::now() < deadline, "b never started");
+                let (guard, _timeout) = cv
+                    .wait_timeout(started, Duration::from_millis(100))
+                    .expect("mutex poisoned");
+                started = guard;
+            }
+        }
+
+        // Poll until task a's cell has actually detached.
+        loop {
+            let detached = store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0]
+                .detached_at_ms
+                .is_some();
+            if detached {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cell a never detached"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Simulate exactly what `server::resume_automation` does: mark the
+        // cell to resume its own session, then hand it back via
+        // `resume_detached_cell` -- NOT `restart_cell` -- while b's cell is
+        // still genuinely running (blocked in `release_b`). This must never
+        // touch the squad's own row: only the target cell resets.
+        {
+            let guard = store.lock().unwrap();
+            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
+            guard.resume_detached_cell(&id, 0, 0).unwrap();
+        }
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Running,
+            "resuming one detached cell must never touch the squad's own row"
+        );
+
+        // The live worker must redispatch and finish cell a on its own,
+        // without needing b to finish first.
+        loop {
+            let cell_a_done =
+                store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0].state == "done";
+            if cell_a_done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached cell a was never revived while sibling b was still running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Let b finish and let this pass complete.
+        {
+            let (lock, cv) = &runner.release_b;
+            let mut released = lock.lock().expect("mutex poisoned");
+            *released = true;
+            cv.notify_all();
+        }
+        handle.join().unwrap();
+
+        // The squad row was never touched by the resume, so this same live
+        // worker's own end-of-pass guard sees `Running` throughout and
+        // finalizes normally in this single pass -- no extra reclaim needed.
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Done
+        );
+    }
+
     fn store_with(toml: &str) -> (Arc<Mutex<Store>>, String) {
         let mut store = Store::open_in_memory().unwrap();
         let file = toml::from_str(toml).unwrap();
@@ -3663,6 +4013,112 @@ mod tests {
         assert_eq!(sem.in_use(), 64);
         drop(permits);
         assert_eq!(sem.in_use(), 0);
+    }
+
+    // RAL-280: when several ranked waiters are already blocked on an
+    // exhausted semaphore, the single freed permit must go to the lowest
+    // `priority` value, not whichever thread the OS happens to wake first.
+    #[test]
+    fn acquire_ranked_grants_freed_permit_to_lowest_priority_waiter() {
+        let sem = Semaphore::new(1);
+        let held = sem.acquire();
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|s| {
+            let sem_ref = &sem;
+            let order_ref = &order;
+            // Both block immediately (the one permit is held by `held`);
+            // spawn the *higher*-priority-number (lower-preference) one
+            // first so a naive FIFO/OS-order semaphore would grant it first.
+            let low_pref = s.spawn(move || {
+                let _p = sem_ref.acquire_ranked(f64::INFINITY);
+                order_ref.lock().unwrap().push("low_pref");
+            });
+            // Give the low-preference waiter time to register itself first.
+            std::thread::sleep(Duration::from_millis(30));
+            let high_pref = s.spawn(move || {
+                let _p = sem_ref.acquire_ranked(-5.0);
+                order_ref.lock().unwrap().push("high_pref");
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            drop(held);
+            high_pref.join().unwrap();
+            low_pref.join().unwrap();
+        });
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["high_pref", "low_pref"],
+            "the lower-priority-value (more preferred) waiter must win the freed permit \
+             even though it registered second"
+        );
+    }
+
+    // RAL-280 end-to-end: the same fairness property as
+    // `acquire_ranked_grants_freed_permit_to_lowest_priority_waiter` above,
+    // but exercised through the real dispatcher (`execute_squad_inner`)
+    // rather than calling `Semaphore::acquire_ranked` directly -- proving
+    // `cell_dispatch_priority` is actually consulted at dispatch time, and
+    // that a plain (non-Review) sibling still gets scheduled afterward
+    // rather than starving behind the boosted cell.
+    #[test]
+    fn review_branch_cell_wins_a_freed_dispatch_slot_over_a_plain_sibling() {
+        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
+        {
+            let guard = store.lock().unwrap();
+            let gid = guard
+                .create_guardian_for_squad("Stack", "main", "/repo", Some(&id))
+                .unwrap();
+            guard.add_guardian_branch(&gid, "rb").unwrap();
+            guard.set_cell_review_branch(&id, 0, 0, "rb").unwrap();
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let runner: Arc<dyn Runner> = Arc::new(RecordingRunner {
+            order: Arc::clone(&order),
+            fail_on: None,
+        });
+        // One slot, pre-held so both of the squad's independently-ready
+        // cells ("x", fed to the Review; "y", plain) pile up as real
+        // `acquire_ranked` waiters before either can run -- mirroring how
+        // the plain `Semaphore` test above establishes queue order before
+        // freeing the permit.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+
+        let dispatch_store = Arc::clone(&store);
+        let dispatch_sem = Arc::clone(&sem);
+        let dispatch_id = id.clone();
+        let handle = std::thread::spawn(move || {
+            let cancel = CancelToken::new();
+            let cancellations = Cancellations::new();
+            with_standalone_summary_queue(&dispatch_store, |queue| {
+                execute_squad_inner(
+                    &dispatch_store,
+                    runner.as_ref(),
+                    &dispatch_id,
+                    &cancel,
+                    &dispatch_sem,
+                    queue,
+                    &cancellations,
+                );
+            });
+        });
+
+        // Give both cells time to be dispatched and pile up behind the held
+        // permit before it frees.
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        handle.join().unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["x", "y"],
+            "the Review-feeding cell must win the freed slot ahead of its plain \
+             sibling, which must still run afterward rather than starve"
+        );
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Done
+        );
     }
 
     /// Stands in for a long-running cell: blocks in `run_cancellable` until
@@ -4029,6 +4485,161 @@ mod tests {
         assert!(
             !finalize_started.load(Ordering::SeqCst) || proof_calls.load(Ordering::SeqCst) >= 2,
             "finalize must never dispatch before its upstream proof's retry actually completed"
+        );
+
+        b_release.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+    }
+
+    /// Task "a": "work" -> "finalize" (`depends_on=["work"]`), no proof —
+    /// mirrors squad-000000000039's ral-295, whose `finalize` *cell body*
+    /// itself was restarted (via `Store::restart_cell`, not a proof-scoped
+    /// restart). Task "b" is a lone long-running cell that keeps the squad's
+    /// worker thread alive across the restart, standing in for ral-300's
+    /// still-running 7-step proof chain.
+    const WORK_FINALIZE_NO_PROOF: &str = "[[task]]\nname=\"a\"\n\
+        [[task.cell]]\nid=\"work\"\ncwd=\".\"\ncommand=\"do-work\"\n\
+        [[task.cell]]\nid=\"finalize\"\ncwd=\".\"\ncommand=\"do-finalize\"\ndepends_on=[\"work\"]\n\
+        [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do-b\"\n";
+
+    /// Task "b"'s single cell blocks until released (standing in for a
+    /// still-in-flight sibling); "a"'s `finalize` cell fails on its first
+    /// invocation and passes on any later one (standing in for "restarted
+    /// after being fixed"); "work" always succeeds.
+    struct CellRestartReclaimRunner {
+        finalize_calls: Arc<std::sync::atomic::AtomicUsize>,
+        b_started: Arc<std::sync::atomic::AtomicBool>,
+        b_release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Runner for CellRestartReclaimRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            use std::sync::atomic::Ordering;
+            if spec.task == "b" {
+                self.b_started.store(true, Ordering::SeqCst);
+                while !self.b_release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return RunnerResult {
+                    status: "done".to_string(),
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cost_usd: 0.0,
+                    summary: "b done".to_string(),
+                    error: None,
+                    proofed: None,
+                    agent_session_id: None,
+                    ghost: None,
+                };
+            }
+            if spec.cell_id == "finalize" {
+                let n = self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return RunnerResult::failure("finalize cell fails on first attempt");
+                }
+            }
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.0,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    /// Reproduces squad-000000000039/ral-295: a task's `finalize` cell fails,
+    /// the task finalizes as `Failed`, and the user restarts just that cell
+    /// (`restart_cell`, mirroring the board's per-cell "Restart" action) while
+    /// a sibling task in the same squad is still genuinely running. Because
+    /// the restarted cell wasn't itself `Running`, the restart (correctly)
+    /// never cancels the still-alive worker — but `Store::restart_cell`
+    /// unconditionally flips the *whole squad's* row back to `pending`
+    /// underneath it. The still-alive worker's reclaim step does re-drive
+    /// "a"'s cells and they complete cleanly on retry, but its finalizer must
+    /// still actually write the task's terminal state despite the squad row
+    /// staying desynced from `Running` — that write must not be silently
+    /// skipped, or the task is stuck at `running` forever (until "b", the
+    /// unrelated sibling, eventually finishes on its own).
+    #[test]
+    fn restart_cell_with_live_sibling_reaches_terminal_state_promptly() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (store, id) = store_with(WORK_FINALIZE_NO_PROOF);
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+        let b_started = Arc::new(AtomicBool::new(false));
+        let b_release = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn Runner> = Arc::new(CellRestartReclaimRunner {
+            finalize_calls: Arc::clone(&finalize_calls),
+            b_started: Arc::clone(&b_started),
+            b_release: Arc::clone(&b_release),
+        });
+        let token = CancelToken::new();
+
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || {
+                execute_squad_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
+        };
+
+        // Wait for "finalize"'s first (failing) attempt to land and for "b"
+        // to be genuinely in flight (the worker is alive and busy elsewhere).
+        while finalize_calls.load(Ordering::SeqCst) < 1 || !b_started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Let task "a" actually finalize as Failed before restarting it.
+        let mut a_failed = false;
+        for _ in 0..4000 {
+            if matches!(
+                store.lock().unwrap().task_state(&id, 0),
+                Ok(Some(NodeState::Failed))
+            ) {
+                a_failed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            a_failed,
+            "task a must finalize as Failed before the restart"
+        );
+
+        // Restart the (now-terminal, not Running) "finalize" cell directly
+        // via the store — exactly what `server::restart_cell` does once it
+        // decides the target isn't currently active and skips cancelling
+        // the still-alive worker (see that handler's doc comment).
+        store.lock().unwrap().restart_cell(&id, 0, 1).unwrap();
+
+        // Give the still-alive worker plenty of dispatcher ticks to reclaim
+        // "a", re-run "finalize", and re-finalize the task.
+        let mut a_state = None;
+        for _ in 0..4000 {
+            let state = store.lock().unwrap().task_state(&id, 0).unwrap();
+            if matches!(state, Some(NodeState::Done) | Some(NodeState::Failed)) {
+                a_state = state;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            a_state,
+            Some(NodeState::Done),
+            "task a's cells all completed cleanly on retry but its DB row never \
+             reached a terminal state promptly — stuck at {:?} because the \
+             finalizer's terminal-state write was silently skipped while the \
+             squad row stayed desynced from Running",
+            store.lock().unwrap().task_state(&id, 0).unwrap()
         );
 
         b_release.store(true, Ordering::SeqCst);
@@ -5605,6 +6216,13 @@ mod tests {
         std::fs::write(dir.join("base.txt"), "base\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-m", "base"]);
+        // RAL-293: pin a local `base` branch to the same commit and make
+        // `main` track it, standing in for the `?upstream=` tracking ref a
+        // real worktree materializes (`worktrees::set_explicit_upstream`) --
+        // the no-new-commits guard now reads `@{upstream}` instead of a
+        // captured baseline sha, so every caller needs a resolvable one.
+        run(&["branch", "base"]);
+        run(&["branch", "--set-upstream-to=base", "main"]);
         dir
     }
 
@@ -5818,6 +6436,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispatch_promotes_values_of_secret_named_env_vars_into_the_redaction_registry() {
+        // RAL-281: a name on the DB-configured secret-name list must scrub
+        // that variable's *value* from durable pane text even though it's a
+        // plain literal `environment=` entry, not a `from_env`-indirected
+        // agent-profile value (RAL-264's existing mechanism).
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            let mut store = Store::open_in_memory().unwrap();
+            store.add_secret_env_name("MY_SECRET_TOKEN").unwrap();
+            let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do-thing\"\nenvironment={MY_SECRET_TOKEN=\"sekret-val-xyz\"}\n";
+            let file = toml::from_str(toml).unwrap();
+            let id = store.insert_squad(&file, None, false).unwrap();
+            let store = Arc::new(Mutex::new(store));
+
+            execute_squad(&store, &FakeRunner { fail_on: None }, &id);
+
+            assert_eq!(
+                crate::redact::redact_all("prefix sekret-val-xyz suffix"),
+                "prefix <redacted> suffix"
+            );
+        });
+    }
+
     // ── RAL-156: no-new-commits-since-baseline guard ─────────────────────────
 
     /// A `Runner` that actually commits a file change in `spec.cwd`, standing
@@ -5882,6 +6524,44 @@ mod tests {
     }
 
     #[test]
+    fn git_backed_task_with_zero_commits_records_task_error() {
+        // RAL-291: every cell/proof under this task reports clean success
+        // (FakeRunner always returns "done"), so the only place a human can
+        // learn why the task itself failed is TaskView.error.
+        let repo = wt_test_repo("no-commits-task-error");
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_squad(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        execute_squad(&store, &FakeRunner { fail_on: None }, &id);
+
+        let guard = store.lock().unwrap();
+        let squad = guard.get_squad(&id).unwrap();
+        let task = &squad.tasks[0];
+        assert_eq!(task.state, "failed");
+        assert!(
+            task.cells.iter().all(|s| s.error.is_none()),
+            "the guard failed the task directly -- no cell should carry an error"
+        );
+        let error = task
+            .error
+            .as_deref()
+            .expect("TaskView.error must be set when the no-commits guard fails the task");
+        assert!(
+            error.contains("no commits since baseline"),
+            "expected the guard's own message, got: {error}"
+        );
+    }
+
+    #[test]
     fn git_backed_task_with_a_commit_passes() {
         let repo = wt_test_repo("with-commit");
         let toml = format!(
@@ -5898,10 +6578,143 @@ mod tests {
 
         execute_squad(&store, &CommittingRunner, &id);
 
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            guard.squad_state(&id).unwrap(),
+            SquadState::Done,
+            "a cell that actually committed must satisfy the guard"
+        );
+        assert!(
+            guard.get_squad(&id).unwrap().tasks[0].error.is_none(),
+            "a task that passed the guard must not carry a stale/spurious error"
+        );
+    }
+
+    #[test]
+    fn restarting_a_task_clears_its_no_commits_guard_error() {
+        // RAL-291: TaskView.error must follow the same restart-clears-error
+        // lifecycle as CellView.error -- a retried task that hasn't
+        // re-finalized yet must not still show the previous attempt's reason.
+        let repo = wt_test_repo("no-commits-restart-clears-error");
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_squad(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        execute_squad(&store, &FakeRunner { fail_on: None }, &id);
+        assert!(
+            store.lock().unwrap().get_squad(&id).unwrap().tasks[0]
+                .error
+                .is_some(),
+            "precondition: the guard must have recorded an error"
+        );
+
+        store.lock().unwrap().restart_task(&id, 0).unwrap();
+
+        assert!(
+            store.lock().unwrap().get_squad(&id).unwrap().tasks[0]
+                .error
+                .is_none(),
+            "restart_task must clear the task's stale failure reason"
+        );
+    }
+
+    /// RAL-293's actual repro (squad-000000000037): a worktree already holds
+    /// a real commit ahead of its upstream *before this squad was even
+    /// submitted* -- standing in for an earlier squad run that reused the
+    /// same worktree/branch and did the work, leaving nothing for this run's
+    /// own cells to commit. The old baseline-sha guard captured HEAD at this
+    /// run's cell-start (i.e. *after* the prior commit already landed) and so
+    /// saw zero new commits and failed the task; reading `@{upstream}`
+    /// instead must pass, since the branch is genuinely ahead of its base.
+    #[test]
+    fn task_passes_when_worktree_already_has_a_commit_ahead_of_upstream_from_an_earlier_run() {
+        let repo = wt_test_repo("reused-worktree");
+        // The "earlier run" already committed this before the squad below is
+        // ever submitted -- no cell in this squad will touch the worktree.
+        std::fs::write(repo.join("earlier-run.txt"), "already done\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .status()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "earlier run's work"])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .current_dir(&repo)
+            .status()
+            .expect("git commit");
+
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_squad(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        // This run's own cell makes no commit -- FakeRunner never touches
+        // the filesystem -- yet the task must still pass on the strength of
+        // the pre-existing commit.
+        execute_squad(&store, &FakeRunner { fail_on: None }, &id);
+
         assert_eq!(
             store.lock().unwrap().squad_state(&id).unwrap(),
             SquadState::Done,
-            "a cell that actually committed must satisfy the guard"
+            "a worktree already ahead of upstream must pass, regardless of which run made the commit"
+        );
+    }
+
+    /// RAL-293 AC: a task restart against a worktree left in the same
+    /// (already-ahead-of-upstream) state must still pass -- the guard's
+    /// answer must not depend on a per-run captured baseline that a restart
+    /// could leave stale or inconsistent.
+    #[test]
+    fn task_restart_still_passes_when_the_worktree_remains_ahead_of_upstream() {
+        let repo = wt_test_repo("restart-guard");
+        let toml = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"{}\"\ncommand=\"do-thing\"\n",
+            repo.to_string_lossy().replace('\\', "/")
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let file = toml::from_str(&toml).unwrap();
+        let id = store.insert_squad(&file, None, false).unwrap();
+        let store = Arc::new(Mutex::new(store));
+
+        // First run: the cell really commits, so the task passes.
+        execute_squad(&store, &CommittingRunner, &id);
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Done
+        );
+
+        // Restart the task and re-run with a runner that makes no further
+        // commit. The worktree's git state (and its earlier commit) is left
+        // exactly as the first run finished it.
+        store.lock().unwrap().restart_task(&id, 0).unwrap();
+        execute_squad(&store, &FakeRunner { fail_on: None }, &id);
+
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Done,
+            "a restarted task must still pass on the strength of the earlier run's commit"
         );
     }
 

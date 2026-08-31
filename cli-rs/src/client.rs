@@ -66,6 +66,14 @@ impl DaemonClient {
         DEFAULT_DAEMON_URL
     }
 
+    /// The daemon URL this client was constructed with -- `ralphus-mcp`
+    /// needs it back out for `health::run_checks`, which takes a raw URL
+    /// string rather than a `DaemonClient` (RAL-301).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
@@ -548,6 +556,33 @@ impl DaemonClient {
         ))
     }
 
+    /// This cell's merged, current-attempt-only debug stream (RAL-296) —
+    /// bare JSON array of `SquadTimelineEntry`, ascending by time.
+    pub fn cell_debug_events(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/debug-events"
+        ))
+    }
+
+    /// Same as [`Self::cell_debug_events`], for a `prompt`-kind proof step.
+    pub fn proof_debug_events(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        proof_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/squads/{squad_id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/debug-events"
+        ))
+    }
+
     pub fn ghost_get(&self, owner_uri: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/ghosts/{}", urlencode(owner_uri)))
     }
@@ -1017,8 +1052,8 @@ impl DaemonClient {
         self.post(&format!("/api/guardians/{guardian_id}/merge"), None)
     }
 
-    pub fn guardian_sync_github(&self, guardian_id: &str) -> Result<Value, DaemonError> {
-        self.post(&format!("/api/guardians/{guardian_id}/sync-github"), None)
+    pub fn guardian_sync_pr(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/guardians/{guardian_id}/sync-pr"), None)
     }
 
     pub fn guardian_cancel_and_merge(&self, guardian_id: &str) -> Result<Value, DaemonError> {

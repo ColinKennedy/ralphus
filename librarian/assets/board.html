@@ -377,6 +377,7 @@
           <button id="tab-machines" class="tab" onclick="showTab('machines', true)" data-tip="Machines — registered providers that remote tasks, cells and proof steps run on (RAL-185).\nA task declares machine = &quot;&lt;scheme&gt;:&lt;uri&gt;&quot;; the daemon looks the scheme up here to find the program that reaches that machine.\nRegistering is an admin action and is deliberately not declarable in a task file.">Machines</button>
           <button id="tab-projects" class="tab" onclick="showTab('projects', true)" data-tip="Projects — registered git repositories a task's cell cwd can materialize a worktree under (RAL-100).\nDouble-click Description, Path, or VCS to edit a field, then Save or Cancel.\nA row highlighted in red failed validation — hover its name for why.">Projects</button>
           <button id="tab-users" class="tab" onclick="showTab('users', true)" data-tip="Users — placeholder identities a request can attribute itself to (see AgentAccess/UserContext).\nThis is NOT authentication: no password, no session, no permissions — a name grants nothing on its own.\nTODO: replace with user auth once RAL-252 is done.">Users</button>
+          <button id="tab-secrets" class="tab" onclick="showTab('secrets', true)" data-tip="Secrets — env-var names treated as secret (RAL-281).\nA cell/proof step's resolved env is checked by name against this list; a match scrubs that variable's value from durable pane text and terminal logs, in addition to the existing from_env-sourced agent-profile secrets.\nChanges apply immediately, no daemon restart needed.">Secrets</button>
         </nav>
       </div>
       <div class="status-right">
@@ -517,6 +518,14 @@
       <div id="users"><div class="empty">Loading…</div></div>
     </main>
 
+    <main id="secrets-page" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <b data-tip="Secrets (RAL-281) — env-var names treated as secret.\nA cell/proof step's resolved env is checked by name against this list; a match scrubs that variable's value from durable pane text and terminal logs, additive to the existing from_env-sourced agent-profile secret registry (RAL-264).\nChanges apply immediately, no daemon restart needed.">Secrets</b>
+        <span style="color:var(--muted)" id="secret-env-name-summary">—</span>
+      </div>
+      <div id="secrets"><div class="empty">Loading…</div></div>
+    </main>
+
     <main id="machines-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <b data-tip="Machines (RAL-185) — every machine provider registered with the daemon.\nA task/cell/proof/review sets machine = &quot;&lt;scheme&gt;:&lt;uri&gt;&quot;; the daemon never interprets the uri, it hands it to that scheme's provider program verbatim.\nSee docs/machine-providers.md for the provider contract.">Machines</b>
@@ -590,6 +599,7 @@
        * @property {string|null} agent - Raw task-level `agent` from the submitted TOML, or null when unset.
        * @property {string|null} model - Raw task-level `model` from the submitted TOML, or null when unset.
        * @property {string} state
+       * @property {string|null} [error] - RAL-291: failure detail for a task-level failure with no underlying cell/proof error to point to (e.g. the RAL-156 no-commits-since-baseline guard). Absent/null when the task hasn't failed this way, including when a child cell/proof failure caused the task to fail instead.
        * @property {CellView[]} cells
        * @property {ProofView[]} [proof]
        * @property {string[]} [depends_on]
@@ -770,10 +780,21 @@
        * @property {string} description
        * @property {number|null} [pr_number]
        * @property {string|null} [pr_url]
-       * @property {string} state - "open" | "merged" | "closed"
+       * @property {string} state - "open" | "merged" | "closed" | "dropped"
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
        * @property {string|null} [last_pushed_sha]
+       * @property {string|null} [stack_id]
+       * @property {string|null} [dropped_reason]
+       */
+      /**
+       * One past "submit a stack" call for a review (RAL-302): every PR row
+       * it created, in any state -- see
+       * `GET /api/guardians/{id}/pull-request-stacks`.
+       * @typedef {object} PrStackView
+       * @property {string} stack_id
+       * @property {number} submitted_at_ms
+       * @property {PullRequestView[]} prs
        */
       /**
        * Live drift check between a PR's remote branch and its owning review
@@ -830,10 +851,14 @@
        */
       /**
        * @typedef {object} DebugEventEntry - one row from a `.../debug-events`
-       *   endpoint (RAL-288 Stage 5) -- `daemon/src/timeline.rs`'s
-       *   `SquadTimelineEntry`, scoped to one cell. Deliberately a distinct
-       *   shape from {@link CartographerRow} (no `id`/`squad_id`/
-       *   `guardian_id`/`payload`; adds `log_path`/`log_excerpt`).
+       *   endpoint (RAL-288 Stage 5, generalized to all four terminal-log
+       *   contexts in RAL-296) -- `daemon/src/timeline.rs`'s
+       *   `SquadTimelineEntry`, scoped to one cell/proof step/guardian branch
+       *   resolver/guardian manual-checks run's most recent attempt.
+       *   Deliberately a distinct shape from {@link CartographerRow} (no
+       *   `id`/`squad_id`/`guardian_id`/`payload`; adds
+       *   `log_path`/`log_excerpt`, the latter inlining that entry's own
+       *   terminal-log content when it has one).
        * @property {number} at_ms
        * @property {string} level
        * @property {string} source
@@ -875,6 +900,11 @@
        */
       /**
        * @typedef {object} UserView
+       * @property {string} name
+       * @property {number} created_at_ms
+       */
+      /**
+       * @typedef {object} SecretEnvNameView
        * @property {string} name
        * @property {number} created_at_ms
        */
@@ -1048,6 +1078,9 @@
       CLICK_HANDLERS.toggleCartoPayload = (e, ds) => toggleCartoPayload(Number(ds.id));
       CLICK_HANDLERS.ntRemoveFile = (e, ds) => ntRemoveFile(Number(ds.i));
       CLICK_HANDLERS.setLogsTab = (e, ds) => { logsTab = ds.tab || ""; renderLogs(); };
+      CLICK_HANDLERS.showLogsCopyMenu = (e, ds) => showLogsCopyMenu(e, ds.tab || "");
+      CLICK_HANDLERS.copyLogsAs = (e, ds) => copyLogsAs(e, ds.tab || "", ds.scope || "current");
+      CLICK_HANDLERS.openLinkedOutputPopup = (e, ds) => openLinkedOutputPopup(ds.key || "");
       CLICK_HANDLERS.runSingleManualCheck = (e, ds) => runSingleManualCheck(ds.guardianId || "", Number(ds.i));
       CLICK_HANDLERS.runActionHint = (e, ds) => runActionHint(ds.guardianId || "", Number(ds.i));
       CLICK_HANDLERS.toggleCheckForm = (e, ds) => toggleCheckForm(ds.key || "");
@@ -1094,7 +1127,7 @@
       CLICK_HANDLERS.stopMerge = (e, ds) => stopMerge(ds.guardianId || "");
       CLICK_HANDLERS.forceStartReview = (e, ds) => forceStartReview(ds.guardianId || "");
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
-      CLICK_HANDLERS.syncGithubReview = (e, ds) => syncGithubReview(ds.guardianId || "");
+      CLICK_HANDLERS.syncPrReview = (e, ds) => syncPrReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");
       CLICK_HANDLERS.toggleManualMenu = (e, ds) => toggleManualMenu(ds.guardianId || "");
       CLICK_HANDLERS.copyChatAs = (e, ds) => copyChatAs(ds.guardianId || "", ds.branchId || "", ds.format || "");
@@ -1106,6 +1139,9 @@
       CLICK_HANDLERS.checkMachine = (e, ds) => checkMachine(ds.scheme || "");
       CLICK_HANDLERS.removeMachine = (e, ds) => removeMachine(ds.scheme || "");
       CLICK_HANDLERS.removeUser = (e, ds) => removeUser(ds.name || "");
+      CLICK_HANDLERS.saveUserEdit = (e, ds) => saveUserEdit(ds.name || "");
+      CLICK_HANDLERS.renameSecretEnvName = (e, ds) => renameSecretEnvName(ds.name || "");
+      CLICK_HANDLERS.removeSecretEnvName = (e, ds) => removeSecretEnvName(ds.name || "");
       CLICK_HANDLERS.saveProjectEdit = (e, ds) => saveProjectEdit(ds.name || "");
       CLICK_HANDLERS.queueToggleCollapse = (e, ds) => queueToggleCollapse(e, ds.key || "");
       CLICK_HANDLERS.queueHeaderClick = (e, ds) => queueHeaderClick(e, ds.key || "");
@@ -1115,6 +1151,7 @@
       CTX_HANDLERS.queueMenu = (e, ds) => queueMenu(e, ds.path || "");
       CLICK_HANDLERS.openReviewLogs = (e, ds) => openReviewLogs(ds.guardianId || "");
       CLICK_HANDLERS.openReviewTitleMenu = (e, ds) => openReviewTitleMenu(e, ds.guardianId || "");
+      CLICK_HANDLERS.openReviewPrStacks = (e, ds) => openReviewPrStacks(ds.guardianId || "");
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;
@@ -1164,6 +1201,16 @@
       let users = [];
       /** Message from the last failed add/remove, shown inline above the table. */
       let userError = "";
+      /** @type {string|null} name of the user row currently in edit mode, or null */
+      let userEditState = null;
+      /** @type {{name?: string}} draft for the row being edited */
+      let userEditDraft = {};
+      let userSaveError = "";   // message from the last failed rename, shown inline in the edit row
+      // ---- Secrets tab (RAL-281: user-configurable secret env-var name list) ----
+      /** @type {SecretEnvNameView[]} */
+      let secretEnvNames = [];
+      /** Message from the last failed add/rename/remove, shown inline above the table. */
+      let secretEnvNameError = "";
       /** @type {Map<string, AgentOptionsCacheEntry>} cwd -> agents + default fetched from GET /api/agents, cached for the page's lifetime. */
       const agentOptionsByCwd = new Map();
       /**
@@ -1385,7 +1432,7 @@
       let historyOpen = {};
       /** @type {{[key: string]: AttemptMeta[]}} peek key -> last-fetched list of persisted attempts for that cell/proof/resolver */
       let historyAttempts = {};
-      /** @type {{[key: string]: {attempt: number, content: string}|null}} peek key -> the one historical attempt currently being viewed in full, if any */
+      /** @type {{[key: string]: {attempt: number, content: string, merged: boolean}|null}} peek key -> the one historical attempt currently being viewed in full, if any. `merged` (RAL-296) is true when `content` came from the merged `.../debug-events` stream (the most recent attempt) rather than that attempt's raw, un-merged terminal-log content. */
       let historyViewing = {};
       /** @type {Set<string>} gid -> an Approve is in flight, so the button shows a pending/disabled state until it resolves (RAL-234) */
       let pendingGuardianActions = new Set();
@@ -1909,6 +1956,18 @@
        */
       const failLogBtn = (err) => `<button class="logs-btn fail" data-tip="View the failure log — the full error traceback for this cell." data-full="${esc(err)}" onclick="event.stopPropagation();openErrPopup(event)">📄 Failure log</button>`;
       /**
+       * Writes text to the clipboard, falling back to a hidden textarea +
+       * `execCommand` in insecure contexts where `navigator.clipboard` is unavailable.
+       * @param {string} text
+       * @returns {Promise<void>}
+       */
+      async function writeClipboardText(text) {
+        if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return; }
+        const ta = document.createElement("textarea");
+        ta.value = text; ta.style.cssText = "position:fixed;opacity:0";
+        document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove();
+      }
+      /**
        * Copies a copy-button's `data-copy` payload to the clipboard and flashes a checkmark.
        * @param {MouseEvent} e
        * @returns {Promise<void>}
@@ -1917,8 +1976,7 @@
         e.stopPropagation();
         const btn = /** @type {HTMLElement} */ (e.currentTarget), text = btn.dataset.copy || "";
         try {
-          if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
-          else { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+          await writeClipboardText(text);
           btn.textContent = "✓"; btn.classList.add("copied");
           setTimeout(() => { btn.textContent = "⧉"; btn.classList.remove("copied"); }, 1200);
         } catch (_) { btn.textContent = "✗"; setTimeout(() => { btn.textContent = "⧉"; }, 1200); }
@@ -2077,7 +2135,7 @@
       initSplitters();
 
       // ---------- tabs ----------
-      const TABS = ["tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "users"];
+      const TABS = ["tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "users", "secrets"];
       /**
        * Switches the active top-level tab, updates its URL hash, and re-renders.
        * @param {string} name
@@ -2088,7 +2146,7 @@
         tab = name;
         for (const t of TABS) {
           const page = byId(t + "-page");
-          page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "users" ? "block" : "grid") : "none";
+          page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "users" || t === "secrets" ? "block" : "grid") : "none";
           byId("tab-" + t).classList.toggle("active", name === t);
         }
         // Entering the Queue tab is a deliberate action, so refresh it once on
@@ -3167,39 +3225,80 @@
       // for them).
       //
       // "Show Debug Messages" is additive instead: when checked, it fetches
-      // that cell's own Cartographer rows and appends them as a distinct,
-      // clearly-labeled block after the (unmodified) pane text. This is a
-      // deliberate approximation, not true line-by-line interleaving --
-      // tmux pane captures carry no reliable per-line timestamps to splice
-      // against (`daemon/src/timeline.rs`'s module doc comment already
-      // documents the same limitation for the whole-squad timeline this
-      // reuses).
+      // that entity's own merged, current-attempt-only debug stream
+      // (`.../debug-events`, RAL-296) -- lifecycle events with any
+      // terminal-log excerpt already inlined at its own event -- and prepends
+      // it, in chronological order, ahead of the (unmodified) live pane text.
+      // No separate "---- footer ----" block: the two used to be two
+      // differently-sourced views (a disconnected Cartographer-only footer
+      // here, vs. the durable-attempt viewer below reading raw, un-merged
+      // terminal-log content) that could disagree with each other; RAL-296
+      // unified them onto this one endpoint, which the attempt-history box's
+      // "view latest attempt" path (see `viewHistoryAttempt`) also now reads
+      // from for its "popup/expanded" presentation of the same stream. This
+      // is still a deliberate approximation, not true line-by-line
+      // interleaving -- tmux pane captures carry no reliable per-line
+      // timestamps to splice against (`daemon/src/timeline.rs`'s module doc
+      // comment documents the same limitation for the whole-squad timeline
+      // this reuses).
       /** @type {{[key: string]: DebugEventEntry[]}} cached debug-event rows per peek key, fetched only while that pane's checkbox is checked. */
       let peekDebugEvents = {};
+      // RALPHUS-DEBUG-STREAM:BEGIN
+      // Pure, DOM/fetch/module-state-free logic for the unified debug/
+      // terminal-log stream (RAL-296) -- kept free of `peekContent`/
+      // `peekDebugEvents`/other module-level state so it can be sliced out
+      // and evaluated standalone by test/board-debug-stream.mjs, the same
+      // pattern test/board-peek-state.mjs and test/board-merge-button.mjs use
+      // for their own regions. See librarian/AGENTS.md's "Testing --
+      // Frontend" section before moving these markers.
       /**
-       * The `/debug-events` endpoint for peek key `key`, or `null` when this
-       * kind has no such endpoint yet (proof steps and guardian resolvers/
-       * manual-checks generation -- only plain task cells are wired so far).
+       * The `/debug-events` endpoint for peek key `key` (RAL-296: all four
+       * kinds are wired -- cell, proof step, guardian branch resolver,
+       * guardian manual-checks generation).
        * @param {string} key
        * @returns {string|null}
        */
       function debugEventsUrlFor(key) {
         const [kind, ...rest] = key.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/debug-events`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/debug-events`; }
+        if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/debug-events`; }
+        if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/debug-events`; }
         return null;
       }
       /**
-       * One cached debug-event row rendered as a single human-readable line.
+       * One cached debug-event row rendered as a human-readable line, with
+       * its inlined terminal-log excerpt (if any) indented beneath it --
+       * mirrors `daemon/src/timeline.rs::render_entry`'s plain-text rendering
+       * of the same `SquadTimelineEntry` shape.
        * @param {DebugEventEntry} e
        * @returns {string}
        */
       function formatDebugEvent(e) {
-        return `[${new Date(e.at_ms).toLocaleTimeString()}] ${e.source}: ${e.message}`;
+        const head = `[${new Date(e.at_ms).toLocaleTimeString()}] ${e.source}: ${e.message}`;
+        if (!e.log_excerpt) return head;
+        const excerpt = e.log_excerpt.split("\n").map((l) => `    | ${l}`).join("\n");
+        return `${head}\n${excerpt}`;
       }
       /**
-       * Peek key `key`'s current display text (RAL-288 Stage 5): the clean
-       * base pane content, plus a trailing block of cached debug events when
+       * Whether `attempt` is the most recent of `attempts` (RAL-296) -- the
+       * one `viewHistoryAttempt` routes through the merged `.../debug-events`
+       * stream instead of that attempt's raw, un-merged terminal-log content.
+       * An empty `attempts` list (nothing fetched yet) is never "most recent".
+       * @param {AttemptMeta[]} attempts
+       * @param {number} attempt
+       * @returns {boolean}
+       */
+      function isMostRecentAttempt(attempts, attempt) {
+        return attempts.length > 0 && attempt === Math.max(...attempts.map((a) => a.attempt));
+      }
+      // RALPHUS-DEBUG-STREAM:END
+      /**
+       * Peek key `key`'s current display text: cached debug events (RAL-296:
+       * lifecycle events with their terminal-log excerpts already inlined),
+       * in chronological order, ahead of the live pane's own tail -- when
        * "Show Debug Messages" is checked and any are cached for this key.
+       * Otherwise just the clean base pane content.
        * @param {string} key
        * @returns {string}
        */
@@ -3208,7 +3307,7 @@
         if (!peekShowsDebug(key)) return base;
         const events = peekDebugEvents[key];
         if (!events || !events.length) return base;
-        return `${base}\n\n---- ralphus debug events ----\n${events.map(formatDebugEvent).join("\n")}`;
+        return `${events.map(formatDebugEvent).join("\n")}\n\n${base}`;
       }
       /**
        * Fetches and caches peek key `key`'s debug events, if its checkbox is
@@ -3468,11 +3567,13 @@
           : "";
         // RAL-288 Stage 5: the pane itself is always pure agent output now
         // (the daemon strips ralphus's own marker lines before ever serving
-        // it) -- "Show Debug Messages" additively appends that cell's own
-        // Cartographer rows instead of revealing anything already inline.
+        // it) -- "Show Debug Messages" prepends that entity's own merged,
+        // current-attempt-only debug stream (RAL-296: lifecycle events plus
+        // any inlined terminal-log excerpt, chronologically ahead of the live
+        // tail) instead of revealing anything already inline.
         const showDebug = peekShowsDebug(key);
         const shown = cached !== undefined ? currentPeekDisplayText(key) : undefined;
-        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Append ralphus's own diagnostic/telemetry events (session lifecycle, token/cost, RALPHUS_EVENT markers) after the agent's actual output, fetched from Cartographer.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep both.\nOnly available for plain task cells today (not proof steps or review resolvers)."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost, RALPHUS_EVENT markers) chronologically ahead of the agent's actual output, fetched from Cartographer.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep both."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
         return `<div class="peek-box" data-tip="${headTip}">
             <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             <div class="peek-pre-wrap">
@@ -3703,25 +3804,47 @@
         if (selectedGuardian) renderReviewDetail();
       }
       /**
-       * Fetches one historical attempt's full content and shows it inline in
-       * the attempt-history box.
+       * Fetches one historical attempt's content and shows it inline in the
+       * attempt-history box, this key's "Open Terminal Log" popup/expanded
+       * view. When `attempt` is this key's *most recent* persisted attempt,
+       * RAL-296 routes it through the same merged `.../debug-events` stream
+       * "Show Debug Messages" shows inline (lifecycle events plus inlined
+       * terminal-log excerpts, current-attempt-only) rather than that
+       * attempt's bare, un-merged terminal-log content -- so the two views
+       * never disagree. Older attempts (picked from the list) keep reading
+       * their own raw, un-merged content: browsing *past* attempts is this
+       * box's unchanged job, and only the current attempt is in scope for
+       * unification.
        * @param {string} key
        * @param {number} attempt
        * @returns {Promise<void>}
        */
       async function viewHistoryAttempt(key, attempt) {
-        const url = terminalLogAttemptsUrlFor(key, attempt);
+        const attempts = historyAttempts[key] || [];
+        const debugUrl = isMostRecentAttempt(attempts, attempt) ? debugEventsUrlFor(key) : null;
+        const url = debugUrl || terminalLogAttemptsUrlFor(key, attempt);
         if (!url) return;
-        historyViewing[key] = { attempt, content: "Loading…" };
+        const merged = !!debugUrl;
+        historyViewing[key] = { attempt, content: "Loading…", merged };
         if (sel.kind) renderDetails();
         if (selectedGuardian) renderReviewDetail();
         try {
           const resp = await fetch(url);
-          if (!resp.ok) { historyViewing[key] = { attempt, content: "Could not load this attempt's log." }; return; }
-          const data = await resp.json();
-          historyViewing[key] = { attempt, content: scrubSecrets(data.content || "(empty)") };
+          if (!resp.ok) { historyViewing[key] = { attempt, content: "Could not load this attempt's log.", merged }; return; }
+          if (debugUrl) {
+            /** @type {DebugEventEntry[]} */
+            const events = await resp.json();
+            historyViewing[key] = {
+              attempt,
+              content: events.length ? scrubSecrets(events.map(formatDebugEvent).join("\n")) : "(no debug events recorded)",
+              merged,
+            };
+          } else {
+            const data = await resp.json();
+            historyViewing[key] = { attempt, content: scrubSecrets(data.content || "(empty)"), merged };
+          }
         } catch (_) {
-          historyViewing[key] = { attempt, content: "Could not load this attempt's log (network error)." };
+          historyViewing[key] = { attempt, content: "Could not load this attempt's log (network error).", merged };
         }
         if (sel.kind) renderDetails();
         if (selectedGuardian) renderReviewDetail();
@@ -3757,7 +3880,10 @@
         if (!historyOpen[key]) return "";
         const viewing = historyViewing[key];
         if (viewing) {
-          return `<div class="history-box" data-tip="One persisted attempt's full terminal-log content, read from durable on-disk storage (RAL-154).\nThis is a fixed historical record — it never changes, even if the cell later reattaches again.">
+          const viewingTip = viewing.merged
+            ? "This most recent attempt's merged debug stream (RAL-296) — the same lifecycle events plus inlined terminal-log excerpts \"Show Debug Messages\" shows inline, current-attempt-only.\nCan still change if this attempt is actively running; becomes a fixed historical record once it ends."
+            : "One older, persisted attempt's full terminal-log content, read from durable on-disk storage (RAL-154).\nThis is a fixed historical record — it never changes, even if the cell later reattaches again.";
+          return `<div class="history-box" data-tip="${viewingTip}">
               <div class="history-head"><span>Attempt ${viewing.attempt}</span><button class="btn" style="padding:1px 7px;font-size:11px" data-click="closeHistoryAttempt" data-key="${esc(key)}" data-tip="Back to the list of persisted attempts.">← Back</button></div>
               <div class="peek-pre-wrap"><pre class="peek-pre" style="height:${peekPaneHeight}px">${esc(viewing.content)}</pre></div>
             </div>`;
@@ -5414,7 +5540,7 @@
         return `<div class="dhead"><span class="k">⯀ task</span></div>
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${outOfDateBadge(t.env_out_of_date)}${["pending","queued"].includes(t.state) ? "" : squadLogsBtn(r.id)}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${outOfDateBadge(t.env_out_of_date)}${["pending","queued"].includes(t.state) ? "" : squadLogsBtn(r.id)}${t.error ? failLogBtn(t.error) : ""}</span></div>
           ${timingRows(t.started_at_ms, t.finished_at_ms)}
           ${cells}
           ${proof}
@@ -5665,18 +5791,99 @@
         return `<div${idAttr} class="prompt-box"${tipAttr}>${esc(text || "—")}</div>`;
       }
       /**
+       * Renders a modal popup showing arbitrary text content under `title`.
+       * Shared by `openCmdPopup` (synchronous, from a `data-full` attribute)
+       * and `openLinkedOutputPopup` (RAL-295, fetched asynchronously).
+       * @param {string} title
+       * @param {string} text
+       * @returns {void}
+       */
+      function showTextPopup(title, text) {
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
+            <h2>${esc(title)}</h2>
+            <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px">${esc(text)}</pre>
+            <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button></div>
+          </div></div>`;
+      }
+      /**
        * Opens a modal popup showing a command/output's full text (from `data-full`).
        * @param {MouseEvent} e
        * @returns {void}
        */
       function openCmdPopup(e) {
         const text = /** @type {HTMLElement} */ (e.currentTarget).dataset.full || "";
-        byId("modal-root").innerHTML = `
-          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
-            <h2>Command</h2>
-            <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px">${esc(text)}</pre>
-            <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button></div>
-          </div></div>`;
+        showTextPopup("Command", text);
+      }
+      // RALPHUS-LINKED-OUTPUT-FETCH:BEGIN
+      // How a cell/proof-step's output popup resolves its text: durable
+      // terminal-log attempt first, live/last pane snapshot second, `null` if
+      // neither backend ever captured anything. Its only external calls are
+      // `terminalLogAttemptsUrlFor`/`peekUrlFor`/`scrubSecrets` (all injected
+      // as parameters by test/board-linked-output-fetch.mjs) and the global
+      // `fetch` (stubbed per-test) -- keep it that way so the fallback order
+      // can be exercised under `node --test` without a live daemon.
+      /**
+       * Resolves a cell/proof-step peek `key`'s most recently captured raw
+       * output text (RAL-295): a durably-persisted terminal-log attempt if one
+       * exists (the fuller, final record), else the live/last tmux pane
+       * snapshot, else `null` when neither backend has ever captured anything
+       * for this key. Shared by the Logs modal's cells/proofs tabs, which link
+       * to this data on demand rather than carrying a separate stored/
+       * summarized output field.
+       * @param {string} key
+       * @returns {Promise<string|null>}
+       */
+      async function fetchLinkedOutputText(key) {
+        const attemptsUrl = terminalLogAttemptsUrlFor(key);
+        if (attemptsUrl) {
+          try {
+            const resp = await fetch(attemptsUrl);
+            if (resp.ok) {
+              const data = await resp.json();
+              /** @type {AttemptMeta[]} */
+              const attempts = data.attempts || [];
+              if (attempts.length) {
+                const contentUrl = terminalLogAttemptsUrlFor(key, attempts[attempts.length - 1].attempt);
+                if (contentUrl) {
+                  const contentResp = await fetch(contentUrl);
+                  if (contentResp.ok) {
+                    const contentData = await contentResp.json();
+                    return scrubSecrets(contentData.content || "");
+                  }
+                }
+              }
+            }
+          } catch (_) { /* fall through to the live/last pane snapshot */ }
+        }
+        const paneUrl = peekUrlFor(key);
+        if (paneUrl) {
+          try {
+            const resp = await fetch(paneUrl);
+            if (resp.ok) {
+              /** @type {PeekPaneResponse} */
+              const data = await resp.json();
+              if (data.content) return scrubSecrets(data.content);
+            }
+          } catch (_) { /* nothing left to try */ }
+        }
+        return null;
+      }
+      // RALPHUS-LINKED-OUTPUT-FETCH:END
+      /**
+       * Opens the Logs modal's output popup for a cell/proof-step row
+       * (RAL-295), fetching content on demand from the pane/terminal-log-
+       * attempts endpoints instead of a pre-stored summary field.
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function openLinkedOutputPopup(key) {
+        showTextPopup("Output", "Loading…");
+        const text = await fetchLinkedOutputText(key);
+        // The modal may have been closed while the fetch was in flight --
+        // don't pop a stale result back open over whatever the user did next.
+        if (!byId("modal-root").innerHTML) return;
+        showTextPopup("Output", text || "No output recorded yet.");
       }
       // A failed cell/finalize shows only a badge + this button; the full
       // error (often a long traceback) opens here instead of flooding the graph.
@@ -6344,12 +6551,91 @@
         render();
         loadCartoModalRows(cacheKey, { guardian_id: gid }).then(render);
       }
+      /** @type {{[gid: string]: PrStackView[]|null|undefined}} */
+      let prStackModalCache = {};
+      /**
+       * Fetches and caches a review's past PR stacks (RAL-302).
+       * @param {string} gid
+       * @returns {Promise<void>}
+       */
+      async function loadPrStackModal(gid) {
+        prStackModalCache[gid] = null; // loading
+        try {
+          const r = await fetch(`/api/guardians/${gid}/pull-request-stacks`);
+          prStackModalCache[gid] = r.ok ? await r.json() : [];
+        } catch (_) {
+          prStackModalCache[gid] = [];
+        }
+      }
+      /**
+       * Renders one PR row within the "view past PR stacks" modal (RAL-302) --
+       * a trimmed-down `prCard`: no live drift banner (this is history, not a
+       * currently-open PR), but a `dropped` state gets a muted badge and its
+       * `dropped_reason` surfaced as the tooltip.
+       * @param {PullRequestView} p
+       * @returns {string}
+       */
+      function prStackModalRow(p) {
+        const link = p.pr_url
+          ? `<a href="${esc(p.pr_url)}" target="_blank" rel="noopener" class="mono" style="color:var(--accent)" data-tip="Open this pull/merge request on ${esc(p.forge)}.">#${p.pr_number ?? "?"}</a>`
+          : `<span class="mono">${esc(p.branch_alias)}</span>`;
+        const dropped = p.state === "dropped";
+        const tip = dropped && p.dropped_reason ? esc(p.dropped_reason) : `Pull/merge request submitted via ${esc(p.forge)}.`;
+        return `<div style="border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px" data-tip="${tip}">
+            <div class="row" style="justify-content:space-between;gap:6px">
+              <span>${esc(p.forge)} ${link} <span class="mono" style="color:var(--muted);font-size:11px">${esc(p.branch_alias)} → ${esc(p.base_ref)}</span></span>
+              <span class="badge" style="font-size:11px${dropped ? ";color:var(--muted);border-color:var(--muted)" : ""}">${esc(p.state)}</span>
+            </div>
+          </div>`;
+      }
+      /**
+       * Renders the "view past PR stacks" modal's body from cached data.
+       * @param {string} gid
+       * @returns {string}
+       */
+      function prStackModalBody(gid) {
+        const stacks = prStackModalCache[gid];
+        if (stacks === null || stacks === undefined) return `<div class="empty">loading…</div>`;
+        if (!stacks.length) return `<div class="empty">No PR stacks have been submitted for this review yet.</div>`;
+        return stacks.map((s) => `<div style="margin-bottom:14px">
+              <div style="color:var(--muted);font-size:12px;margin-bottom:4px">${new Date(s.submitted_at_ms).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })}</div>
+              ${s.prs.map(prStackModalRow).join("")}
+            </div>`).join("");
+      }
+      /**
+       * Opens the "view past PR stacks" modal for a review (RAL-302): every
+       * PR stack ralphus has ever submitted for it, in any state, including
+       * ones dropped because their linked PR merged on the forge while the
+       * review was still mid-flight (RAL-300). Read-only history -- does not
+       * resubmit or replay anything.
+       * @param {string} gid
+       * @returns {void}
+       */
+      function openReviewPrStacks(gid) {
+        closeSquadMenu();
+        const g = guardians.find((x) => x.id === gid);
+        const render = () => {
+          byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
+              <h2>Past PR stacks — ${esc(g ? g.name : gid)}</h2>
+              <div style="max-height:60vh;overflow:auto">${prStackModalBody(gid)}</div>
+              <div class="row" style="justify-content:flex-end;margin-top:8px">
+                <button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button>
+              </div>
+            </div></div>`;
+        };
+        prStackModalCache[gid] = null;
+        render();
+        loadPrStackModal(gid).then(render);
+      }
 
       // ---------- new task modal ----------
-      // RAL-97: two tabs — "Files" (drag-and-drop / browse, accepts multiple
-      // .toml files, each queued as its own squad) and "Paste" (single TOML
-      // pasted/edited inline, unchanged from the original single-file flow).
-      let ntTab = "files";
+      // RAL-97: "Files" (drag-and-drop / browse, accepts multiple .toml
+      // files, each queued as its own squad) and "Paste" (single TOML
+      // pasted/edited inline). RAL-297 adds "Simple": a deterministic,
+      // template-driven form that assembles its own TOML client-side (no
+      // LLM call) and submits it through the same `POST /api/squads` the
+      // other two tabs use.
+      let ntTab = "simple";
       /**
        * @typedef {object} NtFile
        * @property {string} name
@@ -6366,24 +6652,33 @@
        * @returns {void}
        */
       function openNewTask() {
-        ntTab = "files"; ntFiles = []; ntPasteToml = ""; ntLabel = "";
+        ntTab = ntConfigDefaultTab; ntFiles = []; ntPasteToml = ""; ntLabel = "";
+        ntSimpleReset();
         renderNewTaskModal();
+        loadNtSimpleConfig();
       }
       /**
-       * Renders the New Task modal (Files or Paste tab).
+       * Renders the New Task modal (Simple, Files, or Paste tab).
        * @returns {void}
        */
       function renderNewTaskModal() {
+        const body = ntTab === "simple" ? ntSimpleTabHtml() : ntTab === "files" ? ntFilesTabHtml() : ntPasteTabHtml();
+        const tip = ntTab === "simple"
+          ? "Fill in the form and queue a single deterministic task — no TOML to write by hand."
+          : ntTab === "files"
+            ? "Validate every loaded file and queue each as its own squad."
+            : "Validate the TOML and queue the squad.";
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
             <h2>New Task</h2>
             <div class="modal-tabs">
+              <button class="modal-tab ${ntTab === "simple" ? "active" : ""}" onclick="ntSwitchTab('simple')" data-tip="A guided form for the common case: one prompt, one agent/model, one project, an optional review.\nDeterministic — no LLM call is made just to build the submission (only the opt-in Generate buttons call an agent).">🧭 Simple</button>
               <button class="modal-tab ${ntTab === "files" ? "active" : ""}" onclick="ntSwitchTab('files')" data-tip="Load one or more .toml task files by dragging them in or browsing.\nUse this when the task is already saved as a file — each file is queued as its own separate squad.">📁 Files</button>
               <button class="modal-tab ${ntTab === "paste" ? "active" : ""}" onclick="ntSwitchTab('paste')" data-tip="Paste or type a single TOML task definition directly, instead of loading a file.\nUse this for a quick one-off task you haven't saved anywhere.">✒ Paste</button>
             </div>
-            <div id="nt-body">${ntTab === "files" ? ntFilesTabHtml() : ntPasteTabHtml()}</div>
+            <div id="nt-body">${body}</div>
             <div id="nt-err" class="verr"></div>
-            <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close without submitting.">Cancel</button><button class="btn primary" onclick="submitTask()" data-tip="${ntTab === "files" ? "Validate every loaded file and queue each as its own squad." : "Validate the TOML and queue the squad."}\nThe daemon will start each as soon as a scheduler slot is available.">Validate &amp; Queue</button></div>
+            <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close without submitting.">Cancel</button><button class="btn primary" onclick="submitTask()" data-tip="${tip}\nThe daemon will start each as soon as a scheduler slot is available.">Validate &amp; Queue</button></div>
           </div></div>`;
       }
       /**
@@ -6404,6 +6699,664 @@
        * @returns {void}
        */
       function closeModal() { byId("modal-root").innerHTML = ""; }
+
+      // ---------- new task modal: Simple tab (RAL-297) ----------
+      // A deterministic, template-driven form: the five fixed base fields
+      // (prompt/agent/model/project/proofs) plus whatever supplementary
+      // fields the selected [[templates]] entry declares. Building the
+      // submitted TOML is pure string substitution — no LLM call — except
+      // the explicit, opt-in "Generate proof steps"/"Generate manual
+      // checks" buttons, which call POST /api/generate.
+      const NT_INPUT_STYLE = "width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px;margin-top:2px";
+      /**
+       * @typedef {object} NtTemplateField
+       * @property {string} name
+       * @property {string} [label]
+       * @property {string} [type]
+       * @property {boolean} required
+       */
+      /**
+       * @typedef {object} NtTemplate
+       * @property {string} name
+       * @property {string} [label]
+       * @property {string} [description]
+       * @property {NtTemplateField[]} fields
+       * @property {string} [prompt_template]
+       */
+      /**
+       * @typedef {object} NtCatalogAgent
+       * @property {string} id
+       * @property {string} kind
+       * @property {string} backend
+       * @property {string[]} models
+       */
+      /** @type {NtCatalogAgent[]} */
+      const NT_FALLBACK_AGENTS = [
+        { id: "claude", kind: "builtin", backend: "claude", models: [] },
+        { id: "claude-code", kind: "builtin", backend: "claude-code", models: ["sonnet", "opus", "haiku", "fable"] },
+        { id: "ollama", kind: "builtin", backend: "ollama", models: [] },
+      ];
+      /** @type {NtTemplate[]} loaded from GET /api/config/templates */
+      let ntTemplates = [];
+      /** whether `ntTemplates` is just the built-in fallback (zero valid [[templates]] configured) */
+      let ntTemplatesFallback = true;
+      /** the `.ralphus.toml [ui] new_task_default_tab` value, applied the next time the modal opens */
+      let ntConfigDefaultTab = "simple";
+      /** @type {NtCatalogAgent[]} loaded from GET /api/agents/catalog */
+      let ntAgentCatalog = [];
+      let ntAgentCatalogDefault = "claude";
+      /**
+       * @typedef {object} NtListItem
+       * @property {string} label
+       * @property {string} value
+       */
+      /**
+       * @typedef {object} NtSimpleState
+       * @property {string} templateName
+       * @property {string} prompt
+       * @property {{[fieldName: string]: string}} fieldValues
+       * @property {string} agent
+       * @property {string} model
+       * @property {string} project
+       * @property {string} upstreamBranch
+       * @property {boolean} proofs
+       * @property {boolean} addReview
+       * @property {boolean} generateManualChecks
+       * @property {NtListItem[]} proofItems
+       * @property {NtListItem[]} checkItems
+       * @property {boolean} generating
+       * @property {boolean} confirmStep
+       */
+      /** @type {NtSimpleState} */
+      let ntSimple = ntFreshSimpleState();
+      /**
+       * Builds a fresh Simple-tab form state.
+       * @returns {NtSimpleState}
+       */
+      function ntFreshSimpleState() {
+        return {
+          templateName: ntTemplates.length ? ntTemplates[0].name : NT_FALLBACK_TEMPLATE.name,
+          prompt: "", fieldValues: {}, agent: ntAgentCatalogDefault, model: "",
+          project: "", upstreamBranch: "", proofs: true, addReview: false, generateManualChecks: false,
+          proofItems: [], checkItems: [], generating: false, confirmStep: false,
+        };
+      }
+      /**
+       * Resets the Simple tab's form state (called from `openNewTask`).
+       * @returns {void}
+       */
+      function ntSimpleReset() { ntSimple = ntFreshSimpleState(); }
+      /**
+       * Loads the Simple tab's template list and agent catalog, then
+       * re-renders if the modal is still open on the Simple tab. Never
+       * throws — a network failure just leaves the hardcoded fallbacks in
+       * place, the same graceful-degradation pattern `fetchAgentOptions`
+       * uses for the review-resolver dropdown.
+       * @returns {Promise<void>}
+       */
+      async function loadNtSimpleConfig() {
+        try {
+          const [tplResp, catResp] = await Promise.all([fetch("/api/config/templates"), fetch("/api/agents/catalog")]);
+          if (tplResp.ok) {
+            const tpl = await tplResp.json();
+            ntTemplates = tpl.templates || [];
+            ntTemplatesFallback = !!tpl.using_fallback;
+            ntConfigDefaultTab = ntResolveDefaultTab(tpl);
+            if (!ntSimple.prompt && !Object.keys(ntSimple.fieldValues).length && ntTemplates.length) {
+              ntSimple.templateName = ntTemplates[0].name;
+            }
+          }
+          if (catResp.ok) {
+            const cat = await catResp.json();
+            ntAgentCatalog = cat.agents || [];
+            ntAgentCatalogDefault = cat.default_agent || "claude";
+            if (!ntSimple.agent) ntSimple.agent = ntAgentCatalogDefault;
+          }
+        } catch (e) { /* keep the hardcoded fallbacks; the form stays usable */ }
+        if (ntTab === "simple") renderNewTaskModal();
+      }
+      // RALPHUS-SIMPLE-TAB:BEGIN
+      // Pure decision logic for the Simple tab (RAL-297): template
+      // resolution/fallback, field validation, the generic editable-list-
+      // widget row operations shared by proof steps and manual checks, which
+      // generation jobs a submit click should launch, the generate-then-
+      // confirm vs. build-and-submit branch, and the config-driven default
+      // tab. Deliberately free of DOM/fetch/module-level state so
+      // test/board-simple-tab.mjs can slice this region out and exercise it
+      // under `node --test` -- anything reaching for `document`/`fetch`
+      // stays in ntSimpleTabHtml/ntRunGenerationStep/submitTaskSimple/
+      // loadNtSimpleConfig, which call into these.
+
+      /** @type {NtTemplate} */
+      const NT_FALLBACK_TEMPLATE = {
+        name: "hello-world", label: "Hello World",
+        description: "Minimal one-shot task: run a prompt as-is, no extra context.",
+        fields: [], prompt_template: "{prompt}",
+      };
+      /**
+       * Resolves the selected template, falling back to the built-in one
+       * when `templates` is empty or `templateName` isn't found in it.
+       * @param {NtTemplate[]} templates
+       * @param {string} templateName
+       * @returns {NtTemplate}
+       */
+      function ntPickTemplate(templates, templateName) {
+        const list = templates.length ? templates : [NT_FALLBACK_TEMPLATE];
+        return list.find((t) => t.name === templateName) || list[0];
+      }
+      /**
+       * Substitutes `{prompt}` and each declared field's `{name}` into a
+       * template's `prompt_template`.
+       * @param {NtTemplate} template
+       * @param {string} prompt
+       * @param {{[fieldName: string]: string}} fieldValues
+       * @returns {string}
+       */
+      function ntBuildEffectivePrompt(template, prompt, fieldValues) {
+        let text = template.prompt_template || "{prompt}";
+        text = text.split("{prompt}").join(prompt);
+        (template.fields || []).forEach((f) => { text = text.split(`{${f.name}}`).join(fieldValues[f.name] || ""); });
+        return text;
+      }
+      /**
+       * Client-side field validation (type/required) against a resolved
+       * template -- separate from the daemon's own TOML validator, which
+       * only ever sees the already-assembled TOML.
+       * @param {NtSimpleState} state
+       * @param {NtTemplate} template
+       * @returns {string[]} error messages; empty when valid
+       */
+      function ntValidateSimpleFields(state, template) {
+        /** @type {string[]} */
+        const errors = [];
+        if (!state.prompt.trim()) errors.push("Prompt is required.");
+        (template.fields || []).forEach((f) => {
+          const v = (state.fieldValues[f.name] || "").trim();
+          const label = f.label || f.name;
+          if (f.required && !v) errors.push(`"${label}" is required.`);
+          if (v && f.type === "number" && Number.isNaN(Number(v))) errors.push(`"${label}" must be a number.`);
+        });
+        if (!state.agent) errors.push("Agent is required.");
+        if (!state.project) errors.push("Project is required.");
+        return errors;
+      }
+      /**
+       * Appends a blank row.
+       * @param {NtListItem[]} items
+       * @returns {NtListItem[]}
+       */
+      function ntListInsertRow(items) { return items.concat([{ label: "", value: "" }]); }
+      /**
+       * Removes row `i`.
+       * @param {NtListItem[]} items
+       * @param {number} i
+       * @returns {NtListItem[]}
+       */
+      function ntListRemoveRow(items, i) { return items.slice(0, i).concat(items.slice(i + 1)); }
+      /**
+       * Swaps row `i` with its neighbor `i + delta`; a no-op (same array) if
+       * the neighbor is out of range.
+       * @param {NtListItem[]} items
+       * @param {number} i
+       * @param {number} delta
+       * @returns {NtListItem[]}
+       */
+      function ntListSwapRows(items, i, delta) {
+        const j = i + delta;
+        if (j < 0 || j >= items.length) return items;
+        const copy = items.slice();
+        const tmp = copy[i]; copy[i] = copy[j]; copy[j] = tmp;
+        return copy;
+      }
+      /**
+       * Replaces one field of row `i`.
+       * @param {NtListItem[]} items
+       * @param {number} i
+       * @param {"label"|"value"} field
+       * @param {string} value
+       * @returns {NtListItem[]}
+       */
+      function ntListEditRow(items, i, field, value) {
+        return items.map((it, idx) => {
+          if (idx !== i) return it;
+          return field === "label" ? { label: value, value: it.value } : { label: it.label, value: value };
+        });
+      }
+      /**
+       * Which `/api/generate` kinds a submit click should launch, per the
+       * proofs/review/generate-manual-checks checkboxes.
+       * @param {NtSimpleState} state
+       * @returns {("proof_steps"|"manual_checks")[]}
+       */
+      function ntPlannedGenerationKinds(state) {
+        /** @type {("proof_steps"|"manual_checks")[]} */
+        const kinds = [];
+        if (state.proofs) kinds.push("proof_steps");
+        if (state.addReview && state.generateManualChecks) kinds.push("manual_checks");
+        return kinds;
+      }
+      /**
+       * Whether a submit click should run generation-then-confirm first, or
+       * go straight to build-and-submit: generation runs once per opted-in
+       * kind, then a second click (now `confirmStep`) submits.
+       * @param {NtSimpleState} state
+       * @returns {"generate"|"submit"}
+       */
+      function ntSimpleSubmitAction(state) {
+        return ntPlannedGenerationKinds(state).length > 0 && !state.confirmStep ? "generate" : "submit";
+      }
+      /**
+       * Resolves the New Task modal's default tab from the parsed
+       * `GET /api/config/templates` response, defaulting to "simple" when
+       * the field is absent (including when the fetch itself failed).
+       * @param {{default_new_task_tab?: string}|undefined} payload
+       * @returns {string}
+       */
+      function ntResolveDefaultTab(payload) { return (payload && payload.default_new_task_tab) || "simple"; }
+      // RALPHUS-SIMPLE-TAB:END
+      /**
+       * The currently-selected template (falls back to the built-in one).
+       * @returns {NtTemplate}
+       */
+      function ntSelectedTemplate() { return ntPickTemplate(ntTemplates, ntSimple.templateName); }
+      /**
+       * Substitutes `{prompt}` and each declared field's `{name}` into the
+       * selected template's `prompt_template`.
+       * @returns {string}
+       */
+      function ntSimpleEffectivePrompt() {
+        return ntBuildEffectivePrompt(ntSelectedTemplate(), ntSimple.prompt, ntSimple.fieldValues);
+      }
+      /**
+       * Client-side field validation (type/required), run before generation
+       * and before final submission -- separate from the daemon's own TOML
+       * validator, which only ever sees the already-assembled TOML.
+       * @returns {string[]} error messages; empty when valid
+       */
+      function ntSimpleValidateFields() { return ntValidateSimpleFields(ntSimple, ntSelectedTemplate()); }
+      /**
+       * Submit-time-only check that a typed upstream branch actually exists
+       * for the selected git project (RAL-297 interview decision: checked
+       * at submit, not live-as-you-type). Never blocks on a lookup failure
+       * -- an unreachable daemon shouldn't prevent submission any harder
+       * than the eventual worktree-materialization failure already would.
+       * @returns {Promise<string|null>} an error message, or null if OK
+       */
+      async function ntSimpleValidateUpstream() {
+        const branch = ntSimple.upstreamBranch.trim();
+        if (!branch) return null;
+        const project = projects.find((p) => p.name === ntSimple.project);
+        if (!project || project.vcs !== "git") return null;
+        try {
+          const resp = await fetch(`/api/projects/${encodeURIComponent(ntSimple.project)}/branches`);
+          if (!resp.ok) return null;
+          const data = await resp.json();
+          /** @type {string[]} */
+          const branches = data.branches || [];
+          if (!branches.includes(branch) && !branches.includes(`origin/${branch}`)) {
+            return `Upstream branch "${branch}" was not found in project "${ntSimple.project}".`;
+          }
+        } catch (e) { return null; }
+        return null;
+      }
+      /**
+       * Quotes and escapes a string as a single-line TOML basic string,
+       * including embedded newlines/tabs -- always valid regardless of the
+       * user's own text, unlike a `"""`-delimited literal (which would need
+       * to worry about an embedded `"""` sequence).
+       * @param {string} s
+       * @returns {string}
+       */
+      function tomlStr(s) {
+        const escaped = String(s)
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"')
+          .replace(/\r/g, "")
+          .replace(/\n/g, "\\n")
+          .replace(/\t/g, "\\t");
+        return `"${escaped}"`;
+      }
+      // The system prompts below are reused verbatim from `ralphus task
+      // show-tutor`'s recommended work+finalize layout (cli-rs/src/tutor.rs)
+      // so a Simple submission's generated cells match what that tutorial
+      // teaches a user to write by hand.
+      const NT_NO_COMMIT_SYSTEM_PROMPT = "Do NOT commit and do NOT push under any circumstances.";
+      const NT_FINALIZE_TEXT = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists.";
+      // Mirrors `core::schema::agent_supports_system_prompt` -- the daemon's
+      // TOML validator hard-rejects `system_prompt`/`system_prompt_position`
+      // for any other *known* builtin agent name (e.g. "claude", "ollama"),
+      // both of which the agent picker can offer. An unrecognized value
+      // (a custom `[agent.profiles.*]` name) is treated the same as
+      // "unsupported" here too -- conservative but always submittable,
+      // since core itself only defers (rather than allows) that case once
+      // the daemon resolves the profile's real backend.
+      const NT_SYSTEM_PROMPT_CAPABLE_AGENTS = ["claude-code", "claude-cli", "codex", "codex-cli", "pi"];
+      /**
+       * Appends `system_prompt`/`system_prompt_position` lines when `agent`
+       * supports appended system prompts; otherwise prepends the same text
+       * onto `prompt` so the instruction still reaches an agent with no
+       * such delivery mechanism.
+       * @param {string[]} lines
+       * @param {string} agent
+       * @param {string} systemPrompt
+       * @param {string} prompt
+       * @returns {string}
+       */
+      function ntPushSystemPromptOrInline(lines, agent, systemPrompt, prompt) {
+        if (NT_SYSTEM_PROMPT_CAPABLE_AGENTS.includes(agent)) {
+          lines.push(`system_prompt = ${tomlStr(systemPrompt)}`);
+          lines.push('system_prompt_position = "append"');
+          return prompt;
+        }
+        return `${systemPrompt}\n\n${prompt}`;
+      }
+      /**
+       * Assembles the Simple tab's task TOML: a project-scoped placeholder
+       * worktree `cwd`, a `work` cell (template-substituted prompt, agent,
+       * model, optional proof steps) and a `finalize` cell -- mirroring
+       * `ralphus task show-tutor`'s recommended per-branch layout -- plus an
+       * optional `[[review]]` with optional manual-check actions.
+       * @returns {string}
+       */
+      function ntSimpleBuildToml() {
+        const branch = `simple-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        // `parse_worktree_placeholder_upstream` (core/src/schema.rs) does raw
+        // string splitting on this query suffix, not URL-decoding -- percent-
+        // encoding `upstream` here would corrupt the `<<default>>` sentinel
+        // into a literal (and invalid) branch name, so it's embedded as-is.
+        const upstream = ntSimple.upstreamBranch.trim() || "<<default>>";
+        const cwd = `ralphus:new-worktree/${branch}?upstream=${upstream}`;
+        const prompt = ntSimpleEffectivePrompt();
+        /** @type {string[]} */
+        const lines = [];
+        lines.push("[[task]]");
+        lines.push(`name = ${tomlStr(branch)}`);
+        lines.push(`project = ${tomlStr(ntSimple.project)}`);
+        lines.push("");
+        lines.push("[[task.cell]]");
+        lines.push('id = "work"');
+        lines.push(`agent = ${tomlStr(ntSimple.agent)}`);
+        if (ntSimple.model.trim()) lines.push(`model = ${tomlStr(ntSimple.model.trim())}`);
+        lines.push(`cwd = ${tomlStr(cwd)}`);
+        if (ntSimple.addReview) lines.push('review = "<<ralphus:new-review/simple>>"');
+        const workPrompt = ntPushSystemPromptOrInline(lines, ntSimple.agent, NT_NO_COMMIT_SYSTEM_PROMPT, prompt);
+        lines.push(`prompt = ${tomlStr(workPrompt)}`);
+        ntSimple.proofItems.filter((it) => it.value.trim()).forEach((it) => {
+          lines.push("");
+          lines.push("[[task.cell.proof]]");
+          if (it.label.trim()) lines.push(`id = ${tomlStr(it.label.trim())}`);
+          lines.push(`command = ${tomlStr(it.value.trim())}`);
+        });
+        lines.push("");
+        lines.push("[[task.cell]]");
+        lines.push('id = "finalize"');
+        lines.push(`agent = ${tomlStr(ntSimple.agent)}`);
+        if (ntSimple.model.trim()) lines.push(`model = ${tomlStr(ntSimple.model.trim())}`);
+        lines.push(`cwd = ${tomlStr(cwd)}`);
+        lines.push('depends_on = ["work"]');
+        if (NT_SYSTEM_PROMPT_CAPABLE_AGENTS.includes(ntSimple.agent)) {
+          lines.push(`system_prompt = ${tomlStr(NT_FINALIZE_TEXT)}`);
+          lines.push('system_prompt_position = "append"');
+        }
+        lines.push(`prompt = ${tomlStr(NT_FINALIZE_TEXT)}`);
+        if (ntSimple.addReview) {
+          lines.push("");
+          lines.push("[[review]]");
+          lines.push('id = "ralphus:new-review/simple"');
+          ntSimple.checkItems.filter((it) => it.value.trim()).forEach((it) => {
+            lines.push("");
+            lines.push("[[review.action]]");
+            lines.push(`label = ${tomlStr(it.label.trim() || "Manual check")}`);
+            lines.push(`prompt = ${tomlStr(it.value.trim())}`);
+          });
+        }
+        return `${lines.join("\n")}\n`;
+      }
+      // ---------- generic editable-list-widget primitive (RAL-297) ----------
+      // Reused as-is for both proof steps and manual checks -- the only
+      // difference between the two call sites is the placeholder/tooltip
+      // copy passed in `opts`, never the widget's own markup or behavior.
+      /**
+       * The state key backing a given list kind.
+       * @param {"proofs"|"checks"} kind
+       * @returns {"proofItems"|"checkItems"}
+       */
+      function ntListKey(kind) { return kind === "proofs" ? "proofItems" : "checkItems"; }
+      /**
+       * @param {"proofs"|"checks"} kind
+       * @returns {NtListItem[]}
+       */
+      function ntListRef(kind) { return ntSimple[ntListKey(kind)]; }
+      /**
+       * Adds an empty row to the given list and re-renders.
+       * @param {"proofs"|"checks"} kind
+       * @returns {void}
+       */
+      function ntListAdd(kind) { ntSimple[ntListKey(kind)] = ntListInsertRow(ntListRef(kind)); renderNewTaskModal(); }
+      /**
+       * Removes row `i` from the given list and re-renders.
+       * @param {"proofs"|"checks"} kind
+       * @param {number} i
+       * @returns {void}
+       */
+      function ntListRemove(kind, i) { ntSimple[ntListKey(kind)] = ntListRemoveRow(ntListRef(kind), i); renderNewTaskModal(); }
+      /**
+       * Swaps row `i` with its neighbor `i + delta` and re-renders.
+       * @param {"proofs"|"checks"} kind
+       * @param {number} i
+       * @param {number} delta
+       * @returns {void}
+       */
+      function ntListMove(kind, i, delta) { ntSimple[ntListKey(kind)] = ntListSwapRows(ntListRef(kind), i, delta); renderNewTaskModal(); }
+      /**
+       * Edits one field of row `i` in the given list (no re-render needed --
+       * plain text input, same pattern as the Files tab's inline textarea).
+       * @param {"proofs"|"checks"} kind
+       * @param {number} i
+       * @param {"label"|"value"} field
+       * @param {string} value
+       * @returns {void}
+       */
+      function ntListEdit(kind, i, field, value) { ntSimple[ntListKey(kind)] = ntListEditRow(ntListRef(kind), i, field, value); }
+      /**
+       * @typedef {object} NtListWidgetOpts
+       * @property {string} labelPlaceholder
+       * @property {string} valuePlaceholder
+       * @property {string} addLabel
+       * @property {string} labelTip
+       * @property {string} valueTip
+       */
+      /**
+       * Renders a generic editable list of `{label, value}` rows: add,
+       * remove, reorder (via up/down buttons rather than drag-and-drop, to
+       * keep the widget's state trivially serializable), and edit-in-place.
+       * @param {NtListItem[]} items
+       * @param {"proofs"|"checks"} kind
+       * @param {NtListWidgetOpts} opts
+       * @returns {string}
+       */
+      function ntListWidgetHtml(items, kind, opts) {
+        const rows = items.map((it, i) => `
+          <div class="row" style="gap:4px;margin-bottom:4px">
+            <input style="flex:1" value="${esc(it.label)}" placeholder="${esc(opts.labelPlaceholder)}" oninput="ntListEdit('${kind}', ${i}, 'label', this.value)" data-tip="${esc(opts.labelTip)}">
+            <input style="flex:2" value="${esc(it.value)}" placeholder="${esc(opts.valuePlaceholder)}" oninput="ntListEdit('${kind}', ${i}, 'value', this.value)" data-tip="${esc(opts.valueTip)}">
+            <button class="btn" style="padding:1px 6px" ${i === 0 ? "disabled" : ""} onclick="ntListMove('${kind}', ${i}, -1)" data-tip="Move this row up.">▲</button>
+            <button class="btn" style="padding:1px 6px" ${i === items.length - 1 ? "disabled" : ""} onclick="ntListMove('${kind}', ${i}, 1)" data-tip="Move this row down.">▼</button>
+            <button class="btn" style="padding:1px 6px" onclick="ntListRemove('${kind}', ${i})" data-tip="Remove this row from the list.\nThis cannot be undone, but you can always add a new row.">✕</button>
+          </div>`).join("");
+        return `${rows}<button class="btn" onclick="ntListAdd('${kind}')" data-tip="${esc(opts.addLabel)}">+ Add</button>`;
+      }
+      // ---------- generic "generation step" primitive (RAL-297) ----------
+      /**
+       * Kicks off one opt-in generation step (`POST /api/generate`) and
+       * polls `GET /api/generate/{id}` until it resolves. Reused as-is for
+       * both "Generate proof steps" and "Generate manual checks" -- only
+       * `kind` differs between the two call sites.
+       * @param {"proof_steps"|"manual_checks"} kind
+       * @returns {Promise<NtListItem[]|null>} the proposed items, or null on any failure (never throws)
+       */
+      async function ntRunGenerationStep(kind) {
+        const project = projects.find((p) => p.name === ntSimple.project);
+        const cwd = project ? project.path : ".";
+        try {
+          const startResp = await fetch("/api/generate", {
+            method: "POST",
+            body: JSON.stringify({
+              kind, cwd, agent: ntSimple.agent,
+              model: ntSimple.model.trim() || undefined,
+              prompt_context: ntSimpleEffectivePrompt(),
+            }),
+          });
+          if (!startResp.ok) return null;
+          const { id } = await startResp.json();
+          for (let i = 0; i < 80; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const poll = await fetch(`/api/generate/${id}`);
+            if (!poll.ok) return null;
+            const job = await poll.json();
+            if (job.status === "done") return job.items || [];
+            if (job.status === "error") return null;
+          }
+          return null;
+        } catch (e) { return null; }
+      }
+      /**
+       * Renders the Simple tab's form -- the template picker, prompt,
+       * agent/model, project (+ upstream branch when git), proofs/review
+       * checkboxes and their editable lists -- or, mid-generation/-confirm,
+       * the generation-progress notice or the confirm-and-edit step.
+       * @returns {string}
+       */
+      function ntSimpleTabHtml() {
+        if (ntSimple.generating) {
+          return `<p style="color:var(--muted);font-size:13px">Generating${ntSimple.proofs ? " proof steps" : ""}${ntSimple.addReview && ntSimple.generateManualChecks ? (ntSimple.proofs ? " and manual checks" : " manual checks") : ""}… this calls the selected agent, so it may take a little while.</p>`;
+        }
+        if (ntSimple.confirmStep) {
+          const proofsSection = ntSimple.proofs
+            ? `<h4 style="margin:10px 0 4px">Proof steps</h4>${ntListWidgetHtml(ntSimple.proofItems, "proofs", {
+                labelPlaceholder: "id", valuePlaceholder: "shell command",
+                addLabel: "Add a proof step to run after the work cell — a command that must pass.",
+                labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs.",
+              })}`
+            : "";
+          const checksSection = ntSimple.addReview && ntSimple.generateManualChecks
+            ? `<h4 style="margin:10px 0 4px">Manual checks</h4>${ntListWidgetHtml(ntSimple.checkItems, "checks", {
+                labelPlaceholder: "label", valuePlaceholder: "what to check",
+                addLabel: "Add a manual check button reviewers will see on this review.",
+                labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try.",
+              })}`
+            : "";
+          return `<p style="color:var(--muted);font-size:13px">Review the generated items below — edit or remove any you don't want — then submit.</p>${proofsSection}${checksSection}`;
+        }
+        const templates = ntTemplates.length ? ntTemplates : [NT_FALLBACK_TEMPLATE];
+        const t = ntSelectedTemplate();
+        const templateOptions = templates.map((tpl) => `<option value="${esc(tpl.name)}" ${tpl.name === t.name ? "selected" : ""}>${esc(tpl.label || tpl.name)}</option>`).join("");
+        const fieldRows = (t.fields || []).map((f) => `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="${esc(f.label || f.name)}${f.required ? " (required)" : " (optional)"} — a supplementary field for the &quot;${esc(t.label || t.name)}&quot; template, substituted into the generated prompt.">
+            ${esc(f.label || f.name)}${f.required ? " *" : ""}
+            <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.fieldValues[f.name] || "")}" oninput="ntSimple.fieldValues[${JSON.stringify(f.name)}]=this.value">
+          </label>`).join("");
+        const catalog = ntAgentCatalog.length ? ntAgentCatalog : NT_FALLBACK_AGENTS;
+        const agentOptions = catalog.map((a) => `<option value="${esc(a.id)}" ${a.id === ntSimple.agent ? "selected" : ""}>${esc(a.id)}${a.id === ntAgentCatalogDefault ? " (default)" : ""}</option>`).join("");
+        const selectedAgent = catalog.find((a) => a.id === ntSimple.agent);
+        const modelDatalist = ((selectedAgent && selectedAgent.models) || []).map((m) => `<option value="${esc(m)}">`).join("");
+        const projectOptions = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === ntSimple.project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+        const selectedProject = projects.find((p) => p.name === ntSimple.project);
+        const showUpstream = !!(selectedProject && selectedProject.vcs === "git");
+        return `
+          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in \\&quot;Hello World\\&quot; template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
+            Template
+            <select style="${NT_INPUT_STYLE}" ${ntTemplatesFallback ? "disabled" : ""} onchange="ntSimple.templateName=this.value;ntSimple.fieldValues={};renderNewTaskModal()">${templateOptions}</select>
+          </label>
+          ${t.description ? `<p style="font-size:11px;color:var(--muted);margin:2px 0 0">${esc(t.description)}</p>` : ""}
+          ${fieldRows}
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="The instruction the work cell's agent runs. Combined with the selected template's supplementary fields, if any.">
+            Prompt
+            <textarea style="${NT_INPUT_STYLE};height:90px" oninput="ntSimple.prompt=this.value">${esc(ntSimple.prompt)}</textarea>
+          </label>
+          <div class="row" style="gap:8px;margin-top:8px">
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="Which agent backend runs the work cell. Independent of the chosen project — not scoped to any particular worktree.">
+              Agent
+              <select style="${NT_INPUT_STYLE}" onchange="ntSimple.agent=this.value;ntSimple.model='';renderNewTaskModal()">${agentOptions}</select>
+            </label>
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The model to use. Choices are scoped to the selected agent when known, but you can type any model name — an unsupported value fails at submit time, not as you type.">
+              Model
+              <input list="nt-model-list" style="${NT_INPUT_STYLE}" value="${esc(ntSimple.model)}" oninput="ntSimple.model=this.value" placeholder="(agent default)">
+              <datalist id="nt-model-list">${modelDatalist}</datalist>
+            </label>
+          </div>
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="Which registered project the work runs against. The task always runs in a fresh worktree branch for this project — never the project's raw checkout directly.">
+            Project
+            <select style="${NT_INPUT_STYLE}" onchange="ntSimple.project=this.value;renderNewTaskModal()"><option value="">(select a project)</option>${projectOptions}</select>
+          </label>
+          ${showUpstream ? `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="The branch the fresh worktree starts from. Leave blank to use the project's default branch. Checked against the project's real branches when you submit.">
+            Upstream branch (optional)
+            <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.upstreamBranch)}" oninput="ntSimple.upstreamBranch=this.value" placeholder="(project default)">
+          </label>` : ""}
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose proof step(s) — commands that must pass — against this project's codebase before you submit, shown to you for edit/removal first. You can also add proof steps by hand regardless of this checkbox.">
+            <input type="checkbox" ${ntSimple.proofs ? "checked" : ""} onchange="ntSimple.proofs=this.checked;renderNewTaskModal()"> Generate proof steps
+          </label>
+          ${ntSimple.proofItems.length
+            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.proofItems, "proofs", { labelPlaceholder: "id", valuePlaceholder: "shell command", addLabel: "Add a proof step by hand.", labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs." })}</div>`
+            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('proofs')" data-tip="Add a proof step by hand, without generating one.">+ Add a proof step by hand</button>`}
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, generates a [[review]] block for this task so it shows up in the Reviews tab for approval.">
+            <input type="checkbox" ${ntSimple.addReview ? "checked" : ""} onchange="ntSimple.addReview=this.checked;renderNewTaskModal()"> Add a review
+          </label>
+          ${ntSimple.addReview ? `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;margin-left:16px" data-tip="When checked, the selected agent/model is asked to propose manual check button(s) reviewers can run against this project's codebase before you submit, shown to you for edit/removal first. You can also add manual checks by hand regardless of this checkbox.">
+            <input type="checkbox" ${ntSimple.generateManualChecks ? "checked" : ""} onchange="ntSimple.generateManualChecks=this.checked;renderNewTaskModal()"> Generate manual checks
+          </label>
+          ${ntSimple.checkItems.length
+            ? `<div style="margin-top:6px;margin-left:16px">${ntListWidgetHtml(ntSimple.checkItems, "checks", { labelPlaceholder: "label", valuePlaceholder: "what to check", addLabel: "Add a manual check by hand.", labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try." })}</div>`
+            : `<button class="btn" style="margin-top:6px;margin-left:16px" onclick="ntListAdd('checks')" data-tip="Add a manual check by hand, without generating one.">+ Add a manual check by hand</button>`}
+          ` : ""}`;
+      }
+      /**
+       * Validates and submits the Simple tab. If any opted-in generation
+       * step would produce a UI update, the first click runs the step(s)
+       * (concurrently when more than one is enabled) and shows the confirm
+       * step instead of submitting; a second click (now `confirmStep`)
+       * assembles the TOML and submits.
+       * @returns {Promise<void>}
+       */
+      async function submitTaskSimple() {
+        const errEl = byId("nt-err");
+        errEl.innerHTML = "";
+        const fieldErrors = ntSimpleValidateFields();
+        if (fieldErrors.length) { errEl.innerHTML = fieldErrors.map((e) => esc(e)).join("<br>"); return; }
+        const upstreamError = await ntSimpleValidateUpstream();
+        if (upstreamError) { errEl.textContent = upstreamError; return; }
+
+        if (ntSimpleSubmitAction(ntSimple) === "generate") {
+          ntSimple.generating = true;
+          renderNewTaskModal();
+          const kinds = ntPlannedGenerationKinds(ntSimple);
+          /** @type {Promise<void>[]} */
+          const jobs = [];
+          if (kinds.includes("proof_steps")) {
+            jobs.push(ntRunGenerationStep("proof_steps").then((items) => { if (items) ntSimple.proofItems = ntSimple.proofItems.concat(items); }));
+          }
+          if (kinds.includes("manual_checks")) {
+            jobs.push(ntRunGenerationStep("manual_checks").then((items) => { if (items) ntSimple.checkItems = ntSimple.checkItems.concat(items); }));
+          }
+          await Promise.all(jobs);
+          ntSimple.generating = false;
+          ntSimple.confirmStep = true;
+          renderNewTaskModal();
+          return;
+        }
+
+        const toml = ntSimpleBuildToml();
+        const v = await ntValidateOne(toml);
+        if (!v.valid) {
+          errEl.innerHTML = (v.errors || []).map((e) => `line ${e.line ?? "?"}: ${esc(e.message)}`).join("<br>") || "validation failed";
+          return;
+        }
+        const resp = await fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label: ntSimple.prompt.slice(0, 60) || null }) });
+        if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
+        closeModal(); tick();
+      }
 
       // ---------- new task modal: Files tab ----------
       /**
@@ -6562,6 +7515,11 @@
       /** @type {string|null} */
       let logSquadId = null;
       let logsTab = "cells";
+      // Shared with the "copy as Markdown" header-tooltip footnotes below —
+      // kept as single constants so the HTML tooltip and the Markdown export
+      // can't drift from each other.
+      const TASK_REASON_TOOLTIP = "A task-level failure reason (RAL-291) — set only when the task itself failed for a reason with no underlying cell/proof error to point to, e.g. the RAL-156 no-commits-since-baseline guard.\nEmpty when the task instead failed because one of its own cells or proof steps failed — that failure is already visible in the cells/proofs tabs.";
+      const CELL_CUM_TOOLTIP = "Sum of input/output tokens and $ cost across every completed attempt of this cell (including restarts), read from the Cartographer event log.\nMay undercount if older attempts have aged out of Cartographer retention (see [cartographer] in .ralphus.toml).";
       /**
        * Opens the Logs modal for a squad (defaults to the selected squad).
        * @param {string|null} [id]
@@ -6596,8 +7554,9 @@
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:880px;max-width:94vw">
             <h2>Logs — ${esc(squad.label || squad.id)}</h2>
-            <div class="row" style="margin-bottom:10px">
-              ${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" data-click="setLogsTab" data-tab="${esc(t)}" data-tip="${{events:"The structured event log (RAL-98), filtered to this squad — every state change, scheduler decision, and LLM call.",tasks:"Task-level summary with cell count.",cells:"Per-cell state, token usage, and cost breakdown — plus cumulative totals across restarts.",proofs:"Proof step status and raw output."}[t]||t}">${t}</span>`).join("")}
+            <div class="row" style="margin-bottom:10px;justify-content:space-between;align-items:center">
+              <div class="row">${tabs.map((t) => `<span class="chip ${t === logsTab ? "active" : ""}" data-click="setLogsTab" data-tab="${esc(t)}" data-tip="${{events:"The structured event log (RAL-98), filtered to this squad — every state change, scheduler decision, and LLM call.",tasks:"Task-level summary with cell count.",cells:"Per-cell state, token usage, and cost breakdown — plus cumulative totals across restarts.",proofs:"Proof step status and raw output."}[t]||t}">${t}</span>`).join("")}</div>
+              ${logsCopyBtnHtml(logsTab)}
             </div>
             <div style="max-height:60vh;overflow:auto">${logsBody(squad)}</div>
             <div class="btn-row">${logsTab === "events" ? `<span style="flex:1;color:var(--muted);font-size:12px;align-self:center" data-tip="See the Logs tab for filtering across every squad/cell/guardian and full pagination.">${(cartoModalCache[`squad:${logSquadId}`] || {}).total || 0} total — open the Logs tab for more filters</span>` : ""}<button class="btn" onclick="closeModal()">Close</button></div>
@@ -6654,6 +7613,28 @@
         });
         return totals;
       }
+      // RALPHUS-LOGS-OUTPUT-BTN:BEGIN
+      // The Logs modal's cells/proofs-tab "output" button: pending/queued
+      // rows fall back to "—" (nothing has run yet to fetch), every other
+      // state renders a button that fetches on demand via
+      // `openLinkedOutputPopup` rather than reading a stored `output` field.
+      // Deliberately pure -- its only free variable is `esc`, injected as a
+      // parameter by test/board-logs-output-btn.mjs -- so the empty-state
+      // fallback and key wiring can be exercised under `node --test`.
+      /**
+       * Renders a Logs-modal "output" button that opens `key`'s raw output
+       * (RAL-295) via `openLinkedOutputPopup`, fetched on demand from the
+       * pane/terminal-log-attempts endpoints -- or the same "—" fallback
+       * used elsewhere once a cell/proof step hasn't run yet.
+       * @param {string} key
+       * @param {string} state
+       * @returns {string}
+       */
+      function logsOutputBtn(key, state) {
+        if (["pending", "queued"].includes(state)) return "—";
+        return `<button class="btn" style="padding:1px 6px;font-size:11px" data-click="openLinkedOutputPopup" data-key="${esc(key)}" data-tip="View this row's raw output — the agent's response or command stdout/stderr.\nWho/when: checking what a cell or proof step actually did, without leaving the Logs modal.\nFetched live from its terminal log each time you click, not a stored summary.">▶ output</button>`;
+      }
+      // RALPHUS-LOGS-OUTPUT-BTN:END
       /**
        * Renders the Logs modal cells-tab rows, each with its current-squad and
        * cumulative-across-restarts (RAL-160) token/cost figures.
@@ -6665,7 +7646,7 @@
         const loading = cartoModalCache[`cellstotals:${squad.id}`] === null;
         /** @type {string[]} */
         const rows = [];
-        squad.tasks.forEach((t) => t.cells.forEach((s) => {
+        squad.tasks.forEach((t, ti) => t.cells.forEach((s, si) => {
           const cum = totals[s.id];
           const cumText = cum
             ? `input ${cum.tokensIn} · output ${cum.tokensOut} · ${fmtCostUsd(cum.costUsd)} (${cum.attempts} attempt${cum.attempts === 1 ? "" : "s"})`
@@ -6677,6 +7658,7 @@
             `input ${s.tokens_in} · output ${s.tokens_out}`,
             `${fmtCostUsd(s.cost_usd)}${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}`,
             cumText,
+            logsOutputBtn(`cell|${squad.id}|${ti}|${si}`, s.state),
             s.error ? `<span style="color:var(--failed)">${esc(s.error)}</span>` : "",
           ]));
         }));
@@ -6699,26 +7681,473 @@
           return cartoTableHtml(d ? d.rows : null);
         }
         if (logsTab === "tasks") {
-          return T(["task", "state", "cells"], squad.tasks.map((t) => tblRow([esc(t.name), pill(t.state), t.cells.length])));
+          const reasonHead = `<span data-tip="${TASK_REASON_TOOLTIP}">reason</span>`;
+          return T(["task", "state", "cells", reasonHead], squad.tasks.map((t) => tblRow([
+            esc(t.name),
+            pill(t.state),
+            t.cells.length,
+            t.error ? `<span style="color:var(--failed)">${esc(t.error)}</span>` : "",
+          ])));
         }
         if (logsTab === "proofs") {
           /** @type {string[]} */
           const rows = [];
-          /**
-           * @param {ProofView} v
-           * @returns {string}
-           */
-          const outBtn = (v) => v.output ? `<button class="btn" style="padding:1px 6px;font-size:11px" data-full="${esc(v.output)}" ondblclick="openCmdPopup(event)" onclick="openCmdPopup(event)">▶ output</button>` : "—";
-          squad.tasks.forEach((t) => {
-            (t.proof || []).forEach((v) => rows.push(tblRow([esc(t.name), "task", esc(v.id || "—"), esc(v.kind), pill(v.state), outBtn(v)])));
-            (t.cells || []).forEach((s) => (s.proof || []).forEach((v) =>
-              rows.push(tblRow([esc(t.name), `cell ${esc(s.id)}`, esc(v.id || "—"), esc(v.kind), pill(v.state), outBtn(v)]))));
+          // RAL-295: the output button links to the pane/terminal-log-attempts
+          // endpoints (logsOutputBtn) rather than reading `v.output` directly,
+          // for consistency with the cells tab's equivalent button.
+          squad.tasks.forEach((t, ti) => {
+            (t.proof || []).forEach((v, vi) => rows.push(tblRow([esc(t.name), "task", esc(v.id || "—"), esc(v.kind), pill(v.state), logsOutputBtn(`proof|${squad.id}|${ti}|task|-1|${vi}`, v.state)])));
+            (t.cells || []).forEach((s, si) => (s.proof || []).forEach((v, vi) =>
+              rows.push(tblRow([esc(t.name), `cell ${esc(s.id)}`, esc(v.id || "—"), esc(v.kind), pill(v.state), logsOutputBtn(`proof|${squad.id}|${ti}|cell|${si}|${vi}`, v.state)]))));
           });
           return rows.length ? T(["task", "scope", "id", "kind", "state", "output"], rows) : `<div class="empty">No proofs.</div>`;
         }
+        const cumHead = `<span data-tip="${CELL_CUM_TOOLTIP}">cumulative (all restarts)</span>`;
+        return T(["task", "cell", "state", "tokens (this squad)", "cost (this squad)", cumHead, "output", "error"], cumulativeCellRows(squad));
+      }
+
+      // ---------- logs modal: copy active tab as Markdown (RAL-294) ----------
+      /**
+       * @typedef {object} LogsMdTable
+       * @property {string[]} head
+       * @property {string[][]} rows plain-text cells, already escaped for a pipe table
+       * @property {string[]} notes footnote lines (`[1]: ...`) referenced from `head`/`rows`
+       * @property {string[]} warnings free-form lines shown above the table (e.g. a capped fetch)
+       */
+      // RALPHUS-LOGS-MARKDOWN:BEGIN
+      /**
+       * Escapes a plain-text value for a Markdown pipe-table cell: collapses
+       * newlines to spaces and escapes literal `|` so the row can't break.
+       * @param {string|number|null|undefined} value
+       * @returns {string}
+       */
+      function mdEscapeCell(value) {
+        const s = String(value ?? "").replace(/\|/g, "\\|").replace(/[\r\n]+/g, " ").trim();
+        return s || "—";
+      }
+      /**
+       * Renders a table cell that may be long or multi-line: short single-line
+       * values are inlined as-is, longer ones are truncated with a `[n]`
+       * footnote marker whose full text is pushed onto `notes` for the
+       * Notes block below the table.
+       * @param {string|null|undefined} value
+       * @param {string[]} notes
+       * @returns {string}
+       */
+      function mdCellWithFootnote(value, notes) {
+        const s = String(value ?? "").trim();
+        if (!s) return "—";
+        const maxLen = 120;
+        if (s.length <= maxLen && !/[\r\n]/.test(s)) return mdEscapeCell(s);
+        const idx = notes.length + 1;
+        notes.push(`[${idx}]: ${s}`);
+        return `${mdEscapeCell(s.split(/[\r\n]/)[0].slice(0, maxLen))}… [${idx}]`;
+      }
+      /**
+       * Renders a header cell, folding a substantive column tooltip into a
+       * `[n]` footnote (in `notes`) rather than dropping it in the text export.
+       * @param {string} label
+       * @param {string} [tooltip]
+       * @param {string[]} [notes]
+       * @returns {string}
+       */
+      function mdHeadCell(label, tooltip, notes) {
+        if (!tooltip || !notes) return label;
+        const idx = notes.length + 1;
+        notes.push(`[${idx}]: ${tooltip}`);
+        return `${label} [${idx}]`;
+      }
+      /**
+       * Serializes a `LogsMdTable` into a pipe-delimited Markdown table, with
+       * any warnings above it and any footnotes below it.
+       * @param {LogsMdTable} t
+       * @returns {string}
+       */
+      function mdTableToText(t) {
+        /** @type {string[]} */
+        const lines = [];
+        if (t.warnings.length) { lines.push(...t.warnings, ""); }
+        lines.push("| " + t.head.join(" | ") + " |");
+        lines.push("| " + t.head.map(() => "---").join(" | ") + " |");
+        t.rows.forEach((r) => lines.push("| " + r.join(" | ") + " |"));
+        if (t.notes.length) { lines.push("", "--- Notes ---", ...t.notes); }
+        return lines.join("\n");
+      }
+      /**
+       * Plain-text mirror of `cartoRefChip` — the same squad/guardian/entity
+       * references, without the HTML links.
+       * @param {CartographerRow} row
+       * @returns {string}
+       */
+      function cartoRefText(row) {
+        /** @type {string[]} */
+        const parts = [];
+        if (row.squad_id) parts.push(row.squad_id);
+        if (row.guardian_id) parts.push(row.guardian_id);
+        const target = cartoResolveEntity(row);
+        if (target) parts.push(target.label);
+        else if (row.cell_id) parts.push(row.cell_id);
+        return parts.length ? parts.join(" · ") : "—";
+      }
+      // Safety cap on an "all rows" Markdown export: keeps a squad with a
+      // huge event/cell history from turning one click into thousands of
+      // fetch round-trips. logsCopyBtnHtml below documents this to the user.
+      const LOGS_COPY_ALL_ROWS_CAP = 2000;
+      /**
+       * Fetches every Cartographer row matching `filter` across as many pages
+       * as needed (up to `cap`), for the "all rows" copy-as-Markdown scope.
+       * @param {Partial<CartoFilter>} filter
+       * @param {number} cap
+       * @returns {Promise<{rows: CartographerRow[], total: number}>}
+       */
+      async function fetchAllCartoRows(filter, cap) {
+        /** @type {CartographerRow[]} */
+        const rows = [];
+        let offset = 0, total = Infinity;
+        const limit = 200;
+        while (rows.length < total && rows.length < cap) {
+          const page = await cartoFetch(/** @type {CartoFilter} */ ({ ...filter, limit, offset, sortCol: "time", dir: "desc" }));
+          total = page.total || 0;
+          if (!page.rows.length) break;
+          rows.push(...page.rows);
+          offset += limit;
+          if (page.rows.length < limit) break;
+        }
+        return { rows, total };
+      }
+      /**
+       * Sums a set of "cell completed" Cartographer rows into the same
+       * per-cell totals shape as `cumulativeCellTotals`, for rows fetched
+       * outside the modal cache (the "all rows" copy scope).
+       * @param {CartographerRow[]} rows
+       * @returns {{[cellId: string]: {tokensIn: number, tokensOut: number, costUsd: number, attempts: number}}}
+       */
+      function cellTotalsFromRows(rows) {
+        /** @type {{[cellId: string]: {tokensIn: number, tokensOut: number, costUsd: number, attempts: number}}} */
+        const totals = {};
+        rows.forEach((row) => {
+          const sid = row.cell_id;
+          if (!sid) return;
+          const cur = totals[sid] || { tokensIn: 0, tokensOut: 0, costUsd: 0, attempts: 0 };
+          cur.tokensIn += Number(row.payload.tokens_in) || 0;
+          cur.tokensOut += Number(row.payload.tokens_out) || 0;
+          cur.costUsd += Number(row.payload.cost_usd) || 0;
+          cur.attempts += 1;
+          totals[sid] = cur;
+        });
+        return totals;
+      }
+      /**
+       * Builds the events tab's Markdown table.
+       * @param {string} squadId
+       * @param {"current"|"all"} scope
+       * @returns {Promise<LogsMdTable>}
+       */
+      async function eventsMdTable(squadId, scope) {
+        /** @type {string[]} */
+        const notes = [];
+        /** @type {string[]} */
+        const warnings = [];
+        const cached = cartoModalCache[`squad:${squadId}`];
+        const fetched = scope === "all"
+          ? await fetchAllCartoRows({ squad_id: squadId }, LOGS_COPY_ALL_ROWS_CAP)
+          : { rows: cached ? cached.rows : [], total: cached ? cached.total : 0 };
+        const rows = fetched.rows, total = fetched.total;
+        if (rows.length < total) warnings.push(`Note: showing ${rows.length} of ${total} events — ${scope === "all" ? "capped to avoid a very slow export; narrow the filters in the Logs tab for the rest." : "choose \"All rows\" or use the Logs tab for the rest."}`);
+        const head = ["time", "level", "source", "scope", "task", "refs", "message"];
+        const mdRows = rows.map((r) => {
+          const payload = r.payload && Object.keys(r.payload).length ? JSON.stringify(r.payload) : "";
+          return [
+            mdEscapeCell(new Date(r.at_ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })),
+            mdEscapeCell(r.level),
+            mdEscapeCell(r.source),
+            mdEscapeCell(r.scope || "—"),
+            mdEscapeCell(r.task || "—"),
+            mdEscapeCell(cartoRefText(r)),
+            payload ? mdCellWithFootnote(`${r.message}\npayload: ${payload}`, notes) : mdEscapeCell(r.message),
+          ];
+        });
+        return { head, rows: mdRows, notes, warnings };
+      }
+      /**
+       * Builds the tasks tab's Markdown table.
+       * @param {SquadView} squad
+       * @returns {LogsMdTable}
+       */
+      function tasksMdTable(squad) {
+        /** @type {string[]} */
+        const notes = [];
+        const head = ["task", "state", "cells", mdHeadCell("reason", TASK_REASON_TOOLTIP, notes)];
+        const rows = squad.tasks.map((t) => [
+          mdEscapeCell(t.name),
+          mdEscapeCell(t.state),
+          mdEscapeCell(t.cells.length),
+          t.error ? mdCellWithFootnote(t.error, notes) : "—",
+        ]);
+        return { head, rows, notes, warnings: [] };
+      }
+      /**
+       * Builds the cells tab's Markdown table, including cumulative
+       * (across-restarts) totals for the chosen scope.
+       * @param {SquadView} squad
+       * @param {"current"|"all"} scope
+       * @returns {Promise<LogsMdTable>}
+       */
+      async function cellsMdTable(squad, scope) {
+        /** @type {string[]} */
+        const notes = [];
+        /** @type {string[]} */
+        const warnings = [];
+        /** @type {{[cellId: string]: {tokensIn: number, tokensOut: number, costUsd: number, attempts: number}}} */
+        let totals;
+        if (scope === "all") {
+          const fetched = await fetchAllCartoRows({ squad_id: squad.id, q: "cell completed" }, LOGS_COPY_ALL_ROWS_CAP);
+          if (fetched.rows.length < fetched.total) warnings.push(`Note: cumulative totals use ${fetched.rows.length} of ${fetched.total} "cell completed" events — capped to avoid a very slow export.`);
+          totals = cellTotalsFromRows(fetched.rows);
+        } else {
+          const cache = cartoModalCache[`cellstotals:${squad.id}`];
+          totals = cellTotalsFromRows(cache ? cache.rows : []);
+          if (cache && cache.rows.length < cache.total) warnings.push(`Note: cumulative totals reflect the currently loaded ${cache.rows.length} of ${cache.total} "cell completed" events — choose "All rows" for the complete history.`);
+        }
+        const head = ["task", "cell", "state", "tokens (this squad)", "cost (this squad)", mdHeadCell("cumulative (all restarts)", CELL_CUM_TOOLTIP, notes), "error"];
+        /** @type {string[][]} */
+        const rows = [];
+        squad.tasks.forEach((t) => t.cells.forEach((s) => {
+          const cum = totals[s.id];
+          const cumText = cum
+            ? `input ${cum.tokensIn} · output ${cum.tokensOut} · ${fmtCostUsd(cum.costUsd)} (${cum.attempts} attempt${cum.attempts === 1 ? "" : "s"})`
+            : "—";
+          rows.push([
+            mdEscapeCell(t.name),
+            mdEscapeCell(s.id),
+            mdEscapeCell(s.state),
+            mdEscapeCell(`input ${s.tokens_in} · output ${s.tokens_out}`),
+            mdEscapeCell(`${fmtCostUsd(s.cost_usd)}${s.maximum_budget_usd ? ` / cap $${s.maximum_budget_usd.toFixed(4)}` : ""}`),
+            mdEscapeCell(cumText),
+            s.error ? mdCellWithFootnote(s.error, notes) : "—",
+          ]);
+        }));
+        return { head, rows, notes, warnings };
+      }
+      /**
+       * Builds one proofs-tab Markdown row for a single proof step.
+       * @param {string} taskName
+       * @param {string} scope
+       * @param {ProofView} v
+       * @param {string[]} notes
+       * @returns {string[]}
+       */
+      function proofMdRow(taskName, scope, v, notes) {
+        return [
+          mdEscapeCell(taskName),
+          mdEscapeCell(scope),
+          mdEscapeCell(v.id || "—"),
+          mdEscapeCell(v.kind),
+          mdEscapeCell(v.state),
+          v.output ? mdCellWithFootnote(v.output, notes) : "—",
+        ];
+      }
+      /**
+       * Builds the proofs tab's Markdown table.
+       * @param {SquadView} squad
+       * @returns {LogsMdTable}
+       */
+      function proofsMdTable(squad) {
+        /** @type {string[]} */
+        const notes = [];
+        const head = ["task", "scope", "id", "kind", "state", "output"];
+        /** @type {string[][]} */
+        const rows = [];
+        squad.tasks.forEach((t) => {
+          (t.proof || []).forEach((v) => rows.push(proofMdRow(t.name, "task", v, notes)));
+          (t.cells || []).forEach((s) => (s.proof || []).forEach((v) => rows.push(proofMdRow(t.name, `cell ${s.id}`, v, notes))));
+        });
+        return { head, rows, notes, warnings: [] };
+      }
+      /**
+       * Builds the Markdown table for the Logs modal's currently active tab.
+       * @param {string} tab
+       * @param {SquadView} squad
+       * @param {"current"|"all"} scope
+       * @returns {Promise<LogsMdTable>}
+       */
+      async function buildLogsMdTable(tab, squad, scope) {
+        if (tab === "events") return eventsMdTable(squad.id, scope);
+        if (tab === "cells") return cellsMdTable(squad, scope);
+        if (tab === "proofs") return proofsMdTable(squad);
+        return tasksMdTable(squad);
+      }
+      // RALPHUS-LOGS-MARKDOWN:END
+      /**
+       * Renders the Logs modal's "copy active tab as Markdown" trigger button,
+       * disabled while that tab's underlying data is still loading.
+       * @param {string} tab
+       * @returns {string}
+       */
+      function logsCopyBtnHtml(tab) {
+        const busy = (tab === "events" && !cartoModalCache[`squad:${logSquadId}`])
+          || (tab === "cells" && !cartoModalCache[`cellstotals:${logSquadId}`]);
+        const tip = "Copy this tab's table as a Markdown table you can paste into a PR description, ticket, or chat message.\n\"Current view\" copies what's shown here; \"All rows\" fetches the complete underlying history first (up to " + LOGS_COPY_ALL_ROWS_CAP + " rows) — that can be slow for a squad with a lot of event/cell/proof history.";
+        return `<button id="logs-copy-btn" class="copy-btn" data-tip="${esc(tip)}" ${busy ? "disabled" : ""} data-click="showLogsCopyMenu" data-tab="${esc(tab)}">⧉ Copy as Markdown</button>`;
+      }
+      /**
+       * Opens the "current view" / "all rows" scope menu for the Logs modal's copy-as-Markdown button.
+       * @param {MouseEvent} e
+       * @param {string} tab
+       * @returns {void}
+       */
+      function showLogsCopyMenu(e, tab) {
+        e.stopPropagation();
+        const existing = document.getElementById("logs-copy-menu");
+        if (existing) { existing.remove(); return; }
+        const rect = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+        const menu = document.createElement("div");
+        menu.id = "logs-copy-menu";
+        menu.className = "copy-menu";
+        menu.style.top = (rect.bottom + 4) + "px";
+        menu.style.left = rect.left + "px";
+        menu.innerHTML = `<div class="copy-menu-item" data-click="copyLogsAs" data-tab="${esc(tab)}" data-scope="current" data-tip="Copy just what's currently loaded in this tab.">Current view</div><div class="copy-menu-item" data-click="copyLogsAs" data-tab="${esc(tab)}" data-scope="all" data-tip="Fetch and copy the complete history for this tab first — can be slow for a squad with a lot of event/cell/proof history.">All rows</div>`;
+        document.body.appendChild(menu);
+        setTimeout(() => document.addEventListener("click", () => { const m = document.getElementById("logs-copy-menu"); if (m) m.remove(); }, { once: true }), 0);
+      }
+      /**
+       * Copies the Logs modal's active tab to the clipboard as Markdown, at the chosen scope.
+       * @param {MouseEvent} e
+       * @param {string} tab
+       * @param {string} scope
+       * @returns {Promise<void>}
+       */
+      async function copyLogsAs(e, tab, scope) {
+        e.stopPropagation();
+        const menu = document.getElementById("logs-copy-menu");
+        if (menu) menu.remove();
+        const squad = logSquadId ? findSquad(logSquadId) : null;
+        const btn = document.getElementById("logs-copy-btn");
+        if (!squad) return;
+        if (btn) { btn.textContent = "…"; /** @type {HTMLButtonElement} */ (btn).disabled = true; }
+        try {
+          const table = await buildLogsMdTable(tab, squad, scope === "all" ? "all" : "current");
+          await writeClipboardText(mdTableToText(table));
+          if (btn) { btn.textContent = "✓ Copied"; btn.classList.add("copied"); }
+        } catch (_) {
+          if (btn) btn.textContent = "✗ Copy failed";
+        } finally {
+          if (btn) setTimeout(() => { btn.textContent = "⧉ Copy as Markdown"; btn.classList.remove("copied"); /** @type {HTMLButtonElement} */ (btn).disabled = false; }, 1200);
+        }
+      }
+      /**
+       * Plain-text form of a Cartographer row's squad/guardian/cell references
+       * (RAL-294) — the Markdown-export sibling of cartoRefChip's HTML links.
+       * @param {CartographerRow} row
+       * @returns {string}
+       */
+      function cartoRefText(row) {
+        /** @type {string[]} */
+        const parts = [];
+        if (row.squad_id) parts.push(row.squad_id);
+        if (row.guardian_id) parts.push(row.guardian_id);
+        if (row.cell_id) parts.push(row.cell_id);
+        return parts.length ? parts.join(" · ") : "—";
+      }
+      /**
+       * Builds the events tab's Markdown table text from its cached Cartographer rows.
+       * @param {CartographerRow[]|null|undefined} rows
+       * @returns {string}
+       */
+      function eventsMdTable(rows) {
+        if (!rows || !rows.length) return "No events.";
+        /** @type {string[]} */
+        const notes = [];
+        const dataRows = rows.map((r) => [
+          mdEscapeCell(new Date(r.at_ms).toLocaleString()),
+          mdEscapeCell(r.level),
+          mdEscapeCell(r.source),
+          mdEscapeCell(r.scope),
+          mdEscapeCell(r.task),
+          mdEscapeCell(cartoRefText(r)),
+          mdCellWithFootnote(r.message, notes),
+        ]);
+        return mdTableToText({ head: ["time", "level", "source", "scope", "task", "refs", "message"], rows: dataRows, notes, warnings: [] });
+      }
+      /**
+       * Builds the tasks tab's Markdown table text for a squad.
+       * @param {SquadView} squad
+       * @returns {string}
+       */
+      function tasksMdTable(squad) {
+        /** @type {string[]} */
+        const notes = [];
+        const reasonTip = "A task-level failure reason (RAL-291) — set only when the task itself failed for a reason with no underlying cell/proof error to point to, e.g. the RAL-156 no-commits-since-baseline guard.\nEmpty when the task instead failed because one of its own cells or proof steps failed — that failure is already visible in the cells/proofs tabs.";
+        const head = ["task", "state", "cells", mdHeadCell("reason", reasonTip, notes)];
+        const rows = squad.tasks.map((t) => [
+          mdEscapeCell(t.name),
+          mdEscapeCell(t.state),
+          mdEscapeCell(t.cells.length),
+          mdCellWithFootnote(t.error, notes),
+        ]);
+        return mdTableToText({ head, rows, notes, warnings: [] });
+      }
+      /**
+       * Builds the cells tab's Markdown table text for a squad, including RAL-160 cumulative totals.
+       * @param {SquadView} squad
+       * @returns {string}
+       */
+      function cellsMdTable(squad) {
+        /** @type {string[]} */
+        const notes = [];
+        const totals = cumulativeCellTotals(squad.id);
+        /** @type {string[][]} */
+        const rows = [];
+        squad.tasks.forEach((t) => t.cells.forEach((s) => {
+          const cum = totals[s.id];
+          const cumText = cum
+            ? `input ${cum.tokensIn} · output ${cum.tokensOut} · ${fmtCostUsd(cum.costUsd)} (${cum.attempts} attempt${cum.attempts === 1 ? "" : "s"})`
+            : "—";
+          rows.push([
+            mdEscapeCell(t.name),
+            mdEscapeCell(s.id),
+            mdEscapeCell(s.state),
+            mdEscapeCell(`input ${s.tokens_in} · output ${s.tokens_out}`),
+            mdEscapeCell(fmtCostUsd(s.cost_usd)),
+            mdEscapeCell(cumText),
+            mdCellWithFootnote(s.error, notes),
+          ]);
+        }));
         const cumTip = "Sum of input/output tokens and $ cost across every completed attempt of this cell (including restarts), read from the Cartographer event log.\nMay undercount if older attempts have aged out of Cartographer retention (see [cartographer] in .ralphus.toml).";
-        const cumHead = `<span data-tip="${cumTip}">cumulative (all restarts)</span>`;
-        return T(["task", "cell", "state", "tokens (this squad)", "cost (this squad)", cumHead, "error"], cumulativeCellRows(squad));
+        const head = ["task", "cell", "state", "tokens (this squad)", "cost (this squad)", mdHeadCell("cumulative (all restarts)", cumTip, notes), "error"];
+        return mdTableToText({ head, rows, notes, warnings: [] });
+      }
+      /**
+       * Builds the proofs tab's Markdown table text for a squad.
+       * @param {SquadView} squad
+       * @returns {string}
+       */
+      function proofsMdTable(squad) {
+        /** @type {string[]} */
+        const notes = [];
+        /** @type {string[][]} */
+        const rows = [];
+        squad.tasks.forEach((t) => {
+          (t.proof || []).forEach((v) => rows.push([mdEscapeCell(t.name), "task", mdEscapeCell(v.id || "—"), mdEscapeCell(v.kind), mdEscapeCell(v.state), mdCellWithFootnote(v.output, notes)]));
+          (t.cells || []).forEach((s) => (s.proof || []).forEach((v) =>
+            rows.push([mdEscapeCell(t.name), `cell ${s.id}`, mdEscapeCell(v.id || "—"), mdEscapeCell(v.kind), mdEscapeCell(v.state), mdCellWithFootnote(v.output, notes)])));
+        });
+        if (!rows.length) return "No proofs.";
+        return mdTableToText({ head: ["task", "scope", "id", "kind", "state", "output"], rows, notes, warnings: [] });
+      }
+      /**
+       * Builds the Markdown export text for the Logs modal's currently active tab.
+       * @param {SquadView} squad
+       * @returns {string}
+       */
+      function logsMarkdownForTab(squad) {
+        if (logsTab === "events") {
+          const d = cartoModalCache[`squad:${squad.id}`];
+          return eventsMdTable(d ? d.rows : null);
+        }
+        if (logsTab === "tasks") return tasksMdTable(squad);
+        if (logsTab === "proofs") return proofsMdTable(squad);
+        return cellsMdTable(squad);
       }
 
       // ---------- uber-log-viewer timeline modal (RAL-155) ----------
@@ -6834,6 +8263,7 @@
        * @returns {Promise<void>}
        */
       async function submitTask() {
+        if (ntTab === "simple") { await submitTaskSimple(); return; }
         if (ntTab === "files") { await submitTaskFiles(); return; }
         const toml = /** @type {HTMLTextAreaElement} */ (document.getElementById("nt-toml")).value;
         const label = /** @type {HTMLInputElement} */ (document.getElementById("nt-label")).value;
@@ -7238,9 +8668,11 @@
         const canCancel = G_CANCELLABLE.includes(g.status);
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu";
-        menu.innerHTML = canCancel
+        const cancelItem = canCancel
           ? `<div class="danger" data-click="cancelReview" data-guardian-id="${esc(id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>`
           : `<div style="color:var(--muted);padding:6px 10px;font-size:12px" data-tip="No actions are available because this review's status is '${g.status}'.\nActions like Cancel are only available while the review is collecting, merging, merge_failed, in_review, or approved.">No actions available</div>`;
+        const stacksItem = `<div data-click="openReviewPrStacks" data-guardian-id="${esc(id)}" data-tip="View every PR stack previously submitted for this review, in any state -- including ones dropped because their linked PR merged on the forge while the review was still mid-flight (RAL-300).\nWho/when: use this to see what was submitted before deciding whether/how to resubmit.\nRead-only -- does not resubmit or replay anything.">📜 View past PR stacks</div>`;
+        menu.innerHTML = cancelItem + stacksItem;
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
@@ -7892,7 +9324,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               const syncTip = canSync
                 ? "Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack."
                 : "Not available — a stack reorder can only be detected once this review has an open PR stack (status in_review or merging).";
-              const syncBtn = `<button class="btn" data-click="syncGithubReview" data-guardian-id="${esc(g.id)}" ${canSync ? "" : "disabled"}${canSync ? ` data-tip="${syncTip}"` : ""}>Sync with GitHub</button>`;
+              const syncBtn = `<button class="btn" data-click="syncPrReview" data-guardian-id="${esc(g.id)}" ${canSync ? "" : "disabled"}${canSync ? ` data-tip="${syncTip}"` : ""}>Sync PR</button>`;
               return canSync ? syncBtn : `<span data-tip="${syncTip}">${syncBtn}</span>`;
             })()}
           </div>
@@ -8793,13 +10225,35 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
 
       // ---- Guardian notices -> toast (RAL-273) ----
       // A guardian notice (`notice_kind`/`notice_message`/`notice_at_ms`) is
-      // server-recorded, one-shot, purely informational state -- today only
-      // ever set when an incoming GitHub/GitLab stack reorder interrupts a
-      // local reorder in flight (`Store::set_guardian_notice`). There is no
-      // server-side "seen" tracking: each poll of `/api/guardians` re-sends
-      // whatever the last notice was, so the board itself remembers which
-      // `notice_at_ms` it already showed per guardian and only toasts once
-      // per new one.
+      // server-recorded, one-shot, purely informational state -- e.g. an
+      // incoming GitHub/GitLab stack reorder interrupting a local reorder in
+      // flight, or a linked PR merging out-of-band while a rebase/feedback
+      // pass owned the review's worktrees (`pr_merged_mid_flight`, RAL-300;
+      // see `Store::set_guardian_notice`). There is no server-side "seen"
+      // tracking: each poll of `/api/guardians` re-sends whatever the last
+      // notice was, so the board itself remembers which `notice_at_ms` it
+      // already showed per guardian and only toasts once per new one.
+      // RALPHUS-GUARDIAN-NOTICE:BEGIN
+      /**
+       * Which of `list`'s guardian notices are newer than what `shown` last
+       * recorded for that guardian, as ready-to-display toast text (RAL-273;
+       * RAL-300 adds the `pr_merged_mid_flight` notice kind). Pure: does not
+       * touch the DOM or mutate `shown` -- the caller applies the result.
+       * @param {GuardianView[]} list
+       * @param {Map<string, number>} shown - guardian id -> last-shown notice_at_ms
+       * @returns {{id: string, notice_at_ms: number, text: string}[]}
+       */
+      function pendingGuardianNoticeToasts(list, shown) {
+        const out = [];
+        for (const g of list) {
+          if (!g.notice_kind || !g.notice_at_ms) continue;
+          const lastShown = shown.get(g.id) || 0;
+          if (g.notice_at_ms <= lastShown) continue;
+          out.push({ id: g.id, notice_at_ms: g.notice_at_ms, text: `${g.name}: ${g.notice_message || g.notice_kind}` });
+        }
+        return out;
+      }
+      // RALPHUS-GUARDIAN-NOTICE:END
       /** @type {Map<string, number>} guardian id -> last-shown notice_at_ms */
       const _guardianNoticeShown = new Map();
       /**
@@ -8809,12 +10263,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {void}
        */
       function checkGuardianNotices(list) {
-        for (const g of list) {
-          if (!g.notice_kind || !g.notice_at_ms) continue;
-          const lastShown = _guardianNoticeShown.get(g.id) || 0;
-          if (g.notice_at_ms <= lastShown) continue;
-          _guardianNoticeShown.set(g.id, g.notice_at_ms);
-          showInfoToast(`${g.name}: ${g.notice_message || g.notice_kind}`);
+        for (const toast of pendingGuardianNoticeToasts(list, _guardianNoticeShown)) {
+          _guardianNoticeShown.set(toast.id, toast.notice_at_ms);
+          showInfoToast(toast.text);
         }
       }
       // POST to a guardian/review action endpoint; on failure, surfaces a
@@ -8918,17 +10369,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       /**
-       * Explicit "Sync with GitHub" (RAL-273): asks the daemon to check this
-       * review's open PRs' live forge bases for a reorder made outside
-       * ralphus and apply it if found. Fires and forgets -- the daemon runs
-       * detection/apply in the background, so the result (a new branch
-       * order, a rebuild, or nothing at all) shows up through the normal
-       * `tick()` refresh, same as the 5-minute background poll.
+       * Explicit "Sync PR" (RAL-273): asks the daemon to check this
+       * review's open PRs' live forge bases (GitHub or GitLab) for a
+       * reorder made outside ralphus and apply it if found. Fires and
+       * forgets -- the daemon runs detection/apply in the background, so
+       * the result (a new branch order, a rebuild, or nothing at all) shows
+       * up through the normal `tick()` refresh, same as the 5-minute
+       * background poll.
        * @param {string} id
        * @returns {Promise<void>}
        */
-      async function syncGithubReview(id) {
-        await guardianAction(`/api/guardians/${id}/sync-github`);
+      async function syncPrReview(id) {
+        await guardianAction(`/api/guardians/${id}/sync-pr`);
         showInfoToast("Checking GitHub/GitLab for a stack reorder…");
         tick();
       }
@@ -9263,6 +10715,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         else if (tab === "projects") { await updateCounter(); await pollProjects(); }
         else if (tab === "machines") { await updateCounter(); await pollMachines(); }
         else if (tab === "users") { await updateCounter(); await pollUsers(); }
+        else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
         else await pollTasks();
         await refreshBanner();
       }
@@ -9830,17 +11283,84 @@ Work submitted against it will fail — fix the machine or deregister the provid
           byId("conn").className = "dot on";
           byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
           users = (d.users || []).slice().sort((/** @type {UserView} */ a, /** @type {UserView} */ b) => a.name.localeCompare(b.name));
-          renderUsers();
+          if (userEditState === null) renderUsers();
         } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
       }
       /**
-       * Renders one registered user's table row.
+       * Enters inline edit mode for a user row.
+       * @param {string} name
+       * @returns {void}
+       */
+      function startUserEdit(name) {
+        const u = users.find((x) => x.name === name);
+        if (!u) return;
+        userEditState = name;
+        userEditDraft = { name: u.name };
+        userSaveError = "";
+        renderUsers();
+      }
+      /**
+       * Exits a user row's inline edit mode without saving.
+       * @returns {void}
+       */
+      function cancelUserEdit() {
+        userEditState = null;
+        userEditDraft = {};
+        userSaveError = "";
+        renderUsers();
+      }
+      /**
+       * Saves a user row's inline edit draft (renames the user).
+       * @param {string} name
+       * @returns {Promise<void>}
+       */
+      async function saveUserEdit(name) {
+        const newName = (userEditDraft.name ?? "").trim();
+        userSaveError = "";
+        if (!newName) { userSaveError = "Name is required."; renderUsers(); return; }
+        let resp;
+        try {
+          resp = await fetch(`/api/users/${encodeURIComponent(name)}/rename`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName }),
+          });
+        } catch (e) {
+          userSaveError = "save failed: daemon unreachable";
+          renderUsers();
+          return;
+        }
+        if (!resp.ok) {
+          userSaveError = await responseError(resp, "save failed");
+          renderUsers();
+          return;
+        }
+        userEditState = null;
+        userEditDraft = {};
+        await pollUsers();
+      }
+      /**
+       * Renders one registered user's table row (read-only or inline-edit form).
        * @param {UserView} u
        * @returns {string}
        */
       function userRowHtml(u) {
+        if (userEditState === u.name) {
+          const d = userEditDraft;
+          return `<tr class="proj-edit-row">
+              <td><input type="text" value="${esc(d.name)}" oninput="userEditDraft.name=this.value" data-tip="Placeholder identity name — no format restrictions beyond non-empty." /></td>
+              <td style="color:var(--muted)">${fmtProjCreated(u.created_at_ms)}</td>
+              <td>
+                <div class="row" style="gap:6px;flex-wrap:nowrap">
+                  <button class="btn primary" data-click="saveUserEdit" data-name="${esc(u.name)}" data-tip="Save this rename.\nA request already claiming the old name keeps working under the old name until it re-claims the new one.">Save</button>
+                  <button class="btn" onclick="cancelUserEdit()" data-tip="Discard your changes and exit edit mode.">Cancel</button>
+                </div>
+                ${userSaveError ? `<div class="verr">${esc(userSaveError)}</div>` : ""}
+              </td>
+            </tr>`;
+        }
         return `<tr>
-            <td><span class="proj-name">${esc(u.name)}</span></td>
+            <td><span class="proj-name proj-field" data-name="${esc(u.name)}" ondblclick="startUserEdit(this.dataset.name)" data-tip="Double-click to rename this placeholder user.">${esc(u.name)}</span></td>
             <td style="color:var(--muted)">${fmtProjCreated(u.created_at_ms)}</td>
             <td><button class="btn" data-click="removeUser" data-name="${esc(u.name)}" data-tip="Remove this placeholder user.\nGrants/revokes nothing by itself — it just stops the name from being selectable as a default_user or explicit identity.\nThis cannot be undone — you would have to add it again.">Remove</button></td>
           </tr>`;
@@ -9859,7 +11379,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           : "";
         const table = users.length
           ? `<table class="proj-table"><thead><tr>`
-            + `<th data-tip="Placeholder identity name — what a caller claims via ?user=, or a default_user config value, names.">Name</th>`
+            + `<th data-tip="Placeholder identity name — what a caller claims via ?user=, or a default_user config value, names. Double-click a row to rename.">Name</th>`
             + `<th data-tip="When this user was registered.">Registered</th><th></th>`
             + `</tr></thead><tbody>${users.map((u) => userRowHtml(u)).join("")}</tbody></table>`
           : `<div class="empty">No registered users yet.</div>`;
@@ -9901,6 +11421,110 @@ Work submitted against it will fail — fix the machine or deregister the provid
           userError = r.ok ? "" : await responseError(r, "remove failed");
         } catch (e) { userError = "daemon unreachable"; }
         await pollUsers();
+      }
+
+      /**
+       * Polls `/api/secret-env-names` and re-renders the Secrets tab.
+       * @returns {Promise<void>}
+       */
+      async function pollSecretEnvNames() {
+        try {
+          const d = await (await fetch("/api/secret-env-names")).json();
+          byId("conn").className = "dot on";
+          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          secretEnvNames = (d.names || []).slice().sort((/** @type {SecretEnvNameView} */ a, /** @type {SecretEnvNameView} */ b) => a.name.localeCompare(b.name));
+          renderSecretEnvNames();
+        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+      }
+      /**
+       * Renders one secret env-var name's table row.
+       * @param {SecretEnvNameView} s
+       * @returns {string}
+       */
+      function secretEnvNameRowHtml(s) {
+        return `<tr>
+            <td><span class="proj-name">${esc(s.name)}</span></td>
+            <td style="color:var(--muted)">${fmtProjCreated(s.created_at_ms)}</td>
+            <td>
+              <button class="btn" data-click="renameSecretEnvName" data-name="${esc(s.name)}" data-tip="Rename this secret env-var name.\nThe new name takes over redaction coverage immediately; the old name stops being treated as secret.">Rename</button>
+              <button class="btn" data-click="removeSecretEnvName" data-name="${esc(s.name)}" data-tip="Stop treating this env-var name as secret.\nValues already redacted in existing pane text/terminal logs stay redacted — this only affects future dispatches.\nThis cannot be undone — you would have to add it again.">Remove</button>
+            </td>
+          </tr>`;
+      }
+      /**
+       * Renders the Secrets tab: registered secret env-var names and the add form.
+       * @returns {void}
+       */
+      function renderSecretEnvNames() {
+        byId("secret-env-name-summary").innerHTML =
+          `${secretEnvNames.length} secret env-var ${secretEnvNames.length === 1 ? "name" : "names"} `
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollSecretEnvNames()" data-tip="Re-query the daemon for the secret env-var name list.">⟳ Refresh</button>`;
+        const el = byId("secrets");
+        const err = secretEnvNameError
+          ? `<div class="empty" style="color:var(--failed);margin-bottom:8px">${esc(secretEnvNameError)}</div>`
+          : "";
+        const table = secretEnvNames.length
+          ? `<table class="proj-table"><thead><tr>`
+            + `<th data-tip="Env-var name — a cell/proof step's resolved env is checked against this list by exact name match.">Name</th>`
+            + `<th data-tip="When this name was registered.">Registered</th><th></th>`
+            + `</tr></thead><tbody>${secretEnvNames.map((s) => secretEnvNameRowHtml(s)).join("")}</tbody></table>`
+          : `<div class="empty">No secret env-var names registered yet.</div>`;
+        const form = `<div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+            <div style="margin-bottom:8px" data-tip="Register an env-var name as secret.\nA matching variable's resolved value is scrubbed from durable pane text and terminal logs wherever it shows up, additive to the existing from_env-sourced agent-profile secrets (RAL-264).">Add a secret env-var name</div>
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <input id="secret-env-name-input" type="text" placeholder="name (e.g. STRIPE_SECRET_KEY)" style="width:240px" data-tip="Must be a valid environment-variable identifier: starts with a letter or underscore, then letters/digits/underscores." />
+              <button class="primary" onclick="addSecretEnvName()" data-tip="Register this name with the daemon.\nAdding a name that's already registered is rejected, not merged.">Add</button>
+            </div>
+          </div>`;
+        el.innerHTML = err + table + form;
+      }
+      /**
+       * Registers a secret env-var name from the Secrets tab form.
+       * @returns {Promise<void>}
+       */
+      async function addSecretEnvName() {
+        const name = /** @type {HTMLInputElement} */ (byId("secret-env-name-input")).value.trim();
+        if (!name) { secretEnvNameError = "Name is required."; renderSecretEnvNames(); return; }
+        try {
+          const r = await fetch("/api/secret-env-names", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+          secretEnvNameError = r.ok ? "" : await responseError(r, "add failed");
+        } catch (e) { secretEnvNameError = "daemon unreachable"; }
+        await pollSecretEnvNames();
+      }
+      /**
+       * Renames a registered secret env-var name.
+       * @param {string} name
+       * @returns {Promise<void>}
+       */
+      async function renameSecretEnvName(name) {
+        const newName = prompt(`Rename secret env-var name "${name}" to:`, name);
+        if (!newName || newName.trim() === "" || newName.trim() === name) return;
+        try {
+          const r = await fetch(`/api/secret-env-names/${encodeURIComponent(name)}/rename`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName.trim() }),
+          });
+          secretEnvNameError = r.ok ? "" : await responseError(r, "rename failed");
+        } catch (e) { secretEnvNameError = "daemon unreachable"; }
+        await pollSecretEnvNames();
+      }
+      /**
+       * Removes a registered secret env-var name.
+       * @param {string} name
+       * @returns {Promise<void>}
+       */
+      async function removeSecretEnvName(name) {
+        if (!confirm(`Stop treating "${name}" as a secret env-var name?`)) return;
+        try {
+          const r = await fetch(`/api/secret-env-names/${encodeURIComponent(name)}`, { method: "DELETE" });
+          secretEnvNameError = r.ok ? "" : await responseError(r, "remove failed");
+        } catch (e) { secretEnvNameError = "daemon unreachable"; }
+        await pollSecretEnvNames();
       }
 
       /**

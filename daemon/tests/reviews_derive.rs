@@ -762,6 +762,14 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-b", "main"]);
+    // The second "Merge / rebase" press below drives a real rebase through
+    // production's own git spawn (GitVcs::exec_raw, which correctly never
+    // injects an identity), so this repo needs one of its own in local
+    // config -- not just on this file's `git()` helper's per-invocation env
+    // vars -- or that rebase's commit fails identity checks on a CI runner
+    // with no global gitconfig.
+    git(&repo, &["config", "user.name", "ralphus"]);
+    git(&repo, &["config", "user.email", "ralphus@example.com"]);
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);

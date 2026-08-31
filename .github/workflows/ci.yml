@@ -76,8 +76,42 @@ jobs:
       - name: Unit tests (board.html's pure peek state machine)
         run: npm test
 
-  python:
-    name: Python ${{ matrix.python-version }} (ruff, mypy --strict, privata, deadcode, pytest)
+  python-lint:
+    name: Python lint (ruff, mypy --strict, privata, deadcode)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      # Lint/type-check once, on the newest version cli/pyproject.toml's
+      # `requires-python = ">=3.11"` covers -- these tools don't need a
+      # version matrix, only pytest (below) does.
+      - name: Install Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --dev
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Ruff (format check)
+        run: uv run ruff format --check .
+      - name: mypy --strict
+        run: uv run mypy
+      - name: privata (module privacy)
+        run: |
+          uv run privata src
+          uv run privata tests
+      - name: deadcode
+        run: uv run deadcode src tests
+
+  python-test:
+    name: Python ${{ matrix.python-version }} (pytest)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -105,18 +139,13 @@ jobs:
           enable-cache: true
       - name: Sync dependencies
         run: uv sync --dev
-      - name: Ruff (lint)
-        run: uv run ruff check .
-      - name: Ruff (format check)
-        run: uv run ruff format --check .
-      - name: mypy --strict
-        run: uv run mypy
-      - name: privata (module privacy)
-        run: |
-          uv run privata src
-          uv run privata tests
-      - name: deadcode
-        run: uv run deadcode src tests
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+        working-directory: .
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ralphus binary (needed by docsgen tests)
+        run: cargo build -p ralphus-cli
+        working-directory: .
       - name: pytest
         run: uv run pytest
 
@@ -160,5 +189,12 @@ jobs:
         run: uv sync --dev
       - name: Every board.html tab has a screenshot
         run: uv run ralphus-docs-lint
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+        working-directory: .
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ralphus binary (needed by docsgen helpmap check)
+        run: cargo build -p ralphus-cli
+        working-directory: .
       - name: cli-reference.md help-map is up to date (RAL-110)
         run: uv run ralphus-docs-helpmap --check

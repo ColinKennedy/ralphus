@@ -38,6 +38,21 @@ pub fn emit(
     ctx: EventContext<'_>,
     payload: serde_json::Value,
 ) {
+    emit_scoped(source, message, level, None, ctx, payload);
+}
+
+/// As [`emit`], but also carries a `scope` tag (e.g. `"cell"`) --
+/// `daemon/src/runner.rs::forward_runner_event` passes this straight through
+/// onto the persisted `CartographerEntry`, the same free-text convention
+/// `daemon/src/cartographer.rs::Note` uses for daemon-originated events.
+pub fn emit_scoped(
+    source: &str,
+    message: &str,
+    level: &str,
+    scope: Option<&str>,
+    ctx: EventContext<'_>,
+    payload: serde_json::Value,
+) {
     let mut body = json!({
         "source": source,
         "message": message,
@@ -45,6 +60,9 @@ pub fn emit(
         "payload": payload,
     });
     if let Some(o) = body.as_object_mut() {
+        if let Some(scope) = scope {
+            o.insert("scope".to_string(), json!(scope));
+        }
         if let Some(squad_id) = ctx.squad_id {
             o.insert("squad_id".to_string(), json!(squad_id));
         }

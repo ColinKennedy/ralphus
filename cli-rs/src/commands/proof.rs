@@ -48,7 +48,7 @@ fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> ProofCommand) ->
 
 /// Mirrors `_resolve_selector_or_none`'s kind check; see `task.rs`'s twin for
 /// why this returns a `Result` instead of printing inline.
-fn resolve_scoped(
+pub fn resolve_scoped(
     client: &DaemonClient,
     selector: &str,
     want_kind: &str,
@@ -63,7 +63,7 @@ fn resolve_scoped(
     Ok(resolved)
 }
 
-fn with_uri(mut payload: Value, uri: String) -> Value {
+pub fn with_uri(mut payload: Value, uri: String) -> Value {
     if let Value::Object(map) = &mut payload {
         let mut ordered = serde_json::Map::new();
         ordered.insert("uri".to_string(), Value::String(uri));
@@ -76,7 +76,7 @@ fn with_uri(mut payload: Value, uri: String) -> Value {
 /// Indexes the proof step `resolved` addresses out of a `/api/squads/{id}`
 /// view -- ported from Python's `_verify_step_for`: `task["proof"][idx]`
 /// when `proof_scope == "task"`, else `cell["proof"][idx]`.
-fn proof_step_for(squad: &Value, resolved: &ResolvedSelector) -> Value {
+pub fn proof_step_for(squad: &Value, resolved: &ResolvedSelector) -> Value {
     let task = &squad["tasks"][resolved.task_idx as usize];
     if resolved.proof_scope == "cell" {
         task["cells"][resolved.cell_idx as usize]["proof"][resolved.proof_idx as usize].clone()
