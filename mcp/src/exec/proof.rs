@@ -47,5 +47,16 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
                 )?)
             }
         }
+        ProofCommand::Edit { selector, model } => {
+            let resolved = proof::resolve_scoped(client, &selector, "proof")?;
+            Ok(client.edit_proof(
+                &resolved.squad_id,
+                resolved.task_idx,
+                &resolved.proof_scope,
+                resolved.cell_idx,
+                resolved.proof_idx,
+                model.as_deref(),
+            )?)
+        }
     }
 }

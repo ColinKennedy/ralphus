@@ -918,9 +918,10 @@ fn proof_extras(
     branch_id: &str,
     runner: &dyn Runner,
     resolved: &ResolvedResolverAgent,
+    cancel: &CancelToken,
 ) -> (String, String) {
     let quality_note =
-        synthesize_proof_instructions(store, id, branch, branch_id, runner, resolved);
+        synthesize_proof_instructions(store, id, branch, branch_id, runner, resolved, cancel);
     let ghost_uri = crate::ghost::review_uri(id, Some(branch_id));
     let ghost_prefix = {
         let guard = store.lock().expect("poisoned");
@@ -1086,6 +1087,7 @@ fn synthesize_proof_instructions(
     branch_id: &str,
     runner: &dyn Runner,
     resolved: &ResolvedResolverAgent,
+    cancel: &CancelToken,
 ) -> String {
     let log = |msg: &str| {
         let _ = store.lock().expect("poisoned").log_event(
@@ -1216,6 +1218,8 @@ fn synthesize_proof_instructions(
         timeout_sec: Some(120),
         budget_tokens: Some(1000),
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -1235,7 +1239,7 @@ fn synthesize_proof_instructions(
         machine: review_machine,
         tool_arg_truncate_chars: None,
     };
-    let result = runner.run(&spec);
+    let result = runner.run_cancellable(&spec, cancel);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
     // `Result`) -- a budget already exceeded here is caught on the very next
     // call in `resolve_conflicts_with_agent`'s own loop.
@@ -1456,7 +1460,7 @@ fn resolve_conflicts_with_agent(
                 ));
             }
             let (quality_note, ghost_prefix) =
-                proof_extras(store, id, branch, branch_id, runner, resolved);
+                proof_extras(store, id, branch, branch_id, runner, resolved, cancel);
             let (proof_session_id, proof_detail) = run_final_proof(
                 store,
                 id,
@@ -1467,6 +1471,7 @@ fn resolve_conflicts_with_agent(
                 resolved,
                 &quality_note,
                 &ghost_prefix,
+                cancel,
             );
             return Ok((proof_session_id.or(last_session_id), proof_detail));
         }
@@ -1575,6 +1580,8 @@ fn resolve_conflicts_with_agent(
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -1832,6 +1839,7 @@ fn run_final_proof(
     resolved: &ResolvedResolverAgent,
     quality_note: &str,
     ghost_prefix: &str,
+    cancel: &CancelToken,
 ) -> (Option<String>, String) {
     let agent = &resolved.backend;
     let model = &resolved.model;
@@ -1890,6 +1898,8 @@ fn run_final_proof(
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: true,
         trace_context: None,
         resume_agent_session_id: None,
@@ -1914,7 +1924,7 @@ fn run_final_proof(
         .lock()
         .expect("poisoned")
         .stamp_branch_started_at(id, branch_id);
-    let result = runner.run(&spec);
+    let result = runner.run_cancellable(&spec, cancel);
     // RAL-193: not fatal here -- per this function's own doc comment, the
     // proof call never blocks the rebase from completing, so a budget overrun is
     // recorded but doesn't abort an already-in-flight resolution.
@@ -2759,7 +2769,14 @@ pub fn start_feedback(
     let bid = branch_id.to_string();
     std::thread::spawn(move || {
         record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
-        let outcome = run_feedback(&store, runner.as_ref(), &sid, &bid, &feedback);
+        let outcome = run_feedback(
+            &store,
+            runner.as_ref(),
+            &sid,
+            &bid,
+            &feedback,
+            &CancelToken::never(),
+        );
         crate::rlog!(
             INFO,
             "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
@@ -4057,6 +4074,7 @@ pub fn run_feedback(
     id: &str,
     branch_id: &str,
     feedback: &str,
+    cancel: &CancelToken,
 ) -> FeedbackOutcome {
     let guardian = match store.lock().expect("poisoned").get_guardian(id) {
         Ok(g) => g,
@@ -4183,6 +4201,8 @@ pub fn run_feedback(
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -4217,7 +4237,7 @@ pub fn run_feedback(
     } else {
         None
     };
-    let result = runner.run(&spec);
+    let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     let dirty = wt.git(&["status", "--porcelain"]).unwrap_or_default();
     let committed = !dirty.trim().is_empty() && !no_commit;
@@ -4236,7 +4256,7 @@ pub fn run_feedback(
         let gate = ProofGate::resolve(store, id, is_final_branch);
         if gate.allows_for_clean_branch() {
             let (quality_note, ghost_prefix) =
-                proof_extras(store, id, &feature, branch_id, runner, &resolved);
+                proof_extras(store, id, &feature, branch_id, runner, &resolved, cancel);
             let (_, note) = run_final_proof(
                 store,
                 id,
@@ -4247,6 +4267,7 @@ pub fn run_feedback(
                 &resolved,
                 &quality_note,
                 &ghost_prefix,
+                cancel,
             );
             proof_note = Some(note);
             // The proof pass may itself have edited files.
@@ -4538,6 +4559,15 @@ pub fn run_feedback(
 /// restack machinery `pr.rs` needs to reuse — see that module's doc comment
 /// on why it delegates to `run_feedback` for the analogous text-feedback
 /// case).
+///
+/// RAL-307 (`resolve_pr_alias`'s `use_worktree_branch_name`) needs no special
+/// case here even though `alias` can now equal the feature branch's own
+/// name: `remote`/`alias` is a REMOTE ref, `review_ref` (this worktree's
+/// checked-out branch) is always the distinct, guardian-id-prefixed local
+/// ref `submit_stacked_branch_pr` pushed to it -- they can never collide by
+/// name. Reconciliation below is already purely SHA-based (fetch into the
+/// anonymous `FETCH_HEAD`, `merge-base --is-ancestor` for the no-op check,
+/// then a normal rebase), never a same-named self-rebase.
 pub fn pull_pr_commits(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
@@ -5905,7 +5935,7 @@ fn drive_rebase(
             }
             let resolved = resolver_backend(store, id)?;
             let (quality_note, ghost_prefix) =
-                proof_extras(store, id, feature, branch_id, runner, &resolved);
+                proof_extras(store, id, feature, branch_id, runner, &resolved, cancel);
             let (proof_session_id, proof_detail) = run_final_proof(
                 store,
                 id,
@@ -5916,6 +5946,7 @@ fn drive_rebase(
                 &resolved,
                 &quality_note,
                 &ghost_prefix,
+                cancel,
             );
             Ok((RebaseOutcome::CleanProofed(proof_detail), proof_session_id))
         }
@@ -6556,6 +6587,8 @@ fn generate_final_summary(
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -6874,6 +6907,8 @@ fn generate_manual_commands(
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -7060,6 +7095,8 @@ pub(crate) fn resolve_check_input(
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,

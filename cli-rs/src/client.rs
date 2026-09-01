@@ -348,11 +348,11 @@ impl DaemonClient {
         path: &str,
         description: &str,
         vcs: &str,
+        match_pr_branch_name: Option<bool>,
     ) -> Result<Value, DaemonError> {
-        self.post(
-            "/api/projects",
-            Some(json!({"name": name, "path": path, "description": description, "vcs": vcs})),
-        )
+        let mut body = json!({"name": name, "path": path, "description": description, "vcs": vcs});
+        set_if_some(&mut body, "match_pr_branch_name", match_pr_branch_name);
+        self.post("/api/projects", Some(body))
     }
 
     pub fn list_projects(&self) -> Result<Value, DaemonError> {
@@ -787,10 +787,32 @@ impl DaemonClient {
         task_idx: i64,
         name: Option<&str>,
         project: Option<&str>,
+        model: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"kind": "task", "task_idx": task_idx});
         set_if_some(&mut body, "name", name.map(str::to_string));
         set_if_some(&mut body, "project", project.map(str::to_string));
+        set_if_some(&mut body, "model", model.map(str::to_string));
+        self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
+    }
+
+    pub fn edit_proof(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        proof_scope: &str,
+        cell_idx: i64,
+        proof_idx: i64,
+        model: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({
+            "kind": "proof",
+            "task_idx": task_idx,
+            "proof_scope": proof_scope,
+            "cell_idx": cell_idx,
+            "proof_idx": proof_idx,
+        });
+        set_if_some(&mut body, "model", model.map(str::to_string));
         self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
     }
 
@@ -959,6 +981,11 @@ impl DaemonClient {
             settings.proof_skip_auto_clean,
         );
         set_if_some(&mut body, "skip_base_updates", settings.skip_base_updates);
+        set_if_some(
+            &mut body,
+            "match_pr_branch_name",
+            settings.match_pr_branch_name,
+        );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -1186,6 +1213,9 @@ pub struct GuardianSettings<'a> {
     pub proof_skip_auto_clean: Option<bool>,
     /// RAL-250: whether this review skips automatic base-branch auto-updates.
     pub skip_base_updates: Option<bool>,
+    /// RAL-307: whether this review defaults a newly submitted PR's branch
+    /// to the exact worktree/feature branch name.
+    pub match_pr_branch_name: Option<bool>,
 }
 
 #[cfg(test)]

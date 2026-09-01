@@ -342,6 +342,8 @@ fn rows_from_file<'a>(file: &'a TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellRe
                 timeout_sec: None,
                 budget_tokens: None,
                 maximum_budget_usd: None,
+                maximum_context: None,
+                auto_compact_threshold: None,
                 upstream: s.upstream.clone(),
                 machine: ralphus_core::schema::resolve_cell_machine(task, s),
             });
@@ -1052,6 +1054,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         }

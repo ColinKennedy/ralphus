@@ -180,6 +180,15 @@ impl ModelBackend for ClaudeCodeBackend {
             options,
         )?))
     }
+
+    // `supports_context_limits` is deliberately left at the trait's default
+    // (`false`, `backend.rs:123`): the claude CLI's only related lever,
+    // `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, reserves output-generation budget out
+    // of the same fixed context window rather than bounding the window
+    // itself (`prompt_tokens + max_tokens <= context_window` is enforced
+    // server-side), so raising it shrinks room for history instead of
+    // capping it. There is no claude-code lever that does what
+    // `maximum_context`/`auto_compact_threshold` promise.
 }
 
 /// The `--resume <id>` / `--session-id <id>` argument pair for a claude-code

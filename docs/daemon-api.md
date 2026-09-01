@@ -425,7 +425,15 @@ Request:
 { "name": "ralphus", "description": "the ralphus repo", "path": "C:/Users/me/ralphus", "vcs": "git" }
 ```
 `vcs` defaults to `"git"` (only kind implemented today). `400` if `path` is not
-a directory or is not a git working tree. Response `201`:
+a directory or is not a git working tree. `match_pr_branch_name` (RAL-307,
+optional boolean) sets this project's default for whether a newly submitted
+PR's branch defaults to the exact worktree/feature branch name; omitted, it
+stamps the live global config's value instead (same "frozen at first
+registration, not retroactive, not backfilled for a re-registration" shape as
+the internal-only `skip_base_updates` stamp). Every new review created under
+this project stamps that effective value onto itself at creation time (see
+`POST /api/guardians/{id}/settings`'s `match_pr_branch_name`), where it's then
+independently editable per-review. Response `201`:
 ```json
 { "name": "ralphus" }
 ```
@@ -1322,12 +1330,24 @@ merged outside ralphus (the GitHub/GitLab UI, `gh pr close`, ...) is detected
 and its branch gets a fresh PR instead of being silently skipped forever;
 the stale local row is corrected to match. `branch_alias`/`title`/`description` only apply to a
 stacked request (they don't make sense across N PRs at once, so they're
-ignored on a whole-stack request); `branch_alias` defaults to the feature
-branch's own name, never the internal `guardian/guardian-<id>/...` ref.
-`title`/`description` default to an LLM-synthesized suggestion from the
-branch's commits, conforming to the target repo's PR template when one is
-found (`.github/PULL_REQUEST_TEMPLATE.md` or
+ignored on a whole-stack request); an omitted `branch_alias` defaults to the
+`[forge] pull_request_branch_convention`-templated name (`"{name}-review"` by
+default) — set `use_worktree_branch_name: true` (RAL-307) to default it to the
+feature branch's own name instead, bypassing the convention entirely; either
+way it's always templated from the feature branch's own name, never the
+internal `guardian/guardian-<id>/...` ref. `title`/`description` default to
+an LLM-synthesized suggestion from the branch's commits, conforming to the
+target repo's PR template when one is found
+(`.github/PULL_REQUEST_TEMPLATE.md` or
 `.gitlab/merge_request_templates/Default.md`).
+
+`use_worktree_branch_name` (RAL-307, optional boolean, applies to both a
+stacked and a whole-stack request) is ignored when `branch_alias` is also set
+(an explicit alias always wins verbatim). Omitted, it defers to the review's
+own `match_pr_branch_name`/`effective_match_pr_branch_name` setting (see
+`POST /api/guardians/{id}/settings`); `true`/`false` here overrides that
+setting for this submission only, without changing the review's persisted
+default.
 
 Runs in the background (`git push` + a forge API call are both networked);
 returns `202 {"status":"submitting"}` immediately. Poll `GET .../pull-requests`

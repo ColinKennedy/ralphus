@@ -764,6 +764,8 @@
        * @property {string|null} [notice_kind] - RAL-273: a one-shot, GUI-facing notice, e.g. "forge_reorder_interrupted_local". Null when there is nothing to show.
        * @property {string|null} [notice_message] - RAL-273: human-readable text for `notice_kind`.
        * @property {number|null} [notice_at_ms] - RAL-273: when `notice_kind` was recorded (epoch ms); the board toasts once per new value it observes.
+       * @property {boolean|null} [match_pr_branch_name] - RAL-307: this review's own override for whether a newly submitted PR's branch defaults to the worktree/feature branch name, or null to inherit the project/global default. Stamped from the project's effective value at review creation.
+       * @property {boolean} [effective_match_pr_branch_name] - RAL-307: match_pr_branch_name resolved against the project/global default -- what PR submission actually gates on unless a per-submission override is passed.
        */
       /**
        * A pull/merge request submitted for one of a review's branches, or for
@@ -6768,7 +6770,7 @@
        * @property {boolean} confirmStep
        */
       /** @type {NtSimpleState} */
-      let ntSimple = ntFreshSimpleState();
+      let ntSimple;
       /**
        * Builds a fresh Simple-tab form state.
        * @returns {NtSimpleState}
@@ -6954,6 +6956,21 @@
        */
       function ntResolveDefaultTab(payload) { return (payload && payload.default_new_task_tab) || "simple"; }
       // RALPHUS-SIMPLE-TAB:END
+      // `ntSimple`'s initial value is assigned here, after the marked region
+      // above, rather than at its `let` declaration near `ntFreshSimpleState`.
+      // That declaration runs as top-level script execution reaches it,
+      // which -- if it called `ntFreshSimpleState()` immediately, as it used
+      // to -- would read `NT_FALLBACK_TEMPLATE.name` before this same
+      // top-level script's `const NT_FALLBACK_TEMPLATE = ...` (declared
+      // further down, inside the marked region) had executed: a temporal-
+      // dead-zone `ReferenceError` that aborted every subsequent top-level
+      // statement in this script, including the initial poll/render calls
+      // the Reviews and Projects tabs depend on -- not just the new-task
+      // modal. Deferring the call to here, after the region that defines
+      // `NT_FALLBACK_TEMPLATE` has run, fixes that without moving
+      // `NT_FALLBACK_TEMPLATE` itself out of the marked region (it's part of
+      // `exported` in test/board-simple-tab.mjs).
+      ntSimple = ntFreshSimpleState();
       /**
        * The currently-selected template (falls back to the built-in one).
        * @returns {NtTemplate}
@@ -8989,7 +9006,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function combinedPrSection(g) {
         if (!g.branches.some((b) => b.enabled && b.worktree)) return "";
         return `<h3 class="section" data-tip="Pull/merge requests submitted for this review on GitHub/GitLab (RAL-117/RAL-190).">pull requests</h3>
-            <button class="btn primary" style="padding:3px 10px;font-size:11px" data-click="submitPrStack" data-guardian-id="${esc(g.id)}" data-tip="Push every enabled branch in this review as its own PR, each based on the branch below it -- never one squashed PR containing everything.\nOn GitHub, also registers/grows a native PR stack so GitHub's own UI shows them as a linked stack.\nWho/when: once the stack looks good, open real PRs for the whole thing without leaving the board.\nSafe to press again after adding a new branch on top -- only the new branch gets its own PR.\nRuns in the background -- each branch's PR card above updates once its forge call completes.">submit PR stack</button>`;
+            <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
+              <button class="btn primary" style="padding:3px 10px;font-size:11px" data-click="submitPrStack" data-guardian-id="${esc(g.id)}" data-tip="Push every enabled branch in this review as its own PR, each based on the branch below it -- never one squashed PR containing everything.\nOn GitHub, also registers/grows a native PR stack so GitHub's own UI shows them as a linked stack.\nWho/when: once the stack looks good, open real PRs for the whole thing without leaving the board.\nSafe to press again after adding a new branch on top -- only the new branch gets its own PR.\nRuns in the background -- each branch's PR card above updates once its forge call completes.">submit PR stack</button>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Use the exact worktree/feature branch name as the PR branch, instead of the convention-derived alias (e.g. '{name}-review').\nWho/when: makes it easy to trace a submitted PR back to the review/worktree that produced it.\nStarts from this project's default (set via 'ralphus project git --match-pr-branch-name') and can be flipped per-review here; a --use-worktree-branch-name flag on 'ralphus review pr submit' can still override it for one submission.">
+                <input type="checkbox" ${g.effective_match_pr_branch_name ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setMatchPrBranchName(this.dataset.guardianId,this.checked)">match worktree branch name
+              </label>
+            </div>`;
       }
       // RALPHUS-MERGE-BUTTON:BEGIN
       // How the "Merge / rebase" button reads, and what the click acknowledges.
@@ -10109,6 +10131,28 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function setSkipAutoBuild(id, skip) {
         await guardianAction(`/api/guardians/${id}/settings`, { skip_auto_build: skip });
+        tick();
+      }
+      /**
+       * Toggles a review's match-pr-branch-name setting (RAL-307): whether a
+       * newly submitted PR's branch defaults to the worktree/feature branch
+       * name instead of the convention-derived alias.
+       * @param {string} id
+       * @param {boolean} enabled
+       * @returns {Promise<void>}
+       */
+      async function setMatchPrBranchName(id, enabled) {
+        await guardianAction(`/api/guardians/${id}/settings`, { match_pr_branch_name: enabled });
+        tick();
+      }
+      /**
+       * Toggles a review's skip-per-worktree-checks setting.
+       * @param {string} id
+       * @param {boolean} skip
+       * @returns {Promise<void>}
+       */
+      async function setSkipWorktreeChecks(id, skip) {
+        await guardianAction(`/api/guardians/${id}/settings`, { skip_worktree_checks: skip });
         tick();
       }
       /**

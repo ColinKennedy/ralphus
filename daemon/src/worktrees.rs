@@ -604,6 +604,8 @@ fn synthetic_cell_row(ctx: PlaceholderContext<'_>) -> CellRow {
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         upstream: None,
         machine: ctx.machine.map(str::to_string),
     }
@@ -1126,6 +1128,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         }

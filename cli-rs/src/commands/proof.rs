@@ -12,15 +12,26 @@ use crate::selector::{ResolvedSelector, SelectorError, resolve_squad_selector, s
 #[derive(Debug, Clone)]
 pub enum ProofCommand {
     Help,
-    Show { selector: String },
-    SetStatus { selector: String, state: String },
-    Restart { selector: String },
+    Show {
+        selector: String,
+    },
+    SetStatus {
+        selector: String,
+        state: String,
+    },
+    Restart {
+        selector: String,
+    },
+    Edit {
+        selector: String,
+        model: Option<String>,
+    },
     UsageError(String),
 }
 
 #[must_use]
 pub fn parse(args: &[String]) -> ProofCommand {
-    let scanner = Scanner::new(&args[1.min(args.len())..]);
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => ProofCommand::Help,
         Some("show") => with_selector(scanner, |selector| ProofCommand::Show { selector }),
@@ -35,6 +46,10 @@ pub fn parse(args: &[String]) -> ProofCommand {
             }
         }
         Some("restart") => with_selector(scanner, |selector| ProofCommand::Restart { selector }),
+        Some("edit") => {
+            let model = scanner.take_value("--model").ok().flatten();
+            with_selector(scanner, |selector| ProofCommand::Edit { selector, model })
+        }
         Some(other) => ProofCommand::UsageError(format!("unknown proof subcommand: {other}")),
     }
 }
@@ -142,6 +157,19 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, render_dirtied);
             Ok(())
         }),
+        ProofCommand::Edit { selector, model } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "proof")?;
+            let result = client.edit_proof(
+                &resolved.squad_id,
+                resolved.task_idx,
+                &resolved.proof_scope,
+                resolved.cell_idx,
+                resolved.proof_idx,
+                model.as_deref(),
+            )?;
+            emit(opts, &result, |_| println!("{selector} updated"));
+            Ok(())
+        }),
     }
 }
 
@@ -203,6 +231,17 @@ mod tests {
     fn parses_restart() {
         match parse(&v(&["restart", "squad-1/build/proof/0"])) {
             ProofCommand::Restart { selector } => assert_eq!(selector, "squad-1/build/proof/0"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_model_flag() {
+        match parse(&v(&["edit", "squad-1/build/proof/0", "--model", "gpt-5"])) {
+            ProofCommand::Edit { selector, model } => {
+                assert_eq!(selector, "squad-1/build/proof/0");
+                assert_eq!(model.as_deref(), Some("gpt-5"));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

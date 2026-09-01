@@ -274,6 +274,12 @@ struct RegisterProjectBody {
     path: String,
     #[serde(default = "default_vcs")]
     vcs: String,
+    /// RAL-307: explicit per-project default for whether a newly submitted PR
+    /// defaults to the worktree/feature branch name. `None` (the field
+    /// omitted) stamps the live global config's value instead, mirroring
+    /// `skip_base_updates`'s auto-stamp -- see `Store::register_project`.
+    #[serde(default)]
+    match_pr_branch_name: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1318,10 +1324,13 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
     if let Err(msg) = validate_project_location(&req.path, &req.vcs) {
         return error(400, "invalid_value", &msg, vec![]);
     }
-    match daemon
-        .lock()
-        .register_project(&req.name, &req.description, &req.path, &req.vcs)
-    {
+    match daemon.lock().register_project_ex(
+        &req.name,
+        &req.description,
+        &req.path,
+        &req.vcs,
+        req.match_pr_branch_name,
+    ) {
         Ok(()) => json(201, &serde_json::json!({"name": req.name})),
         Err(e) => store_error(&e),
     }
@@ -2880,6 +2889,10 @@ struct EditBody {
     #[serde(default)]
     cell_idx: i64,
     #[serde(default)]
+    proof_idx: i64,
+    #[serde(default)]
+    proof_scope: String,
+    #[serde(default)]
     label: Option<String>,
     #[serde(default)]
     name: Option<String>,
@@ -2909,7 +2922,8 @@ fn nullable_field_edit(v: Option<&String>) -> Option<Option<&str>> {
     v.map(|s| non_empty(Some(s)))
 }
 
-/// Edit a squad's label, a task's name/project, or a cell's fields.
+/// Edit a squad's label, a task's name/project/model, a cell's fields, or a
+/// proof step's model.
 ///
 /// A `squad` edit (the label only) is purely cosmetic -- it isn't tied to any
 /// node in the dependency graph or to the content executed, so it does not
@@ -2924,7 +2938,11 @@ fn nullable_field_edit(v: Option<&String>) -> Option<Option<&str>> {
 /// reset -- so editing one cell's prompt silently re-ran every
 /// already-`done` upstream task in the squad too. See
 /// [`wait_for_worker_stop`]'s doc comment for why any in-flight worker this
-/// touches must be cancelled *and waited out* first.)
+/// touches must be cancelled *and waited out* first.) A `proof` edit mirrors
+/// the `cell` case's narrow-scope principle: it reuses
+/// [`Store::restart_cell_proof`]/[`Store::restart_task_proof`] so only that
+/// proof step (and any later step in its scope) goes back to Pending, rather
+/// than resetting the whole squad or task.
 fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<EditBody>(body) else {
         return error(400, "bad_request", "invalid edit body", vec![]);
@@ -2938,10 +2956,12 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
         "task" => {
             let store = daemon.lock();
-            let name = non_empty(req.name.as_ref()).unwrap_or("task");
-            if let Err(e) =
-                store.edit_task_fields(id, req.task_idx, name, non_empty(req.project.as_ref()))
-            {
+            let edit = crate::store::TaskEdit {
+                name: non_empty(req.name.as_ref()),
+                project: nullable_field_edit(req.project.as_ref()),
+                model: nullable_field_edit(req.model.as_ref()),
+            };
+            if let Err(e) = store.edit_task_fields(id, req.task_idx, &edit) {
                 return store_error(&e);
             }
             if let Err(e) = store.reset_squad_to_pending(id) {
@@ -2992,6 +3012,41 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             wait_for_worker_stop(daemon, id);
             if let Err(e) = daemon.lock().restart_cell(id, req.task_idx, req.cell_idx) {
                 return store_error(&e);
+            }
+        }
+        "proof" => {
+            let edit = crate::store::ProofEdit {
+                model: nullable_field_edit(req.model.as_ref()),
+            };
+            if let Err(e) = daemon.lock().edit_proof_fields(
+                id,
+                req.task_idx,
+                &req.proof_scope,
+                req.cell_idx,
+                req.proof_idx,
+                &edit,
+            ) {
+                return store_error(&e);
+            }
+            daemon.cancellations.cancel(id);
+            wait_for_worker_stop(daemon, id);
+            let restarted = if req.proof_scope == "cell" {
+                daemon
+                    .lock()
+                    .restart_cell_proof(id, req.task_idx, req.cell_idx, req.proof_idx)
+            } else {
+                daemon
+                    .lock()
+                    .restart_task_proof(id, req.task_idx, req.proof_idx)
+            };
+            match restarted {
+                Ok(dirtied) => {
+                    for dep_id in &dirtied {
+                        daemon.cancellations.cancel(dep_id);
+                        wait_for_worker_stop(daemon, dep_id);
+                    }
+                }
+                Err(e) => return store_error(&e),
             }
         }
         other => {
@@ -6931,6 +6986,12 @@ struct GuardianSettingsBody {
     /// absent) means "inherit the project/global default".
     #[serde(default)]
     skip_base_updates: Option<bool>,
+    /// RAL-307: this review's own override for whether a newly submitted
+    /// PR's branch defaults to the exact worktree/feature branch name
+    /// instead of the convention-derived alias. `None` (or the field being
+    /// absent) means "inherit the project/global default".
+    #[serde(default)]
+    match_pr_branch_name: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -7113,6 +7174,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(skip) = req.skip_base_updates {
         if let Err(e) = store.set_guardian_skip_base_updates(id, Some(skip)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.match_pr_branch_name {
+        if let Err(e) = store.set_guardian_match_pr_branch_name(id, Some(enabled)) {
             return store_error(&e);
         }
     }
@@ -10694,6 +10760,97 @@ machine=\"incredibuild:B\"
         let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"project\":\"myproj\""));
+    }
+
+    #[test]
+    fn edit_task_model() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body =
+            serde_json::json!({"kind":"task","task_idx":0,"name":"t","model":"gpt-5"}).to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"model\":\"gpt-5\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_task_partial_edit_preserves_unspecified_fields() {
+        // Regression companion to
+        // `edit_cell_partial_edit_preserves_unspecified_fields`: editing a
+        // task with only *some* of the edit fields must leave every field
+        // the caller didn't mention exactly as it was, not silently null it
+        // out or reset it to a placeholder (this used to always overwrite
+        // `name` to the literal "task" and `project` to NULL whenever the
+        // caller omitted them).
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "task", "task_idx": 0, "name": "t", "project": "myproj", "model": "gpt-5"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        // Editing only `name` must leave project/model untouched.
+        let body =
+            serde_json::json!({"kind": "task", "task_idx": 0, "name": "renamed"}).to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"name\":\"renamed\""), "{}", r.body);
+        assert!(r.body.contains("\"project\":\"myproj\""), "{}", r.body);
+        assert!(r.body.contains("\"model\":\"gpt-5\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_proof_model_resets_only_that_step_onward() {
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\ncommand=\"check\"\n";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Done)
+            .unwrap();
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "model": "gpt-5",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"model\":\"gpt-5\""), "{}", r.body);
+        assert!(r.body.contains("\"state\":\"pending\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_task_proof_model_resets_only_that_step_onward() {
+        const TASK_PROOF: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n[[task.proof]]\ncommand=\"check\"\n";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(TASK_PROOF));
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Done)
+            .unwrap();
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "task", "cell_idx": -1,
+            "proof_idx": 0, "model": "gpt-5",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"model\":\"gpt-5\""), "{}", r.body);
+        assert!(r.body.contains("\"state\":\"pending\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_missing_step_is_not_found() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "model": "gpt-5",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 404, "{}", r.body);
     }
 
     #[test]
@@ -14986,6 +15143,22 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"skip_base_updates\":false"));
         assert!(r.body.contains("\"effective_skip_base_updates\":false"));
+    }
+
+    #[test]
+    fn guardian_settings_sets_and_resets_match_pr_branch_name() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let body = serde_json::json!({"match_pr_branch_name": true}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"match_pr_branch_name\":true"));
+        assert!(r.body.contains("\"effective_match_pr_branch_name\":true"));
+        let body = serde_json::json!({"match_pr_branch_name": false}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"match_pr_branch_name\":false"));
+        assert!(r.body.contains("\"effective_match_pr_branch_name\":false"));
     }
 
     // -----------------------------------------------------------------------

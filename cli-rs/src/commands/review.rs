@@ -87,6 +87,10 @@ pub enum ReviewCommand {
         proof_scope: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_base_updates: Option<bool>,
+        /// RAL-307: this review's own override for whether a newly
+        /// submitted PR's branch defaults to the worktree/feature branch
+        /// name.
+        match_pr_branch_name: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -169,6 +173,10 @@ pub enum ReviewPrCommand {
         alias: Option<String>,
         title: Option<String>,
         description: Option<String>,
+        /// RAL-307: `Some(true)` when `--use-worktree-branch-name` is
+        /// passed, overriding the review's own `match_pr_branch_name`
+        /// setting for this submission only; `None` defers to it.
+        use_worktree_branch_name: Option<bool>,
     },
     List {
         selector: String,
@@ -303,6 +311,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
             let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
+            let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -314,6 +323,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 proof_scope,
                 skip_auto_clean,
                 skip_base_updates,
+                match_pr_branch_name,
             })
         }
         Some("build-env") => match parse_guardian_env(scanner) {
@@ -428,7 +438,7 @@ fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> ReviewCommand) -
 /// `argparse.BooleanOptionalAction` (default `None`). `name` must be the
 /// positive spelling (e.g. `"--skip-auto-build"`); the negative form is
 /// derived by inserting `no-` after the leading `--`.
-fn take_tri_bool(scanner: &mut Scanner, name: &str) -> Option<bool> {
+pub(crate) fn take_tri_bool(scanner: &mut Scanner, name: &str) -> Option<bool> {
     let neg = format!("--no-{}", &name[2..]);
     let mut result = None;
     if scanner.take_bool(&neg) {
@@ -520,6 +530,9 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
             let alias = scanner.take_value("--alias").ok().flatten();
             let title = scanner.take_value("--title").ok().flatten();
             let description = scanner.take_value("--description").ok().flatten();
+            let use_worktree_branch_name = scanner
+                .take_bool("--use-worktree-branch-name")
+                .then_some(true);
             if position.is_some() == combined {
                 return ReviewPrCommand::UsageError(
                     "submit requires exactly one of --position or --combined".to_string(),
@@ -533,6 +546,7 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
                     alias,
                     title,
                     description,
+                    use_worktree_branch_name,
                 },
                 None => {
                     ReviewPrCommand::UsageError("missing required <selector> argument".to_string())
@@ -1164,6 +1178,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             proof_scope,
             skip_auto_clean,
             skip_base_updates,
+            match_pr_branch_name,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1176,6 +1191,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 proof_scope: proof_scope.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
+                match_pr_branch_name,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -1503,6 +1519,7 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
             alias,
             title,
             description,
+            use_worktree_branch_name,
         } => run_and_report(opts, Some("ralphus review list --pr-ready"), || {
             let mut pr_spec = serde_json::Map::new();
             if let Some(alias) = &alias {
@@ -1515,6 +1532,12 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
                 pr_spec.insert(
                     "description".to_string(),
                     Value::String(description.clone()),
+                );
+            }
+            if let Some(use_worktree_branch_name) = use_worktree_branch_name {
+                pr_spec.insert(
+                    "use_worktree_branch_name".to_string(),
+                    Value::Bool(use_worktree_branch_name),
                 );
             }
             let resolved =
@@ -2531,6 +2554,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_settings_match_pr_branch_name_tri_state() {
+        match parse(&v(&["settings", "g1", "--match-pr-branch-name"])) {
+            ReviewCommand::Settings {
+                match_pr_branch_name,
+                ..
+            } => assert_eq!(match_pr_branch_name, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1", "--no-match-pr-branch-name"])) {
+            ReviewCommand::Settings {
+                match_pr_branch_name,
+                ..
+            } => assert_eq!(match_pr_branch_name, Some(false)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings {
+                match_pr_branch_name,
+                ..
+            } => assert_eq!(match_pr_branch_name, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_build_env_repeated_flags() {
         match parse(&v(&[
             "build-env",
@@ -2707,6 +2755,38 @@ mod tests {
                 assert_eq!(position, Some(1));
                 assert!(!combined);
                 assert_eq!(alias.as_deref(), Some("my-branch"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_submit_use_worktree_branch_name() {
+        match parse(&v(&[
+            "pr",
+            "submit",
+            "g1",
+            "--combined",
+            "--use-worktree-branch-name",
+        ])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit {
+                use_worktree_branch_name,
+                ..
+            }) => {
+                assert_eq!(use_worktree_branch_name, Some(true));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_submit_use_worktree_branch_name_defaults_to_none() {
+        match parse(&v(&["pr", "submit", "g1", "--combined"])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit {
+                use_worktree_branch_name,
+                ..
+            }) => {
+                assert_eq!(use_worktree_branch_name, None);
             }
             other => panic!("unexpected: {other:?}"),
         }

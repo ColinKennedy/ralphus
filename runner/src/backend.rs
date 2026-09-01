@@ -48,6 +48,16 @@ pub struct RunOptions<'a> {
     /// `--session-id` when not resuming; other backends ignore it.
     pub assigned_agent_session_id: Option<&'a str>,
     pub timeout_sec: Option<u64>,
+    /// RAL-304: resolved context-window token limit, or `None` for no cap.
+    /// Only ever `Some` for a backend whose
+    /// [`ModelBackend::supports_context_limits`] returns `true` -- `core`'s
+    /// `agent_supports_maximum_context` validation gate rejects it for
+    /// anything else before submission.
+    pub maximum_context: Option<u64>,
+    /// RAL-304: resolved auto-compact trigger threshold in tokens, or `None`
+    /// for no explicit threshold. Same support restriction as
+    /// [`Self::maximum_context`].
+    pub auto_compact_threshold: Option<u64>,
     /// RAL-303: how many characters of a `tool_use` argument value to render
     /// into the Live View tmux pane before truncating, resolved daemon-side
     /// from `[live_view] tool_arg_truncate_chars`. Support is optional per
@@ -97,6 +107,21 @@ pub trait ModelBackend {
     ) -> Result<Option<BackendOutcome>, BackendError> {
         let _ = (workspace, options);
         Ok(None)
+    }
+
+    /// RAL-304: whether this backend has a real delivery mechanism for
+    /// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold`
+    /// (an env var, a CLI arg, or an on-disk settings file -- see
+    /// `ClaudeCodeBackend`/`CodexBackend`/`PiBackend`'s own overrides for
+    /// which). Defaults to `false`, mirroring [`nudge`](Self::nudge)'s
+    /// default-no-op-override shape: only a backend with a real mechanism
+    /// needs to override it. `core::validate`'s `agent_supports_maximum_context`
+    /// is the actual submit-time gate that keeps these fields from reaching a
+    /// backend that doesn't support them; this is the runner-side mirror of
+    /// that same classification, checked defensively in `execute.rs` before
+    /// a cell is ever run.
+    fn supports_context_limits(&self) -> bool {
+        false
     }
 }
 

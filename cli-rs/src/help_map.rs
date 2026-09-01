@@ -211,6 +211,7 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
             "--description [text]",
             "--position [integer]",
             "--title [text]",
+            "--use-worktree-branch-name",
         ],
         "Submit a PR/MR for one stacked branch or the combined worktree.",
         false,
@@ -542,6 +543,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[
             "--auto-pr-feedback/--no-auto-pr-feedback",
             "--base-branch [branch]",
+            "--match-pr-branch-name/--no-match-pr-branch-name",
             "--resolver-agent [name]",
             "--resolver-model [name]",
             "--skip-auto-build/--no-skip-auto-build",
@@ -702,7 +704,12 @@ const PROJECT_CHILDREN: &[HelpNode] = &[
     node(
         "git",
         &[],
-        &["--description [text]", "--name [name]", "--path [path]"],
+        &[
+            "--description [text]",
+            "--match-pr-branch-name/--no-match-pr-branch-name",
+            "--name [name]",
+            "--path [path]",
+        ],
         "Register a git repository as a project the daemon can resolve placeholder cell \
 cwds against.",
         false,
@@ -998,8 +1005,8 @@ const TASK_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
         &["selector [str]"],
-        &["--name [name]", "--project [name]"],
-        "Edit a task node's name/project.",
+        &["--name [name]", "--project [name]", "--model [name]"],
+        "Edit a task node's name/project/model.",
         false,
         false,
         &[],
@@ -1037,6 +1044,15 @@ const TASK_CHILDREN: &[HelpNode] = &[
 ];
 
 const PROOF_CHILDREN: &[HelpNode] = &[
+    node(
+        "edit",
+        &["selector [str]"],
+        &["--model [name]"],
+        "Edit a proof step's model override.",
+        false,
+        false,
+        &[],
+    ),
     node(
         "restart",
         &["selector [str]"],

@@ -80,6 +80,16 @@ pub struct ReviewConfig {
     /// `Guardian::skip_base_updates` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub skip_base_updates: Option<bool>,
+    /// RAL-307: whether a newly submitted PR's branch defaults to the exact
+    /// worktree/feature branch name (`branch.branch`) instead of the
+    /// convention-derived alias (`apply_pr_branch_convention`). `None` means
+    /// unset, which resolves to `false` (convention-derived alias stays the
+    /// default); per-project scalars win over the global layer, same as
+    /// `skip_worktrees`. A per-review override (see
+    /// `Guardian::match_pr_branch_name` in `guardian.rs`) wins over this; a
+    /// per-submission `PrRequest::use_worktree_branch_name` wins over that.
+    #[serde(default)]
+    pub match_pr_branch_name: Option<bool>,
 }
 
 impl ReviewConfig {
@@ -135,6 +145,14 @@ impl ReviewConfig {
         self.skip_base_updates.unwrap_or(false)
     }
 
+    /// Whether a newly submitted PR defaults to the worktree/feature branch
+    /// name instead of the convention-derived alias (unset resolves to
+    /// `false`). RAL-307.
+    #[must_use]
+    pub fn match_pr_branch_name(&self) -> bool {
+        self.match_pr_branch_name.unwrap_or(false)
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -155,6 +173,7 @@ impl ReviewConfig {
             verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             skip_base_updates: over.skip_base_updates.or(self.skip_base_updates),
+            match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
         }
     }
 }
@@ -2153,6 +2172,36 @@ mod tests {
         assert!(!global.clone().merge(project).skip_base_updates());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).skip_base_updates());
+    }
+
+    // ── match_pr_branch_name (RAL-307) ─────────────────────────────────────
+
+    #[test]
+    fn match_pr_branch_name_defaults_to_false_when_unset() {
+        assert!(!ReviewConfig::default().match_pr_branch_name());
+        assert!(!from_toml_str("[review]\nskip_worktrees = true\n").match_pr_branch_name());
+    }
+
+    #[test]
+    fn match_pr_branch_name_parses_explicit_true() {
+        let c = from_toml_str("[review]\nmatch_pr_branch_name = true\n");
+        assert_eq!(c.match_pr_branch_name, Some(true));
+        assert!(c.match_pr_branch_name());
+    }
+
+    #[test]
+    fn merge_match_pr_branch_name_project_wins() {
+        let global = ReviewConfig {
+            match_pr_branch_name: Some(true),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            match_pr_branch_name: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(!global.clone().merge(project).match_pr_branch_name());
+        // Project unset falls back to the global value.
+        assert!(global.merge(ReviewConfig::default()).match_pr_branch_name());
     }
 
     #[test]

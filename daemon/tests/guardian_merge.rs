@@ -719,7 +719,14 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
-    run_feedback(&store, &FeedbackRunner, &id, &bid0, "add a note file");
+    run_feedback(
+        &store,
+        &FeedbackRunner,
+        &id,
+        &bid0,
+        "add a note file",
+        &CancelToken::never(),
+    );
 
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
@@ -852,6 +859,7 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
         &id,
         &bid0,
         "tighten up the error messages",
+        &CancelToken::never(),
     );
 
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
@@ -2400,6 +2408,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
         &id,
         &bid0,
         "add a note file, don't commit",
+        &CancelToken::never(),
     );
 
     // The review branch HEAD must not have moved — no new commit was created.
@@ -2454,6 +2463,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &id,
         &bid0,
         "add note1, don't commit",
+        &CancelToken::never(),
     );
     assert!(
         wt.join("note1.txt").exists(),
@@ -2467,6 +2477,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &id,
         &bid0,
         "add note2",
+        &CancelToken::never(),
     );
 
     let view2 = store.lock().unwrap().get_guardian(&id).unwrap();

@@ -225,6 +225,22 @@ fn run_prompt_inner(
         Ok(backend) => backend,
         Err(e) => return CellResult::failed(e, ""),
     };
+    // RAL-304: defense in depth -- `core::validate`'s `agent_supports_maximum_context`
+    // gate already rejects this combination at submit time, so this should be
+    // unreachable in practice, but fail closed rather than silently ignoring
+    // the cap if it's ever reached (e.g. a spec built by something other than
+    // the daemon's own submit path).
+    if (spec.maximum_context.is_some() || spec.auto_compact_threshold.is_some())
+        && !backend.supports_context_limits()
+    {
+        return CellResult::failed(
+            format!(
+                "agent {:?} does not support maximum_context/auto_compact_threshold",
+                spec.agent
+            ),
+            "",
+        );
+    }
     run_with_backend(spec, original_prompt, workspace, backend.as_ref())
 }
 
@@ -272,6 +288,8 @@ fn run_with_backend(
             resume_agent_session_id: resume_id.as_deref(),
             assigned_agent_session_id: spec.assigned_agent_session_id.as_deref(),
             timeout_sec: spec.timeout_sec,
+            maximum_context: spec.maximum_context,
+            auto_compact_threshold: spec.auto_compact_threshold,
             tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
         };
         let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
@@ -336,6 +354,8 @@ fn run_with_backend(
                 resume_agent_session_id: agent_session_id.as_deref(),
                 assigned_agent_session_id: None,
                 timeout_sec: spec.timeout_sec,
+                maximum_context: spec.maximum_context,
+                auto_compact_threshold: spec.auto_compact_threshold,
                 tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
             };
             outcome = match backend.nudge(workspace, &nudge_options) {
@@ -706,6 +726,8 @@ mod tests {
             system_prompt_position: None,
             args: vec![],
             budget_tokens: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             timeout_sec: None,
             proof,
             trace_context: None,
@@ -793,6 +815,8 @@ mod tests {
             system_prompt_position: None,
             args: vec![],
             budget_tokens: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             timeout_sec: None,
             proof: false,
             trace_context: None,
