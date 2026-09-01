@@ -33,14 +33,16 @@ impl ModelBackend for CodexBackend {
         });
         let compound = crate::cli_agent_common::is_compound_command(&program);
 
-        // `-c developer_instructions=...` must precede `exec` -- Codex's own
-        // root-level arg parser is the only one that recognizes it; `exec`'s
-        // subcommand struct deliberately does not re-declare it.
+        // `-c developer_instructions=...` (and the RAL-304 context-limit
+        // overrides from `context_limit_args`) must precede `exec` -- Codex's
+        // own root-level arg parser is the only one that recognizes `-c`;
+        // `exec`'s subcommand struct deliberately does not re-declare it.
         let mut args: Vec<String> = Vec::new();
         if let Some(sp) = options.append_system_prompt {
             args.push("-c".to_string());
             args.push(format!("developer_instructions={sp}"));
         }
+        args.extend(context_limit_args(options));
         args.push("exec".to_string());
         args.push("--json".to_string());
         args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
@@ -83,6 +85,29 @@ impl ModelBackend for CodexBackend {
 
         outcome
     }
+
+    fn supports_context_limits(&self) -> bool {
+        true
+    }
+}
+
+/// RAL-304: the `-c key=value` argument pairs that deliver
+/// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold` to
+/// `codex` -- there is no dedicated flag for either, only these two
+/// config-override keys (mirrors `developer_instructions`'s precedent for
+/// `system_prompt`). Must be spliced into the arg list before `exec` -- see
+/// the caller's comment.
+fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(v) = options.maximum_context {
+        args.push("-c".to_string());
+        args.push(format!("model_context_window={v}"));
+    }
+    if let Some(v) = options.auto_compact_threshold {
+        args.push("-c".to_string());
+        args.push(format!("model_auto_compact_token_limit={v}"));
+    }
+    args
 }
 
 fn spawn(
@@ -219,6 +244,22 @@ fn drive_thread_events(
             Some("error") => {
                 turn_error = event["message"].as_str().map(str::to_string);
             }
+            // No arm observes a compaction boundary here: `codex exec --json`'s
+            // `ThreadEvent` stream (`thread.started`/`turn.started`/
+            // `item.completed`/`turn.completed`/`turn.failed`/`error`, matched
+            // above) never emits one. Confirmed empirically -- a `codex exec`
+            // thread resumed with `model_auto_compact_token_limit` already
+            // exceeded shows the next turn's `input_tokens` drop by an order
+            // of magnitude (context was compacted) with no corresponding
+            // event on stdout. The richer `codex app-server` JSON-RPC
+            // protocol does carry compaction-related state (its binary
+            // exposes `ContextCompacted`/`compaction_request`/
+            // `compaction_response`), but that's a persistent per-session RPC
+            // connection, not the one-shot `exec` subprocess this backend
+            // spawns per cell -- consuming it would need a different spawn
+            // model entirely, not just a new match arm. Contrast
+            // `pi_backend.rs::process_event`'s `compaction_start`/
+            // `compaction_end` arms, which pi's `--mode json` does surface.
             _ => {}
         }
     }
@@ -287,5 +328,33 @@ fn wait_for_child(
             return child.wait();
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_limit_args_empty_when_neither_is_set() {
+        assert!(context_limit_args(&RunOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn context_limit_args_maps_both_fields_as_config_overrides() {
+        let options = RunOptions {
+            maximum_context: Some(100_000),
+            auto_compact_threshold: Some(80_000),
+            ..Default::default()
+        };
+        let args = context_limit_args(&options);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-c", "model_context_window=100000"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-c", "model_auto_compact_token_limit=80000"])
+        );
     }
 }

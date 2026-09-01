@@ -370,6 +370,37 @@ fn validate_task_file_profiles_with(
                     line: None,
                 });
             }
+            // RAL-304: same deferral shape as system_prompt above -- `core`
+            // can't classify a custom profile's backend itself, so it only
+            // rejects `maximum_context`/`auto_compact_threshold` for a
+            // RESERVED_AGENT_NAMES agent; check the resolved backend here.
+            // Either field cascades from the task, so both are checked at
+            // their effective (cell-or-task) value, not just the cell's own.
+            let has_maximum_context =
+                cell.maximum_context.is_some() || task.maximum_context.is_some();
+            let has_auto_compact_threshold =
+                cell.auto_compact_threshold.is_some() || task.auto_compact_threshold.is_some();
+            if selection.custom_profile
+                && (has_maximum_context || has_auto_compact_threshold)
+                && !ralphus_core::schema::agent_supports_maximum_context(&selection.backend)
+            {
+                let key = if has_maximum_context {
+                    "maximum_context"
+                } else {
+                    "auto_compact_threshold"
+                };
+                errors.push(ValidationError {
+                    path: format!("task[{task_idx}].cell[{cell_idx}].{key}"),
+                    kind: ErrorKind::InvalidValue,
+                    message: format!(
+                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
+                         support maximum_context/auto_compact_threshold (only codex and pi \
+                         backends do)",
+                        selection.backend
+                    ),
+                    line: None,
+                });
+            }
         }
     }
 
@@ -779,6 +810,84 @@ backend = "claude-code"
 
         assert!(
             errors.iter().all(|e| !e.path.contains("system_prompt")),
+            "{errors:?}"
+        );
+    }
+
+    fn task_file_with_agent_and_maximum_context(cwd: &Path, agent: &str) -> TaskFile {
+        let cwd = cwd.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\nmaximum_context=100000\n"
+        );
+        toml::from_str(&src).expect("parse task file")
+    }
+
+    #[test]
+    fn validate_task_file_profiles_rejects_maximum_context_for_non_supporting_profile_backend() {
+        let project_root = tempdir("maximum-context-ollama-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-ollama]
+backend = "ollama"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_maximum_context(&project_root, "custom-ollama");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.contains("maximum_context") && e.message.contains("ollama")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_rejects_maximum_context_for_claude_code_profile_backend() {
+        let project_root = tempdir("maximum-context-claude-code-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-claude]
+backend = "claude-code"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_maximum_context(&project_root, "custom-claude");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.contains("maximum_context") && e.message.contains("claude-code")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_allows_maximum_context_for_pi_profile_backend() {
+        let project_root = tempdir("maximum-context-pi-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-pi]
+backend = "pi"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_maximum_context(&project_root, "custom-pi");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors.iter().all(|e| !e.path.contains("maximum_context")),
             "{errors:?}"
         );
     }

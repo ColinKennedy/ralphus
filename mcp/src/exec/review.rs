@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use ralphus_cli::client::{DaemonClient, GuardianSettings};
 use ralphus_cli::commands::CommandError;
 use ralphus_cli::commands::review::{
-    self, GuardianEnvArgs, ReviewActionCommand, ReviewBaseCommand, ReviewBranchCommand,
-    ReviewChecksCommand, ReviewCommand, ReviewPrCommand,
+    self, GuardianEnvArgs, ReviewActionCommand, ReviewBranchCommand, ReviewChecksCommand,
+    ReviewCommand, ReviewPrCommand, ReviewUpstreamCommand,
 };
 use ralphus_cli::commands::task::with_uri;
 use ralphus_cli::selector::{
@@ -74,7 +74,6 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             git_root,
             checks,
             skip_auto_build,
-            skip_worktree_checks,
             skip_worktrees,
             review_type,
         } => {
@@ -92,7 +91,6 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 &git_root,
                 Some(&checks_vec),
                 skip_auto_build,
-                skip_worktree_checks,
                 skip_worktrees,
                 review_type.as_deref(),
             )?)
@@ -118,7 +116,6 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
         ReviewCommand::Settings {
             selector,
             skip_auto_build,
-            skip_worktree_checks,
             skip_worktrees,
             resolver_agent,
             resolver_model,
@@ -127,11 +124,11 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             proof_scope,
             skip_auto_clean,
             skip_base_updates,
+            match_pr_branch_name,
         } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
                 skip_auto_build,
-                skip_worktree_checks,
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
@@ -140,6 +137,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 proof_scope: proof_scope.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
+                match_pr_branch_name,
             };
             Ok(client.guardian_settings(&resolved.guardian_id, &settings)?)
         }
@@ -243,7 +241,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 &to_resolved.guardian_id,
             )?)
         }
-        ReviewCommand::Base(c) => exec_base(c, client),
+        ReviewCommand::Upstream(c) => exec_upstream(c, client),
         ReviewCommand::Pr(c) => exec_pr(c, client),
         ReviewCommand::Branch(c) => exec_branch(c, client),
         ReviewCommand::Checks(c) => exec_checks(c, client),
@@ -306,14 +304,16 @@ fn exec_guardian_env(
     Ok(result)
 }
 
-fn exec_base(cmd: ReviewBaseCommand, client: &DaemonClient) -> ExecResult {
+fn exec_upstream(cmd: ReviewUpstreamCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
-        ReviewBaseCommand::Help | ReviewBaseCommand::UsageError(_) => Err(usage("no such tool")),
-        ReviewBaseCommand::List { selector } => {
+        ReviewUpstreamCommand::Help | ReviewUpstreamCommand::UsageError(_) => {
+            Err(usage("no such tool"))
+        }
+        ReviewUpstreamCommand::List { selector } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_base_branches(&resolved.guardian_id)?)
         }
-        ReviewBaseCommand::Set { selector, branch } => {
+        ReviewUpstreamCommand::Set { selector, branch } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_change_base(&resolved.guardian_id, &branch)?)
         }
@@ -330,6 +330,7 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
             alias,
             title,
             description,
+            use_worktree_branch_name,
         } => {
             let mut pr_spec = serde_json::Map::new();
             if let Some(alias) = &alias {
@@ -342,6 +343,12 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
                 pr_spec.insert(
                     "description".to_string(),
                     Value::String(description.clone()),
+                );
+            }
+            if let Some(use_worktree_branch_name) = use_worktree_branch_name {
+                pr_spec.insert(
+                    "use_worktree_branch_name".to_string(),
+                    Value::Bool(use_worktree_branch_name),
                 );
             }
             let resolved =

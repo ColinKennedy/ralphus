@@ -120,6 +120,17 @@ pub struct RunnerSpec {
     /// consumed by the runner itself, so it's serialized here for
     /// completeness but harmlessly ignored by `CellSpec::from_json`.
     pub maximum_budget_usd: Option<f64>,
+    /// Context-window token limit (RAL-304), delivered to the backend via
+    /// its own mechanism (env var/CLI arg/settings file -- see
+    /// `ralphus_core::schema::agent_supports_maximum_context`). `None` means
+    /// no cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_context: Option<u64>,
+    /// Auto-compact trigger threshold in tokens (RAL-304). Same delivery
+    /// mechanism as [`Self::maximum_context`]. `None` means no explicit
+    /// threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_compact_threshold: Option<u64>,
     /// True when this spec is an `agent`-kind proof step rather than a
     /// normal cell: the runner wraps `prompt` with verdict-reporting
     /// instructions and returns a `proofed` result instead of just "ran".
@@ -402,6 +413,10 @@ impl RunnerSpec {
             timeout_sec: row.timeout_sec.and_then(|s| u64::try_from(s).ok()),
             budget_tokens: row.budget_tokens.and_then(|b| u64::try_from(b).ok()),
             maximum_budget_usd: row.maximum_budget_usd,
+            maximum_context: row.maximum_context.and_then(|v| u64::try_from(v).ok()),
+            auto_compact_threshold: row
+                .auto_compact_threshold
+                .and_then(|v| u64::try_from(v).ok()),
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -457,9 +472,13 @@ impl RunnerSpec {
             system_prompt_position: None,
             timeout_sec,
             budget_tokens,
-            // Proof steps have no `maximum_budget_usd` field of their own
-            // today (RAL-161 scoped the cap to cells/tasks only).
+            // Proof steps have no `maximum_budget_usd`/`maximum_context`/
+            // `auto_compact_threshold` field of their own today (RAL-161
+            // scoped the USD cap to cells/tasks only; RAL-304 follows the
+            // same scope for the context-window/auto-compact caps).
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -519,6 +538,8 @@ impl RunnerSpec {
             timeout_sec,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -1932,6 +1953,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -1965,6 +1988,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -1976,6 +2001,38 @@ mod tests {
         assert_eq!(spec.tool_arg_truncate_chars, Some(200));
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"tool_arg_truncate_chars\":200"));
+    }
+
+    #[test]
+    fn spec_carries_maximum_context_and_auto_compact_threshold_from_row() {
+        let row = CellRow {
+            task_idx: 0,
+            idx: 0,
+            task_name: "build".to_string(),
+            cell_id: "s0".to_string(),
+            cwd: Some("/repo".to_string()),
+            subprojects: vec![],
+            prompt: Some("do work".to_string()),
+            command: None,
+            agent: "claude-code".to_string(),
+            model: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            maximum_budget_usd: None,
+            maximum_context: Some(100_000),
+            auto_compact_threshold: Some(80_000),
+            upstream: None,
+            machine: None,
+        };
+        let spec = RunnerSpec::from_row("run-1", &row);
+        assert_eq!(spec.maximum_context, Some(100_000));
+        assert_eq!(spec.auto_compact_threshold, Some(80_000));
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"maximum_context\":100000"));
+        assert!(json.contains("\"auto_compact_threshold\":80000"));
     }
 
     #[test]
@@ -1997,6 +2054,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2030,6 +2089,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -2152,6 +2213,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2205,6 +2268,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2234,6 +2299,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2311,6 +2378,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2349,6 +2418,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2381,6 +2452,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2419,6 +2492,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2908,6 +2983,8 @@ prompt = "make it build"
             timeout_sec: Some(120),
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -2987,6 +3064,8 @@ prompt = "make it build"
             timeout_sec: Some(1),
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };
@@ -3568,6 +3647,8 @@ prompt = "make it build"
             timeout_sec: Some(30),
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -3698,6 +3779,8 @@ prompt = "make it build"
             timeout_sec: Some(30),
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,

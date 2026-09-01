@@ -40,6 +40,7 @@ pub fn execute(cmd: TaskCommand, client: &DaemonClient) -> ExecResult {
             selector,
             name,
             project,
+            model,
         } => {
             let resolved = task::resolve_scoped(client, &selector, "task")?;
             Ok(client.edit_task(
@@ -47,6 +48,7 @@ pub fn execute(cmd: TaskCommand, client: &DaemonClient) -> ExecResult {
                 resolved.task_idx,
                 name.as_deref(),
                 project.as_deref(),
+                model.as_deref(),
             )?)
         }
     }

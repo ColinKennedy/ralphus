@@ -561,6 +561,20 @@ pub struct GuardianView {
     /// this project's creation-time stamp, and the live global config -- the
     /// value `rebuild_on_base_shift` actually gates on.
     pub effective_skip_base_updates: bool,
+    /// RAL-307: this review's own override for whether a newly submitted
+    /// PR's branch defaults to the exact worktree/feature branch name
+    /// instead of the convention-derived alias. `None` means "inherit the
+    /// project/global default" (resolved into
+    /// [`Self::effective_match_pr_branch_name`] at hydration time). Stamped
+    /// from the owning project's effective value at review creation, then
+    /// editable per-review afterward (board checkbox / `review settings`).
+    pub match_pr_branch_name: Option<bool>,
+    /// RAL-307: [`Self::match_pr_branch_name`] resolved against the
+    /// project-level `.ralphus.toml [review] match_pr_branch_name` default,
+    /// this project's creation-time stamp, and the live global config -- the
+    /// value PR submission actually gates on unless a per-submission
+    /// `PrRequest::use_worktree_branch_name` overrides it.
+    pub effective_match_pr_branch_name: bool,
     /// `true` once the review is built and awaiting human approval
     /// (`status == "in_review"`). Ported from board.html's "ready to act on"
     /// banner condition (`renderReadyBanner`, minus its client-only dismissed
@@ -799,10 +813,26 @@ impl Store {
     ) -> Result<String> {
         let id = self.next_id("guardian_seq", "guardian")?;
         let now = crate::store::now_ms();
+        // RAL-307: stamp this project's *effective* `match_pr_branch_name`
+        // (explicit `.ralphus.toml [review]` value > this project's
+        // registration-time stamp > the live global config > `false`) onto
+        // the new review at creation time -- unlike `skip_base_updates`
+        // (left `NULL`/"inherit" forever), this setting is meant to be a
+        // per-review starting point the board checkbox then edits directly,
+        // so it must be a concrete value from the start, not a perpetual
+        // fallback chain.
+        let explicit_project = crate::config::project_review_config(Path::new(git_root));
+        let stamp = self.project_match_pr_branch_name_stamp(git_root);
+        let live_global = crate::config::global_review_config();
+        let match_pr_branch_name = explicit_project
+            .match_pr_branch_name
+            .or(stamp)
+            .or(live_global.match_pr_branch_name)
+            .unwrap_or(false);
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms)
-             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?)",
-            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now],
+            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name)
+             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?,?)",
+            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name)],
         )?;
         Ok(id)
     }
@@ -1917,6 +1947,22 @@ impl Store {
         }
     }
 
+    /// Set this review's own override for whether a newly submitted PR's
+    /// branch defaults to the exact worktree/feature branch name instead of
+    /// the convention-derived alias (RAL-307). `None` resets it to "inherit
+    /// the project/global default".
+    pub fn set_guardian_match_pr_branch_name(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET match_pr_branch_name=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set whether this review auto-incorporates PR feedback comments instead of
     /// requiring the manual "Pull in PR feedback" action (RAL-117). Data-model
     /// only for v1 -- no background poller reads this flag yet.
@@ -2810,7 +2856,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -2823,7 +2869,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -2879,6 +2925,7 @@ impl Store {
             notice_kind: r.get(42)?,
             notice_message: r.get(43)?,
             notice_at_ms: r.get(44)?,
+            match_pr_branch_name: r.get::<_, Option<i64>>(45)?.map(|v| v != 0),
         })
     }
 
@@ -3140,6 +3187,18 @@ impl Store {
             .or(live_global.skip_base_updates)
             .unwrap_or(false);
 
+        // RAL-307: same layering as `effective_skip_base_updates` above, for
+        // whether a newly submitted PR's branch defaults to the exact
+        // worktree/feature branch name instead of the convention-derived
+        // alias.
+        let match_pr_branch_name_stamp = self.project_match_pr_branch_name_stamp(&row.git_root);
+        let effective_match_pr_branch_name = row
+            .match_pr_branch_name
+            .or(explicit_project.match_pr_branch_name)
+            .or(match_pr_branch_name_stamp)
+            .or(live_global.match_pr_branch_name)
+            .unwrap_or(false);
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -3199,6 +3258,8 @@ impl Store {
             effective_proof_skip_auto_clean,
             skip_base_updates: row.skip_base_updates,
             effective_skip_base_updates,
+            match_pr_branch_name: row.match_pr_branch_name,
+            effective_match_pr_branch_name,
             ready,
             merge_progress,
             summary_state,
@@ -3503,6 +3564,10 @@ struct GuardianRow {
     notice_kind: Option<String>,
     notice_message: Option<String>,
     notice_at_ms: Option<i64>,
+    /// RAL-307: per-review override for whether a newly submitted PR's
+    /// branch defaults to the worktree/feature branch name. `None` inherits
+    /// the project/global default.
+    match_pr_branch_name: Option<bool>,
 }
 
 #[cfg(test)]
@@ -4594,6 +4659,59 @@ mod tests {
         assert!(
             store
                 .set_guardian_skip_base_updates("nope", Some(true))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn match_pr_branch_name_is_stamped_false_at_creation_when_no_project_default() {
+        // Unlike `skip_base_updates` (left `NULL`/"inherit" forever), a new
+        // review stamps a concrete value from the owning project's effective
+        // default at creation time (RAL-307) -- with no registered project,
+        // that resolves to the live global default, `false`.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.match_pr_branch_name, Some(false));
+        assert!(!g.effective_match_pr_branch_name);
+    }
+
+    #[test]
+    fn match_pr_branch_name_stamps_the_owning_projects_effective_default() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_ex("proj", "", "/repo", "git", Some(true))
+            .unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.match_pr_branch_name,
+            Some(true),
+            "the project's stamped default is frozen onto the new review"
+        );
+        assert!(g.effective_match_pr_branch_name);
+    }
+
+    #[test]
+    fn match_pr_branch_name_toggles_independently_per_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_match_pr_branch_name(&id, Some(true))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.match_pr_branch_name, Some(true));
+        assert!(g.effective_match_pr_branch_name);
+
+        // Resetting back to None restores "inherit the project/global default".
+        store.set_guardian_match_pr_branch_name(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.match_pr_branch_name, None);
+        assert!(!g.effective_match_pr_branch_name);
+
+        assert!(
+            store
+                .set_guardian_match_pr_branch_name("nope", Some(true))
                 .is_err()
         );
     }

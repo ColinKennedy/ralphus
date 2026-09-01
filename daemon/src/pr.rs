@@ -598,6 +598,43 @@ pub struct PrRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// RAL-307: use the worktree/feature branch name (`branch.branch`)
+    /// verbatim as the PR branch alias, bypassing the
+    /// `apply_pr_branch_convention` default -- ignored when `branch_alias`
+    /// is also set (an explicit alias always wins). `None` defers to the
+    /// review's own [`crate::guardian::GuardianView::effective_match_pr_branch_name`]
+    /// setting; `Some(_)` overrides it for this submission only, without
+    /// changing the review's persisted default.
+    #[serde(default)]
+    pub use_worktree_branch_name: Option<bool>,
+}
+
+/// The PR branch alias `submit_stacked_branch_pr` pushes to, before
+/// [`resolve_unique_pr_alias`]'s collision-suffixing: an explicit
+/// `branch_alias` always wins verbatim; otherwise the default is templated
+/// from the convention rather than reusing `branch_name` bare -- an
+/// identically-named remote branch would mask the fact that its content is
+/// the review's (possibly rebased/conflict-resolved/squashed) output, not the
+/// task branch's own commits. RAL-307: that masking risk is an explicit,
+/// opt-in tradeoff when `use_worktree_branch_name` (this submission's own
+/// override) or `effective_match_pr_branch_name` (the review's persisted
+/// setting, used when the override is `None`) asks for `branch_name`
+/// verbatim instead -- makes it easy to trace a PR back to the review/
+/// worktree that produced it, at the cost of that masking.
+fn resolve_pr_alias(
+    branch_alias: Option<&str>,
+    use_worktree_branch_name: Option<bool>,
+    effective_match_pr_branch_name: bool,
+    pr_branch_convention: &str,
+    branch_name: &str,
+) -> String {
+    let use_worktree_branch_name =
+        use_worktree_branch_name.unwrap_or(effective_match_pr_branch_name);
+    sanitize_branch_name(&match branch_alias {
+        Some(alias) => alias.to_string(),
+        None if use_worktree_branch_name => branch_name.to_string(),
+        None => apply_pr_branch_convention(pr_branch_convention, branch_name),
+    })
 }
 
 /// Applies a `.ralphus.toml` `[forge] pull_request_branch_convention`
@@ -836,6 +873,8 @@ fn synthesize_pr_text(
         timeout_sec: None,
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: trace_context.map(str::to_string),
         resume_agent_session_id: None,
@@ -1947,7 +1986,8 @@ pub fn check_and_apply_forge_reorder(
         };
         let root = PathBuf::from(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(&root);
-        let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+        let remote_name =
+            crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
         let local_base = qualify_forge_base(&guardian.base_branch, &remote_name, &drift.base);
         let base_applied = if drift.base_changed {
             match guard.set_guardian_base_branch_if_newer(id, &local_base, drift.base_changed_at_ms)
@@ -2395,15 +2435,13 @@ fn submit_stacked_branch_pr(
         .review_branch
         .clone()
         .ok_or_else(|| format!("branch {branch_id} has no review ref yet; run the merge first"))?;
-    // RAL-244: an explicit `branch_alias` always wins verbatim; otherwise the
-    // default is templated from the convention rather than reusing
-    // `branch.branch` bare -- an identically-named remote branch would mask
-    // the fact that its content is the review's (possibly rebased/
-    // conflict-resolved/squashed) output, not the task branch's own commits.
-    let desired_alias = sanitize_branch_name(&match &req.branch_alias {
-        Some(alias) => alias.clone(),
-        None => apply_pr_branch_convention(pr_branch_convention, &branch.branch),
-    });
+    let desired_alias = resolve_pr_alias(
+        req.branch_alias.as_deref(),
+        req.use_worktree_branch_name,
+        guardian.effective_match_pr_branch_name,
+        pr_branch_convention,
+        &branch.branch,
+    );
     // RAL-190: suffix (`-002`, ...) if another PR already claims this
     // alias, so two branches/reviews that would otherwise default to the
     // same remote branch name don't collide.
@@ -2674,6 +2712,7 @@ fn submit_stack_for_guardian(
     pr_branch_convention: &str,
     trace_context: Option<&str>,
     stack_id: &str,
+    use_worktree_branch_name: Option<bool>,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
     let already_open = refresh_open_prs(store, client, open_prs_by_branch(existing_prs));
     let mut created = Vec::new();
@@ -2688,6 +2727,7 @@ fn submit_stack_for_guardian(
             branch_alias: None,
             title: None,
             description: None,
+            use_worktree_branch_name,
         };
         let pr = submit_stacked_branch_pr(
             store,
@@ -2844,6 +2884,15 @@ fn submit_pull_requests_inner(
             .unwrap_or(0)
     });
     let submit_whole_stack = requests.iter().any(|r| r.branch_id.is_none());
+    // RAL-307: a whole-stack request's own override (if the caller set one)
+    // applies to every branch this call creates -- there's exactly one
+    // `branch_id: None` request per submission (title/description are
+    // likewise ignored/undefined across more than one), so the first match
+    // is unambiguous.
+    let whole_stack_use_worktree_branch_name = requests
+        .iter()
+        .find(|r| r.branch_id.is_none())
+        .and_then(|r| r.use_worktree_branch_name);
 
     // RAL-302: one id per call to `submit_pull_requests_inner`, stamped on
     // every PR row this call creates (stacked and/or whole-stack), so a past
@@ -2898,6 +2947,7 @@ fn submit_pull_requests_inner(
             &pr_branch_convention,
             trace_context,
             &stack_id,
+            whole_stack_use_worktree_branch_name,
         )?;
         created.extend(stack_prs);
     }
@@ -3330,8 +3380,14 @@ fn action_pr_feedback_inner(
         fresh.len(),
         pr.guardian_id
     );
-    let outcome =
-        guardian_merge::run_feedback(store, runner, &pr.guardian_id, &branch_id, &feedback);
+    let outcome = guardian_merge::run_feedback(
+        store,
+        runner,
+        &pr.guardian_id,
+        &branch_id,
+        &feedback,
+        &crate::cancel::CancelToken::never(),
+    );
 
     for c in &fresh {
         let _ = store
@@ -5873,6 +5929,58 @@ mod tests {
         assert_eq!(
             sanitize_branch_name("PIPE-1234-some_description"),
             "PIPE-1234-some_description"
+        );
+    }
+
+    // ── resolve_pr_alias (RAL-307) ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_pr_alias_defaults_to_convention_when_nothing_opts_in() {
+        assert_eq!(
+            resolve_pr_alias(None, None, false, "{name}-review", "feature-x"),
+            "feature-x-review"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_alias_explicit_branch_alias_always_wins() {
+        // Wins over both a request-level override and the review's own
+        // persisted setting.
+        assert_eq!(
+            resolve_pr_alias(
+                Some("custom-alias"),
+                Some(true),
+                true,
+                "{name}-review",
+                "feature-x"
+            ),
+            "custom-alias"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_alias_uses_worktree_branch_name_from_per_request_override() {
+        assert_eq!(
+            resolve_pr_alias(None, Some(true), false, "{name}-review", "feature-x"),
+            "feature-x"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_alias_uses_worktree_branch_name_from_review_default() {
+        assert_eq!(
+            resolve_pr_alias(None, None, true, "{name}-review", "feature-x"),
+            "feature-x"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_alias_per_request_override_wins_over_review_default() {
+        // Explicit `Some(false)` opts back out even when the review's own
+        // setting is on.
+        assert_eq!(
+            resolve_pr_alias(None, Some(false), true, "{name}-review", "feature-x"),
+            "feature-x-review"
         );
     }
 

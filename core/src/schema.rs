@@ -83,6 +83,23 @@ pub struct TaskDef {
     /// `maximum_budget_usd`.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
+    /// Task-level context-window token limit (RAL-304), delivered to the
+    /// backend via its own mechanism (e.g. Claude Code's
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` env var, Codex's
+    /// `-c model_context_window=...`). Cells inherit this unless they set
+    /// their own `maximum_context`. Only accepted for a backend with a real
+    /// delivery mechanism -- see
+    /// [`agent_supports_maximum_context`] -- checked at validation time.
+    #[serde(default)]
+    pub maximum_context: Option<u64>,
+    /// Task-level auto-compact trigger threshold in tokens (RAL-304),
+    /// delivered to the backend via its own mechanism (e.g. Claude Code's
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var, Codex's
+    /// `-c model_auto_compact_token_limit=...`). Cells inherit this unless
+    /// they set their own `auto_compact_threshold`. Same backend-support
+    /// restriction as [`Self::maximum_context`].
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
     /// Retry count.
     #[serde(default)]
     pub max_retries: Option<u32>,
@@ -195,6 +212,17 @@ pub struct CellDef {
     /// exceeds this, the daemon kills it mid-run and fails it.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
+    /// Per-cell context-window token limit (RAL-304). Falls back to the
+    /// task-level `maximum_context` when unset. See
+    /// [`TaskDef::maximum_context`] for the delivery mechanism and the
+    /// backend-support restriction.
+    #[serde(default)]
+    pub maximum_context: Option<u64>,
+    /// Per-cell auto-compact trigger threshold in tokens (RAL-304). Falls
+    /// back to the task-level `auto_compact_threshold` when unset. See
+    /// [`TaskDef::auto_compact_threshold`].
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
     /// Per-cell wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
@@ -850,6 +878,36 @@ pub fn agent_supports_system_prompt(agent: &str) -> bool {
     )
 }
 
+/// Whether `agent` is a backend with a real delivery mechanism for
+/// `maximum_context`/`auto_compact_threshold` (RAL-304).
+///
+/// The Codex CLI (`codex`/`codex-cli`) maps these to
+/// `-c model_context_window=...`/`-c model_auto_compact_token_limit=...`;
+/// Pi maps `maximum_context` to a `models.json`
+/// `providers.<provider>.modelOverrides.<model-id>.contextWindow` override
+/// (requiring a `"<provider>/<model-id>"` resolved model) and
+/// `auto_compact_threshold` to `settings.json`'s `compaction.reserveTokens`
+/// (only when `maximum_context` is also set, since `reserveTokens` is a
+/// buffer computed against that ceiling, not an absolute threshold). Every
+/// other backend has no such mechanism, so validation rejects
+/// `maximum_context`/`auto_compact_threshold` for it (mirrors
+/// [`agent_supports_system_prompt`]'s RAL-5 precedent).
+///
+/// The Claude Code CLI (`claude-code`/`claude-cli`) is deliberately absent:
+/// its only related lever, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, reserves
+/// output-generation budget out of the same fixed context window rather
+/// than bounding the window itself, so there is no real delivery mechanism
+/// to accept these fields for.
+///
+/// On the runner side, each supported backend overrides
+/// `ModelBackend::supports_context_limits` to match this set -- the two
+/// checks are independent (`core` cannot see `runner`'s trait impls) and
+/// must be kept in sync by hand.
+#[must_use]
+pub fn agent_supports_maximum_context(agent: &str) -> bool {
+    matches!(agent, "codex" | "codex-cli" | "pi")
+}
+
 impl ResolvedAgent {
     /// Merge task defaults with cell overrides (cell wins).
     #[must_use]
@@ -897,6 +955,8 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             max_retries: None,
             priority: None,
             timeout_minutes: None,
@@ -926,6 +986,8 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             timeout_minutes: None,
             priority: None,
             environment: BTreeMap::new(),

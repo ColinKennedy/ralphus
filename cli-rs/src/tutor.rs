@@ -44,6 +44,26 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  args           array<string>  Extra agent CLI flags for every cell
  budget_tokens  integer        Default total-token cap (in+out); cells/proofs
                                inherit it. Exceeding it fails the step.
+ maximum_context        integer  Default context-window token limit, delivered to the
+                                 backend via its own mechanism (Codex's
+                                 -c model_context_window=..., or a `pi` models.json
+                                 override -- requires a "<provider>/<model-id>"
+                                 model). Cells inherit it unless they set their own.
+                                 Only accepted for agent = "codex" (or alias) or
+                                 "pi" -- rejected at validation time for any other
+                                 backend, including "claude-code" (its only related
+                                 lever reserves output budget out of the same
+                                 context window rather than bounding it).
+ auto_compact_threshold integer  Default auto-compact trigger, in tokens: once a
+                                 cell's context usage crosses this, the backend
+                                 compacts its own history instead of running until it
+                                 hits `maximum_context` and fails outright. Same
+                                 delivery mechanism and backend restriction as
+                                 `maximum_context` above. A reasonable starting point
+                                 is around 80000 tokens, set comfortably below
+                                 whatever `maximum_context` (or the backend's own
+                                 default context window) is, so compaction has room to
+                                 trigger before the hard limit.
  max_retries    integer        Auto-retry count on failure
  priority       integer        Initial Queue priority hint (lower = runs sooner).
                                Seeds this task's starting position in the Queue tab;
@@ -177,6 +197,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         expansion as `cwd`; repeat the exact marker
                                         to reuse that worktree's resolved path.
  budget_tokens           integer        Per-cell total-token cap (falls back to task)
+ maximum_context         integer        Per-cell context-window token limit (falls back
+                                        to task's `maximum_context`); see the
+                                        [[task]] field reference above.
+ auto_compact_threshold  integer        Per-cell auto-compact trigger, in tokens (falls
+                                        back to task's `auto_compact_threshold`); see
+                                        the [[task]] field reference above. ~80000 is a
+                                        reasonable starting point.
  timeout_minutes         integer        Per-cell wall-clock timeout (falls back to task)
  priority                integer        Initial Queue priority hint (lower = runs sooner);
                                         seeds this cell's starting Queue position.

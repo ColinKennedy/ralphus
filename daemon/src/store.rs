@@ -744,6 +744,8 @@ impl Store {
                 budget_tokens INTEGER,
                 agent_session_id TEXT,
                 maximum_budget_usd REAL,
+                maximum_context INTEGER,
+                auto_compact_threshold INTEGER,
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
@@ -1278,6 +1280,11 @@ impl Store {
             // NULL = never stamped (pre-RAL-250 project, deliberately not
             // backfilled -- the ticket's explicit no-migration decision).
             "ALTER TABLE projects ADD COLUMN skip_base_updates INTEGER",
+            // RAL-304: context-window/auto-compact resolved caps, delivered
+            // to the backend via its own mechanism (env var/CLI arg/settings
+            // file) -- see `ralphus_core::schema::agent_supports_maximum_context`.
+            "ALTER TABLE cells ADD COLUMN maximum_context INTEGER",
+            "ALTER TABLE cells ADD COLUMN auto_compact_threshold INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1493,6 +1500,18 @@ impl Store {
             // It now soft-deletes by setting `state='dropped'` and recording
             // why here, leaving the row (and its `stack_id` grouping) queryable.
             "ALTER TABLE guardian_pull_requests ADD COLUMN dropped_reason TEXT",
+            // RAL-307: per-review opt-in to default a newly submitted PR's
+            // branch to the exact worktree/feature branch name instead of the
+            // convention-derived alias. NULL = inherit the project/global
+            // default, same layering as `skip_base_updates`.
+            "ALTER TABLE guardians ADD COLUMN match_pr_branch_name INTEGER",
+            // RAL-307: the `match_pr_branch_name` value a project stamped from
+            // the live global config (or an explicit `ralphus project git`
+            // flag) at first registration, so a later global change doesn't
+            // retroactively flip an already-created project. NULL = never
+            // stamped (pre-RAL-307 project, deliberately not backfilled, same
+            // as `skip_base_updates`).
+            "ALTER TABLE projects ADD COLUMN match_pr_branch_name INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1748,12 +1767,18 @@ impl Store {
                 let budget_tokens = resolve_budget(cell.budget_tokens, task.budget_tokens);
                 let maximum_budget_usd =
                     resolve_maximum_budget_usd(cell.maximum_budget_usd, task.maximum_budget_usd);
+                let maximum_context =
+                    resolve_maximum_context(cell.maximum_context, task.maximum_context);
+                let auto_compact_threshold = resolve_auto_compact_threshold(
+                    cell.auto_compact_threshold,
+                    task.auto_compact_threshold,
+                );
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, upstream, queue_rank, env_overrides, machine)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, upstream, queue_rank, env_overrides, machine)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -1774,6 +1799,8 @@ impl Store {
                         timeout_sec,
                         budget_tokens,
                         maximum_budget_usd,
+                        maximum_context,
+                        auto_compact_threshold,
                         cell.upstream,
                         // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -2889,11 +2916,36 @@ impl Store {
         path: &str,
         vcs: &str,
     ) -> Result<()> {
+        self.register_project_ex(name, description, path, vcs, None)
+    }
+
+    /// Full form of [`Self::register_project`] that also accepts an explicit
+    /// per-project override for `match_pr_branch_name` (RAL-307, e.g. from
+    /// `ralphus project git --match-pr-branch-name`). `None` falls back to
+    /// stamping the live global config's value, the same always-from-global
+    /// shape `skip_base_updates` already uses.
+    pub fn register_project_ex(
+        &self,
+        name: &str,
+        description: &str,
+        path: &str,
+        vcs: &str,
+        match_pr_branch_name: Option<bool>,
+    ) -> Result<()> {
         // RAL-250: stamp the *current* global `skip_base_updates` value into a
         // brand-new project at first registration, so a later global change
         // does not retroactively flip it.
-        let global = crate::config::global_review_config().skip_base_updates();
-        self.register_project_with_stamp(name, description, path, vcs, Some(global))
+        let skip_base_updates = crate::config::global_review_config().skip_base_updates();
+        let match_pr_branch_name = match_pr_branch_name
+            .unwrap_or_else(|| crate::config::global_review_config().match_pr_branch_name());
+        self.register_project_with_stamp(
+            name,
+            description,
+            path,
+            vcs,
+            Some(skip_base_updates),
+            Some(match_pr_branch_name),
+        )
     }
 
     /// RAL-250: `register_project` with the global value that would normally be
@@ -2909,7 +2961,8 @@ impl Store {
         description: &str,
         path: &str,
         vcs: &str,
-        stamp: Option<bool>,
+        skip_base_updates_stamp: Option<bool>,
+        match_pr_branch_name_stamp: Option<bool>,
     ) -> Result<()> {
         // An existing project being re-registered (an upsert update, not a
         // first insert) is deliberately left untouched -- the ticket's explicit
@@ -2921,12 +2974,29 @@ impl Store {
             })
             .optional()?
             .is_some();
-        let stamp = if exists { None } else { stamp };
+        let skip_base_updates_stamp = if exists {
+            None
+        } else {
+            skip_base_updates_stamp
+        };
+        let match_pr_branch_name_stamp = if exists {
+            None
+        } else {
+            match_pr_branch_name_stamp
+        };
         self.conn.execute(
-            "INSERT INTO projects(name, description, path, vcs, created_at_ms, skip_base_updates)
-             VALUES(?,?,?,?,?,?)
+            "INSERT INTO projects(name, description, path, vcs, created_at_ms, skip_base_updates, match_pr_branch_name)
+             VALUES(?,?,?,?,?,?,?)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, path=excluded.path, vcs=excluded.vcs",
-            params![name, description, path, vcs, now_ms(), stamp.map(i64::from)],
+            params![
+                name,
+                description,
+                path,
+                vcs,
+                now_ms(),
+                skip_base_updates_stamp.map(i64::from),
+                match_pr_branch_name_stamp.map(i64::from)
+            ],
         )?;
         crate::rlog!(
             INFO,
@@ -2955,10 +3025,27 @@ impl Store {
     /// a later global change from retroactively flipping an already-created
     /// project.
     pub fn project_skip_base_updates_stamp(&self, path: &str) -> Option<bool> {
+        self.project_bool_stamp(path, "skip_base_updates")
+    }
+
+    /// RAL-307: the `match_pr_branch_name` value a project stamped (from the
+    /// live global config, or an explicit `ralphus project git` flag) when it
+    /// was first registered, looked up by repo path -- same lookup/ancestry
+    /// semantics as [`Self::project_skip_base_updates_stamp`].
+    pub fn project_match_pr_branch_name_stamp(&self, path: &str) -> Option<bool> {
+        self.project_bool_stamp(path, "match_pr_branch_name")
+    }
+
+    /// Shared lookup behind [`Self::project_skip_base_updates_stamp`] and
+    /// [`Self::project_match_pr_branch_name_stamp`]: `column`'s value on
+    /// whichever registered project's path is `path` itself or an ancestor of
+    /// it. `column` is always a fixed internal string literal, never
+    /// caller/user-supplied, so interpolating it into the query is safe.
+    fn project_bool_stamp(&self, path: &str, column: &str) -> Option<bool> {
         let trimmed = path.trim_end_matches(['/', '\\']);
         let mut stmt = match self
             .conn
-            .prepare("SELECT path, skip_base_updates FROM projects")
+            .prepare(&format!("SELECT path, {column} FROM projects"))
         {
             Ok(s) => s,
             Err(_) => return None,
@@ -3331,6 +3418,20 @@ fn resolve_maximum_budget_usd(cell: Option<f64>, task: Option<f64>) -> Option<f6
     cell.or(task)
 }
 
+/// Resolve an effective context-window token limit from a cell-level and a
+/// task-level value (cell wins; task is the default). `None` means no cap
+/// (RAL-304).
+fn resolve_maximum_context(cell: Option<u64>, task: Option<u64>) -> Option<i64> {
+    cell.or(task).map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+}
+
+/// Resolve an effective auto-compact trigger threshold from a cell-level and
+/// a task-level value (cell wins; task is the default). `None` means no
+/// explicit threshold (RAL-304).
+fn resolve_auto_compact_threshold(cell: Option<u64>, task: Option<u64>) -> Option<i64> {
+    cell.or(task).map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_proof(
     tx: &rusqlite::Transaction<'_>,
@@ -3431,6 +3532,14 @@ pub struct CellRow {
     /// cap. The runner kills the cell mid-run and fails it once the live
     /// `cost_usd` exceeds this (RAL-161).
     pub maximum_budget_usd: Option<f64>,
+    /// Effective context-window token limit (resolved from cell/task), or
+    /// `None` for no cap (RAL-304). Delivered to the backend via its own
+    /// mechanism -- see `ralphus_core::schema::agent_supports_maximum_context`.
+    pub maximum_context: Option<i64>,
+    /// Effective auto-compact trigger threshold in tokens (resolved from
+    /// cell/task), or `None` for no explicit threshold (RAL-304). Same
+    /// delivery mechanism as [`Self::maximum_context`].
+    pub auto_compact_threshold: Option<i64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this cell's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
@@ -3463,6 +3572,31 @@ pub struct CellEdit<'a> {
     pub prompt: Option<Option<&'a str>>,
     /// Shell command.
     pub command: Option<Option<&'a str>>,
+}
+
+/// Editable task definition fields. Same nested-`Option` nullable-field
+/// semantics as [`CellEdit`]. `name` can't be NULL (`tasks.name` is
+/// `NOT NULL`), so like `CellEdit::agent` it only has the "untouched"
+/// (`None`) and "set" (`Some(v)`) states.
+#[derive(Debug, Clone)]
+pub struct TaskEdit<'a> {
+    /// Task name.
+    pub name: Option<&'a str>,
+    /// Project this task's cells resolve their cwd against.
+    pub project: Option<Option<&'a str>>,
+    /// Model.
+    pub model: Option<Option<&'a str>>,
+}
+
+/// Editable proof step definition fields. A proof step has no separate
+/// `agent` selector (it always runs under its owning cell's/task's resolved
+/// agent program -- see `core::schema::ProofStep`'s doc comment), so `model`
+/// is the only editable field. Same nullable-field semantics as
+/// [`CellEdit::model`].
+#[derive(Debug, Clone)]
+pub struct ProofEdit<'a> {
+    /// Model override (meaningful for `prompt`-kind steps).
+    pub model: Option<Option<&'a str>>,
 }
 
 /// A task's identity and dependencies, for scheduling.
@@ -3559,7 +3693,7 @@ impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -3587,6 +3721,8 @@ impl Store {
                     upstream: r.get(15)?,
                     maximum_budget_usd: r.get(16)?,
                     machine: r.get(17)?,
+                    maximum_context: r.get(18)?,
+                    auto_compact_threshold: r.get(19)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3930,17 +4066,71 @@ impl Store {
         }
     }
 
-    /// Edit a task's name and project.
+    /// Edit a task's editable definition fields. A field the caller didn't
+    /// mention (`None` in `edit`) leaves the corresponding column untouched
+    /// -- see [`TaskEdit`]'s doc comment.
     pub fn edit_task_fields(
         &self,
         squad_id: &str,
         task_idx: i64,
-        name: &str,
-        project: Option<&str>,
+        edit: &TaskEdit<'_>,
     ) -> Result<()> {
+        let name_touched = edit.name.is_some();
+        let project_touched = edit.project.is_some();
+        let project_value = edit.project.flatten();
+        let model_touched = edit.model.is_some();
+        let model_value = edit.model.flatten();
         let n = self.conn.execute(
-            "UPDATE tasks SET name=?, project=? WHERE squad_id=? AND idx=?",
-            params![name, project, squad_id, task_idx],
+            "UPDATE tasks SET
+                name = CASE WHEN :name_touched THEN :name ELSE name END,
+                project = CASE WHEN :project_touched THEN :project ELSE project END,
+                model = CASE WHEN :model_touched THEN :model ELSE model END
+             WHERE squad_id=:squad_id AND idx=:idx",
+            named_params! {
+                ":name_touched": name_touched,
+                ":name": edit.name,
+                ":project_touched": project_touched,
+                ":project": project_value,
+                ":model_touched": model_touched,
+                ":model": model_value,
+                ":squad_id": squad_id,
+                ":idx": task_idx,
+            },
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Edit a proof step's editable definition fields. A field the caller
+    /// didn't mention (`None` in `edit`) leaves the corresponding column
+    /// untouched -- see [`ProofEdit`]'s doc comment.
+    pub fn edit_proof_fields(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+        edit: &ProofEdit<'_>,
+    ) -> Result<()> {
+        let model_touched = edit.model.is_some();
+        let model_value = edit.model.flatten();
+        let n = self.conn.execute(
+            "UPDATE proofs SET
+                model = CASE WHEN :model_touched THEN :model ELSE model END
+             WHERE squad_id=:squad_id AND task_idx=:task_idx AND scope=:scope AND cell_idx=:cell_idx AND idx=:idx",
+            named_params! {
+                ":model_touched": model_touched,
+                ":model": model_value,
+                ":squad_id": squad_id,
+                ":task_idx": task_idx,
+                ":scope": scope,
+                ":cell_idx": cell_idx,
+                ":idx": idx,
+            },
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -7057,6 +7247,55 @@ system_prompt_position = "append"
     }
 
     #[test]
+    fn cell_resolves_maximum_context_and_auto_compact_threshold_from_task() {
+        let src = r#"
+[[task]]
+name = "build"
+agent = "claude-code"
+maximum_context = 100000
+auto_compact_threshold = 80000
+[[task.cell]]
+id = "inherits"
+cwd = "/repo"
+prompt = "go"
+[[task.cell]]
+id = "overrides"
+cwd = "/repo"
+prompt = "go"
+maximum_context = 50000
+auto_compact_threshold = 40000
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let cells = store.cells_of(&id).unwrap();
+
+        let inherits = cells.iter().find(|c| c.cell_id == "inherits").unwrap();
+        assert_eq!(inherits.maximum_context, Some(100_000));
+        assert_eq!(inherits.auto_compact_threshold, Some(80_000));
+
+        let overrides = cells.iter().find(|c| c.cell_id == "overrides").unwrap();
+        assert_eq!(overrides.maximum_context, Some(50_000));
+        assert_eq!(overrides.auto_compact_threshold, Some(40_000));
+    }
+
+    #[test]
+    fn cell_maximum_context_defaults_to_none() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+id = "worker"
+cwd = "/repo"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let cells = store.cells_of(&id).unwrap();
+        assert_eq!(cells[0].maximum_context, None);
+        assert_eq!(cells[0].auto_compact_threshold, None);
+    }
+
+    #[test]
     fn explicit_project_wins_over_cwd_fallback() {
         let src = r#"
 [[task]]
@@ -9820,7 +10059,7 @@ command = "check-c"
         // the new project row via the injectable seam -- `agent_profiles.rs`
         // documents why the process env can't be mutated in-test to supply it.
         store
-            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true))
+            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true), None)
             .unwrap();
         assert_eq!(
             store.project_skip_base_updates_stamp("C:/repos/ralphus"),
@@ -9837,7 +10076,7 @@ command = "check-c"
     fn reregistering_existing_project_does_not_restamp() {
         let store = Store::open_in_memory().unwrap();
         store
-            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true))
+            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true), None)
             .unwrap();
 
         // Re-register the same name with a *different* global value (`false`):
@@ -9851,6 +10090,7 @@ command = "check-c"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -9865,7 +10105,14 @@ command = "check-c"
         let store = Store::open_in_memory().unwrap();
         // A project registered with an explicit value resolves to that value.
         store
-            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(false))
+            .register_project_with_stamp(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                Some(false),
+                None,
+            )
             .unwrap();
         assert_eq!(
             store.project_skip_base_updates_stamp("C:/repos/ralphus"),
@@ -9888,6 +10135,50 @@ command = "check-c"
             store.project_skip_base_updates_stamp("C:/legacy"),
             None,
             "an unstamped legacy project must resolve to None (not backfilled)"
+        );
+    }
+
+    #[test]
+    fn register_project_ex_uses_explicit_match_pr_branch_name_over_global() {
+        let store = Store::open_in_memory().unwrap();
+        // An explicit `Some` override (the new CLI flag) wins regardless of
+        // what the live global config would otherwise stamp.
+        store
+            .register_project_ex("ralphus", "", "C:/repos/ralphus", "git", Some(true))
+            .unwrap();
+        assert_eq!(
+            store.project_match_pr_branch_name_stamp("C:/repos/ralphus"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn register_project_ex_falls_back_to_global_when_unset() {
+        let store = Store::open_in_memory().unwrap();
+        // `register_project` (no explicit override) stamps from the live
+        // global config, which defaults to `false` when unconfigured.
+        store
+            .register_project("ralphus", "", "C:/repos/ralphus", "git")
+            .unwrap();
+        assert_eq!(
+            store.project_match_pr_branch_name_stamp("C:/repos/ralphus"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn reregistering_existing_project_does_not_restamp_match_pr_branch_name() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_ex("ralphus", "", "C:/repos/ralphus", "git", Some(true))
+            .unwrap();
+        store
+            .register_project_ex("ralphus", "updated", "C:/repos/ralphus", "git", Some(false))
+            .unwrap();
+        assert_eq!(
+            store.project_match_pr_branch_name_stamp("C:/repos/ralphus"),
+            Some(true),
+            "re-registering must not overwrite the original creation-time stamp"
         );
     }
 

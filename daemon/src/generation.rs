@@ -211,6 +211,8 @@ pub fn run_generation(req: &GenerateRequest) -> GenerationJob {
         timeout_sec: Some(120),
         budget_tokens: None,
         maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,

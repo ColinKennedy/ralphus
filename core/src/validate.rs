@@ -169,6 +169,8 @@ const TASK_KEYS: &[&str] = &[
     "args",
     "budget_tokens",
     "maximum_budget_usd",
+    "maximum_context",
+    "auto_compact_threshold",
     "max_retries",
     "priority",
     "timeout_minutes",
@@ -195,6 +197,8 @@ const CELL_KEYS: &[&str] = &[
     "args",
     "budget_tokens",
     "maximum_budget_usd",
+    "maximum_context",
+    "auto_compact_threshold",
     "timeout_minutes",
     "priority",
     "environment",
@@ -459,6 +463,11 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &path, header);
         check_positive_number(ctx, table, "maximum_budget_usd", &path, header);
+        check_type(ctx, table, "maximum_context", Ty::Int, &path, header);
+        check_positive_number(ctx, table, "maximum_context", &path, header);
+        check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
+        check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
+        check_maximum_context(ctx, table, None, &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
@@ -650,6 +659,11 @@ fn validate_cells(
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &path, header);
         check_positive_number(ctx, table, "maximum_budget_usd", &path, header);
+        check_type(ctx, table, "maximum_context", Ty::Int, &path, header);
+        check_positive_number(ctx, table, "maximum_context", &path, header);
+        check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
+        check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
+        check_maximum_context(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
@@ -896,6 +910,53 @@ fn check_system_prompt(
                 line,
             );
         }
+    }
+}
+
+/// Enforce the context-window/auto-compact backend-support rule (RAL-304):
+/// `maximum_context` and `auto_compact_threshold` are only accepted for
+/// backends with a real delivery mechanism -- see
+/// [`agent_supports_maximum_context`](crate::schema::agent_supports_maximum_context).
+/// Mirrors [`check_system_prompt`]'s shape exactly, including the same
+/// `core`-can-only-classify-[`RESERVED_AGENT_NAMES`] deferral to the daemon
+/// for a custom `[agent.profiles.*]` entry.
+fn check_maximum_context(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    task_agent: Option<&str>,
+    path: &str,
+    header: Option<u32>,
+) {
+    let has_context = table.contains_key("maximum_context");
+    let has_threshold = table.contains_key("auto_compact_threshold");
+    if !has_context && !has_threshold {
+        return;
+    }
+
+    let agent = table
+        .get("agent")
+        .and_then(toml::Value::as_str)
+        .or(task_agent)
+        .unwrap_or(crate::schema::DEFAULT_AGENT);
+    if crate::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !crate::schema::agent_supports_maximum_context(agent)
+    {
+        let key = if has_context {
+            "maximum_context"
+        } else {
+            "auto_compact_threshold"
+        };
+        let line = ctx.key_line(header, key);
+        ctx.error(
+            &format!("{path}.{key}"),
+            ErrorKind::InvalidValue,
+            format!(
+                "'maximum_context'/'auto_compact_threshold' are only supported for the \
+                 'codex'/'pi' agents right now, not '{agent}'. Remove this setting, or switch \
+                 to one of those agents."
+            ),
+            line,
+        );
     }
 }
 
@@ -2191,6 +2252,103 @@ command = "cargo build"
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=123\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
+    fn maximum_context_rejected_for_claude_code() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nmaximum_context=100000\nauto_compact_threshold=80000\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.path.contains("maximum_context")
+                && e.message.contains("claude-code")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn maximum_context_valid_for_codex_and_pi() {
+        for agent in ["codex", "pi"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"{agent}\"\nmaximum_context=100000\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{agent}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn maximum_context_at_task_level_inherits_to_cell() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\nmaximum_context=100000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn maximum_context_rejected_for_ollama() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\nmaximum_context=100000\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn auto_compact_threshold_rejected_for_default_agent() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nauto_compact_threshold=80000\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("only supported for the")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn maximum_context_rejected_at_task_level_for_unsupported_agent() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"ollama\"\nmaximum_context=100000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn maximum_context_must_be_positive() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nmaximum_context=0\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("maximum_context")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn maximum_context_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nmaximum_context=\"lots\"\n";
+        let r = validate_toml(src);
+        assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
+    fn maximum_context_deferred_to_daemon_for_custom_agent_profile() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"openrouter-deepseek\"\nmaximum_context=100000\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]

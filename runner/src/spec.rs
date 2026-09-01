@@ -36,6 +36,13 @@ pub struct CellSpec {
     pub system_prompt_position: Option<String>,
     pub args: Vec<String>,
     pub budget_tokens: Option<u64>,
+    /// RAL-304: resolved context-window token limit. `None` for no cap, or
+    /// when unsupported by `agent` (the daemon rejects this combination at
+    /// submit time, per `core::validate`'s `agent_supports_maximum_context`).
+    pub maximum_context: Option<u64>,
+    /// RAL-304: resolved auto-compact trigger threshold in tokens. Same
+    /// support restriction as `maximum_context`.
+    pub auto_compact_threshold: Option<u64>,
     pub timeout_sec: Option<u64>,
     pub proof: bool,
     pub trace_context: Option<String>,
@@ -82,6 +89,8 @@ impl CellSpec {
         let system_prompt_position = opt_str(obj, "system_prompt_position")?;
         let args = str_list(obj, "args")?;
         let budget_tokens = opt_uint(obj, "budget_tokens")?;
+        let maximum_context = opt_uint(obj, "maximum_context")?;
+        let auto_compact_threshold = opt_uint(obj, "auto_compact_threshold")?;
         let timeout_sec = opt_uint(obj, "timeout_sec")?;
         let proof = opt_bool(obj, "proof")?.unwrap_or(false);
         let trace_context = opt_str(obj, "trace_context")?;
@@ -109,6 +118,8 @@ impl CellSpec {
             system_prompt_position,
             args,
             budget_tokens,
+            maximum_context,
+            auto_compact_threshold,
             timeout_sec,
             proof,
             trace_context,

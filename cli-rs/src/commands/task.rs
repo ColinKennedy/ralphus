@@ -33,6 +33,7 @@ pub enum TaskCommand {
         selector: String,
         name: Option<String>,
         project: Option<String>,
+        model: Option<String>,
     },
     UsageError(String),
 }
@@ -66,10 +67,12 @@ pub fn parse(args: &[String]) -> TaskCommand {
         Some("edit") => {
             let name = scanner.take_value("--name").ok().flatten();
             let project = scanner.take_value("--project").ok().flatten();
+            let model = scanner.take_value("--model").ok().flatten();
             with_selector(scanner, |selector| TaskCommand::Edit {
                 selector,
                 name,
                 project,
+                model,
             })
         }
         Some(other) => TaskCommand::UsageError(format!("unknown task subcommand: {other}")),
@@ -160,6 +163,7 @@ pub fn dispatch(cmd: TaskCommand, opts: &GlobalOpts) -> i32 {
             selector,
             name,
             project,
+            model,
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "task")?;
             let result = client.edit_task(
@@ -167,6 +171,7 @@ pub fn dispatch(cmd: TaskCommand, opts: &GlobalOpts) -> i32 {
                 resolved.task_idx,
                 name.as_deref(),
                 project.as_deref(),
+                model.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
             Ok(())
@@ -193,6 +198,7 @@ fn render_task_detail(t: &Value) {
             t["project"].as_str().unwrap_or_default().to_string(),
         ),
         ("state", t["state"].as_str().unwrap_or_default().to_string()),
+        ("model", t["model"].as_str().unwrap_or_default().to_string()),
         ("depends_on", depends_on),
     ]);
     for (vi, v) in t["proof"].as_array().into_iter().flatten().enumerate() {
@@ -273,15 +279,19 @@ mod tests {
             "new-name",
             "--project",
             "proj",
+            "--model",
+            "gpt-5",
         ])) {
             TaskCommand::Edit {
                 selector,
                 name,
                 project,
+                model,
             } => {
                 assert_eq!(selector, "squad-1/build");
                 assert_eq!(name.as_deref(), Some("new-name"));
                 assert_eq!(project.as_deref(), Some("proj"));
+                assert_eq!(model.as_deref(), Some("gpt-5"));
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -246,7 +246,7 @@ impl Semaphore {
         };
         Self {
             state: Mutex::new(SemaphoreState {
-                permits: permits.max(1),
+                permits: capacity,
                 next_seq: 0,
                 waiting: Vec::new(),
             }),
@@ -3287,6 +3287,30 @@ mod tests {
     use crate::runner::{RunnerResult, RunnerSpec};
     use std::collections::BTreeMap;
 
+    /// Runs `f` on its own thread and requires it to finish within `timeout`.
+    ///
+    /// Authoring rule (see the Semaphore entry in `.agent/gotchas.md`): a test
+    /// that exercises a real blocking wait on a semaphore/mutex/condvar/channel
+    /// must never be able to block indefinitely on a regression, since
+    /// `cargo test` runs every unit test in one process and a single stuck
+    /// thread freezes the whole binary with no `FAILED` line and no
+    /// `test result:` summary -- indistinguishable from "the suite is just
+    /// slow" until someone bisects it by hand. Wrap the blocking call in this
+    /// helper so a real deadlock fails loud in `timeout` seconds instead.
+    fn assert_completes_within<T: Send + 'static>(
+        timeout: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(timeout).expect(
+            "blocking operation did not complete within the timeout -- \
+             likely a deadlock regression, not a slow test",
+        )
+    }
+
     /// Simulates the `"exit N"` shell-command convention this test module's
     /// TOML fixtures use for a `command`-kind proof step. Since RAL-151
     /// routes `command`-kind proof steps through the same `Runner` cells
@@ -3987,32 +4011,36 @@ mod tests {
 
     #[test]
     fn semaphore_bounds_and_releases() {
-        let sem = Semaphore::new(1);
-        let a = sem.acquire();
-        // Second acquire in a scoped thread must block until `a` is dropped.
-        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        std::thread::scope(|s| {
-            let flag = Arc::clone(&acquired);
-            let sem_ref = &sem;
-            s.spawn(move || {
-                let _b = sem_ref.acquire();
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_completes_within(Duration::from_secs(5), || {
+            let sem = Semaphore::new(1);
+            let a = sem.acquire();
+            // Second acquire in a scoped thread must block until `a` is dropped.
+            let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            std::thread::scope(|s| {
+                let flag = Arc::clone(&acquired);
+                let sem_ref = &sem;
+                s.spawn(move || {
+                    let _b = sem_ref.acquire();
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(30));
+                assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+                drop(a);
             });
-            std::thread::sleep(Duration::from_millis(30));
-            assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
-            drop(a);
+            assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
         });
-        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
     fn semaphore_zero_means_unlimited() {
-        let sem = Semaphore::new(0);
-        // Hold far more permits at once than any positive cap would allow.
-        let permits: Vec<_> = (0..64).map(|_| sem.acquire()).collect();
-        assert_eq!(sem.in_use(), 64);
-        drop(permits);
-        assert_eq!(sem.in_use(), 0);
+        assert_completes_within(Duration::from_secs(5), || {
+            let sem = Semaphore::new(0);
+            // Hold far more permits at once than any positive cap would allow.
+            let permits: Vec<_> = (0..64).map(|_| sem.acquire()).collect();
+            assert_eq!(sem.in_use(), 64);
+            drop(permits);
+            assert_eq!(sem.in_use(), 0);
+        });
     }
 
     // RAL-280: when several ranked waiters are already blocked on an
@@ -4020,36 +4048,38 @@ mod tests {
     // `priority` value, not whichever thread the OS happens to wake first.
     #[test]
     fn acquire_ranked_grants_freed_permit_to_lowest_priority_waiter() {
-        let sem = Semaphore::new(1);
-        let held = sem.acquire();
-        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
-        std::thread::scope(|s| {
-            let sem_ref = &sem;
-            let order_ref = &order;
-            // Both block immediately (the one permit is held by `held`);
-            // spawn the *higher*-priority-number (lower-preference) one
-            // first so a naive FIFO/OS-order semaphore would grant it first.
-            let low_pref = s.spawn(move || {
-                let _p = sem_ref.acquire_ranked(f64::INFINITY);
-                order_ref.lock().unwrap().push("low_pref");
+        assert_completes_within(Duration::from_secs(5), || {
+            let sem = Semaphore::new(1);
+            let held = sem.acquire();
+            let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            std::thread::scope(|s| {
+                let sem_ref = &sem;
+                let order_ref = &order;
+                // Both block immediately (the one permit is held by `held`);
+                // spawn the *higher*-priority-number (lower-preference) one
+                // first so a naive FIFO/OS-order semaphore would grant it first.
+                let low_pref = s.spawn(move || {
+                    let _p = sem_ref.acquire_ranked(f64::INFINITY);
+                    order_ref.lock().unwrap().push("low_pref");
+                });
+                // Give the low-preference waiter time to register itself first.
+                std::thread::sleep(Duration::from_millis(30));
+                let high_pref = s.spawn(move || {
+                    let _p = sem_ref.acquire_ranked(-5.0);
+                    order_ref.lock().unwrap().push("high_pref");
+                });
+                std::thread::sleep(Duration::from_millis(30));
+                drop(held);
+                high_pref.join().unwrap();
+                low_pref.join().unwrap();
             });
-            // Give the low-preference waiter time to register itself first.
-            std::thread::sleep(Duration::from_millis(30));
-            let high_pref = s.spawn(move || {
-                let _p = sem_ref.acquire_ranked(-5.0);
-                order_ref.lock().unwrap().push("high_pref");
-            });
-            std::thread::sleep(Duration::from_millis(30));
-            drop(held);
-            high_pref.join().unwrap();
-            low_pref.join().unwrap();
+            assert_eq!(
+                *order.lock().unwrap(),
+                vec!["high_pref", "low_pref"],
+                "the lower-priority-value (more preferred) waiter must win the freed permit \
+                 even though it registered second"
+            );
         });
-        assert_eq!(
-            *order.lock().unwrap(),
-            vec!["high_pref", "low_pref"],
-            "the lower-priority-value (more preferred) waiter must win the freed permit \
-             even though it registered second"
-        );
     }
 
     // RAL-280 end-to-end: the same fairness property as
@@ -4107,7 +4137,7 @@ mod tests {
         // permit before it frees.
         std::thread::sleep(Duration::from_millis(200));
         drop(held);
-        handle.join().unwrap();
+        assert_completes_within(Duration::from_secs(5), move || handle.join().unwrap());
 
         assert_eq!(
             *order.lock().unwrap(),
@@ -5882,6 +5912,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         }
@@ -6007,6 +6039,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             upstream: None,
             machine: None,
         };

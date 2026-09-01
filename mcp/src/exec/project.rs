@@ -12,12 +12,19 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
             path,
             name,
             description,
+            match_pr_branch_name,
         } => {
             let target = ralphus_core::expand_home(&path);
             let target =
                 ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
             let target_str = target.to_string_lossy().to_string();
-            Ok(client.register_project(&name, &target_str, &description, "git")?)
+            Ok(client.register_project(
+                &name,
+                &target_str,
+                &description,
+                "git",
+                match_pr_branch_name,
+            )?)
         }
         ProjectCommand::List { short: _ } => Ok(client.list_projects()?),
         ProjectCommand::Get { name } => Ok(client.get_project(&name)?),

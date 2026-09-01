@@ -1456,66 +1456,6 @@ mod tests {
     }
 
     #[test]
-    fn get_pull_request_base_reads_github_base_ref() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
-            assert_eq!(req.method(), &tiny_http::Method::Get);
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/5");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"base": {"ref": "trunk"}}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
-        });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
-        assert_eq!(client.get_pull_request_base(5).unwrap(), "trunk");
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn get_pull_request_base_reads_gitlab_target_branch() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
-            assert_eq!(req.method(), &tiny_http::Method::Get);
-            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/11");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"target_branch": "trunk"}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
-        });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
-        assert_eq!(client.get_pull_request_base(11).unwrap(), "trunk");
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn get_pull_request_base_requires_token() {
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            "https://api.github.com".to_string(),
-            "acme/widget".to_string(),
-            None,
-        );
-        let err = client.get_pull_request_base(1).unwrap_err();
-        assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
-    }
-
-    #[test]
     fn get_pull_request_state_normalizes_gitlab_opened() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();

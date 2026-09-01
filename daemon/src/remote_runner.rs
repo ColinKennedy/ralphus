@@ -1128,6 +1128,8 @@ mod tests {
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,

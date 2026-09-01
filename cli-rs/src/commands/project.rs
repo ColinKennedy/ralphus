@@ -26,6 +26,10 @@ pub enum ProjectCommand {
         path: String,
         name: String,
         description: String,
+        /// RAL-307: explicit per-project default for whether a newly
+        /// submitted PR defaults to the worktree/feature branch name.
+        /// `None` stamps the live global config's value instead.
+        match_pr_branch_name: Option<bool>,
     },
     List {
         short: bool,
@@ -61,6 +65,8 @@ fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
     let path = scanner.take_value("--path")?;
     let name = scanner.take_value("--name")?;
     let description = scanner.take_value("--description")?.unwrap_or_default();
+    let match_pr_branch_name =
+        crate::commands::review::take_tri_bool(scanner, "--match-pr-branch-name");
     let Some(path) = path else {
         return Err(UsageError("project git requires --path".to_string()));
     };
@@ -71,6 +77,7 @@ fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
         path,
         name,
         description,
+        match_pr_branch_name,
     })
 }
 
@@ -93,6 +100,7 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
             path,
             name,
             description,
+            match_pr_branch_name,
         } => {
             // A leading `~` is expanded (see `ralphus_core::expand_home`); no
             // other relative-path expansion is done, matching this crate's
@@ -101,7 +109,13 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
             let target =
                 ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
             let target_str = target.to_string_lossy().to_string();
-            match client.register_project(&name, &target_str, &description, "git") {
+            match client.register_project(
+                &name,
+                &target_str,
+                &description,
+                "git",
+                match_pr_branch_name,
+            ) {
                 Ok(_) => {
                     println!("registered project \"{name}\" -> {target_str}");
                     0
@@ -207,11 +221,45 @@ mod tests {
                 path,
                 name,
                 description,
+                match_pr_branch_name,
             } => {
                 assert_eq!(path, "/repo");
                 assert_eq!(name, "my-project");
                 assert_eq!(description, "desc");
+                assert_eq!(match_pr_branch_name, None);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_git_match_pr_branch_name_tri_state() {
+        match parse(&v(&[
+            "git",
+            "--path",
+            "/repo",
+            "--name",
+            "my-project",
+            "--match-pr-branch-name",
+        ])) {
+            ProjectCommand::Git {
+                match_pr_branch_name,
+                ..
+            } => assert_eq!(match_pr_branch_name, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&[
+            "git",
+            "--path",
+            "/repo",
+            "--name",
+            "my-project",
+            "--no-match-pr-branch-name",
+        ])) {
+            ProjectCommand::Git {
+                match_pr_branch_name,
+                ..
+            } => assert_eq!(match_pr_branch_name, Some(false)),
             other => panic!("unexpected: {other:?}"),
         }
     }
