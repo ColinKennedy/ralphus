@@ -196,7 +196,7 @@ fn placeholder_cwd_with_registered_project_submits_successfully() {
     assert_eq!(reply.status, 201, "register: {}", reply.body);
 
     let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
-                [[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"do work\"\n";
     let submit_body = serde_json::json!({"toml": toml}).to_string();
     let reply = route(&daemon, "POST", "/api/squads", &submit_body);
     assert_eq!(reply.status, 201, "submit: {}", reply.body);
@@ -209,7 +209,7 @@ fn placeholder_cwd_with_unregistered_project_is_rejected_at_submit() {
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
 
     let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n\
-                [[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"do work\"\n";
+                [[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"do work\"\n";
     let submit_body = serde_json::json!({"toml": toml}).to_string();
     let reply = route(&daemon, "POST", "/api/squads", &submit_body);
     assert_eq!(reply.status, 400, "submit: {}", reply.body);

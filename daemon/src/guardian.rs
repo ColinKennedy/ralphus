@@ -1013,15 +1013,39 @@ impl Store {
         Ok(ids)
     }
 
-    /// Ids of collecting guardians that have at least one branch whose name
-    /// matches a cell `review_branch` in the given squad. This catches linked
-    /// reviews whose guardian `squad_id` points to an earlier submission (because
-    /// the guardian was found — not created — when the newer squad was submitted).
+    /// Ids of collecting guardians this squad's cells contribute to.
+    ///
+    /// Prefers each cell's direct `review_guardian_id` (RAL-314: set at
+    /// submit time by `reviews::derive_reviews`, alongside `review_branch`)
+    /// so two unrelated squads' cells that happen to record the identical
+    /// branch *string* (e.g. repeat submissions against the same worktree,
+    /// each minting its own fresh guardian) are never conflated -- this
+    /// matters here specifically because the scheduler's stack-readiness
+    /// gating (`scheduler::mark_ready_...`) reads this list to decide which
+    /// guardian's branch-readiness a squad's cells are contributing to, not
+    /// just which reviews cosmetically show up on the board.
+    ///
+    /// Falls back to the old `cells.review_branch = guardian_branches.branch`
+    /// string join for a cell with no `review_guardian_id` -- a pre-RAL-314
+    /// row, or one whose review linkage came from the manual
+    /// `POST /api/guardians/{id}/branches` attach path, which has no
+    /// submission-time cell membership to record one against. This also
+    /// covers a guardian *found* (not created) by a later submission that
+    /// shares a `ralphus:new-review/<key>` link, whose `squad_id` still
+    /// points at whichever squad created it.
     pub fn collecting_guardians_for_cells(&self, squad_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT g.id FROM guardians g
-             JOIN guardian_branches gb ON g.id = gb.guardian_id
-             JOIN cells s ON s.review_branch = gb.branch
+             JOIN cells s ON (
+                 s.review_guardian_id = g.id
+                 OR (
+                     s.review_guardian_id IS NULL
+                     AND EXISTS (
+                         SELECT 1 FROM guardian_branches gb
+                         WHERE gb.guardian_id = g.id AND gb.branch = s.review_branch
+                     )
+                 )
+             )
              WHERE s.squad_id = ? AND g.status = 'collecting'
              ORDER BY g.created_at_ms, g.id",
         )?;

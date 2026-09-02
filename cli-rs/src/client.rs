@@ -1157,6 +1157,10 @@ impl DaemonClient {
     pub fn pr_action_feedback(&self, pr_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/pull-requests/{pr_id}/action-feedback"), None)
     }
+
+    pub fn pr_pull_from_pr(&self, pr_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/pull-requests/{pr_id}/pull-from-pr"), None)
+    }
 }
 
 /// Optional filters for [`DaemonClient::cartographer`] -- bundled to avoid a

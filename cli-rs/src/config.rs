@@ -119,7 +119,7 @@ fn type_name(value: &toml::Value) -> &'static str {
 
 fn validate_raw(raw: &toml::Table) -> Vec<String> {
     let mut issues = Vec::new();
-    const KNOWN_TOP: [&str; 5] = ["task", "daemon", "review", "defaults", "agent"];
+    const KNOWN_TOP: [&str; 6] = ["task", "daemon", "review", "defaults", "agent", "ark"];
     for key in raw.keys() {
         if !KNOWN_TOP.contains(&key.as_str()) {
             issues.push(format!("key \"{key}\" is unknown"));
@@ -213,6 +213,38 @@ fn validate_raw(raw: &toml::Table) -> Vec<String> {
                             "key \"daemon.keep_temporary_files\" expects \"boolean\" but got a \"{}\" type",
                             type_name(ktf)
                         ));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ark_raw) = raw.get("ark") {
+        match ark_raw.as_table() {
+            None => issues.push(format!(
+                "key \"ark\" expects a \"table\" but got a \"{}\" type",
+                type_name(ark_raw)
+            )),
+            Some(table) => {
+                const KNOWN_ARK: [&str; 3] =
+                    ["sweep_interval_days", "stale_after_days", "max_worktrees"];
+                for key in table.keys() {
+                    if !KNOWN_ARK.contains(&key.as_str()) {
+                        issues.push(format!("key \"ark.{key}\" is unknown"));
+                    }
+                }
+                for key in KNOWN_ARK {
+                    if let Some(value) = table.get(key) {
+                        match value.as_integer() {
+                            None => issues.push(format!(
+                                "key \"ark.{key}\" expects \"integer\" but got a \"{}\" type",
+                                type_name(value)
+                            )),
+                            Some(value) if value <= 0 => issues.push(format!(
+                                "key \"ark.{key}\" got invalid value {value}. Expected > 0"
+                            )),
+                            Some(_) => {}
+                        }
                     }
                 }
             }
@@ -645,6 +677,24 @@ BAD = 5
                 .parse()
                 .unwrap();
         assert!(validate_raw(&raw).is_empty());
+    }
+
+    #[test]
+    fn validate_raw_checks_ark_policy() {
+        let valid: toml::Table =
+            "[ark]\nsweep_interval_days=1\nstale_after_days=90\nmax_worktrees=100"
+                .parse()
+                .unwrap();
+        assert!(validate_raw(&valid).is_empty());
+
+        let invalid: toml::Table =
+            "[ark]\nsweep_interval_days=0\nstale_after_days=\"old\"\nunknown=true"
+                .parse()
+                .unwrap();
+        let issues = validate_raw(&invalid).join("\n");
+        assert!(issues.contains("sweep_interval_days"));
+        assert!(issues.contains("stale_after_days"));
+        assert!(issues.contains("ark.unknown"));
     }
 
     #[test]

@@ -490,6 +490,11 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
 /// occupying that `w/<short>` slot lands in `w/<short>-2` instead of silently
 /// reusing the other branch's worktree.
 ///
+/// The path is [`resolve_task_worktree_dir`], not the plain [`worktree_dir`]
+/// -- so a branch whose short name collides with another branch already
+/// occupying that `w/<short>` slot lands in `w/<short>-2` instead of silently
+/// reusing the other branch's worktree.
+///
 /// Restart-safe: if the worktree directory's `.git` already exists, the
 /// directory is assumed to be a previously materialized worktree and is
 /// reused rather than recreated (or erroring because the branch or directory

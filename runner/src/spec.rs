@@ -40,8 +40,12 @@ pub struct CellSpec {
     /// when unsupported by `agent` (the daemon rejects this combination at
     /// submit time, per `core::validate`'s `agent_supports_maximum_context`).
     pub maximum_context: Option<u64>,
-    /// RAL-304: resolved auto-compact trigger threshold in tokens. Same
-    /// support restriction as `maximum_context`.
+    /// RAL-304: resolved auto-compact trigger threshold in tokens. `None`
+    /// for no explicit threshold, or when unsupported by `agent` (the
+    /// daemon rejects this combination at submit time, per
+    /// `core::validate`'s `agent_supports_auto_compact_threshold`). Accepted
+    /// by a wider set of backends than `maximum_context` -- e.g. claude-code
+    /// supports this field but not that one.
     pub auto_compact_threshold: Option<u64>,
     pub timeout_sec: Option<u64>,
     pub proof: bool,

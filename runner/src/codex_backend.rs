@@ -86,7 +86,11 @@ impl ModelBackend for CodexBackend {
         outcome
     }
 
-    fn supports_context_limits(&self) -> bool {
+    fn supports_maximum_context(&self) -> bool {
+        true
+    }
+
+    fn supports_auto_compact_threshold(&self) -> bool {
         true
     }
 }

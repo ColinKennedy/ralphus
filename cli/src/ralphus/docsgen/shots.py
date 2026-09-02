@@ -188,6 +188,18 @@ def _users_overview(page: Page) -> None:
         _shoot(page, "users-overview")
 
 
+def _secrets_overview(page: Page) -> None:
+    # Same no-dedicated-hash situation as Machines/Users above.
+    with (
+        fixture_server(fixtures.SECRETS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('secrets', true)")
+        page.wait_for_selector("#secrets .proj-table")
+        _shoot(page, "secrets-overview")
+
+
 SCENARIOS = (
     _tasks_overview,
     _tasks_session_detail,
@@ -198,6 +210,7 @@ SCENARIOS = (
     _projects_overview,
     _machines_overview,
     _users_overview,
+    _secrets_overview,
 )
 
 

@@ -57,12 +57,18 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  auto_compact_threshold integer  Default auto-compact trigger, in tokens: once a
                                  cell's context usage crosses this, the backend
                                  compacts its own history instead of running until it
-                                 hits `maximum_context` and fails outright. Same
-                                 delivery mechanism and backend restriction as
-                                 `maximum_context` above. A reasonable starting point
-                                 is around 80000 tokens, set comfortably below
-                                 whatever `maximum_context` (or the backend's own
-                                 default context window) is, so compaction has room to
+                                 hits `maximum_context` and fails outright. Delivered
+                                 via each backend's own mechanism -- Codex's
+                                 -c model_auto_compact_token_limit=..., pi's
+                                 settings.json reserveTokens buffer (requires
+                                 `maximum_context` also be set, unlike the other two
+                                 backends), or claude-code's
+                                 CLAUDE_CODE_AUTO_COMPACT_WINDOW env var (accepted on
+                                 its own -- claude-code takes this field but not
+                                 `maximum_context`). A reasonable starting point is
+                                 around 80000 tokens, set comfortably below whatever
+                                 `maximum_context` (or the backend's own default
+                                 context window) is, so compaction has room to
                                  trigger before the hard limit.
  max_retries    integer        Auto-retry count on failure
  priority       integer        Initial Queue priority hint (lower = runs sooner).

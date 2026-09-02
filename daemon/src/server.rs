@@ -6757,6 +6757,15 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Err(e) = result {
         return store_error(&e);
     }
+    // RAL-315: a task cancelled here (directly, or via `apply_stop_cascade`
+    // cancelling its owning task from a cell/proof-level stop) is invisible
+    // to the scheduler's own end-of-dispatch aggregation, since this request
+    // happens outside that loop. Re-run the same precedence check so a squad
+    // cancelled one task at a time still reaches `cancelled` once every task
+    // has landed.
+    if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "cancelled" {
+        let _ = store.reconcile_squad_cancellation(id);
+    }
     match store.get_squad(id) {
         Ok(squad) => json(200, &squad),
         Err(e) => store_error(&e),
@@ -9401,6 +9410,114 @@ mod tests {
         assert!(g.input_values.is_empty());
     }
 
+    // ── RAL-312: board.html's request field is `run_cleanup`, matching what
+    // these two handlers deserialize (not the `squad_cleanup` name the board
+    // briefly sent post-RAL-239) ────────────────────────────────────────────
+
+    #[test]
+    fn guardian_run_manual_commands_accepts_run_cleanup_body_field() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock()
+            .set_guardian_manual_commands(
+                &id,
+                &[crate::guardian::GuardianCheck {
+                    label: None,
+                    command: Some("ralphus-daemon serve --port {port}".to_string()),
+                    prompt: None,
+                    cleanup_command: None,
+                    inputs: vec![check_input_typed(
+                        "port",
+                        "Port",
+                        "7890",
+                        crate::guardian::CheckInputType::Int,
+                    )],
+                }],
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Same injection-shaped rejection as
+        // `guardian_run_manual_commands_rejects_injection_shaped_int_input`,
+        // but with a `run_cleanup` field on the body -- proves the field name
+        // the handler expects round-trips through `route()` without being
+        // silently dropped as an unrecognized key.
+        let body = serde_json::to_string(&serde_json::json!({
+            "index": 0,
+            "inputs": {"port": "1.0 & calc.exe & rem"},
+            "run_cleanup": true
+        }))
+        .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{id}/run-manual-commands"),
+            &body,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_check_input"));
+    }
+
+    #[test]
+    fn guardian_run_action_hint_accepts_run_cleanup_body_field() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock()
+            .set_guardian_action_hints(
+                &id,
+                &[crate::guardian::GuardianCheck {
+                    label: Some("Serve locally".to_string()),
+                    command: Some("ralphus-daemon serve --port {port}".to_string()),
+                    prompt: None,
+                    cleanup_command: None,
+                    inputs: vec![check_input_typed(
+                        "port",
+                        "Port",
+                        "7890",
+                        crate::guardian::CheckInputType::Int,
+                    )],
+                }],
+            )
+            .unwrap();
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "index": 0,
+            "inputs": {"port": "1.0 & calc.exe & rem"},
+            "run_cleanup": true
+        }))
+        .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{id}/run-action-hint"),
+            &body,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_check_input"));
+    }
+
+    #[test]
+    fn guardian_run_action_hint_rejects_wrong_type_for_run_cleanup_field() {
+        // A malformed `run_cleanup` (wrong JSON type) fails to deserialize
+        // only if the handler's body struct actually declares a field named
+        // `run_cleanup` -- if the field name regressed back to
+        // `squad_cleanup`, this value would be silently ignored as an
+        // unrecognized key and the request would proceed past body parsing
+        // instead of 400ing here.
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let body = r#"{"index": 0, "run_cleanup": "not-a-bool"}"#;
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{id}/run-action-hint"),
+            body,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("bad_request"));
+    }
+
     #[test]
     fn health_ok() {
         let d = daemon();
@@ -9809,7 +9926,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     #[test]
     fn submit_rejects_placeholder_cwd_with_unregistered_project() {
         let d = daemon();
-        let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("project_validation_failed"));
@@ -10077,7 +10194,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
             &machine_body("incredibuild", "/opt/ib.sh"),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
     }
@@ -10094,7 +10211,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
             &register_body("proj", &repo.to_string_lossy(), ""),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"local\"\n\
-                    [[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
+                    [[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
     }
@@ -10301,7 +10418,7 @@ machine=\"incredibuild:B\"
             &machine_body("incredibuild", "/opt/ib.sh"),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
                     [[review]]\nid=\"r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
@@ -10384,7 +10501,7 @@ machine=\"incredibuild:B\"
             "/api/projects",
             &register_body("proj", &repo.to_string_lossy(), ""),
         );
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
     }
@@ -11822,6 +11939,7 @@ machine=\"incredibuild:B\"
     // RAL-157: solo/unsolo a task within a squad.
 
     const TWO_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    const THREE_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
     const STOP_CASCADE_RUN: &str = r#"
 [[task]]
 name = "alpha"
@@ -12268,6 +12386,154 @@ command = "true"
         assert_ne!(v["tasks"][2]["state"].as_str(), Some("cancelled"));
         assert_eq!(v["tasks"][2]["cells"][0]["state"].as_str(), Some("running"));
         assert_ne!(v["state"].as_str(), Some("cancelled"));
+    }
+
+    // RAL-315: task-by-task cancellation via `set-status` (which the board's
+    // "Stop" button also hits, since `stopNode` posts to this exact same
+    // endpoint) must eventually propagate to the squad's own state, the same
+    // way whole-squad `cancel_squad` and the scheduler's own end-of-dispatch
+    // aggregation already do.
+
+    #[test]
+    fn set_status_task_cancel_one_at_a_time_transitions_squad_to_cancelled() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(TWO_TASKS));
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Running)
+            .unwrap();
+
+        let body =
+            serde_json::json!({"kind": "task", "task_idx": 0, "state": "cancelled"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &body,
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["state"].as_str(), Some("cancelled"));
+        assert_ne!(
+            v["state"].as_str(),
+            Some("cancelled"),
+            "squad must stay alive while a sibling task is still pending"
+        );
+
+        let body =
+            serde_json::json!({"kind": "task", "task_idx": 1, "state": "cancelled"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &body,
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["state"].as_str(),
+            Some("cancelled"),
+            "squad must transition to cancelled once every task has landed cancelled"
+        );
+    }
+
+    #[test]
+    fn set_status_cell_cancel_cascades_to_task_and_reconciles_squad() {
+        // The board's per-cell "Stop" button hits the same `set-status`
+        // endpoint with `kind: "cell"`; `apply_stop_cascade` cancels the
+        // owning task too, which must be visible to the same reconciliation
+        // that a direct `kind: "task"` cancel triggers.
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(TWO_TASKS));
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Running)
+            .unwrap();
+        d.lock()
+            .set_task_state("squad-000000000001", 0, NodeState::Cancelled)
+            .unwrap();
+
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 1, "cell_idx": 0, "state": "cancelled"
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &body,
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["state"].as_str(),
+            Some("cancelled"),
+            "cell-level stop cascading to its owning task must still reconcile the squad"
+        );
+    }
+
+    #[test]
+    fn set_status_task_cancel_with_sibling_still_running_does_not_cancel_squad() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(THREE_TASKS));
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Running)
+            .unwrap();
+        d.lock()
+            .set_task_state("squad-000000000001", 0, NodeState::Done)
+            .unwrap();
+        d.lock()
+            .set_task_state("squad-000000000001", 2, NodeState::Running)
+            .unwrap();
+
+        let body =
+            serde_json::json!({"kind": "task", "task_idx": 1, "state": "cancelled"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &body,
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["state"].as_str(), Some("done"));
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(v["tasks"][2]["state"].as_str(), Some("running"));
+        assert_ne!(
+            v["state"].as_str(),
+            Some("cancelled"),
+            "a still-running sibling task must block the squad from being reported cancelled"
+        );
+    }
+
+    #[test]
+    fn set_status_task_cancel_with_sibling_failed_reports_squad_failed_not_cancelled() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(TWO_TASKS));
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Running)
+            .unwrap();
+        d.lock()
+            .set_task_state("squad-000000000001", 0, NodeState::Failed)
+            .unwrap();
+
+        let body =
+            serde_json::json!({"kind": "task", "task_idx": 1, "state": "cancelled"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &body,
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["state"].as_str(), Some("failed"));
+        assert_eq!(v["tasks"][1]["state"].as_str(), Some("cancelled"));
+        assert_eq!(
+            v["state"].as_str(),
+            Some("failed"),
+            "a real failure must win over a sibling cancellation"
+        );
     }
 
     #[test]

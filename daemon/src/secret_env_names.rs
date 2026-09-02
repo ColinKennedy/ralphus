@@ -103,6 +103,18 @@ impl Store {
         }
         self.invalidate_secret_env_names_cache();
         crate::rlog!(INFO, "ralphus [store] secret env-var name {name:?} added");
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "secret env-var name added",
+            scope: Some("secret"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({ "name": name }),
+        });
         Ok(())
     }
 
@@ -168,6 +180,18 @@ impl Store {
                 INFO,
                 "ralphus [store] secret env-var name {old:?} renamed to {new:?}"
             );
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "store",
+                message: "secret env-var name renamed",
+                scope: Some("secret"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "old": old, "new": new }),
+            });
         }
         Ok(())
     }
@@ -185,6 +209,18 @@ impl Store {
         if n > 0 {
             self.invalidate_secret_env_names_cache();
             crate::rlog!(INFO, "ralphus [store] secret env-var name {name:?} removed");
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "store",
+                message: "secret env-var name removed",
+                scope: Some("secret"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "name": name }),
+            });
         }
         Ok(n > 0)
     }

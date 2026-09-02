@@ -2,12 +2,15 @@
 //! feature branch becomes one guardian per project, with the branch collected and
 //! the run association recorded. `<<upstream>>` without an upstream is rejected.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::guardian_merge::{run_merge, start_merge};
@@ -86,26 +89,6 @@ impl Runner for ConflictResolvingRunner {
     }
 }
 
-fn git(root: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "ralphus")
-        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
-        .env("GIT_COMMITTER_NAME", "ralphus")
-        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
-        .env("GIT_EDITOR", "true")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 fn temp_base(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -120,7 +103,7 @@ fn temp_base(tag: &str) -> PathBuf {
 fn repo_with_worktree(base: &Path, branch: &str) -> String {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);
@@ -138,7 +121,7 @@ fn repo_with_worktree(base: &Path, branch: &str) -> String {
 fn repo_with_worktree_no_upstream(base: &Path, branch: &str) -> String {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);
@@ -273,7 +256,7 @@ fn two_projects_make_two_disambiguated_reviews() {
 fn repo_with_two_worktrees(base: &Path, branch_a: &str, branch_b: &str) -> (String, String) {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);
@@ -293,6 +276,86 @@ fn repo_with_two_worktrees(base: &Path, branch_a: &str, branch_b: &str) -> (Stri
         wta.to_string_lossy().replace('\\', "/"),
         wtb.to_string_lossy().replace('\\', "/"),
     )
+}
+
+/// RAL-314: repeat submissions against the SAME worktree (no branch switch)
+/// each mint their own fresh guardian (`separate_submissions_each_mint_a_fresh_review`
+/// above already proves that write-side fact), but both guardians record the
+/// identical branch *string* -- before this fix, the read-side branch-string
+/// join then conflated them, so squad B's cell showed up as "in" squad A's
+/// review and vice versa (and the scheduler's `collecting_guardians_for_cells`
+/// readiness lookup made the same mistake). Each squad's cell must resolve
+/// only to the guardian its OWN submission created.
+#[test]
+fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
+    let base = temp_base("collision");
+    let cwd = repo_with_worktree(&base, "feature/shared");
+    let mut store = Store::open_in_memory().unwrap();
+
+    let toml_a = session_toml(&cwd, "ralphus:new-review/batch", "name=\"Batch\"");
+    let file_a: TaskFile = toml::from_str(&toml_a).unwrap();
+    let squad_a = store.insert_squad(&file_a, None, false).unwrap();
+    let ids_a = derive_reviews(&store, &squad_a, &file_a).expect("derive a");
+    assert_eq!(ids_a.len(), 1);
+    let gid_a = ids_a[0].clone();
+
+    // Second submission, same worktree/branch, no branch switch in between --
+    // it mints its OWN guardian (per `separate_submissions_each_mint_a_fresh_review`)
+    // that happens to record the exact same branch string as guardian A.
+    let toml_b = session_toml(&cwd, "ralphus:new-review/batch", "name=\"Batch\"");
+    let file_b: TaskFile = toml::from_str(&toml_b).unwrap();
+    let squad_b = store.insert_squad(&file_b, None, false).unwrap();
+    let ids_b = derive_reviews(&store, &squad_b, &file_b).expect("derive b");
+    assert_eq!(ids_b.len(), 1);
+    let gid_b = ids_b[0].clone();
+
+    assert_ne!(gid_a, gid_b, "each submission mints its own guardian");
+    assert_eq!(
+        store.get_guardian(&gid_a).unwrap().branches[0].branch,
+        store.get_guardian(&gid_b).unwrap().branches[0].branch,
+        "sanity: both guardians recorded the identical branch string"
+    );
+
+    // The cell-level "in reviews" list (RAL-17, via `get_squad`) must link
+    // each squad's cell to only its own guardian.
+    let view_a = store.get_squad(&squad_a).unwrap();
+    let cell_a = &view_a.tasks[0].cells[0];
+    assert_eq!(
+        cell_a
+            .reviews
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![gid_a.clone()],
+        "squad A's cell must link only to guardian A, not guardian B"
+    );
+
+    let view_b = store.get_squad(&squad_b).unwrap();
+    let cell_b = &view_b.tasks[0].cells[0];
+    assert_eq!(
+        cell_b
+            .reviews
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![gid_b.clone()],
+        "squad B's cell must link only to guardian B, not guardian A"
+    );
+
+    // The scheduler's stack-readiness gating (`collecting_guardians_for_cells`)
+    // must draw the same distinction, not just the cosmetic board view.
+    assert_eq!(
+        store.collecting_guardians_for_cells(&squad_a).unwrap(),
+        vec![gid_a],
+        "squad A must only be seen as contributing to guardian A"
+    );
+    assert_eq!(
+        store.collecting_guardians_for_cells(&squad_b).unwrap(),
+        vec![gid_b],
+        "squad B must only be seen as contributing to guardian B"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
@@ -372,7 +435,7 @@ fn repo_with_three_worktrees(
 ) -> (String, String, String) {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);
@@ -651,7 +714,7 @@ fn force_push_then_merge_resolves_cleanly() {
     // Initial repo: A edits shared.txt; B edits b_only.txt (no conflict yet).
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("shared.txt"), "original\n").unwrap();
     std::fs::write(repo.join("b_only.txt"), "b_only\n").unwrap();
     git(&repo, &["add", "."]);
@@ -761,15 +824,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     let base = temp_base("rebutton");
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    // The second "Merge / rebase" press below drives a real rebase through
-    // production's own git spawn (GitVcs::exec_raw, which correctly never
-    // injects an identity), so this repo needs one of its own in local
-    // config -- not just on this file's `git()` helper's per-invocation env
-    // vars -- or that rebase's commit fails identity checks on a CI runner
-    // with no global gitconfig.
-    git(&repo, &["config", "user.name", "ralphus"]);
-    git(&repo, &["config", "user.email", "ralphus@example.com"]);
+    init_repo(&repo);
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);
@@ -1284,7 +1339,7 @@ fn pydantic_ai_available(runner_cmd: &str) -> bool {
 fn two_conflicting_worktrees(base: &Path) -> (String, String) {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("shared.txt"), "original line\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "base"]);

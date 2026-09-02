@@ -81,6 +81,16 @@ pub struct MailboxMessageView {
 }
 
 impl Store {
+    /// Atomically claim the one lifetime Ark escalation for an entity.
+    /// Returns `true` only to the first caller.
+    pub fn claim_ark_notification(&self, entity_kind: &str, entity_id: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO ark_notifications(entity_kind, entity_id, notified_at_ms)
+             VALUES(?1, ?2, ?3)",
+            params![entity_kind, entity_id, now_ms()],
+        )? == 1)
+    }
+
     /// Register a new mailbox client, returning its freshly minted
     /// `client_id`. Called once by `ralphus quick-start watcher ...`/
     /// `ralphus mailbox check` on first use; the caller persists the id
@@ -333,5 +343,21 @@ mod tests {
             .mailbox_messages_for_client(&client_id, true, None)
             .unwrap();
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn ark_notification_claim_is_durable_and_entity_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .claim_ark_notification("review", "guardian-1")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_ark_notification("review", "guardian-1")
+                .unwrap()
+        );
+        assert!(store.claim_ark_notification("squad", "guardian-1").unwrap());
     }
 }

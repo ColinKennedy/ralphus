@@ -16,6 +16,7 @@ nav:
       - Projects: views/projects.md
       - Machines: views/machines.md
       - Users: views/users.md
+      - Secrets: views/secrets.md
 
 theme:
   name: material

@@ -84,20 +84,25 @@ pub struct TaskDef {
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
     /// Task-level context-window token limit (RAL-304), delivered to the
-    /// backend via its own mechanism (e.g. Claude Code's
-    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` env var, Codex's
+    /// backend via its own mechanism (e.g. Codex's
     /// `-c model_context_window=...`). Cells inherit this unless they set
     /// their own `maximum_context`. Only accepted for a backend with a real
     /// delivery mechanism -- see
     /// [`agent_supports_maximum_context`] -- checked at validation time.
+    /// Claude Code has no lever that caps the window itself (its
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only reserves output-generation
+    /// budget), so it does not accept this field -- see
+    /// [`agent_supports_auto_compact_threshold`] for the field it does
+    /// accept.
     #[serde(default)]
     pub maximum_context: Option<u64>,
     /// Task-level auto-compact trigger threshold in tokens (RAL-304),
     /// delivered to the backend via its own mechanism (e.g. Claude Code's
     /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var, Codex's
     /// `-c model_auto_compact_token_limit=...`). Cells inherit this unless
-    /// they set their own `auto_compact_threshold`. Same backend-support
-    /// restriction as [`Self::maximum_context`].
+    /// they set their own `auto_compact_threshold`. Accepted for a wider set
+    /// of backends than [`Self::maximum_context`] -- see
+    /// [`agent_supports_auto_compact_threshold`].
     #[serde(default)]
     pub auto_compact_threshold: Option<u64>,
     /// Retry count.
@@ -421,6 +426,15 @@ pub fn text_placeholders(text: &str) -> Vec<&str> {
 
 /// The first worktree placeholder found in `text`, either as the whole string
 /// itself (`ralphus:new-worktree/...`) or wrapped inside `<<...>>`.
+///
+/// This lenient (bare-or-wrapped) matching is for daemon-side resolution of
+/// already-submitted data, which must keep resolving whatever shape a cell's
+/// `cwd` was recorded in. Newly authored TOML is held to a stricter rule:
+/// `core::validate` rejects a bare (unwrapped) placeholder cwd and requires
+/// the wrapped `<<...>>` form, which is also the only form
+/// `cli-rs/src/tutor.rs` teaches -- it is the only shape that still composes
+/// when the same marker needs to be repeated inside another field (e.g. an
+/// `environment` value reusing a cell's worktree path).
 #[must_use]
 pub fn first_worktree_placeholder_in_text(text: &str) -> Option<&str> {
     parse_worktree_placeholder(text).map(|_| text).or_else(|| {
@@ -879,33 +893,58 @@ pub fn agent_supports_system_prompt(agent: &str) -> bool {
 }
 
 /// Whether `agent` is a backend with a real delivery mechanism for
-/// `maximum_context`/`auto_compact_threshold` (RAL-304).
+/// `maximum_context` -- i.e. a way to actually cap the context-window
+/// ceiling itself (RAL-304).
 ///
-/// The Codex CLI (`codex`/`codex-cli`) maps these to
-/// `-c model_context_window=...`/`-c model_auto_compact_token_limit=...`;
-/// Pi maps `maximum_context` to a `models.json`
+/// The Codex CLI (`codex`/`codex-cli`) maps it to
+/// `-c model_context_window=...`; Pi maps it to a `models.json`
 /// `providers.<provider>.modelOverrides.<model-id>.contextWindow` override
-/// (requiring a `"<provider>/<model-id>"` resolved model) and
-/// `auto_compact_threshold` to `settings.json`'s `compaction.reserveTokens`
-/// (only when `maximum_context` is also set, since `reserveTokens` is a
-/// buffer computed against that ceiling, not an absolute threshold). Every
-/// other backend has no such mechanism, so validation rejects
-/// `maximum_context`/`auto_compact_threshold` for it (mirrors
-/// [`agent_supports_system_prompt`]'s RAL-5 precedent).
+/// (requiring a `"<provider>/<model-id>"` resolved model). Every other
+/// backend has no such mechanism, so validation rejects `maximum_context`
+/// for it (mirrors [`agent_supports_system_prompt`]'s RAL-5 precedent).
 ///
 /// The Claude Code CLI (`claude-code`/`claude-cli`) is deliberately absent:
 /// its only related lever, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, reserves
 /// output-generation budget out of the same fixed context window rather
 /// than bounding the window itself, so there is no real delivery mechanism
-/// to accept these fields for.
+/// to accept this field for. See [`agent_supports_auto_compact_threshold`]
+/// for the separate (wider) set of backends that accept
+/// `auto_compact_threshold`.
 ///
 /// On the runner side, each supported backend overrides
-/// `ModelBackend::supports_context_limits` to match this set -- the two
+/// `ModelBackend::supports_maximum_context` to match this set -- the two
 /// checks are independent (`core` cannot see `runner`'s trait impls) and
 /// must be kept in sync by hand.
 #[must_use]
 pub fn agent_supports_maximum_context(agent: &str) -> bool {
     matches!(agent, "codex" | "codex-cli" | "pi")
+}
+
+/// Whether `agent` is a backend with a real delivery mechanism for
+/// `auto_compact_threshold` -- an absolute token count at which
+/// auto-compaction should trigger (RAL-304).
+///
+/// The Codex CLI (`codex`/`codex-cli`) maps it to
+/// `-c model_auto_compact_token_limit=...`; Pi maps it to `settings.json`'s
+/// `compaction.reserveTokens` (only when `maximum_context` is also set,
+/// since `reserveTokens` is a buffer computed against that ceiling, not an
+/// absolute threshold -- see [`agent_supports_maximum_context`]); the Claude
+/// Code CLI (`claude-code`/`claude-cli`) maps it directly to the
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var, which (unlike Pi) already
+/// takes a plain absolute token count, so no accompanying `maximum_context`
+/// is required. Every other backend has no such mechanism, so validation
+/// rejects `auto_compact_threshold` for it.
+///
+/// On the runner side, each supported backend overrides
+/// `ModelBackend::supports_auto_compact_threshold` to match this set -- the
+/// two checks are independent (`core` cannot see `runner`'s trait impls) and
+/// must be kept in sync by hand.
+#[must_use]
+pub fn agent_supports_auto_compact_threshold(agent: &str) -> bool {
+    matches!(
+        agent,
+        "codex" | "codex-cli" | "pi" | "claude-code" | "claude-cli"
+    )
 }
 
 impl ResolvedAgent {
@@ -1256,6 +1295,28 @@ mod tests {
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         assert!(parsed.task[0].environment.is_empty());
         assert!(parsed.task[0].cell[0].environment.is_empty());
+    }
+
+    #[test]
+    fn auto_compact_threshold_supported_by_claude_code_but_not_maximum_context() {
+        assert!(agent_supports_auto_compact_threshold("claude-code"));
+        assert!(agent_supports_auto_compact_threshold("claude-cli"));
+        assert!(!agent_supports_maximum_context("claude-code"));
+        assert!(!agent_supports_maximum_context("claude-cli"));
+    }
+
+    #[test]
+    fn auto_compact_threshold_and_maximum_context_both_supported_by_codex_and_pi() {
+        for agent in ["codex", "codex-cli", "pi"] {
+            assert!(agent_supports_auto_compact_threshold(agent), "{agent}");
+            assert!(agent_supports_maximum_context(agent), "{agent}");
+        }
+    }
+
+    #[test]
+    fn auto_compact_threshold_rejected_for_bare_claude_and_ollama() {
+        assert!(!agent_supports_auto_compact_threshold("claude"));
+        assert!(!agent_supports_auto_compact_threshold("ollama"));
     }
 
     #[test]

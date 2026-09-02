@@ -37,6 +37,8 @@ __all__ = [
     "REVIEWS_GUARDIAN",
     "REVIEWS_MESSAGES",
     "REVIEWS_ROUTES",
+    "SECRETS_ROUTES",
+    "SECRETS_ROWS",
     "TASKS_ROUTES",
     "TASKS_RUNS",
     "USERS_ROUTES",
@@ -52,6 +54,7 @@ __all__ = [
     "queue_item",
     "resource_row",
     "run",
+    "secret_env_name_entry",
     "session",
     "task",
     "user_entry",
@@ -408,6 +411,10 @@ def machine_provider(
 
 
 def user_entry(name: str, *, created_at_ms: int) -> Json:
+    return {"name": name, "created_at_ms": created_at_ms}
+
+
+def secret_env_name_entry(name: str, *, created_at_ms: int) -> Json:
     return {"name": name, "created_at_ms": created_at_ms}
 
 
@@ -953,6 +960,24 @@ USERS_ROUTES: Routes = {
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
     "/api/users": {"users": list(USERS_ROWS)},
+}
+
+# ---------------------------------------------------------------------------
+# Secrets scenario — a few registered secret env-var names (RAL-281).
+# ---------------------------------------------------------------------------
+
+SECRETS_ROWS: tuple[Json, ...] = (
+    secret_env_name_entry("STRIPE_SECRET_KEY", created_at_ms=1_783_100_000_000),
+    secret_env_name_entry("DATABASE_URL", created_at_ms=1_783_104_000_000),
+    secret_env_name_entry("GITHUB_TOKEN", created_at_ms=1_783_108_000_000),
+)
+
+SECRETS_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/secret-env-names": {"names": list(SECRETS_ROWS)},
 }
 
 # ---------------------------------------------------------------------------

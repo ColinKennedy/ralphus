@@ -251,6 +251,7 @@ aborts the remaining batch).
 | `review pr update <pr_id> [--pr-number] [--pr-url] [--branch-alias] [--state]` | Mutate the recorded PR mapping (e.g. after a reopen) |
 | `review pr comments <pr_id>` | List a PR's comments, flagging which are already actioned |
 | `review pr pull-feedback <pr_id>` | Action a PR's un-actioned feedback into the owning worktree |
+| `review pr pull-from-pr <pr_id>` | Pull a reviewer's commits pushed directly to the PR branch into the owning worktree, resolving conflicts and restacking downstream branches (RAL-190) |
 
 ### Why some commands print instead of act
 
@@ -561,9 +562,10 @@ use; see `READ_ONLY_NOTE`.
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
-        - git --description [text] --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
+        - git --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
     - proof  {Inspect and act on proof steps.}
+        - edit selector [str] --model [name]  {Edit a proof step's model override.}
         - restart selector [str]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [str] state [str]  {Manually override a proof step's status.}
         - (read-only-safe) show selector [str]  {Show a single proof step's detail.}
@@ -580,9 +582,6 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) run selector [str] --index [integer] --input [name=value...]  {Print the command + cwd for a command-kind action hint.}
         - add-branch selector [str] branch [str]  {Add a branch to a review.}
         - approve selector [str]  {Approve a review that is in_review.}
-        - base  {Inspect/change a review's base branch.}
-            - (read-only-safe) list selector [str]  {List candidate base branches.}
-            - set selector [str] branch [str]  {Change the base branch.}
         - branch  {Enable/disable one review branch.}
             - disable selector [str]  {Disable a branch and kick off the rebase.}
             - enable selector [str]  {Enable a branch and kick off the rebase.}
@@ -608,18 +607,22 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) find forge [github|gitlab] repo [str] pr_number [integer]  {Look up the ralphus PR row for a forge PR/MR number.}
             - (read-only-safe) list selector [str]  {List PRs submitted for a review.}
             - pull-feedback pr_id [str]  {Action a PR's un-actioned feedback into the owning review worktree.}
+            - pull-from-pr pr_id [str]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
             - (read-only-safe) show pr_id [str]  {Show one PR row.}
-            - submit selector [str] --alias [name] --combined --description [text] --position [integer] --title [text]  {Submit a PR/MR for one stacked branch or the combined worktree.}
+            - submit selector [str] --alias [name] --combined --description [text] --position [integer] --title [text] --use-worktree-branch-name  {Submit a PR/MR for one stacked branch or the combined worktree.}
             - update pr_id [str] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
         - rename selector [str] name [str]  {Rename a review.}
         - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [str]  {Show a single review's detail.}
         - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
         - stop-merge selector [str]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - sync-pr selector [str]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
+        - upstream  {Inspect/change a review's upstream branch.}
+            - (read-only-safe) list selector [str]  {List candidate upstream branches.}
+            - set selector [str] branch [str]  {Change the upstream branch.}
         - (read-only-safe) worktrees selector [str]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}
@@ -639,7 +642,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) status squad_id [str, optional] --concurrency  {Show squad status from the daemon.}
     - submit file [str...] --activate --hold --label [text] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
-        - edit selector [str] --name [name] --project [name]  {Edit a task node's name/project.}
+        - edit selector [str] --model [name] --name [name] --project [name]  {Edit a task node's name/project/model.}
         - restart-proof selector [str] --from [index]  {Restart a task's proof steps from an index onwards.}
         - set-status selector [str] state [str]  {Manually override a task's status.}
         - (read-only-safe) show selector [str]  {Show a single task node's detail.}

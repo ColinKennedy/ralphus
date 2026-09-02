@@ -99,8 +99,14 @@ impl ModelBackend for ClaudeCodeBackend {
             }
         }
 
-        let mut child = spawn(&program, compound, &base_args, workspace)
-            .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
+        let mut child = spawn(
+            &program,
+            compound,
+            &base_args,
+            workspace,
+            options.auto_compact_threshold,
+        )
+        .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
 
         // Human-readable header for the live tmux pane (RAL-102) -- everything
         // below this is Claude's own text/tool-call activity, not runner logging.
@@ -181,14 +187,18 @@ impl ModelBackend for ClaudeCodeBackend {
         )?))
     }
 
-    // `supports_context_limits` is deliberately left at the trait's default
-    // (`false`, `backend.rs:123`): the claude CLI's only related lever,
+    // `supports_maximum_context` is deliberately left at the trait's default
+    // (`false`): the claude CLI's only related lever,
     // `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, reserves output-generation budget out
     // of the same fixed context window rather than bounding the window
     // itself (`prompt_tokens + max_tokens <= context_window` is enforced
     // server-side), so raising it shrinks room for history instead of
     // capping it. There is no claude-code lever that does what
-    // `maximum_context`/`auto_compact_threshold` promise.
+    // `maximum_context` promises.
+
+    fn supports_auto_compact_threshold(&self) -> bool {
+        true
+    }
 }
 
 /// The `--resume <id>` / `--session-id <id>` argument pair for a claude-code
@@ -205,43 +215,67 @@ fn session_id_args(options: &RunOptions<'_>) -> Vec<String> {
     }
 }
 
+/// The env var Claude Code's own CLI reads to override its auto-compact
+/// trigger threshold, taking a plain absolute token count and precedence
+/// over the `/autocompact` command, the `--autocompact` flag, and the
+/// `autoCompactWindow` setting (code.claude.com/docs/en/model-config.md).
+/// This is the real delivery mechanism `RunOptions::auto_compact_threshold`
+/// maps onto for this backend (RAL-304).
+const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
 fn spawn(
     program: &str,
     compound: bool,
     args: &[String],
     workspace: &Workspace,
+    auto_compact_threshold: Option<u64>,
 ) -> std::io::Result<Child> {
     if compound {
         let shell = shellcmd::resolve_shell(None);
         let _ = shellcmd::detect_parent_shell(&Env::from_process()); // documents intent; resolve_shell already covers detection
         let line = shellcmd::build_compound_command_line(&shell, program, args);
         match shellcmd::shell_spawn_args(&shell, &line) {
-            SpawnArgs::RawShellLine(raw) => Command::new("cmd")
-                .arg("/C")
-                .arg(raw)
-                .current_dir(workspace.root())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn(),
+            SpawnArgs::RawShellLine(raw) => {
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/C")
+                    .arg(raw)
+                    .current_dir(workspace.root())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+                cmd.spawn()
+            }
             SpawnArgs::Argv(argv) => {
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
                 cmd.current_dir(workspace.root())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                    .stderr(Stdio::piped());
+                apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+                cmd.spawn()
             }
         }
     } else {
-        Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(workspace.root())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+        cmd.spawn()
+    }
+}
+
+/// Sets [`AUTO_COMPACT_WINDOW_ENV`] on `cmd` when `auto_compact_threshold` is
+/// set -- a no-op otherwise, mirroring the trigger already used by
+/// `context_limit_args` (codex) and `apply_context_settings` (pi) for the
+/// same `RunOptions::auto_compact_threshold` field.
+fn apply_auto_compact_env(cmd: &mut Command, auto_compact_threshold: Option<u64>) {
+    if let Some(v) = auto_compact_threshold {
+        cmd.env(AUTO_COMPACT_WINDOW_ENV, v.to_string());
     }
 }
 
@@ -764,6 +798,30 @@ mod tests {
     #[test]
     fn tail_keeps_trailing_text() {
         assert_eq!(tail(&"x".repeat(10), 3), "xxx");
+    }
+
+    // ── auto-compact env delivery (RAL-304) ────────────────────────────────
+
+    #[test]
+    fn apply_auto_compact_env_sets_the_var_when_threshold_is_some() {
+        let mut cmd = Command::new("echo");
+        apply_auto_compact_env(&mut cmd, Some(80_000));
+        let val = cmd
+            .get_envs()
+            .find(|(k, _)| *k == AUTO_COMPACT_WINDOW_ENV)
+            .and_then(|(_, v)| v);
+        assert_eq!(val, Some(std::ffi::OsStr::new("80000")));
+    }
+
+    #[test]
+    fn apply_auto_compact_env_is_a_noop_when_threshold_is_none() {
+        let mut cmd = Command::new("echo");
+        apply_auto_compact_env(&mut cmd, None);
+        assert!(
+            cmd.get_envs()
+                .find(|(k, _)| *k == AUTO_COMPACT_WINDOW_ENV)
+                .is_none()
+        );
     }
 
     // ── format_tool_input truncation length (RAL-303) ─────────────────────

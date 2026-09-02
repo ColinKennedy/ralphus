@@ -42,7 +42,7 @@ branch order relates to task dependencies.
 ## The board
 
 Everything above is visible on one live web board, polling the daemon every
-couple of seconds. It has eight tabs:
+couple of seconds. It has nine tabs:
 
 | Tab | What it's for |
 |---|---|
@@ -54,3 +54,4 @@ couple of seconds. It has eight tabs:
 | [Projects](views/projects.md) | Registered git repositories a task's cell `cwd` can materialize a worktree under. |
 | [Machines](views/machines.md) | Registered providers that remote tasks, cells, and proof steps run on. |
 | [Users](views/users.md) | Placeholder identities a request can attribute itself to (not authentication). |
+| [Secrets](views/secrets.md) | Env-var names whose resolved values get scrubbed from pane text and terminal logs. |

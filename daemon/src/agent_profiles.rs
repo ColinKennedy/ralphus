@@ -376,25 +376,39 @@ fn validate_task_file_profiles_with(
             // RESERVED_AGENT_NAMES agent; check the resolved backend here.
             // Either field cascades from the task, so both are checked at
             // their effective (cell-or-task) value, not just the cell's own.
+            // The two fields are checked independently, not as a pair --
+            // claude-code accepts auto_compact_threshold but not
+            // maximum_context (see `agent_supports_auto_compact_threshold`'s
+            // doc comment for why).
             let has_maximum_context =
                 cell.maximum_context.is_some() || task.maximum_context.is_some();
             let has_auto_compact_threshold =
                 cell.auto_compact_threshold.is_some() || task.auto_compact_threshold.is_some();
             if selection.custom_profile
-                && (has_maximum_context || has_auto_compact_threshold)
+                && has_maximum_context
                 && !ralphus_core::schema::agent_supports_maximum_context(&selection.backend)
             {
-                let key = if has_maximum_context {
-                    "maximum_context"
-                } else {
-                    "auto_compact_threshold"
-                };
                 errors.push(ValidationError {
-                    path: format!("task[{task_idx}].cell[{cell_idx}].{key}"),
+                    path: format!("task[{task_idx}].cell[{cell_idx}].maximum_context"),
                     kind: ErrorKind::InvalidValue,
                     message: format!(
                         "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
-                         support maximum_context/auto_compact_threshold (only codex and pi \
+                         support maximum_context (only codex and pi backends do)",
+                        selection.backend
+                    ),
+                    line: None,
+                });
+            }
+            if selection.custom_profile
+                && has_auto_compact_threshold
+                && !ralphus_core::schema::agent_supports_auto_compact_threshold(&selection.backend)
+            {
+                errors.push(ValidationError {
+                    path: format!("task[{task_idx}].cell[{cell_idx}].auto_compact_threshold"),
+                    kind: ErrorKind::InvalidValue,
+                    message: format!(
+                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
+                         support auto_compact_threshold (only codex, pi, and claude-code \
                          backends do)",
                         selection.backend
                     ),
@@ -888,6 +902,63 @@ backend = "pi"
 
         assert!(
             errors.iter().all(|e| !e.path.contains("maximum_context")),
+            "{errors:?}"
+        );
+    }
+
+    fn task_file_with_agent_and_auto_compact_threshold(cwd: &Path, agent: &str) -> TaskFile {
+        let cwd = cwd.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\nauto_compact_threshold=80000\n"
+        );
+        toml::from_str(&src).expect("parse task file")
+    }
+
+    #[test]
+    fn validate_task_file_profiles_allows_auto_compact_threshold_for_claude_code_profile_backend() {
+        let project_root = tempdir("auto-compact-threshold-claude-code-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-claude]
+backend = "claude-code"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_auto_compact_threshold(&project_root, "custom-claude");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.path.contains("auto_compact_threshold")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_rejects_auto_compact_threshold_for_non_supporting_profile_backend()
+     {
+        let project_root = tempdir("auto-compact-threshold-ollama-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-ollama]
+backend = "ollama"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_auto_compact_threshold(&project_root, "custom-ollama");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.contains("auto_compact_threshold") && e.message.contains("ollama")),
             "{errors:?}"
         );
     }

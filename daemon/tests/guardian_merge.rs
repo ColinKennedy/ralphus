@@ -2,19 +2,24 @@
 //! stack, and a conflicting branch resolved by a (fake) agent that strips
 //! conflict markers.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
+use ralphus_daemon::cartographer::CartographerFilter;
 use ralphus_daemon::guardian::{GuardianCheck, MergeStatus};
 use ralphus_daemon::guardian_merge::{
     pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
     rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_feedback, run_merge,
     run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
+    stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
@@ -22,26 +27,6 @@ use ralphus_daemon::scheduler::Semaphore;
 use ralphus_daemon::server::{Daemon, route};
 use ralphus_daemon::store::{NodeState, Store};
 use ralphus_daemon::workspace::Workspace;
-
-fn git(root: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "ralphus")
-        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
-        .env("GIT_COMMITTER_NAME", "ralphus")
-        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
-        .env("GIT_EDITOR", "true")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 fn write(root: &Path, name: &str, content: &str) {
     std::fs::write(root.join(name), content).expect("write file");
@@ -218,22 +203,6 @@ impl Runner for NamedFeedbackRunner {
             ghost: None,
         }
     }
-}
-
-fn init_repo(root: &Path) {
-    git(root, &["init", "-b", "main"]);
-    // The guardian merge engine under test shells out through
-    // `GitVcs::exec_raw`, which (correctly, for real repos) never injects an
-    // identity -- so every one of these throwaway repos needs one in local
-    // config, not just on this file's own `git()` helper's per-invocation
-    // env vars, or a commit created deep inside conflict resolution/rebase
-    // fails identity checks on a CI runner with no global gitconfig. Also
-    // pin core.autocrlf off: a Windows runner's default of `true` would
-    // otherwise silently rewrite fixture file content on checkout/rebase,
-    // corrupting the exact-content assertions throughout this suite.
-    git(root, &["config", "user.name", "ralphus"]);
-    git(root, &["config", "user.email", "ralphus@example.com"]);
-    git(root, &["config", "core.autocrlf", "false"]);
 }
 
 fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String) {
@@ -440,10 +409,6 @@ fn rebase_command_progress_reads_synthetic_done_and_todo_files() {
 fn squash_collapses_multi_commit_branch_to_single_commit() {
     let root = temp_repo();
     init_repo(&root);
-    // Ensure the daemon's own squash commit has an author identity regardless of
-    // ambient git config.
-    git(&root, &["config", "user.email", "ralphus@example.com"]);
-    git(&root, &["config", "user.name", "ralphus"]);
     write(&root, "base.txt", "base\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "base"]);
@@ -506,8 +471,6 @@ fn squash_setting_is_per_project_independent() {
     let make_repo = |feature: &str, commits: &[(&str, &str)]| -> PathBuf {
         let root = temp_repo();
         init_repo(&root);
-        git(&root, &["config", "user.email", "ralphus@example.com"]);
-        git(&root, &["config", "user.name", "ralphus"]);
         write(&root, "base.txt", "base\n");
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "base"]);
@@ -938,6 +901,82 @@ fn failing_check_gate_fails_the_merge() {
     assert_eq!(view.status, "merge_failed");
     assert!(view.detail.unwrap_or_default().contains("check failed"));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-239: cancelling a review must not leave its check-gate subprocess
+// running against the worktree — before this, `run_commit_checks` blocked on
+// the command's own `Output` with no cancel polling, so a long-running check
+// (`cargo test`, `npm run build`) kept executing to completion regardless of
+// how quickly the DB flipped to `cancelled`.
+#[test]
+fn cancelling_a_review_kills_an_in_flight_check_gate_command() {
+    let (root, store, id) = single_feature_repo();
+
+    let marker_dir = temp_repo();
+    let started = marker_dir.join("started.txt");
+    let started_str = started.to_string_lossy().to_string();
+
+    // A check gate that announces it started, then sleeps far longer than
+    // this test's cancellation budget below -- if cancel doesn't actually
+    // kill the subprocess, the merge worker stays "active" for the whole
+    // sleep instead of stopping within the tight budget.
+    let check_cmd = if cfg!(windows) {
+        format!("echo x > {started_str} & ping -n 21 127.0.0.1 >NUL")
+    } else {
+        format!("touch {started_str}; sleep 20")
+    };
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_checks(&id, &[check_cmd])
+        .unwrap();
+
+    let cancellations = Cancellations::new();
+    let sem = Arc::new(Semaphore::new(4));
+    let runner: Arc<dyn Runner> = Arc::new(NoopRunner);
+
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+        cancellations.clone(),
+    );
+    assert_eq!(reply.status, 202);
+
+    for _ in 0..2000 {
+        if started.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(started.exists(), "check gate command never started");
+
+    // Cancel the review exactly the way the `review cancel` HTTP handler does.
+    stop_merge_worker_for_cancel(&cancellations, &id);
+    store.lock().unwrap().cancel_guardian(&id).unwrap();
+
+    // The worker must stop well within the ~20s the check gate would
+    // otherwise keep sleeping for -- a generous but bounded budget so this
+    // test fails fast (rather than hanging ~20s) if cancellation regresses.
+    let key = format!("guardian:{id}");
+    for _ in 0..600 {
+        if !cancellations.is_active(&key) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !cancellations.is_active(&key),
+        "merge worker kept running the check-gate command well past the cancel"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "cancelled"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&marker_dir);
 }
 
 // RAL-101: a review with no `checks` configured (and not opted out) still gets
@@ -1442,6 +1481,73 @@ fn base_branch_shift_triggers_rebuild() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Shared-worktree reviews cannot preserve a per-branch staged prefix. A base
+// shift entering through `run_merge_staged` must therefore take its documented
+// all-or-nothing fallback rather than executing the staged engine.
+#[test]
+fn base_shift_for_skip_worktrees_uses_cancellable_fallback() {
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_skip_worktrees(&id, true)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+
+    let event_counts = || {
+        let page = store
+            .lock()
+            .unwrap()
+            .cartographer_query(&CartographerFilter {
+                guardian_id: Some(id.clone()),
+                limit: 100,
+                ..CartographerFilter::default()
+            })
+            .unwrap();
+        (
+            page.rows
+                .iter()
+                .filter(|row| row.message == "merge executing")
+                .count(),
+            page.rows
+                .iter()
+                .filter(|row| row.message == "staged merge executing")
+                .count(),
+        )
+    };
+    let before = event_counts();
+
+    git(&root, &["checkout", "main"]);
+    write(&root, "base-shift.txt", "new base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base shifts"]);
+
+    let sem = Semaphore::new(4);
+    assert!(rebuild_on_base_shift(
+        &store,
+        &NoopRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let after = event_counts();
+    assert_eq!(after.0, before.0 + 1, "legacy fallback must execute once");
+    assert_eq!(
+        after.1, before.1,
+        "shared-worktree fallback must return before staged execution"
+    );
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(
+        Path::new(view.combined_worktree.as_deref().expect("combined"))
+            .join("base-shift.txt")
+            .exists(),
+        "fallback rebuild includes the shifted base"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // RAL-300: when the base branch's shift IS the review's own work landing (a
 // fast-forward merge that happened outside any tracked PR), the base
 // shift is not new upstream work to rebase onto -- it must approve the
@@ -1690,14 +1796,12 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Lever 2 (carry-forward) regression: once a review branch's conflict is resolved,
-// a LATER base shift must NOT re-run the resolver for the same conflict — even with
-// git rerere OFF. The prior resolved commit is replayed onto the new base. This
-// simulates the exact reported scenario: a task branch that goes out of date with
-// its upstream, is resolved once, then the upstream moves again and the resolution
-// must survive without any agent call. Pure git; the agent is only used for build 1.
+// A staged base-shift rebuild must match the full rebuild's resolved-conflict
+// end state without deleting a healthy linked worktree. The prior resolved
+// commit is replayed onto the new base even with rerere disabled, and the
+// resolver is only needed for the first build.
 #[test]
-fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
+fn staged_base_shift_preserves_prior_resolution_and_worktree() {
     let root = temp_repo();
     init_repo(&root);
     // Prove the point WITHOUT rerere: force it off so a passing test can only be
@@ -1728,9 +1832,14 @@ fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
         id
     };
 
-    // Build 1: rebasing feature/x onto the advanced base conflicts; the agent
-    // resolves it (StageDoneRunner strips markers, keeping both sides).
-    run_merge(&store, &StageDoneRunner, &id);
+    // Build 1 through the staged engine: rebasing feature/x onto the advanced
+    // base conflicts; the agent resolves it (StageDoneRunner strips markers,
+    // keeping both sides) and records the build signature used below.
+    let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    mark_ready(&store, &id, &branch_id);
+    run_merge_staged(&store, &StageDoneRunner, &id, &CancelToken::never());
     let v1 = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(v1.status, "in_review", "detail: {:?}", v1.detail);
     let x1 = v1
@@ -1749,6 +1858,9 @@ fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
         show1.contains('X') && show1.contains("MAIN2"),
         "both sides kept: {show1}"
     );
+    let worktree1 = PathBuf::from(x1.worktree.clone().expect("branch worktree"));
+    let sentinel = worktree1.join("keep-worktree-sentinel.tmp");
+    std::fs::write(&sentinel, "preserved\n").expect("write sentinel");
 
     // The base shifts AGAIN, in an unrelated file — no new conflict on conflict.txt.
     git(&root, &["checkout", "main"]);
@@ -1757,7 +1869,7 @@ fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
     git(&root, &["commit", "-m", "unrelated base move"]);
 
     // Build 2 via the auto-rebuild path, with a runner that MUST NOT be called.
-    // Carry-forward replays the already-resolved commit onto the new base, so the
+    // The staged replay carries the already-resolved commit onto the new base, so the
     // resolver agent is never invoked. If it regressed and re-derived from the
     // feature tip, the old conflict would resurface, NoopRunner would be called,
     // and the guardian would end merge_failed — caught by the assertion below.
@@ -1774,6 +1886,24 @@ fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
         v2.detail
     );
     let review2 = v2.review_branch.clone().expect("review branch");
+    let x2 = v2
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/x")
+        .unwrap();
+    assert_eq!(
+        x2.merge_status, "done",
+        "replaying the resolved commit onto an unrelated base shift is clean, matching the full rebuild"
+    );
+    assert_eq!(
+        x2.worktree.as_deref(),
+        Some(worktree1.to_string_lossy().as_ref()),
+        "base-shift rebuild must retain the branch worktree path"
+    );
+    assert!(
+        sentinel.exists(),
+        "an untracked sentinel proves cleanup did not delete and recreate the worktree"
+    );
     let show2 = git(&root, &["show", &format!("{review2}:conflict.txt")]);
     assert!(
         !show2.contains("<<<<<<<"),
@@ -1801,6 +1931,63 @@ fn base_shift_replays_prior_resolution_without_agent_or_rerere() {
     assert!(
         carry.trim().is_empty(),
         "carry-forward refs leaked: {carry}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// The all-or-nothing merge remains the parity baseline for a resolved conflict:
+// replaying its prior review tip across an unrelated base shift reaches the same
+// clean branch/guardian state and preserves the resolved file content.
+#[test]
+fn full_rebuild_preserves_prior_resolution_state() {
+    let root = temp_repo();
+    init_repo(&root);
+    git(&root, &["config", "rerere.enabled", "false"]);
+
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+    git(&root, &["checkout", "main"]);
+    write(&root, "conflict.txt", "line1\nMAIN2\nline3\n");
+    git(&root, &["commit", "-am", "main advances"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let guard = store.lock().unwrap();
+        let id = guard
+            .create_guardian("full rebuild parity", "main", root.to_str().unwrap())
+            .unwrap();
+        guard.add_guardian_branch(&id, "feature/x").unwrap();
+        id
+    };
+    run_merge(&store, &StageDoneRunner, &id);
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().branches[0].merge_status,
+        "conflict_resolved"
+    );
+
+    git(&root, &["checkout", "main"]);
+    write(&root, "unrelated.txt", "later\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "unrelated base move"]);
+    run_merge(&store, &NoopRunner, &id);
+
+    let rebuilt = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(rebuilt.status, "in_review", "detail: {:?}", rebuilt.detail);
+    assert_eq!(rebuilt.branches[0].merge_status, "done");
+    let review = rebuilt.review_branch.expect("review branch");
+    let resolved = git(&root, &["show", &format!("{review}:conflict.txt")]);
+    assert!(resolved.contains('X') && resolved.contains("MAIN2"));
+    assert!(!resolved.contains("<<<<<<<"));
+    assert!(
+        Path::new(rebuilt.combined_worktree.as_deref().expect("combined"))
+            .join("unrelated.txt")
+            .exists()
     );
 
     let _ = std::fs::remove_dir_all(&root);

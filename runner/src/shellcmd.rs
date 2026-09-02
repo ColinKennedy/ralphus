@@ -42,6 +42,16 @@ fn shell_prefix(shell: &str) -> &'static [&'static str] {
 const WINDOWS_DIRECT_EXEC_SUFFIXES: &[&str] = &[".exe", ".com", ".bat", ".cmd"];
 const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
+fn windows_suffixes(pathext: &str) -> Vec<String> {
+    let mut suffixes: Vec<String> = pathext
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    suffixes.push(String::new());
+    suffixes
+}
+
 fn shell_kind_from_exe(name: &str) -> Option<&'static str> {
     let cleaned = name.trim().trim_start_matches('-').to_lowercase();
     match cleaned.as_str() {
@@ -195,16 +205,16 @@ pub fn find_program(name: &str) -> Option<String> {
         directories.extend(std::env::split_paths(&path).map(|p| p.to_string_lossy().into_owned()));
     }
 
-    let mut suffixes = vec![String::new()];
-    if is_windows() {
+    let suffixes = if is_windows() {
+        // Windows shells resolve executable extensions before an extensionless
+        // file. npm packages commonly install both forms; choosing the
+        // extensionless POSIX shim can send an otherwise native launcher
+        // through an extra shell process and change its terminal behavior.
         let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string());
-        suffixes.extend(
-            pathext
-                .split(';')
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-        );
-    }
+        windows_suffixes(&pathext)
+    } else {
+        vec![String::new()]
+    };
 
     for dir in &directories {
         for suffix in &suffixes {
@@ -362,6 +372,13 @@ mod tests {
     fn build_compound_command_line_appends_quoted_args() {
         let line = build_compound_command_line("bash", "cd /foo && claude", &["a b".to_string()]);
         assert_eq!(line, "cd /foo && claude 'a b'");
+    }
+
+    #[test]
+    fn windows_launcher_extensions_are_tried_before_extensionless_shims() {
+        let suffixes = windows_suffixes(DEFAULT_PATHEXT);
+        assert_eq!(suffixes.last(), Some(&String::new()));
+        assert_eq!(suffixes.first().map(String::as_str), Some(".COM"));
     }
 
     #[test]

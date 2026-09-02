@@ -288,6 +288,12 @@ pub(crate) fn cell_upstream_display(
 
 /// One cell's contribution to a review.
 struct Membership {
+    /// The contributing cell's position, so the guardian this membership's
+    /// group resolves to (known only once the group is created, further
+    /// below) can be recorded back onto the exact cell row it came from
+    /// (RAL-314) rather than just its branch string.
+    task_idx: i64,
+    idx: i64,
     project: PathBuf,
     branch: String,
     upstream: String,
@@ -604,6 +610,8 @@ pub fn derive_reviews(
         let rv = review_map.get(rev_id).copied();
         let link_key = review_link_key(rev_id).map(str::to_string);
         memberships.push(Membership {
+            task_idx: crow.task_idx,
+            idx: crow.idx,
             project: project.clone(),
             branch: branch.clone(),
             upstream,
@@ -641,6 +649,14 @@ pub fn derive_reviews(
     // members -- no separate UI/query path needed. Matched by literal
     // worktree root, not mere project identity, so a sibling *linked*
     // worktree of the same repo (a different branch) does not cross-match.
+    // RAL-314: cells picked up here have no `Membership` of their own (they
+    // never declared a review), so the guardian each one belongs to isn't
+    // known until the group its matched branch ends up in is created, below.
+    // Keyed by branch since that's all `explicit_roots` records; a worktree
+    // checks out exactly one branch, so every implicit cell matching a given
+    // branch always belongs to the same guardian as the explicit member(s)
+    // that share it.
+    let mut implicit_cells_by_branch: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
     for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
         if rev_id_opt.is_some() {
             continue; // already handled explicitly above
@@ -656,6 +672,10 @@ pub fn derive_reviews(
             store
                 .set_cell_review_branch(squad_id, crow.task_idx, crow.idx, branch)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
+            implicit_cells_by_branch
+                .entry(branch.clone())
+                .or_default()
+                .push((crow.task_idx, crow.idx));
         }
     }
 
@@ -716,6 +736,7 @@ pub fn derive_reviews(
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Single-project: no need to tag branches with a project (they share git_root).
         add_new_branches(store, &gid, &[], &members, false)?;
+        record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
         created.push(gid);
     }
 
@@ -764,10 +785,41 @@ pub fn derive_reviews(
         // Freshly minted guardian: no branches attached yet. Tag each branch with
         // its project root (multi-project link group).
         add_new_branches(store, &gid, &[], &members, true)?;
+        record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
         created.push(gid);
     }
 
     Ok(created)
+}
+
+/// Stamp `gid` as the guardian a group's cells resolved to (RAL-314), both
+/// for the members whose own `review = "<<review:<id>>>"` declaration formed
+/// the group, and for any cell that implicitly joined it by sharing an
+/// explicit member's worktree (`implicit_cells_by_branch`, populated by the
+/// RAL-159 pass above `derive_reviews` runs before grouping). Called once
+/// per freshly created guardian, right after `add_new_branches` -- `gid` is
+/// only known at this point, which is why this can't happen alongside the
+/// earlier `set_cell_review_branch` calls.
+fn record_review_guardian(
+    store: &Store,
+    squad_id: &str,
+    gid: &str,
+    members: &[&Membership],
+    implicit_cells_by_branch: &BTreeMap<String, Vec<(i64, i64)>>,
+) -> std::result::Result<(), ReviewError> {
+    for m in members {
+        store
+            .set_cell_review_guardian(squad_id, m.task_idx, m.idx, gid)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        if let Some(implicit) = implicit_cells_by_branch.get(&m.branch) {
+            for &(task_idx, idx) in implicit {
+                store
+                    .set_cell_review_guardian(squad_id, task_idx, idx, gid)
+                    .map_err(|e| ReviewError::new(e.to_string()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Layered review config (global under per-project) may opt a project's reviews
@@ -1162,6 +1214,8 @@ mod tests {
 
     fn membership(maximum_budget_usd: Option<f64>) -> Membership {
         Membership {
+            task_idx: 0,
+            idx: 0,
             project: PathBuf::from("/repo"),
             branch: "feat".to_string(),
             upstream: "main".to_string(),
