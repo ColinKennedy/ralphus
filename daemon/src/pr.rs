@@ -1066,7 +1066,11 @@ fn resync_pr_bases_inner(
             branch.position,
             &base_branch_name,
         );
-        if new_base != pr.base_ref {
+        // A synchronous user-authored base change verifies every open member
+        // of the chain on the forge, including unchanged N-1 links. Besides
+        // satisfying the all-or-error request contract, this repairs a prior
+        // partial attempt whose local row was already updated.
+        if new_base != pr.base_ref || require_forge_success {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
@@ -2043,7 +2047,7 @@ pub fn check_and_apply_forge_reorder(
 
     let token = cancellations.register(&cancel_key);
     let _permit = sem.acquire();
-    guardian_merge::run_merge_cancellable(store, runner, id, &token);
+    guardian_merge::run_merge_staged(store, runner, id, &token);
     cancellations.remove(&cancel_key);
     true
 }
@@ -2238,6 +2242,7 @@ pub fn poll_pr_base_drift(
             &base_branch_name,
             &forge_base,
         ) else {
+            // ralphus[ignore-rlog-pair]: per-PR drift-detection detail; the batch summary in poll_pr_base_drift_once records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [pr] review {id} pr={} forge base '{forge_base}' matches neither a known \
@@ -2247,6 +2252,7 @@ pub fn poll_pr_base_drift(
             continue;
         };
         for skipped in skipped_branches {
+            // ralphus[ignore-rlog-pair]: per-PR drift-detection detail; the batch summary in poll_pr_base_drift_once records the structured workflow outcome
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} branch {} disabled -- forge-side base retarget on pr={} \
@@ -2261,6 +2267,7 @@ pub fn poll_pr_base_drift(
             );
         }
 
+        // ralphus[ignore-rlog-pair]: per-PR drift-detection detail; the batch summary in poll_pr_base_drift_once records the structured workflow outcome
         crate::rlog!(
             INFO,
             "ralphus [pr] review {id} pr={} base drifted on the forge: old={} new={forge_base}",

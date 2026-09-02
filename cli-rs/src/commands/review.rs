@@ -202,6 +202,9 @@ pub enum ReviewPrCommand {
     PullFeedback {
         pr_id: String,
     },
+    PullFromPr {
+        pr_id: String,
+    },
     UsageError(String),
 }
 
@@ -603,6 +606,10 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
         },
         Some("pull-feedback") => match scanner.remaining().into_iter().next() {
             Some(pr_id) => ReviewPrCommand::PullFeedback { pr_id },
+            None => ReviewPrCommand::UsageError("missing required <pr_id> argument".to_string()),
+        },
+        Some("pull-from-pr") => match scanner.remaining().into_iter().next() {
+            Some(pr_id) => ReviewPrCommand::PullFromPr { pr_id },
             None => ReviewPrCommand::UsageError("missing required <pr_id> argument".to_string()),
         },
         Some(other) => {
@@ -1616,6 +1623,13 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
             let result = client.pr_action_feedback(&pr_id)?;
             emit(opts, &result, |_| {
                 println!("pulling feedback for {pr_id}...")
+            });
+            Ok(())
+        }),
+        ReviewPrCommand::PullFromPr { pr_id } => run_and_report(opts, None, || {
+            let result = client.pr_pull_from_pr(&pr_id)?;
+            emit(opts, &result, |_| {
+                println!("pulling PR commits for {pr_id}...")
             });
             Ok(())
         }),
@@ -2872,6 +2886,14 @@ mod tests {
             parse(&v(&["pr", "pull-feedback", "pr-1"])),
             ReviewCommand::Pr(ReviewPrCommand::PullFeedback { .. })
         );
+    }
+
+    #[test]
+    fn parses_pr_pull_from_pr() {
+        assert!(matches!(
+            parse(&v(&["pr", "pull-from-pr", "pr-1"])),
+            ReviewCommand::Pr(ReviewPrCommand::PullFromPr { .. })
+        ));
     }
 
     #[test]

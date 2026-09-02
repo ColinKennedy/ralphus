@@ -126,9 +126,11 @@ pub struct RunnerSpec {
     /// no cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_context: Option<u64>,
-    /// Auto-compact trigger threshold in tokens (RAL-304). Same delivery
-    /// mechanism as [`Self::maximum_context`]. `None` means no explicit
-    /// threshold.
+    /// Auto-compact trigger threshold in tokens (RAL-304), delivered to the
+    /// backend via its own mechanism -- see
+    /// `ralphus_core::schema::agent_supports_auto_compact_threshold`.
+    /// Accepted by a wider set of backends than [`Self::maximum_context`].
+    /// `None` means no explicit threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_compact_threshold: Option<u64>,
     /// True when this spec is an `agent`-kind proof step rather than a

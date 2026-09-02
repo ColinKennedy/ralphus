@@ -357,6 +357,10 @@ pub fn run_loop(
     let mut last_prune = std::time::Instant::now();
     let mut last_terminal_log_prune = std::time::Instant::now();
     let mut last_forge_reorder_poll = std::time::Instant::now();
+    // Ark persists its per-project due times, so calling once at startup is
+    // cheap for projects whose configured interval has not elapsed.
+    crate::ark::periodic_sweep(&store, &cancellations, &sem);
+    let mut last_ark_check = std::time::Instant::now();
     // Recovery: restart merges that were interrupted by a daemon shutdown.
     // Guardians stuck in `merging` have no live background thread; reset them to
     // `collecting` so `claim_guardian_merge` can claim them again. Notably we do
@@ -412,6 +416,10 @@ pub fn run_loop(
         if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
             crate::guardian_merge::sweep_pending_summaries(&store, &sem);
             last_summary_sweep = std::time::Instant::now();
+        }
+        if last_ark_check.elapsed() >= Duration::from_secs(3600) {
+            crate::ark::periodic_sweep(&store, &cancellations, &sem);
+            last_ark_check = std::time::Instant::now();
         }
         if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();
@@ -1391,13 +1399,7 @@ fn execute_squad_inner(
         .cancelled_tasks(squad_id)
         .map(|t| !t.is_empty())
         .unwrap_or(false);
-    let squad_state = if !failed_tasks.is_empty() {
-        SquadState::Failed
-    } else if any_cancelled {
-        SquadState::Cancelled
-    } else {
-        SquadState::Done
-    };
+    let squad_state = Store::squad_terminal_state(!failed_tasks.is_empty(), any_cancelled);
     let _ = guard.set_squad_state(squad_id, squad_state);
     // Per-task review triggers fire from `run_task_finalizer` as each task
     // completes, so no squad-level sweep is needed here.

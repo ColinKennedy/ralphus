@@ -394,6 +394,7 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
         )?),
         ReviewPrCommand::Comments { pr_id } => Ok(client.pr_comments(&pr_id)?),
         ReviewPrCommand::PullFeedback { pr_id } => Ok(client.pr_action_feedback(&pr_id)?),
+        ReviewPrCommand::PullFromPr { pr_id } => Ok(client.pr_pull_from_pr(&pr_id)?),
     }
 }
 

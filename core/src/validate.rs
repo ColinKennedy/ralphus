@@ -563,7 +563,30 @@ fn validate_cells(
                 // A non-empty string (the two guarded arms above handled empty /
                 // non-string cases): check whether it's a worktree placeholder.
                 if let Some(s) = v.as_str() {
-                    if let Some(placeholder) = crate::schema::first_worktree_placeholder_in_text(s)
+                    if crate::schema::parse_worktree_placeholder(s).is_some() {
+                        // The whole value is a bare, unwrapped
+                        // "ralphus:new-worktree/<branch>..." placeholder. The
+                        // daemon's own resolver (schema::first_worktree_placeholder_in_text)
+                        // still accepts this shape for historical/already-submitted
+                        // data, but authors must use the wrapped "<<...>>" form --
+                        // it's the only form the tutor teaches, and it's the only
+                        // form that composes when the same marker needs to be
+                        // repeated inside another field (e.g. an `environment`
+                        // value reusing this cell's worktree path).
+                        has_placeholder = true;
+                        let line = ctx.key_line(header, "cwd");
+                        ctx.error(
+                            &format!("{path}.cwd"),
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "a \"ralphus:new-worktree/<branch>\" placeholder cwd must be \
+                                 wrapped in \"<<...>>\", e.g. \"<<{s}>>\""
+                            ),
+                            line,
+                        );
+                    } else if let Some(placeholder) = crate::schema::text_placeholders(s)
+                        .into_iter()
+                        .find(|body| crate::schema::parse_worktree_placeholder(body).is_some())
                     {
                         has_placeholder = true;
                         let line = ctx.key_line(header, "cwd");
@@ -914,9 +937,13 @@ fn check_system_prompt(
 }
 
 /// Enforce the context-window/auto-compact backend-support rule (RAL-304):
-/// `maximum_context` and `auto_compact_threshold` are only accepted for
-/// backends with a real delivery mechanism -- see
-/// [`agent_supports_maximum_context`](crate::schema::agent_supports_maximum_context).
+/// `maximum_context` and `auto_compact_threshold` are each only accepted for
+/// backends with a real delivery mechanism for that specific field -- see
+/// [`agent_supports_maximum_context`](crate::schema::agent_supports_maximum_context)
+/// and
+/// [`agent_supports_auto_compact_threshold`](crate::schema::agent_supports_auto_compact_threshold).
+/// The two fields are checked independently (not as a pair) since
+/// claude-code accepts `auto_compact_threshold` but not `maximum_context`.
 /// Mirrors [`check_system_prompt`]'s shape exactly, including the same
 /// `core`-can-only-classify-[`RESERVED_AGENT_NAMES`] deferral to the daemon
 /// for a custom `[agent.profiles.*]` entry.
@@ -938,22 +965,31 @@ fn check_maximum_context(
         .and_then(toml::Value::as_str)
         .or(task_agent)
         .unwrap_or(crate::schema::DEFAULT_AGENT);
-    if crate::schema::RESERVED_AGENT_NAMES.contains(&agent)
-        && !crate::schema::agent_supports_maximum_context(agent)
-    {
-        let key = if has_context {
-            "maximum_context"
-        } else {
-            "auto_compact_threshold"
-        };
-        let line = ctx.key_line(header, key);
+    if !crate::schema::RESERVED_AGENT_NAMES.contains(&agent) {
+        return;
+    }
+
+    if has_context && !crate::schema::agent_supports_maximum_context(agent) {
+        let line = ctx.key_line(header, "maximum_context");
         ctx.error(
-            &format!("{path}.{key}"),
+            &format!("{path}.maximum_context"),
             ErrorKind::InvalidValue,
             format!(
-                "'maximum_context'/'auto_compact_threshold' are only supported for the \
-                 'codex'/'pi' agents right now, not '{agent}'. Remove this setting, or switch \
-                 to one of those agents."
+                "'maximum_context' is only supported for the 'codex'/'pi' agents right now, \
+                 not '{agent}'. Remove this setting, or switch to one of those agents."
+            ),
+            line,
+        );
+    }
+    if has_threshold && !crate::schema::agent_supports_auto_compact_threshold(agent) {
+        let line = ctx.key_line(header, "auto_compact_threshold");
+        ctx.error(
+            &format!("{path}.auto_compact_threshold"),
+            ErrorKind::InvalidValue,
+            format!(
+                "'auto_compact_threshold' is only supported for the 'codex'/'pi'/'claude-code' \
+                 agents right now, not '{agent}'. Remove this setting, or switch to one of \
+                 those agents."
             ),
             line,
         );
@@ -1723,7 +1759,7 @@ command = "cargo build"
 
     #[test]
     fn placeholder_cwd_rejects_an_unknown_sentinel_with_an_actionable_message() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=<<wat>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=<<wat>>>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         let e = r
             .errors
@@ -2257,6 +2293,26 @@ command = "cargo build"
     #[test]
     fn maximum_context_rejected_for_claude_code() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nmaximum_context=100000\nauto_compact_threshold=80000\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.path.contains("maximum_context")
+                && e.message.contains("claude-code")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn auto_compact_threshold_valid_for_claude_code_alone() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nauto_compact_threshold=80000\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn maximum_context_still_rejected_for_claude_code_even_when_auto_compact_threshold_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nmaximum_context=100000\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
@@ -2872,14 +2928,25 @@ command = "cargo build"
     // ── worktree placeholder cwd (RAL-100) ────────────────────────────────────
 
     #[test]
-    fn placeholder_cwd_with_project_is_valid() {
+    fn bare_unwrapped_placeholder_cwd_is_rejected() {
         let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
-        assert!(r.is_ok(), "{:?}", r.errors);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("must be wrapped in \"<<...>>\"")
+                && e.message
+                    .contains("<<ralphus:new-worktree/feat?upstream=main>>")),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]
-    fn placeholder_cwd_without_project_is_rejected() {
+    fn bare_unwrapped_placeholder_cwd_still_requires_project() {
+        // Even though the bare form is itself rejected, it must still count as
+        // "uses a placeholder" for the task-level `project` requirement -- an
+        // author fixing the wrap error shouldn't then hit a second,
+        // out-of-order surprise about `project`.
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
@@ -2892,8 +2959,28 @@ command = "cargo build"
     }
 
     #[test]
+    fn placeholder_cwd_with_project_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn placeholder_cwd_without_project_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
+                && e.message.contains("project")
+                && e.message.contains("placeholder")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn placeholder_cwd_without_upstream_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2906,7 +2993,7 @@ command = "cargo build"
 
     #[test]
     fn placeholder_cwd_with_empty_upstream_value_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2919,7 +3006,7 @@ command = "cargo build"
 
     #[test]
     fn placeholder_cwd_with_remote_qualified_upstream_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/origin/feature/x?upstream=origin/blah\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }

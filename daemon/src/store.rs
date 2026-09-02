@@ -277,6 +277,19 @@ pub struct CellView {
     /// (RAL-161).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_budget_usd: Option<f64>,
+    /// Resolved context-window token limit (cell overrides task), or `None`
+    /// for no cap (RAL-304). See
+    /// `ralphus_core::schema::agent_supports_maximum_context` for which
+    /// backends accept this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_context: Option<i64>,
+    /// Resolved auto-compact trigger threshold in tokens (cell overrides
+    /// task), or `None` for no explicit threshold (RAL-304). See
+    /// `ralphus_core::schema::agent_supports_auto_compact_threshold` for
+    /// which backends accept this -- a wider set than
+    /// [`Self::maximum_context`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_compact_threshold: Option<i64>,
     /// Failure detail, when the cell failed.
     pub error: Option<String>,
     /// Dependency references (within-task cell ids or `task/cell`).
@@ -1064,6 +1077,18 @@ impl Store {
                 drained_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (message_id, client_id)
             );
+            -- Ark escalation dedup is entity-scoped and durable. Mailbox
+            -- drain state is client-scoped and cannot provide this guarantee.
+            CREATE TABLE IF NOT EXISTS ark_notifications (
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                notified_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (entity_kind, entity_id)
+            );
+            CREATE TABLE IF NOT EXISTS ark_sweeps (
+                project_path TEXT PRIMARY KEY,
+                swept_at_ms INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_mailbox_drains_client ON mailbox_drains(client_id);
             ",
         )?;
@@ -1285,6 +1310,18 @@ impl Store {
             // file) -- see `ralphus_core::schema::agent_supports_maximum_context`.
             "ALTER TABLE cells ADD COLUMN maximum_context INTEGER",
             "ALTER TABLE cells ADD COLUMN auto_compact_threshold INTEGER",
+            // RAL-314: the exact guardian a review-opted-in cell's membership
+            // resolved to at submit time, set alongside `review_branch` by
+            // `reviews::derive_reviews`. Read paths prefer this direct link
+            // over the `cells.review_branch = guardian_branches.branch`
+            // string join, which conflates unrelated guardians that happen to
+            // share a branch name (e.g. repeat submissions against the same
+            // worktree). NULL for a cell created before this column existed,
+            // or one whose review linkage came from the manual
+            // `POST /api/guardians/{id}/branches` attach path rather than
+            // submission-time derivation -- both cases still need the
+            // branch-string join as a fallback.
+            "ALTER TABLE cells ADD COLUMN review_guardian_id TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1534,6 +1571,13 @@ impl Store {
         // created before the `review_branch` column existed.
         let _ = self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cells_review_branch ON cells(review_branch)",
+            [],
+        );
+        // RAL-314: same reasoning as `idx_cells_review_branch` above, for the
+        // direct guardian-id join `reviews_by_branch`/`collecting_guardians_for_cells`
+        // now prefer over the branch-string join.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cells_review_guardian_id ON cells(review_guardian_id)",
             [],
         );
         // RAL-122: enforce branch-id uniqueness at the DB layer (not just via
@@ -2727,20 +2771,20 @@ impl Store {
     fn cells_by_task(
         &self,
         squad_id: &str,
-        review_by_branch: &HashMap<String, Vec<SquadReviewRef>>,
+        review_by_branch: &HashMap<(i64, i64), Vec<SquadReviewRef>>,
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
                 let task_idx: i64 = r.get(0)?;
                 let idx: i64 = r.get(1)?;
-                let review_branch: Option<String> = r.get(16)?;
-                let reviews = review_branch
-                    .and_then(|b| review_by_branch.get(&b).cloned())
+                let reviews = review_by_branch
+                    .get(&(task_idx, idx))
+                    .cloned()
                     .unwrap_or_default();
                 Ok((
                     task_idx,
@@ -2771,6 +2815,8 @@ impl Store {
                         env_out_of_date: r.get::<_, bool>(23)?,
                         machine: r.get::<_, Option<String>>(24)?,
                         detached_at_ms: r.get::<_, Option<i64>>(25)?,
+                        maximum_context: r.get::<_, Option<i64>>(26)?,
+                        auto_compact_threshold: r.get::<_, Option<i64>>(27)?,
                     },
                 ))
             })?
@@ -2787,42 +2833,84 @@ impl Store {
         Ok(map)
     }
 
-    /// Map each of this squad's cell branches back to the reviews containing
-    /// it, so a cell can list the reviews its branch participates in
-    /// (RAL-17). Joins on `cells.review_branch = guardian_branches.branch`
-    /// rather than filtering guardians by `guardians.squad_id`, because a
-    /// guardian can be *found* (not created) by a later submission that shares
-    /// a `ralphus:new-review/<key>` link or was attached to manually — its
-    /// `squad_id` then still points at whichever squad created it, even though a
-    /// different squad's cell branch was appended to it (see
-    /// `collecting_guardians_for_cells`, which needs the same join).
-    fn reviews_by_branch(&self, squad_id: &str) -> Result<HashMap<String, Vec<SquadReviewRef>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT gb.branch, g.id, g.name, g.status
-             FROM guardian_branches gb
-             JOIN guardians g ON g.id = gb.guardian_id
-             JOIN cells s ON s.review_branch = gb.branch
-             WHERE s.squad_id = ?
-             ORDER BY g.created_at_ms, g.id",
+    /// Map each of this squad's cells back to the reviews it contributes to,
+    /// so a cell can list the reviews its branch participates in (RAL-17).
+    ///
+    /// A cell whose `review_guardian_id` is set (RAL-314: recorded at submit
+    /// time by `reviews::derive_reviews` -> `Store::set_cell_review_guardian`,
+    /// alongside `review_branch`) resolves directly to that guardian --
+    /// this is what keeps two unrelated squads' cells from being conflated
+    /// just because their submissions happened to record the identical
+    /// branch *string* (e.g. repeat submissions against the same worktree,
+    /// which always mint a fresh guardian per submission but reuse the
+    /// worktree's currently-checked-out branch name).
+    ///
+    /// A cell with no `review_guardian_id` (a pre-RAL-314 row, or one whose
+    /// review linkage came from the manual
+    /// `POST /api/guardians/{id}/branches` attach path, which has no
+    /// submission-time cell membership to record one against) falls back to
+    /// the old `cells.review_branch = guardian_branches.branch` string join.
+    /// This is also what lets a guardian *found* (not created) by a later
+    /// submission that shares a `ralphus:new-review/<key>` link keep
+    /// resolving correctly -- see `collecting_guardians_for_cells`, which
+    /// needs the same two-tier lookup.
+    fn reviews_by_branch(
+        &self,
+        squad_id: &str,
+    ) -> Result<HashMap<(i64, i64), Vec<SquadReviewRef>>> {
+        let mut map: HashMap<(i64, i64), Vec<SquadReviewRef>> = HashMap::new();
+
+        let mut direct_stmt = self.conn.prepare(
+            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch
+             FROM cells s
+             JOIN guardians g ON g.id = s.review_guardian_id
+             WHERE s.squad_id = ? AND s.review_guardian_id IS NOT NULL",
         )?;
-        let rows = stmt
+        let direct_rows = direct_stmt
             .query_map(params![squad_id], |r| {
-                let branch: String = r.get(0)?;
                 Ok((
-                    branch.clone(),
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
                     SquadReviewRef {
-                        id: r.get(1)?,
-                        name: r.get(2)?,
-                        status: r.get(3)?,
-                        branch: Some(branch),
+                        id: r.get(2)?,
+                        name: r.get(3)?,
+                        status: r.get(4)?,
+                        branch: r.get::<_, Option<String>>(5)?,
                     },
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut map: HashMap<String, Vec<SquadReviewRef>> = HashMap::new();
-        for (branch, rref) in rows {
-            map.entry(branch).or_default().push(rref);
+        for (task_idx, idx, rref) in direct_rows {
+            map.entry((task_idx, idx)).or_default().push(rref);
         }
+
+        let mut fallback_stmt = self.conn.prepare(
+            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch
+             FROM cells s
+             JOIN guardian_branches gb ON gb.branch = s.review_branch
+             JOIN guardians g ON g.id = gb.guardian_id
+             WHERE s.squad_id = ? AND s.review_guardian_id IS NULL
+                   AND s.review_branch IS NOT NULL
+             ORDER BY g.created_at_ms, g.id",
+        )?;
+        let fallback_rows = fallback_stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    SquadReviewRef {
+                        id: r.get(2)?,
+                        name: r.get(3)?,
+                        status: r.get(4)?,
+                        branch: r.get::<_, Option<String>>(5)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (task_idx, idx, rref) in fallback_rows {
+            map.entry((task_idx, idx)).or_default().push(rref);
+        }
+
         Ok(map)
     }
 
@@ -3537,8 +3625,10 @@ pub struct CellRow {
     /// mechanism -- see `ralphus_core::schema::agent_supports_maximum_context`.
     pub maximum_context: Option<i64>,
     /// Effective auto-compact trigger threshold in tokens (resolved from
-    /// cell/task), or `None` for no explicit threshold (RAL-304). Same
-    /// delivery mechanism as [`Self::maximum_context`].
+    /// cell/task), or `None` for no explicit threshold (RAL-304). Delivered
+    /// to the backend via its own mechanism -- see
+    /// `ralphus_core::schema::agent_supports_auto_compact_threshold`.
+    /// Accepted by a wider set of backends than [`Self::maximum_context`].
     pub auto_compact_threshold: Option<i64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this cell's branch onto the named dependency's
@@ -4921,6 +5011,73 @@ impl Store {
         Ok(rows)
     }
 
+    /// `Failed` > `Cancelled` > `Done` precedence for a squad's own terminal
+    /// state, given whether any of its tasks failed and whether any were left
+    /// cancelled. Shared by the scheduler's own end-of-dispatch aggregation
+    /// (`run_squad` in scheduler.rs) and [`Store::reconcile_squad_cancellation`]
+    /// (RAL-315's task-by-task cancellation path), so the two verdicts can
+    /// never drift apart.
+    #[must_use]
+    pub fn squad_terminal_state(any_failed: bool, any_cancelled: bool) -> SquadState {
+        if any_failed {
+            SquadState::Failed
+        } else if any_cancelled {
+            SquadState::Cancelled
+        } else {
+            SquadState::Done
+        }
+    }
+
+    /// After a task reaches `cancelled` outside the scheduler's own dispatch
+    /// loop (RAL-315: a direct `kind: "task"` cancel via `set_status`, or a
+    /// cell/proof-level "Stop" whose `apply_stop_cascade` cancels the owning
+    /// task), check whether the squad as a whole should now be reported
+    /// `cancelled` too — mirroring the aggregation the scheduler runs at the
+    /// tail of its own dispatch loop via [`Store::squad_terminal_state`], but
+    /// triggered from outside that loop. Trigger granularity matches
+    /// [`Store::cancelled_tasks`]: task state only, not raw cell/proof state.
+    ///
+    /// No-ops (leaving the squad's state untouched) unless all of the
+    /// following hold, so a real failure or a squad with work still in flight
+    /// is never overwritten:
+    /// - the squad is currently `running` (an edit that reset it to `pending`
+    ///   mid-flight must not be clobbered, matching the scheduler's own
+    ///   guard);
+    /// - every task has reached a terminal state (`done`/`failed`/
+    ///   `cancelled`);
+    /// - at least one task is `cancelled` (otherwise this is an ordinary
+    ///   completion, which the scheduler's own dispatch-loop tail already
+    ///   reports for squads it is actively running).
+    pub fn reconcile_squad_cancellation(&self, squad_id: &str) -> Result<()> {
+        if !matches!(self.squad_state(squad_id), Ok(SquadState::Running)) {
+            return Ok(());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state FROM tasks WHERE squad_id=?")?;
+        let states = stmt
+            .query_map(params![squad_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if states.is_empty() {
+            return Ok(());
+        }
+        let all_terminal = states
+            .iter()
+            .all(|s| NodeState::parse(s).is_some_and(NodeState::is_terminal));
+        if !all_terminal {
+            return Ok(());
+        }
+        let any_cancelled = states.iter().any(|s| s == "cancelled");
+        if !any_cancelled {
+            return Ok(());
+        }
+        let any_failed = states.iter().any(|s| s == "failed");
+        self.set_squad_state(
+            squad_id,
+            Self::squad_terminal_state(any_failed, any_cancelled),
+        )
+    }
+
     /// Compute everything [`Store::restart_squad`] would dirty, without mutating
     /// anything: every cell/task in the squad (a whole-squad restart resets all
     /// of them) plus every squad transitively dependent on it. Shared by the
@@ -5512,6 +5669,28 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET review_branch=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![branch, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Record the exact guardian a review cell's membership resolved to at
+    /// submit time (RAL-314), alongside [`Self::set_cell_review_branch`].
+    /// Read paths (`reviews_by_branch`, `collecting_guardians_for_cells`)
+    /// prefer this direct link over the branch-string join, which conflates
+    /// unrelated guardians that happen to share a branch name -- e.g. a
+    /// repeat submission against the same worktree/branch, which always
+    /// mints its own fresh guardian (see `reviews::derive_reviews`) but
+    /// records the same branch text as an earlier submission's guardian.
+    pub fn set_cell_review_guardian(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        guardian_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET review_guardian_id=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![guardian_id, squad_id, task_idx, idx],
         )?;
         Ok(())
     }
@@ -7276,6 +7455,32 @@ auto_compact_threshold = 40000
         let overrides = cells.iter().find(|c| c.cell_id == "overrides").unwrap();
         assert_eq!(overrides.maximum_context, Some(50_000));
         assert_eq!(overrides.auto_compact_threshold, Some(40_000));
+    }
+
+    #[test]
+    fn squad_view_carries_resolved_maximum_context_and_auto_compact_threshold() {
+        // The board's own `CellView` (what `GET /api/squads/{id}` and the
+        // details pane actually see) is built from a separate query
+        // (`cells_by_task`) than the scheduler-facing `CellRow` the test
+        // above exercises -- this proves the same resolved values reach the
+        // board payload too, not just the scheduler.
+        let src = r#"
+[[task]]
+name = "build"
+agent = "claude-code"
+auto_compact_threshold = 80000
+[[task.cell]]
+id = "inherits"
+cwd = "/repo"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        let cell = &squad.tasks[0].cells[0];
+        assert_eq!(cell.auto_compact_threshold, Some(80_000));
+        assert_eq!(cell.maximum_context, None);
     }
 
     #[test]
@@ -9154,6 +9359,79 @@ command = "y"
             store.cancelled_tasks(&squad).unwrap(),
             HashSet::from([1, 2]),
             "cancel_nonterminal_nodes flips tasks alongside cells"
+        );
+    }
+
+    #[test]
+    fn squad_terminal_state_precedence() {
+        assert_eq!(Store::squad_terminal_state(false, false), SquadState::Done);
+        assert_eq!(
+            Store::squad_terminal_state(false, true),
+            SquadState::Cancelled
+        );
+        assert_eq!(Store::squad_terminal_state(true, false), SquadState::Failed);
+        assert_eq!(Store::squad_terminal_state(true, true), SquadState::Failed);
+    }
+
+    /// RAL-315: cancelling a squad's tasks one at a time via `set_status`
+    /// (outside the scheduler's own dispatch loop) must still reach
+    /// `cancelled` once every task has landed there -- matching what a
+    /// whole-squad cancel or the scheduler's own end-of-dispatch aggregation
+    /// would report.
+    #[test]
+    fn reconcile_squad_cancellation_flips_squad_once_every_task_is_terminal() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_squad_state(&squad, SquadState::Running).unwrap();
+
+        store
+            .set_task_state(&squad, 0, NodeState::Cancelled)
+            .unwrap();
+        store.reconcile_squad_cancellation(&squad).unwrap();
+        assert_eq!(
+            store.squad_state(&squad).unwrap(),
+            SquadState::Running,
+            "a still-pending sibling task must block reconciliation"
+        );
+
+        store
+            .set_task_state(&squad, 1, NodeState::Cancelled)
+            .unwrap();
+        store.reconcile_squad_cancellation(&squad).unwrap();
+        assert_eq!(store.squad_state(&squad).unwrap(), SquadState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_squad_cancellation_lets_failed_task_win_over_cancelled() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_squad_state(&squad, SquadState::Running).unwrap();
+        store.set_task_state(&squad, 0, NodeState::Failed).unwrap();
+        store
+            .set_task_state(&squad, 1, NodeState::Cancelled)
+            .unwrap();
+
+        store.reconcile_squad_cancellation(&squad).unwrap();
+        assert_eq!(store.squad_state(&squad).unwrap(), SquadState::Failed);
+    }
+
+    #[test]
+    fn reconcile_squad_cancellation_is_a_noop_without_a_cancelled_task() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store.set_squad_state(&squad, SquadState::Running).unwrap();
+        store.set_task_state(&squad, 0, NodeState::Done).unwrap();
+
+        store.reconcile_squad_cancellation(&squad).unwrap();
+        assert_eq!(
+            store.squad_state(&squad).unwrap(),
+            SquadState::Running,
+            "an ordinary completion is the scheduler's own job to report, not this reconciliation"
         );
     }
 

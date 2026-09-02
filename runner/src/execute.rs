@@ -225,23 +225,36 @@ fn run_prompt_inner(
         Ok(backend) => backend,
         Err(e) => return CellResult::failed(e, ""),
     };
-    // RAL-304: defense in depth -- `core::validate`'s `agent_supports_maximum_context`
-    // gate already rejects this combination at submit time, so this should be
-    // unreachable in practice, but fail closed rather than silently ignoring
-    // the cap if it's ever reached (e.g. a spec built by something other than
-    // the daemon's own submit path).
-    if (spec.maximum_context.is_some() || spec.auto_compact_threshold.is_some())
-        && !backend.supports_context_limits()
-    {
-        return CellResult::failed(
-            format!(
-                "agent {:?} does not support maximum_context/auto_compact_threshold",
-                spec.agent
-            ),
-            "",
-        );
+    if let Err(e) = check_context_limit_support(spec, backend.as_ref()) {
+        return CellResult::failed(e, "");
     }
     run_with_backend(spec, original_prompt, workspace, backend.as_ref())
+}
+
+/// RAL-304: defense in depth -- `core::validate`'s
+/// `agent_supports_maximum_context`/`agent_supports_auto_compact_threshold`
+/// gates already reject these combinations at submit time, so this should be
+/// unreachable in practice, but fail closed rather than silently ignoring the
+/// cap if it's ever reached (e.g. a spec built by something other than the
+/// daemon's own submit path). Checked independently, not as a pair --
+/// claude-code supports `auto_compact_threshold` but not `maximum_context`.
+/// Split out from [`run_prompt_inner`] so it can be exercised against a stub
+/// [`ModelBackend`] in tests, the same reason [`run_with_backend`] is split
+/// out.
+fn check_context_limit_support(spec: &CellSpec, backend: &dyn ModelBackend) -> Result<(), String> {
+    if spec.maximum_context.is_some() && !backend.supports_maximum_context() {
+        return Err(format!(
+            "agent {:?} does not support maximum_context",
+            spec.agent
+        ));
+    }
+    if spec.auto_compact_threshold.is_some() && !backend.supports_auto_compact_threshold() {
+        return Err(format!(
+            "agent {:?} does not support auto_compact_threshold",
+            spec.agent
+        ));
+    }
+    Ok(())
 }
 
 /// The backend-agnostic half of [`run_prompt_inner`], split out so the
@@ -792,6 +805,76 @@ mod tests {
         assert!(!result.ok());
         let error = result.error.unwrap();
         assert!(error.contains("does not support nudging"), "{error}");
+    }
+
+    /// A minimal [`ModelBackend`] whose `supports_maximum_context`/
+    /// `supports_auto_compact_threshold` are independently toggleable, so
+    /// [`check_context_limit_support`]'s field-by-field gate can be exercised
+    /// without a real CLI subprocess. `run`/`nudge` are never called by these
+    /// tests -- the check fails closed before either would run.
+    struct LimitsStubBackend {
+        max_context: bool,
+        auto_compact: bool,
+    }
+
+    impl ModelBackend for LimitsStubBackend {
+        fn run(
+            &self,
+            _prompt: &str,
+            _workspace: &Workspace,
+            _options: &RunOptions<'_>,
+        ) -> Result<BackendOutcome, BackendError> {
+            unreachable!("check_context_limit_support tests never call run()")
+        }
+
+        fn supports_maximum_context(&self) -> bool {
+            self.max_context
+        }
+
+        fn supports_auto_compact_threshold(&self) -> bool {
+            self.auto_compact
+        }
+    }
+
+    #[test]
+    fn check_context_limit_support_rejects_maximum_context_when_unsupported() {
+        let mut spec = test_spec(false);
+        spec.maximum_context = Some(100_000);
+        let backend = LimitsStubBackend {
+            max_context: false,
+            auto_compact: false,
+        };
+        let err = check_context_limit_support(&spec, &backend).unwrap_err();
+        assert!(err.contains("does not support maximum_context"), "{err}");
+    }
+
+    #[test]
+    fn check_context_limit_support_rejects_auto_compact_threshold_when_unsupported() {
+        let mut spec = test_spec(false);
+        spec.auto_compact_threshold = Some(80_000);
+        let backend = LimitsStubBackend {
+            max_context: false,
+            auto_compact: false,
+        };
+        let err = check_context_limit_support(&spec, &backend).unwrap_err();
+        assert!(
+            err.contains("does not support auto_compact_threshold"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn check_context_limit_support_allows_auto_compact_threshold_without_maximum_context_support() {
+        // Mirrors the claude-code backend's real shape: it supports
+        // auto_compact_threshold but not maximum_context, and the two fields
+        // must be checked independently rather than as a pair.
+        let mut spec = test_spec(false);
+        spec.auto_compact_threshold = Some(80_000);
+        let backend = LimitsStubBackend {
+            max_context: false,
+            auto_compact: true,
+        };
+        assert!(check_context_limit_support(&spec, &backend).is_ok());
     }
 
     #[test]

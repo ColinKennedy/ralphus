@@ -57,6 +57,7 @@ or transport (see **channel**).
 |---|---|
 | **project** | A registered git repository (`ralphus project git`), referenced by name from a task's `project` field. Lets a cell's `cwd` be a placeholder instead of a hardcoded path. |
 | **worktree** | A git worktree — one checked-out branch. A cell works in one; a review builds its own per-branch ones. |
+| **Ark** | The daemon subsystem that detects old ralphus-owned git worktrees, escalates old reviews, and can explicitly reap eligible checkouts after proving their commits exist on a remote. Preserved local refs live under `refs/ralphus/ark/`. Automatic deletion is gated off. |
 | **placeholder** (cwd) | `ralphus:new-worktree/<branch>` — a `cwd` naming a branch rather than a path. Materialized (or provisioned remotely) before the cell runs. |
 | **placeholder** (review) | `ralphus:new-review/<key>` — a review id that mints a *fresh* review per submission. The key groups cells within one submission; it never attaches to a previous submission's review. A `[[task.cell]].review` reference to it (or to a plain existing `[[review]].id`) is always a **sentinel** (RAL-269): `<<ralphus:new-review/<key>>>` or `<<review:<id>>>`. |
 | **ralphus URI** | RAL-188's addressing scheme for any entity: `ralphus:/SQUAD[label]/TASK[name]/CELL[name]?id=…`. Distinct from both placeholders above despite sharing the `ralphus:` prefix. |
@@ -69,6 +70,19 @@ or transport (see **channel**).
 | **out of date** (env overrides) | RAL-271: a cosmetic, non-blocking badge on a task/cell/proof step whose own env overrides changed since it last ran/retried or had its status explicitly set. Purely informational — never invalidates a prior proof result. Not to be confused with `--drift` (PR/worktree divergence, RAL-190) or `--stale` (Live View pane liveness, RAL-170) — distinct concepts with their own colors, see `docs/colors.md`. |
 | **ticket** | RAL-222: a short-lived (30s), single-use nonce that gates `/api/events` (SSE) in place of the long-lived bearer token, since `EventSource` cannot set an `Authorization` header. Minted via `POST /api/events/ticket`, consumed on first use. Distinct from the informal use of "ticket" for a Jira issue (RAL-…) elsewhere in this repo's docs/commit messages — context disambiguates. |
 | **mailbox** | RAL-241: the cross-cutting escalation queue — a `mailbox_client` polls its unread `mailbox_messages` (`urgent`/`high`/`normal` priority) and drains them via `POST /api/mailbox/{client_id}/drain`. Broadcast-only in the poll-only scope: every message is visible to every registered client, with per-`(message_id, client_id)` read state in `mailbox_drains`. Distinct from a **ghost** (an advisory handoff note tied to one owner) — a mailbox message is a broadcast push about something needing attention, not a note left for whoever picks up dependent work next. |
+
+## User identity (placeholder, pre-RAL-252)
+
+There is no multi-user authentication in ralphus today. These names exist as
+a seam for RAL-252 to fill in — see `TODO: Replace with user auth once
+RAL-252 is done` comments at each one.
+
+| Term | Meaning |
+|---|---|
+| **user** | A registered placeholder identity (`crate::users`, `users` table): just a name, no password, no session, no permissions. Grants nothing on its own — a caller can claim any registered name. **Distinct from a licensing seat** — see **seat** above, which names a person on a host for `secure-dist` locking, not a request identity. |
+| **default_user** | The `[daemon]` config scalar (`.ralphus.toml`) naming which registered **user** a request is attributed to when it names none explicitly. |
+| **UserContext** | The type (`daemon/src/agent_access.rs`) carrying a request's claimed user identity (`id: Option<String>`) through `AgentAccess`. Not a verified identity. |
+| **AgentAccess** | The trait deciding which agents a `UserContext` may select (`GET /api/agents`). Only implementation today, `DefaultAgentAccess`, ignores the user and is permissive by design. |
 
 ## User identity (placeholder, pre-RAL-252)
 

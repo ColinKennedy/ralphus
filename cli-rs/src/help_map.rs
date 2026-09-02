@@ -194,6 +194,16 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "pull-from-pr",
+        &["pr_id [str]"],
+        &[],
+        "Pull a reviewer's commits pushed directly to the PR branch back into the owning review \
+worktree, resolving conflicts and restacking downstream branches (RAL-190).",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "show",
         &["pr_id [str]"],
         &[],

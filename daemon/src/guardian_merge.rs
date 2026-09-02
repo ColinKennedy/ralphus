@@ -523,6 +523,35 @@ fn worktree_add_or_reset(
     wt: &Workspace,
     branch: &str,
 ) -> std::result::Result<(), String> {
+    worktree_add_or_reset_with_faults(root, rev, wt, branch, &mut NoRecoveryFaults)
+}
+
+trait RecoveryFaults {
+    fn checkout_error(&mut self) -> Option<String> {
+        None
+    }
+
+    fn remove_error(&mut self) -> Option<String> {
+        None
+    }
+}
+
+struct NoRecoveryFaults;
+
+impl RecoveryFaults for NoRecoveryFaults {}
+
+/// Test seam for the two transient failures involved in final worktree
+/// recovery. All non-injected VCS operations still use [`Workspace::git`].
+fn worktree_add_or_reset_with_faults<F>(
+    root: &Workspace,
+    rev: &str,
+    wt: &Workspace,
+    branch: &str,
+    faults: &mut F,
+) -> std::result::Result<(), String>
+where
+    F: RecoveryFaults,
+{
     let wt_str = wt.root().to_string_lossy().to_string();
 
     if !wt.root().exists() {
@@ -580,7 +609,10 @@ fn worktree_add_or_reset(
                  before resetting to '{branch}'"
             );
         }
-        if wt.git(&["checkout", "-f", "-B", rev, branch]).is_ok() {
+        let checkout = faults
+            .checkout_error()
+            .map_or_else(|| wt.git(&["checkout", "-f", "-B", rev, branch]), Err);
+        if checkout.is_ok() {
             return Ok(());
         }
     }
@@ -591,8 +623,15 @@ fn worktree_add_or_reset(
     // Remove any existing tracking entry for this path.
     // One `-f` handles dirty/untracked files; a second `-f` handles locked
     // worktrees (belt-and-suspenders after the explicit unlock above).
-    let _ = root.git(&["worktree", "remove", "-f", &wt_str]);
-    let _ = root.git(&["worktree", "remove", "-f", "-f", &wt_str]);
+    let remove = faults
+        .remove_error()
+        .map_or_else(|| root.git(&["worktree", "remove", "-f", &wt_str]), Err);
+    log_worktree_remove_attempt(&wt_str, 1, &remove);
+    let remove = faults.remove_error().map_or_else(
+        || root.git(&["worktree", "remove", "-f", "-f", &wt_str]),
+        Err,
+    );
+    log_worktree_remove_attempt(&wt_str, 2, &remove);
 
     // [State 4] Prune stale entries where a tracking path no longer exists on
     // disk, so that `git worktree add` does not reject the path as registered.
@@ -652,11 +691,18 @@ fn worktree_add_or_reset(
     // [State 5] Branch mismatch: `-B` resets to the correct starting point.
     // [State 6] Detached HEAD: `checkout` reattaches to a named branch.
     // `-f` discards local modifications.
-    match wt.git(&["checkout", "-f", "-B", rev, branch]) {
+    let checkout = faults
+        .checkout_error()
+        .map_or_else(|| wt.git(&["checkout", "-f", "-B", rev, branch]), Err);
+    match checkout {
         Ok(_) => Ok(()),
         Err(checkout_err) => {
             // Feature branch may be absent; wipe and regenerate.
             wt.remove_path(".", true);
+            // The preceding worktree removals may have failed transiently on
+            // Windows while the directory still existed. Now that it is gone,
+            // prune the leftover registration before trying to add it back.
+            let _ = root.git(&["worktree", "prune"]);
             if branch_exists(root, branch) {
                 root.git(&["worktree", "add", "-B", rev, &wt_str, branch])
                     .map(|_| ())
@@ -1986,6 +2032,7 @@ fn run_commit_checks(
     branch_id: &str,
     wt: &Workspace,
     branch: &str,
+    cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
     let (skip_auto_build, checks) = {
         let guard = store.lock().expect("poisoned");
@@ -2002,7 +2049,12 @@ fn run_commit_checks(
     // is worthless if it runs without the variables the code expects.
     let env = branch_env(store, id, branch_id);
     for cmd in &checks {
-        if !wt.run_command_with_env(cmd, &env).0 {
+        // RAL-239: a review cancelled while a check gate is running must not
+        // let the next queued check start against this worktree.
+        if cancel.is_cancelled() {
+            return Err("cancelled".to_string());
+        }
+        if !wt.run_command_with_env(cmd, &env, cancel).0 {
             return Err(format!("check failed after '{branch}': {cmd}"));
         }
     }
@@ -2215,13 +2267,13 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         {
             return;
         }
-        if let Err(e) = run_commit_checks(store, id, &ob.id, &wt_j, &ob.branch) {
+        if let Err(e) = run_commit_checks(store, id, &ob.id, &wt_j, &ob.branch, cancel) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
             return;
         }
         prev_ref = rev;
     }
-    match finalize_review(store, root, wt_base, id, &prev_ref) {
+    match finalize_review(store, root, wt_base, id, &prev_ref, cancel) {
         Ok(note) => {
             // RAL-208: request a change-summary regen -- a no-op unless the
             // enabled-branch set actually changed since the last one (a plain
@@ -2238,6 +2290,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
                 &base_sha,
                 &prev_ref,
                 Some(&wt_base.join("review")),
+                cancel,
             );
             // RAL-92: re-baseline every branch's review-branch tip now that the
             // stack has settled, so the restacked downstream branches are not
@@ -3062,14 +3115,35 @@ fn staged_build_signature(
             parts.push(format!("base:{proj}:{sha}"));
         }
     }
+    let branch_signature = staged_branch_signature(enabled_branches);
+    if !branch_signature.is_empty() {
+        parts.push(branch_signature);
+    }
+    parts.join("|")
+}
+
+/// The branch-config suffix of [`staged_build_signature`], kept separate so a
+/// pass can distinguish a base-only change from a reordered/added/removed
+/// branch set. Only a base-only rebuild may replay prior resolved review tips.
+fn staged_branch_signature(enabled_branches: &[crate::guardian::BranchView]) -> String {
     let mut ordered: Vec<&crate::guardian::BranchView> =
         enabled_branches.iter().filter(|b| b.enabled).collect();
     ordered.sort_by_key(|b| b.position);
-    for b in ordered {
-        let proj = b.project.clone().unwrap_or_default();
-        parts.push(format!("branch:{proj}:{}:{}", b.position, b.branch));
-    }
-    parts.join("|")
+    ordered
+        .into_iter()
+        .map(|b| {
+            let proj = b.project.clone().unwrap_or_default();
+            format!("branch:{proj}:{}:{}", b.position, b.branch)
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn signature_has_branch_config(signature: &str, branch_signature: &str) -> bool {
+    signature == branch_signature
+        || signature
+            .strip_suffix(branch_signature)
+            .is_some_and(|prefix| prefix.ends_with('|'))
 }
 
 /// One incremental pass: rebase the contiguous ready prefix of each project,
@@ -3146,6 +3220,7 @@ fn staged_merge_pass(
         .cloned()
         .collect();
     let current_sig = staged_build_signature(&project_order, &base_shas, &enabled_branches);
+    let branch_sig = staged_branch_signature(&enabled_branches);
     let stored_sig = store
         .lock()
         .expect("poisoned")
@@ -3156,6 +3231,11 @@ fn staged_merge_pass(
     // forces a rebuild of the previously-`Done` prefix so a stale tip is never
     // treated as valid.
     let resume = stored_sig.as_deref() == Some(current_sig.as_str());
+    let base_only_rebuild = !resume
+        && !branch_sig.is_empty()
+        && stored_sig
+            .as_deref()
+            .is_some_and(|sig| signature_has_branch_config(sig, &branch_sig));
 
     // Unambiguous last branch in the stack for `ProofScope::FinalBranch`.
     let final_id = final_branch_id(
@@ -3191,6 +3271,33 @@ fn staged_merge_pass(
         } else {
             (base_sha.clone(), 0usize)
         };
+        // A base-only signature change invalidates the prefix, but the existing
+        // review refs still contain any conflict resolutions from the prior
+        // build. Validate the complete old stack chain before using any of it;
+        // branch-config changes deliberately rebuild from feature tips instead.
+        let carry_chain = if base_only_rebuild {
+            let old_base = guardian.base_commits.get(proj).cloned().or_else(|| {
+                (proj == &guardian.git_root)
+                    .then(|| guardian.base_commit.clone())
+                    .flatten()
+            });
+            old_base.and_then(|mut old_upstream| {
+                let mut chain = Vec::with_capacity(proj_branches.len());
+                for bv in proj_branches {
+                    let rev = format!("guardian/{id}/wt-{}", bv.branch);
+                    let old_tip = root.git(&["rev-parse", "--verify", &rev]).ok()?;
+                    let old_tip = old_tip.trim().to_string();
+                    if !is_ancestor(&root, &old_upstream, &old_tip) {
+                        return None;
+                    }
+                    chain.push((old_tip.clone(), old_upstream));
+                    old_upstream = old_tip;
+                }
+                Some(chain)
+            })
+        } else {
+            None
+        };
         let short_names = branch_short_names(store, id, Some(proj.as_str()));
         let squash = guardian.squash_projects.iter().any(|p| p == proj);
         for (idx, bv) in proj_branches.iter().enumerate() {
@@ -3218,7 +3325,14 @@ fn staged_merge_pass(
             let rev = format!("guardian/{id}/wt-{}", bv.branch);
             let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
             let wt_str = wt.root().to_string_lossy().to_string();
-            if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &bv.branch) {
+            let (source_ref, upstream) = carry_chain
+                .as_ref()
+                .and_then(|chain| chain.get(idx))
+                .map_or_else(
+                    || (bv.branch.as_str(), base_sha.as_str()),
+                    |(old_tip, old_upstream)| (old_tip.as_str(), old_upstream.as_str()),
+                );
+            if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, source_ref) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
                 return StagedPassOutcome::Failed;
             }
@@ -3234,9 +3348,8 @@ fn staged_merge_pass(
             // stacks onto (base at the first build of a project, else the prior
             // branch's tip — preserved on resume, the last rebuilt branch on a
             // rebuild).
-            let upstream = base_sha.clone();
             if stack_pick(
-                store, runner, id, &bv.id, &bv.branch, &upstream, &prev_ref, &rev, &wt, squash,
+                store, runner, id, &bv.id, &bv.branch, upstream, &prev_ref, &rev, &wt, squash,
                 &gate, cancel,
             )
             .is_err()
@@ -3247,11 +3360,11 @@ fn staged_merge_pass(
             if cancel.is_cancelled() {
                 return StagedPassOutcome::Cancelled;
             }
-            if let Err(e) = run_commit_checks(store, id, &bv.id, &wt, &bv.branch) {
+            if let Err(e) = run_commit_checks(store, id, &bv.id, &wt, &bv.branch, cancel) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
                 return StagedPassOutcome::Failed;
             }
-            if note_if_branch_is_empty(store, id, &bv.id, &bv.branch, &root, &upstream) {
+            if note_if_branch_is_empty(store, id, &bv.id, &bv.branch, &root, upstream) {
                 fail_branch(
                     store,
                     id,
@@ -3396,6 +3509,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
                     &base_sha,
                     &prev_ref,
                     Some(&wt_base.join("review")),
+                    cancel,
                 );
             }
             Err(e) => {
@@ -3409,7 +3523,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         return;
     }
     let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        match final_checks(store, id, root, combined_str) {
+        match final_checks(store, id, root, combined_str, cancel) {
             Ok(n) => n,
             Err(e) => {
                 set_status(GuardianStatus::MergeFailed, Some(&e));
@@ -3802,7 +3916,7 @@ pub fn run_merge_cancellable(
                 log_merge_cancelled(store, id);
                 return;
             }
-            if let Err(e) = run_commit_checks(store, id, &ob.id, &wt, &ob.branch) {
+            if let Err(e) = run_commit_checks(store, id, &ob.id, &wt, &ob.branch, cancel) {
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
                 return;
             }
@@ -3845,6 +3959,7 @@ pub fn run_merge_cancellable(
                     &base_sha,
                     &prev_ref,
                     Some(&root.at(&combined_wt)),
+                    cancel,
                 );
             }
             Err(e) => {
@@ -3860,7 +3975,7 @@ pub fn run_merge_cancellable(
     }
     // Run final check gates against the last combined worktree (all-projects pass).
     let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        match final_checks(store, id, root, combined_str) {
+        match final_checks(store, id, root, combined_str, cancel) {
             Ok(n) => n,
             Err(e) => {
                 set_status(GuardianStatus::MergeFailed, Some(&e));
@@ -3998,7 +4113,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             log_merge_cancelled(store, id);
             return;
         }
-        if let Err(e) = run_commit_checks(store, id, &ob.id, &wt, &ob.branch) {
+        if let Err(e) = run_commit_checks(store, id, &ob.id, &wt, &ob.branch, cancel) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
             return;
         }
@@ -4013,7 +4128,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         let _ = guard.set_guardian_combined_worktree(id, &wt_str);
     }
     regenerate_readme(store, root);
-    match final_checks(store, id, root, &wt_str) {
+    match final_checks(store, id, root, &wt_str, cancel) {
         Ok(note) => {
             // RAL-208: the LLM change summary is no longer regenerated here on
             // every stack rebuild -- `run_merge` requests a (debounced) regen
@@ -4032,6 +4147,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 base_sha,
                 &combined_branch,
                 Some(&wt),
+                cancel,
             );
             // RAL-92: baseline the shared review branch's tip (all branches share
             // it here) so the daemon's own build is not read as a manual push.
@@ -4486,34 +4602,27 @@ pub fn run_feedback(
             id,
             Some(ob.id.as_str()) == final_branch_id.as_deref(),
         );
-        // RAL-213: reviewer feedback is a separate flow from a guardian-settings
-        // -triggered merge restart -- see `run_merge_cancellable`'s doc comment.
+        // RAL-213/RAL-239: this downstream re-stack is its own invocation, not
+        // the background merge worker `run_merge_cancellable` guards against
+        // racing -- but it still must honor an explicit review cancel, so it
+        // shares this feedback application's own live `cancel` token rather
+        // than a token that never trips.
         if stack_pick(
-            store,
-            runner,
-            id,
-            &ob.id,
-            &ob.branch,
-            &base_sha,
-            &prev_ref,
-            &rev,
-            &wt_j,
-            squash,
-            &gate,
-            &CancelToken::never(),
+            store, runner, id, &ob.id, &ob.branch, &base_sha, &prev_ref, &rev, &wt_j, squash,
+            &gate, cancel,
         )
         .is_err()
         {
             return outcome;
         }
-        if let Err(e) = run_commit_checks(store, id, &ob.id, &wt_j, &ob.branch) {
+        if let Err(e) = run_commit_checks(store, id, &ob.id, &wt_j, &ob.branch, cancel) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
             return outcome;
         }
         prev_ref = rev;
     }
 
-    match finalize_review(store, &root, &wt_base, id, &prev_ref) {
+    match finalize_review(store, &root, &wt_base, id, &prev_ref, cancel) {
         Ok(note) => {
             // RAL-208: request a change-summary regen -- a no-op unless the
             // enabled-branch set actually changed since the last one (a
@@ -4530,6 +4639,7 @@ pub fn run_feedback(
                 &base_sha,
                 &prev_ref,
                 Some(&wt_base.join("review")),
+                cancel,
             );
             // RAL-92: re-baseline after applying feedback so the new tips (the
             // edited branch and its restacked downstream) are the reference for
@@ -4827,9 +4937,9 @@ pub fn review_maintenance(
 /// moved on (e.g. to `in_review`) before the straggler's squad finished, nothing
 /// else ever revisits it. This periodic self-heal (called from
 /// [`review_maintenance`]) promotes the now-done branch to `ready` and, if the
-/// reopen claim wins, reruns [`run_merge`] from scratch — which rebuilds every
-/// enabled branch and so picks the straggler up with no per-branch
-/// special-casing. Returns whether a reopen actually happened.
+/// reopen claim wins, runs the staged merge so the completed prefix is reused
+/// and the newly-ready straggler is appended. Returns whether a reopen actually
+/// happened.
 pub fn reopen_straggler(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
@@ -4851,7 +4961,7 @@ pub fn reopen_straggler(
             "ralphus [guardian] review {id} reopened: straggler branch ready"
         );
         let _permit = sem.acquire();
-        run_merge_cancellable(store, runner, id, cancel);
+        run_merge_staged(store, runner, id, cancel);
     }
     claimed
 }
@@ -5241,7 +5351,7 @@ pub fn rebuild_on_base_shift(
     };
     if claimed {
         let _permit = sem.acquire();
-        run_merge_cancellable(store, runner, id, cancel);
+        run_merge_staged(store, runner, id, cancel);
         true
     } else {
         false
@@ -5344,9 +5454,10 @@ fn finalize_review(
     wt_base: &Workspace,
     id: &str,
     prev_ref: &str,
+    cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
     let combined_str = rebuild_combined(store, root, wt_base, id, prev_ref)?;
-    final_checks(store, id, root, &combined_str)
+    final_checks(store, id, root, &combined_str, cancel)
 }
 
 /// The URL a remote machine should clone a *project* from. This is the one
@@ -5370,6 +5481,7 @@ fn final_checks(
     id: &str,
     root: &Workspace,
     combined_str: &str,
+    cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
     let (skip_auto_build, checks, env) = {
         let guard = store.lock().expect("poisoned");
@@ -5392,7 +5504,16 @@ fn final_checks(
     }
     if !checks.is_empty() {
         for cmd in &checks {
-            if !root.at(combined_str).run_command_with_env(cmd, &env).0 {
+            // RAL-239: same reasoning as `run_commit_checks` -- don't start the
+            // next final check gate once the review has been cancelled.
+            if cancel.is_cancelled() {
+                return Err("cancelled".to_string());
+            }
+            if !root
+                .at(combined_str)
+                .run_command_with_env(cmd, &env, cancel)
+                .0
+            {
                 return Err(format!("check failed: {cmd}"));
             }
         }
@@ -5405,7 +5526,11 @@ fn final_checks(
     // inference next.
     match crate::config::resolve(root.root()).auto_build {
         Some(cmd) => {
-            if !root.at(combined_str).run_command_with_env(&cmd, &env).0 {
+            if !root
+                .at(combined_str)
+                .run_command_with_env(&cmd, &env, cancel)
+                .0
+            {
                 return Err(format!("auto-build failed: {cmd}"));
             }
             Ok(Some(format!("auto-built via project default: {cmd}")))
@@ -5902,14 +6027,6 @@ fn drive_rebase(
         .lock()
         .expect("poisoned")
         .clear_branch_started_at(id, branch_id);
-    // Remove untracked files before rebasing. `git rebase --onto <newbase>` fails
-    // with "untracked working tree files would be overwritten by checkout" when the
-    // worktree contains a file that is tracked in `newbase` but untracked here —
-    // a common leftover from a prior agent cell that didn't stage everything.
-    // This is especially likely on Windows where a CWD lock prevents
-    // `ensure_worktree` from deleting and recreating the directory cleanly.
-    let _ = wt.git(&["clean", "-fd"]);
-
     // `--empty=drop` discards commits already present on `newbase` (patch-equal),
     // which is exactly why rebase — not a range cherry-pick — is used here: a
     // shared or already-merged commit is dropped instead of halting the stack.
@@ -5922,7 +6039,24 @@ fn drive_rebase(
         base_sha,
         branch_arg,
     ];
-    match wt.git(&args) {
+    let mut result = wt.git(&args);
+    if matches!(&result, Err(e) if e.contains("untracked working tree files would be overwritten"))
+    {
+        // `git rebase --onto <newbase>` fails with exactly this message when the
+        // worktree contains a file that is tracked in `newbase` but untracked
+        // here -- a common leftover from a prior agent cell that didn't stage
+        // everything, especially likely on Windows where a CWD lock prevents
+        // `worktree_add_or_reset` from deleting and recreating the directory
+        // cleanly. Only reach for `git clean -fd` -- which wipes every
+        // untracked file, not just the blocking one -- as a retry after this
+        // specific failure, not unconditionally before every attempt: an
+        // unrelated untracked file (a still-in-progress build artifact, a
+        // resumable worktree's own bookkeeping) has no business being swept
+        // away by a rebase that would have succeeded without it.
+        let _ = wt.git(&["clean", "-fd"]);
+        result = wt.git(&args);
+    }
+    match result {
         Ok(_) => {
             // RAL-168: "each_branch" (without auto-clean-skip) or
             // "final_branch" (on the last branch) also proves a branch that
@@ -6328,6 +6462,17 @@ fn repair_missing_final_summary(store: &Arc<Mutex<Store>>, id: &str) {
         INFO,
         "ralphus [guardian] review {id} has no agent-authored change summary: recomputing"
     );
+    {
+        let guard = store.lock().expect("poisoned");
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                "review has no agent-authored change summary: recomputing",
+                serde_json::json!({}),
+            );
+    }
     recompute_preliminary_summary(store, id);
     queue_final_summary_regen(store, id);
 }
@@ -6799,6 +6944,7 @@ fn manual_commands_prompt(tail: &str, ask_build: bool) -> String {
 /// Returns `Some(note)` when an inferred build ran (or failed trying) so the
 /// caller can fold it into the `InReview` status detail alongside
 /// [`final_checks`]'s note; `None` otherwise.
+#[allow(clippy::too_many_arguments)]
 fn generate_manual_commands(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
@@ -6807,16 +6953,24 @@ fn generate_manual_commands(
     base_sha: &str,
     tip_ref: &str,
     worktree: Option<&Workspace>,
+    cancel: &CancelToken,
 ) -> Option<String> {
     // RAL-110: only attempt AI build inference/execution when nothing else
     // already covers finalize-time verification and there's a worktree to
     // build in — mirrors `final_checks`'s own precedence so the two never
     // double-build regardless of call-site ordering.
-    let (skip_auto_build, has_explicit_checks) = {
+    let (skip_auto_build, has_explicit_checks, build_env) = {
         let guard = store.lock().expect("poisoned");
         (
             guard.guardian_skip_auto_build(id).unwrap_or(false),
             !guard.guardian_checks(id).unwrap_or_default().is_empty(),
+            // RAL-313: same rationale as `final_checks`'s `env` fetch just
+            // above -- an AI-inferred build is worthless if it runs without
+            // the variables the combined worktree's branches were built with.
+            guard
+                .get_guardian(id)
+                .map(|g| g.build_env)
+                .unwrap_or_default(),
         )
     };
     let has_config_auto_build = crate::config::resolve(root.root()).auto_build.is_some();
@@ -6954,7 +7108,7 @@ fn generate_manual_commands(
         .lock()
         .expect("poisoned")
         .stamp_guardian_manual_checks_started_at(id);
-    let result = runner.run(&spec);
+    let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, None, "manual_commands", &result);
 
     stop.store(true, Ordering::Relaxed);
@@ -6986,7 +7140,7 @@ fn generate_manual_commands(
     }
     let cmd = build_command?;
     let wt = worktree?.clone();
-    let ok = wt.run_command(&cmd).0;
+    let ok = wt.run_command_with_env(&cmd, &build_env, cancel).0;
     let _ =
         store
             .lock()
@@ -7834,6 +7988,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn worktree_add_or_reset_prunes_after_final_checkout_failure() {
+        let (base, repo, _fwt) = make_repo("final-fallback-prune");
+        let rwt = base.join("rwt");
+        let root = Workspace::local(&repo);
+        let review_wt = Workspace::local(&rwt);
+        let rev = "guardian/g/wt-feature-a";
+
+        worktree_add_or_reset(&root, rev, &review_wt, "feature/a")
+            .expect("initial review worktree");
+        assert_on_branch(&rwt, rev);
+
+        #[derive(Default)]
+        struct FailCheckoutAndRemove {
+            checkout_failures: usize,
+            remove_failures: usize,
+        }
+
+        impl RecoveryFaults for FailCheckoutAndRemove {
+            fn checkout_error(&mut self) -> Option<String> {
+                self.checkout_failures += 1;
+                Some(format!(
+                    "injected checkout failure {}",
+                    self.checkout_failures
+                ))
+            }
+
+            fn remove_error(&mut self) -> Option<String> {
+                self.remove_failures += 1;
+                Some(format!(
+                    "injected transient worktree remove failure {}",
+                    self.remove_failures
+                ))
+            }
+        }
+
+        let mut faults = FailCheckoutAndRemove::default();
+        let result =
+            worktree_add_or_reset_with_faults(&root, rev, &review_wt, "feature/a", &mut faults);
+
+        assert!(result.is_ok(), "final fallback must recover: {result:?}");
+        assert_eq!(faults.checkout_failures, 2, "both checkout paths must fail");
+        assert_eq!(
+            faults.remove_failures, 2,
+            "both worktree removals must fail"
+        );
+        assert_on_branch(&rwt, rev);
+        let feature_head = git(&repo, &["rev-parse", "feature/a"])
+            .expect("feature head")
+            .trim()
+            .to_string();
+        let review_head = git(&repo, &["rev-parse", rev])
+            .expect("review head")
+            .trim()
+            .to_string();
+        assert_eq!(review_head, feature_head);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // -----------------------------------------------------------------------
     // Fail-state 7 — worktree locked externally
     // -----------------------------------------------------------------------
@@ -7951,6 +8165,47 @@ mod tests {
         std::fs::write(wt.join(".git"), "gitdir: /some/path\n").unwrap();
         assert!(is_valid_linked_worktree(&Workspace::local(&wt)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_short_names_are_stable_across_unchanged_store_reads() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = store
+            .lock()
+            .unwrap()
+            .create_guardian("r", "main", "/repo")
+            .unwrap();
+        for branch in [
+            "improve-wasd-alpha",
+            "improve-wasd-beta",
+            "improve-wasd-gamma",
+        ] {
+            store
+                .lock()
+                .unwrap()
+                .add_guardian_branch(&id, branch)
+                .unwrap();
+        }
+
+        let ordered = store.lock().unwrap().get_guardian(&id).unwrap().branches;
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|branch| branch.branch.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "improve-wasd-alpha",
+                "improve-wasd-beta",
+                "improve-wasd-gamma"
+            ]
+        );
+
+        let first = branch_short_names(&store, &id, Some("/repo"));
+        let second = branch_short_names(&store, &id, Some("/repo"));
+        assert_eq!(first, second);
+        assert_eq!(first["improve-wasd-alpha"], "improve-wasd");
+        assert_eq!(first["improve-wasd-beta"], "improve-wasd-2");
+        assert_eq!(first["improve-wasd-gamma"], "improve-wasd-3");
     }
 
     #[test]
@@ -9696,6 +9951,7 @@ mod tests {
             &id,
             &Workspace::local(&repo),
             &repo.to_string_lossy(),
+            &CancelToken::never(),
         );
         // The configured `exit 1` check gate fails the review.
         assert!(result.is_err());
@@ -9738,10 +9994,144 @@ mod tests {
             &id,
             &Workspace::local(&repo),
             &repo.to_string_lossy(),
+            &CancelToken::never(),
         );
         assert!(
             result.is_ok(),
             "check gate must see the build-env override: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RAL-203/RAL-313: `final_checks`'s project `auto_build` fallback
+    /// (RAL-101, taken when a review declares no explicit `checks`) shares
+    /// the same `env` fetch as the check-gates branch above -- confirm it
+    /// also runs under this review's own `build_env`.
+    #[test]
+    fn final_checks_runs_project_auto_build_under_this_reviews_build_env_override() {
+        let (base, repo, _fwt) = make_repo("finalchecks-autobuild-buildenv");
+        let build_cmd = if cfg!(windows) {
+            "if not \"%RAL313_AUTOBUILD_VAR%\"==\"expected\" exit 1"
+        } else {
+            "test \"$RAL313_AUTOBUILD_VAR\" = expected"
+        };
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!("[review]\nauto_build = {build_cmd:?}\n"),
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            let mut set = std::collections::BTreeMap::new();
+            set.insert("RAL313_AUTOBUILD_VAR".to_string(), "expected".to_string());
+            guard
+                .set_guardian_build_env_overrides(&id, &set, &[], &[])
+                .unwrap();
+            id
+        };
+
+        let result = final_checks(
+            &store,
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        );
+        assert!(
+            result.is_ok(),
+            "project auto_build must see the build-env override: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap()
+                .unwrap()
+                .contains("auto-built via project default"),
+            "expected the project-auto_build note"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A resolver-agent stand-in that returns a fixed manual-commands/
+    /// build-command JSON response instead of actually calling an LLM.
+    struct FixedManualCommandsRunner(String);
+    impl Runner for FixedManualCommandsRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                summary: self.0.clone(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    /// RAL-313: `generate_manual_commands`'s AI-inferred build command runs
+    /// against the combined worktree under this review's own `build_env`,
+    /// same as `final_checks`'s check gates/project `auto_build`
+    /// (`final_checks_runs_check_gates_under_this_reviews_build_env_override`
+    /// above) -- the inferred build command below fails unless the
+    /// overridden variable is actually present in its process environment.
+    #[test]
+    fn generate_manual_commands_runs_inferred_build_under_this_reviews_build_env_override() {
+        let (base, repo, fwt) = make_repo("manualcmds-buildenv");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let base_sha = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let build_cmd = if cfg!(windows) {
+            "if not \"%RAL313_BUILD_VAR%\"==\"expected\" exit 1"
+        } else {
+            "test \"$RAL313_BUILD_VAR\" = expected"
+        };
+
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            let mut set = std::collections::BTreeMap::new();
+            set.insert("RAL313_BUILD_VAR".to_string(), "expected".to_string());
+            guard
+                .set_guardian_build_env_overrides(&id, &set, &[], &[])
+                .unwrap();
+            id
+        };
+
+        let response = serde_json::json!({
+            "manual_commands": ["echo hi"],
+            "build_command": build_cmd,
+        })
+        .to_string();
+        let runner = FixedManualCommandsRunner(response);
+
+        let note = generate_manual_commands(
+            &store,
+            &runner,
+            &id,
+            &Workspace::local(&repo),
+            &base_sha,
+            "feature/a",
+            Some(&Workspace::local(&fwt)),
+            &CancelToken::never(),
+        );
+
+        assert_eq!(
+            note.as_deref(),
+            Some(format!("auto-built via inferred build command: {build_cmd}").as_str()),
+            "inferred build must see the build-env override"
         );
 
         let _ = std::fs::remove_dir_all(&base);

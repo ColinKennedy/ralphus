@@ -185,8 +185,12 @@ impl Workspace {
     /// command (`cargo test`, `npm run build`), not a VCS operation — the
     /// provider may well want to run the two very differently.
     #[must_use]
-    pub fn run_command(&self, command: &str) -> (bool, String) {
-        self.run_command_with_env(command, &std::collections::BTreeMap::new())
+    pub fn run_command(
+        &self,
+        command: &str,
+        cancel: &crate::cancel::CancelToken,
+    ) -> (bool, String) {
+        self.run_command_with_env(command, &std::collections::BTreeMap::new(), cancel)
     }
 
     /// Like [`Self::run_command`] but applies `env` on top of the daemon's own
@@ -196,12 +200,15 @@ impl Workspace {
     /// **Local workspaces only.** A remote workspace's
     /// [`crate::remote_runner::RunRequest`] has no env field, so `env` is
     /// ignored there rather than silently half-applied; a check gate on a
-    /// remote machine still runs exactly as it did before.
+    /// remote machine still runs exactly as it did before. `cancel` is
+    /// likewise local-only (RAL-239): a remote provider call has no polling
+    /// hook to kill mid-flight, so it blocks to completion same as before.
     #[must_use]
     pub fn run_command_with_env(
         &self,
         command: &str,
         env: &std::collections::BTreeMap<String, String>,
+        cancel: &crate::cancel::CancelToken,
     ) -> (bool, String) {
         match &self.machine {
             None => crate::proof::run_command_proof_capture(
@@ -209,6 +216,7 @@ impl Workspace {
                 command,
                 &opentelemetry::Context::new(),
                 env,
+                cancel,
             ),
             Some(_) => {
                 // Split on whitespace is wrong for a shell command, so the

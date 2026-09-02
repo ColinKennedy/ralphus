@@ -20,6 +20,80 @@ use chrono::{NaiveTime, Utc};
 use ralphus_core::cors::CorsConfig;
 use serde::{Deserialize, Serialize};
 
+/// Ark's worktree-retention policy. Durations are expressed in whole days so
+/// project configuration remains easy to audit.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ArkConfig {
+    #[serde(default = "default_ark_sweep_interval_days")]
+    pub sweep_interval_days: u64,
+    #[serde(default = "default_ark_stale_after_days")]
+    pub stale_after_days: u64,
+    #[serde(default = "default_ark_max_worktrees")]
+    pub max_worktrees: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ArkConfigLayer {
+    sweep_interval_days: Option<u64>,
+    stale_after_days: Option<u64>,
+    max_worktrees: Option<usize>,
+}
+
+impl ArkConfigLayer {
+    fn apply(self, base: ArkConfig) -> ArkConfig {
+        ArkConfig {
+            sweep_interval_days: self.sweep_interval_days.unwrap_or(base.sweep_interval_days),
+            stale_after_days: self.stale_after_days.unwrap_or(base.stale_after_days),
+            max_worktrees: self.max_worktrees.unwrap_or(base.max_worktrees),
+        }
+    }
+}
+
+const fn default_ark_sweep_interval_days() -> u64 {
+    1
+}
+const fn default_ark_stale_after_days() -> u64 {
+    90
+}
+const fn default_ark_max_worktrees() -> usize {
+    100
+}
+
+impl Default for ArkConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval_days: default_ark_sweep_interval_days(),
+            stale_after_days: default_ark_stale_after_days(),
+            max_worktrees: default_ark_max_worktrees(),
+        }
+    }
+}
+
+impl ArkConfig {
+    #[must_use]
+    pub fn sweep_interval(&self) -> Duration {
+        Duration::from_secs(self.sweep_interval_days.saturating_mul(86_400))
+    }
+
+    #[must_use]
+    pub fn stale_after_ms(&self) -> i64 {
+        i64::try_from(self.stale_after_days.saturating_mul(86_400_000)).unwrap_or(i64::MAX)
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.sweep_interval_days == 0 {
+            return Err("ark.sweep_interval_days must be greater than zero".to_string());
+        }
+        if self.stale_after_days == 0 {
+            return Err("ark.stale_after_days must be greater than zero".to_string());
+        }
+        if self.max_worktrees == 0 {
+            return Err("ark.max_worktrees must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Resolved review configuration (after layering global under per-project).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ReviewConfig {
@@ -946,6 +1020,8 @@ pub fn validate_new_task_default_tab(tab: &str) -> std::result::Result<(), Strin
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
+    ark: Option<ArkConfigLayer>,
+    #[serde(default)]
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
@@ -969,6 +1045,33 @@ struct ConfigFile {
     templates: Vec<TemplateDef>,
     #[serde(default)]
     ui: Option<UiConfig>,
+}
+
+#[must_use]
+pub fn ark_from_toml_str(s: &str) -> ArkConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .ark
+        .unwrap_or_default()
+        .apply(ArkConfig::default())
+}
+
+/// Load Ark policy for one registered project. Project values replace global
+/// values as a unit; all fields have explicit defaults.
+#[must_use]
+pub fn load_ark_config(project_root: &Path) -> ArkConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
+        .and_then(|file| file.ark)
+        .unwrap_or_default()
+        .apply(ArkConfig::default());
+    find_project_config(project_root)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
+        .and_then(|file| file.ark)
+        .unwrap_or_default()
+        .apply(global)
 }
 
 /// Parse a config from TOML text, preferring `[review]` over `[defaults]`.
@@ -1409,6 +1512,35 @@ pub(crate) fn reset_cors_cache_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ark_defaults_and_validation_are_safe() {
+        let defaults = ark_from_toml_str("");
+        assert_eq!(defaults.sweep_interval_days, 1);
+        assert_eq!(defaults.stale_after_days, 90);
+        assert_eq!(defaults.max_worktrees, 100);
+        assert!(defaults.validate().is_ok());
+
+        let configured = ark_from_toml_str(
+            "[ark]\nsweep_interval_days=2\nstale_after_days=30\nmax_worktrees=25\n",
+        );
+        assert_eq!(configured.sweep_interval(), Duration::from_secs(172_800));
+        assert_eq!(configured.stale_after_ms(), 2_592_000_000);
+        assert_eq!(configured.max_worktrees, 25);
+        assert!(
+            ark_from_toml_str("[ark]\nmax_worktrees=0")
+                .validate()
+                .is_err()
+        );
+        let layered = ArkConfigLayer {
+            stale_after_days: Some(14),
+            ..ArkConfigLayer::default()
+        }
+        .apply(configured);
+        assert_eq!(layered.sweep_interval_days, 2);
+        assert_eq!(layered.stale_after_days, 14);
+        assert_eq!(layered.max_worktrees, 25);
+    }
 
     fn cfg(skip: Option<bool>, checks: &[&str]) -> ReviewConfig {
         ReviewConfig {

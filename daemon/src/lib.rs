@@ -8,6 +8,7 @@
 pub mod agent_access;
 pub mod agent_catalog;
 pub mod agent_profiles;
+pub mod ark;
 pub mod cancel;
 pub mod cartographer;
 pub mod channel;

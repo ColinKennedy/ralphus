@@ -576,6 +576,8 @@
        * @property {number} [tokens_out]
        * @property {number} [cost_usd]
        * @property {number} [maximum_budget_usd]
+       * @property {number} [maximum_context] - RAL-304: resolved context-window token limit, or absent for no cap. Only ever set for a backend with a real delivery mechanism (codex, pi) -- see `agent_supports_maximum_context`.
+       * @property {number} [auto_compact_threshold] - RAL-304: resolved auto-compact trigger threshold in tokens, or absent for no explicit threshold. Accepted by a wider set of backends than `maximum_context` (codex, pi, and claude-code) -- see `agent_supports_auto_compact_threshold`.
        * @property {string|null} [error]
        * @property {ProofView[]} [proof]
        * @property {string[]} [depends_on]
@@ -1857,6 +1859,10 @@
       // "cell completed" event history — load it on demand rather than on
       // every render, since it's an extra API call a routine refresh should not repeat.
       const LIFETIME_COST_TIP = "Sums tokens and cost across every completed attempt of this exact cell (same task + cell id), including restarts and separate re-submissions of the same task, not just the current squad.\nWho/when: check this to see total spend on a cell that's been restarted or resubmitted multiple times.\nLoaded on demand from the Cartographer event log — click to fetch; older attempts may be missing if Cartographer retention has pruned them.";
+      // RAL-304: read-only — set via `maximum_context`/`auto_compact_threshold`
+      // in the submitted TOML, not editable here. Only shown when at least one
+      // is set, since most cells set neither.
+      const CONTEXT_LIMITS_TIP = "Context-window controls delivered to the backend at cell start, resolved from the cell (or its owning task) at submit time.\nmax = the context-window ceiling itself (maximum_context) — only codex and pi backends have a real lever for this.\ncompact @ = the token count at which the backend auto-compacts its own history (auto_compact_threshold) — also supported by claude-code, via its CLAUDE_CODE_AUTO_COMPACT_WINDOW env var.\nWho/when: check this on a long-running cell to see whether/where it's set up to compact instead of just running until it hits the wall and fails.\nRead-only here — edit the TOML and resubmit to change it.";
       // Same idea as TOKENS_COST_TIP/LIFETIME_COST_TIP above, for proof steps
       // (RAL-172): a proof step's own token/cost usage is now tracked
       // per-attempt server-side, and its lifetime total is loaded the same
@@ -5665,6 +5671,21 @@
         } catch (_) { delete squadPaths[id]; }
       }
       /**
+       * Renders the RAL-304 context-window controls row (`maximum_context`/
+       * `auto_compact_threshold`) for the cell details pane, or an empty
+       * string when neither is set — most cells set neither, so the row is
+       * omitted rather than shown empty.
+       * @param {CellView} s
+       * @returns {string}
+       */
+      function contextLimitsRow(s) {
+        if (s.maximum_context == null && s.auto_compact_threshold == null) return "";
+        const parts = [];
+        if (s.maximum_context != null) parts.push(`max ${s.maximum_context.toLocaleString()}`);
+        if (s.auto_compact_threshold != null) parts.push(`compact @ ${s.auto_compact_threshold.toLocaleString()}`);
+        return `<div class="kv-row" data-tip="${CONTEXT_LIMITS_TIP}"><span class="k">context limits</span><span class="v">${parts.join(" · ")}</span></div>`;
+      }
+      /**
        * Renders the cell-level details pane.
        * @param {SquadView} r
        * @param {TaskView} t
@@ -5724,6 +5745,7 @@
           ${upstreamRow}
           <div class="kv-row" data-tip="${TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">input ${s.tokens_in} · output ${s.tokens_out} · ${fmtCostUsd(s.cost_usd)}${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}</span></div>
           <div class="kv-row" data-tip="${LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="cum-cost-${esc(s.id)}">—</span> <button class="btn" data-click="loadCumulativeCost" data-cell-id="${esc(s.id)}" data-tip="${LIFETIME_COST_TIP}">Σ load total</button></span></div>
+          ${contextLimitsRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
           ${systemPromptSection}
@@ -7722,7 +7744,20 @@
         const cumHead = `<span data-tip="${CELL_CUM_TOOLTIP}">cumulative (all restarts)</span>`;
         return T(["task", "cell", "state", "tokens (this squad)", "cost (this squad)", cumHead, "output", "error"], cumulativeCellRows(squad));
       }
-
+      /**
+       * Plain-text form of a Cartographer row's squad/guardian/cell references
+       * (RAL-294) — the Markdown-export sibling of cartoRefChip's HTML links.
+       * @param {CartographerRow} row
+       * @returns {string}
+       */
+      function cartoRefText(row) {
+        /** @type {string[]} */
+        const parts = [];
+        if (row.squad_id) parts.push(row.squad_id);
+        if (row.guardian_id) parts.push(row.guardian_id);
+        if (row.cell_id) parts.push(row.cell_id);
+        return parts.length ? parts.join(" · ") : "—";
+      }
       // ---------- logs modal: copy active tab as Markdown (RAL-294) ----------
       /**
        * @typedef {object} LogsMdTable
@@ -8051,120 +8086,6 @@
         } finally {
           if (btn) setTimeout(() => { btn.textContent = "⧉ Copy as Markdown"; btn.classList.remove("copied"); /** @type {HTMLButtonElement} */ (btn).disabled = false; }, 1200);
         }
-      }
-      /**
-       * Plain-text form of a Cartographer row's squad/guardian/cell references
-       * (RAL-294) — the Markdown-export sibling of cartoRefChip's HTML links.
-       * @param {CartographerRow} row
-       * @returns {string}
-       */
-      function cartoRefText(row) {
-        /** @type {string[]} */
-        const parts = [];
-        if (row.squad_id) parts.push(row.squad_id);
-        if (row.guardian_id) parts.push(row.guardian_id);
-        if (row.cell_id) parts.push(row.cell_id);
-        return parts.length ? parts.join(" · ") : "—";
-      }
-      /**
-       * Builds the events tab's Markdown table text from its cached Cartographer rows.
-       * @param {CartographerRow[]|null|undefined} rows
-       * @returns {string}
-       */
-      function eventsMdTable(rows) {
-        if (!rows || !rows.length) return "No events.";
-        /** @type {string[]} */
-        const notes = [];
-        const dataRows = rows.map((r) => [
-          mdEscapeCell(new Date(r.at_ms).toLocaleString()),
-          mdEscapeCell(r.level),
-          mdEscapeCell(r.source),
-          mdEscapeCell(r.scope),
-          mdEscapeCell(r.task),
-          mdEscapeCell(cartoRefText(r)),
-          mdCellWithFootnote(r.message, notes),
-        ]);
-        return mdTableToText({ head: ["time", "level", "source", "scope", "task", "refs", "message"], rows: dataRows, notes, warnings: [] });
-      }
-      /**
-       * Builds the tasks tab's Markdown table text for a squad.
-       * @param {SquadView} squad
-       * @returns {string}
-       */
-      function tasksMdTable(squad) {
-        /** @type {string[]} */
-        const notes = [];
-        const reasonTip = "A task-level failure reason (RAL-291) — set only when the task itself failed for a reason with no underlying cell/proof error to point to, e.g. the RAL-156 no-commits-since-baseline guard.\nEmpty when the task instead failed because one of its own cells or proof steps failed — that failure is already visible in the cells/proofs tabs.";
-        const head = ["task", "state", "cells", mdHeadCell("reason", reasonTip, notes)];
-        const rows = squad.tasks.map((t) => [
-          mdEscapeCell(t.name),
-          mdEscapeCell(t.state),
-          mdEscapeCell(t.cells.length),
-          mdCellWithFootnote(t.error, notes),
-        ]);
-        return mdTableToText({ head, rows, notes, warnings: [] });
-      }
-      /**
-       * Builds the cells tab's Markdown table text for a squad, including RAL-160 cumulative totals.
-       * @param {SquadView} squad
-       * @returns {string}
-       */
-      function cellsMdTable(squad) {
-        /** @type {string[]} */
-        const notes = [];
-        const totals = cumulativeCellTotals(squad.id);
-        /** @type {string[][]} */
-        const rows = [];
-        squad.tasks.forEach((t) => t.cells.forEach((s) => {
-          const cum = totals[s.id];
-          const cumText = cum
-            ? `input ${cum.tokensIn} · output ${cum.tokensOut} · ${fmtCostUsd(cum.costUsd)} (${cum.attempts} attempt${cum.attempts === 1 ? "" : "s"})`
-            : "—";
-          rows.push([
-            mdEscapeCell(t.name),
-            mdEscapeCell(s.id),
-            mdEscapeCell(s.state),
-            mdEscapeCell(`input ${s.tokens_in} · output ${s.tokens_out}`),
-            mdEscapeCell(fmtCostUsd(s.cost_usd)),
-            mdEscapeCell(cumText),
-            mdCellWithFootnote(s.error, notes),
-          ]);
-        }));
-        const cumTip = "Sum of input/output tokens and $ cost across every completed attempt of this cell (including restarts), read from the Cartographer event log.\nMay undercount if older attempts have aged out of Cartographer retention (see [cartographer] in .ralphus.toml).";
-        const head = ["task", "cell", "state", "tokens (this squad)", "cost (this squad)", mdHeadCell("cumulative (all restarts)", cumTip, notes), "error"];
-        return mdTableToText({ head, rows, notes, warnings: [] });
-      }
-      /**
-       * Builds the proofs tab's Markdown table text for a squad.
-       * @param {SquadView} squad
-       * @returns {string}
-       */
-      function proofsMdTable(squad) {
-        /** @type {string[]} */
-        const notes = [];
-        /** @type {string[][]} */
-        const rows = [];
-        squad.tasks.forEach((t) => {
-          (t.proof || []).forEach((v) => rows.push([mdEscapeCell(t.name), "task", mdEscapeCell(v.id || "—"), mdEscapeCell(v.kind), mdEscapeCell(v.state), mdCellWithFootnote(v.output, notes)]));
-          (t.cells || []).forEach((s) => (s.proof || []).forEach((v) =>
-            rows.push([mdEscapeCell(t.name), `cell ${s.id}`, mdEscapeCell(v.id || "—"), mdEscapeCell(v.kind), mdEscapeCell(v.state), mdCellWithFootnote(v.output, notes)])));
-        });
-        if (!rows.length) return "No proofs.";
-        return mdTableToText({ head: ["task", "scope", "id", "kind", "state", "output"], rows, notes, warnings: [] });
-      }
-      /**
-       * Builds the Markdown export text for the Logs modal's currently active tab.
-       * @param {SquadView} squad
-       * @returns {string}
-       */
-      function logsMarkdownForTab(squad) {
-        if (logsTab === "events") {
-          const d = cartoModalCache[`squad:${squad.id}`];
-          return eventsMdTable(d ? d.rows : null);
-        }
-        if (logsTab === "tasks") return tasksMdTable(squad);
-        if (logsTab === "proofs") return proofsMdTable(squad);
-        return cellsMdTable(squad);
       }
 
       // ---------- uber-log-viewer timeline modal (RAL-155) ----------
@@ -9218,13 +9139,19 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // Conflict-resolver backend for this review.
         const resolverFrozen = ["approved", "deployed"].includes(g.status);
         const rp = (pendingResolver && pendingResolver.gid === g.id) ? pendingResolver : null;
-        const rPending = !!rp;
-        const rSelVal = rp ? rp.agent : (g.resolver_agent || "");
+        const storedResolverAgent = g.resolver_agent || "";
+        const storedResolverModel = g.resolver_model || "";
+        const rSelVal = rp ? rp.agent : storedResolverAgent;
+        const rModelVal = rp ? rp.model : storedResolverModel;
+        const rAgentPending = !!rp && rp.agent !== storedResolverAgent;
+        const rModelPending = !!rp && rp.model.trim() !== storedResolverModel;
         const resolverCwd = g.git_root || (g.projects && g.projects[0]) || "";
         const resolverOptions = resolverOptionHtml(resolverCwd, rSelVal);
         const resolverRow = resolverFrozen
-          ? `<div class="kv-row"><span class="k">resolver</span><span class="v mono">${esc(resolverOf(g))}</span></div>`
-          : `<div class="kv-row"><span class="k">resolver</span><div style="display:flex;flex-direction:column;gap:4px"><select id="resolver-select" data-guardian-id="${esc(g.id)}" onchange="onResolverChange(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts.\nIncludes this project's built-in backends plus any custom agent profiles configured in its .ralphus.toml.\nPress Save to apply — if a rebase is already in progress it restarts immediately with the new backend.">${resolverOptions}</select><div id="resolver-pending" style="display:${rPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveResolver" data-guardian-id="${esc(g.id)}" data-tip="Save the resolver backend.\nIf a rebase is already in progress, it restarts immediately with the new backend.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelResolver" data-guardian-id="${esc(g.id)}" data-tip="Discard — revert the dropdown to the last saved value.">Cancel</button></div></div></div>`;
+          ? `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(resolverOf(g))}</span></div>
+             <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(storedResolverModel || "agent default")}</span></div>`
+          : `<div class="kv-row"><span class="k">resolver agent</span><div style="display:flex;flex-direction:column;gap:4px"><select id="resolver-select" data-guardian-id="${esc(g.id)}" onchange="onResolverChange(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts.\nIncludes this project's built-in backends plus any custom agent profiles configured in its .ralphus.toml.\nPress Save to apply — if a rebase is already in progress it restarts immediately with the new backend.">${resolverOptions}</select><div id="resolver-pending" style="display:${rAgentPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveResolver" data-guardian-id="${esc(g.id)}" data-tip="Save the staged resolver agent and model together.\nIf a rebase is already in progress, it restarts immediately with the new resolver configuration.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelResolver" data-guardian-id="${esc(g.id)}" data-tip="Discard all staged resolver changes and restore the last saved agent and model.">Cancel</button></div></div></div>
+             <div class="kv-row"><span class="k">resolver model</span><div style="display:flex;flex-direction:column;gap:4px"><input type="text" id="resolver-model-input" class="mono" value="${esc(rModelVal)}" placeholder="agent default" data-guardian-id="${esc(g.id)}" oninput="onResolverModelInput(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="Exact model passed to the selected resolver agent, such as gpt-5.6-luna.\nWho/when: set this when the agent's default model is not the one you want for conflict resolution and review work.\nAny model name is accepted; an unavailable, misspelled, or agent-incompatible value can make the resolver fail. Clear the field to use the agent's default."><div id="resolver-model-pending" style="display:${rModelPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveResolver" data-guardian-id="${esc(g.id)}" data-tip="Save the staged resolver model and agent together.\nLeading and trailing whitespace is removed; an empty field clears the model override. If a rebase is already in progress, it restarts immediately with the new resolver configuration.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelResolver" data-guardian-id="${esc(g.id)}" data-tip="Discard all staged resolver changes and restore the last saved agent and model.">Cancel</button></div></div></div>`;
         // RAL-168: "Proof" scope -- how often the dedicated LLM-based
         // final-proof pass runs. Save/Cancel like the resolver dropdown
         // above (interview Q6: confirm via Save/Cancel, but no rebase
@@ -9446,11 +9373,37 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @typedef {object} PendingResolver
        * @property {string} gid
        * @property {string} agent
+       * @property {string} model
        */
-      /** @type {PendingResolver|null} */
-      let pendingResolver = null;
-      /** @type {{gid: string, scope: string, skipAutoClean: boolean}|null} RAL-168: staged Proof-scope choice, not yet saved. */
-      let pendingProofScope = null;
+       /** @type {PendingResolver|null} */
+       let pendingResolver = null;
+      // RALPHUS-RESOLVER-SETTINGS:BEGIN
+      /**
+       * Returns the current resolver draft, starting from the stored pair when
+       * this review has no pending edit. Agent and model always travel together
+       * so saving one control cannot erase the other.
+       * @param {string} gid
+       * @param {string} storedAgent
+       * @param {string} storedModel
+       * @param {PendingResolver|null} pending
+       * @returns {PendingResolver}
+       */
+      function resolverDraftFor(gid, storedAgent, storedModel, pending) {
+        return pending && pending.gid === gid
+          ? { ...pending }
+          : { gid, agent: storedAgent, model: storedModel };
+      }
+      /**
+       * Produces the settings request for a staged resolver pair.
+       * @param {PendingResolver} draft
+       * @returns {{resolver_agent: string, resolver_model: string}}
+       */
+      function resolverSettingsBody(draft) {
+        return { resolver_agent: draft.agent, resolver_model: draft.model.trim() };
+      }
+      // RALPHUS-RESOLVER-SETTINGS:END
+       /** @type {{gid: string, scope: string, skipAutoClean: boolean}|null} RAL-168: staged Proof-scope choice, not yet saved. */
+       let pendingProofScope = null;
       /**
        * Drag-start handler for a branch row: records the dragged branch name.
        * @param {DragEvent} e
@@ -9984,20 +9937,42 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {void}
        */
       function onResolverChange(gid, agent) {
-        pendingResolver = { gid, agent };
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        const draft = resolverDraftFor(gid, g.resolver_agent || "", g.resolver_model || "", pendingResolver);
+        draft.agent = agent;
+        pendingResolver = draft;
         renderReviewDetail();
       }
       /**
-       * Saves the staged resolver-agent choice. The daemon itself restarts an
+       * Stages a raw resolver-model value while leaving focus in the text
+       * field. The value is trimmed only when saved.
+       * @param {string} gid
+       * @param {string} model
+       * @returns {void}
+       */
+      function onResolverModelInput(gid, model) {
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        const draft = resolverDraftFor(gid, g.resolver_agent || "", g.resolver_model || "", pendingResolver);
+        draft.model = model;
+        pendingResolver = draft;
+        const controls = document.getElementById("resolver-model-pending");
+        if (controls) controls.style.display = model.trim() !== (g.resolver_model || "") ? "flex" : "none";
+      }
+      /**
+       * Saves the staged resolver-agent/model pair. The daemon itself restarts an
        * already-`merging` review's in-flight rebase so the new resolver takes
        * effect immediately (RAL-213) -- this no longer needs to do that here.
        * @param {string} gid
        * @returns {Promise<void>}
        */
       async function saveResolver(gid) {
-        const agent = pendingResolver ? pendingResolver.agent : "";
-        pendingResolver = null;
-        await guardianAction(`/api/guardians/${gid}/settings`, { resolver_agent: agent, resolver_model: "" });
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        const draft = resolverDraftFor(gid, g.resolver_agent || "", g.resolver_model || "", pendingResolver);
+        const resp = await guardianAction(`/api/guardians/${gid}/settings`, resolverSettingsBody(draft));
+        if (resp && resp.ok) pendingResolver = null;
         tick();
       }
       /**
@@ -10006,7 +9981,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {void}
        */
       function cancelResolver(gid) {
-        pendingResolver = null;
+        if (pendingResolver && pendingResolver.gid === gid) pendingResolver = null;
         renderReviewDetail();
       }
       /**
@@ -10143,16 +10118,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function setMatchPrBranchName(id, enabled) {
         await guardianAction(`/api/guardians/${id}/settings`, { match_pr_branch_name: enabled });
-        tick();
-      }
-      /**
-       * Toggles a review's skip-per-worktree-checks setting.
-       * @param {string} id
-       * @param {boolean} skip
-       * @returns {Promise<void>}
-       */
-      async function setSkipWorktreeChecks(id, skip) {
-        await guardianAction(`/api/guardians/${id}/settings`, { skip_worktree_checks: skip });
         tick();
       }
       /**
@@ -10539,7 +10504,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {Promise<void>}
        */
       async function runAllManualChecks(id) {
-        await guardianAction(`/api/guardians/${id}/squad-manual-commands`, {});
+        await guardianAction(`/api/guardians/${id}/run-manual-commands`, {});
       }
       /**
        * Runs a single suggested manual-check command by index.
@@ -10550,7 +10515,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       async function runSingleManualCheck(id, index) {
         manualMenuOpen[id] = false;
         renderReviewDetail();
-        await guardianAction(`/api/guardians/${id}/squad-manual-commands`, { index });
+        await guardianAction(`/api/guardians/${id}/run-manual-commands`, { index });
       }
       // RAL-77: run a user-declared action hint by index.
       /**
@@ -10560,7 +10525,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {Promise<void>}
        */
       async function runActionHint(id, index) {
-        await guardianAction(`/api/guardians/${id}/squad-action-hint`, { index });
+        await guardianAction(`/api/guardians/${id}/run-action-hint`, { index });
       }
 
       // ---------- structured check inputs (RAL-164) ----------
@@ -10593,11 +10558,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           if (el) inputs[inp.name] = el.value;
         });
         const cleanupEl = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-cleanup:${key}`));
-        const squad_cleanup = !!(cleanupEl && cleanupEl.checked);
+        const run_cleanup = !!(cleanupEl && cleanupEl.checked);
         checkFormOpen[key] = false;
         renderReviewDetail();
-        const url = `/api/guardians/${id}/${kind === "manual" ? "squad-manual-commands" : "squad-action-hint"}`;
-        await guardianAction(url, { index, inputs, squad_cleanup });
+        const url = `/api/guardians/${id}/${kind === "manual" ? "run-manual-commands" : "run-action-hint"}`;
+        await guardianAction(url, { index, inputs, run_cleanup });
         tick();
       }
       // "Set it for me" (RAL-164): delegates resolution of one named check

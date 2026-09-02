@@ -50,13 +50,17 @@ pub struct RunOptions<'a> {
     pub timeout_sec: Option<u64>,
     /// RAL-304: resolved context-window token limit, or `None` for no cap.
     /// Only ever `Some` for a backend whose
-    /// [`ModelBackend::supports_context_limits`] returns `true` -- `core`'s
+    /// [`ModelBackend::supports_maximum_context`] returns `true` -- `core`'s
     /// `agent_supports_maximum_context` validation gate rejects it for
     /// anything else before submission.
     pub maximum_context: Option<u64>,
     /// RAL-304: resolved auto-compact trigger threshold in tokens, or `None`
-    /// for no explicit threshold. Same support restriction as
-    /// [`Self::maximum_context`].
+    /// for no explicit threshold. Only ever `Some` for a backend whose
+    /// [`ModelBackend::supports_auto_compact_threshold`] returns `true` --
+    /// `core`'s `agent_supports_auto_compact_threshold` validation gate
+    /// rejects it for anything else before submission. Accepted by a wider
+    /// set of backends than [`Self::maximum_context`] (e.g. claude-code
+    /// accepts this but not that).
     pub auto_compact_threshold: Option<u64>,
     /// RAL-303: how many characters of a `tool_use` argument value to render
     /// into the Live View tmux pane before truncating, resolved daemon-side
@@ -110,17 +114,34 @@ pub trait ModelBackend {
     }
 
     /// RAL-304: whether this backend has a real delivery mechanism for
-    /// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold`
-    /// (an env var, a CLI arg, or an on-disk settings file -- see
-    /// `ClaudeCodeBackend`/`CodexBackend`/`PiBackend`'s own overrides for
+    /// `RunOptions::maximum_context` -- a way to actually cap the
+    /// context-window ceiling itself (an env var, a CLI arg, or an on-disk
+    /// settings file -- see `CodexBackend`/`PiBackend`'s own overrides for
     /// which). Defaults to `false`, mirroring [`nudge`](Self::nudge)'s
     /// default-no-op-override shape: only a backend with a real mechanism
     /// needs to override it. `core::validate`'s `agent_supports_maximum_context`
-    /// is the actual submit-time gate that keeps these fields from reaching a
-    /// backend that doesn't support them; this is the runner-side mirror of
+    /// is the actual submit-time gate that keeps this field from reaching a
+    /// backend that doesn't support it; this is the runner-side mirror of
     /// that same classification, checked defensively in `execute.rs` before
     /// a cell is ever run.
-    fn supports_context_limits(&self) -> bool {
+    fn supports_maximum_context(&self) -> bool {
+        false
+    }
+
+    /// RAL-304: whether this backend has a real delivery mechanism for
+    /// `RunOptions::auto_compact_threshold` -- an absolute token count at
+    /// which auto-compaction should trigger (see
+    /// `ClaudeCodeBackend`/`CodexBackend`/`PiBackend`'s own overrides for
+    /// which mechanism each uses). Defaults to `false`, same shape as
+    /// [`supports_maximum_context`](Self::supports_maximum_context); accepted
+    /// by a wider set of backends than that method (claude-code overrides
+    /// this one but not that one -- see
+    /// `ralphus_core::schema::agent_supports_auto_compact_threshold`'s doc
+    /// comment for why). `core::validate`'s
+    /// `agent_supports_auto_compact_threshold` is the actual submit-time
+    /// gate; this is the runner-side mirror, checked defensively in
+    /// `execute.rs` before a cell is ever run.
+    fn supports_auto_compact_threshold(&self) -> bool {
         false
     }
 }
