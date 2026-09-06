@@ -340,6 +340,13 @@ struct Membership {
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
     auto_submit_pr_stack: Option<bool>,
+    /// Optional `[review.auto_build]` declaration (RAL-342): either a static
+    /// `command` or an agent-invocation shape, mutually exclusive with
+    /// `skip_auto_build`.
+    auto_build: Option<ralphus_core::schema::AutoBuildDef>,
+    /// Explicit opt-out of the auto_build requirement (`[[review]]
+    /// skip_auto_build = true`, RAL-342), mutually exclusive with `auto_build`.
+    skip_auto_build: bool,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -667,6 +674,8 @@ pub fn derive_reviews(
                 .and_then(|r| r.proof_scope.clone())
                 .filter(|s| !s.trim().is_empty()),
             auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
+            auto_build: rv.and_then(|r| r.auto_build.clone()),
+            skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
         });
     }
 
@@ -764,11 +773,13 @@ pub fn derive_reviews(
         } else {
             suggested
         };
+        require_auto_build_declaration(&members, std::slice::from_ref(project), &name)?;
         let gid = store
             .create_guardian_for_squad(&name, &upstream, project, Some(squad_id))
             .map_err(|e| ReviewError::new(e.to_string()))?;
         apply_resolver(store, &gid, &members)?;
         apply_project_review_defaults(store, &gid, project)?;
+        apply_auto_build(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Single-project: no need to tag branches with a project (they share git_root).
         add_new_branches(store, &gid, &[], &members, false)?;
@@ -801,12 +812,8 @@ pub fn derive_reviews(
             .iter()
             .find(|m| !m.name.is_empty())
             .map_or_else(|| key.clone(), |m| m.name.clone());
-        let gid = store
-            .create_guardian_keyed(&name, &upstream, &project, Some(squad_id), Some(key))
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-        apply_resolver(store, &gid, &members)?;
-        // Apply project-level defaults (skip_worktrees, machine,
-        // maximum_budget_usd) for every distinct project in the group.
+        // Computed before the guardian is created: every distinct project in
+        // the group, and the required-declaration check both need this.
         let distinct_projects: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
             members
@@ -815,9 +822,17 @@ pub fn derive_reviews(
                 .filter(|p| seen.insert(p.clone()))
                 .collect()
         };
+        let review_ref = format!("{}{key}", ralphus_core::schema::REVIEW_LINK_PREFIX);
+        require_auto_build_declaration(&members, &distinct_projects, &review_ref)?;
+        let gid = store
+            .create_guardian_keyed(&name, &upstream, &project, Some(squad_id), Some(key))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        // Apply skip_worktrees for every distinct project in the group.
         for proj in &distinct_projects {
             apply_project_review_defaults(store, &gid, proj)?;
         }
+        apply_resolver(store, &gid, &members)?;
+        apply_auto_build(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Freshly minted guardian: no branches attached yet. Tag each branch with
         // its project root (multi-project link group).
@@ -953,6 +968,80 @@ fn apply_resolver(
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
+}
+
+/// Field-for-field conversion from the offline `core::schema` shape (as parsed
+/// from `[review.auto_build]`) to the runtime `guardian::GuardianAutoBuild`
+/// shape persisted in the store.
+fn into_guardian_auto_build(
+    def: &ralphus_core::schema::AutoBuildDef,
+) -> crate::guardian::GuardianAutoBuild {
+    crate::guardian::GuardianAutoBuild {
+        command: def.command.clone(),
+        prompt: def.prompt.clone(),
+        system_prompt: def.system_prompt.clone(),
+        system_prompt_position: def.system_prompt_position.clone(),
+        agent: def.agent.clone(),
+        model: def.model.clone(),
+    }
+}
+
+/// Persist this review's declared build step (RAL-342), from the first member
+/// that sets `[review.auto_build]`, or -- failing that -- the first member
+/// that sets `skip_auto_build = true`. A no-op when no member declares
+/// either, leaving the guardian to fall back to the project-config default at
+/// merge time.
+fn apply_auto_build(
+    store: &Store,
+    gid: &str,
+    members: &[&Membership],
+) -> std::result::Result<(), ReviewError> {
+    if let Some(def) = members.iter().find_map(|m| m.auto_build.as_ref()) {
+        store
+            .set_guardian_auto_build(gid, Some(&into_guardian_auto_build(def)))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    } else if members.iter().any(|m| m.skip_auto_build) {
+        store
+            .set_guardian_skip_auto_build(gid, true)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// RAL-342: every review must explicitly declare its finalize-time build step
+/// -- `[review.auto_build]` or `skip_auto_build = true` -- unless every
+/// distinct project in the group already has a project-level `auto_build`
+/// default configured (`.ralphus.toml [review] auto_build`). Runs before the
+/// guardian is created, so a rejection here never leaves behind a partial
+/// guardian (mirrors the whole-squad rollback-on-`Err` at the submit call
+/// site). Submit-time only -- reopen/restart-merge do not re-check this.
+///
+/// `review_ref` identifies the pending review in the error message: for a
+/// link group this is its `ralphus:new-review/<key>` placeholder URI (no
+/// guardian id exists yet to reference instead); for a project group it is
+/// the review's resolved name.
+fn require_auto_build_declaration(
+    members: &[&Membership],
+    distinct_projects: &[String],
+    review_ref: &str,
+) -> std::result::Result<(), ReviewError> {
+    let declared = members
+        .iter()
+        .any(|m| m.auto_build.is_some() || m.skip_auto_build);
+    if declared {
+        return Ok(());
+    }
+    let covered_by_config = !distinct_projects.is_empty()
+        && distinct_projects
+            .iter()
+            .all(|p| crate::config::resolve(Path::new(p)).auto_build.is_some());
+    if covered_by_config {
+        return Ok(());
+    }
+    Err(ReviewError::new(format!(
+        "{review_ref} must declare [review.auto_build] or skip_auto_build = true \
+         (or configure a project-level auto_build default in .ralphus.toml)"
+    )))
 }
 
 /// Persist user-declared action hints from the top-level `[[review.action]]`
@@ -1497,9 +1586,11 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_project_review_defaults, apply_resolver,
-        create_review_from_triage_pool, derive_triage_pools, rebase_onto, repair_triage_pool_keys,
-        workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
+        Membership, any_workspace_ahead_of_upstream, apply_auto_build,
+        apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
+        derive_triage_pools, rebase_onto, repair_triage_pool_keys,
+        require_auto_build_declaration, workspace_has_commits_ahead_of_upstream,
+        workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::Store;
     use crate::workspace::Workspace;
@@ -1786,6 +1877,8 @@ mod tests {
             maximum_budget_usd,
             proof_scope: None,
             auto_submit_pr_stack: None,
+            auto_build: None,
+            skip_auto_build: false,
         }
     }
 
@@ -1864,6 +1957,131 @@ mod tests {
             store.get_guardian(&gid).unwrap().auto_submit_pr_stack,
             before
         );
+    }
+
+    // ── [[review]] auto_build wiring / required-declaration (RAL-342) ────
+
+    #[test]
+    fn apply_auto_build_sets_auto_build_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let def = ralphus_core::schema::AutoBuildDef {
+            command: Some("make build".to_string()),
+            ..Default::default()
+        };
+        let m = Membership {
+            auto_build: Some(def),
+            ..membership(None)
+        };
+        apply_auto_build(&store, &gid, &[&m]).unwrap();
+        let stored = store.guardian_auto_build(&gid).unwrap();
+        assert_eq!(
+            stored.and_then(|b| b.command),
+            Some("make build".to_string())
+        );
+        assert!(!store.guardian_skip_auto_build(&gid).unwrap());
+    }
+
+    #[test]
+    fn apply_auto_build_sets_skip_auto_build_when_declared_and_no_auto_build_present() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            skip_auto_build: true,
+            ..membership(None)
+        };
+        apply_auto_build(&store, &gid, &[&m]).unwrap();
+        assert!(store.guardian_skip_auto_build(&gid).unwrap());
+        assert_eq!(store.guardian_auto_build(&gid).unwrap(), None);
+    }
+
+    #[test]
+    fn apply_auto_build_leaves_unset_when_no_member_declares_either() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_auto_build(&store, &gid, &[&m]).unwrap();
+        assert_eq!(store.guardian_auto_build(&gid).unwrap(), None);
+        assert!(!store.guardian_skip_auto_build(&gid).unwrap());
+    }
+
+    #[test]
+    fn require_auto_build_declaration_ok_when_member_declares_auto_build() {
+        let def = ralphus_core::schema::AutoBuildDef {
+            command: Some("make build".to_string()),
+            ..Default::default()
+        };
+        let m = Membership {
+            auto_build: Some(def),
+            ..membership(None)
+        };
+        let root = temp_repo();
+        let project = root.to_string_lossy().into_owned();
+        assert!(require_auto_build_declaration(&[&m], &[project], "r").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_auto_build_declaration_ok_when_member_declares_skip() {
+        let m = Membership {
+            skip_auto_build: true,
+            ..membership(None)
+        };
+        let root = temp_repo();
+        let project = root.to_string_lossy().into_owned();
+        assert!(require_auto_build_declaration(&[&m], &[project], "r").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_auto_build_declaration_ok_when_project_config_declares_default() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nauto_build = \"make build\"\n",
+        )
+        .unwrap();
+        let m = membership(None);
+        let project = root.to_string_lossy().into_owned();
+        assert!(require_auto_build_declaration(&[&m], &[project], "r").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_auto_build_declaration_err_when_nothing_declared_and_no_config_fallback() {
+        let root = temp_repo();
+        let m = membership(None);
+        let project = root.to_string_lossy().into_owned();
+        let err = require_auto_build_declaration(&[&m], &[project], "ralphus:new-review/abc123")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ralphus:new-review/abc123"),
+            "error must identify the pending review: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_auto_build_declaration_err_when_link_group_only_partially_covered_by_config() {
+        // Two distinct projects in a link group; only one has a project-level
+        // `auto_build` default. A partial fallback doesn't count for the whole
+        // group -- the merge could silently pick up the covered project's
+        // default while running with none for the other.
+        let covered = temp_repo();
+        std::fs::write(
+            covered.join(".ralphus.toml"),
+            "[review]\nauto_build = \"make build\"\n",
+        )
+        .unwrap();
+        let uncovered = temp_repo();
+        let m = membership(None);
+        let projects = [
+            covered.to_string_lossy().into_owned(),
+            uncovered.to_string_lossy().into_owned(),
+        ];
+        assert!(require_auto_build_declaration(&[&m], &projects, "r").is_err());
+        let _ = std::fs::remove_dir_all(&covered);
+        let _ = std::fs::remove_dir_all(&uncovered);
     }
 
     // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────
