@@ -2256,10 +2256,9 @@ fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
             );
         }
     }
-    match daemon
-        .lock()
-        .set_triage_pool_threshold(&req.project, &req.triage_type, req.threshold)
-    {
+    let store = daemon.lock();
+    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    match store.set_triage_pool_threshold(&project, &req.triage_type, req.threshold) {
         Ok(()) => json(200, &serde_json::json!({"ok": true})),
         Err(e) => store_error(&e),
     }
@@ -2274,14 +2273,14 @@ struct TriageSchedulesResponse {
 }
 
 fn list_triage_schedules(daemon: &Daemon, query: &str) -> Reply {
-    let filter = match (
-        query_param(query, "project"),
-        query_param(query, "triage_type"),
-    ) {
-        (Some(p), Some(t)) => Some((p, t)),
+    let store = daemon.lock();
+    let resolved_project =
+        query_param(query, "project").map(|p| crate::triage::resolve_pool_key_input(&store, p));
+    let filter = match (&resolved_project, query_param(query, "triage_type")) {
+        (Some(p), Some(t)) => Some((p.as_str(), t)),
         _ => None,
     };
-    match daemon.lock().list_triage_schedules(filter) {
+    match store.list_triage_schedules(filter) {
         Ok(schedules) => json(200, &TriageSchedulesResponse { schedules }),
         Err(e) => store_error(&e),
     }
@@ -2315,8 +2314,10 @@ fn add_triage_schedule(daemon: &Daemon, body: &str) -> Reply {
             vec![],
         );
     };
-    match daemon.lock().add_triage_schedule(
-        &req.project,
+    let store = daemon.lock();
+    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    match store.add_triage_schedule(
+        &project,
         &req.triage_type,
         &req.cron_expr,
         req.anchor_date_ms,
@@ -2839,6 +2840,7 @@ fn delete_user(daemon: &Daemon, name: &str) -> Reply {
 fn resolve_acting_user(query: &str) -> Option<String> {
     query_param(query, "user")
         .map(url_decode)
+        .filter(|u| !u.is_empty())
         .or_else(|| crate::config::load_daemon_config().default_user)
 }
 
@@ -10359,6 +10361,12 @@ pub fn serve<A: ToSocketAddrs>(
             "ralphus [recovery] input resolution recovery failed: {e}"
         ),
     }
+    // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
+    // keyed by its pre-fix raw worktree path instead of the resolved
+    // project name, and fire any pool that's now correctly counted and
+    // already past its threshold. Naturally idempotent (see the function's
+    // own doc comment), so unconditional on every restart is safe.
+    crate::reviews::repair_triage_pool_keys(&store);
     // Zombie tmux.exe reaping: on the Windows tmux-alternative (psmux) this
     // project targets, `kill-session` frees a cell's *name* but never
     // actually terminates the backing OS process (see

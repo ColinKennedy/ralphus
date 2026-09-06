@@ -23,6 +23,8 @@
 //! type -- possibly more than one) lives in `crate::arbiter`, which is a
 //! separate concern from this module's pure storage/registry role.
 
+use std::path::Path;
+
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
@@ -105,13 +107,15 @@ pub struct TriageCandidateView {
     pub cell_id: String,
     pub cell_name: Option<String>,
     pub project: String,
-    /// This cell's raw stored `state` -- not the effective state
-    /// (`daemon::store::effective_cell_state`, which also folds in proof
-    /// step outcomes). A cell whose own state reads `done` but whose proof
-    /// step failed shows as "queued" here rather than "scheduled"; a minor
-    /// inaccuracy accepted for this secondary admin list rather than
-    /// joining proof state in as well.
-    pub state: String,
+    /// This cell's Triage relationship status: `"scheduled"` (not done yet,
+    /// nothing to sweep), `"queued"` (done and viable -- a live candidate
+    /// for the next pool drain), or `"failed"` (done but its proof failed --
+    /// permanently excluded from ever being swept into an auto-review; see
+    /// `Store::drain_triage_pool`). Computed via the same proof-aware
+    /// effective-state fold pooling itself uses
+    /// (`Store::effective_state_for_cell`), so this always agrees with
+    /// whether the cell would actually be included in the next drain.
+    pub status: String,
     pub triage_types: Vec<String>,
 }
 
@@ -388,6 +392,15 @@ impl Store {
             let triage_types = self.get_cell_triage_types(&squad_id, task_idx, idx)?;
             let project = project
                 .unwrap_or_else(|| crate::store::fallback_project_identifier(cwd.as_deref()));
+            let effective = self
+                .effective_state_for_cell(&squad_id, task_idx, idx)?
+                .unwrap_or(state);
+            let status = match effective.as_str() {
+                "failed" => "failed",
+                "done" => "queued",
+                _ => "scheduled",
+            }
+            .to_string();
             out.push(TriageCandidateView {
                 squad_id,
                 squad_label,
@@ -397,11 +410,56 @@ impl Store {
                 cell_id,
                 cell_name,
                 project,
-                state,
+                status,
                 triage_types,
             });
         }
         Ok(out)
+    }
+}
+
+// ── Pool key resolution ─────────────────────────────────────────────────────
+
+/// Best-effort canonical form of a filesystem path for pool-key comparison:
+/// canonicalized (falling back to the path unchanged if canonicalization
+/// fails, e.g. a worktree deleted since), verbatim-prefix stripped, and
+/// forward-slash separated so a Windows `git rev-parse` path and a Rust
+/// `Path::canonicalize()` path for the same directory compare equal.
+fn normalize_path_key(path: &Path) -> String {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    ralphus_core::strip_verbatim_prefix(canon)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The canonical Triage pool key for a worktree root (RAL-318): the
+/// registered project whose own path normalizes to the same location, by
+/// name; otherwise the normalized path itself. Every site that computes a
+/// pool key -- submit-time pooling (`crate::reviews::derive_triage_pools`)
+/// and threshold/schedule set+get (`crate::server`) -- must call this so
+/// keys agree byte-for-byte regardless of git's slash direction or a
+/// differently-cased registration.
+pub fn pool_key_for_path(store: &Store, path: &Path) -> String {
+    let target = normalize_path_key(path);
+    store
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| normalize_path_key(Path::new(&p.path)) == target)
+        .map_or(target, |p| p.name)
+}
+
+/// Resolve a caller-supplied `project` string (an HTTP request body field or
+/// CLI flag) into a pool key. An exact registered-project-name match
+/// resolves through that project's own registered path via
+/// [`pool_key_for_path`], so it agrees with the key a cell submitted under
+/// that project would be pooled under -- even before any cell has been
+/// pooled yet. Anything else is assumed to already be a literal pool key
+/// (e.g. copied from a pool listing) and is returned unchanged.
+pub fn resolve_pool_key_input(store: &Store, raw: &str) -> String {
+    match store.get_project(raw) {
+        Ok(Some(p)) => pool_key_for_path(store, Path::new(&p.path)),
+        _ => raw.to_string(),
     }
 }
 
@@ -431,18 +489,134 @@ impl Store {
         Ok(())
     }
 
-    /// Current pool size for `(project, triage_type)`.
+    /// Every row currently pooled, across every `(project, triage_type)` key
+    /// -- used only by the RAL-318 startup pool-key repair pass
+    /// (`crate::reviews::repair_triage_pool_keys`).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn all_pooled_cells(&self) -> StoreResult<Vec<(String, String, TriagePoolCellRow)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project, triage_type, squad_id, task_idx, idx, branch, upstream FROM triage_pool_cells",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    TriagePoolCellRow {
+                        squad_id: r.get(2)?,
+                        task_idx: r.get(3)?,
+                        idx: r.get(4)?,
+                        branch: r.get(5)?,
+                        upstream: r.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Move one pooled cell row onto a different `project` key -- e.g.
+    /// repairing a stale path-based key onto its resolved project name
+    /// (RAL-318). A no-op if the row no longer exists (e.g. concurrently
+    /// drained).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rekey_triage_pool_cell(
+        &self,
+        old_project: &str,
+        triage_type: &str,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        new_project: &str,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE triage_pool_cells SET project=?
+             WHERE project=? AND triage_type=? AND squad_id=? AND task_idx=? AND idx=?",
+            params![
+                new_project,
+                old_project,
+                triage_type,
+                squad_id,
+                task_idx,
+                idx
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one pooled cell row outright -- e.g. a failed cell dropped
+    /// during the RAL-318 pool-key repair pass rather than migrated (it
+    /// remains visible forever in the Triage candidate list regardless; see
+    /// [`Store::triage_candidates`]).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn remove_triage_pool_cell(
+        &self,
+        project: &str,
+        triage_type: &str,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "DELETE FROM triage_pool_cells
+             WHERE project=? AND triage_type=? AND squad_id=? AND task_idx=? AND idx=?",
+            params![project, triage_type, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// All cells currently pooled for `(project, triage_type)`, without
+    /// removing them -- shared by [`Store::triage_pool_count`] and
+    /// [`Store::drain_triage_pool`].
+    fn list_pooled_cells(
+        &self,
+        project: &str,
+        triage_type: &str,
+    ) -> StoreResult<Vec<TriagePoolCellRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT squad_id, task_idx, idx, branch, upstream FROM triage_pool_cells
+             WHERE project=? AND triage_type=?",
+        )?;
+        let rows = stmt
+            .query_map(params![project, triage_type], |r| {
+                Ok(TriagePoolCellRow {
+                    squad_id: r.get(0)?,
+                    task_idx: r.get(1)?,
+                    idx: r.get(2)?,
+                    branch: r.get(3)?,
+                    upstream: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Current pool size for `(project, triage_type)`, excluding any pooled
+    /// cell whose effective state (`Store::effective_state_for_cell`) has
+    /// resolved to `failed` -- a failed cell can never pass review, so it
+    /// must never count toward a threshold (RAL-318 bug 2).
     ///
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn triage_pool_count(&self, project: &str, triage_type: &str) -> StoreResult<i64> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM triage_pool_cells WHERE project=? AND triage_type=?",
-                params![project, triage_type],
-                |r| r.get(0),
-            )
-            .map_err(Into::into)
+        let rows = self.list_pooled_cells(project, triage_type)?;
+        let mut count = 0;
+        for row in &rows {
+            let effective = self
+                .effective_state_for_cell(&row.squad_id, row.task_idx, row.idx)?
+                .unwrap_or_default();
+            if effective != "failed" {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Every distinct `(project, triage_type)` key with at least one pooled
@@ -482,15 +656,25 @@ impl Store {
         Ok(rows)
     }
 
-    /// Atomically remove and return every cell currently pooled for
-    /// `(project, triage_type)`. Race-safety note: every `Store` method is
-    /// called through the daemon's single `Arc<Mutex<Store>>` (see
-    /// `crate::scheduler`/`crate::server`), so this single-statement
-    /// `DELETE ... RETURNING` already can't race a concurrent
-    /// insert/drain from another thread -- the same reliance every other
-    /// cumulative-then-act sequence in this codebase makes (e.g.
-    /// `guardian_merge.rs`'s cost-cap check). No cell can be double-drained:
-    /// once removed here, it is gone from the pool for every other caller.
+    /// Atomically remove every cell currently pooled for `(project,
+    /// triage_type)` and return only the ones still viable for a review --
+    /// any cell whose effective state has resolved to `failed` is dropped
+    /// for good here rather than returned, and never resurfaces in a later
+    /// drain (RAL-318 bug 2: a failed cell can never pass review, so it must
+    /// never be swept into an auto-created one). A failed cell dropped this
+    /// way remains visible forever in the separate Triage candidate list
+    /// (`triage_candidates`, spanning every squad regardless of pool
+    /// membership) with a `"failed"` status -- this only removes it from
+    /// the internal pool-counting table.
+    ///
+    /// Race-safety note: every `Store` method is called through the
+    /// daemon's single `Arc<Mutex<Store>>` (see `crate::scheduler`/
+    /// `crate::server`), so the read-then-delete sequence here already
+    /// can't race a concurrent insert/drain from another thread -- the same
+    /// reliance every other cumulative-then-act sequence in this codebase
+    /// makes (e.g. `guardian_merge.rs`'s cost-cap check). No cell can be
+    /// double-drained: once removed here, it is gone from the pool for
+    /// every other caller.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
@@ -499,22 +683,21 @@ impl Store {
         project: &str,
         triage_type: &str,
     ) -> StoreResult<Vec<TriagePoolCellRow>> {
-        let mut stmt = self.conn.prepare(
-            "DELETE FROM triage_pool_cells WHERE project=? AND triage_type=?
-             RETURNING squad_id, task_idx, idx, branch, upstream",
+        let rows = self.list_pooled_cells(project, triage_type)?;
+        self.conn.execute(
+            "DELETE FROM triage_pool_cells WHERE project=? AND triage_type=?",
+            params![project, triage_type],
         )?;
-        let rows = stmt
-            .query_map(params![project, triage_type], |r| {
-                Ok(TriagePoolCellRow {
-                    squad_id: r.get(0)?,
-                    task_idx: r.get(1)?,
-                    idx: r.get(2)?,
-                    branch: r.get(3)?,
-                    upstream: r.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let mut viable = Vec::new();
+        for row in rows {
+            let effective = self
+                .effective_state_for_cell(&row.squad_id, row.task_idx, row.idx)?
+                .unwrap_or_default();
+            if effective != "failed" {
+                viable.push(row);
+            }
+        }
+        Ok(viable)
     }
 
     /// Set (or clear, with `None`) the count threshold for `(project,
@@ -566,6 +749,22 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Every configured pool threshold, across every `(project,
+    /// triage_type)` key -- used only by the RAL-318 startup pool-key repair
+    /// pass (`crate::reviews::repair_triage_pool_keys`).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn all_triage_pool_thresholds(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project, triage_type, threshold_count FROM triage_pool_thresholds")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Register a new cron schedule entry for `(project, triage_type)`.
@@ -644,6 +843,20 @@ impl Store {
             .conn
             .execute("DELETE FROM triage_schedules WHERE id=?", params![id])?;
         Ok(n > 0)
+    }
+
+    /// Move one schedule row onto a different `project` key -- used only by
+    /// the RAL-318 startup pool-key repair pass
+    /// (`crate::reviews::repair_triage_pool_keys`).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn rekey_triage_schedule(&self, id: i64, new_project: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE triage_schedules SET project=? WHERE id=?",
+            params![new_project, id],
+        )?;
+        Ok(())
     }
 
     /// Advance a schedule's cursor by one cron occurrence (RAL-318's
@@ -876,6 +1089,76 @@ mod tests {
         Store::open_in_memory().expect("in-memory store")
     }
 
+    /// A real, existing directory for tests that need `std::fs::canonicalize`
+    /// to succeed (pool-key resolution normalizes via canonicalization).
+    fn real_tempdir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-triage-pool-key-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    #[test]
+    fn pool_key_for_path_prefers_registered_project_name_over_path() {
+        let s = store();
+        let dir = real_tempdir("prefers-name");
+        s.register_project("myproj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        assert_eq!(pool_key_for_path(&s, &dir), "myproj");
+    }
+
+    #[test]
+    fn pool_key_for_path_falls_back_to_normalized_path_when_unregistered() {
+        let s = store();
+        let dir = real_tempdir("unregistered-fallback");
+        let key = pool_key_for_path(&s, &dir);
+        assert_eq!(key, normalize_path_key(&dir));
+        assert!(
+            !key.contains('\\'),
+            "fallback key must be forward-slashed: {key:?}"
+        );
+    }
+
+    #[test]
+    fn pool_key_for_path_normalizes_slash_direction() {
+        let s = store();
+        let dir = real_tempdir("slash-direction");
+        // Register under whatever native separator the path already uses,
+        // then look the key up via a deliberately forward-slashed copy --
+        // the two must resolve to the identical registered name.
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        let forward_slashed = dir.to_string_lossy().replace('\\', "/");
+        assert_eq!(
+            pool_key_for_path(&s, std::path::Path::new(&forward_slashed)),
+            "proj"
+        );
+    }
+
+    #[test]
+    fn resolve_pool_key_input_resolves_a_known_project_name() {
+        let s = store();
+        let dir = real_tempdir("resolve-known-name");
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        assert_eq!(resolve_pool_key_input(&s, "proj"), "proj");
+    }
+
+    #[test]
+    fn resolve_pool_key_input_passes_through_an_unknown_string_unchanged() {
+        let s = store();
+        assert_eq!(
+            resolve_pool_key_input(&s, "C:/some/literal/pool/key"),
+            "C:/some/literal/pool/key"
+        );
+    }
+
     #[test]
     fn unclassified_type_always_exists_and_cannot_be_removed() {
         let s = store();
@@ -993,6 +1276,64 @@ mod tests {
         assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
         // The "perf" pool is untouched by draining "security".
         assert_eq!(s.triage_pool_count("proj", "perf").unwrap(), 1);
+    }
+
+    const POOL_CELL_FIXTURE: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n[[task.cell.proof]]\ncommand=\"cargo test\"\n";
+
+    #[test]
+    fn triage_pool_count_excludes_a_cell_whose_proof_failed() {
+        let mut s = store();
+        let file: TaskFile = toml::from_str(POOL_CELL_FIXTURE).unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b1", "main")
+            .unwrap();
+        assert_eq!(s.triage_pool_count("proj", "bug").unwrap(), 1);
+
+        s.set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        s.set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Failed)
+            .unwrap();
+        assert_eq!(
+            s.triage_pool_count("proj", "bug").unwrap(),
+            0,
+            "a cell whose proof failed must never count toward a threshold"
+        );
+    }
+
+    #[test]
+    fn drain_triage_pool_excludes_failed_cells_and_still_returns_viable_ones() {
+        let mut s = store();
+        let file: TaskFile = toml::from_str(POOL_CELL_FIXTURE).unwrap();
+        let failed_squad = s.insert_squad(&file, None, false).unwrap();
+        let ok_squad = s.insert_squad(&file, None, false).unwrap();
+        s.record_triage_pool_cell("proj", "bug", &failed_squad, 0, 0, "b1", "main")
+            .unwrap();
+        s.record_triage_pool_cell("proj", "bug", &ok_squad, 0, 0, "b2", "main")
+            .unwrap();
+
+        s.set_cell_state(&failed_squad, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        s.set_proof_state(
+            &failed_squad,
+            0,
+            "cell",
+            0,
+            0,
+            crate::store::NodeState::Failed,
+        )
+        .unwrap();
+        s.set_cell_state(&ok_squad, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        s.set_proof_state(&ok_squad, 0, "cell", 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+
+        let drained = s.drain_triage_pool("proj", "bug").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].squad_id, ok_squad);
+
+        // The failed row never resurfaces on a later drain of the same key.
+        assert_eq!(s.triage_pool_count("proj", "bug").unwrap(), 0);
+        assert!(s.drain_triage_pool("proj", "bug").unwrap().is_empty());
     }
 
     #[test]
@@ -1195,12 +1536,36 @@ mod tests {
         assert_eq!(candidates[0].task_name, "t");
         assert_eq!(candidates[0].project, "proj");
         assert_eq!(candidates[0].triage_types, vec!["security".to_string()]);
-        assert_eq!(candidates[0].state, "pending");
+        assert_eq!(candidates[0].status, "scheduled");
 
         // Once the cell is linked to an actual review, it drops off the list.
         s.set_cell_review_guardian(&squad_id, 0, 0, "guardian-1")
             .unwrap();
         assert!(s.triage_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn triage_candidates_status_reflects_a_failed_proof_not_the_raw_done_state() {
+        let mut s = store();
+        let src = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"security\"\n[[task.cell.proof]]\ncommand=\"cargo test\"\n";
+        let file: TaskFile = toml::from_str(src).unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
+            .unwrap();
+
+        // The scheduler sets `cells.state = done` as soon as the agent body
+        // finishes, before its own proof runs (RAL-64) -- the raw column
+        // alone would misreport this as "queued" (a live candidate).
+        s.set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        s.set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Failed)
+            .unwrap();
+        assert_eq!(s.triage_candidates().unwrap()[0].status, "failed");
+
+        // A passing proof instead reports "queued" -- a genuine live candidate.
+        s.set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        assert_eq!(s.triage_candidates().unwrap()[0].status, "queued");
     }
 
     #[test]

@@ -1259,7 +1259,7 @@
        * @property {string} cell_id
        * @property {string|null} cell_name
        * @property {string} project
-       * @property {string} state - This cell's raw stored state, not the effective state folding in proof-step outcomes.
+       * @property {"scheduled"|"queued"|"failed"} status - "scheduled" (not done yet), "queued" (done and viable, a live candidate for the next pool drain), or "failed" (done but its proof failed -- permanently excluded from ever being swept into an auto-review).
        * @property {string[]} triage_types
        */
       /**
@@ -1605,8 +1605,6 @@
       let triageError = "";
       /** @type {string|null} the project (display name) scoped by the open Projects-tab "auto-review thresholds" popup, or null when closed. */
       let projectTriageModalProject = null;
-      /** The resolved git worktree root path for `projectTriageModalProject` -- the actual Triage pool key (see `openProjectTriageThresholds`), not the display name. Empty when unresolved. */
-      let projectTriageModalPath = "";
       /** Message from the last failed action inside the open Projects-tab Triage-threshold popup. */
       let projectTriageModalError = "";
       /** @type {ProjectView[]} */
@@ -6666,28 +6664,39 @@
        * never opted into Triage (`s.triage_types` empty) -- `cellView()`
        * only calls this as the fallback when `s.reviews` is empty.
        *
-       * Two states, matching the cell's own `state` rather than any stored
-       * Triage/pool field (there's nothing to poll for beyond what
-       * `CellView` already carries): "scheduled" for a cell that hasn't
-       * reached `done` yet (pending, running, or failed -- nothing to
-       * meaningfully review), and "queued" once it has finished and is
-       * simply waiting on its Triage pool's count threshold or a cron
-       * schedule to fire. Both read the same `--arbiter` hue (this is the
-       * Arbiter/Triage subsystem's provenance color, not a distinct global
-       * status) and differ by icon/opacity/copy only.
+       * Three states, matching the cell's own `state` rather than any
+       * stored Triage/pool field (there's nothing to poll for beyond what
+       * `CellView` already carries -- and `CellView.state` is already the
+       * proof-aware effective state, not the raw persisted column): "failed"
+       * (permanently excluded -- a failed cell can never pass review, so it
+       * is never swept into an auto-review), "scheduled" for a cell that
+       * hasn't reached `done` yet (pending or running -- nothing to
+       * meaningfully review), and "queued" once it has finished and passed
+       * and is simply waiting on its Triage pool's count threshold or a cron
+       * schedule to fire. "scheduled"/"queued" read the same `--arbiter` hue
+       * (this is the Arbiter/Triage subsystem's provenance color, not a
+       * distinct global status) and differ by icon/opacity/copy only;
+       * "failed" reads the shared `--failed` status red instead.
        * @param {CellView} s
        * @returns {string}
        */
       function triagePlaceholderSection(s) {
         const types = s.triage_types || [];
         if (!types.length || (s.reviews || []).length) return "";
+        const typeList = types.join(", ");
+        if (s.state === "failed") {
+          const tip = `This cell opted into Triage (type(s): ${typeList}) but failed.\nA failed cell can never pass review, so it is permanently excluded from being swept into an automatic review.`;
+          return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
+            `<span><span class="dot" style="background:${cvar("--failed")}"></span></span>` +
+            `<span class="v" style="flex:1"><div>✗ Excluded (failed)</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(typeList)}</div></span>` +
+            `</div>`;
+        }
         const done = s.state === "done";
         const label = done ? "Queued for auto-review" : "Scheduled for auto-review";
         const icon = done ? "✓" : "⏳";
-        const typeList = types.join(", ");
         const tip = done
           ? `This cell finished and resolved to Triage type(s): ${typeList}.\nIt's pooled and waiting for that pool's count threshold or a cron schedule to fire -- once it does, the Arbiter drains the pool into a fresh review automatically.\nCheck the Triage tab for the pool's current count vs. threshold.`
-          : `This cell opted into Triage (type(s): ${typeList}) and is already pooled for an automatic review, but hasn't reached "done" yet.\nOnce it finishes, this will show "Queued for auto-review" instead -- a pending, running, or failed cell has nothing to contribute to a review yet.`;
+          : `This cell opted into Triage (type(s): ${typeList}) and is already pooled for an automatic review, but hasn't reached "done" yet.\nOnce it finishes, this will show "Queued for auto-review" instead -- a pending or running cell has nothing to contribute to a review yet.`;
         return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
           `<span style="opacity:${done ? "1" : "0.55"}"><span class="dot" style="background:${cvar("--arbiter")}"></span></span>` +
           `<span class="v" style="flex:1"><div>${icon} ${esc(label)}</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(typeList)}</div></span>` +
@@ -12831,20 +12840,25 @@ Work submitted against it will fail — fix the machine or deregister the provid
       /**
        * Renders the small status badge for one candidate row describing its
        * relationship to Triage, not its own cell state: "Scheduled" (opted
-       * in, not done yet -- nothing to sweep into a review) or "Queued"
-       * (done, just waiting on its pool's count threshold or a cron
-       * schedule). Mirrors `triagePlaceholderSection()`'s per-cell
-       * placeholder wording/color, compacted for a table cell.
+       * in, not done yet -- nothing to sweep into a review), "Queued" (done
+       * and viable, waiting on its pool's count threshold or a cron
+       * schedule), or "Excluded (failed)" (done, but its proof failed --
+       * permanently barred from ever being swept into an auto-review; see
+       * `Store::drain_triage_pool`). Mirrors `triagePlaceholderSection()`'s
+       * per-cell placeholder wording/color, compacted for a table cell.
        * @param {TriageCandidateView} c
        * @returns {string}
        */
       function triageCandidateStatusBadge(c) {
-        const done = c.state === "done";
+        if (c.status === "failed") {
+          return `<span class="badge" style="color:var(--failed);border-color:var(--failed);font-size:11px" data-tip="This cell's proof failed -- a failed cell can never pass review, so it is permanently excluded from being swept into an automatic review.">✗ Excluded (failed)</span>`;
+        }
+        const done = c.status === "queued";
         const label = done ? "Queued" : "Scheduled";
         const icon = done ? "✓" : "⏳";
         const tip = done
-          ? "This cell finished and is pooled, waiting for its Triage pool's count threshold or a cron schedule to fire."
-          : `This cell opted into Triage but hasn't reached "done" yet (state: ${esc(c.state)}) -- it can't be swept into an automatic review until it finishes.`;
+          ? "This cell finished and passed, and is pooled, waiting for its Triage pool's count threshold or a cron schedule to fire."
+          : "This cell opted into Triage but hasn't finished yet -- it can't be swept into an automatic review until it finishes.";
         return `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px;opacity:${done ? "1" : "0.7"}" data-tip="${tip}">${icon} ${label}</span>`;
       }
       /**
@@ -13576,18 +13590,15 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * Triage tab's own `triageTypes`/`triagePools` state first so the
        * popup reflects the latest registered types and pool counts.
        *
-       * A Triage pool's `project` key is the cell's git worktree root path
-       * (see the daemon's `worktree_project`), NOT this registered project's
-       * short `name` -- the two are different concepts that happen to share
-       * a label. `projectTriageModalPath` resolves that once at open time so
-       * every filter/API call below targets the pool key cells actually get
-       * pooled under, instead of a name that would never match.
+       * The daemon resolves this registered project's name to its actual
+       * Triage pool key server-side (falling back to a normalized worktree
+       * path only for cells under an unregistered project), so this popup
+       * only ever needs to pass `projectName` through as-is.
        * @param {string} projectName
        * @returns {Promise<void>}
        */
       async function openProjectTriageThresholds(projectName) {
         projectTriageModalProject = projectName;
-        projectTriageModalPath = projects.find((p) => p.name === projectName)?.path || "";
         projectTriageModalError = "";
         await pollTriage();
         renderProjectTriageModal();
@@ -13598,7 +13609,6 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function closeProjectTriageModal() {
         projectTriageModalProject = null;
-        projectTriageModalPath = "";
         closeModal();
       }
       /**
@@ -13611,8 +13621,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
       function renderProjectTriageModal() {
         const projectName = projectTriageModalProject;
         if (!projectName) return;
-        const path = projectTriageModalPath;
-        const rows = triagePools.filter((p) => p.project === path);
+        const rows = triagePools.filter((p) => p.project === projectName);
         const rowsHtml = rows.length
           ? rows.map((p) => {
               const thresholdVal = p.threshold === null || p.threshold === undefined ? "" : String(p.threshold);
@@ -13628,9 +13637,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           : `<tr><td colspan="3" class="empty">No thresholds configured yet.</td></tr>`;
         const usedTypes = new Set(rows.map((p) => p.triage_type));
         const addableTypes = triageTypes.filter((t) => !usedTypes.has(t.name));
-        const addSection = !path
-          ? `<div class="empty" style="margin-top:12px">This project's registered path could not be resolved -- refresh the Projects tab and try again.</div>`
-          : addableTypes.length
+        const addSection = addableTypes.length
           ? `<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px">
               <select id="ptm-add-type" style="width:180px" data-tip="Which registered Triage type this threshold applies to. Register new types on the Triage tab.">
                 ${addableTypes.map((t) => `<option value="${esc(t.name)}">${esc(t.label || t.name)}</option>`).join("")}
@@ -13662,8 +13669,8 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {Promise<void>}
        */
       async function saveProjectTriageThreshold(e, triageType) {
-        const path = projectTriageModalPath;
-        if (!path) return;
+        const projectName = projectTriageModalProject;
+        if (!projectName) return;
         const input = /** @type {HTMLInputElement|null} */ (document.getElementById(`ptm-threshold-${triageType}`));
         const raw = input ? input.value.trim() : "";
         if (raw !== "" && (!/^\d+$/.test(raw) || Number(raw) < 1)) {
@@ -13675,7 +13682,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           const r = await fetch("/api/triage/pools/threshold", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ project: path, triage_type: triageType, threshold: raw === "" ? null : Number(raw) }),
+            body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: raw === "" ? null : Number(raw) }),
           });
           projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
@@ -13688,8 +13695,8 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {Promise<void>}
        */
       async function addProjectTriageThreshold() {
-        const path = projectTriageModalPath;
-        if (!path) return;
+        const projectName = projectTriageModalProject;
+        if (!projectName) return;
         const typeSel = /** @type {HTMLSelectElement|null} */ (document.getElementById("ptm-add-type"));
         const thresholdInput = /** @type {HTMLInputElement|null} */ (document.getElementById("ptm-add-threshold"));
         const triageType = typeSel ? typeSel.value : "";
@@ -13703,7 +13710,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           const r = await fetch("/api/triage/pools/threshold", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ project: path, triage_type: triageType, threshold: Number(raw) }),
+            body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: Number(raw) }),
           });
           projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
         } catch (err) { projectTriageModalError = "daemon unreachable"; }

@@ -716,15 +716,47 @@ const TRIAGE_TYPE_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
-const TRIAGE_CHILDREN: &[HelpNode] = &[node(
-    "type",
-    &[],
-    &[],
-    "Register and inspect Triage types (RAL-318).",
-    false,
-    false,
-    TRIAGE_TYPE_CHILDREN,
-)];
+const TRIAGE_POOL_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[],
+        "List every Triage pool key with pooled cells and/or a configured count threshold, plus its resolved project name (RAL-318).",
+        false,
+        true, // ("triage", "pool", "list")
+        &[],
+    ),
+    node(
+        "threshold",
+        &["project [str]", "triage_type [str]"],
+        &["--threshold [integer]", "--clear"],
+        "Set (or --clear) the count threshold for a (project, triage_type) pool -- once it holds this many cells, it drains into a fresh review (RAL-318).",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const TRIAGE_CHILDREN: &[HelpNode] = &[
+    node(
+        "pool",
+        &[],
+        &[],
+        "Inspect and configure Triage auto-review pools (RAL-318).",
+        false,
+        false,
+        TRIAGE_POOL_CHILDREN,
+    ),
+    node(
+        "type",
+        &[],
+        &[],
+        "Register and inspect Triage types (RAL-318).",
+        false,
+        false,
+        TRIAGE_TYPE_CHILDREN,
+    ),
+];
 
 const MACHINE_CHILDREN: &[HelpNode] = &[
     node(

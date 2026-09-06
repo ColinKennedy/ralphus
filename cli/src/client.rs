@@ -471,6 +471,26 @@ impl DaemonClient {
         self.delete(&format!("/api/triage/types/{name}"))
     }
 
+    /// `ralphus triage pool list` (RAL-318): every `(project, triage_type)`
+    /// pool key with pooled cells and/or a configured count threshold.
+    pub fn list_triage_pools(&self) -> Result<Value, DaemonError> {
+        self.get("/api/triage/pools")
+    }
+
+    /// `ralphus triage pool threshold` (RAL-318). `threshold: None` clears a
+    /// previously configured threshold.
+    pub fn set_triage_pool_threshold(
+        &self,
+        project: &str,
+        triage_type: &str,
+        threshold: Option<i64>,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            "/api/triage/pools/threshold",
+            Some(json!({"project": project, "triage_type": triage_type, "threshold": threshold})),
+        )
+    }
+
     /// `ralphus check health`'s live Arbiter round-trip (RAL-318).
     pub fn health_arbiter(&self) -> Result<Value, DaemonError> {
         self.post("/api/health/arbiter", None)
