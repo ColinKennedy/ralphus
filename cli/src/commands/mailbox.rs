@@ -24,16 +24,16 @@ pub enum MailboxCommand {
         message_ids: Option<Vec<String>>,
         user: Option<String>,
     },
-    Follow {
+    Watch {
         entity_uri: String,
         tiers: Vec<String>,
         user: Option<String>,
     },
-    Unfollow {
+    Unwatch {
         entity_uri: String,
         user: Option<String>,
     },
-    Follows {
+    Watches {
         user: Option<String>,
     },
     Preferences {
@@ -41,7 +41,7 @@ pub enum MailboxCommand {
     },
     SetPreferences {
         user: String,
-        auto_follow: bool,
+        auto_watch: bool,
         tiers: Vec<String>,
     },
     UsageError(String),
@@ -85,7 +85,7 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 user,
             }
         }
-        Some("follow") => {
+        Some("watch") => {
             let tiers = match scanner.take_repeated("--tier") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
@@ -95,30 +95,30 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
             match scanner.remaining().into_iter().next() {
-                Some(entity_uri) => MailboxCommand::Follow {
+                Some(entity_uri) => MailboxCommand::Watch {
                     entity_uri,
                     tiers,
                     user,
                 },
-                None => MailboxCommand::UsageError("follow requires <entity-uri>".to_string()),
+                None => MailboxCommand::UsageError("watch requires <entity-uri>".to_string()),
             }
         }
-        Some("unfollow") => {
+        Some("unwatch") => {
             let user = match scanner.take_value("--user") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
             match scanner.remaining().into_iter().next() {
-                Some(entity_uri) => MailboxCommand::Unfollow { entity_uri, user },
-                None => MailboxCommand::UsageError("unfollow requires <entity-uri>".to_string()),
+                Some(entity_uri) => MailboxCommand::Unwatch { entity_uri, user },
+                None => MailboxCommand::UsageError("unwatch requires <entity-uri>".to_string()),
             }
         }
-        Some("follows") => {
+        Some("watches") => {
             let user = match scanner.take_value("--user") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            MailboxCommand::Follows { user }
+            MailboxCommand::Watches { user }
         }
         Some("preferences") => {
             let user = match scanner.take_value("--user") {
@@ -137,28 +137,28 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            let auto_follow_on = scanner.take_bool("--auto-follow");
-            let auto_follow_off = scanner.take_bool("--no-auto-follow");
+            let auto_watch_on = scanner.take_bool("--auto-watch");
+            let auto_watch_off = scanner.take_bool("--no-auto-watch");
             let tiers = match scanner.take_repeated("--tier") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            let auto_follow = match (auto_follow_on, auto_follow_off) {
+            let auto_watch = match (auto_watch_on, auto_watch_off) {
                 (true, false) => Some(true),
                 (false, true) => Some(false),
                 _ => None,
             };
-            match (user, auto_follow) {
-                (Some(user), Some(auto_follow)) => MailboxCommand::SetPreferences {
+            match (user, auto_watch) {
+                (Some(user), Some(auto_watch)) => MailboxCommand::SetPreferences {
                     user,
-                    auto_follow,
+                    auto_watch,
                     tiers,
                 },
                 (None, _) => {
                     MailboxCommand::UsageError("set-preferences requires --user <name>".to_string())
                 }
                 (_, None) => MailboxCommand::UsageError(
-                    "set-preferences requires exactly one of --auto-follow/--no-auto-follow"
+                    "set-preferences requires exactly one of --auto-watch/--no-auto-watch"
                         .to_string(),
                 ),
             }
@@ -212,31 +212,31 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
-        MailboxCommand::Follow {
+        MailboxCommand::Watch {
             entity_uri,
             tiers,
             user,
         } => run_and_report(opts, None, || {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            let result = client.create_follow(&entity_uri, tiers_opt, user.as_deref())?;
+            let result = client.create_watch(&entity_uri, tiers_opt, user.as_deref())?;
             emit(opts, &result, |v| {
                 println!(
-                    "followed {}",
+                    "watching {}",
                     v["entity_uri"].as_str().unwrap_or(&entity_uri)
                 );
             });
             Ok(())
         }),
-        MailboxCommand::Unfollow { entity_uri, user } => {
-            run_and_report(opts, Some("ralphus mailbox follows"), || {
-                let result = client.delete_follow(&entity_uri, user.as_deref())?;
-                emit(opts, &result, |_| println!("unfollowed {entity_uri}"));
+        MailboxCommand::Unwatch { entity_uri, user } => {
+            run_and_report(opts, Some("ralphus mailbox watches"), || {
+                let result = client.delete_watch(&entity_uri, user.as_deref())?;
+                emit(opts, &result, |_| println!("unwatched {entity_uri}"));
                 Ok(())
             })
         }
-        MailboxCommand::Follows { user } => run_and_report(opts, None, || {
-            let result = client.list_follows(user.as_deref())?;
-            emit(opts, &result, render_follows);
+        MailboxCommand::Watches { user } => run_and_report(opts, None, || {
+            let result = client.list_watches(user.as_deref())?;
+            emit(opts, &result, render_watches);
             Ok(())
         }),
         MailboxCommand::Preferences { user } => run_and_report(opts, None, || {
@@ -246,11 +246,11 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
         }),
         MailboxCommand::SetPreferences {
             user,
-            auto_follow,
+            auto_watch,
             tiers,
         } => run_and_report(opts, None, || {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            let result = client.set_user_preferences(&user, auto_follow, tiers_opt)?;
+            let result = client.set_user_preferences(&user, auto_watch, tiers_opt)?;
             emit(opts, &result, render_preferences);
             Ok(())
         }),
@@ -310,13 +310,13 @@ fn render_messages(messages: &Value) {
     }
 }
 
-fn render_follows(result: &Value) {
-    let follows = result["follows"].as_array().cloned().unwrap_or_default();
-    if follows.is_empty() {
-        println!("no follows");
+fn render_watches(result: &Value) {
+    let watches = result["watches"].as_array().cloned().unwrap_or_default();
+    if watches.is_empty() {
+        println!("no watches");
         return;
     }
-    for f in &follows {
+    for f in &watches {
         let tiers = f["notify_tiers"]
             .as_array()
             .map(|a| {
@@ -346,9 +346,9 @@ fn render_preferences(u: &Value) {
         })
         .unwrap_or_default();
     println!(
-        "{}: auto_follow={} default_notify_tiers=[{}]",
+        "{}: auto_watch={} default_notify_tiers=[{}]",
         u["name"].as_str().unwrap_or_default(),
-        u["auto_follow"].as_bool().unwrap_or(false),
+        u["auto_watch"].as_bool().unwrap_or(false),
         tiers
     );
 }
@@ -428,9 +428,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_follow_with_entity_uri_and_tiers() {
+    fn parses_watch_with_entity_uri_and_tiers() {
         match parse(&v(&[
-            "follow",
+            "watch",
             "--tier",
             "urgent",
             "--tier",
@@ -439,7 +439,7 @@ mod tests {
             "colin",
             "squad:squad-1",
         ])) {
-            MailboxCommand::Follow {
+            MailboxCommand::Watch {
                 entity_uri,
                 tiers,
                 user,
@@ -453,14 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn follow_without_entity_uri_is_usage_error() {
-        matches!(parse(&v(&["follow"])), MailboxCommand::UsageError(_));
+    fn watch_without_entity_uri_is_usage_error() {
+        matches!(parse(&v(&["watch"])), MailboxCommand::UsageError(_));
     }
 
     #[test]
-    fn parses_unfollow() {
-        match parse(&v(&["unfollow", "squad:squad-1"])) {
-            MailboxCommand::Unfollow { entity_uri, user } => {
+    fn parses_unwatch() {
+        match parse(&v(&["unwatch", "squad:squad-1"])) {
+            MailboxCommand::Unwatch { entity_uri, user } => {
                 assert_eq!(entity_uri, "squad:squad-1");
                 assert_eq!(user, None);
             }
@@ -469,9 +469,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_follows_listing() {
-        match parse(&v(&["follows", "--user", "colin"])) {
-            MailboxCommand::Follows { user } => assert_eq!(user.as_deref(), Some("colin")),
+    fn parses_watches_listing() {
+        match parse(&v(&["watches", "--user", "colin"])) {
+            MailboxCommand::Watches { user } => assert_eq!(user.as_deref(), Some("colin")),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -486,30 +486,30 @@ mod tests {
     }
 
     #[test]
-    fn set_preferences_requires_user_and_auto_follow_choice() {
+    fn set_preferences_requires_user_and_auto_watch_choice() {
         matches!(
             parse(&v(&["set-preferences", "--user", "colin"])),
             MailboxCommand::UsageError(_)
         );
         matches!(
-            parse(&v(&["set-preferences", "--auto-follow"])),
+            parse(&v(&["set-preferences", "--auto-watch"])),
             MailboxCommand::UsageError(_)
         );
         match parse(&v(&[
             "set-preferences",
             "--user",
             "colin",
-            "--auto-follow",
+            "--auto-watch",
             "--tier",
             "urgent",
         ])) {
             MailboxCommand::SetPreferences {
                 user,
-                auto_follow,
+                auto_watch,
                 tiers,
             } => {
                 assert_eq!(user, "colin");
-                assert!(auto_follow);
+                assert!(auto_watch);
                 assert_eq!(tiers, v(&["urgent"]));
             }
             other => panic!("unexpected: {other:?}"),
@@ -518,9 +518,9 @@ mod tests {
             "set-preferences",
             "--user",
             "colin",
-            "--no-auto-follow",
+            "--no-auto-watch",
         ])) {
-            MailboxCommand::SetPreferences { auto_follow, .. } => assert!(!auto_follow),
+            MailboxCommand::SetPreferences { auto_watch, .. } => assert!(!auto_watch),
             other => panic!("unexpected: {other:?}"),
         }
     }

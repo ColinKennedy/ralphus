@@ -31,11 +31,11 @@ pub struct UserView {
     pub name: String,
     /// Registration time (Unix epoch milliseconds).
     pub created_at_ms: i64,
-    /// RAL-320: when set, `ralphus submit` auto-follows every entity this
+    /// RAL-320: when set, `ralphus submit` auto-watches every entity this
     /// user submits, using `default_notify_tiers` below.
-    pub auto_follow: bool,
-    /// RAL-320: the tier set a new follow defaults to when the caller
-    /// doesn't specify one explicitly (including auto-follow-on-submit).
+    pub auto_watch: bool,
+    /// RAL-320: the tier set a new watch defaults to when the caller
+    /// doesn't specify one explicitly (including auto-watch-on-submit).
     pub default_notify_tiers: Vec<MailboxPriority>,
     /// RAL-332: UI-level convenience gate (admin-only tabs, Cartographer
     /// row visibility) -- see this module's doc comment for why it is not a
@@ -44,13 +44,13 @@ pub struct UserView {
 }
 
 /// Shared row-mapper for `users` queries that select
-/// `name, created_at_ms, auto_follow, default_notify_tiers, is_admin` in that order.
+/// `name, created_at_ms, auto_watch, default_notify_tiers, is_admin` in that order.
 fn row_to_user_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserView> {
     let tiers_csv: String = r.get(3)?;
     Ok(UserView {
         name: r.get(0)?,
         created_at_ms: r.get(1)?,
-        auto_follow: r.get(2)?,
+        auto_watch: r.get(2)?,
         default_notify_tiers: mailbox::parse_tiers(&tiers_csv),
         is_admin: r.get::<_, i64>(4)? != 0,
     })
@@ -95,7 +95,7 @@ impl Store {
     pub fn get_user(&self, name: &str) -> StoreResult<Option<UserView>> {
         self.conn
             .query_row(
-                "SELECT name, created_at_ms, auto_follow, default_notify_tiers, is_admin FROM users WHERE name=?",
+                "SELECT name, created_at_ms, auto_watch, default_notify_tiers, is_admin FROM users WHERE name=?",
                 rusqlite::params![name],
                 row_to_user_view,
             )
@@ -119,7 +119,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn list_users(&self) -> StoreResult<Vec<UserView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at_ms, auto_follow, default_notify_tiers, is_admin FROM users
+            "SELECT name, created_at_ms, auto_watch, default_notify_tiers, is_admin FROM users
              ORDER BY created_at_ms DESC, name",
         )?;
         let rows = stmt
@@ -129,7 +129,7 @@ impl Store {
     }
 
     /// Register `name` if it isn't already, otherwise a no-op — used by
-    /// call sites (e.g. [`Store::create_follow`]) that want "just make sure
+    /// call sites (e.g. [`Store::create_watch`]) that want "just make sure
     /// this user exists" without caring whether it's the first time.
     ///
     /// # Errors
@@ -139,25 +139,25 @@ impl Store {
     }
 
     /// Set `name`'s notification preferences (RAL-320) -- registers the user
-    /// first if needed, same as [`Store::create_follow`].
+    /// first if needed, same as [`Store::create_watch`].
     ///
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn set_user_preferences(
         &self,
         name: &str,
-        auto_follow: bool,
+        auto_watch: bool,
         default_notify_tiers: &[MailboxPriority],
     ) -> StoreResult<UserView> {
         self.ensure_user_row(name)?;
         let tiers_csv = mailbox::tiers_to_csv(default_notify_tiers);
         self.conn.execute(
-            "UPDATE users SET auto_follow=?1, default_notify_tiers=?2 WHERE name=?3",
-            rusqlite::params![auto_follow, tiers_csv, name],
+            "UPDATE users SET auto_watch=?1, default_notify_tiers=?2 WHERE name=?3",
+            rusqlite::params![auto_watch, tiers_csv, name],
         )?;
         crate::rlog!(
             INFO,
-            "ralphus [store] {name:?} notification preferences updated (auto_follow={auto_follow})"
+            "ralphus [store] {name:?} notification preferences updated (auto_watch={auto_watch})"
         );
         self.get_user(name)?.ok_or(StoreError::NotFound)
     }

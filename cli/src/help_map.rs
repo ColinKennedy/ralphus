@@ -868,7 +868,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
             "--unread",
             "--user [name]",
         ],
-        "List the acting user's personal mailbox messages, filtered through their follows \
+        "List the acting user's personal mailbox messages, filtered through their watches \
          (RAL-320).",
         false,
         true, // read-only: lists messages, never marks them read.
@@ -884,29 +884,29 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
-        "follow",
+        "watch",
         &["entity_uri [str]"],
         &["--tier [urgent|high|normal...]", "--user [name]"],
-        "Follow an entity (squad/task/cell/proof/review/review-worktree) so its notifications \
-         reach the mailbox; re-following updates the notification tiers in place (RAL-320).",
+        "Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications \
+         reach the mailbox; re-watching updates the notification tiers in place (RAL-320).",
         false,
-        false, // creates/updates a follow.
+        false, // creates/updates a watch.
         &[],
     ),
     node(
-        "unfollow",
+        "unwatch",
         &["entity_uri [str]"],
         &["--user [name]"],
-        "Stop following an entity (RAL-320).",
+        "Stop watching an entity (RAL-320).",
         false,
-        false, // deletes a follow.
+        false, // deletes a watch.
         &[],
     ),
     node(
-        "follows",
+        "watches",
         &[],
         &["--user [name]"],
-        "List the acting user's follows (RAL-320).",
+        "List the acting user's watches (RAL-320).",
         false,
         true, // read-only listing.
         &[],
@@ -915,7 +915,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         "preferences",
         &[],
         &["--user [name]"],
-        "Show a user's notification preferences: auto-follow and default notify tiers (RAL-320).",
+        "Show a user's notification preferences: auto-watch and default notify tiers (RAL-320).",
         false,
         true, // read-only.
         &[],
@@ -925,12 +925,12 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         &[],
         &[
             "--user [name]",
-            "--auto-follow",
-            "--no-auto-follow",
+            "--auto-watch",
+            "--no-auto-watch",
             "--tier [urgent|high|normal...]",
         ],
-        "Set a user's auto-follow and default notification-tier preferences; requires exactly \
-         one of --auto-follow/--no-auto-follow (RAL-320).",
+        "Set a user's auto-watch and default notification-tier preferences; requires exactly \
+         one of --auto-watch/--no-auto-watch (RAL-320).",
         false,
         false, // mutates stored preferences.
         &[],
@@ -1586,7 +1586,7 @@ tailing and --wait-until-valid are not yet ported).",
             &[],
             &[],
             "Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for \
-             attention. Also personal follows and notification preferences layered over the \
+             attention. Also personal watches and notification preferences layered over the \
              same mailbox (RAL-320).",
             false,
             false,

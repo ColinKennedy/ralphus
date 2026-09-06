@@ -1591,10 +1591,10 @@ impl Store {
             "DELETE FROM guardian_input_resolutions WHERE guardian_id=?",
             params![id],
         )?;
-        // RAL-320: follows are keyed by `EntityUri` string, not a `guardian_id`
-        // FK column, so a deleted review's follows need an explicit sweep.
+        // RAL-320: watches are keyed by `EntityUri` string, not a `guardian_id`
+        // FK column, so a deleted review's watches need an explicit sweep.
         self.conn.execute(
-            "DELETE FROM follows WHERE entity_uri = 'guardian:'||?1",
+            "DELETE FROM watches WHERE entity_uri = 'guardian:'||?1",
             params![id],
         )?;
         let n = self

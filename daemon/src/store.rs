@@ -805,6 +805,43 @@ impl Store {
             )
             .unwrap_or(0)
             > 0;
+        // RAL-364: `follows` was renamed to `watches`. The `CREATE TABLE IF
+        // NOT EXISTS watches` inside the batch below would otherwise create
+        // an empty `watches` table on a database that still has the old
+        // `follows` table populated; a migration attempted *after* that
+        // (e.g. `ALTER TABLE follows RENAME TO watches`) would then fail
+        // with "table watches already exists" -- silently, since every
+        // migration statement below is wrapped in `let _ =`. So this has to
+        // run as a copy-and-drop *before* the batch instead, guarded so it
+        // only fires once (on the next call `follows` is gone and this
+        // block is skipped).
+        let follows_table_preexisting: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='follows'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if follows_table_preexisting {
+            let _ = self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS watches (
+                    id            TEXT PRIMARY KEY,
+                    user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                    entity_uri    TEXT NOT NULL,
+                    notify_tiers  TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    UNIQUE (user_name, entity_uri)
+                );
+                INSERT INTO watches SELECT * FROM follows;
+                UPDATE watches SET id = REPLACE(id, 'follow-', 'watch-');
+                UPDATE meta SET key = 'watch_seq' WHERE key = 'follow_seq';
+                DROP TABLE follows;
+                ",
+            );
+        }
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -1033,7 +1070,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS users (
                 name                  TEXT PRIMARY KEY,
                 created_at_ms         INTEGER NOT NULL,
-                auto_follow           INTEGER NOT NULL DEFAULT 0,
+                auto_watch            INTEGER NOT NULL DEFAULT 0,
                 default_notify_tiers  TEXT NOT NULL DEFAULT 'urgent,high,normal'
             );
             -- RAL-328: view preferences are scoped to a registered user and
@@ -1226,12 +1263,15 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_user_mailbox_drains_user ON user_mailbox_drains(user_name);
             -- RAL-320: a user's personal subscription to an `EntityUri`
-            -- (squad/task/cell/proof/review/review-worktree). Following a
+            -- (squad/task/cell/proof/review/review-worktree). Watching a
             -- parent cascades to its children via `EntityUri::covers()` at
             -- read time -- no expansion is stored here. `notify_tiers` is a
-            -- per-follow override of which `MailboxPriority` tiers reach the
-            -- follower (see `crate::mailbox::{parse_tiers, tiers_to_csv}`).
-            CREATE TABLE IF NOT EXISTS follows (
+            -- per-watch override of which `MailboxPriority` tiers reach the
+            -- watcher (see `crate::mailbox::{parse_tiers, tiers_to_csv}`).
+            -- RAL-343 describes this same entity-subscription concept under
+            -- the name \"Monitor\"; if/when it's built, it should reuse this
+            -- table rather than add a parallel data model.
+            CREATE TABLE IF NOT EXISTS watches (
                 id            TEXT PRIMARY KEY,
                 user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
                 entity_uri    TEXT NOT NULL,
@@ -1239,7 +1279,7 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 UNIQUE (user_name, entity_uri)
             );
-            CREATE INDEX IF NOT EXISTS idx_follows_user ON follows(user_name);
+            CREATE INDEX IF NOT EXISTS idx_watches_user ON watches(user_name);
             -- Ark escalation dedup is entity-scoped and durable. Mailbox
             -- drain state is client-scoped and cannot provide this guarantee.
             CREATE TABLE IF NOT EXISTS ark_notifications (
@@ -1666,6 +1706,10 @@ impl Store {
             "ALTER TABLE proofs RENAME COLUMN claude_session_id TO agent_session_id",
             "ALTER TABLE guardian_branches RENAME COLUMN resolver_claude_session_id TO resolver_agent_session_id",
             "ALTER TABLE guardians RENAME COLUMN manual_commands_claude_session_id TO manual_commands_agent_session_id",
+            // RAL-364: `follows` was renamed to `watches`; same best-effort
+            // rename/fallback-ADD-COLUMN idiom as the `*claude_session_id`
+            // columns above.
+            "ALTER TABLE users RENAME COLUMN auto_follow TO auto_watch",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1906,16 +1950,16 @@ impl Store {
             // every existing/manually-created row).
             "ALTER TABLE guardians ADD COLUMN origin TEXT NOT NULL DEFAULT 'explicit'",
             // RAL-320: the `EntityUri` a mailbox message is about, so a
-            // user's personal follows can match against it (see
+            // user's personal watches can match against it (see
             // `crate::mailbox::personal_mailbox_messages_for_user`). NULL for
             // pre-RAL-320 rows and for messages with no addressable entity.
             "ALTER TABLE mailbox_messages ADD COLUMN entity_uri TEXT",
             // RAL-320: per-user preference, consulted by the `ralphus submit`
-            // auto-follow hook -- when set, every entity a user submits is
-            // followed automatically using `default_notify_tiers` below.
-            "ALTER TABLE users ADD COLUMN auto_follow INTEGER NOT NULL DEFAULT 0",
+            // auto-watch hook -- when set, every entity a user submits is
+            // watched automatically using `default_notify_tiers` below.
+            "ALTER TABLE users ADD COLUMN auto_watch INTEGER NOT NULL DEFAULT 0",
             // RAL-320: the `MailboxPriority` tier set (CSV, see
-            // `crate::mailbox::{parse_tiers, tiers_to_csv}`) a new follow
+            // `crate::mailbox::{parse_tiers, tiers_to_csv}`) a new watch
             // defaults to when the caller doesn't specify one explicitly.
             "ALTER TABLE users ADD COLUMN default_notify_tiers TEXT NOT NULL DEFAULT 'urgent,high,normal'",
             // RAL-375: feedback text still awaiting application by
@@ -6239,11 +6283,11 @@ impl Store {
             "DELETE FROM mailbox_messages WHERE squad_id=?",
             params![squad_id],
         )?;
-        // RAL-320: follows are keyed by `EntityUri` string, not a `squad_id`
-        // FK column, so a deleted squad's follows (and its tasks'/cells'/
+        // RAL-320: watches are keyed by `EntityUri` string, not a `squad_id`
+        // FK column, so a deleted squad's watches (and its tasks'/cells'/
         // proofs') need an explicit sweep rather than `ON DELETE CASCADE`.
         tx.execute(
-            "DELETE FROM follows WHERE entity_uri = 'squad:'||?1
+            "DELETE FROM watches WHERE entity_uri = 'squad:'||?1
                 OR entity_uri LIKE 'task:'||?1||':%'
                 OR entity_uri LIKE 'cell:'||?1||':%'
                 OR entity_uri LIKE 'proof:'||?1||':%'",
@@ -6731,7 +6775,7 @@ impl Store {
     }
 
     /// Resolve `(squad_id, task_name, cell_sid)` into a `cell:...`
-    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 follows can match
+    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 watches can match
     /// against it. `None` when the triple doesn't match a row — mirrors
     /// [`Self::set_cell_agent_session_id_live`]'s same best-effort lookup.
     #[must_use]
@@ -6763,7 +6807,7 @@ impl Store {
     }
 
     /// Resolve `(squad_id, task_name)` into a `task:...`
-    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 follows can match
+    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 watches can match
     /// against it. `None` when the pair doesn't match a row.
     #[must_use]
     pub fn task_entity_uri(&self, squad_id: &str, task_name: &str) -> Option<String> {
@@ -8119,6 +8163,119 @@ command = "cargo test"
         assert!(
             !old_column_still_exists,
             "old claude_session_id column should have been renamed away, not left behind"
+        );
+    }
+
+    /// Same shape as `migration_renames_legacy_claude_session_id_columns`,
+    /// but for RAL-364's `follows` -> `watches` copy-and-drop migration and
+    /// the paired `auto_follow` -> `auto_watch` column rename: hand-rolls a
+    /// pre-migration database with the old table/column names and a real
+    /// row in each, runs `init_schema()` against it, and proves the row
+    /// (including its id and the `follow_seq` sequence counter) survives
+    /// under the new names rather than being stranded in a dropped table.
+    #[test]
+    fn migration_renames_legacy_follows_table_and_auto_follow_column() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE users (
+                name TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL,
+                auto_follow INTEGER NOT NULL DEFAULT 0,
+                is_admin INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+             );
+             CREATE TABLE follows (
+                id            TEXT PRIMARY KEY,
+                user_name     TEXT NOT NULL,
+                entity_uri    TEXT NOT NULL,
+                notify_tiers  TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+             );",
+        )
+        .expect("create legacy (pre-rename) schema");
+        conn.execute(
+            "INSERT INTO users (name, created_at_ms, auto_follow) VALUES ('colin', 1, 1)",
+            [],
+        )
+        .expect("insert legacy user row");
+        conn.execute("INSERT INTO meta (key, value) VALUES ('follow_seq', 1)", [])
+            .expect("insert legacy follow_seq counter");
+        conn.execute(
+            "INSERT INTO follows (id, user_name, entity_uri, notify_tiers, created_at_ms)
+             VALUES ('follow-000000000001', 'colin', 'squad:squad-1', 'urgent', 2)",
+            [],
+        )
+        .expect("insert legacy follow row");
+
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
+        };
+        store
+            .init_schema()
+            .expect("migration must succeed against a legacy schema");
+
+        let (id, entity_uri): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT id, entity_uri FROM watches WHERE user_name='colin'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("watches table must exist and hold the migrated row");
+        assert_eq!(id, "watch-000000000001", "row id prefix must be rewritten");
+        assert_eq!(entity_uri, "squad:squad-1");
+
+        let watch_seq: i64 = store
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='watch_seq'", [], |r| {
+                r.get(0)
+            })
+            .expect("watch_seq counter must exist and hold the migrated value");
+        assert_eq!(watch_seq, 1);
+
+        let auto_watch: bool = store
+            .conn
+            .query_row("SELECT auto_watch FROM users WHERE name='colin'", [], |r| {
+                r.get(0)
+            })
+            .expect("auto_watch column must exist and hold the migrated value");
+        assert!(auto_watch);
+
+        let old_table_still_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='follows'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("sqlite_master query must succeed")
+            .is_some();
+        assert!(
+            !old_table_still_exists,
+            "old follows table should have been dropped, not left behind"
+        );
+
+        let old_column_still_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('users') WHERE name='auto_follow'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("pragma_table_info query must succeed")
+            .is_some();
+        assert!(
+            !old_column_still_exists,
+            "old auto_follow column should have been renamed away, not left behind"
         );
     }
 

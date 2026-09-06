@@ -599,10 +599,10 @@ impl DaemonClient {
         self.post(&format!("/api/mailbox/{client_id}/drain"), Some(body))
     }
 
-    // ---- personal mailbox / follows / preferences (RAL-320) ------------
+    // ---- personal mailbox / watches / preferences (RAL-320) ------------
 
     /// `GET /api/mailbox/personal/messages` -- the acting user's personal
-    /// mailbox, filtered through their follows. `user` omitted falls back to
+    /// mailbox, filtered through their watches. `user` omitted falls back to
     /// `.ralphus.toml`'s `default_user` daemon-side.
     pub fn personal_mailbox_messages(
         &self,
@@ -632,16 +632,16 @@ impl DaemonClient {
         self.post(&format!("/api/mailbox/personal/drain{qs}"), Some(body))
     }
 
-    /// `GET /api/follows` -- every follow the acting user owns.
-    pub fn list_follows(&self, user: Option<&str>) -> Result<Value, DaemonError> {
+    /// `GET /api/watches` -- every watch the acting user owns.
+    pub fn list_watches(&self, user: Option<&str>) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
-        self.get(&format!("/api/follows{qs}"))
+        self.get(&format!("/api/watches{qs}"))
     }
 
-    /// `POST /api/follows` -- follow (or re-follow, updating tiers in place)
+    /// `POST /api/watches` -- watch (or re-watch, updating tiers in place)
     /// an entity URI on the acting user's behalf. `notify_tiers` omitted or
     /// empty defaults to the acting user's `default_notify_tiers` preference.
-    pub fn create_follow(
+    pub fn create_watch(
         &self,
         entity_uri: &str,
         notify_tiers: Option<&[String]>,
@@ -650,22 +650,18 @@ impl DaemonClient {
         let mut body = json!({"entity_uri": entity_uri});
         set_if_some(&mut body, "notify_tiers", notify_tiers.map(|t| json!(t)));
         let qs = query_string(&[("user", user.map(str::to_string))]);
-        self.post(&format!("/api/follows{qs}"), Some(body))
+        self.post(&format!("/api/watches{qs}"), Some(body))
     }
 
-    /// `DELETE /api/follows/{entity_uri}` -- `entity_uri` is interpolated raw
+    /// `DELETE /api/watches/{entity_uri}` -- `entity_uri` is interpolated raw
     /// (not urlencoded): the daemon's route matcher expects the literal
     /// colon-delimited URI as the path segment.
-    pub fn delete_follow(
-        &self,
-        entity_uri: &str,
-        user: Option<&str>,
-    ) -> Result<Value, DaemonError> {
+    pub fn delete_watch(&self, entity_uri: &str, user: Option<&str>) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
-        self.delete(&format!("/api/follows/{entity_uri}{qs}"))
+        self.delete(&format!("/api/watches/{entity_uri}{qs}"))
     }
 
-    /// `GET /api/users/{name}/preferences` -- unlike follows/personal
+    /// `GET /api/users/{name}/preferences` -- unlike watches/personal
     /// mailbox, this endpoint has no `default_user` fallback, so `name` is
     /// required.
     pub fn get_user_preferences(&self, name: &str) -> Result<Value, DaemonError> {
@@ -677,10 +673,10 @@ impl DaemonClient {
     pub fn set_user_preferences(
         &self,
         name: &str,
-        auto_follow: bool,
+        auto_watch: bool,
         default_notify_tiers: Option<&[String]>,
     ) -> Result<Value, DaemonError> {
-        let mut body = json!({"auto_follow": auto_follow});
+        let mut body = json!({"auto_watch": auto_watch});
         set_if_some(
             &mut body,
             "default_notify_tiers",
