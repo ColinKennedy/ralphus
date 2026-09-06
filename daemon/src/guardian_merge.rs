@@ -59,6 +59,8 @@ pub(crate) const RESOLVER_PROOF_TASK: &str = "resolve-proof";
 /// session name `generate_manual_commands` actually runs under.
 pub(crate) const MANUAL_COMMANDS_TASK: &str = "manual_commands";
 pub(crate) const MANUAL_COMMANDS_SESSION: &str = "manual-reviewer";
+const AUTO_BUILD_TASK: &str = "auto_build";
+const AUTO_BUILD_SESSION: &str = "auto-build";
 /// Task name for "set it for me" input resolution (RAL-164) -- see
 /// [`resolve_check_input`].
 pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
@@ -2760,16 +2762,14 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         }
         prev_ref = rev;
     }
-    match finalize_review(store, root, wt_base, id, &prev_ref, cancel) {
+    match finalize_review(store, runner, root, wt_base, id, &prev_ref, cancel) {
         Ok(note) => {
             // RAL-208: request a change-summary regen -- a no-op unless the
             // enabled-branch set actually changed since the last one (a plain
             // re-stack never does), and debounced when it did.
             queue_final_summary_regen(store, id);
-            // RAL-27/RAL-110: regenerate manual review commands after
-            // re-stacking, and try an AI-inferred auto-build if nothing else
-            // covered finalize-time verification.
-            let build_note = generate_manual_commands(
+            // RAL-27: regenerate manual review commands after re-stacking.
+            generate_manual_commands(
                 store,
                 runner,
                 id,
@@ -2783,7 +2783,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             // stack has settled, so the restacked downstream branches are not
             // mistaken for a manual push on the next maintenance sweep.
             snapshot_review_heads(store, id);
-            set_status(GuardianStatus::InReview, note.or(build_note).as_deref());
+            set_status(GuardianStatus::InReview, note.as_deref());
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
@@ -4012,7 +4012,6 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
 
     let mut last_combined: Option<String> = None;
     let mut last_root: Option<Workspace> = None;
-    let mut last_build_note: Option<String> = None;
     for proj in &project_order {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -4060,7 +4059,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
             Ok(combined_str) => {
                 last_combined = Some(combined_str);
                 last_root = Some(root.clone());
-                last_build_note = generate_manual_commands(
+                generate_manual_commands(
                     store,
                     runner,
                     id,
@@ -4082,7 +4081,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         return;
     }
     let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        match final_checks(store, id, root, combined_str, cancel) {
+        match final_checks(store, runner, id, root, combined_str, cancel) {
             Ok(n) => n,
             Err(e) => {
                 set_status(GuardianStatus::MergeFailed, Some(&e));
@@ -4098,10 +4097,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
     // RAL-208: debounced LLM change summary for the whole guardian, now that
     // every branch has finished rebuilding.
     queue_final_summary_regen(store, id);
-    set_status(
-        GuardianStatus::InReview,
-        note.or(last_build_note).as_deref(),
-    );
+    set_status(GuardianStatus::InReview, note.as_deref());
 }
 
 /// Build the review stack for a guardian (synchronous; called on a worker thread
@@ -4316,7 +4312,6 @@ pub fn run_merge_cancellable(
     // auto-build config resolution) across all projects, used for final checks.
     let mut last_combined: Option<String> = None;
     let mut last_root: Option<Workspace> = None;
-    let mut last_build_note: Option<String> = None;
 
     for (proj, proj_branches) in &project_branches {
         if cancel.is_cancelled() {
@@ -4506,12 +4501,9 @@ pub fn run_merge_cancellable(
                 let combined_wt = std::path::PathBuf::from(&combined_str);
                 last_combined = Some(combined_str);
                 last_root = Some(root.clone());
-                // RAL-27/RAL-110: regenerate manual review commands once the
-                // stack is ready, and try an AI-inferred auto-build for this
-                // project. Only the last project's note is surfaced below,
-                // matching the final-check-gates pass which also only covers
-                // the last project.
-                last_build_note = generate_manual_commands(
+                // RAL-27: regenerate manual review commands once the stack is
+                // ready for this project.
+                generate_manual_commands(
                     store,
                     runner,
                     id,
@@ -4535,7 +4527,7 @@ pub fn run_merge_cancellable(
     }
     // Run final check gates against the last combined worktree (all-projects pass).
     let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        match final_checks(store, id, root, combined_str, cancel) {
+        match final_checks(store, runner, id, root, combined_str, cancel) {
             Ok(n) => n,
             Err(e) => {
                 set_status(GuardianStatus::MergeFailed, Some(&e));
@@ -4554,10 +4546,7 @@ pub fn run_merge_cancellable(
     // summary covering the whole guardian, once, instead of the old
     // per-project unconditional call this replaced.
     queue_final_summary_regen(store, id);
-    set_status(
-        GuardianStatus::InReview,
-        note.or(last_build_note).as_deref(),
-    );
+    set_status(GuardianStatus::InReview, note.as_deref());
 }
 
 /// CCTL-156 skip-worktrees path: rebase every branch, in order, onto a single
@@ -4692,7 +4681,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         let _ = guard.set_guardian_combined_worktree(id, &wt_str);
     }
     regenerate_readme(store, root);
-    match final_checks(store, id, root, &wt_str, cancel) {
+    match final_checks(store, runner, id, root, &wt_str, cancel) {
         Ok(note) => {
             // RAL-208: the LLM change summary is no longer regenerated here on
             // every stack rebuild -- `run_merge` requests a (debounced) regen
@@ -4700,10 +4689,8 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             // never re-triggered by a rebuild that didn't add/remove/enable/
             // disable a branch (a feedback restack, a manual-push rebase, a
             // base-shift rebuild).
-            // RAL-27/RAL-110: generate manual review commands once the stack is
-            // ready, and try an AI-inferred auto-build if nothing else covered
-            // finalize-time verification.
-            let build_note = generate_manual_commands(
+            // RAL-27: generate manual review commands once the stack is ready.
+            generate_manual_commands(
                 store,
                 runner,
                 id,
@@ -4716,7 +4703,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             // RAL-92: baseline the shared review branch's tip (all branches share
             // it here) so the daemon's own build is not read as a manual push.
             snapshot_review_heads(store, id);
-            set_status(GuardianStatus::InReview, note.or(build_note).as_deref());
+            set_status(GuardianStatus::InReview, note.as_deref());
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
@@ -5240,16 +5227,14 @@ pub fn run_feedback(
         prev_ref = rev;
     }
 
-    match finalize_review(store, &root, &wt_base, id, &prev_ref, cancel) {
+    match finalize_review(store, runner, &root, &wt_base, id, &prev_ref, cancel) {
         Ok(note) => {
             // RAL-208: request a change-summary regen -- a no-op unless the
             // enabled-branch set actually changed since the last one (a
             // feedback restack never does), and debounced when it did.
             queue_final_summary_regen(store, id);
-            // RAL-27/RAL-110: regenerate manual review commands after the
-            // re-stack, and try an AI-inferred auto-build if nothing else
-            // covered finalize-time verification.
-            let build_note = generate_manual_commands(
+            // RAL-27: regenerate manual review commands after the re-stack.
+            generate_manual_commands(
                 store,
                 runner,
                 id,
@@ -5263,7 +5248,7 @@ pub fn run_feedback(
             // edited branch and its restacked downstream) are the reference for
             // future manual-push detection.
             snapshot_review_heads(store, id);
-            set_status(GuardianStatus::InReview, note.or(build_note).as_deref());
+            set_status(GuardianStatus::InReview, note.as_deref());
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
@@ -6063,17 +6048,17 @@ fn stack_pick(
 }
 
 /// Rebuild the combined review worktree at `prev_ref` and run the *deterministic*
-/// check gates (see [`final_checks`] for the full RAL-110 precedence — this does
-/// not attempt the AI-inferred build tier; that runs alongside
-/// [`generate_manual_commands`] at each call site).
+/// check gates (see [`final_checks`] for the full RAL-342 precedence).
 ///
 /// Returns an optional informational note for the `InReview` status: `Some(...)`
-/// when the check gates were opted out (CCTL-130) or a config auto-build ran in
-/// place of explicit checks (RAL-101), so the UI can distinguish those from a
-/// plain "checks passed"; `None` when explicit checks ran and passed, or nothing
-/// ran at all (no checks, no project auto-build default configured).
+/// when the check gates were opted out (CCTL-130), a review-declared auto_build
+/// (RAL-342) ran, or a config auto-build ran in place of explicit checks
+/// (RAL-101), so the UI can distinguish those from a plain "checks passed";
+/// `None` when explicit checks ran and passed, or nothing ran at all (no checks,
+/// no review/project auto_build configured).
 fn finalize_review(
     store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
     root: &Workspace,
     wt_base: &Workspace,
     id: &str,
@@ -6081,27 +6066,36 @@ fn finalize_review(
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
     let combined_str = rebuild_combined(store, root, wt_base, id, prev_ref)?;
-    final_checks(store, id, root, &combined_str, cancel)
+    final_checks(store, runner, id, root, &combined_str, cancel)
 }
 
 /// Run the review's check gates against the finished combined worktree.
 ///
-/// Returns `Some(note)` when checks were opted out, or the config auto-build
-/// (local or remote) ran (so the UI can show what happened), `None` when
-/// explicit checks ran and passed or nothing ran at all, or `Err` on the
-/// first failure.
+/// Four-tier precedence (RAL-342, replacing the old RAL-110 AI-guessed build):
+/// skip (opt-out) → this review's own explicit `checks` gates → this review's
+/// declared `[review.auto_build]` step → the project's `.ralphus.toml`
+/// `auto_build` default → nothing. Only one tier ever runs.
+///
+/// Returns `Some(note)` when checks were opted out, a review auto_build ran, or
+/// the config auto-build (local or remote) ran (so the UI can show what
+/// happened), `None` when explicit checks ran and passed or nothing ran at all,
+/// or `Err` on an explicit check gate failure. Per RAL-342 Q5, a failed
+/// review-declared auto_build is deliberately NOT an `Err` -- see the inline
+/// comment on that tier below.
 fn final_checks(
     store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
     id: &str,
     root: &Workspace,
     combined_str: &str,
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
-    let (skip_auto_build, checks, env) = {
+    let (skip_auto_build, checks, auto_build, env) = {
         let guard = store.lock().expect("poisoned");
         (
             guard.guardian_skip_auto_build(id).unwrap_or(false),
             guard.guardian_checks(id).unwrap_or_default(),
+            guard.guardian_auto_build(id).unwrap_or_default(),
             // RAL-203: run under the same environment the combined worktree's
             // branches were built with (`combined_env`), plus this review's
             // own build-step overrides -- a check gate like `cargo test` is
@@ -6133,11 +6127,22 @@ fn final_checks(
         }
         return Ok(None);
     }
-    // RAL-101: no explicit checks — fall back to the project's default
-    // build/test command, if one is configured, so "in review" still means
-    // "testable" rather than "merged and never built". If this isn't
-    // configured either, `generate_manual_commands` (RAL-110) tries AI
-    // inference next.
+    // RAL-342: no explicit checks -- try this review's own declared
+    // `[review.auto_build]` step next, ahead of the project-wide default.
+    // Per Q5, a failure here is advisory only (a UI notice + Cartographer log)
+    // rather than a merge-failing `Err` -- unlike explicit `checks`, which the
+    // user wrote as a hard gate, an auto_build declaration is a convenience
+    // build step and should never block a review from reaching `InReview`.
+    if let Some(def) = auto_build {
+        if let Some(note) =
+            run_review_auto_build(store, runner, id, root, combined_str, &env, &def, cancel)
+        {
+            return Ok(Some(note));
+        }
+    }
+    // RAL-101: no explicit checks or review auto_build -- fall back to the
+    // project's default build/test command, if one is configured, so
+    // "in review" still means "testable" rather than "merged and never built".
     match crate::config::resolve(root.root()).auto_build {
         Some(cmd) => {
             if !root
@@ -6151,6 +6156,183 @@ fn final_checks(
         }
         None => Ok(None),
     }
+}
+
+/// Run this review's declared `[review.auto_build]` step (RAL-342) against the
+/// finished combined worktree -- either a static shell `command`, or an agent
+/// invocation described by `def`'s remaining fields (exactly one shape is
+/// populated, enforced by `core::validate` at parse time).
+///
+/// Returns `Some(note)` when the step ran, whether it succeeded or failed --
+/// per Q5 a failure is surfaced as an advisory [`Store::set_guardian_notice`]
+/// plus a Cartographer log entry, never as an `Err`, so the caller always
+/// treats this tier as "handled" once it fires and falls through to `InReview`
+/// exactly as if this tier had been absent. `None` only when `def` describes
+/// no runnable step (defensive; `core::validate` should never allow this).
+#[allow(clippy::too_many_arguments)]
+fn run_review_auto_build(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    def: &crate::guardian::GuardianAutoBuild,
+    cancel: &CancelToken,
+) -> Option<String> {
+    if let Some(cmd) = def.command.as_deref() {
+        let ok = root
+            .at(combined_str)
+            .run_command_with_env(cmd, env, cancel)
+            .0;
+        let _ = store.lock().expect("poisoned").cartographer_log(
+            crate::cartographer::CartographerEntry {
+                level: if ok {
+                    crate::logging::LogLevel::INFO
+                } else {
+                    crate::logging::LogLevel::WARNING
+                },
+                source: "guardian",
+                message: if ok {
+                    "review auto_build succeeded"
+                } else {
+                    "review auto_build failed"
+                },
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"command": cmd}),
+                admin_only: false,
+            },
+        );
+        if !ok {
+            let _ = store.lock().expect("poisoned").set_guardian_notice(
+                id,
+                "auto_build_failed",
+                &format!(
+                    "This review's declared auto_build command failed: {cmd}. The review has \
+                     still moved to In Review -- check the build output and re-run manually if \
+                     needed."
+                ),
+            );
+        }
+        return Some(format!(
+            "auto-built via review auto_build: {cmd}{}",
+            if ok { "" } else { " (failed)" }
+        ));
+    }
+
+    // Agent-invocation shape: `def.prompt` (plus optional system prompt/agent/model).
+    let prompt = def.prompt.as_deref()?;
+    let cwd = combined_str.to_string();
+    let (stored_agent, stored_model) = {
+        let guard = store.lock().expect("poisoned");
+        let g = guard.get_guardian(id).ok();
+        (
+            g.as_ref().and_then(|g| g.resolver_agent.clone()),
+            g.and_then(|g| g.resolver_model.clone()),
+        )
+    };
+    let resolved = match resolve_resolver_agent(
+        def.agent.as_deref().or(stored_agent.as_deref()),
+        def.model.as_deref().or(stored_model.as_deref()),
+        Path::new(&cwd),
+    ) {
+        Ok(r) => r,
+        Err(message) => {
+            let _ = store.lock().expect("poisoned").set_guardian_notice(
+                id,
+                "auto_build_failed",
+                &format!(
+                    "This review's declared auto_build agent could not be resolved: {message}. \
+                     The review has still moved to In Review."
+                ),
+            );
+            return Some(format!("auto-build agent unresolvable: {message}"));
+        }
+    };
+    let spec = RunnerSpec {
+        squad_id: format!("guardian-{id}"),
+        task: AUTO_BUILD_TASK.to_string(),
+        cell_id: AUTO_BUILD_SESSION.to_string(),
+        cwd,
+        prompt: Some(prompt.to_string()),
+        command: None,
+        agent: resolved.backend.clone(),
+        executable: resolved.executable.clone(),
+        model: resolved.model.clone(),
+        system_prompt: def.system_prompt.clone(),
+        system_prompt_position: def.system_prompt_position.clone(),
+        timeout_sec: None,
+        budget_tokens: None,
+        maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
+        maximum_tool_output_tokens: None,
+        proof: false,
+        trace_context: None,
+        resume_agent_session_id: None,
+        assigned_agent_session_id: None,
+        env_overrides: {
+            let mut e = resolved.env.clone();
+            e.extend(env.clone());
+            e
+        },
+        machine: root.machine().map(str::to_string),
+        tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
+    };
+    let result = runner.run_cancellable(&spec, cancel);
+    let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
+    let ok = result.is_done();
+    let _ =
+        store
+            .lock()
+            .expect("poisoned")
+            .cartographer_log(crate::cartographer::CartographerEntry {
+                level: if ok {
+                    crate::logging::LogLevel::INFO
+                } else {
+                    crate::logging::LogLevel::WARNING
+                },
+                source: "guardian",
+                message: if ok {
+                    "review auto_build (agent) succeeded"
+                } else {
+                    "review auto_build (agent) failed"
+                },
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"summary": result.summary}),
+                admin_only: false,
+            });
+    if !ok {
+        let _ = store.lock().expect("poisoned").set_guardian_notice(
+            id,
+            "auto_build_failed",
+            &format!(
+                "This review's declared auto_build agent invocation failed: {}. The review has \
+                 still moved to In Review -- check the agent output and re-run manually if \
+                 needed.",
+                result.error.as_deref().unwrap_or("no summary produced")
+            ),
+        );
+    }
+    Some(if ok {
+        "auto-built via review auto_build (agent)".to_string()
+    } else {
+        "auto-build (agent) failed".to_string()
+    })
 }
 
 /// Fetch a branch produced on another machine into this repository, so the
@@ -7638,27 +7820,22 @@ impl From<ManualCheckItem> for GuardianCheck {
     }
 }
 
-/// JSON shape asked of the resolver agent when it also needs to infer a build
-/// command (RAL-110) — see [`generate_manual_commands`]. `build_command` is a
-/// single shell command that prepares the worktree (compile/bundle/install) so
-/// the proposed `manual_commands` are fast to run by hand, or `null` when
-/// nothing needs pre-building.
+/// JSON shape asked of the resolver agent for manual-command suggestions
+/// (RAL-164) — see [`generate_manual_commands`].
 #[derive(Deserialize)]
 struct ManualChecksInference {
     manual_commands: Vec<ManualCheckItem>,
-    #[serde(default)]
-    build_command: Option<String>,
 }
 
-/// Parse the resolver agent's manual-commands response. Tries the RAL-110
-/// `{"manual_commands": [...], "build_command": ...}` object shape first (with
-/// a `{...}`-substring fallback for chatty models), then falls back to the
-/// original bare `["...", ...]` array shape (no build command) for backward
-/// compatibility and for small local models that ignore the object-shape
-/// instruction. Each `manual_commands` element is either a bare string or a
-/// RAL-164 structured object (see [`ManualCheckItem`]). Returns `(checks,
-/// build_command)`; both empty/`None` when nothing parseable was found.
-fn parse_manual_commands_response(text: &str) -> (Vec<GuardianCheck>, Option<String>) {
+/// Parse the resolver agent's manual-commands response. Tries the
+/// `{"manual_commands": [...]}` object shape first (with a `{...}`-substring
+/// fallback for chatty models), then falls back to the original bare
+/// `["...", ...]` array shape for backward compatibility and for small local
+/// models that ignore the object-shape instruction. Each `manual_commands`
+/// element is either a bare string or a RAL-164 structured object (see
+/// [`ManualCheckItem`]). Returns the parsed checks, empty when nothing
+/// parseable was found.
+fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
     let as_object = serde_json::from_str::<ManualChecksInference>(text)
         .ok()
         .or_else(|| {
@@ -7667,10 +7844,7 @@ fn parse_manual_commands_response(text: &str) -> (Vec<GuardianCheck>, Option<Str
             serde_json::from_str::<ManualChecksInference>(&text[start..=end]).ok()
         });
     if let Some(obj) = as_object {
-        return (
-            obj.manual_commands.into_iter().map(Into::into).collect(),
-            obj.build_command.filter(|s| !s.trim().is_empty()),
-        );
+        return obj.manual_commands.into_iter().map(Into::into).collect();
     }
     let as_array = serde_json::from_str::<Vec<ManualCheckItem>>(text)
         .ok()
@@ -7679,20 +7853,15 @@ fn parse_manual_commands_response(text: &str) -> (Vec<GuardianCheck>, Option<Str
             let end = text.rfind(']').unwrap_or(text.len().saturating_sub(1));
             serde_json::from_str::<Vec<ManualCheckItem>>(&text[start..=end]).ok()
         });
-    (
-        as_array
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-        None,
-    )
+    as_array
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect()
 }
 
-/// Shared prompt body for [`generate_manual_commands`]. `ask_build` selects
-/// between the plain bare-array instruction and the RAL-110 JSON-object
-/// instruction that also asks for an inferred build command.
-fn manual_commands_prompt(tail: &str, ask_build: bool) -> String {
+/// Shared prompt body for [`generate_manual_commands`].
+fn manual_commands_prompt(tail: &str) -> String {
     let focus = "You are preparing a code review. Based on the changed files and commit \
          messages below, produce 1-5 shell command strings that a human reviewer should \
          run to manually verify these changes. Focus on hands-on, observable steps: \
@@ -7709,46 +7878,23 @@ fn manual_commands_prompt(tail: &str, ask_build: bool) -> String {
          background process), also set \"cleanup_command\" on that same object to a \
          command that stops/frees it first. A command with nothing variable and nothing \
          left running can stay a plain string.";
-    let format = if ask_build {
-        " Also decide whether a separate build/compile/bundle/install step must run \
-          first so those commands are fast to use once a human runs them (e.g. \
-          `cargo build --release`, `npm install && npm run build`) — if so, put that \
-          single shell command in \"build_command\"; otherwise use null. Return ONLY a \
-          valid JSON object of the shape {\"manual_commands\": [...], \"build_command\": \
-          \"...\"|null}, where each element of \"manual_commands\" is either a plain \
-          string or the object shape described above — no markdown fences, no \
-          explanation, no other text."
-    } else {
-        " Return ONLY a valid JSON array where each element is either a plain string or \
+    let format = " Return ONLY a valid JSON array where each element is either a plain string or \
           the object shape described above — no markdown fences, no explanation, no \
-          other text."
-    };
+          other text.";
     format!("{focus}{format}\n\n{tail}")
 }
 
-/// Generate LLM-suggested shell commands for manually testing or verifying the
-/// changes in the review branch (RAL-27), and — when nothing already covers
-/// finalize-time verification (see [`final_checks`]'s precedence) — an
-/// AI-inferred build command run against the combined worktree in advance, so
-/// a human pressing "Run all" on the manual checks sees an already-built
-/// worktree instead of eating a cold build live (RAL-110). Both come from the
-/// same LLM call: the build a manual check needs is exactly the kind of thing
-/// the model is already inferring context for. Manual-commands generation
-/// failures are silent — a missing command list is better than a crash; an
-/// inferred build that runs and fails is recorded in the returned note rather
-/// than failing the whole finalize (unlike explicit checks/config auto_build,
-/// since this tier is a guess, not something the user configured).
+/// Generate LLM-suggested shell commands for manually testing or verifying
+/// the changes in the review branch (RAL-27).
 ///
 /// `worktree` is the combined review worktree path (preferred). When present the
 /// LLM runs inside the worktree with its `run_bash` tool so it can inspect the
 /// diff itself — no diff content is embedded in the prompt, which avoids OS
 /// command-line length limits in harness backends. Falls back to a file-name
-/// list from `root` when no worktree is available (in which case AI-build
-/// inference/execution never happens — there is nowhere safe to build).
+/// list from `root` when no worktree is available.
 ///
-/// Returns `Some(note)` when an inferred build ran (or failed trying) so the
-/// caller can fold it into the `InReview` status detail alongside
-/// [`final_checks`]'s note; `None` otherwise.
+/// Generation failures are silent — a missing command list is better than a
+/// crash.
 #[allow(clippy::too_many_arguments)]
 fn generate_manual_commands(
     store: &Arc<Mutex<Store>>,
@@ -7759,36 +7905,14 @@ fn generate_manual_commands(
     tip_ref: &str,
     worktree: Option<&Workspace>,
     cancel: &CancelToken,
-) -> Option<String> {
-    // RAL-110: only attempt AI build inference/execution when nothing else
-    // already covers finalize-time verification and there's a worktree to
-    // build in — mirrors `final_checks`'s own precedence so the two never
-    // double-build regardless of call-site ordering.
-    let (skip_auto_build, has_explicit_checks, build_env) = {
-        let guard = store.lock().expect("poisoned");
-        (
-            guard.guardian_skip_auto_build(id).unwrap_or(false),
-            !guard.guardian_checks(id).unwrap_or_default().is_empty(),
-            // RAL-313: same rationale as `final_checks`'s `env` fetch just
-            // above -- an AI-inferred build is worthless if it runs without
-            // the variables the combined worktree's branches were built with.
-            guard
-                .get_guardian(id)
-                .map(|g| g.build_env)
-                .unwrap_or_default(),
-        )
-    };
-    let has_config_auto_build = crate::config::resolve(root.root()).auto_build.is_some();
-    let skip_ai_build =
-        worktree.is_none() || skip_auto_build || has_explicit_checks || has_config_auto_build;
-
+) {
     let (cwd, machine, prompt) = if let Some(wt) = worktree {
         // Worktree path: embed only the --stat output (always compact — one line
         // per changed file). Never embed the full diff; it can be arbitrarily
         // large and would blow OS command-line limits in harness backends.
         let stat = wt.git(&["diff", "--stat", base_sha]).unwrap_or_default();
         if stat.trim().is_empty() {
-            return None;
+            return;
         }
         // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
         // machine -- `root.git(...)` routes through the provider when `root`
@@ -7800,7 +7924,7 @@ fn generate_manual_commands(
         (
             wt.root().to_string_lossy().into_owned(),
             wt.machine().map(str::to_string),
-            manual_commands_prompt(&tail, !skip_ai_build),
+            manual_commands_prompt(&tail),
         )
     } else {
         // Fallback: list changed file names from the repository root. The file
@@ -7808,7 +7932,7 @@ fn generate_manual_commands(
         // RAL-201: same `root.git(...)` fix as above.
         let files = match root.git(&["diff", "--name-only", &format!("{base_sha}..{tip_ref}")]) {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => return None,
+            _ => return,
         };
         let log = root
             .git(&["log", "--format=%s", &format!("{base_sha}..{tip_ref}")])
@@ -7817,7 +7941,7 @@ fn generate_manual_commands(
         (
             root.root().to_string_lossy().into_owned(),
             root.machine().map(str::to_string),
-            manual_commands_prompt(&tail, false),
+            manual_commands_prompt(&tail),
         )
     };
 
@@ -7849,7 +7973,7 @@ fn generate_manual_commands(
                         ),
                         serde_json::json!({"error": message}),
                     );
-                return None;
+                return;
             }
         }
     };
@@ -7939,10 +8063,10 @@ fn generate_manual_commands(
     }
 
     if !result.is_done() || result.summary.trim().is_empty() {
-        return None;
+        return;
     }
 
-    let (commands, build_command) = parse_manual_commands_response(result.summary.trim());
+    let commands = parse_manual_commands_response(result.summary.trim());
 
     if !commands.is_empty() {
         // RAL-88: record which resolved agent/model produced these commands.
@@ -7951,43 +8075,6 @@ fn generate_manual_commands(
             .expect("poisoned")
             .set_guardian_manual_commands(id, &commands, Some(agent.as_str()), model.as_deref());
     }
-
-    if skip_ai_build {
-        return None;
-    }
-    let cmd = build_command?;
-    let wt = worktree?.clone();
-    let ok = wt.run_command_with_env(&cmd, &build_env, cancel).0;
-    let _ =
-        store
-            .lock()
-            .expect("poisoned")
-            .cartographer_log(crate::cartographer::CartographerEntry {
-                level: if ok {
-                    crate::logging::LogLevel::INFO
-                } else {
-                    crate::logging::LogLevel::WARNING
-                },
-                source: "guardian",
-                message: if ok {
-                    "auto-build (AI-inferred) succeeded"
-                } else {
-                    "auto-build (AI-inferred) failed"
-                },
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"command": cmd}),
-                admin_only: false,
-            });
-    Some(if ok {
-        format!("auto-built via inferred build command: {cmd}")
-    } else {
-        format!("auto-build failed: {cmd}")
-    })
 }
 
 /// Prompt asked of the resolver agent for "set it for me" (RAL-164): propose
@@ -8578,13 +8665,12 @@ mod tests {
 
     #[test]
     fn parse_manual_commands_bare_string_array_back_compat() {
-        let (checks, build) = parse_manual_commands_response(r#"["cargo test", "npm run e2e"]"#);
+        let checks = parse_manual_commands_response(r#"["cargo test", "npm run e2e"]"#);
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].command.as_deref(), Some("cargo test"));
         assert!(checks[0].inputs.is_empty());
         assert!(checks[0].cleanup_command.is_none());
         assert_eq!(checks[1].command.as_deref(), Some("npm run e2e"));
-        assert!(build.is_none());
     }
 
     #[test]
@@ -8597,10 +8683,9 @@ mod tests {
                     "cleanup_command": "ralphus-daemon stop --port {port}",
                     "inputs": [{"name": "port", "message": "Port for the daemon", "default": "7890"}]
                 }
-            ],
-            "build_command": "cargo build"
+            ]
         }"#;
-        let (checks, build) = parse_manual_commands_response(text);
+        let checks = parse_manual_commands_response(text);
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].command.as_deref(), Some("cargo test"));
         assert!(checks[0].inputs.is_empty());
@@ -8617,23 +8702,20 @@ mod tests {
         assert_eq!(checks[1].inputs[0].name, "port");
         assert_eq!(checks[1].inputs[0].message, "Port for the daemon");
         assert_eq!(checks[1].inputs[0].default, "7890");
-
-        assert_eq!(build.as_deref(), Some("cargo build"));
     }
 
     #[test]
     fn parse_manual_commands_tolerates_chatty_model_wrapping_json_in_prose() {
         let text = "Sure, here you go:\n```json\n{\"manual_commands\": [\"cargo test\"]}\n```\nHope that helps!";
-        let (checks, _build) = parse_manual_commands_response(text);
+        let checks = parse_manual_commands_response(text);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].command.as_deref(), Some("cargo test"));
     }
 
     #[test]
     fn parse_manual_commands_unparseable_text_is_empty() {
-        let (checks, build) = parse_manual_commands_response("not json at all");
+        let checks = parse_manual_commands_response("not json at all");
         assert!(checks.is_empty());
-        assert!(build.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -11169,6 +11251,7 @@ mod tests {
 
         let result = final_checks(
             &store,
+            &FixedValueRunner("unused"),
             &id,
             &Workspace::local(&repo),
             &repo.to_string_lossy(),
@@ -11212,6 +11295,7 @@ mod tests {
 
         let result = final_checks(
             &store,
+            &FixedValueRunner("unused"),
             &id,
             &Workspace::local(&repo),
             &repo.to_string_lossy(),
@@ -11258,6 +11342,7 @@ mod tests {
 
         let result = final_checks(
             &store,
+            &FixedValueRunner("unused"),
             &id,
             &Workspace::local(&repo),
             &repo.to_string_lossy(),
@@ -11278,23 +11363,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A resolver-agent stand-in that returns a fixed manual-commands/
-    /// build-command JSON response instead of actually calling an LLM.
-    struct FixedManualCommandsRunner(String);
-    impl Runner for FixedManualCommandsRunner {
+    /// RAL-342: a review's own declared `[review.auto_build]` command runs
+    /// ahead of (and instead of) the project-level `.ralphus.toml [review]
+    /// auto_build` default when both are configured. The project default is
+    /// set to a command that would fail, so if it ran instead of the
+    /// review-declared one, this test would fail.
+    #[test]
+    fn final_checks_prefers_review_declared_auto_build_over_project_default() {
+        let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-precedence");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[review]\nauto_build = \"exit 1\"\n",
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_auto_build(
+                    &id,
+                    Some(&crate::guardian::GuardianAutoBuild {
+                        command: Some("exit 0".to_string()),
+                        prompt: None,
+                        system_prompt: None,
+                        system_prompt_position: None,
+                        agent: None,
+                        model: None,
+                    }),
+                )
+                .unwrap();
+            id
+        };
+
+        let result = final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        );
+        assert!(
+            result.is_ok(),
+            "the review-declared auto_build must win and succeed: {result:?}"
+        );
+        let note = result.unwrap().unwrap();
+        assert!(
+            note.contains("auto-built via review auto_build"),
+            "expected the review-declared auto_build note, got: {note}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    struct FailingAgentRunner {
+        cost_usd: f64,
+    }
+
+    impl Runner for FailingAgentRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
-                status: "done".to_string(),
-                tokens_in: 0,
-                tokens_out: 0,
+                status: "failed".to_string(),
+                tokens_in: 10,
+                tokens_out: 20,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 compaction_input_tokens: 0,
                 compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
-                summary: self.0.clone(),
-                error: None,
+                summary: String::new(),
+                error: Some("boom: agent exploded".to_string()),
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
@@ -11302,62 +11444,84 @@ mod tests {
         }
     }
 
-    /// RAL-313: `generate_manual_commands`'s AI-inferred build command runs
-    /// against the combined worktree under this review's own `build_env`,
-    /// same as `final_checks`'s check gates/project `auto_build`
-    /// (`final_checks_runs_check_gates_under_this_reviews_build_env_override`
-    /// above) -- the inferred build command below fails unless the
-    /// overridden variable is actually present in its process environment.
+    /// RAL-342/Q5: a review-declared `[review.auto_build]` *agent* invocation
+    /// that fails must not fail the merge -- it surfaces as an advisory
+    /// notice plus a Cartographer log entry, and `final_checks` still returns
+    /// `Ok(Some(note))` (never `Err`) so the review reaches `InReview`. Cost
+    /// is still recorded via `record_guardian_call_cost` even though the call
+    /// failed.
     #[test]
-    fn generate_manual_commands_runs_inferred_build_under_this_reviews_build_env_override() {
-        let (base, repo, fwt) = make_repo("manualcmds-buildenv");
+    fn final_checks_review_auto_build_agent_failure_is_advisory_not_err() {
+        let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-agent-fail");
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let base_sha = git(&repo, &["rev-parse", "main"])
-            .unwrap()
-            .trim()
-            .to_string();
-
-        let build_cmd = if cfg!(windows) {
-            "if not \"%RAL313_BUILD_VAR%\"==\"expected\" exit 1"
-        } else {
-            "test \"$RAL313_BUILD_VAR\" = expected"
-        };
-
         let id = {
             let guard = store.lock().unwrap();
             let id = guard
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
-            let mut set = std::collections::BTreeMap::new();
-            set.insert("RAL313_BUILD_VAR".to_string(), "expected".to_string());
             guard
-                .set_guardian_build_env_overrides(&id, &set, &[], &[])
+                .set_guardian_auto_build(
+                    &id,
+                    Some(&crate::guardian::GuardianAutoBuild {
+                        command: None,
+                        prompt: Some("build the thing".to_string()),
+                        system_prompt: None,
+                        system_prompt_position: None,
+                        agent: None,
+                        model: None,
+                    }),
+                )
                 .unwrap();
             id
         };
 
-        let response = serde_json::json!({
-            "manual_commands": ["echo hi"],
-            "build_command": build_cmd,
-        })
-        .to_string();
-        let runner = FixedManualCommandsRunner(response);
-
-        let note = generate_manual_commands(
+        let result = final_checks(
             &store,
-            &runner,
+            &FailingAgentRunner { cost_usd: 1.25 },
             &id,
             &Workspace::local(&repo),
-            &base_sha,
-            "feature/a",
-            Some(&Workspace::local(&fwt)),
+            &repo.to_string_lossy(),
             &CancelToken::never(),
         );
+        assert!(
+            result.is_ok(),
+            "an agent-form auto_build failure must be advisory, not an Err: {result:?}"
+        );
+        let note = result.unwrap().unwrap();
+        assert!(
+            note.contains("failed"),
+            "expected the failure to be reflected in the note: {note}"
+        );
 
-        assert_eq!(
-            note.as_deref(),
-            Some(format!("auto-built via inferred build command: {build_cmd}").as_str()),
-            "inferred build must see the build-env override"
+        let guard = store.lock().unwrap();
+        let view = guard.get_guardian(&id).unwrap();
+        assert_eq!(view.notice_kind.as_deref(), Some("auto_build_failed"));
+        assert!(
+            view.notice_message
+                .as_deref()
+                .unwrap()
+                .contains("boom: agent exploded"),
+            "notice: {:?}",
+            view.notice_message
+        );
+
+        let (_, _, cumulative) = guard.guardian_cost_total(&id).unwrap();
+        assert!(
+            (cumulative - 1.25).abs() < 1e-9,
+            "cost must still be recorded on a failed auto_build agent call: {cumulative}"
+        );
+
+        let page = guard
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                guardian_id: Some(id.clone()),
+                ..crate::cartographer::CartographerFilter::recent(10)
+            })
+            .unwrap();
+        assert!(
+            page.rows
+                .iter()
+                .any(|r| r.message == "review auto_build (agent) failed"),
+            "expected a Cartographer entry for the failed agent auto_build"
         );
 
         let _ = std::fs::remove_dir_all(&base);

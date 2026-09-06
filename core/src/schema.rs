@@ -884,6 +884,63 @@ pub struct ReviewDef {
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
+    /// This review's own declared build step (RAL-342), run at merge/finalize
+    /// time ahead of the project-level `.ralphus.toml [review] auto_build`
+    /// default. Mutually exclusive with `skip_auto_build`.
+    ///
+    /// Submitting a task TOML that creates a `[[review]]` must set exactly one
+    /// of `auto_build`, `skip_auto_build`, or rely on a project-level
+    /// `.ralphus.toml [review] auto_build` default covering every project the
+    /// review spans -- the daemon enforces this at submit time (`core`
+    /// validation only checks this table's own shape; see
+    /// [`AutoBuildDef`]).
+    #[serde(default)]
+    pub auto_build: Option<AutoBuildDef>,
+    /// Declares that this review deliberately has no build step. Mutually
+    /// exclusive with `auto_build`; satisfies the submit-time requirement
+    /// that every review say something about how (or whether) it builds.
+    #[serde(default)]
+    pub skip_auto_build: bool,
+}
+
+/// This review's own declared build step (RAL-342): either a static
+/// `command` (run verbatim), or an agent-invocation shape (`prompt` plus
+/// optionally `system_prompt`/`system_prompt_position`/`agent`/`model`) for
+/// build shapes not knowable up front -- e.g. novel work where "what does
+/// building this even mean" must be figured out by inspecting the worktree.
+/// Exactly one of `command` or `prompt` must be set; the agent-invocation
+/// fields are only meaningful alongside `prompt`. Unlike the old AI-guessed
+/// build tier this replaces (RAL-110), a declared `auto_build` is
+/// user-authored: it must be provided (or explicitly skipped via
+/// [`ReviewDef::skip_auto_build`]) at submit time rather than inferred at
+/// merge time.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AutoBuildDef {
+    /// Verbatim shell command run directly, no LLM involvement. Mutually
+    /// exclusive with `prompt`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Prompt forwarded to a headless agent call to figure out and perform
+    /// the build. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Appended system prompt for the agent call (only valid alongside
+    /// `prompt`); see [`ReviewDef`]'s neighbors for the same convention.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Must be [`SYSTEM_PROMPT_POSITION_APPEND`] when set (only valid
+    /// alongside `prompt`).
+    #[serde(default)]
+    pub system_prompt_position: Option<String>,
+    /// Backend for the agent call, e.g. `"claude"` (only valid alongside
+    /// `prompt`). Unset falls back to the guardian's own resolver agent, then
+    /// the daemon's default resolver agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Model the agent call runs (only valid alongside `prompt`). Unset falls
+    /// back to the guardian's own resolver model, then the daemon's default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A user-declared manual-test action shown as a labelled button in the review UI.
@@ -1353,6 +1410,99 @@ mod tests {
         "#;
         let parsed_unset: TaskFile = toml::from_str(toml_unset).expect("should deserialize");
         assert_eq!(parsed_unset.review[0].proof_scope, None);
+    }
+
+    #[test]
+    fn review_auto_build_command_form_deserializes() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "<<review:backend>>"
+
+            [[review]]
+            id = "backend"
+            [review.auto_build]
+            command = "cargo build"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let def = parsed.review[0]
+            .auto_build
+            .as_ref()
+            .expect("auto_build should be set");
+        assert_eq!(def.command.as_deref(), Some("cargo build"));
+        assert!(def.prompt.is_none());
+        assert!(!parsed.review[0].skip_auto_build);
+    }
+
+    #[test]
+    fn review_auto_build_agent_form_deserializes() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "<<review:backend>>"
+
+            [[review]]
+            id = "backend"
+            [review.auto_build]
+            prompt = "figure out how to build this and do it"
+            system_prompt = "be thorough"
+            system_prompt_position = "append"
+            agent = "claude"
+            model = "claude-opus-4-8"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let def = parsed.review[0]
+            .auto_build
+            .as_ref()
+            .expect("auto_build should be set");
+        assert!(def.command.is_none());
+        assert_eq!(
+            def.prompt.as_deref(),
+            Some("figure out how to build this and do it")
+        );
+        assert_eq!(def.system_prompt.as_deref(), Some("be thorough"));
+        assert_eq!(def.system_prompt_position.as_deref(), Some("append"));
+        assert_eq!(def.agent.as_deref(), Some("claude"));
+        assert_eq!(def.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn review_skip_auto_build_defaults_to_false() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "<<review:backend>>"
+
+            [[review]]
+            id = "backend"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert!(!parsed.review[0].skip_auto_build);
+        assert!(parsed.review[0].auto_build.is_none());
+
+        let toml_skip = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "<<review:backend>>"
+
+            [[review]]
+            id = "backend"
+            skip_auto_build = true
+        "#;
+        let parsed_skip: TaskFile = toml::from_str(toml_skip).expect("should deserialize");
+        assert!(parsed_skip.review[0].skip_auto_build);
     }
 
     #[test]

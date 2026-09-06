@@ -1989,6 +1989,20 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
+            // RAL-342: this review's own declared build step, authored via
+            // `[review.auto_build]` and resolved once at submit time
+            // (`reviews::derive_reviews`) into a JSON-serialized
+            // `GuardianAutoBuild`. NULL means the review declared
+            // `skip_auto_build = true` instead -- unlike the
+            // nullable-override columns above (`resolver_agent`,
+            // `proof_scope`, ...), NULL here never means "inherit the
+            // project config default": every guardian created after this
+            // migration has one of `auto_build_json` or `skip_auto_build`
+            // set, enforced by `reviews::require_auto_build_declaration` at
+            // submit time. A guardian created before this shipped (neither
+            // column meaningfully set) simply gets no auto_build tier at
+            // finalize time (see `guardian_merge::final_checks`).
+            "ALTER TABLE guardians ADD COLUMN auto_build_json TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

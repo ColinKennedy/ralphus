@@ -14,7 +14,7 @@ use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::cartographer::CartographerFilter;
-use ralphus_daemon::guardian::{GuardianCheck, GuardianStatus, MergeStatus};
+use ralphus_daemon::guardian::{GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus};
 use ralphus_daemon::guardian_merge::{
     pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
     rebuild_on_base_shift, reopen_cancelled_guardian_merge, reopen_straggler,
@@ -359,7 +359,7 @@ fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String)
          [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
-         [[review]]\nid=\"rev\"\n"
+         [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let run_id = store.insert_squad(&file, None, false).unwrap();
@@ -1567,107 +1567,127 @@ fn skip_auto_build_also_opts_out_of_config_auto_build() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// RAL-110: nothing configured (no explicit checks, no `.ralphus.toml
-// auto_build`) -> `generate_manual_commands` asks the resolver agent for both
-// the manual check commands AND a build command in the same call, then runs
-// that build command against the combined worktree in advance.
-struct InferredBuildRunner;
-impl Runner for InferredBuildRunner {
+// RAL-342: a review's own declared `[review.auto_build]` command takes
+// precedence over the project-level `.ralphus.toml [review] auto_build`
+// default when both are configured -- the project default here deliberately
+// fails, so if it ran instead the merge would incorrectly fail.
+#[test]
+fn review_declared_auto_build_command_wins_over_project_default() {
+    let (root, store, id) = single_feature_repo();
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
+    );
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_auto_build(
+            &id,
+            Some(&GuardianAutoBuild {
+                command: Some("test -f a.txt".to_string()),
+                prompt: None,
+                system_prompt: None,
+                system_prompt_position: None,
+                agent: None,
+                model: None,
+            }),
+        )
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert!(
+        view.detail
+            .unwrap_or_default()
+            .contains("auto-built via review auto_build"),
+        "expected the review-declared auto_build note, not the project default"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A runner that fails only the `auto_build` task, so its use in a
+/// single-clean-branch fixture (no conflicts, no other agent calls) isolates
+/// the review-declared agent-form auto_build invocation.
+struct FailingAutoBuildRunner;
+impl Runner for FailingAutoBuildRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
-        if spec.task == "manual_commands" {
+        if spec.task == "auto_build" {
             return RunnerResult {
-                status: "done".into(),
-                tokens_in: 0,
-                tokens_out: 0,
+                status: "failed".to_string(),
+                tokens_in: 5,
+                tokens_out: 5,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 compaction_input_tokens: 0,
                 compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
-                summary: r#"{"manual_commands": ["echo verify"], "build_command": "echo built > built_marker.txt"}"#
-                    .into(),
-                error: None,
+                summary: String::new(),
+                error: Some("boom: agent exploded".to_string()),
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
             };
         }
-        // Every other task (e.g. "summary") in this single-clean-branch
-        // fixture should never be exercised.
-        RunnerResult::failure("only manual_commands is faked in this test")
+        RunnerResult::failure("only auto_build is faked in this test")
     }
 }
 
+// RAL-342/Q5: a review-declared `[review.auto_build]` *agent* invocation that
+// fails must not fail the merge -- it surfaces as an advisory notice (via the
+// existing notice mechanism) and a Cartographer log entry, but the review
+// still reaches `in_review` exactly as if the tier had been a no-op.
 #[test]
-fn nothing_configured_runs_ai_inferred_build_in_advance() {
-    let (root, store, id) = single_feature_repo();
-    run_merge(&store, &InferredBuildRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
-    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
-    assert_eq!(
-        view.detail.as_deref(),
-        Some("auto-built via inferred build command: echo built > built_marker.txt")
-    );
-    let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
-    assert!(
-        combined.join("built_marker.txt").exists(),
-        "the inferred build command should have run against the combined worktree"
-    );
-    assert_eq!(view.manual_commands.len(), 1);
-    assert_eq!(
-        view.manual_commands[0].command.as_deref(),
-        Some("echo verify")
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-// RAL-110: `skip_auto_build` also opts out of the AI-inferred build tier (not
-// just explicit checks / config auto_build) -- manual_commands are still
-// generated (that's independent), but no build runs.
-#[test]
-fn skip_auto_build_opts_out_of_ai_inferred_build_too() {
+fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
     let (root, store, id) = single_feature_repo();
     store
         .lock()
         .unwrap()
-        .set_guardian_skip_auto_build(&id, true)
+        .set_guardian_auto_build(
+            &id,
+            Some(&GuardianAutoBuild {
+                command: None,
+                prompt: Some("build the thing".to_string()),
+                system_prompt: None,
+                system_prompt_position: None,
+                agent: None,
+                model: None,
+            }),
+        )
         .unwrap();
-    run_merge(&store, &InferredBuildRunner, &id);
+    run_merge(&store, &FailingAutoBuildRunner, &id);
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
-    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
-    assert_eq!(view.detail, None);
-    let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
-    assert!(
-        !combined.join("built_marker.txt").exists(),
-        "skip_auto_build must prevent the inferred build from running"
+    assert_eq!(
+        view.status, "in_review",
+        "a failed review-declared auto_build agent call must still reach in_review: {:?}",
+        view.detail
     );
-    // Manual commands generation is independent of skip_auto_build -- it still
-    // runs (the InferredBuildRunner's fake response still gets parsed and
-    // stored) since only the *build* execution is skipped, not the LLM call.
-    let _ = std::fs::remove_dir_all(&root);
-}
+    assert_eq!(view.notice_kind.as_deref(), Some("auto_build_failed"));
+    assert!(
+        view.notice_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("boom: agent exploded"),
+        "notice: {:?}",
+        view.notice_message
+    );
 
-// RAL-285: Proof scope "nothing" is an independent axis from `skip_auto_build`
-// -- it must not affect the finalize-time AI-inferred auto-build.
-#[test]
-fn proof_scope_nothing_does_not_affect_auto_build() {
-    let (root, store, id) = single_feature_repo();
-    store
+    let page = store
         .lock()
         .unwrap()
-        .set_guardian_proof_scope(&id, Some("nothing"))
+        .cartographer_query(&CartographerFilter {
+            guardian_id: Some(id.clone()),
+            ..CartographerFilter::recent(10)
+        })
         .unwrap();
-    run_merge(&store, &InferredBuildRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
-    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
-    assert_eq!(
-        view.detail.as_deref(),
-        Some("auto-built via inferred build command: echo built > built_marker.txt"),
-        "proof_scope=\"nothing\" must not suppress the auto-build tier"
+    assert!(
+        page.rows
+            .iter()
+            .any(|r| r.message == "review auto_build (agent) failed"),
+        "expected a Cartographer entry for the failed agent auto_build"
     );
-    let combined = PathBuf::from(view.combined_worktree.expect("combined worktree set"));
-    assert!(combined.join("built_marker.txt").exists());
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
