@@ -23,7 +23,7 @@
 //! build is not resolved again — no `git rerere` required. The feature branches
 //! stay untouched throughout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6526,6 +6526,160 @@ fn cleanup_review_worktrees(
     }
 }
 
+/// Review worktrees with no activity for thirty days are stale. This is long
+/// enough to avoid surprising an ordinary review cycle while still bounding
+/// accumulation in a daemon that runs for months.
+pub(crate) const WORKTREE_RETIREMENT_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+fn normalized_worktree_path(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    text.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
+    match kind {
+        "cell" | "proof" => matches!(state, "done" | "cancelled" | "failed"),
+        // Review lifecycle names differ from NodeState: deployed is its done
+        // state and merge_failed is its failed state.
+        "review" => matches!(state, "deployed" | "cancelled" | "merge_failed"),
+        _ => false,
+    }
+}
+
+/// Retire old guardian worktrees whose every persisted Cell, Proof, and Review
+/// claim is terminal. Old worktrees with a non-terminal claim are retained and
+/// raise one durable, per-path mailbox escalation instead.
+///
+/// Called only from the scheduler's daily interval. Git and filesystem work
+/// happen without holding the store mutex; each short snapshot/update does.
+pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
+    let (records, claims) = {
+        let guard = store.lock().expect("poisoned");
+        let records = match guard.guardian_worktree_records() {
+            Ok(records) => records,
+            Err(error) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] worktree retirement snapshot failed: {error}"
+                );
+                return;
+            }
+        };
+        let claims = match guard.worktree_claims() {
+            Ok(claims) => claims,
+            Err(error) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] worktree claim snapshot failed: {error}"
+                );
+                return;
+            }
+        };
+        (records, claims)
+    };
+    let cutoff = crate::store::now_ms().saturating_sub(WORKTREE_RETIREMENT_AGE_MS);
+    // A combined worktree is also the last branch's worktree, so it commonly
+    // has two rows. Age is the newest activity across every row for that path.
+    let mut records_by_path = HashMap::new();
+    for record in records {
+        let key = normalized_worktree_path(Path::new(&record.path));
+        let replace =
+            records_by_path
+                .get(&key)
+                .is_none_or(|old: &crate::store::GuardianWorktreeRecord| {
+                    record.last_activity_ms > old.last_activity_ms
+                });
+        if replace {
+            records_by_path.insert(key, record);
+        }
+    }
+    for (key, record) in records_by_path {
+        if record.last_activity_ms > cutoff {
+            continue;
+        }
+        let root = Workspace::for_guardian(
+            store,
+            &record.guardian_id,
+            PathBuf::from(&record.project_root),
+        );
+        let wt_base = root.at(worktree_dir(&record.project_root, &record.guardian_id));
+        if !crate::short_paths::worktree_belongs_to_guardian(
+            &record.path,
+            wt_base.root(),
+            &record.guardian_id,
+        ) {
+            continue;
+        }
+        let registered = root
+            .git(&["worktree", "list", "--porcelain"])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|path| normalized_worktree_path(Path::new(path.trim())) == key);
+        if !registered {
+            continue;
+        }
+        let active_claim = claims.iter().find(|claim| {
+            normalized_worktree_path(Path::new(&claim.path)) == key
+                && !terminal_worktree_claim(&claim.kind, &claim.state)
+        });
+        if let Some(claim) = active_claim {
+            let guard = store.lock().expect("poisoned");
+            if guard
+                .claim_ark_notification("guardian-worktree", &key)
+                .unwrap_or(false)
+            {
+                let message = format!(
+                    "Guardian worktree {} for review {} ({}) is over 30 days old but is still claimed by a non-terminal {} ({}). If this Task or Review is no longer needed, please cancel it.",
+                    record.path, record.guardian_id, record.guardian_name, claim.kind, claim.owner
+                );
+                let entity_uri = format!("guardian:{}", record.guardian_id);
+                let _ = guard.enqueue_mailbox_message(
+                    crate::mailbox::MailboxPriority::High,
+                    &message,
+                    None,
+                    None,
+                    None,
+                    Some(&entity_uri),
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "old guardian worktree retained because it is still claimed",
+                        serde_json::json!({"worktree": record.path, "claim_kind": claim.kind, "claim_owner": claim.owner}),
+                    );
+            }
+            continue;
+        }
+        let _ = root.git(&["worktree", "unlock", &record.path]);
+        match root.git(&["worktree", "remove", "--force", "--force", &record.path]) {
+            Ok(_) => {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.clear_guardian_worktree_path(&record.path);
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "retired old guardian worktree",
+                        serde_json::json!({"worktree": record.path, "age_threshold_days": 30}),
+                    );
+            }
+            Err(error) => crate::rlog!(
+                WARNING,
+                "ralphus [guardian] could not retire worktree {}: {error}",
+                record.path
+            ),
+        }
+    }
+}
+
 /// RAL-317: record a branch's terminal (`Done`/`ConflictResolved`) merge
 /// outcome and, if the review's effective `auto_submit_pr_stack` setting is
 /// on, auto-submit/grow its PR stack to include the newly-terminal branch.
@@ -9170,6 +9324,96 @@ mod tests {
         assert_eq!(first["improve-wasd-alpha"], "improve-wasd");
         assert_eq!(first["improve-wasd-beta"], "improve-wasd-2");
         assert_eq!(first["improve-wasd-gamma"], "improve-wasd-3");
+    }
+
+    #[test]
+    fn stale_worktree_retirement_removes_safe_and_alerts_for_unsafe() {
+        let (base, repo, _feature_worktree) = make_repo("retire-stale");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
+
+        let make_review = |name: &str, branch: &str, status: &str| {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian(name, "main", &repo.to_string_lossy())
+                .unwrap();
+            guard.add_guardian_branch(&id, branch).unwrap();
+            let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            let wt = worktree_dir(&repo.to_string_lossy(), &id).join("wt-test");
+            std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+            g(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &format!("guardian/{id}/wt-{branch}"),
+                    &wt.to_string_lossy(),
+                    "main",
+                ],
+            );
+            guard
+                .set_branch_review(
+                    &id,
+                    &branch_id,
+                    &format!("guardian/{id}/wt-{branch}"),
+                    &wt.to_string_lossy(),
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
+                    rusqlite::params![status, old, id],
+                )
+                .unwrap();
+            (id, wt)
+        };
+
+        let (_safe_id, safe_wt) = make_review("safe", "safe", "deployed");
+        let (unsafe_id, unsafe_wt) = make_review("unsafe", "unsafe", "in_review");
+        let client = store.lock().unwrap().register_mailbox_client().unwrap();
+
+        retire_stale_worktrees(&store);
+
+        assert!(!safe_wt.exists(), "terminal review worktree should retire");
+        assert!(
+            unsafe_wt.exists(),
+            "active review worktree must be retained"
+        );
+        let guard = store.lock().unwrap();
+        let messages = guard
+            .mailbox_messages_for_client(&client, true, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].message.contains("please cancel it"));
+        assert_eq!(
+            messages[0].entity_uri.as_deref(),
+            Some(format!("guardian:{unsafe_id}").as_str())
+        );
+        drop(guard);
+
+        // The durable per-path claim prevents a daily sweep from spamming.
+        retire_stale_worktrees(&store);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .mailbox_messages_for_client(&client, true, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        g(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &unsafe_wt.to_string_lossy(),
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
