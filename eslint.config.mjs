@@ -23,7 +23,17 @@ export default [
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "script",
-      globals: { ...globals.browser },
+      globals: {
+        ...globals.browser,
+        // Vendored xterm.js UMD globals (RAL-355 Phase 10) -- see the
+        // "Vendored" HTML comment above their <script id="xterm-vendor">
+        // tags in board.html. The vendored scripts themselves are excluded
+        // from linting via `<!-- eslint-disable-next-script -->`; these
+        // entries are only so the *real* inline script's references to them
+        // don't trip `no-undef`.
+        Terminal: "readonly",
+        FitAddon: "readonly",
+      },
     },
     rules: {
       "no-undef": "error",

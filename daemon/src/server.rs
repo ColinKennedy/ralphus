@@ -74,6 +74,28 @@ pub struct Daemon {
     /// other route) and consumed by `run_http_loop` before it hands a
     /// connection off to `serve_events_stream`.
     events_tickets: crate::token::TicketStore,
+    /// Short-lived, single-use tickets gating the terminal-relay WebSocket
+    /// listener (RAL-355 Phase 10) -- same rationale as `events_tickets`
+    /// (`?ticket=...` on a URL a browser `WebSocket` constructor cannot
+    /// attach a bearer header to), kept in a separate namespace so a ticket
+    /// minted for one purpose is never usable for the other.
+    terminal_tickets: crate::token::TicketStore,
+    /// The terminal-relay WebSocket listener's bound port (RAL-355 Phase
+    /// 10), set once by `serve()` after a successful bind. `0` means "not
+    /// started" -- `route()`'s own ~100 in-process unit tests and
+    /// `serve_with`/`serve_with_token` never start this listener, so ticket
+    /// minting there correctly reports it as unavailable rather than
+    /// claiming a port nothing is actually listening on.
+    terminal_relay_port: std::sync::atomic::AtomicU16,
+    /// `(squad_id, task_idx, cell_idx)` of every remote terminal session
+    /// currently attached (RAL-355 Phase 10) -- guards against two WebSocket
+    /// clients independently minting tickets and connecting to the same
+    /// idle cell at once, which would spawn two separate `claude --resume
+    /// <same-session-id>` processes racing to write the same conversation
+    /// transcript on the remote machine. Purely in-memory (a daemon restart
+    /// drops it, same as the WS listener itself not surviving a restart) --
+    /// there is nothing to reconcile it against on startup.
+    active_terminal_sessions: Mutex<std::collections::HashSet<(String, i64, i64)>>,
     /// Decides which agents a user can see/select (`GET /api/agents`) --
     /// always [`crate::agent_access::DefaultAgentAccess`] today, since there
     /// is no real per-user auth to key a different implementation off of yet.
@@ -103,6 +125,9 @@ impl Daemon {
             shutdown: Arc::new(AtomicBool::new(false)),
             token: None,
             events_tickets: crate::token::TicketStore::new(),
+            terminal_tickets: crate::token::TicketStore::new(),
+            terminal_relay_port: std::sync::atomic::AtomicU16::new(0),
+            active_terminal_sessions: Mutex::new(std::collections::HashSet::new()),
             agent_access: Arc::new(crate::agent_access::DefaultAgentAccess),
             generation_jobs: crate::generation::GenerationJobs::new(),
         }
@@ -151,6 +176,66 @@ impl Daemon {
         ticket.is_some_and(|t| self.events_tickets.consume(t))
     }
 
+    /// Mint a short-lived, single-use terminal-relay ticket (RAL-355
+    /// Phase 10). Called from the `POST .../terminal-ticket` route handler,
+    /// itself gated by [`Daemon::authorized`] like every other route.
+    pub(crate) fn mint_terminal_ticket(&self) -> String {
+        self.terminal_tickets.mint()
+    }
+
+    /// Validate and consume a terminal-relay ticket -- `true` if `ticket` was
+    /// a valid, unexpired, not-yet-used ticket this daemon minted. Mirrors
+    /// [`Daemon::consume_events_ticket`]'s "always true when no bearer token
+    /// is configured" rule.
+    pub(crate) fn consume_terminal_ticket(&self, ticket: Option<&str>) -> bool {
+        if self.token.is_none() {
+            return true;
+        }
+        ticket.is_some_and(|t| self.terminal_tickets.consume(t))
+    }
+
+    /// Record the terminal-relay listener's bound port after `serve()`
+    /// starts it, so ticket-mint responses can tell a client where to
+    /// connect.
+    pub(crate) fn set_terminal_relay_port(&self, port: u16) {
+        self.terminal_relay_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The terminal-relay listener's bound port, or `0` if it was never
+    /// started (see the field's own doc comment).
+    pub(crate) fn terminal_relay_port(&self) -> u16 {
+        self.terminal_relay_port
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Claim the terminal-relay slot for one cell -- `true` if it was free
+    /// and is now held by this call, `false` if another session already
+    /// holds it. Pair with [`Daemon::release_terminal_session`] once the
+    /// session ends (see `terminal_relay.rs`'s `SessionSlot` guard, which
+    /// does this via `Drop` so every exit path releases it).
+    pub(crate) fn try_acquire_terminal_session(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> bool {
+        self.active_terminal_sessions
+            .lock()
+            .expect("active_terminal_sessions mutex poisoned")
+            .insert((squad_id.to_string(), task_idx, cell_idx))
+    }
+
+    /// Release a slot claimed by [`Daemon::try_acquire_terminal_session`].
+    /// A no-op if it was not held (defensive -- should never happen given
+    /// the RAII guard, but a double-release must never panic).
+    pub(crate) fn release_terminal_session(&self, squad_id: &str, task_idx: i64, cell_idx: i64) {
+        self.active_terminal_sessions
+            .lock()
+            .expect("active_terminal_sessions mutex poisoned")
+            .remove(&(squad_id.to_string(), task_idx, cell_idx));
+    }
+
     /// A cloned handle to the shared store (for the scheduler thread).
     #[must_use]
     pub fn store_handle(&self) -> Arc<Mutex<Store>> {
@@ -190,7 +275,7 @@ impl Daemon {
         Arc::clone(&self.summary_queue)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Store> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Store> {
         self.store.lock().expect("store mutex poisoned")
     }
 
@@ -272,6 +357,17 @@ struct RegisterProjectBody {
     #[serde(default)]
     description: String,
     path: String,
+    /// Authoritative clone URL for provisioning this project on another
+    /// machine. `url` is accepted as the user-facing API alias.
+    #[serde(default, alias = "url")]
+    clone_url: Option<String>,
+    /// RAL-355: explicitly clear a previously registered clone URL. Distinct
+    /// from omitting `clone_url` (which preserves whatever is already
+    /// stored) and from sending an empty `clone_url` (which is rejected as
+    /// invalid) -- clearing needs its own unambiguous signal rather than
+    /// overloading either of those.
+    #[serde(default)]
+    clear_clone_url: bool,
     #[serde(default = "default_vcs")]
     vcs: String,
     /// RAL-307: explicit per-project default for whether a newly submitted PR
@@ -308,11 +404,67 @@ struct UsersResponse {
     users: Vec<crate::users::UserView>,
 }
 
+/// `GET /api/whoami` response (RAL-332). `name` is `None` when no identity
+/// resolves at all (no header, no `default_user`) -- same case
+/// `current_user` returns `Ok(None)` for.
+#[derive(Serialize)]
+struct WhoAmIResponse {
+    name: Option<String>,
+    is_admin: bool,
+}
+
+/// `POST /api/users/{name}/admin` body (RAL-332).
+#[derive(Deserialize)]
+struct SetAdminBody {
+    is_admin: bool,
+}
+
+#[derive(Serialize)]
+struct HiddenResponse {
+    hidden: Vec<crate::hidden::HiddenItem>,
+}
+
+#[derive(Serialize)]
+struct HiddenStateResponse {
+    hidden: bool,
+}
+
 /// `POST /api/users` body -- see `crate::users`'s module doc comment for why
 /// this is a placeholder identity registry, not authentication.
 #[derive(Deserialize)]
 struct CreateUserBody {
     name: String,
+}
+
+/// `POST /api/users/{name}/preferences` body (RAL-320) -- see
+/// `crate::users::UserView`'s field docs for what `auto_follow` and
+/// `default_notify_tiers` mean.
+#[derive(Deserialize)]
+struct UserPreferencesBody {
+    #[serde(default)]
+    auto_follow: bool,
+    /// Tier names (`"urgent"`/`"high"`/`"normal"`), e.g.
+    /// `["urgent", "high"]`. Omitted or empty means "everything" --
+    /// see [`crate::mailbox::all_tiers`].
+    #[serde(default)]
+    default_notify_tiers: Option<Vec<String>>,
+}
+
+/// `GET /api/follows?user=` response body (RAL-320).
+#[derive(Serialize)]
+struct FollowsResponse {
+    follows: Vec<crate::follows::FollowView>,
+}
+
+/// `POST /api/follows?user=` body (RAL-320) -- `notify_tiers` omitted or
+/// empty defaults to the acting user's `default_notify_tiers` preference
+/// (see `crate::users::UserView`), falling back to every tier if that user
+/// isn't registered either.
+#[derive(Deserialize)]
+struct CreateFollowBody {
+    entity_uri: String,
+    #[serde(default)]
+    notify_tiers: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -443,6 +595,19 @@ struct ErrorBody {
 
 /// Handle one request. Pure over the daemon state so it is unit-testable.
 pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
+    route_for_user(daemon, method, path, body, None)
+}
+
+/// Dispatch a request with the caller-claimed identity read at the HTTP
+/// boundary. `route` uses no claimed identity, which keeps direct callers and
+/// unit tests on the configured-default path.
+fn route_for_user(
+    daemon: &Daemon,
+    method: &str,
+    path: &str,
+    body: &str,
+    user_header: Option<&str>,
+) -> Reply {
     let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
     let segs: Vec<&str> = path_only.trim_matches('/').split('/').collect();
     match (method, segs.as_slice()) {
@@ -455,52 +620,177 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         // like every other route.
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
         ("GET", ["api", "tasks"]) => board(daemon, query),
+        // RAL-332: reads stay open to every caller -- `GET /api/projects` and
+        // `.../branches` back the Simple task form's project/branch pickers
+        // for every user, not just admins. Only the mutating registration
+        // action is an admin action (matches `register_project`'s own doc
+        // comment, "an explicit admin action, not something a task file can
+        // declare" -- true before this ticket, just not enforced until now).
         ("GET", ["api", "projects"]) => list_projects(daemon),
-        ("POST", ["api", "projects"]) => register_project(daemon, body),
+        ("POST", ["api", "projects"]) => {
+            admin_gated(daemon, user_header, || register_project(daemon, body))
+        }
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
         ("GET", ["api", "projects", name, "branches"]) => project_branches(daemon, name),
-        // Machine provider registry (RAL-185).
-        ("GET", ["api", "machines"]) => list_machines(daemon),
-        ("POST", ["api", "machines"]) => register_machine(daemon, body),
-        ("GET", ["api", "machines", scheme]) => get_machine(daemon, scheme),
-        ("DELETE", ["api", "machines", scheme]) => deregister_machine(daemon, scheme),
-        ("POST", ["api", "machines", scheme, "check"]) => check_machine(daemon, scheme),
-        ("POST", ["api", "machines", "cleanup"]) => cleanup_machine(daemon, body),
+        // Machine provider registry (RAL-185) -- RAL-332: admin-only, client
+        // and server side. Nothing outside the Machines tab reads this.
+        ("GET", ["api", "machines"]) => admin_gated(daemon, user_header, || list_machines(daemon)),
+        ("POST", ["api", "machines"]) => {
+            admin_gated(daemon, user_header, || register_machine(daemon, body))
+        }
+        ("GET", ["api", "machines", scheme]) => {
+            admin_gated(daemon, user_header, || get_machine(daemon, scheme))
+        }
+        ("DELETE", ["api", "machines", scheme]) => {
+            admin_gated(daemon, user_header, || deregister_machine(daemon, scheme))
+        }
+        ("POST", ["api", "machines", scheme, "check"]) => {
+            admin_gated(daemon, user_header, || check_machine(daemon, scheme))
+        }
+        ("POST", ["api", "machines", "cleanup"]) => {
+            admin_gated(daemon, user_header, || cleanup_machine(daemon, body))
+        }
+        // Target inventory health (RAL-355 Phase 9).
+        ("GET", ["api", "machines", "targets", "health"]) => {
+            admin_gated(daemon, user_header, || health_all_targets(daemon))
+        }
+        // Triage type registry (RAL-318) -- RAL-332: admin-only, client and
+        // server side. Nothing outside the Triage tab reads this.
+        ("GET", ["api", "triage", "types"]) => {
+            admin_gated(daemon, user_header, || list_triage_types(daemon))
+        }
+        ("POST", ["api", "triage", "types"]) => {
+            admin_gated(daemon, user_header, || register_triage_type(daemon, body))
+        }
+        ("GET", ["api", "triage", "types", name]) => {
+            admin_gated(daemon, user_header, || get_triage_type(daemon, name))
+        }
+        ("DELETE", ["api", "triage", "types", name]) => {
+            admin_gated(daemon, user_header, || deregister_triage_type(daemon, name))
+        }
+        ("GET", ["api", "triage", "pools"]) => {
+            admin_gated(daemon, user_header, || list_triage_pools(daemon))
+        }
+        ("POST", ["api", "triage", "pools", "threshold"]) => {
+            admin_gated(daemon, user_header, || {
+                set_triage_pool_threshold(daemon, body)
+            })
+        }
+        ("GET", ["api", "triage", "schedules"]) => {
+            admin_gated(daemon, user_header, || list_triage_schedules(daemon, query))
+        }
+        ("POST", ["api", "triage", "schedules"]) => {
+            admin_gated(daemon, user_header, || add_triage_schedule(daemon, body))
+        }
+        ("DELETE", ["api", "triage", "schedules", id]) => {
+            admin_gated(daemon, user_header, || remove_triage_schedule(daemon, id))
+        }
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
-        ("GET", ["api", "agents"]) => list_agents(daemon, query),
+        ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
+        ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
         // form's agent picker -- see `crate::agent_catalog`.
         ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(),
+        // RAL-332: the current caller's resolved identity and admin flag --
+        // lets the board decide whether to show its admin-only tabs without
+        // it ever needing to know its own claimed name (it deliberately
+        // never sends X-Ralphus-User outside of a "visit as" override).
+        ("GET", ["api", "whoami"]) => whoami(daemon, user_header),
         // Minimal user registry (RAL-?) -- see `crate::users`'s module doc
         // comment: this is a placeholder identity layer, not authentication.
         // TODO: Replace with user auth once RAL-252 is done.
-        ("GET", ["api", "users"]) => list_users(daemon),
-        ("POST", ["api", "users"]) => create_user(daemon, body),
-        ("DELETE", ["api", "users", name]) => delete_user(daemon, &url_decode(name)),
-        ("POST", ["api", "users", name, "rename"]) => user_rename(daemon, &url_decode(name), body),
-        // RAL-281: user-editable list of env-var names treated as secret --
-        // see `crate::secret_env_names`'s module doc comment.
-        ("GET", ["api", "secret-env-names"]) => list_secret_env_names(daemon),
-        ("POST", ["api", "secret-env-names"]) => add_secret_env_name(daemon, body),
-        ("POST", ["api", "secret-env-names", name, "rename"]) => {
-            rename_secret_env_name(daemon, name, body)
+        // RAL-332: admin-only, client and server side -- nothing outside the
+        // Users tab reads this.
+        ("GET", ["api", "users"]) => admin_gated(daemon, user_header, || list_users(daemon)),
+        ("POST", ["api", "users"]) => {
+            admin_gated(daemon, user_header, || create_user(daemon, body))
         }
-        ("DELETE", ["api", "secret-env-names", name]) => delete_secret_env_name(daemon, name),
+        ("DELETE", ["api", "users", name]) => admin_gated(daemon, user_header, || {
+            delete_user(daemon, &url_decode(name))
+        }),
+        ("POST", ["api", "users", name, "rename"]) => admin_gated(daemon, user_header, || {
+            user_rename(daemon, &url_decode(name), body)
+        }),
+        // RAL-320: per-user notification preferences layered on `users`.
+        ("GET", ["api", "users", name, "preferences"]) => {
+            get_user_preferences(daemon, &url_decode(name))
+        }
+        ("POST", ["api", "users", name, "preferences"]) => {
+            set_user_preferences_endpoint(daemon, &url_decode(name), body)
+        }
+        // RAL-332: promotes/demotes another user's admin flag. Bootstrap
+        // exception in `set_user_admin_endpoint` itself: if no admin is
+        // registered yet, the very first promotion is allowed through so the
+        // system isn't permanently stuck with zero admins.
+        ("POST", ["api", "users", name, "admin"]) => {
+            set_user_admin_endpoint(daemon, user_header, &url_decode(name), body)
+        }
+        // RAL-332: "Edit Profile" -- an admin viewing another user's
+        // Preferences page. Audit-only: does not itself read or write
+        // anything, just records that it happened.
+        ("POST", ["api", "users", name, "visit"]) => {
+            visit_user_profile(daemon, user_header, &url_decode(name))
+        }
+        ("GET", ["api", "hidden"]) => list_hidden(daemon, user_header),
+        ("POST", ["api", "hidden", "squads", id]) => {
+            set_squad_hidden(daemon, user_header, id, true)
+        }
+        ("DELETE", ["api", "hidden", "squads", id]) => {
+            set_squad_hidden(daemon, user_header, id, false)
+        }
+        ("POST", ["api", "hidden", "reviews", id]) => {
+            set_review_hidden(daemon, user_header, id, true)
+        }
+        ("DELETE", ["api", "hidden", "reviews", id]) => {
+            set_review_hidden(daemon, user_header, id, false)
+        }
+        // RAL-281: user-editable list of env-var names treated as secret --
+        // see `crate::secret_env_names`'s module doc comment. RAL-332:
+        // admin-only, client and server side.
+        ("GET", ["api", "secret-env-names"]) => {
+            admin_gated(daemon, user_header, || list_secret_env_names(daemon))
+        }
+        ("POST", ["api", "secret-env-names"]) => {
+            admin_gated(daemon, user_header, || add_secret_env_name(daemon, body))
+        }
+        ("POST", ["api", "secret-env-names", name, "rename"]) => {
+            admin_gated(daemon, user_header, || {
+                rename_secret_env_name(daemon, name, body)
+            })
+        }
+        ("DELETE", ["api", "secret-env-names", name]) => {
+            admin_gated(daemon, user_header, || delete_secret_env_name(daemon, name))
+        }
         ("GET", ["api", "config", "live-view"]) => live_view_config_reply(),
         ("GET", ["api", "config", "templates"]) => templates_config_reply(),
-        ("GET", ["api", "cartographer"]) => cartographer_query(daemon, query),
-        ("GET", ["api", "cartographer", id]) => cartographer_get(daemon, id),
+        ("GET", ["api", "cartographer"]) => cartographer_query(daemon, query, user_header),
+        ("GET", ["api", "cartographer", id]) => cartographer_get(daemon, id, user_header),
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
         ("GET", ["api", "ghosts", owner_uri]) => ghost_get(daemon, owner_uri),
         ("POST", ["api", "mailbox", "register"]) => mailbox_register(daemon),
+        // RAL-320: personal follows + the per-user mailbox view they filter.
+        // These literal "personal"/"follows" segments must stay ahead of the
+        // client_id-parameterized mailbox routes just below, or the
+        // client_id arm would swallow "personal" as if it were a client id.
+        ("GET", ["api", "mailbox", "personal", "messages"]) => {
+            personal_mailbox_messages(daemon, query)
+        }
+        ("POST", ["api", "mailbox", "personal", "drain"]) => {
+            personal_mailbox_drain(daemon, query, body)
+        }
+        ("GET", ["api", "follows"]) => list_follows_endpoint(daemon, query),
+        ("POST", ["api", "follows"]) => create_follow_endpoint(daemon, query, body),
+        ("DELETE", ["api", "follows", entity_uri]) => {
+            delete_follow_endpoint(daemon, query, entity_uri)
+        }
         ("GET", ["api", "mailbox", client_id, "messages"]) => {
             mailbox_messages(daemon, client_id, query)
         }
         ("POST", ["api", "mailbox", client_id, "drain"]) => mailbox_drain(daemon, client_id, body),
         ("POST", ["api", "squads", "validate"]) => validate_endpoint(daemon, body),
-        ("POST", ["api", "squads"]) => submit(daemon, body),
+        ("POST", ["api", "squads"]) => submit(daemon, body, query),
         // RAL-297: Simple task form's opt-in "generation step" primitive.
         ("POST", ["api", "generate"]) => generate_start(daemon, body),
         ("GET", ["api", "generate", id]) => generate_status(daemon, id),
@@ -543,6 +833,24 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             restart_task(daemon, id, ti, body)
         }
         ("POST", ["api", "squads", id, "env"]) => set_squad_env(daemon, id, body),
+        // RAL-324: each `POST .../env` route below has a read-only `GET` twin
+        // on the same path serving that surface's resolved environment with
+        // registered secret values masked -- see `crate::env_view`.
+        ("GET", ["api", "squads", id, "env"]) => squad_env_view(daemon, id),
+        ("GET", ["api", "squads", id, "tasks", ti, "proof", vi, "env"]) => {
+            task_proof_step_env_view(daemon, id, ti, vi)
+        }
+        ("GET", ["api", "squads", id, "tasks", ti, "proof", "env"]) => {
+            task_proof_env_view(daemon, id, ti)
+        }
+        ("GET", ["api", "squads", id, "tasks", ti, "env"]) => task_env_view(daemon, id, ti),
+        ("GET", ["api", "squads", id, "cells", ti, si, "proof", vi, "env"]) => {
+            cell_proof_step_env_view(daemon, id, ti, si, vi)
+        }
+        ("GET", ["api", "squads", id, "cells", ti, si, "proof", "env"]) => {
+            cell_proof_env_view(daemon, id, ti, si)
+        }
+        ("GET", ["api", "squads", id, "cells", ti, si, "env"]) => cell_env_view(daemon, id, ti, si),
         // RAL-191: the per-step routes must precede the scope-wide ones, since
         // `["proof", "env"]` and `["proof", vi, "env"]` are otherwise
         // ambiguous to a reader (they are not to the matcher, which is
@@ -568,6 +876,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         ("POST", ["api", "squads", id, "tasks", ti, "unsolo"]) => unsolo_task(daemon, id, ti),
         ("POST", ["api", "squads", id, "cells", ti, si, "open-terminal"]) => {
             open_terminal(daemon, id, ti, si, query)
+        }
+        ("POST", ["api", "squads", id, "cells", ti, si, "terminal-ticket"]) => {
+            mint_terminal_ticket_route(daemon, id, ti, si)
         }
         ("POST", ["api", "squads", id, "cells", ti, si, "resume-automation"]) => {
             resume_automation(daemon, id, ti, si)
@@ -729,6 +1040,21 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             set_guardian_branch_env(daemon, id, branch_id, body)
         }
         ("POST", ["api", "guardians", id, "build-env"]) => set_guardian_build_env(daemon, id, body),
+        ("GET", ["api", "guardians", id, "branches", branch_id, "env"]) => {
+            review_worktree_env_view(daemon, id, branch_id)
+        }
+        ("GET", ["api", "guardians", id, "build-env"]) => {
+            review_step_env_view(daemon, id, crate::env_view::ReviewStep::Build)
+        }
+        // RAL-324: the check gates ("Tests") get their own viewer entry point
+        // even though they share the build step's stored override layer --
+        // there is deliberately no `POST .../tests-env` twin to edit.
+        ("GET", ["api", "guardians", id, "tests-env"]) => {
+            review_step_env_view(daemon, id, crate::env_view::ReviewStep::Tests)
+        }
+        ("GET", ["api", "guardians", id, "manual-checks-env"]) => {
+            review_step_env_view(daemon, id, crate::env_view::ReviewStep::ManualChecks)
+        }
         ("POST", ["api", "guardians", id, "manual-checks-env"]) => {
             set_guardian_manual_checks_env(daemon, id, body)
         }
@@ -809,6 +1135,7 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
         }
         ("POST", ["api", "guardians", id, "approve"]) => guardian_approve(daemon, id),
         ("POST", ["api", "guardians", id, "cancel"]) => guardian_cancel(daemon, id),
+        ("POST", ["api", "guardians", id, "reopen"]) => guardian_reopen(daemon, id),
         ("POST", ["api", "guardians", id, "run-manual-commands"]) => {
             guardian_run_manual_commands(daemon, id, body)
         }
@@ -822,6 +1149,9 @@ pub fn route(daemon: &Daemon, method: &str, path: &str, body: &str) -> Reply {
             guardian_submit_prs(daemon, id, body)
         }
         ("GET", ["api", "guardians", id, "pull-requests"]) => guardian_list_prs(daemon, id),
+        ("POST", ["api", "guardians", id, "pull-requests", "unlink"]) => {
+            guardian_unlink_prs(daemon, id)
+        }
         ("GET", ["api", "guardians", id, "pull-request-stacks"]) => {
             guardian_list_pr_stacks(daemon, id)
         }
@@ -860,12 +1190,23 @@ pub fn route_with_trace(
     body: &str,
     traceparent: Option<&str>,
 ) -> Reply {
+    route_with_trace_for_user(daemon, method, path, body, traceparent, None)
+}
+
+fn route_with_trace_for_user(
+    daemon: &Daemon,
+    method: &str,
+    path: &str,
+    body: &str,
+    traceparent: Option<&str>,
+    user_header: Option<&str>,
+) -> Reply {
     let cx = crate::otel::context_from_traceparent(traceparent);
     let span = crate::otel::start_span("daemon.http", &cx, SpanKind::Server);
     span.set_attribute("http.method", method.to_string());
     span.set_attribute("http.target", path.to_string());
 
-    let reply = route(daemon, method, path, body);
+    let reply = route_for_user(daemon, method, path, body, user_header);
 
     span.set_attribute("http.status_code", i64::from(reply.status));
     if reply.status >= 400 {
@@ -939,8 +1280,11 @@ fn mint_events_ticket(daemon: &Daemon) -> Reply {
 /// server-side so the board and CLI share one filter/sort implementation).
 ///
 /// - `status`: comma-separated, case-insensitive match against `SquadView::state`.
-/// - `name`: case-insensitive substring match against `SquadView::label` (a squad
-///   with no label never matches a non-empty filter).
+/// - `name`: comma-separated list of case-insensitive substrings matched
+///   against `SquadView::label`; a squad matches if ANY needle is a substring
+///   of its label (union), and a squad with no label never matches a
+///   non-empty filter. Whitespace around each comma-separated needle is
+///   trimmed.
 /// - `sort`: `"name"` sorts by label (falling back to id) case-insensitively,
 ///   ascending; anything else (including absent) keeps `list_squads`'s existing
 ///   newest-first order.
@@ -961,14 +1305,17 @@ fn filter_and_sort_squads(
         }
     }
     if let Some(name) = name {
-        let needle = name.to_lowercase();
-        squads.retain(|r| {
-            r.label
-                .as_deref()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains(&needle)
-        });
+        let needles: Vec<String> = name
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !needles.is_empty() {
+            squads.retain(|r| {
+                let label = r.label.as_deref().unwrap_or("").to_lowercase();
+                needles.iter().any(|n| label.contains(n.as_str()))
+            });
+        }
     }
     if sort == Some("name") {
         squads.sort_by(|a, b| {
@@ -1324,14 +1671,73 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
     if let Err(msg) = validate_project_location(&req.path, &req.vcs) {
         return error(400, "invalid_value", &msg, vec![]);
     }
-    match daemon.lock().register_project_ex(
+    let clone_url = req
+        .clone_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if req.clone_url.is_some() && clone_url.is_none() {
+        return error(
+            400,
+            "invalid_value",
+            "'clone_url'/'url' must not be empty when provided",
+            vec![],
+        );
+    }
+    if clone_url.is_some_and(|value| value.contains(['\r', '\n', '\0'])) {
+        return error(
+            400,
+            "invalid_value",
+            "'clone_url'/'url' must not contain control characters",
+            vec![],
+        );
+    }
+    if req.clear_clone_url && req.clone_url.is_some() {
+        return error(
+            400,
+            "invalid_value",
+            "'clear_clone_url' cannot be combined with a 'clone_url'/'url' value",
+            vec![],
+        );
+    }
+    // RAL-355: a password embedded in an `http(s)://` clone URL is not
+    // rejected -- some legacy remotes genuinely need it -- but it is stored
+    // exactly as given, so warn the caller once, at registration time, so
+    // they can switch to an SSH key or a credential helper instead. Only the
+    // redacted form of the URL is ever named, both here and in the daemon's
+    // own log, so registering the warning never itself becomes a leak path.
+    let credential_warning = clone_url.filter(|url| ralphus_core::redact::https_url_has_embedded_password(url)).map(|url| {
+        let redacted = ralphus_core::redact::redact_url_credentials(url);
+        crate::rlog!(
+            WARNING,
+            "ralphus [store] project {:?} registered with a clone URL that embeds inline credentials ({redacted}); consider an SSH key or credential helper instead",
+            req.name
+        );
+        format!(
+            "clone URL embeds inline credentials ({redacted}); consider an SSH key or credential helper instead"
+        )
+    });
+    let guard = daemon.lock();
+    match guard.register_project_with_clone_url_ex(
         &req.name,
         &req.description,
         &req.path,
         &req.vcs,
+        clone_url,
         req.match_pr_branch_name,
     ) {
-        Ok(()) => json(201, &serde_json::json!({"name": req.name})),
+        Ok(()) => {
+            if req.clear_clone_url {
+                if let Err(e) = guard.clear_project_clone_url(&req.name) {
+                    return store_error(&e);
+                }
+            }
+            let mut body = serde_json::json!({"name": req.name});
+            if let Some(warning) = credential_warning {
+                body["warnings"] = serde_json::json!([warning]);
+            }
+            json(201, &body)
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -1451,33 +1857,50 @@ fn check_machine(daemon: &Daemon, scheme: &str) -> Reply {
 
 #[derive(Deserialize)]
 struct CleanupMachineBody {
-    /// Full `<scheme>:<uri>` value naming the workspace to tear down -- not
-    /// just a scheme, since a provider may back many independent workspaces
-    /// (one per `uri`) and `cleanup` operates on exactly one of them.
+    /// Full `<scheme>:<uri>` value naming the machine to clean up on.
     machine: String,
+    /// Registered project name. A machine can hold many projects' worth of
+    /// durable clones (RAL-355 Phase 4), so `cleanup` needs to know which
+    /// one -- there is no longer a single "the" workspace per machine.
+    project: String,
+    /// Worktree branch to remove. Omitted: remove the whole project
+    /// directory (repository plus every worktree).
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 /// `POST /api/machines/cleanup`: tear down one provisioned workspace
-/// (RAL-201). Body `{"machine": "<scheme>:<uri>"}`.
+/// (RAL-201, reshaped by RAL-355 Phase 2 remainder). Body
+/// `{"machine": "<scheme>:<uri>", "project": "<name>", "branch": "<optional>"}`.
 ///
 /// **Never invoked automatically** — see [`crate::remote_runner::ProviderRunner::cleanup`]'s
 /// doc for the retention-on-failure policy this mirrors. This is the explicit,
 /// operator-initiated action an admin takes once they are actually done with a
 /// workspace, the same way nobody automatically deletes a local
 /// `.git/.ralphus_worktrees/<branch>` directory either.
+///
+/// `project`/`branch` exist because Phase 4 made one machine hold many
+/// projects' worth of durable clones, each with many worktrees — the
+/// original `{"machine": "..."}`-only body could only ever have meant "the
+/// one workspace this machine has", which stopped being a coherent request
+/// the moment that became untrue.
 fn cleanup_machine(daemon: &Daemon, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<CleanupMachineBody>(body) else {
         return error(
             400,
             "bad_request",
-            "body must be {\"machine\": \"...\"}",
+            "body must be {\"machine\": \"...\", \"project\": \"...\", \"branch\"?: \"...\"}",
             vec![],
         );
     };
     let machine = req.machine.trim();
-    let provider = {
+    let project_name = req.project.trim();
+    if project_name.is_empty() {
+        return error(400, "bad_request", "\"project\" must not be empty", vec![]);
+    }
+    let (provider, clone_url, remote_root) = {
         let store = daemon.lock();
-        match crate::remote_runner::provider_from_store(&store, machine) {
+        let provider = match crate::remote_runner::provider_from_store(&store, machine) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 return error(
@@ -1489,7 +1912,42 @@ fn cleanup_machine(daemon: &Daemon, body: &str) -> Reply {
                 );
             }
             Err(e) => return error(400, "invalid_value", &e, vec![]),
-        }
+        };
+        let project = match store.get_project(project_name) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return error(
+                    404,
+                    "not_found",
+                    &format!("no registered project named {project_name:?}"),
+                    vec![],
+                );
+            }
+            Err(e) => return error(500, "internal_error", &e.to_string(), vec![]),
+        };
+        let Some(clone_url) = project.clone_url.filter(|u| !u.trim().is_empty()) else {
+            return error(
+                400,
+                "invalid_value",
+                &format!(
+                    "project {project_name:?} has no registered clone URL -- nothing could \
+                     have been provisioned remotely for it"
+                ),
+                vec![],
+            );
+        };
+        let remote_root = match crate::machine_targets::load_machine_targets() {
+            Ok(targets) => crate::machine_targets::find_by_machine(&targets, machine)
+                .map(|t| t.remote_root.clone()),
+            Err(e) => return error(500, "internal_error", &e, vec![]),
+        };
+        (provider, clone_url, remote_root)
+    };
+    let cleanup_req = crate::remote_runner::CleanupRequest {
+        project: project_name.to_string(),
+        clone_url,
+        branch: req.branch.clone().filter(|b| !b.trim().is_empty()),
+        remote_root,
     };
     let spec = crate::runner::RunnerSpec::for_command_proof(
         "machine-cleanup",
@@ -1500,7 +1958,7 @@ fn cleanup_machine(daemon: &Daemon, body: &str) -> Reply {
         "claude",
         Some(60),
     );
-    let result = provider.cleanup(&spec);
+    let result = provider.cleanup(&cleanup_req, &spec);
     let guard = daemon.lock();
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: if result.is_ok() {
@@ -1518,18 +1976,42 @@ fn cleanup_machine(daemon: &Daemon, body: &str) -> Reply {
         log_path: None,
         payload: serde_json::json!({
             "machine": machine,
+            "project": project_name,
+            "branch": req.branch,
             "ok": result.is_ok(),
+            "removed": result.as_ref().ok().and_then(|r| r.clone()),
             "error": result.as_ref().err(),
         }),
+        admin_only: false,
     });
     match result {
-        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        Ok(removed) => json(200, &serde_json::json!({"ok": true, "removed": removed})),
         // RAL-201: the workspace is left exactly as it was on failure -- there
         // is no daemon-side record of it to roll back or discard (`provision`
         // re-derives the same workspace deterministically every time), so the
         // only responsibility here is surfacing the real reason rather than
         // swallowing it.
         Err(e) => error(502, "provider_error", &e, vec![]),
+    }
+}
+
+/// `GET /api/machines/targets/health`: check every configured
+/// `[machine.targets.*]` entry (RAL-355 Phase 9). Always live -- computed on
+/// demand, never cached/polled, matching the plan's "checks are
+/// user-triggered, not polled every board refresh" requirement by simply
+/// never storing a result to poll in the first place.
+fn health_all_targets(daemon: &Daemon) -> Reply {
+    match crate::health_targets::check_all_targets(&daemon.store_handle()) {
+        Ok(reports) => {
+            let any_fail = reports
+                .iter()
+                .any(crate::health_targets::TargetHealthReport::any_fail);
+            json(
+                200,
+                &serde_json::json!({"ok": true, "any_fail": any_fail, "targets": reports}),
+            )
+        }
+        Err(e) => error(500, "internal_error", &e, vec![]),
     }
 }
 
@@ -1578,6 +2060,287 @@ fn deregister_machine(daemon: &Daemon, scheme: &str) -> Reply {
     }
 }
 
+/// `POST /api/triage/types` body (RAL-318). Mirrors [`RegisterMachineBody`]'s
+/// shape/rationale: registering a Triage type is an explicit administrative
+/// action, not declarable inside a submitted task file.
+#[derive(Deserialize)]
+struct RegisterTriageTypeBody {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Serialize)]
+struct TriageTypesResponse {
+    types: Vec<crate::triage::TriageTypeView>,
+}
+
+/// `POST /api/triage/types`: register (or update) a Triage type (RAL-318).
+fn register_triage_type(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<RegisterTriageTypeBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include a \"name\" string",
+            vec![],
+        );
+    };
+    let name = req.name.trim();
+    if name.is_empty() {
+        return error(400, "invalid_value", "'name' must not be empty", vec![]);
+    }
+    match daemon
+        .lock()
+        .register_triage_type(name, &req.label, &req.description)
+    {
+        Ok(()) => json(201, &serde_json::json!({"name": name})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/triage/types`: every registered Triage type (including the
+/// built-in `unclassified`).
+fn list_triage_types(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_triage_types() {
+        Ok(types) => json(200, &TriageTypesResponse { types }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/triage/types/{name}`.
+fn get_triage_type(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_triage_type(name) {
+        Ok(Some(t)) => json(200, &t),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("triage type \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/triage/types/{name}`. The built-in `unclassified` type can
+/// never be deregistered (RAL-318).
+fn deregister_triage_type(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().deregister_triage_type(name) {
+        Ok(crate::triage::DeregisterOutcome::Removed) => {
+            json(200, &serde_json::json!({"deleted": true}))
+        }
+        Ok(crate::triage::DeregisterOutcome::NotFound) => error(
+            404,
+            "not_found",
+            &format!("triage type \"{name}\" is not registered"),
+            vec![],
+        ),
+        Ok(crate::triage::DeregisterOutcome::BuiltIn) => error(
+            400,
+            "invalid_value",
+            &format!(
+                "\"{}\" is the built-in fallback Triage type and can never be deregistered",
+                crate::triage::UNCLASSIFIED_TYPE
+            ),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/health/arbiter`: a live completion round-trip against the
+/// configured Arbiter agent/model (RAL-318), backing `ralphus check health`.
+/// User-triggered only -- never polled -- so no caching/rate-limiting of its
+/// own cost is needed; it still respects the Arbiter's `maximum_budget_usd`
+/// cap like any other Arbiter call.
+fn health_arbiter(daemon: &Daemon) -> Reply {
+    let arbiter = crate::arbiter::Arbiter::current();
+    match crate::arbiter::health_check(&daemon.lock(), &arbiter) {
+        Ok(reply) => json(
+            200,
+            &serde_json::json!({"status": "pass", "agent": arbiter.agent, "model": arbiter.model, "reply": reply}),
+        ),
+        Err(e) => json(
+            200,
+            &serde_json::json!({"status": "fail", "agent": arbiter.agent, "model": arbiter.model, "detail": e}),
+        ),
+    }
+}
+
+/// One `(project, triage_type)` pool's current state -- the board's Triage
+/// tab "current pool state" view (RAL-318).
+#[derive(Serialize)]
+struct TriagePoolView {
+    project: String,
+    triage_type: String,
+    count: i64,
+    threshold: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TriagePoolsResponse {
+    pools: Vec<TriagePoolView>,
+}
+
+/// `GET /api/triage/pools`: every `(project, triage_type)` key that either
+/// has at least one pooled cell or a configured count threshold (RAL-318) --
+/// the union lets a threshold set ahead of the first pooled cell (e.g. "fire
+/// every 4 bug fixes" configured before any bug fix has landed) show up and
+/// stay editable immediately, the same way a cron schedule already does.
+fn list_triage_pools(daemon: &Daemon) -> Reply {
+    let store = daemon.lock();
+    let mut keys = match store.triage_pool_keys() {
+        Ok(k) => k,
+        Err(e) => return store_error(&e),
+    };
+    let threshold_keys = match store.triage_threshold_keys() {
+        Ok(k) => k,
+        Err(e) => return store_error(&e),
+    };
+    for key in threshold_keys {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    let pools = keys
+        .into_iter()
+        .map(|(project, triage_type)| {
+            let count = store.triage_pool_count(&project, &triage_type).unwrap_or(0);
+            let threshold = store
+                .get_triage_pool_threshold(&project, &triage_type)
+                .unwrap_or(None);
+            TriagePoolView {
+                project,
+                triage_type,
+                count,
+                threshold,
+            }
+        })
+        .collect();
+    json(200, &TriagePoolsResponse { pools })
+}
+
+/// `POST /api/triage/pools/threshold` body (RAL-318). `threshold: null`
+/// clears a previously configured threshold.
+#[derive(Deserialize)]
+struct SetTriagePoolThresholdBody {
+    project: String,
+    triage_type: String,
+    #[serde(default)]
+    threshold: Option<i64>,
+}
+
+/// `POST /api/triage/pools/threshold`: set (or clear) a pool's count
+/// threshold.
+fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetTriagePoolThresholdBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"project\" and \"triage_type\" strings",
+            vec![],
+        );
+    };
+    if let Some(t) = req.threshold {
+        if t < 1 {
+            return error(
+                400,
+                "invalid_value",
+                "'threshold' must be at least 1",
+                vec![],
+            );
+        }
+    }
+    match daemon
+        .lock()
+        .set_triage_pool_threshold(&req.project, &req.triage_type, req.threshold)
+    {
+        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/triage/schedules[?project=...&triage_type=...]`: every
+/// configured cron schedule entry, optionally filtered to one pool key
+/// (RAL-318).
+#[derive(Serialize)]
+struct TriageSchedulesResponse {
+    schedules: Vec<crate::triage::TriageScheduleRow>,
+}
+
+fn list_triage_schedules(daemon: &Daemon, query: &str) -> Reply {
+    let filter = match (
+        query_param(query, "project"),
+        query_param(query, "triage_type"),
+    ) {
+        (Some(p), Some(t)) => Some((p, t)),
+        _ => None,
+    };
+    match daemon.lock().list_triage_schedules(filter) {
+        Ok(schedules) => json(200, &TriageSchedulesResponse { schedules }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/triage/schedules` body (RAL-318). `anchor_date_ms` establishes
+/// interval parity together with `every_n` -- see `crate::triage`'s module
+/// doc comment.
+#[derive(Deserialize)]
+struct AddTriageScheduleBody {
+    project: String,
+    triage_type: String,
+    cron_expr: String,
+    anchor_date_ms: i64,
+    #[serde(default = "default_every_n")]
+    every_n: i64,
+}
+
+fn default_every_n() -> i64 {
+    1
+}
+
+/// `POST /api/triage/schedules`: register a new cron schedule entry for a
+/// `(project, triage_type)` pool.
+fn add_triage_schedule(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddTriageScheduleBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"project\", \"triage_type\", \"cron_expr\", and \"anchor_date_ms\"",
+            vec![],
+        );
+    };
+    match daemon.lock().add_triage_schedule(
+        &req.project,
+        &req.triage_type,
+        &req.cron_expr,
+        req.anchor_date_ms,
+        req.every_n,
+    ) {
+        Ok(id) => json(201, &serde_json::json!({"id": id})),
+        Err(e) => error(400, "invalid_value", &e, vec![]),
+    }
+}
+
+/// `DELETE /api/triage/schedules/{id}`.
+fn remove_triage_schedule(daemon: &Daemon, id: &str) -> Reply {
+    let Ok(id) = id.parse::<i64>() else {
+        return error(
+            400,
+            "invalid_value",
+            "schedule id must be an integer",
+            vec![],
+        );
+    };
+    match daemon.lock().remove_triage_schedule(id) {
+        Ok(true) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(false) => error(404, "not_found", "no such schedule", vec![]),
+        Err(e) => store_error(&e),
+    }
+}
+
 fn list_projects(daemon: &Daemon) -> Reply {
     match daemon.lock().list_projects() {
         Ok(projects) => json(200, &ProjectsResponse { projects }),
@@ -1604,13 +2367,253 @@ fn agent_profiles_health(daemon: &Daemon, query: &str) -> Reply {
     json(200, &AgentProfilesHealthResponse { profiles })
 }
 
+/// Resolve the current placeholder identity from the request header, falling
+/// back to `[daemon].default_user`. Unknown names are rejected because they
+/// cannot own user-scoped rows in the store.
+fn current_user(daemon: &Daemon, user_header: Option<&str>) -> Result<Option<String>, Reply> {
+    // TODO(RAL-252): replace with verified user identity once login exists
+    let user_name = user_header
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::config::load_daemon_config().default_user);
+    let Some(user_name) = user_name else {
+        return Ok(None);
+    };
+    match daemon.lock().get_user(&user_name) {
+        Ok(Some(_)) => Ok(Some(user_name)),
+        Ok(None) => Err(error(
+            400,
+            "unknown_user",
+            &format!("user {user_name:?} is not registered"),
+            vec![],
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+fn require_current_user(daemon: &Daemon, user_header: Option<&str>) -> Result<String, Reply> {
+    current_user(daemon, user_header)?.ok_or_else(|| {
+        error(
+            400,
+            "current_user_required",
+            "set X-Ralphus-User or configure [daemon].default_user",
+            vec![],
+        )
+    })
+}
+
+/// Requires the resolved current user to be a registered admin (RAL-332).
+///
+/// This is a UI-level convenience gate, not a real security boundary -- see
+/// `crate::users`'s module doc comment. There is no verified login yet
+/// (RAL-252), so anyone holding the daemon's shared bearer token can already
+/// reach every endpoint this gates by calling it directly; the point is only
+/// to keep the board's admin-only tabs and actions consistent between the
+/// client-side hide and what the server actually accepts.
+///
+/// Bootstrap exception: before any user anywhere has ever been promoted,
+/// every admin-gated endpoint behaves as if the caller already is one --
+/// otherwise a fresh instance could never register its first user (itself
+/// admin-gated), let alone promote one, since every path to doing so would
+/// be locked behind an admin who cannot yet exist. This window closes
+/// permanently the instant any user is promoted, from any caller.
+fn require_admin(daemon: &Daemon, user_header: Option<&str>) -> Result<String, Reply> {
+    let any_admin_exists = match daemon.lock().list_users() {
+        Ok(users) => users.iter().any(|u| u.is_admin),
+        Err(e) => return Err(store_error(&e)),
+    };
+    if !any_admin_exists {
+        return Ok(current_user(daemon, user_header)?.unwrap_or_default());
+    }
+    let user_name = require_current_user(daemon, user_header)?;
+    match daemon.lock().is_admin(&user_name) {
+        Ok(true) => Ok(user_name),
+        Ok(false) => Err(error(
+            403,
+            "admin_required",
+            &format!("user {user_name:?} is not an admin"),
+            vec![],
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// Runs `reply` only if the current caller is a registered admin, else
+/// returns [`require_admin`]'s error `Reply` unchanged. Keeps every
+/// admin-gated route entry in the dispatch table a one-liner instead of
+/// repeating the same `match require_admin(...) { ... }` at each handler.
+fn admin_gated(daemon: &Daemon, user_header: Option<&str>, reply: impl FnOnce() -> Reply) -> Reply {
+    match require_admin(daemon, user_header) {
+        Ok(_) => reply(),
+        Err(r) => r,
+    }
+}
+
+/// `GET /api/whoami` (RAL-332): the caller's own resolved identity and admin
+/// flag, so the board can decide whether to show its admin-only tabs
+/// without ever needing to already know its own claimed name. Unlike
+/// [`require_current_user`], an unresolved identity is not an error here --
+/// it just reports `is_admin: false`, the same as any other non-admin.
+fn whoami(daemon: &Daemon, user_header: Option<&str>) -> Reply {
+    let name = match current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    let is_admin = match &name {
+        Some(n) => match daemon.lock().is_admin(n) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        },
+        None => false,
+    };
+    json(200, &WhoAmIResponse { name, is_admin })
+}
+
+/// Sets or clears another user's admin flag (RAL-332). Gated by
+/// [`require_admin`], including its bootstrap exception -- a fresh instance
+/// with zero admins can promote its first one.
+fn set_user_admin_endpoint(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    name: &str,
+    body: &str,
+) -> Reply {
+    if let Err(reply) = require_admin(daemon, user_header) {
+        return reply;
+    }
+    let Ok(req) = serde_json::from_str::<SetAdminBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include an \"is_admin\" boolean",
+            vec![],
+        );
+    };
+    match daemon.lock().set_user_admin(name, req.is_admin) {
+        Ok(()) => json(
+            200,
+            &serde_json::json!({"name": name, "is_admin": req.is_admin}),
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Loads the effective config and applies `[daemon].default_user_is_admin`
+/// -- see [`apply_default_user_admin`] for the actual logic, split out so
+/// it's testable against an explicit [`crate::config::DaemonConfig`]
+/// instead of the real env/filesystem `load_daemon_config` reads from.
+fn bootstrap_default_user_admin(store: &Store) {
+    apply_default_user_admin(store, &crate::config::load_daemon_config());
+}
+
+/// Applies `[daemon].default_user_is_admin` (RAL-332) once at daemon
+/// startup: config is the source of truth, so this both promotes and
+/// demotes to match it. A no-op when the flag is unset, or when the
+/// store's current state already matches -- so a normal restart with no
+/// config change touches neither the DB nor the log/Cartographer.
+///
+/// Exists because the board's Users tab is itself admin-gated: without
+/// this, the very first admin can only be granted through a raw
+/// `POST /api/users/{name}/admin` call (`require_admin`'s bootstrap
+/// exception for "zero admins registered").
+fn apply_default_user_admin(store: &Store, cfg: &crate::config::DaemonConfig) {
+    let Some(want_admin) = cfg.default_user_is_admin else {
+        return;
+    };
+    let Some(name) = cfg.default_user.clone() else {
+        crate::rlog!(
+            WARNING,
+            "ralphus [startup] [daemon].default_user_is_admin is set but no default_user is configured -- nothing to promote/demote"
+        );
+        return;
+    };
+    if want_admin {
+        match store.get_user(&name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(e) = store.create_user(&name) {
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [startup] could not register default_user {name:?}: {e}"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [startup] could not look up default_user {name:?}: {e}"
+                );
+                return;
+            }
+        }
+    }
+    match store.is_admin(&name) {
+        Ok(is_admin) if is_admin == want_admin => {}
+        Ok(_) => match store.set_user_admin(&name, want_admin) {
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [startup] set default_user {name:?} admin={want_admin} via [daemon].default_user_is_admin"
+            ),
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [startup] could not set default_user {name:?} admin={want_admin}: {e}"
+            ),
+        },
+        Err(e) => crate::rlog!(
+            ERROR,
+            "ralphus [startup] could not check admin status for default_user {name:?}: {e}"
+        ),
+    }
+}
+
+/// `POST /api/users/{name}/visit` (RAL-332): records that an admin opened
+/// "Edit Profile" for another user -- i.e. viewed RAL-329's Preferences page
+/// scoped to `name` instead of their own. Audit-only: this endpoint does not
+/// itself read or change anything for either user. Requires the caller to
+/// already be an admin (no bootstrap exception -- unlike promotion, there is
+/// no reason this needs to work before any admin exists).
+fn visit_user_profile(daemon: &Daemon, user_header: Option<&str>, name: &str) -> Reply {
+    let admin_name = match require_admin(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    match daemon.lock().get_user(name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("user {name:?} is not registered"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    }
+    let store = daemon.lock();
+    // RAL-332: admin-only Cartographer visibility -- see `Note::admin_only`'s
+    // doc comment. Closes the loop RAL-328 left open at `set_squad_hidden`/
+    // `set_review_hidden`'s own `TODO(RAL-332)` comments.
+    crate::cartographer::Note::new("users")
+        .scope("user")
+        .admin_only()
+        .emit(
+            &store,
+            "admin viewed user profile",
+            serde_json::json!({ "admin": admin_name, "target": name }),
+        );
+    json(
+        200,
+        &serde_json::json!({"admin": admin_name, "target": name}),
+    )
+}
+
 /// Lists the agents a user may select for `cwd` -- built-in backends plus
-/// whatever `.ralphus.toml` custom profiles apply there. `user` is an
-/// optional caller-presented identity (`crate::agent_access::UserContext`);
-/// it is currently inert (see that module's doc comment) but accepted on the
-/// wire now so this endpoint's contract doesn't need to change once a real
-/// "User adapter" exists.
-fn list_agents(daemon: &Daemon, query: &str) -> Reply {
+/// whatever `.ralphus.toml` custom profiles apply there. The caller-presented
+/// identity is currently inert in `AgentAccess`, but shares the same header
+/// and configured-default resolution as other user-scoped endpoints.
+fn list_agents(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply {
     let Some(cwd) = query_param(query, "cwd").map(url_decode) else {
         return error(
             400,
@@ -1619,8 +2622,9 @@ fn list_agents(daemon: &Daemon, query: &str) -> Reply {
             vec![],
         );
     };
-    let user = crate::agent_access::UserContext {
-        id: query_param(query, "user").map(url_decode),
+    let user = match current_user(daemon, user_header) {
+        Ok(id) => crate::agent_access::UserContext { id },
+        Err(reply) => return reply,
     };
     match daemon.agent_access.available_agents(&user, Path::new(&cwd)) {
         Ok(agents) => {
@@ -1637,6 +2641,92 @@ fn list_agents(daemon: &Daemon, query: &str) -> Reply {
         }
         Err(e) => error(500, "internal", &e, vec![]),
     }
+}
+
+fn list_hidden(daemon: &Daemon, user_header: Option<&str>) -> Reply {
+    let user_name = match require_current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    match daemon.lock().list_hidden(&user_name) {
+        Ok(hidden) => json(200, &HiddenResponse { hidden }),
+        Err(e) => store_error(&e),
+    }
+}
+
+fn set_squad_hidden(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    squad_id: &str,
+    hidden: bool,
+) -> Reply {
+    let user_name = match require_current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    let store = daemon.lock();
+    let result = if hidden {
+        store.hide_squad(&user_name, squad_id)
+    } else {
+        store.unhide_squad(&user_name, squad_id)
+    };
+    if let Err(e) = result {
+        return store_error(&e);
+    }
+    // RAL-332: admin-only Cartographer visibility -- a hide/unhide row
+    // reveals one user's personal preference, which every other viewer of
+    // the Logs tab should not see.
+    crate::cartographer::Note::new("hidden")
+        .squad(squad_id)
+        .scope("squad")
+        .admin_only()
+        .emit(
+            &store,
+            if hidden {
+                "squad hidden"
+            } else {
+                "squad unhidden"
+            },
+            serde_json::json!({ "user_name": user_name }),
+        );
+    json(200, &HiddenStateResponse { hidden })
+}
+
+fn set_review_hidden(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    guardian_id: &str,
+    hidden: bool,
+) -> Reply {
+    let user_name = match require_current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    let store = daemon.lock();
+    let result = if hidden {
+        store.hide_review(&user_name, guardian_id)
+    } else {
+        store.unhide_review(&user_name, guardian_id)
+    };
+    if let Err(e) = result {
+        return store_error(&e);
+    }
+    // RAL-332: admin-only Cartographer visibility -- see `set_squad_hidden`'s
+    // matching comment above.
+    crate::cartographer::Note::new("hidden")
+        .guardian(guardian_id)
+        .scope("guardian")
+        .admin_only()
+        .emit(
+            &store,
+            if hidden {
+                "review hidden"
+            } else {
+                "review unhidden"
+            },
+            serde_json::json!({ "user_name": user_name }),
+        );
+    json(200, &HiddenStateResponse { hidden })
 }
 
 /// All registered users (RAL-?) -- see `crate::users`'s module doc comment.
@@ -1694,6 +2784,224 @@ fn delete_user(daemon: &Daemon, name: &str) -> Reply {
             &format!("user \"{name}\" is not registered"),
             vec![],
         ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Resolve the acting user for a request (RAL-320): an explicit `?user=`
+/// query parameter, falling back to `.ralphus.toml`'s `default_user`
+/// (`crate::config::DaemonConfig::default_user`) when the caller doesn't
+/// name one. `None` when neither is set -- callers that require a user
+/// should go through [`require_acting_user`] instead.
+fn resolve_acting_user(query: &str) -> Option<String> {
+    query_param(query, "user")
+        .map(url_decode)
+        .or_else(|| crate::config::load_daemon_config().default_user)
+}
+
+/// Like [`resolve_acting_user`], but a `400` reply when no user can be
+/// resolved -- the shared guard for every follows/personal-mailbox endpoint,
+/// none of which make sense for an anonymous caller.
+fn require_acting_user(query: &str) -> Result<String, Reply> {
+    resolve_acting_user(query).ok_or_else(|| {
+        error(
+            400,
+            "bad_request",
+            "no user: pass ?user=<name> or set default_user in .ralphus.toml",
+            vec![],
+        )
+    })
+}
+
+/// Parse a list of tier-name strings, `400`-erroring on the first one that
+/// isn't `urgent`/`high`/`normal`.
+fn parse_notify_tiers(tiers: &[String]) -> Result<Vec<crate::mailbox::MailboxPriority>, Reply> {
+    let mut parsed = Vec::with_capacity(tiers.len());
+    for t in tiers {
+        match crate::mailbox::MailboxPriority::parse(t) {
+            Some(p) => parsed.push(p),
+            None => {
+                return Err(error(
+                    400,
+                    "bad_request",
+                    "notify tiers must be one of urgent/high/normal",
+                    vec![],
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// `GET /api/users/{name}/preferences` (RAL-320).
+fn get_user_preferences(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_user(name) {
+        Ok(Some(u)) => json(200, &u),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("user \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/users/{name}/preferences` (RAL-320) -- registers `name` first
+/// if needed, same as [`create_follow_endpoint`].
+fn set_user_preferences_endpoint(daemon: &Daemon, name: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<UserPreferencesBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {auto_follow, default_notify_tiers?}",
+            vec![],
+        );
+    };
+    let tiers = match req.default_notify_tiers {
+        Some(tiers) if !tiers.is_empty() => match parse_notify_tiers(&tiers) {
+            Ok(t) => t,
+            Err(r) => return r,
+        },
+        _ => crate::mailbox::all_tiers(),
+    };
+    match daemon
+        .lock()
+        .set_user_preferences(name, req.auto_follow, &tiers)
+    {
+        Ok(u) => json(200, &u),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/follows?user=` (RAL-320) -- every follow the acting user owns.
+fn list_follows_endpoint(daemon: &Daemon, query: &str) -> Reply {
+    let user = match require_acting_user(query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match daemon.lock().list_follows(&user) {
+        Ok(follows) => json(200, &FollowsResponse { follows }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/follows?user=` (RAL-320) -- follow (or re-follow, updating
+/// tiers in place) an [`crate::entity_uri::EntityUri`] on the acting user's
+/// behalf.
+fn create_follow_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
+    let user = match require_acting_user(query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Ok(req) = serde_json::from_str::<CreateFollowBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include an \"entity_uri\" string",
+            vec![],
+        );
+    };
+    if crate::entity_uri::parse(&req.entity_uri).is_none() {
+        return error(
+            400,
+            "bad_request",
+            "entity_uri is not a recognized ralphus entity URI",
+            vec![],
+        );
+    }
+    let store = daemon.lock();
+    let tiers = match req.notify_tiers {
+        Some(tiers) if !tiers.is_empty() => match parse_notify_tiers(&tiers) {
+            Ok(t) => t,
+            Err(r) => return r,
+        },
+        _ => store
+            .get_user(&user)
+            .ok()
+            .flatten()
+            .map(|u| u.default_notify_tiers)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(crate::mailbox::all_tiers),
+    };
+    match store.create_follow(&user, &req.entity_uri, &tiers) {
+        Ok(follow) => json(201, &follow),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/follows/{entity_uri}?user=` (RAL-320).
+fn delete_follow_endpoint(daemon: &Daemon, query: &str, entity_uri: &str) -> Reply {
+    let user = match require_acting_user(query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match daemon.lock().delete_follow(&user, entity_uri) {
+        Ok(true) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(false) => error(404, "not_found", "no such follow", vec![]),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/mailbox/personal/messages?user=` (RAL-320) -- the acting
+/// user's personal mailbox view, filtered through their follows. Mirrors
+/// [`mailbox_messages`]'s query handling.
+fn personal_mailbox_messages(daemon: &Daemon, query: &str) -> Reply {
+    let user = match require_acting_user(query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let unread_only = query_param(query, "unread").is_some_and(|v| v == "1" || v == "true");
+    let priority = match query_param(query, "priority") {
+        None => None,
+        Some(p) => match crate::mailbox::MailboxPriority::parse(p) {
+            Some(p) => Some(p),
+            None => {
+                return error(
+                    400,
+                    "bad_request",
+                    "priority must be one of urgent/high/normal",
+                    vec![],
+                );
+            }
+        },
+    };
+    match daemon
+        .lock()
+        .personal_mailbox_messages_for_user(&user, unread_only, priority)
+    {
+        Ok(messages) => json(200, &messages),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/mailbox/personal/drain?user=` (RAL-320). Mirrors
+/// [`mailbox_drain`]'s body handling.
+fn personal_mailbox_drain(daemon: &Daemon, query: &str, body: &str) -> Reply {
+    let user = match require_acting_user(query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let req: MailboxDrainBody = if body.trim().is_empty() {
+        MailboxDrainBody::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(b) => b,
+            Err(_) => {
+                return error(
+                    400,
+                    "bad_request",
+                    "body must be JSON with an optional \"message_ids\" array of strings",
+                    vec![],
+                );
+            }
+        }
+    };
+    match daemon
+        .lock()
+        .drain_personal_mailbox_messages(&user, req.message_ids.as_deref())
+    {
+        Ok(drained) => json(200, &serde_json::json!({"drained": drained})),
         Err(e) => store_error(&e),
     }
 }
@@ -1901,7 +3209,7 @@ fn generate_status(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
-fn submit(daemon: &Daemon, body: &str) -> Reply {
+fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<SubmitBody>(body) else {
         return error(
             400,
@@ -1943,6 +3251,20 @@ fn submit(daemon: &Daemon, body: &str) -> Reply {
         );
     }
 
+    // RAL-318: an inline `triage_type` must name a registered Triage type --
+    // `core::validate` only checked its structure (non-empty, requires
+    // `triage = true`), since `core` has no store access.
+    let triage_type_errors =
+        crate::triage::validate_task_file_triage_types(&daemon.lock(), &req.toml, &file);
+    if !triage_type_errors.is_empty() {
+        return error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            triage_type_errors,
+        );
+    }
+
     // A task with a placeholder cwd (`ralphus:new-worktree/<branch>`) names a
     // project in its `project` field; `validate_toml` above already required
     // that field to be set (core has no DB access), so this preflight only
@@ -1965,15 +3287,64 @@ fn submit(daemon: &Daemon, body: &str) -> Reply {
     if let Err(msg) = validate_remote_reviews_are_declarative(&daemon.lock(), &file) {
         return error(400, "machine_validation_failed", &msg, vec![]);
     }
+    if let Some(label) = req.label.as_deref() {
+        if let Some(reply) = reject_label_with_comma(label) {
+            return reply;
+        }
+    }
 
     let mut store = daemon.lock();
     let squad_id = match store.insert_squad(&file, req.label.as_deref(), req.hold) {
         Ok(id) => id,
         Err(e) => return store_error(&e),
     };
+    // RAL-318: classify every Triage-opted-in cell exactly once, before it
+    // reaches the pool -- either its own inline `triage_type` (already
+    // validated as registered above), or a fresh Arbiter classification.
+    // Single-attempt, no retry: `arbiter::classify` itself falls back to
+    // `unclassified` on any failure, so this never blocks or slows down
+    // submission beyond one headless LLM call per un-typed Triage cell.
+    let arbiter = crate::arbiter::Arbiter::current();
+    for (task_idx, task) in file.task.iter().enumerate() {
+        for (idx, cell) in task.cell.iter().enumerate() {
+            if !cell.triage {
+                continue;
+            }
+            let (task_idx, idx) = (task_idx as i64, idx as i64);
+            let inline_types: Vec<String> = cell
+                .triage_type
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            let resolved_types = if inline_types.is_empty() {
+                let cell_id = cell.id.clone().unwrap_or_else(|| format!("cell-{idx}"));
+                let context = cell
+                    .prompt
+                    .clone()
+                    .or_else(|| cell.command.clone())
+                    .unwrap_or_default();
+                crate::arbiter::classify(&store, &arbiter, &squad_id, &cell_id, &context)
+            } else {
+                inline_types
+            };
+            let _ = store.set_cell_triage_types(&squad_id, task_idx, idx, &resolved_types);
+        }
+    }
+
     // Derive per-project review guardians. A preflight failure (bad worktree, no
     // upstream for a `<<upstream>>` base) rolls the squad back and rejects the submit.
     if let Err(e) = crate::reviews::derive_reviews(&store, &squad_id, &file) {
+        let _ = store.delete_squad(&squad_id);
+        return error(400, "review_preflight_failed", &e.message, vec![]);
+    }
+    // RAL-318: pool every Triage-opted-in cell and fire any pool whose count
+    // threshold this submission just reached. Failures here mirror
+    // `derive_reviews`'s rollback -- Triage pooling shares the same worktree/
+    // upstream preconditions.
+    if let Err(e) = crate::reviews::derive_triage_pools(&store, &squad_id, &file) {
         let _ = store.delete_squad(&squad_id);
         return error(400, "review_preflight_failed", &e.message, vec![]);
     }
@@ -1982,6 +3353,21 @@ fn submit(daemon: &Daemon, body: &str) -> Reply {
     } else {
         SquadState::Pending
     };
+    // RAL-320: auto-follow-on-submit -- a user who has opted in via
+    // `auto_follow` (`crate::users::set_user_preferences`) is followed to
+    // their own squad automatically, using their `default_notify_tiers`, so
+    // they don't have to separately `follow` every squad they submit.
+    if let Some(user) = resolve_acting_user(query) {
+        if let Ok(Some(u)) = store.get_user(&user) {
+            if u.auto_follow {
+                let entity_uri = crate::entity_uri::EntityUri::Squad {
+                    squad_id: squad_id.clone(),
+                }
+                .to_string();
+                let _ = store.create_follow(&user, &entity_uri, &u.default_notify_tiers);
+            }
+        }
+    }
     json(
         201,
         &SubmitResponse {
@@ -2583,7 +3969,18 @@ fn guardian_logs(daemon: &Daemon, id: &str) -> Reply {
 /// by) and composes with any of those fields also given explicitly — an
 /// explicit field always wins if both are present and disagree, since it's
 /// the more specific ask.
-fn cartographer_query(daemon: &Daemon, query: &str) -> Reply {
+/// Whether the caller currently resolves to a registered admin (RAL-332).
+/// Unlike [`require_admin`], an unresolved or unknown identity is not an
+/// error here -- it just means "hide admin-only rows", the same outcome a
+/// resolved non-admin identity gets.
+fn caller_is_admin(daemon: &Daemon, user_header: Option<&str>) -> bool {
+    match current_user(daemon, user_header) {
+        Ok(Some(name)) => daemon.lock().is_admin(&name).unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn cartographer_query(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply {
     let limit = query_param(query, "limit")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(100);
@@ -2604,6 +4001,7 @@ fn cartographer_query(daemon: &Daemon, query: &str) -> Reply {
         limit,
         offset,
         ascending: query_param(query, "sort") == Some("asc"),
+        include_admin_only: caller_is_admin(daemon, user_header),
     };
     let guard = daemon.lock();
     if let Some(entity) = query_filter(query, "entity") {
@@ -2690,11 +4088,25 @@ fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
 
 /// Fetch one Cartographer row's full detail (used when the table's payload
 /// column is truncated and the UI needs the whole JSON body).
-fn cartographer_get(daemon: &Daemon, id: &str) -> Reply {
+fn cartographer_get(daemon: &Daemon, id: &str, user_header: Option<&str>) -> Reply {
     let Ok(row_id) = id.parse::<i64>() else {
         return error(400, "bad_request", "id must be an integer", vec![]);
     };
-    match daemon.lock().cartographer_get(row_id) {
+    // Resolved to an owned `Result` (not matched directly on `daemon.lock()`)
+    // so the `MutexGuard` is dropped before `caller_is_admin` below takes the
+    // same lock again -- a match guard's condition is evaluated while the
+    // scrutinee's temporaries (including a `daemon.lock()` guard) are still
+    // alive, so matching directly on `daemon.lock().cartographer_get(...)`
+    // and calling `caller_is_admin` from a guard clause self-deadlocks on
+    // this non-reentrant mutex.
+    let result = daemon.lock().cartographer_get(row_id);
+    match result {
+        // RAL-332: an admin-only row is indistinguishable from a missing one
+        // to a non-admin caller -- same 404, no separate "forbidden" leak of
+        // its existence.
+        Ok(Some(row)) if row.admin_only && !caller_is_admin(daemon, user_header) => {
+            error(404, "not_found", "no such cartographer event", vec![])
+        }
         Ok(Some(row)) => json(200, &row),
         Ok(None) => error(404, "not_found", "no such cartographer event", vec![]),
         Err(e) => store_error(&e),
@@ -2908,10 +4320,31 @@ struct EditBody {
     prompt: Option<String>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    auto_compact_threshold: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
 }
 
 fn non_empty(v: Option<&String>) -> Option<&str> {
     v.map(String::as_str).filter(|s| !s.is_empty())
+}
+
+/// A squad label is split on `,` for multi-name filtering (RAL-323, see
+/// `filter_and_sort_squads`), so a comma inside a label would make that
+/// label impossible to filter for on its own. Returns an error `Reply` if
+/// `label` contains a comma, naming the offending value.
+fn reject_label_with_comma(label: &str) -> Option<Reply> {
+    if label.contains(',') {
+        Some(error(
+            400,
+            "invalid_label",
+            &format!("squad label must not contain a comma: \"{label}\""),
+            vec![],
+        ))
+    } else {
+        None
+    }
 }
 
 /// Decodes a `CellEdit` nullable field from the request body: `None` -- the
@@ -2920,6 +4353,22 @@ fn non_empty(v: Option<&String>) -> Option<&str> {
 /// non-empty, set it to `v`.
 fn nullable_field_edit(v: Option<&String>) -> Option<Option<&str>> {
     v.map(|s| non_empty(Some(s)))
+}
+
+/// Like [`nullable_field_edit`] but for an integer-valued nullable field
+/// (currently only `auto_compact_threshold`): `None` -- untouched;
+/// `Some(None)` -- present but empty, clear it; `Some(Some(n))` -- present
+/// and non-empty, parsed to `n`. `Err` means the caller supplied a
+/// non-empty value that isn't a valid integer.
+fn nullable_i64_field_edit(v: Option<&String>) -> std::result::Result<Option<Option<i64>>, String> {
+    match v.map(|s| non_empty(Some(s))) {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(s)) => s
+            .parse::<i64>()
+            .map(|n| Some(Some(n)))
+            .map_err(|_| format!("auto_compact_threshold: invalid integer '{s}'")),
+    }
 }
 
 /// Edit a squad's label, a task's name/project/model, a cell's fields, or a
@@ -2949,6 +4398,11 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     };
     match req.kind.as_str() {
         "squad" => {
+            if let Some(label) = non_empty(req.label.as_ref()) {
+                if let Some(reply) = reject_label_with_comma(label) {
+                    return reply;
+                }
+            }
             let store = daemon.lock();
             if let Err(e) = store.edit_squad_label(id, non_empty(req.label.as_ref())) {
                 return store_error(&e);
@@ -2979,12 +4433,49 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             } else {
                 (None, None)
             };
+            let auto_compact_threshold =
+                match nullable_i64_field_edit(req.auto_compact_threshold.as_ref()) {
+                    Ok(v) => v,
+                    Err(msg) => return error(400, "bad_request", &msg, vec![]),
+                };
+            let system_prompt = nullable_field_edit(req.system_prompt.as_ref());
+            let new_agent = non_empty(req.agent.as_ref());
+            // Reject up front (mirroring `core::validate::check_system_prompt`'s
+            // submit-time rule) rather than silently storing a system_prompt the
+            // cell's agent has no way to deliver -- RAL-341. Clearing the field
+            // back out (`Some(None)`) needs no such check. A custom agent
+            // profile name (not in `RESERVED_AGENT_NAMES`) is deferred the same
+            // way `core` defers it, since resolving a profile's backend needs
+            // the cell's cwd/config, which this edit path doesn't have on hand.
+            if let Some(Some(_)) = system_prompt {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&effective_agent.as_str())
+                    && !ralphus_core::schema::agent_supports_system_prompt(&effective_agent)
+                {
+                    return error(
+                        400,
+                        "bad_request",
+                        &format!(
+                            "'system_prompt' is only supported for the 'claude-code'/'codex'/'pi' agents right now, not '{effective_agent}'"
+                        ),
+                        vec![],
+                    );
+                }
+            }
             let edit = crate::store::CellEdit {
                 cwd: nullable_field_edit(req.cwd.as_ref()),
-                agent: non_empty(req.agent.as_ref()),
+                agent: new_agent,
                 model: nullable_field_edit(req.model.as_ref()),
                 prompt,
                 command,
+                auto_compact_threshold,
+                system_prompt,
             };
             if let Err(e) = daemon
                 .lock()
@@ -3174,6 +4665,7 @@ fn set_squad_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
         task: None,
         log_path: None,
         payload: serde_json::json!({"set": redacted_set, "unset": req.unset}),
+        admin_only: false,
     });
     json(200, &result)
 }
@@ -3264,6 +4756,7 @@ fn set_env_overrides(
         task,
         log_path: None,
         payload: serde_json::json!({"set": redacted_set, "unset": req.unset}),
+        admin_only: false,
     });
     json(200, &result)
 }
@@ -3524,6 +5017,7 @@ fn set_guardian_branch_env(daemon: &Daemon, id: &str, branch_id: &str, body: &st
             "unset": req.unset,
             "clear": req.clear,
         }),
+        admin_only: false,
     });
     json(200, &result)
 }
@@ -3648,6 +5142,7 @@ fn set_guardian_scoped_env(
             "unset": req.unset,
             "clear": req.clear,
         }),
+        admin_only: false,
     });
     json(200, &result)
 }
@@ -3662,6 +5157,139 @@ fn set_guardian_build_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// [`set_guardian_scoped_env`].
 fn set_guardian_manual_checks_env(daemon: &Daemon, id: &str, body: &str) -> Reply {
     set_guardian_scoped_env(daemon, id, body, GuardianEnvSection::ManualChecks)
+}
+
+// -- RAL-324: read-only resolved-environment views --------------------------
+//
+// Every `POST .../env` route above gains a `GET` on the *same* path returning
+// that surface's fully resolved environment, secret values masked. The board's
+// env-viewer popup and `ralphus env` both read these, so neither client can
+// become a redaction bypass for the other -- the daemon never emits a
+// registered secret's value in the first place. See `crate::env_view`.
+
+/// Serve one resolved-environment view, mapping any store failure the same way
+/// every other read route does.
+fn env_view_reply(
+    daemon: &Daemon,
+    build: impl FnOnce(&Store) -> std::result::Result<crate::env_view::EnvView, StoreError>,
+) -> Reply {
+    let store = daemon.lock();
+    match build(&store) {
+        Ok(view) => json(200, &view),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Parse a path index segment, or the 400 every `.../env` route returns for a
+/// non-numeric one.
+fn parse_index(raw: &str, what: &str) -> std::result::Result<i64, Reply> {
+    raw.parse::<i64>().map_err(|_| {
+        error(
+            400,
+            "bad_request",
+            &format!("{what} must be an integer"),
+            vec![],
+        )
+    })
+}
+
+/// `GET /api/squads/{id}/env` (RAL-324).
+fn squad_env_view(daemon: &Daemon, id: &str) -> Reply {
+    env_view_reply(daemon, |store| crate::env_view::squad_env(store, id))
+}
+
+/// `GET /api/squads/{id}/tasks/{ti}/env` (RAL-324).
+fn task_env_view(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+    let task_idx = match parse_index(ti, "task index") {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+    env_view_reply(daemon, |store| {
+        crate::env_view::task_env(store, id, task_idx)
+    })
+}
+
+/// `GET /api/squads/{id}/tasks/{ti}/proof/env` (RAL-324).
+fn task_proof_env_view(daemon: &Daemon, id: &str, ti: &str) -> Reply {
+    let task_idx = match parse_index(ti, "task index") {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+    env_view_reply(daemon, |store| {
+        crate::env_view::task_proof_env(store, id, task_idx)
+    })
+}
+
+/// `GET /api/squads/{id}/tasks/{ti}/proof/{vi}/env` (RAL-324).
+fn task_proof_step_env_view(daemon: &Daemon, id: &str, ti: &str, vi: &str) -> Reply {
+    let task_idx = match parse_index(ti, "task index") {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+    let idx = match parse_index(vi, "proof index") {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+    env_view_reply(daemon, |store| {
+        crate::env_view::proof_step_env(store, id, task_idx, "task", -1, idx)
+    })
+}
+
+/// `GET /api/squads/{id}/cells/{ti}/{si}/env` (RAL-324).
+fn cell_env_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
+    {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(reply), _) | (_, Err(reply)) => return reply,
+    };
+    env_view_reply(daemon, |store| {
+        crate::env_view::cell_env(store, id, task_idx, cell_idx)
+    })
+}
+
+/// `GET /api/squads/{id}/cells/{ti}/{si}/proof/env` (RAL-324).
+fn cell_proof_env_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
+    {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(reply), _) | (_, Err(reply)) => return reply,
+    };
+    env_view_reply(daemon, |store| {
+        crate::env_view::cell_proof_env(store, id, task_idx, cell_idx)
+    })
+}
+
+/// `GET /api/squads/{id}/cells/{ti}/{si}/proof/{vi}/env` (RAL-324).
+fn cell_proof_step_env_view(daemon: &Daemon, id: &str, ti: &str, si: &str, vi: &str) -> Reply {
+    let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
+    {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(reply), _) | (_, Err(reply)) => return reply,
+    };
+    let idx = match parse_index(vi, "proof index") {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+    env_view_reply(daemon, |store| {
+        crate::env_view::proof_step_env(store, id, task_idx, "cell", cell_idx, idx)
+    })
+}
+
+/// `GET /api/guardians/{id}/branches/{branch_id}/env` (RAL-324).
+fn review_worktree_env_view(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    env_view_reply(daemon, |store| {
+        crate::env_view::review_worktree_env(store, id, branch_id)
+    })
+}
+
+/// `GET /api/guardians/{id}/build-env`, `.../tests-env`, and
+/// `.../manual-checks-env` (RAL-324). `tests-env` is the check gates' own
+/// entry point; it deliberately resolves the build step's stored override
+/// layer, because that is the environment the gates actually run under.
+fn review_step_env_view(daemon: &Daemon, id: &str, step: crate::env_view::ReviewStep) -> Reply {
+    env_view_reply(daemon, |store| {
+        crate::env_view::review_step_env(store, id, step)
+    })
 }
 
 #[derive(Serialize)]
@@ -4162,7 +5790,7 @@ fn restart_task_proof(daemon: &Daemon, id: &str, ti: &str, vi: &str, body: &str)
 }
 
 /// Parse a single named parameter from a URL query string (e.g. `"mode=readonly"`).
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
         if k == key { Some(v) } else { None }
@@ -5424,7 +7052,7 @@ fn pane_snapshot_mtime(session_name: &str) -> Option<std::time::SystemTime> {
 /// prompts are bypassed unconditionally, matching each backend's own
 /// headless invocation, so the resumed conversation doesn't immediately
 /// stall on a prompt the human has to notice and click through.
-// Shared with `cli-rs`'s cell/review-terminal commands, so both sides
+// Shared with `cli`'s cell/review-terminal commands, so both sides
 // build the exact same resume command line -- see `ralphus_core::agent_resume`
 // for the logic and its tests.
 use ralphus_core::agent_resume::{
@@ -5464,6 +7092,102 @@ fn resume_shell_invocation(agent: Option<&str>, agent_session_id: &str) -> (Stri
         command,
     ];
     (shell_cmd, shell_args)
+}
+
+/// `POST /api/squads/{id}/cells/{ti}/{si}/terminal-ticket` (RAL-355 Phase
+/// 10): mint a short-lived ticket for the terminal-relay WebSocket listener,
+/// after checking eligibility up front so a client gets an actionable error
+/// immediately rather than only after opening (and being refused by) the WS
+/// connection itself.
+///
+/// Eligibility, checked in this order: the cell must be resolved (a real
+/// squad/task/cell), its `machine` must be a *remote* one (this relay never
+/// handles local cells -- "Open Agent" already works for those, and a
+/// browser client has no way to see a window popped open on the daemon's own
+/// desktop for a local cell anyway), its agent must be Claude Code (this
+/// pass's only supported harness), and it must carry a resumable
+/// `agent_session_id`.
+fn mint_terminal_ticket_route(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell index must be integers",
+            vec![],
+        );
+    };
+    let guard = daemon.lock();
+    let (cwd, agent, agent_session_id) = match guard.get_cell_agent_resume(id, task_idx, cell_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let (machine, _is_command_cell, state) = match guard.get_cell_input_gate(id, task_idx, cell_idx)
+    {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    drop(guard);
+    let _ = cwd;
+    let Some(machine) = machine else {
+        return error(
+            400,
+            "not_remote",
+            "this cell runs locally -- use the existing Open Agent action instead of the \
+             remote terminal relay",
+            vec![],
+        );
+    };
+    // Remote cells have no detach mechanism yet (unlike local `open-agent`'s
+    // RAL-288 Stage 6 dance) -- a `Running` remote cell may still have a
+    // live headless process writing to this exact `agent_session_id`
+    // conversation, so opening a second interactive resume against it now
+    // would race the same way a local cell's still-running branch exists to
+    // prevent. Reject rather than risk corrupting the session; retry once
+    // the cell finishes.
+    if state == crate::store::NodeState::Running {
+        return error(
+            409,
+            "still_running",
+            "this cell is still running remotely -- wait for it to finish before opening a \
+             terminal (the remote terminal relay has no detach mechanism yet)",
+            vec![],
+        );
+    }
+    if !ralphus_core::agent_resume::is_claude_agent(Some(agent.as_str())) {
+        return error(
+            400,
+            "unsupported_agent",
+            &format!(
+                "the remote terminal relay only supports Claude Code cells this release; \
+                 this cell's agent is {agent:?}"
+            ),
+            vec![],
+        );
+    }
+    let Some(session_id) = agent_session_id else {
+        return error(
+            409,
+            "no_claude_session",
+            "no resumable agent session recorded yet for this cell",
+            vec![],
+        );
+    };
+    let port = daemon.terminal_relay_port();
+    if port == 0 {
+        return error(
+            503,
+            "relay_unavailable",
+            "the terminal-relay listener is not running",
+            vec![],
+        );
+    }
+    let ticket = daemon.mint_terminal_ticket();
+    let _ = session_id; // the WS connection itself re-derives it from the cell, not the ticket
+    let _ = machine;
+    json(
+        200,
+        &serde_json::json!({"ticket": ticket, "port": port, "path": "/terminal"}),
+    )
 }
 
 fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
@@ -5884,7 +7608,7 @@ fn spawn_in_terminal(
     // Try Windows Terminal (wt.exe) — opens the command in a new tab.
     let mut wt_cmd = Command::new("wt");
     if let Some(dir) = cwd {
-        wt_cmd.args(["-d", dir]);
+        wt_cmd.args(["--startingDirectory", dir]);
     }
     if wt_cmd.envs(env).arg("--").args(&all).spawn().is_ok() {
         return Ok(());
@@ -6120,6 +7844,7 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
                 "cancelled_squads": cancelled_squads.len(),
                 "cancelled_guardians": cancelled_guardians.len(),
             }),
+            admin_only: false,
         });
     crate::rlog!(
         WARNING,
@@ -7001,6 +8726,12 @@ struct GuardianSettingsBody {
     /// absent) means "inherit the project/global default".
     #[serde(default)]
     match_pr_branch_name: Option<bool>,
+    /// RAL-317: this review's own override for whether the PR stack is
+    /// auto-submitted/grown as each branch reaches a terminal merge state.
+    /// `None` (or the field being absent) means "inherit the project/global
+    /// default".
+    #[serde(default)]
+    auto_submit_pr_stack: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -7191,6 +8922,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.auto_submit_pr_stack {
+        if let Err(e) = store.set_guardian_auto_submit_pr_stack(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -7264,6 +9000,27 @@ fn guardian_list_prs(daemon: &Daemon, id: &str) -> Reply {
         Ok(prs) => json(200, &prs),
         Err(e) => store_error(&e),
     }
+}
+
+/// RAL-317: bulk-drop every currently open PR row for a guardian and clear
+/// its registered GitHub-native PR stack number (`review pr unlink`) -- the
+/// guardian-wide "start this review's PR stack over" action, e.g. after an
+/// auto-submitted stack went wrong. Dropped rows remain visible as history
+/// via `GET .../pull-request-stacks` (`PrStackView`/`group_into_stacks`);
+/// this never hard-deletes.
+fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    if let Err(e) = store.get_guardian(id) {
+        return store_error(&e);
+    }
+    let dropped = match store.bulk_drop_open_pull_requests(id, "unlinked") {
+        Ok(n) => n,
+        Err(e) => return store_error(&e),
+    };
+    // Best-effort: an already-unregistered stack number's `NotFound` here
+    // isn't worth failing an otherwise-successful unlink over.
+    let _ = store.clear_guardian_forge_stack_number(id);
+    json(200, &serde_json::json!({"dropped": dropped}))
 }
 
 /// List every past PR stack submitted for a guardian (RAL-302), most recent
@@ -7678,6 +9435,20 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+/// Reopen a `cancelled` review (status → `collecting`) and immediately try a
+/// fresh merge pass if the daemon has capacity -- see
+/// [`crate::guardian_merge::reopen_cancelled_guardian_merge`].
+fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
+    let runner = guardian_agent_runner(daemon);
+    crate::guardian_merge::reopen_cancelled_guardian_merge(
+        daemon.store_handle(),
+        runner,
+        id,
+        daemon.semaphore_handle(),
+        daemon.cancellations_handle(),
+    )
+}
+
 /// Resolve `{name}` placeholders in `text` from a check's declared inputs
 /// (RAL-164): a value submitted with this squad wins, then a previously
 /// resolved/submitted value stored on the guardian, then the input's own
@@ -7783,6 +9554,7 @@ fn reject_invalid_check_inputs(
             task: None,
             log_path: None,
             payload: serde_json::json!({"failures": failures}),
+            admin_only: false,
         });
     Some(error(
         400,
@@ -8436,6 +10208,9 @@ pub fn serve<A: ToSocketAddrs>(
     let startup_started = Instant::now();
     let store = Store::open(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
     let schema_open_ms = startup_started.elapsed().as_millis();
+    // RAL-332: apply `[daemon].default_user_is_admin` before serving any
+    // request, so `GET /api/whoami` reflects it on the very first poll.
+    bootstrap_default_user_admin(&store);
     // Bind the port before touching any squad state. `recover_orphaned_squads`
     // assumes "nothing is executing yet, so any running row is orphaned" —
     // true only for the process that actually wins the port. A second
@@ -8468,6 +10243,7 @@ pub fn serve<A: ToSocketAddrs>(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({"squad_ids": ids}),
+                admin_only: false,
             });
         }
         Ok(_) => {}
@@ -8499,6 +10275,7 @@ pub fn serve<A: ToSocketAddrs>(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({"guardian_ids": ids}),
+                admin_only: false,
             });
         }
         Ok(_) => {}
@@ -8530,6 +10307,7 @@ pub fn serve<A: ToSocketAddrs>(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({"pairs": pairs}),
+                admin_only: false,
             });
         }
         Ok(_) => {}
@@ -8588,6 +10366,7 @@ pub fn serve<A: ToSocketAddrs>(
             "schema_open_ms": schema_open_ms,
             "tmux_reap_ms": reap_ms,
         }),
+        admin_only: false,
     });
     if reaped > 0 {
         crate::rlog!(
@@ -8605,6 +10384,7 @@ pub fn serve<A: ToSocketAddrs>(
             task: None,
             log_path: None,
             payload: serde_json::json!({"count": reaped}),
+            admin_only: false,
         });
     }
     // RAL-219: every route requires this token (`Authorization: Bearer
@@ -8621,6 +10401,34 @@ pub fn serve<A: ToSocketAddrs>(
         crate::token_path().display()
     );
     let daemon = Arc::new(Daemon::new(store, max_concurrent).with_token(token));
+
+    // The remote Open Agent terminal relay (RAL-355 Phase 10) listens one
+    // port above the main API, on the same host it bound to -- so a remote
+    // browser client reaches it exactly as it reaches the daemon API itself.
+    // Deliberately non-fatal: a bind failure here (port already taken by
+    // something else) disables *only* the remote terminal relay, not the
+    // whole daemon -- `mint_terminal_ticket_route` already reports
+    // `503 relay_unavailable` when `terminal_relay_port()` is still `0`.
+    match server.server_addr().to_ip() {
+        Some(bound) => {
+            let relay_port = bound.port().saturating_add(1);
+            if let Err(e) =
+                crate::terminal_relay::start(bound.ip(), relay_port, Arc::clone(&daemon))
+            {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [terminal] could not start the terminal-relay listener on {}:{relay_port}: {e}",
+                    bound.ip()
+                );
+            }
+        }
+        None => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [terminal] daemon is not bound to an IP socket; the remote terminal relay is disabled"
+            );
+        }
+    }
 
     // Scheduler runs on its own thread, sharing the store via Arc<Mutex> and the
     // cancellation registry so a `cancel` request can reach its workers. The
@@ -8733,7 +10541,7 @@ fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
     ));
     headers.push(cors_header(
         b"Access-Control-Allow-Headers",
-        "Content-Type, traceparent",
+        "Content-Type, traceparent, X-Ralphus-User",
     ));
     headers
 }
@@ -8755,10 +10563,15 @@ fn resolve_cors(request: &tiny_http::Request) -> ralphus_core::cors::CorsDecisio
 /// How many read-only (`GET`) requests the daemon answers concurrently.
 ///
 /// Small on purpose: the point is that one slow read cannot stall the accept
-/// loop, not that reads scale out. Four is enough to cover the board's
-/// fan-out of independent per-review GETs on a single poll while keeping
-/// pressure on the global `Mutex<Store>` low.
-const READ_WORKERS: usize = 4;
+/// loop, not that reads scale out. Sized for several actively-merging
+/// reviews' worth of fan-out, not just one -- each review's own poll issues
+/// several of these (`sync-status` runs `git fetch`, `comments` calls the
+/// forge API, `base-branches` shells out to git), so two or three reviews
+/// merging at once can otherwise saturate a smaller pool for many seconds,
+/// starving unrelated GETs (Users/Projects/Triage) behind them even though
+/// their own handlers are trivial. Still small enough to keep pressure on
+/// the global `Mutex<Store>` low.
+const READ_WORKERS: usize = 12;
 
 /// Handler wall time at or above which a request is logged as slow.
 ///
@@ -8776,6 +10589,7 @@ struct PendingRequest {
     body: String,
     traceparent: Option<String>,
     auth_header: Option<String>,
+    user_header: Option<String>,
     cors: ralphus_core::cors::CorsDecision,
     /// When the accept loop finished reading this request, so the time it
     /// then spent waiting for a worker is reportable separately from the
@@ -8853,6 +10667,7 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         body,
         traceparent,
         auth_header,
+        user_header,
         cors,
         accepted_at,
     } = pending;
@@ -8864,7 +10679,14 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     // unit tests stay auth-agnostic. `/api/events` never reaches this
     // point (handled in the accept loop); RAL-222 owns its auth separately.
     let reply = if daemon.authorized(auth_header.as_deref()) {
-        route_with_trace(daemon, &method, &url, &body, traceparent.as_deref())
+        route_with_trace_for_user(
+            daemon,
+            &method,
+            &url,
+            &body,
+            traceparent.as_deref(),
+            user_header.as_deref(),
+        )
     } else {
         error(
             401,
@@ -9003,6 +10825,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) {
 
         let traceparent = header_value(&request, "traceparent");
         let auth_header = header_value(&request, "Authorization");
+        let user_header = header_value(&request, "X-Ralphus-User");
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -9014,6 +10837,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) {
             body,
             traceparent,
             auth_header,
+            user_header,
             cors,
             accepted_at: Instant::now(),
         };
@@ -9128,6 +10952,14 @@ mod tests {
 
     fn submit_body(toml: &str) -> String {
         serde_json::to_string(&serde_json::json!({ "toml": toml })).unwrap()
+    }
+
+    /// Submit [`GOOD`] and return its squad id.
+    fn submit_squad(d: &Daemon) -> String {
+        let r = route(d, "POST", "/api/squads", &submit_body(GOOD));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        v["squad_id"].as_str().unwrap().to_string()
     }
 
     /// Isolate this test's terminal-log storage (see
@@ -9550,6 +11382,16 @@ mod tests {
         assert!(r.body.contains("validation_failed"));
     }
 
+    #[test]
+    fn submit_rejects_label_with_comma() {
+        let d = daemon();
+        let body = serde_json::json!({ "toml": GOOD, "label": "a,b" }).to_string();
+        let r = route(&d, "POST", "/api/squads", &body);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_label"));
+        assert!(r.body.contains("a,b"));
+    }
+
     // ── RAL-96: OpenTelemetry trace propagation ─────────────────────────────
 
     #[test]
@@ -9698,10 +11540,10 @@ mod tests {
                 .expect("git");
             assert!(status.success(), "git {args:?} failed in {}", dir.display());
         };
-        squad(&["init", "-b", "main"]);
+        squad(&["init", "--initial-branch", "main"]);
         std::fs::write(dir.join("base.txt"), "base\n").unwrap();
         squad(&["add", "."]);
-        squad(&["commit", "-m", "base"]);
+        squad(&["commit", "--message", "base"]);
         dir
     }
 
@@ -9724,6 +11566,172 @@ mod tests {
         );
         assert_eq!(r.status, 201, "{}", r.body);
         assert!(r.body.contains("proj"));
+    }
+
+    #[test]
+    fn register_project_route_accepts_and_returns_clone_url() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-clone-url");
+        let body = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "url": "git@example.invalid:team/proj.git",
+        })
+        .to_string();
+        let registered = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(registered.status, 201, "{}", registered.body);
+        let fetched = route(&d, "GET", "/api/projects/proj", "");
+        assert_eq!(fetched.status, 200, "{}", fetched.body);
+        assert!(
+            fetched.body.contains("git@example.invalid:team/proj.git"),
+            "{}",
+            fetched.body
+        );
+    }
+
+    #[test]
+    fn register_project_route_warns_but_accepts_a_clone_url_with_an_inline_password() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-clone-url-inline-password");
+        let body = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "url": "https://user:hunter2@example.invalid/team/proj.git",
+        })
+        .to_string();
+        let registered = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(registered.status, 201, "{}", registered.body);
+        assert!(registered.body.contains("warnings"), "{}", registered.body);
+        assert!(
+            !registered.body.contains("hunter2"),
+            "the warning must not itself leak the password: {}",
+            registered.body
+        );
+        assert!(
+            registered.body.contains("https://***@example.invalid"),
+            "{}",
+            registered.body
+        );
+        // The password must still round-trip for the owner who registered
+        // it -- the warning is advisory, not a rejection or a scrub of the
+        // stored value.
+        let fetched = route(&d, "GET", "/api/projects/proj", "");
+        assert!(fetched.body.contains("hunter2"), "{}", fetched.body);
+    }
+
+    #[test]
+    fn register_project_route_has_no_warnings_for_a_plain_clone_url() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-clone-url-plain");
+        let body = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "url": "git@example.invalid:team/proj.git",
+        })
+        .to_string();
+        let registered = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(registered.status, 201, "{}", registered.body);
+        assert!(!registered.body.contains("warnings"), "{}", registered.body);
+    }
+
+    #[test]
+    fn register_project_route_rejects_an_empty_clone_url() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-empty-clone-url");
+        let body = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "clone_url": "  ",
+        })
+        .to_string();
+        let response = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(response.body.contains("clone_url"), "{}", response.body);
+    }
+
+    #[test]
+    fn register_project_route_clears_a_previously_registered_clone_url() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-clear-clone-url");
+        let with_url = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "url": "git@example.invalid:team/proj.git",
+        })
+        .to_string();
+        let registered = route(&d, "POST", "/api/projects", &with_url);
+        assert_eq!(registered.status, 201, "{}", registered.body);
+        let fetched = route(&d, "GET", "/api/projects/proj", "");
+        assert!(
+            fetched.body.contains("git@example.invalid:team/proj.git"),
+            "{}",
+            fetched.body
+        );
+
+        let clear = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "clear_clone_url": true,
+        })
+        .to_string();
+        let cleared = route(&d, "POST", "/api/projects", &clear);
+        assert_eq!(cleared.status, 201, "{}", cleared.body);
+        let fetched = route(&d, "GET", "/api/projects/proj", "");
+        assert!(
+            !fetched.body.contains("git@example.invalid:team/proj.git"),
+            "clone URL should have been cleared: {}",
+            fetched.body
+        );
+        // `ProjectView::clone_url` skips serialization when `None`.
+        assert!(!fetched.body.contains("clone_url"), "{}", fetched.body);
+    }
+
+    #[test]
+    fn register_project_route_rejects_clear_clone_url_combined_with_a_url() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-clear-and-set-clone-url");
+        let body = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "url": "git@example.invalid:team/proj.git",
+            "clear_clone_url": true,
+        })
+        .to_string();
+        let response = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(
+            response.body.contains("clear_clone_url"),
+            "{}",
+            response.body
+        );
+    }
+
+    #[test]
+    fn register_project_route_rejects_a_clone_url_containing_control_characters() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-control-char-clone-url");
+        let body = serde_json::json!({
+            "name": "proj",
+            "path": repo.to_string_lossy(),
+            "vcs": "git",
+            "clone_url": "git@example.invalid:team/proj.git\r\nEvil: header",
+        })
+        .to_string();
+        let response = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(response.body.contains("clone_url"), "{}", response.body);
+        assert!(
+            response.body.contains("control characters"),
+            "{}",
+            response.body
+        );
     }
 
     #[test]
@@ -10010,6 +12018,67 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         let r = route(&d, "POST", "/api/machines", &machine_body("local", "/x.sh"));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("built-in"), "{}", r.body);
+    }
+
+    #[test]
+    fn cleanup_requires_project_and_reports_a_registered_projects_missing_clone_url() {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("ib", "/definitely/not/a/real/provider"),
+        );
+        // Missing "project" is a 400, not a panic or a confusing provider dispatch.
+        let r = route(
+            &d,
+            "POST",
+            "/api/machines/cleanup",
+            r#"{"machine": "ib:A"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+
+        // An unregistered project name is a 404.
+        let r = route(
+            &d,
+            "POST",
+            "/api/machines/cleanup",
+            r#"{"machine": "ib:A", "project": "nope"}"#,
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+
+        // A registered project with no clone URL is a 400 -- there is nothing
+        // that could have been provisioned remotely for it.
+        let repo = tmp_git_repo("cleanup-no-url");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/machines/cleanup",
+            r#"{"machine": "ib:A", "project": "proj"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("no registered clone URL"), "{}", r.body);
+    }
+
+    #[test]
+    fn health_all_targets_route_returns_an_empty_report_with_no_configured_targets() {
+        // No [machine.targets.*] configured in this test's environment --
+        // proves the route dispatches and shapes its JSON correctly without
+        // needing a live remote machine. `machine_targets.rs`'s own tests
+        // cover config parsing; `health_targets.rs`'s own tests cover the
+        // per-target check logic -- this is only proving the wiring between
+        // them and the HTTP layer.
+        let d = daemon();
+        let r = route(&d, "GET", "/api/machines/targets/health", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"ok\":true"), "{}", r.body);
+        assert!(r.body.contains("\"targets\":[]"), "{}", r.body);
     }
 
     #[test]
@@ -10648,6 +12717,126 @@ machine=\"incredibuild:B\"
     }
 
     #[test]
+    fn edit_cell_system_prompt_rejected_for_unsupported_agent() {
+        // GOOD's cell has no explicit `agent`, so it resolves to the default
+        // "claude" -- which, unlike "claude-code", has no
+        // append-system-prompt delivery mechanism (RAL-341).
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "system_prompt": "Do NOT push."
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("system_prompt"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_system_prompt_accepted_with_supporting_agent_in_same_call() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "agent": "claude-code", "system_prompt": "Do NOT commit and do NOT push."
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.body.contains("Do NOT commit and do NOT push."),
+            "{}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn edit_cell_system_prompt_accepted_for_existing_supporting_agent() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\n";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "system_prompt": "Custom rail."
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("Custom rail."), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_system_prompt_clear_does_not_require_agent_support() {
+        // Clearing the field back out is always allowed -- only *setting* a
+        // real value requires the agent to support delivering it.
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "system_prompt": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_system_prompt_restarts_cell_to_pending() {
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\n";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        {
+            let store = d.lock();
+            store
+                .set_cell_state("squad-000000000001", 0, 0, NodeState::Done)
+                .unwrap();
+            store
+                .set_squad_state("squad-000000000001", SquadState::Done)
+                .unwrap();
+        }
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "system_prompt": "New rail."
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"state\":\"pending\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_prompt_only_edit_keeps_previously_set_system_prompt() {
+        // A `--system-prompt` edit sets both `system_prompt` and the
+        // recomputed `effective_system_prompt` directly; a later
+        // `--prompt`-only edit must keep recomputing from that stored
+        // `system_prompt` rather than clearing it (RAL-341).
+        let d = daemon();
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\n";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "system_prompt": "Stays put."
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("Stays put."), "{}", r.body);
+
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "prompt": "new prompt text"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.body.contains("Stays put."),
+            "system_prompt must survive a prompt-only edit: {}",
+            r.body
+        );
+        assert!(
+            r.body.contains("\"prompt\":\"new prompt text\""),
+            "{}",
+            r.body
+        );
+    }
+
+    #[test]
     fn edit_cell_dirties_only_the_target_and_its_downstream_not_upstream() {
         // Regression: editing one cell used to call `reset_squad_to_pending`
         // unconditionally, resetting *every* task/cell in the squad -- so
@@ -10866,6 +13055,20 @@ machine=\"incredibuild:B\"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"label\":\"renamed\""));
         assert!(r.body.contains("\"state\":\"done\""));
+    }
+
+    #[test]
+    fn edit_squad_rejects_label_with_comma() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({"kind": "squad", "label": "a,b"}).to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_label"));
+        assert!(r.body.contains("a,b"));
+
+        let got = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        assert!(!got.body.contains("\"label\":\"a,b\""));
     }
 
     #[test]
@@ -11270,12 +13473,14 @@ machine=\"incredibuild:B\"
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         d.lock()
             .enqueue_mailbox_message(
                 crate::mailbox::MailboxPriority::Normal,
                 "fyi",
+                None,
                 None,
                 None,
                 None,
@@ -13291,7 +15496,10 @@ command = "true"
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: "b finished undisturbed".to_string(),
                     error: None,
                     proofed: None,
@@ -13437,7 +15645,10 @@ command = "true"
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: "never cancelled".to_string(),
                     error: None,
                     proofed: None,
@@ -14138,6 +16349,215 @@ command = "true"
         assert_eq!(r.status, 404);
     }
 
+    // -- RAL-324: read-only resolved-environment views ----------------------
+
+    /// A guardian with one branch, plus that branch's id -- the fixture every
+    /// review-scoped env view needs.
+    fn guardian_with_one_branch(d: &Daemon) -> (String, String) {
+        let gid = {
+            let store = d.lock();
+            let id = store.create_guardian("r", "main", "/repo").unwrap();
+            store.add_guardian_branch(&id, "feat").unwrap();
+            id
+        };
+        let bid = {
+            let store = d.lock();
+            store.get_guardian(&gid).unwrap().branches[0].id.clone()
+        };
+        (gid, bid)
+    }
+
+    #[test]
+    fn every_env_surface_serves_a_resolved_view_on_the_same_path_it_is_set_on() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/env",
+            &serde_json::json!({"set": {"FROM_SQUAD": "1"}}).to_string(),
+        );
+        for path in [
+            "/api/squads/squad-000000000001/env",
+            "/api/squads/squad-000000000001/tasks/0/env",
+            "/api/squads/squad-000000000001/tasks/0/proof/env",
+            "/api/squads/squad-000000000001/cells/0/0/env",
+            "/api/squads/squad-000000000001/cells/0/0/proof/env",
+        ] {
+            let r = route(&d, "GET", path, "");
+            assert_eq!(r.status, 200, "{path}");
+            let view: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            let names: Vec<&str> = view["vars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["name"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&"FROM_SQUAD"), "{path}: {names:?}");
+            assert!(view["note"].as_str().unwrap().contains("Secrets tab"));
+        }
+    }
+
+    #[test]
+    fn a_resolved_env_view_masks_a_registered_secret_name_only() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/env",
+            &serde_json::json!({"set": {"MY_TOKEN": "s3kr3t", "PLAIN": "shown"}}).to_string(),
+        );
+        route(
+            &d,
+            "POST",
+            "/api/secret-env-names",
+            &serde_json::json!({"name": "MY_TOKEN"}).to_string(),
+        );
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/0/env",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(!r.body.contains("s3kr3t"), "{}", r.body);
+        assert!(r.body.contains("shown"));
+        let view: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(view["redacted_count"], 1);
+    }
+
+    #[test]
+    fn a_resolved_env_view_for_an_unknown_entity_is_404_and_a_bad_index_is_400() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        assert_eq!(
+            route(&d, "GET", "/api/squads/squad-999/env", "").status,
+            404
+        );
+        assert_eq!(
+            route(&d, "GET", "/api/squads/squad-000000000001/tasks/9/env", "").status,
+            404
+        );
+        assert_eq!(
+            route(&d, "GET", "/api/squads/squad-000000000001/tasks/x/env", "").status,
+            400
+        );
+        assert_eq!(
+            route(&d, "GET", "/api/guardians/guardian-nope/build-env", "").status,
+            404
+        );
+    }
+
+    #[test]
+    fn a_proof_step_env_view_puts_the_steps_own_layer_on_top() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(PROOF_STEPS));
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/proof/env",
+            &serde_json::json!({"set": {"RUST_LOG": "warn"}}).to_string(),
+        );
+        route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/proof/0/env",
+            &serde_json::json!({"set": {"RUST_LOG": "debug"}}).to_string(),
+        );
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/0/proof/0/env",
+            "",
+        );
+        assert_eq!(r.status, 200);
+        let view: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(view["scope"], "proof");
+        let row = view["vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "RUST_LOG")
+            .unwrap_or_else(|| panic!("no RUST_LOG: {}", r.body));
+        assert_eq!(row["value"], "debug");
+        assert_eq!(row["source"], "proof step");
+        assert_eq!(row["layers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_tests_env_view_resolves_the_build_steps_own_override_layer() {
+        let d = daemon();
+        let (gid, _bid) = guardian_with_one_branch(&d);
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/build-env"),
+            &serde_json::json!({"set": {"CI": "1"}}).to_string(),
+        );
+        for (path, scope) in [("build-env", "review-build"), ("tests-env", "review-tests")] {
+            let r = route(&d, "GET", &format!("/api/guardians/{gid}/{path}"), "");
+            assert_eq!(r.status, 200, "{path}");
+            let view: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            assert_eq!(view["scope"], scope);
+            let ci = view["vars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == "CI")
+                .unwrap_or_else(|| panic!("{path} is missing CI: {}", r.body));
+            assert_eq!(ci["value"], "1");
+            assert_eq!(ci["source"], "review build step");
+        }
+        // The manual-checks step is a separate layer -- the build override
+        // must not leak into it.
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/manual-checks-env"),
+            "",
+        );
+        let view: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(
+            !view["vars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == "CI"),
+            "{}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn a_review_worktree_env_view_lists_an_override_and_omits_a_tombstoned_key() {
+        let d = daemon();
+        let (gid, bid) = guardian_with_one_branch(&d);
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{bid}/env"),
+            &serde_json::json!({"set": {"API_URL": "https://staging"}, "unset": ["DROP_ME"]})
+                .to_string(),
+        );
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/branches/{bid}/env"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        let view: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(view["scope"], "review-worktree");
+        let vars = view["vars"].as_array().unwrap();
+        assert!(vars.iter().any(|v| v["name"] == "API_URL"), "{}", r.body);
+        assert!(
+            !vars.iter().any(|v| v["name"] == "DROP_ME"),
+            "a tombstoned key is not part of the resolved environment: {}",
+            r.body
+        );
+    }
+
     #[test]
     fn set_squad_env_sets_and_is_reflected_on_get() {
         let d = daemon();
@@ -14806,6 +17226,7 @@ command = "true"
                 task: Some("t"),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
             let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
@@ -14818,6 +17239,7 @@ command = "true"
                 task: Some("t"),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
         }
         let r = route(
@@ -14866,6 +17288,7 @@ command = "true"
                 task: Some("t"),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
             let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
@@ -14878,6 +17301,7 @@ command = "true"
                 task: Some("t"),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
         }
         let r = route(
@@ -14930,6 +17354,7 @@ command = "true"
                 task: Some(crate::guardian_merge::RESOLVER_TASK),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
             let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
@@ -14945,6 +17370,7 @@ command = "true"
                 task: Some(crate::guardian_merge::RESOLVER_TASK),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
         }
         let r = route(
@@ -14990,6 +17416,7 @@ command = "true"
                 task: Some(crate::guardian_merge::MANUAL_COMMANDS_TASK),
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
         }
         let r = route(
@@ -15107,6 +17534,22 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("squad-000000000001"));
         assert!(!r.body.contains("squad-000000000002"));
+    }
+
+    #[test]
+    fn board_filters_squads_by_name_is_case_insensitive_comma_separated_and_trims_whitespace() {
+        let d = daemon();
+        for label in ["fix the flaky test", "add dark mode"] {
+            let body = serde_json::to_string(&serde_json::json!({ "toml": GOOD, "label": label }))
+                .unwrap();
+            route(&d, "POST", "/api/squads", &body);
+        }
+        route(&d, "POST", "/api/squads", &submit_body(GOOD)); // squad-3: no label
+        let r = route(&d, "GET", "/api/tasks?name=Flaky, DARK", "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("squad-000000000001"));
+        assert!(r.body.contains("squad-000000000002"));
+        assert!(!r.body.contains("squad-000000000003"));
     }
 
     #[test]
@@ -15249,6 +17692,76 @@ command = "true"
         );
         assert_eq!(r.status, 200);
         assert_eq!(r.body, "[]");
+    }
+
+    #[test]
+    fn unlink_prs_drops_open_rows_clears_stack_number_and_keeps_history() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        d.lock().set_guardian_forge_stack_number(&gid, 7).unwrap();
+
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/pull-requests/unlink"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, "{\"dropped\":1}");
+
+        let pr = d.lock().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.state, "dropped");
+        assert_eq!(
+            d.lock().get_guardian_forge_stack_number(&gid).unwrap(),
+            None
+        );
+
+        // History is preserved (never hard-deleted) via pull-request-stacks.
+        let stacks = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/pull-request-stacks"),
+            "",
+        );
+        assert_eq!(stacks.status, 200);
+        assert!(stacks.body.contains(&pr_id));
+
+        // Calling it again with nothing open left is a no-op, not an error.
+        let r2 = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/pull-requests/unlink"),
+            "",
+        );
+        assert_eq!(r2.status, 200);
+        assert_eq!(r2.body, "{\"dropped\":0}");
+    }
+
+    #[test]
+    fn unlink_prs_missing_guardian_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/guardians/guardian-999/pull-requests/unlink",
+            "",
+        );
+        assert_eq!(r.status, 404);
     }
 
     #[test]
@@ -15425,6 +17938,22 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"match_pr_branch_name\":false"));
         assert!(r.body.contains("\"effective_match_pr_branch_name\":false"));
+    }
+
+    #[test]
+    fn guardian_settings_sets_and_resets_auto_submit_pr_stack() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let body = serde_json::json!({"auto_submit_pr_stack": true}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"auto_submit_pr_stack\":true"));
+        assert!(r.body.contains("\"effective_auto_submit_pr_stack\":true"));
+        let body = serde_json::json!({"auto_submit_pr_stack": false}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"auto_submit_pr_stack\":false"));
+        assert!(r.body.contains("\"effective_auto_submit_pr_stack\":false"));
     }
 
     // -----------------------------------------------------------------------
@@ -15623,5 +18152,651 @@ command=\"cargo test\"
             Some("ralphus:/SQUAD[r]")
         );
         assert_eq!(uri_query_value("mode=readonly"), None);
+    }
+
+    // ── Triage type registry routes (RAL-318) ────────────────────────────────
+
+    #[test]
+    fn triage_type_routes_register_list_get_deregister() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/triage/types", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains(crate::triage::UNCLASSIFIED_TYPE));
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/types",
+            r#"{"name":"security","label":"Security","description":"sensitive changes"}"#,
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/triage/types/security", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("sensitive changes"));
+
+        let r = route(&d, "GET", "/api/triage/types/nope", "");
+        assert_eq!(r.status, 404);
+
+        let r = route(&d, "DELETE", "/api/triage/types/security", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/triage/types/security", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn triage_type_register_rejects_empty_name() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/triage/types", r#"{"name":"  "}"#);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_value"));
+    }
+
+    #[test]
+    fn triage_type_deregister_refuses_the_builtin_unclassified_type() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "DELETE",
+            &format!("/api/triage/types/{}", crate::triage::UNCLASSIFIED_TYPE),
+            "",
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("never be deregistered"));
+    }
+
+    #[test]
+    fn triage_pool_and_schedule_routes() {
+        let d = daemon();
+        // Empty at first.
+        let r = route(&d, "GET", "/api/triage/pools", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"pools\":[]"));
+
+        // Populate a pool row directly via the store (submit-time pooling is
+        // exercised in `reviews.rs`'s own tests).
+        d.lock()
+            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+        let r = route(&d, "GET", "/api/triage/pools", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"count\":1"));
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/threshold",
+            r#"{"project":"proj","triage_type":"security","threshold":3}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/triage/pools", "");
+        assert!(r.body.contains("\"threshold\":3"));
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/schedules",
+            r#"{"project":"proj","triage_type":"security","cron_expr":"0 0 0 * * *","anchor_date_ms":0,"every_n":2}"#,
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+        let id = serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let r = route(
+            &d,
+            "GET",
+            "/api/triage/schedules?project=proj&triage_type=security",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"every_n\":2"));
+
+        let r = route(&d, "DELETE", &format!("/api/triage/schedules/{id}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "DELETE", &format!("/api/triage/schedules/{id}"), "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn triage_pools_lists_a_threshold_configured_before_any_cell_is_pooled() {
+        let d = daemon();
+        // Setting a threshold on a (project, type) key with zero pooled
+        // cells must still make it appear in GET /api/triage/pools -- a
+        // count-based trigger configured ahead of the first pooled cell
+        // (e.g. "fire every 4 bug fixes for this project") must be visible
+        // and editable, the same way a cron schedule already is.
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/threshold",
+            r#"{"project":"proj","triage_type":"bug","threshold":4}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/triage/pools", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"project\":\"proj\""), "{}", r.body);
+        assert!(r.body.contains("\"triage_type\":\"bug\""), "{}", r.body);
+        assert!(r.body.contains("\"count\":0"), "{}", r.body);
+        assert!(r.body.contains("\"threshold\":4"), "{}", r.body);
+    }
+
+    #[test]
+    fn add_triage_schedule_route_rejects_invalid_cron() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/schedules",
+            r#"{"project":"proj","triage_type":"security","cron_expr":"nope","anchor_date_ms":0}"#,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    // `POST /api/health/arbiter` itself is deliberately not route-tested here:
+    // with no `[arbiter]` config, `crate::arbiter::Arbiter::current()`
+    // resolves to the "ollama" default, and exercising the route for real
+    // would make a live network call to Ollama -- this crate's convention
+    // (`AGENTS.md`) is that any such call must be `#[ignore]`d, gated, and
+    // never on by default. `crate::arbiter::health_check`'s own unit tests
+    // (`arbiter.rs`) already cover the cap-reached and unsupported-backend
+    // paths without touching the network; this endpoint is a thin,
+    // one-line `match` over that function.
+
+    // ── Remote terminal-relay ticket minting (RAL-355 Phase 10) ─────────────
+
+    /// `machine="incredibuild:A"`, `agent="claude-code"`, `id="a"` -- submits
+    /// and returns the deterministic first-squad id, so callers only need to
+    /// layer in an `agent_session_id` (via `set_cell_agent_session_id_live`)
+    /// and/or a relay port before minting a ticket.
+    fn submit_remote_claude_cell(d: &Daemon) -> String {
+        route(
+            d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        let toml = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
+                     [[task.cell]]\nid=\"a\"\ncwd=\".\"\nagent=\"claude-code\"\nprompt=\"p\"\n";
+        let r = route(d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        "squad-000000000001".to_string()
+    }
+
+    #[test]
+    fn terminal_session_slot_rejects_a_second_concurrent_holder_but_allows_reacquire_after_release()
+    {
+        let d = daemon();
+        assert!(d.try_acquire_terminal_session("squad-1", 0, 0));
+        assert!(!d.try_acquire_terminal_session("squad-1", 0, 0));
+        // A different cell is independent -- not blocked by the first hold.
+        assert!(d.try_acquire_terminal_session("squad-1", 0, 1));
+        d.release_terminal_session("squad-1", 0, 0);
+        assert!(d.try_acquire_terminal_session("squad-1", 0, 0));
+    }
+
+    #[test]
+    fn terminal_ticket_rejects_a_still_running_cell() {
+        let d = daemon();
+        let squad_id = submit_remote_claude_cell(&d);
+        d.lock()
+            .set_cell_agent_session_id_live(&squad_id, "t", "a", "sess-123")
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/set-status"),
+            &serde_json::json!({
+                "state": "running", "kind": "cell", "task_idx": 0,
+                "cell_idx": 0, "proof_idx": -1, "proof_scope": "",
+            })
+            .to_string(),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
+            "",
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body.contains("still_running"), "{}", r.body);
+    }
+
+    #[test]
+    fn terminal_ticket_rejects_a_local_cell() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/terminal-ticket",
+            "",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("not_remote"), "{}", r.body);
+    }
+
+    #[test]
+    fn terminal_ticket_rejects_a_non_claude_agent() {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/machines",
+            &machine_body("incredibuild", "/opt/ib.sh"),
+        );
+        let toml = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
+                     [[task.cell]]\nid=\"a\"\ncwd=\".\"\nagent=\"codex\"\nprompt=\"p\"\n";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/terminal-ticket",
+            "",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("unsupported_agent"), "{}", r.body);
+    }
+
+    #[test]
+    fn terminal_ticket_requires_a_resumable_session() {
+        let d = daemon();
+        let squad_id = submit_remote_claude_cell(&d);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
+            "",
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body.contains("no_claude_session"), "{}", r.body);
+    }
+
+    #[test]
+    fn terminal_ticket_reports_relay_unavailable_when_the_listener_never_started() {
+        let d = daemon();
+        let squad_id = submit_remote_claude_cell(&d);
+        d.lock()
+            .set_cell_agent_session_id_live(&squad_id, "t", "a", "sess-123")
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
+            "",
+        );
+        assert_eq!(r.status, 503, "{}", r.body);
+        assert!(r.body.contains("relay_unavailable"), "{}", r.body);
+    }
+
+    #[test]
+    fn terminal_ticket_mints_once_every_check_passes() {
+        let d = daemon();
+        let squad_id = submit_remote_claude_cell(&d);
+        d.lock()
+            .set_cell_agent_session_id_live(&squad_id, "t", "a", "sess-123")
+            .unwrap();
+        d.set_terminal_relay_port(7891);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"port\":7891"), "{}", r.body);
+        assert!(r.body.contains("\"path\":\"/terminal\""), "{}", r.body);
+        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(
+            parsed["ticket"].as_str().is_some_and(|t| !t.is_empty()),
+            "{}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn terminal_ticket_rejects_a_bad_task_or_cell_index() {
+        let d = daemon();
+        let squad_id = submit_remote_claude_cell(&d);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/nope/0/terminal-ticket"),
+            "",
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    // ── RAL-320: personal follows + notification preferences ────────────────
+
+    #[test]
+    fn follows_require_an_acting_user() {
+        let d = daemon();
+        let body =
+            serde_json::to_string(&serde_json::json!({"entity_uri": "squad:squad-1"})).unwrap();
+        assert_eq!(route(&d, "GET", "/api/follows", "").status, 400);
+        assert_eq!(route(&d, "POST", "/api/follows", &body).status, 400);
+    }
+
+    #[test]
+    fn follows_reject_an_unrecognized_entity_uri() {
+        let d = daemon();
+        let body = serde_json::to_string(&serde_json::json!({"entity_uri": "not-a-uri"})).unwrap();
+        let r = route(&d, "POST", "/api/follows?user=colin", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn follow_lifecycle_over_http() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let entity_uri = format!("squad:{squad_id}");
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "entity_uri": entity_uri,
+            "notify_tiers": ["urgent", "high"],
+        }))
+        .unwrap();
+        let r = route(&d, "POST", "/api/follows?user=colin", &body);
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let list = route(&d, "GET", "/api/follows?user=colin", "");
+        assert_eq!(list.status, 200, "{}", list.body);
+        let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        let follows = parsed["follows"].as_array().unwrap();
+        assert_eq!(follows.len(), 1);
+        assert_eq!(follows[0]["entity_uri"], entity_uri);
+
+        // A follow is scoped per user -- someone else's list stays empty.
+        let others_list = route(&d, "GET", "/api/follows?user=alex", "");
+        let others: serde_json::Value = serde_json::from_str(&others_list.body).unwrap();
+        assert!(others["follows"].as_array().unwrap().is_empty());
+
+        let delete = route(
+            &d,
+            "DELETE",
+            &format!("/api/follows/{entity_uri}?user=colin"),
+            "",
+        );
+        assert_eq!(delete.status, 200, "{}", delete.body);
+        let after: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", "/api/follows?user=colin", "").body).unwrap();
+        assert!(after["follows"].as_array().unwrap().is_empty());
+
+        // Deleting again is a 404, not a repeat success.
+        assert_eq!(
+            route(
+                &d,
+                "DELETE",
+                &format!("/api/follows/{entity_uri}?user=colin"),
+                "",
+            )
+            .status,
+            404
+        );
+    }
+
+    #[test]
+    fn personal_mailbox_filters_by_followed_notify_tiers() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let entity_uri = format!("squad:{squad_id}");
+        let body = serde_json::to_string(&serde_json::json!({
+            "entity_uri": entity_uri,
+            "notify_tiers": ["urgent"],
+        }))
+        .unwrap();
+        assert_eq!(
+            route(&d, "POST", "/api/follows?user=colin", &body).status,
+            201
+        );
+
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::Urgent,
+                "urgent thing happened",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(entity_uri.as_str()),
+            )
+            .unwrap();
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::Normal,
+                "normal thing happened",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(entity_uri.as_str()),
+            )
+            .unwrap();
+
+        let r = route(&d, "GET", "/api/mailbox/personal/messages?user=colin", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(messages.len(), 1, "{}", r.body);
+        assert_eq!(messages[0]["message"], "urgent thing happened");
+
+        // Someone with no follows at all sees nothing, even unfiltered.
+        let empty = route(&d, "GET", "/api/mailbox/personal/messages?user=alex", "");
+        let empty_messages: Vec<serde_json::Value> = serde_json::from_str(&empty.body).unwrap();
+        assert!(empty_messages.is_empty());
+    }
+
+    #[test]
+    fn personal_mailbox_cascades_from_a_followed_parent() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        // Follow the whole squad; a message scoped to one of its cells should
+        // still reach the follower -- `EntityUri::covers` cascade.
+        let body = serde_json::to_string(&serde_json::json!({
+            "entity_uri": format!("squad:{squad_id}"),
+        }))
+        .unwrap();
+        assert_eq!(
+            route(&d, "POST", "/api/follows?user=colin", &body).status,
+            201
+        );
+
+        let cell_uri = format!("cell:{squad_id}:0:0");
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                "cell 0/0 failed",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(cell_uri.as_str()),
+            )
+            .unwrap();
+
+        let r = route(&d, "GET", "/api/mailbox/personal/messages?user=colin", "");
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(messages.len(), 1, "{}", r.body);
+        assert_eq!(messages[0]["entity_uri"], cell_uri);
+    }
+
+    #[test]
+    fn personal_mailbox_drain_marks_messages_read_for_that_user_only() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let entity_uri = format!("squad:{squad_id}");
+        for user in ["colin", "alex"] {
+            let body =
+                serde_json::to_string(&serde_json::json!({"entity_uri": entity_uri})).unwrap();
+            assert_eq!(
+                route(&d, "POST", &format!("/api/follows?user={user}"), &body).status,
+                201
+            );
+        }
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::Urgent,
+                "urgent thing",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(entity_uri.as_str()),
+            )
+            .unwrap();
+
+        let drain = route(&d, "POST", "/api/mailbox/personal/drain?user=colin", "");
+        assert_eq!(drain.status, 200, "{}", drain.body);
+        let drained: serde_json::Value = serde_json::from_str(&drain.body).unwrap();
+        assert_eq!(drained["drained"], 1);
+
+        let colin_unread = route(
+            &d,
+            "GET",
+            "/api/mailbox/personal/messages?user=colin&unread=1",
+            "",
+        );
+        let colin_msgs: Vec<serde_json::Value> = serde_json::from_str(&colin_unread.body).unwrap();
+        assert!(colin_msgs.is_empty(), "{}", colin_unread.body);
+
+        // Draining as colin must not affect alex's own read state.
+        let alex_unread = route(
+            &d,
+            "GET",
+            "/api/mailbox/personal/messages?user=alex&unread=1",
+            "",
+        );
+        let alex_msgs: Vec<serde_json::Value> = serde_json::from_str(&alex_unread.body).unwrap();
+        assert_eq!(alex_msgs.len(), 1, "{}", alex_unread.body);
+    }
+
+    #[test]
+    fn user_preferences_round_trip_over_http() {
+        let d = daemon();
+        let body = serde_json::to_string(&serde_json::json!({
+            "auto_follow": true,
+            "default_notify_tiers": ["urgent", "high"],
+        }))
+        .unwrap();
+        let set = route(&d, "POST", "/api/users/colin/preferences", &body);
+        assert_eq!(set.status, 200, "{}", set.body);
+
+        let get = route(&d, "GET", "/api/users/colin/preferences", "");
+        assert_eq!(get.status, 200, "{}", get.body);
+        let parsed: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+        assert_eq!(parsed["auto_follow"], true);
+        assert_eq!(
+            parsed["default_notify_tiers"],
+            serde_json::json!(["urgent", "high"])
+        );
+
+        assert_eq!(
+            route(&d, "GET", "/api/users/nobody/preferences", "").status,
+            404
+        );
+    }
+
+    #[test]
+    fn auto_follow_on_submit_uses_the_acting_users_preferences() {
+        let d = daemon();
+        let prefs = serde_json::to_string(&serde_json::json!({
+            "auto_follow": true,
+            "default_notify_tiers": ["urgent"],
+        }))
+        .unwrap();
+        assert_eq!(
+            route(&d, "POST", "/api/users/colin/preferences", &prefs).status,
+            200
+        );
+
+        let r = route(&d, "POST", "/api/squads?user=colin", &submit_body(GOOD));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let submitted: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = submitted["squad_id"].as_str().unwrap();
+
+        let list = route(&d, "GET", "/api/follows?user=colin", "");
+        let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        let follows = parsed["follows"].as_array().unwrap();
+        assert_eq!(follows.len(), 1, "{}", list.body);
+        assert_eq!(follows[0]["entity_uri"], format!("squad:{squad_id}"));
+        assert_eq!(follows[0]["notify_tiers"], serde_json::json!(["urgent"]));
+    }
+
+    #[test]
+    fn submit_without_auto_follow_creates_no_follow() {
+        let d = daemon();
+        // colin isn't registered at all -- auto-follow-on-submit must be a
+        // silent no-op, not an error, for an anonymous/unregistered submitter.
+        let r = route(&d, "POST", "/api/squads?user=colin", &submit_body(GOOD));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let list = route(&d, "GET", "/api/follows?user=colin", "");
+        let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert!(parsed["follows"].as_array().unwrap().is_empty());
+    }
+
+    // ── apply_default_user_admin (RAL-332) ──────────────────────────────
+
+    #[test]
+    fn default_user_is_admin_unset_is_a_noop() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = crate::config::DaemonConfig {
+            default_user: Some("colin".to_string()),
+            ..Default::default()
+        };
+        apply_default_user_admin(&store, &cfg);
+        assert!(store.get_user("colin").unwrap().is_none());
+    }
+
+    #[test]
+    fn default_user_is_admin_true_registers_and_promotes() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = crate::config::DaemonConfig {
+            default_user: Some("colin".to_string()),
+            default_user_is_admin: Some(true),
+            ..Default::default()
+        };
+        apply_default_user_admin(&store, &cfg);
+        assert!(store.get_user("colin").unwrap().unwrap().is_admin);
+
+        // Idempotent: a second application with no state change touches
+        // neither the DB nor errors.
+        apply_default_user_admin(&store, &cfg);
+        assert!(store.get_user("colin").unwrap().unwrap().is_admin);
+    }
+
+    #[test]
+    fn default_user_is_admin_false_demotes_an_existing_admin() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_user("colin").unwrap();
+        store.set_user_admin("colin", true).unwrap();
+        let cfg = crate::config::DaemonConfig {
+            default_user: Some("colin".to_string()),
+            default_user_is_admin: Some(false),
+            ..Default::default()
+        };
+        apply_default_user_admin(&store, &cfg);
+        assert!(!store.get_user("colin").unwrap().unwrap().is_admin);
+    }
+
+    #[test]
+    fn default_user_is_admin_false_never_registers_an_unregistered_user() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = crate::config::DaemonConfig {
+            default_user: Some("colin".to_string()),
+            default_user_is_admin: Some(false),
+            ..Default::default()
+        };
+        apply_default_user_admin(&store, &cfg);
+        assert!(store.get_user("colin").unwrap().is_none());
+    }
+
+    #[test]
+    fn default_user_is_admin_true_without_default_user_is_a_noop() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = crate::config::DaemonConfig {
+            default_user_is_admin: Some(true),
+            ..Default::default()
+        };
+        apply_default_user_admin(&store, &cfg);
+        assert!(store.list_users().unwrap().is_empty());
     }
 }

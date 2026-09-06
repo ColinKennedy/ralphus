@@ -27,7 +27,7 @@
 //! resolved and persisted, a restarted squad reads the real path back from the
 //! store — the placeholder string is gone; there's nothing left to resolve.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use opentelemetry::Context;
@@ -52,6 +52,14 @@ pub(crate) struct PlaceholderContext<'a> {
     pub(crate) task_name: &'a str,
     pub(crate) cell_id: &'a str,
     pub(crate) machine: Option<&'a str>,
+    /// Configured `[machine.targets.*]` entries (RAL-355 Phase 2), loaded
+    /// once per [`resolve_placeholders`] call and threaded down rather than
+    /// re-read per cell. Carried on the context (not a separate parameter)
+    /// purely so `provision_remote_with_targets` -- several calls deep --
+    /// doesn't need its own dedicated parameter threaded through every
+    /// intermediate function.
+    pub(crate) targets:
+        &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 }
 
 trait ProjectStartupAdapter {
@@ -172,6 +180,113 @@ fn resolve_task_worktree_dir(root: &Path, branch: &str) -> PathBuf {
     crate::short_paths::ralphus_root(root)
         .join("w")
         .join(candidate)
+}
+
+/// Whether `branch` names an existing remote-tracking ref (`refs/remotes/<branch>`).
+///
+/// Mirrors the condition [`branch_materialization`] uses to pick
+/// [`BranchMaterialization::NewFromRemote`], but is deliberately checked
+/// against the *remote* ref rather than that enum: once the first squad has
+/// materialized `origin/foo`, a local branch by that literal name exists and
+/// `branch_materialization` reports `ExistingLocal`, so it can no longer tell
+/// a shared remote branch from an ordinary local one. `refs/remotes/` is
+/// stable across both resolutions.
+fn names_remote_tracking_branch(root: &Path, branch: &str) -> bool {
+    branch.contains('/')
+        && git(
+            root,
+            &["rev-parse", "--verify", &format!("refs/remotes/{branch}")],
+        )
+        .is_ok()
+}
+
+/// How many `<base>-2`, `-3`, ... branches one base branch may spawn before
+/// resolution gives up. A ceiling, not a quota: reaching it means something
+/// is allocating worktrees in a loop, and failing loudly beats silently
+/// reusing another squad's branch (the exact bug this guards against).
+const MAX_BRANCH_SUFFIX: usize = 1000;
+
+/// The branch `squad_id` should actually use for a
+/// `ralphus:new-worktree/<base_branch>` placeholder (RAL-337).
+///
+/// The placeholder names a *base* branch, but the branch a squad gets is not
+/// necessarily that name. Resolving on the base name alone is what let a
+/// second squad submitting the same task file land on the first squad's
+/// branch — and therefore open a worktree that already contained the first
+/// squad's finished commits, despite the placeholder asking for a *new*
+/// worktree.
+///
+/// - **The owning squad keeps its branch.** A squad that already claimed a
+///   branch in this family resolves back to that exact branch, so every cell
+///   in the squad shares one worktree and `squad restart`/`squad retry`
+///   return to the tree they left behind. This is the restart-safety property
+///   [`ensure_worktree`] documents, now scoped to the squad that earned it
+///   rather than granted to whoever asks next.
+/// - **Any other squad gets a fresh branch.** The next free `<base>-2`,
+///   `-3`, ... is claimed. Because that is a genuinely different branch name,
+///   [`resolve_task_worktree_dir`]'s existing collision suffixing then gives
+///   it its own `w/<short>-2` directory without any further help.
+///
+/// A branch counts as taken if a claim row holds it *or* a live worktree is
+/// checked out on it. The second check is what handles worktrees that predate
+/// this table (they have no row, but they are plainly still in use) and any
+/// branch a user materialized by hand.
+///
+/// **A remote-tracking branch is exempt and always shared.** A placeholder
+/// like `ralphus:new-worktree/origin/foo` names one specific, externally
+/// owned branch — squads deliberately share that worktree and resync it to
+/// new pushes (see [`resync_remote_tracking_branch`]). Allocating
+/// `origin/foo-2` for the second squad would invent a local branch tracking
+/// nothing, which is not what the placeholder asked for. Per-squad allocation
+/// applies only to branches this daemon creates and owns.
+fn resolve_squad_branch(
+    store: &Store,
+    project: &ProjectView,
+    base_branch: &str,
+    squad_id: &str,
+) -> Result<String, String> {
+    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
+        return Ok(base_branch.to_string());
+    }
+    if let Some(existing) = store
+        .task_worktree_claim_for_squad(&project.name, base_branch, squad_id)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(existing);
+    }
+    let claims = store
+        .task_worktree_claims(&project.name, base_branch)
+        .map_err(|e| e.to_string())?;
+    let claimed: HashSet<&str> = claims.iter().map(|c| c.branch.as_str()).collect();
+    let on_disk = existing_task_worktree_branches(Path::new(&project.path));
+    let occupied: HashSet<&str> = on_disk.values().map(String::as_str).collect();
+
+    let mut candidate = base_branch.to_string();
+    let mut n = 2;
+    while claimed.contains(candidate.as_str()) || occupied.contains(candidate.as_str()) {
+        if n > MAX_BRANCH_SUFFIX {
+            return Err(format!(
+                "could not find a free worktree branch for \"{base_branch}\" in project \
+                 \"{}\" after {MAX_BRANCH_SUFFIX} attempts",
+                project.name
+            ));
+        }
+        candidate = format!("{base_branch}-{n}");
+        n += 1;
+    }
+    store
+        .record_task_worktree_claim(&project.name, base_branch, &candidate, squad_id)
+        .map_err(|e| e.to_string())?;
+    if candidate != base_branch {
+        // ralphus[ignore-rlog-pair]: the Store-owning caller records the
+        // structured workflow outcome for this squad.
+        crate::rlog!(
+            INFO,
+            "ralphus [scheduler] worktree branch \"{base_branch}\" is already owned by another \
+             squad; {squad_id} gets a new branch \"{candidate}\""
+        );
+    }
+    Ok(candidate)
 }
 
 /// The OS path-length budget a worktree checkout is held to. Windows'
@@ -580,6 +695,7 @@ fn placeholder_cache_key(machine: Option<&str>, placeholder: &str) -> String {
 fn placeholder_context_for_cell<'a>(
     squad_id: &'a str,
     cell: &'a CellRow,
+    targets: &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> PlaceholderContext<'a> {
     PlaceholderContext {
         squad_id,
@@ -588,6 +704,7 @@ fn placeholder_context_for_cell<'a>(
         task_name: &cell.task_name,
         cell_id: &cell.cell_id,
         machine: cell.machine.as_deref(),
+        targets,
     }
 }
 
@@ -611,8 +728,10 @@ fn synthetic_cell_row(ctx: PlaceholderContext<'_>) -> CellRow {
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         upstream: None,
         machine: ctx.machine.map(str::to_string),
+        share_session: false,
     }
 }
 
@@ -643,14 +762,27 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // `set_explicit_upstream` rejects). Failing to resolve is a hard error,
         // never a guess at `main`/`master`.
         let upstream = resolve_upstream(Path::new(&project.path), upstream)?;
+        // RAL-337: the placeholder names a *base* branch; which branch this
+        // squad actually gets depends on whether another squad already owns
+        // it. Without this, a resubmission of the same task file resolves to
+        // the first squad's branch and inherits its finished commits.
+        let branch = resolve_squad_branch(store, project, branch, ctx.squad_id).map_err(|e| {
+            format!(
+                "cell '{}': could not allocate a worktree branch for \"{placeholder}\": {e}",
+                ctx.cell_id
+            )
+        })?;
+        let branch = branch.as_str();
         let resolved = match ctx.machine {
-            Some(machine) if !machine.trim().is_empty() => provision_remote(
+            Some(machine) if !machine.trim().is_empty() => provision_remote_with_targets(
                 store,
                 machine,
                 project,
                 branch,
+                &upstream,
                 &synthetic_cell_row(ctx),
                 ctx.squad_id,
+                ctx.targets,
             )?,
             _ => ensure_worktree(Path::new(&project.path), branch, &upstream)
                 .map_err(|e| {
@@ -831,19 +963,37 @@ fn classify_placeholder(cwd: &str) -> Result<Option<&str>, String> {
 /// backing a non-git project reads `kind`, ignores the git-shaped fields, and
 /// does whatever that source system needs — which is what keeps the daemon
 /// from re-acquiring the hard git dependency RAL-175/184 baked in.
-fn provision_remote(
+/// Loads the configured [`crate::machine_targets::MachineTarget`]s as a
+/// parameter rather than reading them itself, so the caller controls
+/// exactly when/how often `machine_targets::load_machine_targets` (which
+/// reads real process environment variables --
+/// `RALPHUS_CONFIG_HOME`/`RALPHUS_CONFIGURATION_PATH`) actually runs.
+/// [`resolve_placeholders`] loads it once per call and threads it down via
+/// `PlaceholderContext::targets`; tests that need a specific
+/// `[machine.targets.*]` entry construct a `BTreeMap` directly and call
+/// this function through [`resolve_placeholders_with_targets`] instead,
+/// since they cannot safely override those environment variables in-process
+/// (this workspace forbids `unsafe_code`, so `std::env::set_var` is
+/// unavailable) — the same rationale `agent_profiles`'s own
+/// `load_profiles_for_path_with` documents for its `configuration_path_env`
+/// parameter.
+#[allow(clippy::too_many_arguments)]
+fn provision_remote_with_targets(
     store: &Store,
     machine: &str,
     project: &crate::store::ProjectView,
     branch: &str,
+    upstream: &str,
     cell: &CellRow,
     squad_id: &str,
+    targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<String, String> {
     let provider = crate::remote_runner::provider_from_store(store, machine)
         .map_err(|e| format!("cell '{}': {e}", cell.cell_id))?
         .ok_or_else(|| {
-            // `provision_remote` is only called for a non-empty machine, so a
-            // local resolution here means the value changed under us.
+            // `provision_remote_with_targets` is only called for a non-empty
+            // machine, so a local resolution here means the value changed
+            // under us.
             format!(
                 "cell '{}': machine \"{machine}\" resolved to the local host",
                 cell.cell_id
@@ -852,7 +1002,30 @@ fn provision_remote(
     // Only git has a clone URL to resolve; every other kind gets `None` and
     // the provider decides how to obtain the source.
     let url = if project.vcs == "git" {
-        crate::guardian_merge::remote_clone_url(Path::new(&project.path)).ok()
+        Some(project.clone_url.clone().ok_or_else(|| {
+            format!(
+                "cell '{}': git project {:?} has no registered clone URL; re-register it with `ralphus project git --name {} --path <local-path> --url <clone-url>` before using it on a remote machine",
+                cell.cell_id, project.name, project.name
+            )
+        })?)
+    } else {
+        None
+    };
+    // RAL-355 Phase 2/4: a git project's remote workspace needs a durable
+    // `remote_root` to provision persistent storage under -- refused here,
+    // before ever dispatching to the provider, the same "fail before
+    // provider dispatch" shape the missing-clone-URL check above already
+    // uses, rather than letting the provider discover the gap at its own
+    // runtime and report a less actionable error.
+    let target = crate::machine_targets::find_by_machine(targets, machine);
+    let remote_root = if project.vcs == "git" {
+        let target = target.ok_or_else(|| {
+            format!(
+                "cell '{}': machine {machine:?} has no [machine.targets.*] entry configured with a remote_root; register one before provisioning a git project there",
+                cell.cell_id
+            )
+        })?;
+        Some(target.remote_root.clone())
     } else {
         None
     };
@@ -862,9 +1035,21 @@ fn provision_remote(
             kind: project.vcs.clone(),
             url,
             branch: Some(branch.to_string()),
+            upstream: Some(upstream.to_string()),
         },
         squad_id: squad_id.to_string(),
         cell_id: cell.cell_id.clone(),
+        remote_root,
+        runner: target.map(|target| crate::remote_runner::TargetRunnerConfig {
+            mode: match target.runner_mode {
+                crate::machine_targets::RunnerMode::Installed => "installed",
+                crate::machine_targets::RunnerMode::Upload => "upload",
+            }
+            .to_string(),
+            command: target.runner_command.clone(),
+            artifacts: target.runner_artifacts.clone(),
+            remote_root: target.remote_root.clone(),
+        }),
     };
     let spec = crate::runner::RunnerSpec::from_row(squad_id, cell);
     let result = provider
@@ -925,7 +1110,21 @@ pub fn resolve_placeholders(
 ) -> Result<(), String> {
     let span = otel::start_span("scheduler.resolve_worktrees", parent, SpanKind::Internal);
     span.set_attribute("squad_id", squad_id.to_string());
-    match resolve_placeholders_inner(store, squad_id, cells, tasks) {
+    // RAL-355 Phase 2: loaded once per call (not per cell) and threaded down
+    // via `PlaceholderContext::targets` -- see `provision_remote_with_targets`'s
+    // doc comment for why the loading itself isn't pushed further down.
+    let targets = match crate::machine_targets::load_machine_targets() {
+        Ok(t) => t,
+        Err(e) => {
+            span.set_status(Status::error(e.clone()));
+            crate::rlog!(
+                WARNING,
+                "ralphus [scheduler] squad {squad_id} could not load machine targets: {e}"
+            );
+            return Err(e);
+        }
+    };
+    match resolve_placeholders_inner(store, squad_id, cells, tasks, &targets) {
         Ok(materialized) => {
             span.set_attribute("worktrees.materialized", materialized as i64);
             span.set_status(Status::Ok);
@@ -942,6 +1141,24 @@ pub fn resolve_placeholders(
     }
 }
 
+/// Test-only entry point mirroring [`resolve_placeholders`] but taking the
+/// configured machine targets directly instead of loading them from real
+/// process environment variables -- tests cannot safely override
+/// `RALPHUS_CONFIG_HOME`/`RALPHUS_CONFIGURATION_PATH` in-process (this
+/// workspace forbids `unsafe_code`, and `std::env::set_var` requires it), so
+/// this is the injection point a test that needs a specific
+/// `[machine.targets.*]` entry uses instead.
+#[cfg(test)]
+fn resolve_placeholders_with_targets(
+    store: &Store,
+    squad_id: &str,
+    cells: &mut [CellRow],
+    tasks: &[TaskRow],
+    targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+) -> Result<(), String> {
+    resolve_placeholders_inner(store, squad_id, cells, tasks, targets).map(|_| ())
+}
+
 /// The count returned is how many distinct placeholders were newly
 /// materialized (i.e. not already resolved from a prior squad/restart or a
 /// dedup hit within this call) — reported on the span as
@@ -951,6 +1168,7 @@ fn resolve_placeholders_inner(
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
+    targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<usize, String> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
         .iter()
@@ -982,7 +1200,7 @@ fn resolve_placeholders_inner(
             store,
             project_name,
             &cwd,
-            placeholder_context_for_cell(squad_id, cell),
+            placeholder_context_for_cell(squad_id, cell, targets),
             &mut cache,
         )
         .map_err(|e| {
@@ -1043,10 +1261,10 @@ mod tests {
     /// A fresh repo with one commit on `main`.
     fn init_repo(tag: &str) -> PathBuf {
         let repo = tmp_dir(tag);
-        g(&repo, &["init", "-b", "main"]);
+        g(&repo, &["init", "--initial-branch", "main"]);
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "base"]);
+        g(&repo, &["commit", "--message", "base"]);
         repo
     }
 
@@ -1068,10 +1286,10 @@ mod tests {
 
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        g(&seed, &["init", "-b", "main"]);
+        g(&seed, &["init", "--initial-branch", "main"]);
         std::fs::write(seed.join("base.txt"), "base\n").unwrap();
         g(&seed, &["add", "."]);
-        g(&seed, &["commit", "-m", "base"]);
+        g(&seed, &["commit", "--message", "base"]);
         g(
             &seed,
             &[
@@ -1081,17 +1299,17 @@ mod tests {
                 remote.to_str().expect("remote path"),
             ],
         );
-        g(&seed, &["push", "-u", "origin", "main"]);
+        g(&seed, &["push", "--set-upstream", "origin", "main"]);
 
         g(&seed, &["checkout", "-b", remote_branch]);
         std::fs::write(seed.join("remote-only.txt"), format!("{branch}\n")).unwrap();
         g(&seed, &["add", "."]);
-        g(&seed, &["commit", "-m", "remote branch"]);
+        g(&seed, &["commit", "--message", "remote branch"]);
         let branch_sha = git(&seed, &["rev-parse", "HEAD"])
             .expect("branch sha")
             .trim()
             .to_string();
-        g(&seed, &["push", "-u", "origin", remote_branch]);
+        g(&seed, &["push", "--set-upstream", "origin", remote_branch]);
 
         let clone = base.join("clone");
         g(
@@ -1135,8 +1353,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         }
     }
 
@@ -1148,6 +1368,32 @@ mod tests {
             depends_on: vec![],
             soloed: false,
         }
+    }
+
+    /// A [`crate::machine_targets::MachineTarget`] for `machine`, for tests
+    /// that need `resolve_placeholders_with_targets` to find one -- see that
+    /// function's doc comment for why tests can't just rely on real
+    /// `[machine.targets.*]` config being loaded.
+    fn target_for(machine: &str, remote_root: &str) -> crate::machine_targets::MachineTarget {
+        crate::machine_targets::MachineTarget {
+            name: machine.replace(':', "-"),
+            machine: machine.to_string(),
+            remote_root: remote_root.to_string(),
+            runner_mode: crate::machine_targets::RunnerMode::Installed,
+            runner_command: "ralphus-runner".to_string(),
+            runner_artifacts: std::collections::BTreeMap::new(),
+            agent_executables: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn targets_map(
+        targets: &[crate::machine_targets::MachineTarget],
+    ) -> std::collections::BTreeMap<String, crate::machine_targets::MachineTarget> {
+        targets
+            .iter()
+            .cloned()
+            .map(|t| (t.name.clone(), t))
+            .collect()
     }
 
     #[test]
@@ -1444,7 +1690,7 @@ mod tests {
         // A prior agent session committed local work directly in the worktree.
         std::fs::write(wt.join("local-work.txt"), "agent work\n").unwrap();
         g(&wt, &["add", "."]);
-        g(&wt, &["commit", "-m", "local agent commit"]);
+        g(&wt, &["commit", "--message", "local agent commit"]);
 
         // A new, unrelated commit lands on the remote branch.
         let seed = repo.parent().unwrap().join("seed");
@@ -1638,6 +1884,56 @@ mod tests {
         );
         let store = Store::open_in_memory().unwrap();
         store
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        store
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row_on(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ib:A"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let targets = targets_map(&[target_for("ib:A", "/srv/ralphus")]);
+        resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+            .expect("remote provision");
+        assert_eq!(cells[0].cwd.as_deref(), Some("/remote/wt/feat-r"));
+        // Nothing may be created on the daemon's own disk for a remote cell.
+        assert!(
+            !worktree_dir(&repo, "feat-r").exists(),
+            "a remote cell must not materialize a local worktree"
+        );
+    }
+
+    #[test]
+    fn a_remote_cell_fails_fast_when_its_git_project_has_no_registered_clone_url() {
+        // A legacy project registered with only a local `path` (no `--url`)
+        // must be refused before the provider is ever dispatched, rather
+        // than provisioning against a locally inferred remote.
+        let repo = init_repo("remote-provision-no-url");
+        let script = fake_provisioner(
+            "remote-provision-no-url-p",
+            r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
+        );
+        let store = Store::open_in_memory().unwrap();
+        store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         store
@@ -1658,14 +1954,60 @@ mod tests {
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
-        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
-            .expect("remote provision");
-        assert_eq!(cells[0].cwd.as_deref(), Some("/remote/wt/feat-r"));
-        // Nothing may be created on the daemon's own disk for a remote cell.
-        assert!(
-            !worktree_dir(&repo, "feat-r").exists(),
-            "a remote cell must not materialize a local worktree"
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect_err("a git project with no registered clone URL must fail remote provisioning");
+        assert!(err.contains("has no registered clone URL"), "{err}");
+        assert!(err.contains("proj"), "{err}");
+    }
+
+    #[test]
+    fn a_remote_cell_fails_fast_when_its_machine_has_no_configured_target() {
+        // RAL-355 Phase 2/4: even a project with a registered clone URL must
+        // still be refused before provider dispatch when the target machine
+        // has no `[machine.targets.*]` entry (and therefore no remote_root
+        // to provision persistent storage under) -- provisioning must not
+        // silently guess a location.
+        let repo = init_repo("remote-provision-no-target");
+        let script = fake_provisioner(
+            "remote-provision-no-target-p",
+            r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
         );
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        store
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row_on(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ib:A"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        // Deliberately empty -- no target configured for "ib:A".
+        let targets = targets_map(&[]);
+        let err =
+            resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+                .expect_err("a machine with no configured target must fail remote provisioning");
+        assert!(err.contains("no [machine.targets.*] entry"), "{err}");
+        assert!(err.contains("ib:A"), "{err}");
     }
 
     #[test]
@@ -1682,7 +2024,14 @@ mod tests {
         );
         let store = Store::open_in_memory().unwrap();
         store
-            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
             .unwrap();
         for (scheme, script) in [("ma", &a), ("mb", &b)] {
             store
@@ -1713,7 +2062,11 @@ mod tests {
             ),
         ];
         let tasks = vec![task_row(0, Some("proj")), task_row(1, Some("proj"))];
-        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+        let targets = targets_map(&[
+            target_for("ma:1", "/srv/ralphus-a"),
+            target_for("mb:1", "/srv/ralphus-b"),
+        ]);
+        resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
             .expect("provision both");
         assert_eq!(cells[0].cwd.as_deref(), Some("/on/a"));
         assert_eq!(cells[1].cwd.as_deref(), Some("/on/b"));
@@ -1725,7 +2078,14 @@ mod tests {
         let script = fake_provisioner("no-workspace-p", r#"{"ok":true,"protocol_version":1}"#);
         let store = Store::open_in_memory().unwrap();
         store
-            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
             .unwrap();
         store
             .register_machine_provider(
@@ -1745,8 +2105,10 @@ mod tests {
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
-        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
-            .expect_err("a provider that provisions nothing must fail the squad");
+        let targets = targets_map(&[target_for("ib:A", "/srv/ralphus")]);
+        let err =
+            resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+                .expect_err("a provider that provisions nothing must fail the squad");
         assert!(err.contains("workspace"), "{err}");
     }
 
@@ -1821,7 +2183,7 @@ mod tests {
         g(&repo, &["checkout", "-b", "other"]);
         std::fs::write(repo.join("other.txt"), "on other\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "other branch commit"]);
+        g(&repo, &["commit", "--message", "other branch commit"]);
         g(&repo, &["checkout", "main"]);
 
         let store = Store::open_in_memory().unwrap();
@@ -2037,6 +2399,280 @@ mod tests {
             .expect("restart no-op");
         assert_eq!(cells[0].cwd.as_deref(), Some(resolved.as_str()));
         assert!(Path::new(&resolved).join("marker.txt").exists());
+    }
+
+    /// Resolve one `new-worktree` placeholder for `squad_id` and return the
+    /// worktree path it materialized. RAL-337's tests all consist of doing
+    /// this repeatedly under different squad ids.
+    fn resolve_for_squad(store: &Store, repo: &Path, squad_id: &str, placeholder: &str) -> String {
+        let _ = repo;
+        let mut cells = vec![cell_row(0, 0, "s0", Some(placeholder))];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(store, squad_id, &mut cells, &tasks, &Context::new())
+            .unwrap_or_else(|e| panic!("resolve for {squad_id}: {e:?}"));
+        cells[0].cwd.clone().expect("resolved cwd")
+    }
+
+    /// The branch checked out in the worktree at `wt`.
+    fn head_branch(wt: &str) -> String {
+        git(Path::new(wt), &["symbolic-ref", "--short", "HEAD"])
+            .expect("read HEAD")
+            .trim()
+            .to_string()
+    }
+
+    /// The `w/<short>` directory component of a resolved worktree path.
+    fn w_dir(wt: &str) -> String {
+        short_name_under_w(Path::new(wt)).expect("path under .git/.ralphus/w")
+    }
+
+    #[test]
+    fn ral337_a_second_squad_gets_its_own_worktree_not_the_first_squads() {
+        // The RAL-337 bug in miniature: two squads submit the SAME placeholder.
+        // The second must not land in the first's worktree, because the first
+        // has already committed finished work onto that branch.
+        let repo = init_repo("ral337-second-squad");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let ph = "ralphus:new-worktree/feat-share?upstream=main";
+
+        let first = resolve_for_squad(&store, &repo, "squad-1", ph);
+        // Squad 1 does its work and commits it -- this is what squad 2 must
+        // not inherit.
+        std::fs::write(Path::new(&first).join("done.txt"), "squad-1 work\n").unwrap();
+        g(Path::new(&first), &["add", "done.txt"]);
+        g(Path::new(&first), &["commit", "--message", "squad-1 work"]);
+
+        let second = resolve_for_squad(&store, &repo, "squad-2", ph);
+
+        assert_ne!(first, second, "the second squad must get its own worktree");
+        assert_eq!(w_dir(&first), "feat-share");
+        assert_eq!(
+            w_dir(&second),
+            "feat-share-2",
+            "the second squad walks the existing -2 suffix sequence"
+        );
+        assert_eq!(head_branch(&first), "feat-share");
+        assert_eq!(
+            head_branch(&second),
+            "feat-share-2",
+            "a fresh directory is not enough -- the branch must be new too, or \
+             it would check out the same commits"
+        );
+        assert!(
+            !Path::new(&second).join("done.txt").exists(),
+            "the second squad must not inherit the first squad's committed work"
+        );
+        // And the first squad's tree is left exactly as it was.
+        assert!(Path::new(&first).join("done.txt").exists());
+    }
+
+    #[test]
+    fn ral337_a_third_squad_continues_the_suffix_sequence() {
+        let repo = init_repo("ral337-third-squad");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let ph = "ralphus:new-worktree/feat-seq?upstream=main";
+
+        let a = resolve_for_squad(&store, &repo, "squad-1", ph);
+        let b = resolve_for_squad(&store, &repo, "squad-2", ph);
+        let c = resolve_for_squad(&store, &repo, "squad-3", ph);
+
+        assert_eq!(
+            [w_dir(&a), w_dir(&b), w_dir(&c)],
+            ["feat-seq", "feat-seq-2", "feat-seq-3"]
+        );
+        assert_eq!(
+            [head_branch(&a), head_branch(&b), head_branch(&c)],
+            ["feat-seq", "feat-seq-2", "feat-seq-3"]
+        );
+    }
+
+    #[test]
+    fn ral337_the_owning_squad_still_reuses_its_own_worktree_across_restarts() {
+        // The behavior RAL-337 must NOT break: re-resolving for the SAME squad
+        // returns the same worktree and branch, with its commits intact. This
+        // is what `squad restart` / `squad retry` depend on.
+        let repo = init_repo("ral337-restart");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let ph = "ralphus:new-worktree/feat-restart?upstream=main";
+
+        let first = resolve_for_squad(&store, &repo, "squad-1", ph);
+        std::fs::write(Path::new(&first).join("wip.txt"), "in progress\n").unwrap();
+        g(Path::new(&first), &["add", "wip.txt"]);
+        g(Path::new(&first), &["commit", "--message", "wip"]);
+
+        // A restart resolves the placeholder from scratch again, under the
+        // same squad id.
+        let again = resolve_for_squad(&store, &repo, "squad-1", ph);
+
+        assert_eq!(first, again, "a restart must return to the same worktree");
+        assert_eq!(head_branch(&again), "feat-restart");
+        assert!(
+            Path::new(&again).join("wip.txt").exists(),
+            "a restart must keep the squad's own commits"
+        );
+    }
+
+    #[test]
+    fn ral337_one_task_may_hold_cells_in_several_different_worktrees() {
+        // Per-squad allocation must NOT collapse a squad -- or a single task --
+        // onto one worktree. Claims are keyed on (project, base branch, squad),
+        // so two cells in the SAME task naming DIFFERENT placeholders each get
+        // their own branch and their own worktree. Only cells naming the *same*
+        // placeholder share one (see the test below).
+        let repo = init_repo("ral337-one-task-many-worktrees");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "work",
+                Some("ralphus:new-worktree/feat-split-a?upstream=main"),
+            ),
+            cell_row(
+                0,
+                1,
+                "sidecar",
+                Some("ralphus:new-worktree/feat-split-b?upstream=main"),
+            ),
+        ];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("resolve both");
+
+        let a = cells[0].cwd.clone().expect("resolved a");
+        let b = cells[1].cwd.clone().expect("resolved b");
+        assert_ne!(a, b, "two cells in one task must keep separate worktrees");
+        assert_eq!([w_dir(&a), w_dir(&b)], ["feat-split-a", "feat-split-b"]);
+        assert_eq!(
+            [head_branch(&a), head_branch(&b)],
+            ["feat-split-a", "feat-split-b"],
+            "neither may be suffixed -- these are distinct branches, not a collision"
+        );
+    }
+
+    #[test]
+    fn ral337_cells_naming_the_same_placeholder_share_one_worktree() {
+        // The converse of the test above: suffix allocation is per-squad, not
+        // per-resolution, so two cells naming the SAME placeholder in the same
+        // squad must not end up split across `feat-multi` and `feat-multi-2`.
+        let repo = init_repo("ral337-one-squad-many-cells");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let ph = "ralphus:new-worktree/feat-multi?upstream=main";
+        let mut cells = vec![
+            cell_row(0, 0, "work", Some(ph)),
+            cell_row(0, 1, "finalize", Some(ph)),
+        ];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("resolve");
+        assert_eq!(cells[0].cwd, cells[1].cwd);
+        assert_eq!(w_dir(cells[0].cwd.as_deref().unwrap()), "feat-multi");
+    }
+
+    #[test]
+    fn ral337_a_worktree_predating_the_claims_table_is_treated_as_occupied() {
+        // Migration case: a worktree materialized before RAL-337 has no claim
+        // row, but is plainly still in use. A new squad must step around it
+        // rather than inherit it -- otherwise the very first submission after
+        // upgrading still reproduces the bug.
+        let repo = init_repo("ral337-legacy-worktree");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        // Materialize the way the pre-RAL-337 daemon would have: straight
+        // through `ensure_worktree`, leaving no claim row behind.
+        let legacy = ensure_worktree(&repo, "feat-legacy", "main").expect("legacy worktree");
+        std::fs::write(legacy.join("old.txt"), "pre-upgrade work\n").unwrap();
+        g(&legacy, &["add", "old.txt"]);
+        g(&legacy, &["commit", "--message", "pre-upgrade work"]);
+
+        let fresh = resolve_for_squad(
+            &store,
+            &repo,
+            "squad-1",
+            "ralphus:new-worktree/feat-legacy?upstream=main",
+        );
+
+        assert_ne!(PathBuf::from(&fresh), legacy);
+        assert_eq!(head_branch(&fresh), "feat-legacy-2");
+        assert!(
+            !Path::new(&fresh).join("old.txt").exists(),
+            "an unowned pre-existing worktree must not be inherited either"
+        );
+    }
+
+    #[test]
+    fn ral337_suffix_allocation_skips_slots_that_are_already_taken() {
+        // With `feat-skip` and `feat-skip-2` both occupied, the next squad
+        // must get `-3` -- not silently reuse either.
+        let repo = init_repo("ral337-skip-taken");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let ph = "ralphus:new-worktree/feat-skip?upstream=main";
+        resolve_for_squad(&store, &repo, "squad-1", ph);
+        resolve_for_squad(&store, &repo, "squad-2", ph);
+        let third = resolve_for_squad(&store, &repo, "squad-3", ph);
+        assert_eq!(head_branch(&third), "feat-skip-3");
+        assert_eq!(w_dir(&third), "feat-skip-3");
+    }
+
+    #[test]
+    fn ral337_a_remote_tracking_placeholder_is_shared_across_squads_not_suffixed() {
+        // A `new-worktree/origin/foo` placeholder names one specific,
+        // externally owned branch. Separate squads deliberately share that
+        // worktree and resync it to new pushes, so per-squad allocation must
+        // NOT apply -- `origin/foo-2` would be a local branch tracking
+        // nothing. Guards the behavior asserted end-to-end by
+        // `worktree_projects::placeholder_cwd_origin_foo_resyncs_across_separate_run_submissions`.
+        let (repo, _sha) = init_repo_with_remote_branch("ral337-remote-shared", "origin/foo");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let ph = "ralphus:new-worktree/origin/foo?upstream=origin/foo";
+
+        let first = resolve_for_squad(&store, &repo, "squad-1", ph);
+        let second = resolve_for_squad(&store, &repo, "squad-2", ph);
+
+        assert_eq!(
+            first, second,
+            "a remote-tracking placeholder must resolve to the same shared worktree"
+        );
+        assert_eq!(head_branch(&second), "origin/foo");
+    }
+
+    #[test]
+    fn ral337_suffixed_worktrees_are_still_held_to_the_path_budget() {
+        // A suffix lengthens both the branch and the directory; it must not
+        // become a way to slip past the MAX_PATH preflight.
+        let deep = "a".repeat(120);
+        assert!(
+            crate::short_paths::check_worktree_path_budget(
+                Path::new("/repo/.git/.ralphus/w/feat-skip-3"),
+                &format!("src/{deep}.rs\0"),
+                60,
+            )
+            .is_err(),
+            "the budget check must still reject an over-long suffixed path"
+        );
     }
 
     #[test]

@@ -38,9 +38,9 @@ RUN cargo build --release -p ralphus-daemon -p ralphus-librarian
 # ---- Python builder: the ralphus-runner venv (uv-managed) -----------------
 FROM python:3.12-slim-bookworm AS python-builder
 RUN pip install --no-cache-dir uv
-WORKDIR /src/cli
-COPY cli/pyproject.toml cli/uv.lock cli/README.md ./
-COPY cli/src ./src
+WORKDIR /src/cli-py
+COPY cli-py/pyproject.toml cli-py/uv.lock cli-py/README.md ./
+COPY cli-py/src ./src
 # `--extra runner` pulls in pydantic-ai (the native agent backend);
 # `--no-dev` drops test/lint tooling (pytest, mypy, ruff, ...) that has no
 # business in a runtime image; `--frozen` refuses to silently drift from the
@@ -78,7 +78,7 @@ RUN useradd --create-home --uid 10001 --shell /bin/bash ralphus
 
 COPY --from=rust-builder /src/target/release/ralphus-daemon /usr/local/bin/ralphus-daemon
 COPY --from=rust-builder /src/target/release/ralphus-librarian /usr/local/bin/ralphus-librarian
-COPY --from=python-builder /src/cli/.venv /opt/ralphus-runner-venv
+COPY --from=python-builder /src/cli-py/.venv /opt/ralphus-runner-venv
 COPY docker/entrypoint.sh /usr/local/bin/ralphus-entrypoint.sh
 RUN chmod +x /usr/local/bin/ralphus-entrypoint.sh /usr/local/bin/ralphus-daemon /usr/local/bin/ralphus-librarian
 

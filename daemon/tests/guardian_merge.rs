@@ -14,12 +14,12 @@ use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::cartographer::CartographerFilter;
-use ralphus_daemon::guardian::{GuardianCheck, MergeStatus};
+use ralphus_daemon::guardian::{GuardianCheck, GuardianStatus, MergeStatus};
 use ralphus_daemon::guardian_merge::{
     pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
-    rebuild_on_base_shift, reopen_straggler, restart_guardian_merge, run_feedback, run_merge,
-    run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
-    stop_merge_worker_for_cancel,
+    rebuild_on_base_shift, reopen_cancelled_guardian_merge, reopen_straggler,
+    restart_guardian_merge, run_feedback, run_merge, run_merge_staged, start_feedback, start_merge,
+    stop_guardian_merge, stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
@@ -94,7 +94,68 @@ impl Runner for StageDoneRunner {
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "resolved\nRALPHUS_STAGE: DONE".into(),
+            error: None,
+            proofed: None,
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+}
+
+/// RAL-330: a fake conflict resolver that resolves the real conflict
+/// correctly but also silently drops `new_in_y.txt` -- a wholly unrelated
+/// file the branch's own commit added, which the base never touched. Stands
+/// in for whatever mechanism (a stale rerere replay, or a resolver's own
+/// pass) can produce this class of failure in production, without needing to
+/// reproduce the exact git-level trigger: the content-preservation guard
+/// must catch this regardless of cause.
+struct LossyRunner;
+impl Runner for LossyRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let cwd = PathBuf::from(&spec.cwd);
+        if let Ok(entries) = std::fs::read_dir(&cwd) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if content.contains("<<<<<<<") {
+                        let cleaned: String = content
+                            .lines()
+                            .filter(|l| {
+                                !l.starts_with("<<<<<<<")
+                                    && !l.starts_with("=======")
+                                    && !l.starts_with(">>>>>>>")
+                            })
+                            .map(|l| format!("{l}\n"))
+                            .collect();
+                        let _ = std::fs::write(&path, cleaned);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(cwd.join("new_in_y.txt"));
+        let ok = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&cwd)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "LossyRunner: git add -A failed in {}", cwd.display());
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: "resolved\nRALPHUS_STAGE: DONE".into(),
             error: None,
             proofed: None,
@@ -136,7 +197,10 @@ impl Runner for MarkerStrippingRunner {
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: "resolved".into(),
             error: None,
             proofed: None,
@@ -155,7 +219,44 @@ impl Runner for FeedbackRunner {
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "edited".into(),
+            error: None,
+            proofed: None,
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+}
+
+/// Same as `FeedbackRunner`, but also simulates a concurrent failure landing
+/// on the guardian mid-flight -- e.g. a racing "Merge / rebase" click hitting
+/// a transient worktree error -- by stamping `MergeFailed` on the guardian
+/// directly from inside the resolver call, before `run_feedback` goes on to
+/// restack the downstream branches.
+struct RaceInjectingRunner {
+    store: Arc<Mutex<Store>>,
+    id: String,
+}
+impl Runner for RaceInjectingRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+        let _ = self.store.lock().unwrap().set_guardian_status(
+            &self.id,
+            GuardianStatus::MergeFailed,
+            Some("simulated concurrent failure"),
+        );
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: "edited".into(),
             error: None,
             proofed: None,
@@ -176,7 +277,10 @@ impl Runner for SilentNoOpFeedbackRunner {
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: "nothing to change".into(),
             error: None,
             proofed: None,
@@ -195,7 +299,10 @@ impl Runner for NamedFeedbackRunner {
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: "edited".into(),
             error: None,
             proofed: None,
@@ -326,6 +433,85 @@ fn start_merge_defers_while_an_enabled_branch_is_still_pending() {
     assert_eq!(guardian.base_branch, "main");
     assert_eq!(guardian.branches[0].merge_status, "ready");
     assert_eq!(guardian.branches[1].merge_status, "pending");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-265: reopening a cancelled review must stage the already-ready prefix
+/// immediately rather than waiting for every branch to be ready -- otherwise
+/// a review reopened while its last branch's cell is still running would sit
+/// idle until that cell finishes, even though earlier branches were done and
+/// would already have been rebased in had the review never been cancelled.
+#[test]
+fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pending() {
+    let (root, store, gid, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
+    mark_ready(&store, &gid, &bids[0]);
+
+    store.lock().unwrap().cancel_guardian(&gid).unwrap();
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&gid).unwrap().status,
+        "cancelled"
+    );
+
+    let reply = reopen_cancelled_guardian_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &gid,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 202, "body={}", reply.body);
+    assert!(
+        reply.body.contains("\"status\":\"merging\""),
+        "body={}",
+        reply.body
+    );
+
+    // The staged pass runs on a spawned thread; poll until it lands somewhere
+    // other than the transient `merging` state `claim_guardian_merge` set.
+    let mut guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    for _ in 0..600 {
+        if guardian.status != "merging" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    }
+    assert_eq!(
+        guardian.status, "collecting",
+        "must not finalize early: {:?}",
+        guardian.detail
+    );
+    assert_eq!(
+        guardian.branches[0].merge_status, "done",
+        "the already-ready branch must be staged in immediately"
+    );
+    assert_eq!(guardian.branches[1].merge_status, "pending");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reopen_cancelled_guardian_merge_rejects_a_guardian_that_is_not_cancelled() {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let (root, gid) = {
+        let mut guard = store.lock().unwrap();
+        setup_review_with_pending_last_branch(&mut guard)
+    };
+
+    // Still `collecting`, never cancelled: reopen must be rejected and the
+    // guardian state left untouched.
+    let reply = reopen_cancelled_guardian_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &gid,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 500, "body={}", reply.body);
+
+    let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    assert_eq!(guardian.status, "collecting");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -724,6 +910,95 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
 }
 
 #[test]
+fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() {
+    // A concurrent failure (e.g. a racing "Merge / rebase" click hitting a
+    // transient worktree error) can stamp the guardian `MergeFailed` while
+    // `run_feedback`'s downstream restack (`restack_from_position`) is still
+    // actively landing later branches -- the resolver-agent call it dispatches
+    // before restacking can take long enough for another caller to race in.
+    // Before this fix, nothing re-affirmed `Merging` once the restack
+    // resumed, so the top-level status stayed stuck on the stale failure for
+    // the rest of the restack even though the downstream branch kept
+    // advancing underneath it. Simulate the race deterministically: the fake
+    // resolver stamps `MergeFailed` on the guardian itself, from inside the
+    // same call `run_feedback` is synchronously waiting on.
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let runner = RaceInjectingRunner {
+        store: Arc::clone(&store),
+        id: id.clone(),
+    };
+    run_feedback(
+        &store,
+        &runner,
+        &id,
+        &bid0,
+        "add a note file",
+        &CancelToken::never(),
+    );
+
+    // The restack must have noticed the injected `merge_failed` stamp and
+    // corrected it back to `merging` before advancing the downstream branch,
+    // not left it stuck until `finalize_review` overwrites it at the very end.
+    let events = store.lock().unwrap().events_for_guardian(&id, 100).unwrap();
+    let failed_idx = events
+        .iter()
+        .position(|e| e.scope == "guardian" && e.message.contains("merge_failed"))
+        .expect("the injected failure must be logged");
+    let recovered = events[failed_idx + 1..]
+        .iter()
+        .any(|e| e.scope == "guardian" && e.message == "review → merging");
+    assert!(
+        recovered,
+        "guardian status must be re-affirmed as merging after a racing merge_failed \
+         stamp, got: {events:#?}"
+    );
+
+    // ...and the review still finishes normally afterwards.
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
 fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     // RAL-272: giving feedback on one branch must record it in that branch's
     // own read-only thread, synchronously (before the spawned background
@@ -1078,7 +1353,10 @@ impl Runner for InferredBuildRunner {
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: r#"{"manual_commands": ["echo verify"], "build_command": "echo built > built_marker.txt"}"#
                     .into(),
                 error: None,
@@ -1234,7 +1512,10 @@ fn proof_scope_nothing_suppresses_final_verify() {
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "resolved".into(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -1936,6 +2217,112 @@ fn staged_base_shift_preserves_prior_resolution_and_worktree() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A resolver that behaves like [`StageDoneRunner`] and, the first time it is
+/// called, lands a new commit on the guardian's base branch -- the real-world
+/// shape where upstream advances while a staged pass is still resolving
+/// conflicts and running proofs.
+struct BaseAdvancingRunner {
+    root: PathBuf,
+    advanced: AtomicBool,
+}
+
+impl Runner for BaseAdvancingRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let result = StageDoneRunner.run(spec);
+        if !self.advanced.swap(true, Ordering::Relaxed) {
+            write(&self.root, "upstream.txt", "landed mid-merge\n");
+            git(&self.root, &["add", "."]);
+            git(&self.root, &["commit", "-m", "base advances mid-merge"]);
+        }
+        result
+    }
+}
+
+// A base branch that advances *during* a staged pass is still a shift once that
+// pass finishes: the finalize step records the commit the stack was actually
+// rebased onto rather than re-resolving the (by then newer) base, so the
+// maintenance sweep sees the difference and rebuilds instead of reading a stale
+// review as current.
+#[test]
+fn staged_finalize_keeps_the_base_the_stack_was_built_on() {
+    let root = temp_repo();
+    init_repo(&root);
+    git(&root, &["config", "rerere.enabled", "false"]);
+
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+    git(&root, &["checkout", "main"]);
+
+    // The base moves before the merge starts so the stack rebase conflicts and
+    // the resolver -- which is what advances the base again mid-pass -- runs.
+    write(&root, "conflict.txt", "line1\nMAIN2\nline3\n");
+    git(&root, &["commit", "-am", "main advances"]);
+    let built_on = git(&root, &["rev-parse", "main"]).trim().to_string();
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("mid-merge-shift", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        id
+    };
+    let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    mark_ready(&store, &id, &branch_id);
+
+    let runner = BaseAdvancingRunner {
+        root: root.clone(),
+        advanced: AtomicBool::new(false),
+    };
+    run_merge_staged(&store, &runner, &id, &CancelToken::never());
+    assert!(
+        runner.advanced.load(Ordering::Relaxed),
+        "the resolver never ran, so the base never advanced mid-merge"
+    );
+
+    let moved = git(&root, &["rev-parse", "main"]).trim().to_string();
+    assert_ne!(moved, built_on, "the base must have advanced mid-merge");
+
+    let v1 = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(v1.status, "in_review", "detail: {:?}", v1.detail);
+    assert_eq!(v1.base_commits.len(), 1, "single-project guardian");
+    assert_eq!(
+        v1.base_commits.values().next().map(String::as_str),
+        Some(built_on.as_str()),
+        "finalize must record the base the stack was rebased onto, not the newer tip"
+    );
+
+    // Because the baseline still names what was built, the sweep sees the shift.
+    let sem = Semaphore::new(4);
+    assert!(
+        rebuild_on_base_shift(&store, &StageDoneRunner, &id, &sem, &CancelToken::never()),
+        "a base that moved mid-merge must still trigger a rebuild afterwards"
+    );
+
+    let v2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(v2.status, "in_review", "detail: {:?}", v2.detail);
+    assert_eq!(
+        v2.base_commits.values().next().map(String::as_str),
+        Some(moved.as_str()),
+        "the rebuild rebases onto the newer base and records it"
+    );
+    let combined = v2.combined_worktree.as_deref().expect("combined");
+    assert!(
+        Path::new(combined).join("upstream.txt").exists(),
+        "the rebuilt review must contain the commit that landed mid-merge"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // The all-or-nothing merge remains the parity baseline for a resolved conflict:
 // replaying its prior review tip across an unrelated base shift reaches the same
 // clean branch/guardian state and preserves the resolved file content.
@@ -2421,7 +2808,10 @@ command = "cargo test --workspace"
                     status: "done".into(),
                     tokens_in: 15,
                     tokens_out: 30,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: self.synth_summary.into(),
                     error: None,
                     proofed: None,
@@ -2457,7 +2847,10 @@ command = "cargo test --workspace"
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "resolved".into(),
                 error: None,
                 // RAL-149: the dedicated final-proof call is `proof: true`;
@@ -2914,7 +3307,10 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "resolved".into(),
                 error: None,
                 proofed: None,
@@ -3089,7 +3485,10 @@ impl Runner for PartialResolutionRunner {
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: "resolved".into(),
             error: None,
             proofed: None,
@@ -3180,6 +3579,126 @@ fn conflict_counters_are_rescoped_across_resolver_passes() {
         y.conflicts_committed,
         Some(0),
         "committed must reset once the rebase advances past the resolved commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A fake conflict resolver that never actually clears the conflict markers
+/// (every `run` call is a no-op on disk) but always reports `done`, and hands
+/// back a distinct `agent_session_id` each call -- standing in for an agent
+/// that keeps trying but never converges. Used to exercise the per-commit
+/// give-up budget: a commit stuck behind this runner must fail after exactly
+/// `MAX_ATTEMPTS_PER_COMMIT` (2) passes, not run away for 32 like the old flat
+/// per-branch cap.
+struct NeverResolvesRunner {
+    specs: Arc<Mutex<Vec<RunnerSpec>>>,
+    calls: Arc<Mutex<u32>>,
+}
+impl Runner for NeverResolvesRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.task == "resolve" {
+            self.specs.lock().unwrap().push(spec.clone());
+        }
+        let call = {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            *n
+        };
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "still conflicted".into(),
+            error: None,
+            proofed: None,
+            agent_session_id: Some(format!("sess-{call}")),
+            ghost: None,
+        }
+    }
+}
+
+#[test]
+fn stuck_commit_resumes_the_session_and_gives_up_after_two_attempts() {
+    // A single conflicting commit that the resolver never actually clears
+    // must: (1) get exactly MAX_ATTEMPTS_PER_COMMIT (2) resolution passes, not
+    // the old flat 32-iteration budget, and (2) resume the same agent session
+    // on the retry instead of starting cold.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("stuck-commit-check", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    let specs: Arc<Mutex<Vec<RunnerSpec>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(0u32));
+    let runner = NeverResolvesRunner {
+        specs: specs.clone(),
+        calls: calls.clone(),
+    };
+    run_merge(&store, &runner, &id);
+
+    let specs = specs.lock().unwrap();
+    assert_eq!(
+        specs.len(),
+        2,
+        "a permanently stuck commit must give up after exactly \
+         MAX_ATTEMPTS_PER_COMMIT (2) passes, not the old flat 32-iteration budget: {specs:#?}"
+    );
+    assert_eq!(
+        specs[0].resume_agent_session_id, None,
+        "the first pass on a commit must start a fresh session"
+    );
+    assert_eq!(
+        specs[1].resume_agent_session_id.as_deref(),
+        Some("sess-1"),
+        "the retry must resume the first pass's own agent session instead of starting cold"
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(
+        y.merge_status,
+        MergeStatus::Failed.as_str(),
+        "detail: {:?}",
+        y.detail
+    );
+    assert!(
+        y.detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exhausted its attempt budget on this commit"),
+        "detail must explain the per-commit give-up, not a generic failure: {:?}",
+        y.detail
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -3281,6 +3800,67 @@ fn rerere_autoupdate_resolves_conflict_without_agent() {
     assert!(
         show.contains("X and Y"),
         "rerere resolution not applied: {show}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-330: a resolution that drops real, unrelated content must never be
+// silently accepted, whether it comes from `git rerere`'s fast path or (as
+// exercised here, deterministically) from the resolver's own pass.
+#[test]
+fn resolver_content_loss_is_detected_and_the_branch_is_not_silently_finished() {
+    let root = temp_repo();
+    init_repo(&root);
+
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // feature/x: BASE → X
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+    git(&root, &["checkout", "main"]);
+
+    // feature/y: conflicts with feature/x on conflict.txt, AND in the SAME
+    // commit adds a brand-new file the base never touches -- the shape that
+    // must survive a resolution intact regardless of how the conflict itself
+    // gets fixed.
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    write(&root, "new_in_y.txt", "brand new content from y\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let gid = g
+            .create_guardian("lossy", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&gid, "feature/x").unwrap();
+        g.add_guardian_branch(&gid, "feature/y").unwrap();
+        gid
+    };
+    run_merge(&store, &LossyRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.status, "merge_failed",
+        "a resolution that drops real content must not silently reach in_review; detail: {:?}",
+        view.detail
+    );
+
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_ne!(
+        y.merge_status, "conflict_resolved",
+        "feature/y must not be reported resolved when new_in_y.txt was silently dropped"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -4257,7 +4837,10 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "resolved".into(),
                 error: None,
                 proofed: spec.proof.then_some(true),

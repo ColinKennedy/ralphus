@@ -31,9 +31,26 @@ ralphus-librarian serve [--port 7474]         # web board; RALPHUS_DAEMON_URL po
 ralphus submit task.toml                      # or: validate / status / review / ...
 ```
 
-`scripts/build-release.cmd` (Windows) builds all four standalone executables into `.\dist` via a single `cargo build --release -p ralphus-daemon -p ralphus-librarian -p ralphus-cli -p ralphus-runner`.
+`scripts/build-release.cmd` (Windows) builds all four standalone executables into `.\dist` via a single `cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner`.
 
 **Container execution mode (RAL-225).** A third, opt-in way to run the stack: `scripts/run-container.sh` / `scripts/run-container.cmd` runs the daemon + librarian + runner inside one hardened Linux container (`docker/Dockerfile` + `docker/docker-compose.yml`), with the container's filesystem confined to a single bind-mounted `RALPHUS_WORKSPACE_ROOT` — so every locally-executed agent subprocess is blocked from reaching anything else on the host, enforced by the OS itself rather than by prompt discipline. Bare-subprocess (the two build scripts above) remains the default and is untouched by this mode's existence. See [`docs/container-mode.md`](../docs/container-mode.md) for the full rationale, exactly what is and isn't confined, and a manual escape-attempt verification procedure. The SSH machine-provider path (`ssh-provider/`) is unrelated and unaffected — it already gets isolation for free from running on a separate machine.
+
+**Docker SSH target fixture.** `scripts/ssh-target.ps1` (Windows) and
+`scripts/ssh-target.sh` (bash) manage a separate Linux/OpenSSH container that
+the host daemon can treat as a real remote machine. It never starts or stops a
+Ralphus daemon. Its project/job root, test bare Git origin, and host key use
+named Docker volumes; `down` preserves them and `destroy` removes them. See
+[`docs/remote-docker-target.md`](../docs/remote-docker-target.md).
+
+**Documentation site.** `scripts/docs-build.sh` / `.cmd` renders
+`docs/site/pages/*.md` into `docs/site/_site/` via MkDocs + Material —
+fast, no Playwright, safe to re-run on every doc edit.
+`scripts/docs-screenshots.sh` / `.cmd` is the separate, heavier step that
+regenerates the committed PNGs under `docs/site/pages/screenshots/` from the
+real compiled `ralphus-librarian` — only needed after a `board.html` UI
+change. See [`docs/docs-site.md`](../docs/docs-site.md) for the full
+breakdown of both, plus the separate `ralphus-docs-helpmap` command that
+regenerates `docs/cli-reference.md`'s help-map block.
 
 **`dist/` layout — four standalone exes, no sibling directories:**
 

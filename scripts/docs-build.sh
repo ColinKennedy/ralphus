@@ -15,12 +15,12 @@ root="$(dirname "$(git -C "$_script_dir" rev-parse --path-format=absolute --git-
 unset _script_dir
 
 echo "== syncing docs venv (uv) =="
-( cd "$root/cli" && uv sync --extra docs >/dev/null )
+( cd "$root/cli-py" && uv sync --extra docs >/dev/null )
 
 echo "== screenshot coverage lint =="
-( cd "$root/cli" && uv run ralphus-docs-lint )
+( cd "$root/cli-py" && uv run ralphus-docs-lint )
 
 echo "== mkdocs build =="
-( cd "$root/cli" && uv run mkdocs build -f "$root/docs/site/mkdocs.yml" )
+( cd "$root/cli-py" && uv run mkdocs build --config-file "$root/docs/site/mkdocs.yml" )
 
 echo "== done -> $root/docs/site/_site/index.html =="

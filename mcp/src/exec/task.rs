@@ -2,6 +2,7 @@
 //! module doc for the "why a mirror, not a reuse" rationale.
 
 use ralphus_cli::client::DaemonClient;
+use ralphus_cli::commands::env;
 use ralphus_cli::commands::task::{self, TaskCommand};
 use ralphus_cli::selector::squad_view_uri;
 use serde_json::json;
@@ -11,6 +12,10 @@ use super::{ExecResult, usage};
 pub fn execute(cmd: TaskCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
         TaskCommand::Help | TaskCommand::UsageError(_) => Err(usage("no such tool")),
+        TaskCommand::Env { selector, scope } => {
+            let resolved = task::resolve_scoped(client, &selector, "task")?;
+            Ok(client.env_view(&env::task_path(&resolved, &scope))?)
+        }
         TaskCommand::Show { selector } => {
             let resolved = task::resolve_scoped(client, &selector, "task")?;
             let squad = client.squad(&resolved.squad_id)?;

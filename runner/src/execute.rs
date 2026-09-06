@@ -189,6 +189,8 @@ fn log_llm_done(spec: &CellSpec, result: &CellResult) {
             serde_json::json!({
                 "tokens_in": result.tokens_in,
                 "tokens_out": result.tokens_out,
+                "cache_creation_tokens": result.cache_creation_tokens,
+                "cache_read_tokens": result.cache_read_tokens,
                 "cost_usd": result.cost_usd,
             }),
         );
@@ -254,6 +256,12 @@ fn check_context_limit_support(spec: &CellSpec, backend: &dyn ModelBackend) -> R
             spec.agent
         ));
     }
+    if spec.tool_output_max_tokens.is_some() && !backend.supports_tool_output_max_tokens() {
+        return Err(format!(
+            "agent {:?} does not support tool_output_max_tokens",
+            spec.agent
+        ));
+    }
     Ok(())
 }
 
@@ -291,6 +299,8 @@ fn run_with_backend(
     let mut resume_id = spec.resume_agent_session_id.clone();
     let mut total_tokens_in = 0i64;
     let mut total_tokens_out = 0i64;
+    let mut total_cache_creation_tokens = 0i64;
+    let mut total_cache_read_tokens = 0i64;
     let mut total_cost_usd = 0.0f64;
     let mut agent_session_id: Option<String> = None;
 
@@ -304,6 +314,11 @@ fn run_with_backend(
             maximum_context: spec.maximum_context,
             auto_compact_threshold: spec.auto_compact_threshold,
             tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
+            thrash_max_compactions: spec.thrash_max_compactions,
+            thrash_min_turn_gap: spec.thrash_min_turn_gap,
+            tool_output_max_tokens: spec.tool_output_max_tokens,
+            allow_personal_settings: spec.allow_personal_settings,
+            allow_personal_memory: spec.allow_personal_memory,
         };
         let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
@@ -312,8 +327,30 @@ fn run_with_backend(
 
         total_tokens_in += outcome.tokens_in;
         total_tokens_out += outcome.tokens_out;
+        total_cache_creation_tokens += outcome.cache_creation_tokens;
+        total_cache_read_tokens += outcome.cache_read_tokens;
         total_cost_usd += outcome.cost_usd;
         agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
+
+        // RAL-339: the backend already killed its child process at the
+        // compaction boundary itself (a safe stop point) rather than let a
+        // thrashing run continue -- fail the cell now, before any bg-job
+        // nudge/still-working/budget/proof logic below gets a chance to run,
+        // so this never gets mistaken for a normal completion and no proof
+        // step ever starts.
+        if let Some(detail) = outcome.compaction_thrash {
+            return thrash_cell_result(
+                spec,
+                &detail,
+                outcome.summary,
+                total_tokens_in,
+                total_tokens_out,
+                total_cache_creation_tokens,
+                total_cache_read_tokens,
+                total_cost_usd,
+                agent_session_id,
+            );
+        }
 
         // RAL-292: a turn that ended with an unresolved backgrounded job
         // (launched but never checked) is a silent-completion bug, not a
@@ -338,7 +375,10 @@ fn run_with_backend(
                     status: "failed".to_string(),
                     tokens_in: total_tokens_in,
                     tokens_out: total_tokens_out,
+                    cache_creation_tokens: total_cache_creation_tokens,
+                    cache_read_tokens: total_cache_read_tokens,
                     cost_usd: total_cost_usd,
+                    cost_is_estimated: false,
                     summary: outcome.summary,
                     error: Some(format!(
                         "abandoned background job: agent ended its turn without checking the result of a backgrounded job (\"{job}\") after {bg_nudge_attempt} nudge attempts"
@@ -370,6 +410,11 @@ fn run_with_backend(
                 maximum_context: spec.maximum_context,
                 auto_compact_threshold: spec.auto_compact_threshold,
                 tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
+                thrash_max_compactions: spec.thrash_max_compactions,
+                thrash_min_turn_gap: spec.thrash_min_turn_gap,
+                tool_output_max_tokens: spec.tool_output_max_tokens,
+                allow_personal_settings: spec.allow_personal_settings,
+                allow_personal_memory: spec.allow_personal_memory,
             };
             outcome = match backend.nudge(workspace, &nudge_options) {
                 Ok(Some(o)) => o,
@@ -386,7 +431,10 @@ fn run_with_backend(
                         status: "failed".to_string(),
                         tokens_in: total_tokens_in,
                         tokens_out: total_tokens_out,
+                        cache_creation_tokens: total_cache_creation_tokens,
+                        cache_read_tokens: total_cache_read_tokens,
                         cost_usd: total_cost_usd,
+                        cost_is_estimated: false,
                         summary: outcome.summary,
                         error: Some(format!(
                             "abandoned background job: agent ended its turn without checking the result of a backgrounded job (\"{job}\"); this backend does not support nudging"
@@ -400,8 +448,23 @@ fn run_with_backend(
             };
             total_tokens_in += outcome.tokens_in;
             total_tokens_out += outcome.tokens_out;
+            total_cache_creation_tokens += outcome.cache_creation_tokens;
+            total_cache_read_tokens += outcome.cache_read_tokens;
             total_cost_usd += outcome.cost_usd;
             agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
+            if let Some(detail) = outcome.compaction_thrash {
+                return thrash_cell_result(
+                    spec,
+                    &detail,
+                    outcome.summary,
+                    total_tokens_in,
+                    total_tokens_out,
+                    total_cache_creation_tokens,
+                    total_cache_read_tokens,
+                    total_cost_usd,
+                    agent_session_id,
+                );
+            }
             crate::cartographer::emit_scoped(
                 "runner",
                 "background-job nudge outcome",
@@ -429,7 +492,10 @@ fn run_with_backend(
                     status: "done".to_string(),
                     tokens_in: total_tokens_in,
                     tokens_out: total_tokens_out,
+                    cache_creation_tokens: total_cache_creation_tokens,
+                    cache_read_tokens: total_cache_read_tokens,
                     cost_usd: total_cost_usd,
+                    cost_is_estimated: false,
                     summary: outcome.summary,
                     error: None,
                     proofed: Some(false),
@@ -441,7 +507,10 @@ fn run_with_backend(
                 status: "failed".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
+                cache_creation_tokens: total_cache_creation_tokens,
+                cache_read_tokens: total_cache_read_tokens,
                 cost_usd: total_cost_usd,
+                cost_is_estimated: false,
                 summary: outcome.summary,
                 error: Some(format!(
                     "still working after {MAX_ASYNC_ATTEMPTS} attempts: {reason}"
@@ -470,7 +539,10 @@ fn run_with_backend(
                 status: "done".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
+                cache_creation_tokens: total_cache_creation_tokens,
+                cache_read_tokens: total_cache_read_tokens,
                 cost_usd: total_cost_usd,
+                cost_is_estimated: false,
                 summary,
                 error: None,
                 proofed: Some(verdict.unwrap_or(false)),
@@ -484,7 +556,10 @@ fn run_with_backend(
                 status: "failed".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
+                cache_creation_tokens: total_cache_creation_tokens,
+                cache_read_tokens: total_cache_read_tokens,
                 cost_usd: total_cost_usd,
+                cost_is_estimated: false,
                 summary: outcome.summary,
                 error: Some(format!(
                     "token budget exceeded: used {} tokens, budget was {}",
@@ -501,7 +576,10 @@ fn run_with_backend(
             status: "done".to_string(),
             tokens_in: total_tokens_in,
             tokens_out: total_tokens_out,
+            cache_creation_tokens: total_cache_creation_tokens,
+            cache_read_tokens: total_cache_read_tokens,
             cost_usd: total_cost_usd,
+            cost_is_estimated: false,
             summary: outcome.summary.clone(),
             error: None,
             proofed: None,
@@ -511,6 +589,52 @@ fn run_with_backend(
     }
 
     CellResult::failed("unreachable: retry loop exited without returning", "")
+}
+
+/// RAL-339: builds the failed `CellResult` for a detected autocompaction
+/// thrash condition and emits its Cartographer event, shared by both call
+/// sites in [`run_with_backend`] (the main run and the RAL-292 background-job
+/// nudge loop) so the event shape and error message stay in exactly one
+/// place.
+#[allow(clippy::too_many_arguments)]
+fn thrash_cell_result(
+    spec: &CellSpec,
+    detail: &crate::thrash::ThrashDetail,
+    summary: String,
+    tokens_in: i64,
+    tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    cost_usd: f64,
+    agent_session_id: Option<String>,
+) -> CellResult {
+    crate::cartographer::emit(
+        "runner",
+        "cell failed: autocompaction thrashing",
+        "error",
+        event_context(spec),
+        serde_json::json!({
+            "agent": spec.agent,
+            "compaction_count": detail.compaction_count,
+            "turns_since_previous_compaction": detail.turns_since_previous_compaction,
+            "max_compactions": detail.max_compactions,
+            "min_turn_gap": detail.min_turn_gap,
+        }),
+    );
+    CellResult {
+        status: "failed".to_string(),
+        tokens_in,
+        tokens_out,
+        cache_creation_tokens,
+        cache_read_tokens,
+        cost_usd,
+        cost_is_estimated: false,
+        summary,
+        error: Some(crate::thrash::thrash_error_message(&spec.agent, detail)),
+        proofed: None,
+        agent_session_id,
+        ghost: None,
+    }
 }
 
 fn combine_system_prompts(parts: &[Option<&str>]) -> Option<String> {
@@ -747,6 +871,11 @@ mod tests {
             resume_agent_session_id: None,
             assigned_agent_session_id: None,
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            tool_output_max_tokens: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         }
     }
 
@@ -771,6 +900,71 @@ mod tests {
         assert!(error.contains("abandoned background job"), "{error}");
         assert!(error.contains("bash job"), "{error}");
         assert!(error.contains("3 nudge attempts"), "{error}");
+    }
+
+    /// RAL-339: a backend that detected autocompaction thrashing must fail
+    /// the cell immediately with everything it captured live, and must never
+    /// reach the bg-job-nudge/still-working/budget/proof logic below it --
+    /// the `nudge_calls` assertion below is what proves that.
+    #[test]
+    fn run_with_backend_fails_the_cell_immediately_on_compaction_thrash() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let detail = crate::thrash::ThrashDetail {
+            compaction_count: 3,
+            turns_since_previous_compaction: 0,
+            max_compactions: 3,
+            min_turn_gap: 2,
+        };
+        let backend = ScriptedBackend::new(
+            vec![Ok(BackendOutcome {
+                summary: "partial work before the thrashing compaction".to_string(),
+                tokens_in: 111,
+                tokens_out: 222,
+                cost_usd: 0.5,
+                agent_session_id: Some("sess-thrash".to_string()),
+                compaction_thrash: Some(detail),
+                ..Default::default()
+            })],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert_eq!(backend.nudge_calls.get(), 0);
+        assert!(!result.ok());
+        assert_eq!(result.tokens_in, 111);
+        assert_eq!(result.tokens_out, 222);
+        assert!((result.cost_usd - 0.5).abs() < f64::EPSILON);
+        assert_eq!(
+            result.summary,
+            "partial work before the thrashing compaction"
+        );
+        assert_eq!(result.agent_session_id.as_deref(), Some("sess-thrash"));
+        let error = result.error.unwrap();
+        assert!(error.contains("autocompaction thrashing"), "{error}");
+        assert!(error.contains("claude"), "{error}"); // spec.agent from test_spec
+    }
+
+    /// RAL-339: a healthy run (no thrash) must be entirely unaffected by the
+    /// new check -- same shape as before this change.
+    #[test]
+    fn run_with_backend_succeeds_normally_when_no_thrash_is_reported() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![Ok(BackendOutcome {
+                summary: "all done".to_string(),
+                compaction_thrash: None,
+                ..Default::default()
+            })],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert!(result.ok());
+        assert_eq!(result.summary, "all done");
     }
 
     #[test]
@@ -906,6 +1100,11 @@ mod tests {
             resume_agent_session_id: None,
             assigned_agent_session_id: None,
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            tool_output_max_tokens: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         };
         let result = run_cell(&spec, false);
         assert!(!result.ok());

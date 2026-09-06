@@ -20,6 +20,7 @@
 //! The router is what the scheduler holds, so cell dispatch stays a single
 //! `&dyn Runner` call and nothing above it needs to know a machine exists.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -63,6 +64,16 @@ pub const VERB_REMOVE_PATH: &str = "remove-path";
 /// board, not as part of running anything.
 pub const VERB_PING: &str = "ping";
 
+/// The `capabilities` verb (RAL-355 Phase 0 remainder): report what this
+/// provider/machine pairing actually supports, so the daemon (and Phase 9's
+/// `check health --all-remotes`) can display it and refuse work that needs a
+/// capability the machine lacks, instead of discovering the gap mid-Cell.
+/// Optional — a provider that does not implement it is not a hard failure;
+/// [`ProviderRunner::capabilities`] treats "unimplemented" the same as "no
+/// capability information available" rather than refusing to work with an
+/// otherwise-functional provider.
+pub const VERB_CAPABILITIES: &str = "capabilities";
+
 /// The `status` verb: report whether an async `exec` handle is still running.
 pub const VERB_STATUS: &str = "status";
 
@@ -104,6 +115,15 @@ pub struct WorkspaceSource {
     /// Branch (or equivalent named revision) to check out, when meaningful.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The already-resolved (RAL-100/RAL-258: no `?upstream=<<sentinel>>` or
+    /// literal `<remote>/<branch>` ambiguity left) reference `branch` should
+    /// be created from/track, when meaningful. Mirrors what
+    /// `worktrees::ensure_worktree`'s own `upstream` parameter carries for a
+    /// local worktree (RAL-355 Phase 4) -- until this was added, a
+    /// `provision` request had no way to say what a brand-new remote branch
+    /// should be based on at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
 }
 
 /// The payload sent to a provider's file verbs (`read-file`, `write-file`,
@@ -151,6 +171,92 @@ pub struct ProvisionRequest {
     pub squad_id: String,
     /// Owning cell id, same purpose.
     pub cell_id: String,
+    /// This machine's configured durable remote storage root (RAL-355
+    /// Phase 2: `[machine.targets.<name>].remote_root`), when one is
+    /// configured. A provider that manages persistent, deterministic
+    /// storage (unlike this provider's own pre-Phase-4 behavior, which
+    /// derived an ephemeral-shaped workspace under
+    /// `RALPHUS_SSH_REMOTE_BASE`) needs this to know *where* to put
+    /// anything durable — `None` when no target is configured for this
+    /// machine, which a provider that requires durable storage should
+    /// refuse clearly rather than silently falling back to a guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_root: Option<String>,
+    /// Target-specific runner installation policy. Providers that do not
+    /// manage runner deployment may ignore this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner: Option<TargetRunnerConfig>,
+}
+
+/// The payload sent to a provider's `cleanup` verb (RAL-355 Phase 2
+/// remainder). Carries enough identity to target exactly one workspace under
+/// the Phase 4 durable, multi-workspace-per-machine layout — the verb's
+/// original `{"machine": "<scheme>:<uri>"}`-only contract predates that
+/// layout and could only ever have meant "the one workspace this machine
+/// has", which stopped being true the moment a machine could hold many
+/// projects and many branches per project.
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupRequest {
+    /// Registered project name, for the same deterministic directory
+    /// derivation `provision` uses (`layout::project_dir`).
+    pub project: String,
+    /// The project's registered clone URL — part of that same derivation,
+    /// so a cleanup request can never accidentally resolve to a different
+    /// project's directory that happens to share a name.
+    pub clone_url: String,
+    /// Remove one worktree's directory when set; the whole project
+    /// directory (repository plus every worktree) when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// This machine's configured durable remote storage root, mirroring
+    /// [`ProvisionRequest::remote_root`]. `None` in legacy (pre-Phase-2)
+    /// mode, where a provider has no root to scope the removal under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_root: Option<String>,
+}
+
+/// Runner policy resolved from `[machine.targets.*]` for provider use.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetRunnerConfig {
+    pub mode: String,
+    pub command: String,
+    pub artifacts: BTreeMap<String, String>,
+    pub remote_root: String,
+}
+
+/// What a provider/machine pairing reports supporting (RAL-355 Phase 0
+/// remainder), via the optional `capabilities` verb. Every field is
+/// best-effort: a provider may omit anything it cannot cheaply determine
+/// (e.g. `os`/`arch` when it has no remote-probe mechanism), and `None`
+/// means "unknown", never "no"/"false" by omission.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Remote operating system family, e.g. `"linux"`. Lowercase by
+    /// convention so callers never have to case-fold it themselves.
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Remote CPU architecture, e.g. `"x86_64"`.
+    #[serde(default)]
+    pub arch: Option<String>,
+    /// Verbs this provider actually implements against this machine —
+    /// distinct from the daemon/provider protocol's *documented* verb set,
+    /// since a real provider may implement a subset (`docs/machine-providers.md`).
+    #[serde(default)]
+    pub supported_ops: Vec<String>,
+    /// Whether `exec` can return a durable async handle (`status`/`stream`/
+    /// `cancel`-capable) rather than only blocking synchronously.
+    #[serde(default)]
+    pub async_exec: bool,
+    /// Whether this machine supports an interactive terminal relay (Open
+    /// Agent, RAL-355 Phase 10).
+    #[serde(default)]
+    pub terminal: bool,
+    /// The remote `ralphus-runner` executable's own version string
+    /// (`ralphus-runner --version`'s output), when the provider could
+    /// determine it without side effects (e.g. without triggering an
+    /// upload). `None` when unknown or not yet installed.
+    #[serde(default)]
+    pub runner_version: Option<String>,
 }
 
 /// One provider's JSON response envelope (`docs/machine-providers.md`).
@@ -202,6 +308,14 @@ struct ProviderResponse {
     /// failing to run it (`ok: false`).
     #[serde(default)]
     exit_code: Option<i64>,
+    /// `cleanup` only: the absolute path, on the provider's machine, that was
+    /// removed — so an operator can see exactly what a cleanup call did
+    /// rather than trusting a bare `ok: true`.
+    #[serde(default)]
+    removed: Option<String>,
+    /// `capabilities` only.
+    #[serde(default)]
+    capabilities: Option<Capabilities>,
 }
 
 /// Runs cells on one machine by invoking a registered provider program.
@@ -230,6 +344,13 @@ pub struct ProviderRunner {
     /// its stderr on its own short-lived thread (see [`Self::invoke_with`]),
     /// not the thread that later checks the cap.
     live_usage: Arc<Mutex<Option<LiveUsage>>>,
+    /// Target-specific runner policy forwarded to providers through a
+    /// protected process environment value, never command-line arguments.
+    target_runner: Option<TargetRunnerConfig>,
+    /// Per-agent executable overrides for this target (RAL-355 Phase 7
+    /// remainder), keyed by agent name. Consulted, never forwarded to the
+    /// provider directly — see [`Self::resolve_remote_executable`].
+    agent_executables: BTreeMap<String, String>,
 }
 
 impl ProviderRunner {
@@ -249,7 +370,17 @@ impl ProviderRunner {
             supports_channel: false,
             cartographer: None,
             live_usage: Arc::new(Mutex::new(None)),
+            target_runner: None,
+            agent_executables: BTreeMap::new(),
         }
+    }
+
+    /// Attach this target's per-agent executable overrides
+    /// (`[machine.targets.<name>.agents]`).
+    #[must_use]
+    pub fn with_agent_executables(mut self, agent_executables: BTreeMap<String, String>) -> Self {
+        self.agent_executables = agent_executables;
+        self
     }
 
     /// Declare that this provider implements the `channel` verb.
@@ -263,6 +394,13 @@ impl ProviderRunner {
     #[must_use]
     pub fn with_cartographer(mut self, store: Arc<Mutex<Store>>) -> Self {
         self.cartographer = Some(store);
+        self
+    }
+
+    /// Attach the runner policy for the concrete configured target.
+    #[must_use]
+    pub fn with_target_runner(mut self, runner: Option<TargetRunnerConfig>) -> Self {
+        self.target_runner = runner;
         self
     }
 
@@ -292,10 +430,14 @@ impl ProviderRunner {
             .arg("--uri")
             .arg(&self.uri)
             .args(extra)
-            .envs(&spec.env_overrides)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(runner) = &self.target_runner {
+            let encoded = serde_json::to_string(runner)
+                .map_err(|e| format!("could not serialize target runner policy: {e}"))?;
+            cmd.env("RALPHUS_TARGET_RUNNER_CONFIG", encoded);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             format!(
                 "could not run machine provider {:?} ({}): {e}",
@@ -385,13 +527,14 @@ impl ProviderRunner {
                 }
             ));
         }
-        let resp: ProviderResponse = serde_json::from_str(trimmed).map_err(|e| {
+        let mut resp: ProviderResponse = serde_json::from_str(trimmed).map_err(|e| {
             format!(
                 "machine provider {:?} returned unparseable JSON: {e} ({})",
                 self.scheme,
-                truncate(trimmed, 300)
+                redact_remote_text(&truncate(trimmed, 300))
             )
         })?;
+        redact_provider_response(&mut resp);
         // A provider declaring the wrong contract version is refused rather
         // than trusted -- the whole point of versioning it (1.13).
         if let Some(v) = resp.protocol_version {
@@ -446,6 +589,34 @@ fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     format!("{}…", &s[..max])
+}
+
+fn redact_remote_text(text: &str) -> String {
+    let registered = crate::redact::redact_all(text);
+    ralphus_core::redact::redact_secrets(&registered).into_owned()
+}
+
+fn redact_provider_response(response: &mut ProviderResponse) {
+    for text in [
+        &mut response.error,
+        &mut response.output,
+        &mut response.detail,
+        &mut response.stdout,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *text = redact_remote_text(text);
+    }
+    if let Some(result) = &mut response.result {
+        result.summary = redact_remote_text(&result.summary);
+        if let Some(error) = &mut result.error {
+            *error = redact_remote_text(error);
+        }
+        if let Some(ghost) = &mut result.ghost {
+            *ghost = redact_remote_text(ghost);
+        }
+    }
 }
 
 impl ProviderRunner {
@@ -600,12 +771,7 @@ impl ProviderRunner {
                             "cap": cap,
                         }),
                     );
-                    return RunnerResult::cost_exceeded(
-                        usage.tokens_in,
-                        usage.tokens_out,
-                        usage.cost_usd,
-                        cap,
-                    );
+                    return RunnerResult::cost_exceeded(usage, cap);
                 }
             }
             // Pump output first so a cell that finishes between polls still
@@ -638,7 +804,7 @@ impl ProviderRunner {
                 }
             };
             match status.state.as_deref() {
-                Some("running") | None => {}
+                Some("starting" | "running") | None => {}
                 Some(_) => {
                     crate::tmux::write_pane_snapshot(&session_name, &transcript);
                     return status.result.unwrap_or_else(|| {
@@ -658,13 +824,18 @@ impl ProviderRunner {
         if cancel.is_some_and(CancelToken::is_cancelled) {
             return RunnerResult::failure("cancelled before dispatch to the machine provider");
         }
-        let payload = match serde_json::to_string(spec) {
+        let mut spec = spec.clone();
+        match self.resolve_remote_executable(&spec) {
+            Ok(resolved) => spec.executable = resolved,
+            Err(e) => return RunnerResult::failure(e),
+        }
+        let payload = match provider_exec_payload(&spec) {
             Ok(p) => p,
             Err(e) => {
                 return RunnerResult::failure(format!("could not serialize cell spec: {e}"));
             }
         };
-        let resp = match self.invoke(VERB_EXEC, &payload, spec) {
+        let resp = match self.invoke(VERB_EXEC, &payload, &spec) {
             Ok(r) => r,
             Err(e) => {
                 crate::rlog!(WARNING, "ralphus [remote] {e}");
@@ -696,7 +867,7 @@ impl ProviderRunner {
                         );
                     }
                 }
-                let result = self.poll_to_completion(&handle, spec, cancel);
+                let result = self.poll_to_completion(&handle, &spec, cancel);
                 if let Some(store) = &self.cartographer {
                     if let Ok(guard) = store.lock() {
                         let _ = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id);
@@ -710,9 +881,95 @@ impl ProviderRunner {
             )),
         }
     }
+
+    /// Resolve which executable a remote cell's agent backend should launch
+    /// with (RAL-355 Phase 7 remainder).
+    ///
+    /// A target-specific override
+    /// (`[machine.targets.<name>.agents].<agent>`) always wins when present
+    /// — that is exactly the "deliberately mapped" escape hatch the plan
+    /// calls for. Otherwise, `spec.executable` (an agent profile's explicit
+    /// override, resolved for the *daemon's own* filesystem) is forwarded
+    /// unchanged only if it is a bare command name; a path-shaped value
+    /// (contains `/` or `\`) is refused before ever reaching the provider,
+    /// since a daemon-local path is essentially never valid on a different
+    /// machine and running it anyway would fail confusingly deep inside the
+    /// remote runner instead of with an actionable message here. `None`
+    /// (no override at all) passes through unchanged, letting the remote
+    /// runner fall back to its own `RALPHUS_CLAUDE_COMMAND`-style
+    /// environment default or bare command on the remote account's `PATH`.
+    ///
+    /// # Errors
+    /// A daemon-local absolute/path-shaped executable override with no
+    /// target-specific mapping to replace it.
+    fn resolve_remote_executable(&self, spec: &RunnerSpec) -> Result<Option<String>, String> {
+        if let Some(mapped) = self.agent_executables.get(&spec.agent) {
+            return Ok(Some(mapped.clone()));
+        }
+        match &spec.executable {
+            Some(path) if path.contains('/') || path.contains('\\') => Err(format!(
+                "cell '{}' agent {:?} has a daemon-local executable override {path:?}, which \
+                 cannot run on machine {:?} — configure [machine.targets.<name>.agents].{:?} to \
+                 map it, or leave the agent profile's executable unset to use the remote \
+                 account's PATH",
+                spec.cell_id, spec.agent, self.scheme, spec.agent
+            )),
+            other => Ok(other.clone()),
+        }
+    }
+}
+
+fn provider_exec_payload(spec: &RunnerSpec) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(spec)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "execution_environment".to_string(),
+            serde_json::to_value(&spec.env_overrides)?,
+        );
+    }
+    serde_json::to_string(&value)
 }
 
 impl ProviderRunner {
+    /// Spawn this provider's `terminal` verb (RAL-355 Phase 10) as a
+    /// long-lived child process with piped stdin/stdout, and return the
+    /// [`std::process::Child`] handle directly instead of invoking it
+    /// through [`Self::invoke`] -- `terminal` is the one verb in the
+    /// contract that is not JSON request/response (see
+    /// `docs/machine-providers.md`), so there is no envelope to parse here;
+    /// the caller relays raw bytes to/from this child's stdio itself for as
+    /// long as the terminal session lives.
+    ///
+    /// # Errors
+    /// The provider program failing to spawn at all.
+    pub fn spawn_terminal(
+        &self,
+        command: &str,
+        cols: u16,
+        lines: u16,
+    ) -> Result<std::process::Child, String> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args)
+            .arg("terminal")
+            .arg("--uri")
+            .arg(&self.uri)
+            .arg("--command")
+            .arg(command)
+            .arg("--cols")
+            .arg(cols.to_string())
+            .arg("--lines")
+            .arg(lines.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        cmd.spawn().map_err(|e| {
+            format!(
+                "could not run machine provider {:?} ({}) for a terminal session: {e}",
+                self.scheme, self.program
+            )
+        })
+    }
+
     /// Ask the machine to confirm it is reachable and ready (RAL-185 Phase 3,
     /// Q3). Returns the provider's own detail line, if it offered one.
     ///
@@ -727,6 +984,25 @@ impl ProviderRunner {
     pub fn ping(&self, spec: &RunnerSpec) -> Result<Option<String>, String> {
         let resp = self.invoke(VERB_PING, "", spec)?;
         Ok(resp.detail)
+    }
+
+    /// Ask the machine what it supports (RAL-355 Phase 0 remainder).
+    /// `Ok(None)` covers both "the provider does not implement this verb"
+    /// and "it implemented it but returned nothing" — deliberately treated
+    /// the same as "no information available" rather than an error, since a
+    /// provider is fully usable without ever answering this.
+    ///
+    /// # Errors
+    /// Only a genuine transport/invocation failure (the machine could not
+    /// be reached at all) — an unimplemented verb is reported as `Ok(None)`,
+    /// not an `Err`, via the same `UNIMPLEMENTED_VERBS` reply shape every
+    /// other optional verb (`channel`) already uses.
+    pub fn capabilities(&self, spec: &RunnerSpec) -> Result<Option<Capabilities>, String> {
+        match self.invoke(VERB_CAPABILITIES, "", spec) {
+            Ok(resp) => Ok(resp.capabilities),
+            Err(e) if e.contains("does not implement") => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -755,8 +1031,15 @@ impl ProviderRunner {
     ///
     /// # Errors
     /// The provider's own refusal reason, verbatim.
-    pub fn cleanup(&self, spec: &RunnerSpec) -> Result<(), String> {
-        self.invoke(VERB_CLEANUP, "", spec).map(|_| ())
+    pub fn cleanup(
+        &self,
+        req: &CleanupRequest,
+        spec: &RunnerSpec,
+    ) -> Result<Option<String>, String> {
+        let payload = serde_json::to_string(req)
+            .map_err(|e| format!("could not serialize cleanup request: {e}"))?;
+        let resp = self.invoke(VERB_CLEANUP, &payload, spec)?;
+        Ok(resp.removed)
     }
 }
 
@@ -862,6 +1145,73 @@ impl ProviderRunner {
         self.invoke(VERB_REMOVE_PATH, &payload, spec).map(|_| ())
     }
 
+    /// Prove `remote_root` is actually usable on the machine: create a small
+    /// probe file, read it back, rename it (approximated as write-under-a-
+    /// new-name then remove-the-old-name, since the provider contract has no
+    /// direct rename verb), then delete it (RAL-355 Phase 2 remainder).
+    ///
+    /// This is the "expand and validate on the remote machine, not the
+    /// daemon machine" check `[machine.targets.*]` config parsing can only
+    /// approximate textually (`machine_targets::looks_absolute`) — round-
+    /// tripping a real file through the real machine is the only way to
+    /// know a configured root is genuinely writable there. Reuses the
+    /// `read-file`/`write-file`/`remove-path` verbs rather than adding a
+    /// dedicated probe verb, per the Phase 2 design interview
+    /// (`REMOTE_IMPROVEMENTS.local.md`).
+    ///
+    /// Best-effort cleanup on failure: if a later step fails, this still
+    /// attempts to remove whatever it already created, so a failed probe
+    /// doesn't litter the remote root with orphaned probe files — but a
+    /// cleanup failure itself is never allowed to mask the original error.
+    ///
+    /// # Errors
+    /// Names which of create/read-back/rename/delete failed and why.
+    pub fn probe_remote_root(&self, remote_root: &str, spec: &RunnerSpec) -> Result<(), String> {
+        const CONTENT: &str = "ralphus-probe";
+        let root = remote_root.trim_end_matches('/');
+        let mut suffix = [0_u8; 8];
+        getrandom::getrandom(&mut suffix)
+            .map_err(|e| format!("could not generate a probe file name: {e}"))?;
+        let suffix = suffix
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let created = format!("{root}/.ralphus-probe-{suffix}");
+        let renamed = format!("{root}/.ralphus-probe-{suffix}-renamed");
+
+        self.write_file(&created, CONTENT, spec).map_err(|e| {
+            format!("remote_root {root:?} probe: could not create a file there: {e}")
+        })?;
+
+        let readback = self.read_file(&created, spec).map_err(|e| {
+            let _ = self.remove_path(&created, false, spec);
+            format!("remote_root {root:?} probe: could not read the file back: {e}")
+        })?;
+        if readback.trim() != CONTENT {
+            let _ = self.remove_path(&created, false, spec);
+            return Err(format!(
+                "remote_root {root:?} probe: file round-tripped with unexpected content {readback:?}"
+            ));
+        }
+
+        if let Err(e) = self.write_file(&renamed, CONTENT, spec) {
+            let _ = self.remove_path(&created, false, spec);
+            return Err(format!(
+                "remote_root {root:?} probe: could not create the renamed file: {e}"
+            ));
+        }
+        if let Err(e) = self.remove_path(&created, false, spec) {
+            let _ = self.remove_path(&renamed, false, spec);
+            return Err(format!(
+                "remote_root {root:?} probe: could not remove the pre-rename file: {e}"
+            ));
+        }
+
+        self.remove_path(&renamed, false, spec).map_err(|e| {
+            format!("remote_root {root:?} probe: could not delete the probe file: {e}")
+        })
+    }
+
     pub fn run_vcs(&self, req: &RunRequest, spec: &RunnerSpec) -> Result<String, String> {
         let payload = serde_json::to_string(req)
             .map_err(|e| format!("could not serialize run request: {e}"))?;
@@ -918,9 +1268,26 @@ pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<Provid
         ));
     };
     let supports_channel = provider.supports_channel;
+    let targets = crate::machine_targets::load_machine_targets()?;
+    let resolved_target = crate::machine_targets::find_by_machine(&targets, machine);
+    let target_runner = resolved_target.map(|target| TargetRunnerConfig {
+        mode: match target.runner_mode {
+            crate::machine_targets::RunnerMode::Installed => "installed",
+            crate::machine_targets::RunnerMode::Upload => "upload",
+        }
+        .to_string(),
+        command: target.runner_command.clone(),
+        artifacts: target.runner_artifacts.clone(),
+        remote_root: target.remote_root.clone(),
+    });
+    let agent_executables = resolved_target
+        .map(|target| target.agent_executables.clone())
+        .unwrap_or_default();
     Ok(Some(
         ProviderRunner::new(provider.program, provider.args, scheme, uri)
-            .with_channel(supports_channel),
+            .with_channel(supports_channel)
+            .with_target_runner(target_runner)
+            .with_agent_executables(agent_executables),
     ))
 }
 
@@ -1102,7 +1469,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 7,
                 tokens_out: 8,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.25,
+                cost_is_estimated: false,
                 summary: "local".to_string(),
                 error: None,
                 proofed: None,
@@ -1130,6 +1500,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -1137,6 +1508,10 @@ mod tests {
             env_overrides: BTreeMap::new(),
             machine: machine.map(str::to_string),
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         }
     }
 
@@ -1267,6 +1642,101 @@ mod tests {
         path
     }
 
+    /// A Python provider that fakes a tiny remote filesystem under `store_in`
+    /// (a real local directory the test controls) so `read-file`/
+    /// `write-file`/`remove-path` behave like a genuine round-trip across
+    /// process spawns, unlike [`fake_provider`]'s single canned reply. When
+    /// `writes_fail` is set, every `write-file` call reports `ok: false`
+    /// instead of succeeding, to test the probe's failure path.
+    fn fake_filesystem_provider(
+        store_in: &std::path::Path,
+        writes_fail: bool,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(store_in).expect("mkdir");
+        let py = store_in.join("provider.py");
+        let fail_writes = if writes_fail { "True" } else { "False" };
+        std::fs::write(
+            &py,
+            format!(
+                r#"import json, os, sys
+verb = sys.argv[1]
+base = {store_in:?}
+fail_writes = {fail_writes}
+def path_for(p):
+    return os.path.join(base, p.lstrip("/").replace("/", "_"))
+if verb == "write-file":
+    if fail_writes:
+        print(json.dumps({{"ok": False, "protocol_version": 1, "error": "disk full"}}))
+    else:
+        req = json.load(sys.stdin)
+        with open(path_for(req["path"]), "w") as f:
+            f.write(req["content"])
+        print(json.dumps({{"ok": True, "protocol_version": 1}}))
+elif verb == "read-file":
+    req = json.load(sys.stdin)
+    fp = path_for(req["path"])
+    if os.path.exists(fp):
+        print(json.dumps({{"ok": True, "protocol_version": 1, "stdout": open(fp).read()}}))
+    else:
+        print(json.dumps({{"ok": False, "protocol_version": 1, "error": "not found"}}))
+elif verb == "remove-path":
+    req = json.load(sys.stdin)
+    fp = path_for(req["path"])
+    if os.path.exists(fp):
+        os.remove(fp)
+    print(json.dumps({{"ok": True, "protocol_version": 1}}))
+else:
+    print(json.dumps({{"ok": False, "protocol_version": 1, "error": "unexpected verb " + verb}}))
+"#,
+                store_in = store_in.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        py
+    }
+
+    #[test]
+    fn probe_remote_root_round_trips_create_read_rename_delete() {
+        let dir = std::env::temp_dir().join(format!("ral355-probe-ok-{}", std::process::id()));
+        let py = fake_filesystem_provider(&dir, false);
+        let provider = ProviderRunner::new(
+            "python",
+            vec![py.to_string_lossy().into_owned()],
+            "probetest",
+            "A",
+        );
+        provider
+            .probe_remote_root("/srv/ralphus", &spec(Some("probetest:A")))
+            .expect("a fully functional remote filesystem must pass the probe");
+        // Nothing left behind: the fake filesystem directory holds only the
+        // provider script itself once the probe's own cleanup has run.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "provider.py")
+            .collect();
+        assert!(leftover.is_empty(), "probe left files behind: {leftover:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_remote_root_reports_which_step_failed() {
+        let dir = std::env::temp_dir().join(format!("ral355-probe-fail-{}", std::process::id()));
+        let py = fake_filesystem_provider(&dir, true);
+        let provider = ProviderRunner::new(
+            "python",
+            vec![py.to_string_lossy().into_owned()],
+            "probefail",
+            "A",
+        );
+        let err = provider
+            .probe_remote_root("/srv/ralphus", &spec(Some("probefail:A")))
+            .expect_err("an unwritable remote_root must fail the probe");
+        assert!(err.contains("could not create a file there"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_real_provider_script_executes_a_cell_and_its_result_is_returned() {
         let script = fake_provider(
@@ -1297,6 +1767,53 @@ mod tests {
             local.seen.lock().unwrap().is_empty(),
             "the cell must have run remotely, not locally"
         );
+    }
+
+    #[test]
+    fn remote_exec_forwards_the_full_runner_result_shape_unchanged() {
+        // RAL-355 Phase 7 result/accounting parity: `ProviderRunner::exec`
+        // performs no field-level transformation on `result` at all --
+        // `resp.result` (already a parsed `RunnerResult`) is returned
+        // verbatim (see `exec`'s `if let Some(result) = resp.result { return
+        // result; }`). So the strongest true parity claim is exactly what
+        // this test proves: feeding the identical CellResult content through
+        // the wire contract's `result` object round-trips every field
+        // (summary, tokens, cost, error, proof verdict, session id, ghost)
+        // byte-for-byte, the same way any local caller parsing that same
+        // JSON directly would see it -- there is no separate "local
+        // formatting" step in this codebase for a remote path to diverge
+        // from.
+        let full_result = serde_json::json!({
+            "status": "failed",
+            "tokens_in": 42,
+            "tokens_out": 84,
+            "cost_usd": 1.23,
+            "summary": "did the thing, then it broke",
+            "error": "agent exited non-zero",
+            "proofed": false,
+            "agent_session_id": "sess-abc-123",
+            "ghost": "handoff: retry with a smaller diff"
+        });
+        let expected: RunnerResult = serde_json::from_value(full_result.clone()).unwrap();
+
+        let script = fake_provider(
+            "parity",
+            &format!(r#"{{"ok":true,"protocol_version":1,"result":{full_result}}}"#),
+            &[],
+        );
+        let provider =
+            ProviderRunner::new(script.to_string_lossy().into_owned(), vec![], "ct", "A");
+        let remote = provider.exec(&spec(Some("ct:A")), None);
+
+        assert_eq!(remote.status, expected.status);
+        assert_eq!(remote.tokens_in, expected.tokens_in);
+        assert_eq!(remote.tokens_out, expected.tokens_out);
+        assert!((remote.cost_usd - expected.cost_usd).abs() < f64::EPSILON);
+        assert_eq!(remote.summary, expected.summary);
+        assert_eq!(remote.error, expected.error);
+        assert_eq!(remote.proofed, expected.proofed);
+        assert_eq!(remote.agent_session_id, expected.agent_session_id);
+        assert_eq!(remote.ghost, expected.ghost);
     }
 
     #[test]
@@ -1498,6 +2015,100 @@ mod tests {
         assert_eq!(r.summary, "remote async ok");
         assert_eq!(r.tokens_in, 11);
         assert!(local.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn execution_environment_is_payload_not_local_provider_environment() {
+        let dir = std::env::temp_dir().join(format!("ral185-provider-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("provider.py");
+        std::fs::write(
+            &py,
+            [
+                "import json, os, sys",
+                "payload = json.load(sys.stdin)",
+                "remote = payload.get('execution_environment', {}).get('REMOTE_ONLY')",
+                "local = os.environ.get('REMOTE_ONLY')",
+                "ok = remote == 'payload-secret' and local is None",
+                "result = {'status': 'done' if ok else 'failed', 'summary': 'separated' if ok else 'environment leaked into provider'}",
+                "print(json.dumps({'ok': True, 'protocol_version': 1, 'result': result}))",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let provider =
+            ProviderRunner::new("python", vec![py.to_string_lossy().into_owned()], "ct", "A");
+        let mut remote = spec(Some("ct:A"));
+        remote
+            .env_overrides
+            .insert("REMOTE_ONLY".to_string(), "payload-secret".to_string());
+        let result = provider.run(&remote);
+        assert_eq!(result.status, "done", "{result:?}");
+        assert_eq!(result.summary, "separated");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_results_and_stream_output_redact_registered_secrets() {
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            crate::redact::register("phase7-secret-value");
+            let mut response: ProviderResponse = serde_json::from_value(serde_json::json!({
+                "ok": true,
+                "output": "stream phase7-secret-value",
+                "detail": "detail phase7-secret-value",
+                "stdout": "stdout phase7-secret-value",
+                "result": {
+                    "status": "failed",
+                    "summary": "summary phase7-secret-value",
+                    "error": "error phase7-secret-value",
+                    "ghost": "ghost phase7-secret-value"
+                }
+            }))
+            .unwrap();
+            redact_provider_response(&mut response);
+            let rendered = format!("{response:?}");
+            assert!(!rendered.contains("phase7-secret-value"), "{rendered}");
+            assert!(rendered.contains(crate::redact::REDACTED), "{rendered}");
+            crate::redact::clear_for_tests();
+        });
+    }
+
+    #[test]
+    fn an_async_starting_state_is_polled_instead_of_treated_as_terminal() {
+        let dir =
+            std::env::temp_dir().join(format!("ral185-async-starting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("provider.py");
+        std::fs::write(
+            &py,
+            [
+                "import json, pathlib, sys",
+                "verb = sys.argv[1]",
+                "counter = pathlib.Path(__file__).with_suffix('.count')",
+                "if verb == 'exec':",
+                "    print(json.dumps({'ok': True, 'protocol_version': 1, 'handle': 'h1'}))",
+                "elif verb == 'stream':",
+                "    print(json.dumps({'ok': True, 'protocol_version': 1, 'output': '', 'next': 0}))",
+                "elif verb == 'status':",
+                "    seen = counter.exists()",
+                "    counter.write_text('1')",
+                "    if seen:",
+                "        print(json.dumps({'ok': True, 'protocol_version': 1, 'state': 'done', 'result': {'status': 'done', 'summary': 'started safely'}}))",
+                "    else:",
+                "        print(json.dumps({'ok': True, 'protocol_version': 1, 'state': 'starting'}))",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let provider =
+            ProviderRunner::new("python", vec![py.to_string_lossy().into_owned()], "ct", "A");
+        let result = provider.run(&spec(Some("ct:A")));
+        assert_eq!(result.status, "done", "{result:?}");
+        assert_eq!(result.summary, "started safely");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1878,13 +2489,222 @@ mod tests {
         assert!(err.contains("ib"), "error must name the provider: {err}");
     }
 
+    fn cleanup_req(project: &str) -> CleanupRequest {
+        CleanupRequest {
+            project: project.to_string(),
+            clone_url: "git@host:org/repo.git".to_string(),
+            branch: None,
+            remote_root: None,
+        }
+    }
+
+    #[test]
+    fn a_target_specific_agent_override_always_wins() {
+        let ok = fake_provider(
+            "agentexec-ok",
+            r#"{"ok":true,"protocol_version":1,"result":{"status":"done","tokens_in":1,"tokens_out":1,"cost_usd":0.0,"summary":"ok"}}"#,
+            &[],
+        );
+        let provider = ProviderRunner::new(ok.to_string_lossy().into_owned(), vec![], "ct", "A")
+            .with_agent_executables(BTreeMap::from([(
+                "claude".to_string(),
+                "claude-remote".to_string(),
+            )]));
+        let mut cell = spec(Some("ct:A"));
+        // The daemon-local path would normally be refused (see below) --
+        // proving the target override still wins even against a value that
+        // would otherwise be rejected shows the override is checked first,
+        // not merely as a fallback for the None case.
+        cell.executable = Some("/usr/local/bin/claude".to_string());
+        assert_eq!(
+            provider.resolve_remote_executable(&cell).unwrap(),
+            Some("claude-remote".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bare_command_name_forwards_unchanged() {
+        let provider = ProviderRunner::new("unused", vec![], "ct", "A");
+        let mut cell = spec(Some("ct:A"));
+        cell.executable = Some("claude".to_string());
+        assert_eq!(
+            provider.resolve_remote_executable(&cell).unwrap(),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn no_override_at_all_passes_through_as_none() {
+        let provider = ProviderRunner::new("unused", vec![], "ct", "A");
+        assert_eq!(
+            provider
+                .resolve_remote_executable(&spec(Some("ct:A")))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_daemon_local_path_shaped_override_is_refused_without_a_target_mapping() {
+        let provider = ProviderRunner::new("unused", vec![], "ct", "A");
+        let mut cell = spec(Some("ct:A"));
+        cell.executable = Some("/usr/local/bin/claude".to_string());
+        let err = provider
+            .resolve_remote_executable(&cell)
+            .expect_err("a path-shaped override with no target mapping must be refused");
+        assert!(err.contains("daemon-local executable override"), "{err}");
+        assert!(err.contains("[machine.targets.<name>.agents]"), "{err}");
+
+        let mut windows_path = spec(Some("ct:A"));
+        windows_path.executable = Some(r"C:\Users\me\claude.exe".to_string());
+        assert!(provider.resolve_remote_executable(&windows_path).is_err());
+    }
+
+    #[test]
+    fn a_refused_executable_override_never_reaches_the_provider() {
+        // The provider program does not even exist -- if `exec` dispatched
+        // anyway, the error would say "could not run machine provider", not
+        // name the executable override. Proves the check happens strictly
+        // before dispatch.
+        let provider = ProviderRunner::new("/definitely/not/a/real/provider", vec![], "ct", "A");
+        let mut cell = spec(Some("ct:A"));
+        cell.executable = Some("/usr/local/bin/claude".to_string());
+        let result = provider.exec(&cell, None);
+        assert_eq!(result.status, "failed");
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("daemon-local executable override"), "{err}");
+        assert!(!err.contains("could not run machine provider"), "{err}");
+    }
+
+    /// Write a throwaway provider script that echoes its own argv, one
+    /// argument per line, to stdout and exits 0 -- used to confirm
+    /// [`ProviderRunner::spawn_terminal`] actually builds the command line
+    /// it claims to (`terminal --uri ... --command ... --cols ... --lines
+    /// ...`), since `terminal` has no JSON reply to assert against the way
+    /// every other verb's tests do.
+    fn argv_echoing_provider(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ral355-argv-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (path, body) = if cfg!(windows) {
+            (
+                dir.join("provider.cmd"),
+                "@echo off\r\nfor %%a in (%*) do echo %%~a\r\n".to_string(),
+            )
+        } else {
+            (
+                dir.join("provider.sh"),
+                "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done\n".to_string(),
+            )
+        };
+        std::fs::write(&path, body).expect("write provider script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path
+    }
+
+    #[test]
+    fn spawn_terminal_builds_the_expected_argv_and_pipes_stdio() {
+        let script = argv_echoing_provider("spawn-terminal");
+        let provider =
+            ProviderRunner::new(script.to_string_lossy().into_owned(), vec![], "ct", "A");
+        let child = provider
+            .spawn_terminal(
+                "claude --resume sess-1 --dangerously-skip-permissions",
+                100,
+                40,
+            )
+            .expect("must spawn");
+        let output = child.wait_with_output().expect("must run to completion");
+        let argv = String::from_utf8_lossy(&output.stdout);
+        assert!(argv.contains("terminal"), "{argv}");
+        assert!(argv.contains("--uri"), "{argv}");
+        assert!(argv.contains('A'), "{argv}");
+        assert!(argv.contains("--command"), "{argv}");
+        assert!(
+            argv.contains("claude --resume sess-1 --dangerously-skip-permissions"),
+            "{argv}"
+        );
+        assert!(argv.contains("--cols"), "{argv}");
+        assert!(argv.contains("100"), "{argv}");
+        assert!(argv.contains("--lines"), "{argv}");
+        assert!(argv.contains("40"), "{argv}");
+    }
+
+    #[test]
+    fn spawn_terminal_reports_a_clear_error_when_the_provider_program_does_not_exist() {
+        let provider = ProviderRunner::new("/definitely/not/a/real/provider", vec![], "ct", "A");
+        let err = provider
+            .spawn_terminal("claude --resume sess-1", 80, 24)
+            .expect_err("a nonexistent provider program must fail to spawn");
+        assert!(err.contains("terminal session"), "{err}");
+    }
+
+    #[test]
+    fn capabilities_reports_what_the_provider_returns() {
+        let ok = fake_provider(
+            "capabilities-ok",
+            r#"{"ok":true,"protocol_version":1,"capabilities":{"os":"linux","arch":"x86_64","supported_ops":["run","exec"],"async_exec":true,"terminal":false,"runner_version":"ralphus-runner 0.1.0"}}"#,
+            &[],
+        );
+        let provider = ProviderRunner::new(ok.to_string_lossy().into_owned(), vec![], "ct", "A");
+        let caps = provider
+            .capabilities(&spec(Some("ct:A")))
+            .expect("must succeed")
+            .expect("must report capabilities");
+        assert_eq!(caps.os.as_deref(), Some("linux"));
+        assert_eq!(caps.arch.as_deref(), Some("x86_64"));
+        assert!(caps.async_exec);
+        assert!(!caps.terminal);
+        assert_eq!(caps.runner_version.as_deref(), Some("ralphus-runner 0.1.0"));
+        assert_eq!(
+            caps.supported_ops,
+            vec!["run".to_string(), "exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn capabilities_from_a_provider_that_does_not_implement_the_verb_is_none_not_an_error() {
+        let unimplemented = fake_provider(
+            "capabilities-unimplemented",
+            r#"{"ok":false,"protocol_version":1,"error":"some-provider does not implement \"capabilities\"; see docs/machine-providers.md for its supported verbs"}"#,
+            &[],
+        );
+        let provider = ProviderRunner::new(
+            unimplemented.to_string_lossy().into_owned(),
+            vec![],
+            "ct",
+            "A",
+        );
+        let caps = provider
+            .capabilities(&spec(Some("ct:A")))
+            .expect("an unimplemented verb must not be an error");
+        assert!(caps.is_none());
+    }
+
+    #[test]
+    fn capabilities_from_an_unreachable_machine_is_a_real_error() {
+        let provider = ProviderRunner::new("/definitely/not/a/real/provider", vec![], "ct", "A");
+        let err = provider
+            .capabilities(&spec(Some("ct:A")))
+            .expect_err("a genuinely unreachable provider must still be an error");
+        assert!(err.contains("ct"), "{err}");
+    }
+
     #[test]
     fn cleanup_dispatches_the_cleanup_verb_and_reports_provider_failure() {
-        let ok = fake_provider("cleanup-ok", r#"{"ok":true,"protocol_version":1}"#, &[]);
+        let ok = fake_provider(
+            "cleanup-ok",
+            r#"{"ok":true,"protocol_version":1,"removed":"/srv/ralphus/projects/proj-1234"}"#,
+            &[],
+        );
         let provider = ProviderRunner::new(ok.to_string_lossy().into_owned(), vec![], "ct", "A");
-        provider
-            .cleanup(&spec(Some("ct:A")))
+        let removed = provider
+            .cleanup(&cleanup_req("proj"), &spec(Some("ct:A")))
             .expect("a provider replying ok:true must succeed");
+        assert_eq!(removed.as_deref(), Some("/srv/ralphus/projects/proj-1234"));
 
         let fail = fake_provider(
             "cleanup-fail",
@@ -1893,7 +2713,7 @@ mod tests {
         );
         let failing = ProviderRunner::new(fail.to_string_lossy().into_owned(), vec![], "ct", "B");
         let err = failing
-            .cleanup(&spec(Some("ct:B")))
+            .cleanup(&cleanup_req("proj"), &spec(Some("ct:B")))
             .expect_err("a provider replying ok:false must surface its reason");
         // RAL-201: retention-on-failure -- the caller must see the provider's
         // own reason verbatim, not a swallowed/generic failure, since nothing
@@ -1976,10 +2796,10 @@ mod tests {
             .cancel_handle("h-generic", &spec(Some("asyncscheme:Y")))
             .expect("async provider's cancel must dispatch generically");
         sync_provider
-            .cleanup(&spec(Some("syncscheme:X")))
+            .cleanup(&cleanup_req("proj"), &spec(Some("syncscheme:X")))
             .expect("sync provider's cleanup must dispatch generically");
         async_provider
-            .cleanup(&spec(Some("asyncscheme:Y")))
+            .cleanup(&cleanup_req("proj"), &spec(Some("asyncscheme:Y")))
             .expect("async provider's cleanup must dispatch generically");
     }
 }

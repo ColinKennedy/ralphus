@@ -7,6 +7,7 @@
 //! | `RALPHUS_SSH_EXCLUDE` | *(none)* | Comma-separated patterns added to [`crate::transport::DEFAULT_EXCLUDES`]. |
 //! | `RALPHUS_SSH_CONNECT_TIMEOUT_SECS` | `15` | `ssh -o ConnectTimeout=`. |
 //! | `RALPHUS_SSH_REMOTE_RUNNER_CMD` | `ralphus-runner` | The command run remotely, mirroring the daemon's own `RALPHUS_RUNNER_CMD`. |
+//! | `RALPHUS_SSH_CONFIG_FILE` | *(OpenSSH default)* | Optional explicit OpenSSH client config passed with `ssh -F` (useful for isolated test targets and daemon service accounts). |
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -57,7 +58,12 @@ pub fn remote_workspace_dir(base: &str, local_dir: &str) -> String {
 /// Reduce an arbitrary local path to a short, shell-safe slug: its final
 /// path component, with anything that is not alphanumeric/`-`/`_` collapsed
 /// to `_`, capped to a reasonable length so it stays readable.
-fn sanitize_slug(local_dir: &str) -> String {
+///
+/// `pub(crate)`: also reused by [`crate::layout`] to sanitize a project name
+/// or branch name into a directory-safe slug (RAL-355 Phase 2/4) -- the same
+/// "final path component, unsafe chars collapsed, capped length" shape
+/// applies there too, just with a bare name instead of a path.
+pub(crate) fn sanitize_slug(local_dir: &str) -> String {
     let last = local_dir
         .rsplit(['/', '\\'])
         .find(|s| !s.is_empty())

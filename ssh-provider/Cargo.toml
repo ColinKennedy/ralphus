@@ -18,5 +18,8 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+ralphus-core.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }

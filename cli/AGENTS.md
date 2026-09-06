@@ -1,53 +1,45 @@
-# cli/ (Python project)
+# cli/
 
-The old Python CLI/runner (and its whole test suite) is gone — this folder
-now holds only `docsgen/` (doc screenshot generation, dev-only, never
-shipped) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML
-graphs from data `bench-harness/` writes — see
-[[../bench-harness/AGENTS|bench-harness/AGENTS.md]] for the full RAL-94
-design). CLI/runner work belongs in `cli-rs/`/`runner/` and their own Rust
-test suites, not here.
+The `ralphus` CLI: a thin HTTP client over the daemon's API (`client.rs`, all
+77 methods), ~105 leaf subcommands under `commands/`. See the root
+`AGENTS.md`'s Architecture table and "The Rust CLI/runner port" section for
+the module map and the disclosed `ralphus author` gap.
 
-```bash
-uv sync --dev
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy                         # strict; covers src + tests
-uv run privata src                  # module-privacy linter for production code
-uv run privata tests                # module-privacy linter for pytest support modules
-uv run deadcode src tests           # unreferenced code linter; configured in cli/pyproject.toml
-uv run pytest                       # run one: uv run pytest -k name
-```
+`ralphus-mcp` (`../mcp/`, RAL-301) depends on this crate as a library and
+mirrors `commands/*.rs`'s `dispatch` match arms to build MCP tool responses
+(see `mcp/src/exec/*.rs`) -- that's why a number of otherwise-private
+per-command helpers here (`resolve_scoped`, `with_uri`, `proof_step_for`,
+`agent_resume_command`, and similar) are `pub` despite having exactly one
+call site inside this crate's own `dispatch`. Don't re-privatize one of these
+without checking `mcp/src/exec/` for a caller first.
 
-## Testing — Python tests
+## Read-Only Quick-Start Safety List (RAL-194)
 
-`cd cli && uv run pytest`. Key test files:
+Each `HelpNode` in `cli/src/help_map.rs`'s command tree (`ROOT` and its
+children) carries a `read_only_safe: bool` field — the allowlist a
+`--read-only` quick-start session (manager/reviewer/watcher) is told it may
+call. The tag describes a property of the command itself (it performs no
+mutation under any of its own flags), not a permission gate — a normal
+(non-read-only) session may call any command, tagged or not. Only a
+`--read-only` session is restricted, and for that session the injected
+help-map tree is pruned down to `(read-only-safe)` commands only (plus the
+group headers needed to reach them) via `help_map::generate_read_only_safe`
+— see `quick_start.rs`'s `help_map_tree` — rather than merely tagging
+everything and trusting the model to self-filter.
 
-| File | Covers |
-|---|---|
-| `test_docsgen_helpmap.py` | `helpmap_docs.py`'s marker splice + drift-check logic, and a real (non-mocked) call into the compiled `ralphus show help-map` |
-| `test_bench_storage.py` | Bench record read/write, filename hashing |
-| `test_bench_graphs.py` | SVG/HTML rendering from stored records |
-| `test_bench_gitinfo.py` | Git commit/dirty-state detection |
-| `test_bench_stats.py` | Stats-bundle computation (mean/median/stddev/IQR/outliers) |
+**Whenever you add a new `ralphus` CLI subcommand, decide whether it is safe
+to run under `--read-only`, and if so, set its `HelpNode`'s `read_only_safe`
+to `true`.** A command belongs on the list only if it performs no mutation
+under *any* of its own flags — it queries the daemon or local files and
+prints, never writes (a command that only prints an action for a human to
+run themselves, like `review checks run`, still counts as non-mutating).
+Everything else — including any new
+`set-status`/`restart`/`edit`/`create`/`delete`/`cancel`/`merge`/`approve`/`feedback`/`register`/`remove`/`git`,
+`submit`, or `clear`-shaped command — must be left `false` (unsafe-by-default).
+Don't default to leaving a new command off the list out of habit; make the
+call explicitly, the same way the Bench Patience rule
+([[../bench-harness/AGENTS|bench-harness/AGENTS.md]]) asks you to deliberately
+decide on `patience` for every new benchmarked test.
 
-None of these need live external services — that's a hard requirement (see
-the Ollama-test authoring rule in [[../daemon/AGENTS|daemon/AGENTS.md]], which
-this folder is exempt from having at all since it has no daemon/model code).
-
-## docsgen/
-
-`cli/src/ralphus/docsgen/` — `shots.py` (Playwright scenario driver),
-`stub_server.py` (deterministic `/api/*` JSON stub), `librarian_server.py`
-(spawns the real, compiled `ralphus-librarian` binary against that stub),
-`fixtures.py` (canned response data), `lint.py` (screenshot-coverage check),
-`helpmap_docs.py` (regenerates `docs/cli-reference.md`'s help-map block from
-`ralphus show help-map`), `binaries.py` (locates the compiled
-`ralphus`/`ralphus-librarian` exes).
-
-## bench/
-
-`cli/src/ralphus/bench/` — renders the Rust bench harness's stored timing
-data as SVG/HTML graphs: `storage.py` (record read/write), `gitinfo.py`,
-`stats.py`, `graphs.py`. Does not run or time anything itself — see
-[[../bench-harness/AGENTS|bench-harness/AGENTS.md]].
+Logging conventions for `cli/src/main.rs`'s `cli` log type are documented
+centrally at [[../.agent/logging-policy|logging-policy.md]].

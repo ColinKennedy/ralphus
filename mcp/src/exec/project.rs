@@ -10,6 +10,8 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
         ProjectCommand::Help | ProjectCommand::UsageError(_) => Err(usage("no such tool")),
         ProjectCommand::Git {
             path,
+            clone_url,
+            clear_url,
             name,
             description,
             match_pr_branch_name,
@@ -23,6 +25,8 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
                 &target_str,
                 &description,
                 "git",
+                clone_url.as_deref(),
+                clear_url,
                 match_pr_branch_name,
             )?)
         }

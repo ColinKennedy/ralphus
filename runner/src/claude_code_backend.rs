@@ -82,6 +82,8 @@ impl ModelBackend for ClaudeCodeBackend {
             base_args.push("--model".to_string());
             base_args.push(model.to_string());
         }
+        base_args.extend(setting_sources_args(options));
+        let claude_config_dir = isolated_claude_config_dir(options, workspace);
 
         let mut prompt_file_for_system: Option<std::path::PathBuf> = None;
         if let Some(sp) = options.append_system_prompt {
@@ -105,6 +107,8 @@ impl ModelBackend for ClaudeCodeBackend {
             &base_args,
             workspace,
             options.auto_compact_threshold,
+            options.tool_output_max_tokens,
+            claude_config_dir.as_deref(),
         )
         .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
 
@@ -153,6 +157,14 @@ impl ModelBackend for ClaudeCodeBackend {
         let tool_arg_truncate_chars = options
             .tool_arg_truncate_chars
             .map_or(DEFAULT_TOOL_ARG_TRUNCATE_CHARS, |n| n as usize);
+        let thrash_thresholds = crate::thrash::ThrashThresholds {
+            max_compactions: options
+                .thrash_max_compactions
+                .unwrap_or(crate::thrash::DEFAULT_MAX_COMPACTIONS),
+            min_turn_gap: options
+                .thrash_min_turn_gap
+                .unwrap_or(crate::thrash::DEFAULT_MIN_TURN_GAP),
+        };
         let outcome = drive_stream_json(
             &mut child,
             workspace,
@@ -160,6 +172,7 @@ impl ModelBackend for ClaudeCodeBackend {
             assigned_session_id,
             &saw_result,
             tool_arg_truncate_chars,
+            thrash_thresholds,
         );
 
         keep_polling.store(false, Ordering::SeqCst);
@@ -199,6 +212,10 @@ impl ModelBackend for ClaudeCodeBackend {
     fn supports_auto_compact_threshold(&self) -> bool {
         true
     }
+
+    fn supports_tool_output_max_tokens(&self) -> bool {
+        true
+    }
 }
 
 /// The `--resume <id>` / `--session-id <id>` argument pair for a claude-code
@@ -215,6 +232,18 @@ fn session_id_args(options: &RunOptions<'_>) -> Vec<String> {
     }
 }
 
+/// RAL-336: `--setting-sources ""` disables loading settings from the
+/// user/project/local sources, independent of where `CLAUDE_CONFIG_DIR`
+/// points -- the settings-specific isolation lever. Empty when personal
+/// settings are allowed.
+fn setting_sources_args(options: &RunOptions<'_>) -> Vec<String> {
+    if options.allow_personal_settings {
+        Vec::new()
+    } else {
+        vec!["--setting-sources".to_string(), String::new()]
+    }
+}
+
 /// The env var Claude Code's own CLI reads to override its auto-compact
 /// trigger threshold, taking a plain absolute token count and precedence
 /// over the `/autocompact` command, the `--autocompact` flag, and the
@@ -223,12 +252,20 @@ fn session_id_args(options: &RunOptions<'_>) -> Vec<String> {
 /// maps onto for this backend (RAL-304).
 const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 
+/// The env var Claude Code's CLI reads to cap how many tokens a single
+/// file-read tool result may inject into the conversation -- the real
+/// delivery mechanism `RunOptions::tool_output_max_tokens` maps onto for this
+/// backend (RAL-333).
+const FILE_READ_MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS";
+
 fn spawn(
     program: &str,
     compound: bool,
     args: &[String],
     workspace: &Workspace,
     auto_compact_threshold: Option<u64>,
+    tool_output_max_tokens: Option<u64>,
+    claude_config_dir: Option<&std::path::Path>,
 ) -> std::io::Result<Child> {
     if compound {
         let shell = shellcmd::resolve_shell(None);
@@ -244,6 +281,8 @@ fn spawn(
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+                apply_tool_output_max_tokens_env(&mut cmd, tool_output_max_tokens);
+                apply_claude_config_dir_env(&mut cmd, claude_config_dir);
                 cmd.spawn()
             }
             SpawnArgs::Argv(argv) => {
@@ -254,6 +293,8 @@ fn spawn(
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+                apply_tool_output_max_tokens_env(&mut cmd, tool_output_max_tokens);
+                apply_claude_config_dir_env(&mut cmd, claude_config_dir);
                 cmd.spawn()
             }
         }
@@ -265,6 +306,8 @@ fn spawn(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+        apply_tool_output_max_tokens_env(&mut cmd, tool_output_max_tokens);
+        apply_claude_config_dir_env(&mut cmd, claude_config_dir);
         cmd.spawn()
     }
 }
@@ -277,6 +320,54 @@ fn apply_auto_compact_env(cmd: &mut Command, auto_compact_threshold: Option<u64>
     if let Some(v) = auto_compact_threshold {
         cmd.env(AUTO_COMPACT_WINDOW_ENV, v.to_string());
     }
+}
+
+/// Sets [`FILE_READ_MAX_OUTPUT_TOKENS_ENV`] on `cmd` when
+/// `tool_output_max_tokens` is set -- a no-op otherwise, same shape as
+/// [`apply_auto_compact_env`] (RAL-333).
+fn apply_tool_output_max_tokens_env(cmd: &mut Command, tool_output_max_tokens: Option<u64>) {
+    if let Some(v) = tool_output_max_tokens {
+        cmd.env(FILE_READ_MAX_OUTPUT_TOKENS_ENV, v.to_string());
+    }
+}
+
+/// Sets `CLAUDE_CONFIG_DIR` on `cmd` when RAL-336 isolation resolved a
+/// redirect directory -- a no-op otherwise, leaving the child's inherited
+/// `CLAUDE_CONFIG_DIR` (if any) untouched so an operator who opts fully back
+/// in sees unchanged behavior.
+fn apply_claude_config_dir_env(cmd: &mut Command, claude_config_dir: Option<&std::path::Path>) {
+    if let Some(dir) = claude_config_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+}
+
+/// Resolves the `CLAUDE_CONFIG_DIR` this run's child process should see
+/// (RAL-336): `None` when personal memory is allowed (today's behavior --
+/// whatever the child inherits is used unmodified), else a per-worktree
+/// isolated directory that the operator's real global `CLAUDE.md` is never
+/// read from. Claude Code's `--setting-sources ""` flag (added separately in
+/// `run()`) already gates settings independent of this directory, so
+/// `settings.json` is only worth preserving into the isolated dir when
+/// personal settings are still allowed -- otherwise that flag already blocks
+/// it regardless of where `CLAUDE_CONFIG_DIR` points. A stored
+/// `.credentials.json` login is preserved unconditionally: isolating
+/// personal config/memory is not the same decision as forcing a re-login.
+fn isolated_claude_config_dir(
+    options: &RunOptions<'_>,
+    workspace: &Workspace,
+) -> Option<std::path::PathBuf> {
+    if options.allow_personal_memory {
+        return None;
+    }
+    let real_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::agent_isolation::home_dir().map(|h| h.join(".claude")));
+    let isolated = crate::agent_isolation::isolated_config_dir(workspace.root(), "claude-code");
+    crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, ".credentials.json");
+    if options.allow_personal_settings {
+        crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "settings.json");
+    }
+    Some(isolated)
 }
 
 /// Writes the cell's prompt as the first stream-json user turn on the
@@ -353,6 +444,7 @@ fn drive_stream_json(
     assigned_session_id: Option<&str>,
     saw_result_flag: &AtomicBool,
     tool_arg_truncate_chars: usize,
+    thrash_thresholds: crate::thrash::ThrashThresholds,
 ) -> Result<BackendOutcome, BackendError> {
     // Drain stderr on a background thread concurrently with the main-thread
     // stdout reader below -- avoids a pipe-buffer deadlock if Claude Code
@@ -379,7 +471,10 @@ fn drive_stream_json(
         .ok_or_else(|| BackendError("claude-code: no stdout pipe".to_string()))?;
     let reader = BufReader::new(stdout);
 
-    let mut state = ParseState::default();
+    let mut state = ParseState {
+        thrash: crate::thrash::ThrashTracker::new(thrash_thresholds),
+        ..ParseState::default()
+    };
     for line in reader.lines().map_while(Result::ok) {
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -397,12 +492,40 @@ fn drive_stream_json(
         if state.saw_result {
             saw_result_flag.store(true, Ordering::SeqCst);
         }
+        // RAL-339: stop reading at the compaction boundary itself -- a safe
+        // stop point -- instead of waiting for Claude's own stdout to reach
+        // EOF, which could be arbitrarily many further (thrashing) turns away.
+        if state.compaction_thrash.is_some() {
+            break;
+        }
     }
     // Safety net: if the stream ended without a trailing `assistant`/`result`
     // event to close it (e.g. the process died mid-turn), don't leave a
     // dangling partial line in the pane.
     if state.printed_text_delta {
         finish_delta_line();
+    }
+
+    if let Some(detail) = state.compaction_thrash {
+        // RAL-339: the run is thrashing -- kill the child now rather than let
+        // `wait_for_child` wait for a natural exit that may be arbitrarily far
+        // off, then fail the cell with whatever was captured live so far.
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(t) = stderr_thread {
+            let _ = t.join();
+        }
+        return Ok(BackendOutcome {
+            summary: state.result_summary,
+            tokens_in: state.tokens_in,
+            tokens_out: state.tokens_out,
+            cache_creation_tokens: state.cache_creation_tokens,
+            cache_read_tokens: state.cache_read_tokens,
+            cost_usd: state.cost_usd,
+            agent_session_id: state.agent_session_id,
+            abandoned_background_job: state.open_background_job,
+            compaction_thrash: Some(detail),
+        });
     }
 
     // Claude's own stdout has already hit EOF at this point -- it decided it
@@ -427,9 +550,12 @@ fn drive_stream_json(
         summary: state.result_summary,
         tokens_in: state.tokens_in,
         tokens_out: state.tokens_out,
+        cache_creation_tokens: state.cache_creation_tokens,
+        cache_read_tokens: state.cache_read_tokens,
         cost_usd: state.cost_usd,
         agent_session_id: state.agent_session_id,
         abandoned_background_job: state.open_background_job,
+        compaction_thrash: None,
     })
 }
 
@@ -444,6 +570,8 @@ struct ParseState {
     result_summary: String,
     tokens_in: i64,
     tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
     cost_usd: f64,
     saw_result: bool,
     /// RAL-288 Stage 2: `--include-partial-messages` streams token-level text
@@ -458,6 +586,14 @@ struct ParseState {
     /// turn's terminal `result` event fires means the turn ended without
     /// ever checking that job's actual outcome.
     open_background_job: Option<String>,
+    /// RAL-339: shared compaction-thrash counter for this run (see
+    /// `crate::thrash`).
+    thrash: crate::thrash::ThrashTracker,
+    /// RAL-339: set the moment [`Self::thrash`] reports the run has crossed
+    /// into thrash -- the outer read loop in [`drive_stream_json`] checks
+    /// this after every event and stops (kills the child) rather than
+    /// waiting for stdout EOF.
+    compaction_thrash: Option<crate::thrash::ThrashDetail>,
 }
 
 /// Handles one parsed stream-json line, updating `state` and printing to the
@@ -537,6 +673,17 @@ fn process_event(
                 crate::cartographer::EventContext::default(),
                 serde_json::json!({"trigger": trigger, "pre_tokens": pre_tokens}),
             );
+            // RAL-339: track compaction cadence and fail closed the moment
+            // it crosses into thrash -- see `crate::thrash` for the rule.
+            if let Some(detail) = state.thrash.record_compaction() {
+                print_line(&format!(
+                    "[thrash] autocompaction thrashing detected: {} compactions, \
+                     most recently {} turn(s) after the previous one",
+                    detail.compaction_count, detail.turns_since_previous_compaction
+                ));
+                crate::thrash::emit_thrash_event("claude-code", &detail);
+                state.compaction_thrash = Some(detail);
+            }
         }
         Some("assistant") => {
             // Claude's own text/tool-call activity -- the whole point of the
@@ -545,6 +692,10 @@ fn process_event(
             // blocks are skipped here when the deltas above already streamed
             // this turn's text -- printing both would duplicate the whole
             // response in the pane.
+            //
+            // RAL-339: this event fires once per assistant turn, making it
+            // the natural "turns since previous compaction" tick.
+            state.thrash.record_assistant_turn();
             let already_streamed = state.printed_text_delta;
             if state.printed_text_delta {
                 finish_delta_line();
@@ -579,15 +730,28 @@ fn process_event(
             let usage = &event["message"]["usage"];
             let ti = usage["input_tokens"].as_i64().unwrap_or(0);
             let to = usage["output_tokens"].as_i64().unwrap_or(0);
-            if ti > 0 || to > 0 {
+            // RAL-326: for an agentic session these two are routinely larger
+            // than `input_tokens` by an order of magnitude, so a live usage
+            // snapshot that omits them reads as implausibly cheap.
+            let cc = usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+            let cr = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+            if ti > 0 || to > 0 || cc > 0 || cr > 0 {
+                state.cache_creation_tokens = cc;
+                state.cache_read_tokens = cr;
                 let model = event["message"]["model"].as_str().unwrap_or("");
-                let live_cost = estimate_cost_usd(model, ti, to);
+                let live_cost = estimate_cost_usd(model, ti + cc + cr, to);
                 crate::cartographer::emit(
                     "claude-code",
                     crate::cartographer::LIVE_USAGE_MESSAGE,
                     "info",
                     crate::cartographer::EventContext::default(),
-                    serde_json::json!({"tokens_in": ti, "tokens_out": to, "cost_usd": live_cost}),
+                    serde_json::json!({
+                        "tokens_in": ti,
+                        "tokens_out": to,
+                        "cache_creation_tokens": cc,
+                        "cache_read_tokens": cr,
+                        "cost_usd": live_cost,
+                    }),
                 );
             }
         }
@@ -630,6 +794,9 @@ fn process_event(
             let usage = &event["usage"];
             state.tokens_in = usage["input_tokens"].as_i64().unwrap_or(0);
             state.tokens_out = usage["output_tokens"].as_i64().unwrap_or(0);
+            state.cache_creation_tokens =
+                usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+            state.cache_read_tokens = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
             state.cost_usd = event["total_cost_usd"]
                 .as_f64()
                 .or_else(|| event["cost_usd"].as_f64())
@@ -774,11 +941,18 @@ fn tool_result_text(content: &Value) -> String {
 }
 
 /// Approximate per-million-token pricing by model-name substring, used only
-/// for the *live* progress estimate emitted mid-run (the final `CellResult`
-/// always uses the authoritative `total_cost_usd` from the terminal `result`
-/// event). Deliberately conservative (falls back to the priciest tier) since
-/// this feeds the RAL-161 cost-cap kill switch -- overestimating triggers an
-/// early check rather than letting an actual overspend slip through.
+/// for the *live* progress estimate emitted mid-run (a normally-completed
+/// `CellResult` uses the authoritative `total_cost_usd` from the terminal
+/// `result` event). Deliberately conservative (falls back to the priciest
+/// tier) since this feeds the RAL-161 cost-cap kill switch -- overestimating
+/// triggers an early check rather than letting an actual overspend slip
+/// through.
+///
+/// `tokens_in` is *total* billed input: uncached input plus cache-creation
+/// plus cache-read tokens (RAL-326). Anthropic bills the two cache tiers at
+/// different rates than uncached input, but pricing them all at the uncached
+/// rate keeps this on the conservative side of the real figure, which is the
+/// only property the kill switch depends on.
 fn estimate_cost_usd(model: &str, tokens_in: i64, tokens_out: i64) -> f64 {
     let m = model.to_lowercase();
     let (rate_in, rate_out) = if m.contains("haiku") {
@@ -913,10 +1087,13 @@ mod tests {
     }
 
     #[test]
-    fn process_event_handles_compact_boundary_without_panicking_or_mutating_state() {
+    fn process_event_handles_compact_boundary_without_panicking_or_mutating_other_state() {
         // Compaction carries no session/usage/result data of its own -- this
         // just proves the new arm doesn't panic on a missing/malformed
-        // `compactMetadata` and doesn't fall through to the catch-all.
+        // `compactMetadata` and doesn't fall through to the catch-all. A
+        // single, isolated compaction never thrashes (RAL-339), so
+        // `compaction_thrash` stays `None` even though the tracker itself
+        // now records the one compaction.
         let mut state = ParseState::default();
         let ws = test_workspace();
         process_event(
@@ -930,7 +1107,99 @@ mod tests {
             None,
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
-        assert_eq!(state, ParseState::default());
+        assert_eq!(state.compaction_thrash, None);
+        assert_eq!(
+            state,
+            ParseState {
+                thrash: state.thrash,
+                ..ParseState::default()
+            }
+        );
+    }
+
+    /// RAL-339: the default thresholds (N=3, M=2) -- three compactions with
+    /// zero assistant turns between the second and third must fail closed at
+    /// the third compaction's own event, not later.
+    #[test]
+    fn process_event_flags_thrash_on_the_default_thresholds() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let compact = serde_json::json!({
+            "type":"system",
+            "subtype":"compact_boundary",
+            "compactMetadata":{"trigger":"auto","preTokens":100000}
+        });
+        process_event(
+            &compact,
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.compaction_thrash, None);
+        process_event(
+            &compact,
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.compaction_thrash, None);
+        process_event(
+            &compact,
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        let detail = state
+            .compaction_thrash
+            .expect("third rapid compaction should thrash");
+        assert_eq!(detail.compaction_count, 3);
+        assert_eq!(detail.turns_since_previous_compaction, 0);
+    }
+
+    /// RAL-339: the same three compactions, but with enough assistant turns
+    /// between each, must never thrash -- healthy long-running compaction
+    /// cadence is not a failure.
+    #[test]
+    fn process_event_does_not_flag_thrash_when_turns_separate_compactions_healthily() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let compact = serde_json::json!({
+            "type":"system",
+            "subtype":"compact_boundary",
+            "compactMetadata":{"trigger":"auto","preTokens":100000}
+        });
+        let assistant_turn = serde_json::json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"text","text":"working"}]}
+        });
+        for _ in 0..3 {
+            process_event(
+                &compact,
+                &mut state,
+                &ws,
+                None,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+            assert_eq!(state.compaction_thrash, None);
+            process_event(
+                &assistant_turn,
+                &mut state,
+                &ws,
+                None,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+            process_event(
+                &assistant_turn,
+                &mut state,
+                &ws,
+                None,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+        }
+        assert_eq!(state.compaction_thrash, None);
     }
 
     #[test]
@@ -962,6 +1231,105 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.result_summary, "all done");
         assert!(state.saw_result);
+    }
+
+    /// RAL-326: an agentic claude-code session bills most of its input through
+    /// the two prompt-cache tiers, so a `result` event read without them
+    /// produces the implausible "input 34" the ticket was filed over. They are
+    /// captured as their own fields rather than folded into `tokens_in`, which
+    /// keeps meaning uncached input.
+    #[test]
+    fn process_event_captures_prompt_cache_tokens_from_the_result_event() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"result",
+                "usage":{
+                    "input_tokens":34,
+                    "output_tokens":5374,
+                    "cache_creation_input_tokens":320_114,
+                    "cache_read_input_tokens":7_204_990
+                },
+                "total_cost_usd":0.6807,
+                "result":"done"
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.tokens_in, 34, "uncached input keeps its old meaning");
+        assert_eq!(state.tokens_out, 5374);
+        assert_eq!(state.cache_creation_tokens, 320_114);
+        assert_eq!(state.cache_read_tokens, 7_204_990);
+    }
+
+    /// The live per-turn snapshot half of the same capture. This one also
+    /// feeds the RAL-161 cost cap, and is what the lost-cell fallback records
+    /// permanently -- an omission here under-reports both places.
+    #[test]
+    fn process_event_captures_prompt_cache_tokens_from_a_live_assistant_turn() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"assistant",
+                "message":{
+                    "model":"claude-opus-5",
+                    "content":[],
+                    "usage":{
+                        "input_tokens":4,
+                        "output_tokens":90,
+                        "cache_creation_input_tokens":1_200,
+                        "cache_read_input_tokens":48_000
+                    }
+                }
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.cache_creation_tokens, 1_200);
+        assert_eq!(state.cache_read_tokens, 48_000);
+    }
+
+    /// A turn whose only billed input is cache reads must still register: the
+    /// pre-RAL-326 guard keyed on `input_tokens`/`output_tokens` alone, so a
+    /// fully cache-served turn recorded nothing at all.
+    #[test]
+    fn process_event_records_a_turn_billed_entirely_to_the_cache() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"assistant",
+                "message":{
+                    "model":"claude-opus-5",
+                    "content":[],
+                    "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":52_000}
+                }
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.cache_read_tokens, 52_000);
+    }
+
+    /// The live estimate feeds the RAL-161 kill switch, so it must price the
+    /// cache tiers rather than ignore them -- ignoring them is what let a
+    /// multi-million-token session read as pennies.
+    #[test]
+    fn estimate_cost_usd_counts_cache_tokens_as_billed_input() {
+        let uncached_only = estimate_cost_usd("claude-opus-5", 1_000, 0);
+        let with_cache = estimate_cost_usd("claude-opus-5", 1_000 + 500_000, 0);
+        assert!(
+            with_cache > uncached_only,
+            "cache tokens must raise, never lower, the conservative estimate"
+        );
     }
 
     #[test]
@@ -1249,5 +1617,66 @@ mod tests {
     #[test]
     fn session_id_args_empty_when_neither_is_set() {
         assert!(session_id_args(&RunOptions::default()).is_empty());
+    }
+
+    // ── RAL-336 agent isolation ────────────────────────────────────────────
+
+    #[test]
+    fn setting_sources_args_disables_settings_by_default() {
+        // `RunOptions::default()` -- `allow_personal_settings` is `false`.
+        assert_eq!(
+            setting_sources_args(&RunOptions::default()),
+            vec!["--setting-sources".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn setting_sources_args_is_empty_when_personal_settings_are_allowed() {
+        let options = RunOptions {
+            allow_personal_settings: true,
+            ..Default::default()
+        };
+        assert!(setting_sources_args(&options).is_empty());
+    }
+
+    #[test]
+    fn apply_claude_config_dir_env_sets_the_var_when_some() {
+        let dir = std::env::temp_dir().join("ralphus-claude-isolation-test");
+        let mut cmd = Command::new("echo");
+        apply_claude_config_dir_env(&mut cmd, Some(&dir));
+        let val = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "CLAUDE_CONFIG_DIR")
+            .and_then(|(_, v)| v);
+        assert_eq!(val, Some(dir.as_os_str()));
+    }
+
+    #[test]
+    fn apply_claude_config_dir_env_is_a_noop_when_none() {
+        let mut cmd = Command::new("echo");
+        apply_claude_config_dir_env(&mut cmd, None);
+        assert!(
+            cmd.get_envs()
+                .find(|(k, _)| *k == "CLAUDE_CONFIG_DIR")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn isolated_claude_config_dir_is_none_when_personal_memory_is_allowed() {
+        let options = RunOptions {
+            allow_personal_memory: true,
+            ..Default::default()
+        };
+        let ws = test_workspace();
+        assert_eq!(isolated_claude_config_dir(&options, &ws), None);
+    }
+
+    #[test]
+    fn isolated_claude_config_dir_is_some_when_personal_memory_is_isolated() {
+        let options = RunOptions::default();
+        let ws = test_workspace();
+        let dir = isolated_claude_config_dir(&options, &ws).expect("isolated dir");
+        assert!(dir.to_string_lossy().contains("claude-code"));
     }
 }

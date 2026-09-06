@@ -1,17 +1,18 @@
 @echo off
 setlocal enabledelayedexpansion
-rem Build the four ralphus executables into .\dist as copyable standalone
-rem binaries -- all four are Rust:
+rem Build the five ralphus executables into .\dist as copyable standalone
+rem binaries -- all five are Rust:
 rem
 rem   daemon    -> dist\ralphus-daemon.exe
 rem   librarian -> dist\ralphus-librarian.exe
 rem   CLI       -> dist\ralphus.exe
 rem   runner    -> dist\ralphus-runner.exe
+rem   SSH       -> dist\ralphus-ssh-provider.exe
 rem
-rem All four link SQLite in where needed (rusqlite `bundled`) and need no
-rem system libraries or bundled interpreter -- a plain `cargo build --release`
-rem produces one self-contained exe per binary, no _internal\ directory to
-rem keep each exe beside. `cli\` still exists for `docsgen\` (Playwright
+rem All five need no adjacent interpreter/runtime directory; SQLite is linked
+rem into the binaries that use it (rusqlite's bundled feature). A plain
+rem cargo build --release produces one executable per binary, no _internal\ directory to
+rem keep each exe beside. `cli-py\` still exists for `docsgen\` (Playwright
 rem screenshots, dev-only, never shipped) -- see AGENTS.md.
 
 set "root=%~dp0.."
@@ -26,15 +27,15 @@ rem here too (RAL-288's relay design, superseded and removed) even though
 rem nothing below builds it anymore, so a stale one never lingers.
 if exist "%dist%\ralphus" rmdir /s /q "%dist%\ralphus"
 if exist "%dist%\ralphus-runner" rmdir /s /q "%dist%\ralphus-runner"
-for %%B in (ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-attach) do (
+for %%B in (ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh-provider ralphus-attach) do (
   if exist "%dist%\%%B.exe" del /f /q "%dist%\%%B.exe"
 )
 
 echo == building Rust executables (release) ==
-cargo build --release -p ralphus-daemon -p ralphus-librarian -p ralphus-cli -p ralphus-runner --manifest-path "%root%\Cargo.toml"
+cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
 
-for %%B in (ralphus-daemon ralphus-librarian ralphus ralphus-runner) do (
+for %%B in (ralphus-daemon ralphus-librarian ralphus ralphus-runner ralphus-ssh-provider) do (
   if exist "%root%\target\release\%%B.exe" copy /y "%root%\target\release\%%B.exe" "%dist%\" >nul
 )
 
@@ -46,6 +47,7 @@ echo   %dist%\ralphus-daemon.exe
 echo   %dist%\ralphus-librarian.exe
 echo   %dist%\ralphus.exe
 echo   %dist%\ralphus-runner.exe
+echo   %dist%\ralphus-ssh-provider.exe
 echo.
 echo Put %dist% on PATH to get the `ralphus` CLI and have RALPHUS_RUNNER_CMD
 echo resolve `ralphus-runner` automatically; or point RALPHUS_RUNNER_CMD at

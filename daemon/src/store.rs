@@ -183,12 +183,13 @@ impl NodeState {
 // ── Read views (serialized straight to the API) ──────────────────────────────
 
 /// One row from [`Store::proof_specs`]:
-/// `(idx, kind, spec, model, timeout_sec, budget_tokens)`.
+/// `(idx, kind, spec, model, timeout_sec, budget_tokens, tool_output_max_tokens)`.
 pub type ProofSpecRow = (
     i64,
     String,
     String,
     Option<String>,
+    Option<i64>,
     Option<i64>,
     Option<i64>,
 );
@@ -213,6 +214,12 @@ pub struct ProofView {
     pub system_prompt: Option<String>,
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<String>,
+    /// Resolved tool-output token cap (RAL-333): this step's own value, or
+    /// inherited from its owning cell/task, or `None` for no cap. See
+    /// `ralphus_core::schema::agent_supports_tool_output_max_tokens` for
+    /// which backends accept this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output_max_tokens: Option<i64>,
     /// Resolved agent program (inherited from the owning cell or task defaults).
     pub agent: String,
     /// Resumable CLI-agent cell/thread id captured when the step ran via a
@@ -224,8 +231,22 @@ pub struct ProofView {
     pub tokens_in: i64,
     /// Output tokens used by this step's most recent run.
     pub tokens_out: i64,
+    /// RAL-326: prompt-cache *write* tokens -- input billed at the
+    /// cache-creation rate, tracked separately so `tokens_in` keeps meaning
+    /// exactly what it always has (uncached input). `0` for a backend whose
+    /// harness reports no cache breakdown, and for every row written before
+    /// RAL-326.
+    pub cache_creation_tokens: i64,
+    /// RAL-326: prompt-cache *read* tokens -- input served from an existing
+    /// cache entry at the discounted rate. See `cache_creation_tokens`.
+    pub cache_read_tokens: i64,
     /// Cost of this step's most recent run, USD.
     pub cost_usd: f64,
+    /// RAL-326: `true` when `cost_usd` and the token counts are the last
+    /// live mid-run snapshot rather than the backend's own terminal
+    /// accounting (the step's process was lost, cancelled, timed out, or
+    /// killed before a final usage event arrived).
+    pub cost_is_estimated: bool,
     /// RAL-191: environment-variable overrides set on **this individual step**,
     /// the narrowest layer — merged on top of the owning scope's
     /// `proof_env_overrides` (and its ancestors) when the step runs. Empty for
@@ -270,8 +291,22 @@ pub struct CellView {
     pub tokens_in: i64,
     /// Output tokens recorded so far.
     pub tokens_out: i64,
+    /// RAL-326: prompt-cache *write* tokens -- input billed at the
+    /// cache-creation rate, tracked separately so `tokens_in` keeps meaning
+    /// exactly what it always has (uncached input). `0` for a backend whose
+    /// harness reports no cache breakdown, and for every row written before
+    /// RAL-326.
+    pub cache_creation_tokens: i64,
+    /// RAL-326: prompt-cache *read* tokens -- input served from an existing
+    /// cache entry at the discounted rate. See `cache_creation_tokens`.
+    pub cache_read_tokens: i64,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
+    /// RAL-326: `true` when `cost_usd` and the token counts are the last
+    /// live mid-run snapshot rather than the backend's own terminal
+    /// accounting (the cell's process was lost, cancelled, timed out, or
+    /// killed before a final usage event arrived).
+    pub cost_is_estimated: bool,
     /// Resolved USD spend cap (cell overrides task), or `None` for no cap.
     /// Once `cost_usd` exceeds this the daemon kills the cell mid-run
     /// (RAL-161).
@@ -290,6 +325,12 @@ pub struct CellView {
     /// [`Self::maximum_context`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_compact_threshold: Option<i64>,
+    /// Resolved tool-output token cap (cell overrides task), or `None` for no
+    /// cap (RAL-333). See
+    /// `ralphus_core::schema::agent_supports_tool_output_max_tokens` for
+    /// which backends accept this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output_max_tokens: Option<i64>,
     /// Failure detail, when the cell failed.
     pub error: Option<String>,
     /// Dependency references (within-task cell ids or `task/cell`).
@@ -508,6 +549,11 @@ pub struct ProjectView {
     pub description: String,
     /// Absolute filesystem path to the project's root.
     pub path: String,
+    /// Canonical clone URL used when a provider provisions this project on a
+    /// different machine. Kept separate from `path`, which names this
+    /// daemon host's existing checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clone_url: Option<String>,
     /// VCS kind. Only `"git"` is implemented today.
     pub vcs: String,
     /// Registration time (Unix epoch milliseconds).
@@ -699,6 +745,22 @@ impl Store {
             )
             .unwrap_or(0)
             > 0;
+        // RAL-318: same rationale as `secret_env_names_preexisting` above --
+        // captured before the `CREATE TABLE IF NOT EXISTS` below so the
+        // starter Triage types (`crate::triage::DEFAULT_TRIAGE_TYPES`) are
+        // seeded exactly once, at first-ever creation. A user who
+        // deregisters one of these must not see it silently reappear on the
+        // next daemon restart -- unlike the built-in `unclassified` type,
+        // which always exists and is reseeded unconditionally below.
+        let triage_types_preexisting: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='triage_types'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -750,7 +812,10 @@ impl Store {
                 depends_on TEXT NOT NULL DEFAULT '[]',
                 tokens_in  INTEGER NOT NULL DEFAULT 0,
                 tokens_out INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
                 cost_usd   REAL NOT NULL DEFAULT 0,
+                cost_is_estimated INTEGER NOT NULL DEFAULT 0,
                 error      TEXT,
                 review_branch TEXT,
                 timeout_sec   INTEGER,
@@ -759,6 +824,7 @@ impl Store {
                 maximum_budget_usd REAL,
                 maximum_context INTEGER,
                 auto_compact_threshold INTEGER,
+                tool_output_max_tokens INTEGER,
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
@@ -784,6 +850,7 @@ impl Store {
                 agent_session_id TEXT,
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
+                tool_output_max_tokens INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
                 materialized_env_overrides TEXT,
@@ -907,6 +974,7 @@ impl Store {
                 name          TEXT PRIMARY KEY,
                 description   TEXT NOT NULL DEFAULT '',
                 path          TEXT NOT NULL,
+                clone_url     TEXT,
                 vcs           TEXT NOT NULL DEFAULT 'git',
                 created_at_ms INTEGER NOT NULL,
                 skip_base_updates INTEGER
@@ -917,9 +985,31 @@ impl Store {
             -- is no login, no password, no session here, just a name a caller
             -- can claim.
             CREATE TABLE IF NOT EXISTS users (
-                name          TEXT PRIMARY KEY,
-                created_at_ms INTEGER NOT NULL
+                name                  TEXT PRIMARY KEY,
+                created_at_ms         INTEGER NOT NULL,
+                auto_follow           INTEGER NOT NULL DEFAULT 0,
+                default_notify_tiers  TEXT NOT NULL DEFAULT 'urgent,high,normal'
             );
+            -- RAL-328: view preferences are scoped to a registered user and
+            -- reference exactly one squad or review. Entity deletion removes
+            -- the preference before sequential ids can be reused.
+            CREATE TABLE IF NOT EXISTS hidden_items (
+                kind          TEXT NOT NULL CHECK(kind IN ('squad', 'review')),
+                squad_id      TEXT REFERENCES squads(id) ON DELETE CASCADE,
+                guardian_id   TEXT REFERENCES guardians(id) ON DELETE CASCADE,
+                user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE ON UPDATE CASCADE,
+                hidden_at_ms  INTEGER NOT NULL,
+                CHECK(
+                    (kind = 'squad' AND squad_id IS NOT NULL AND guardian_id IS NULL)
+                    OR
+                    (kind = 'review' AND squad_id IS NULL AND guardian_id IS NOT NULL)
+                ),
+                UNIQUE(user_name, squad_id),
+                UNIQUE(user_name, guardian_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hidden_items_user ON hidden_items(user_name);
+            CREATE INDEX IF NOT EXISTS idx_hidden_items_squad ON hidden_items(squad_id);
+            CREATE INDEX IF NOT EXISTS idx_hidden_items_guardian ON hidden_items(guardian_id);
             -- RAL-281: user-editable list of env-var *names* treated as secret,
             -- additive to the value-based `crate::redact` registry (RAL-264).
             -- See `crate::secret_env_names`'s module doc comment for how this is
@@ -1066,7 +1156,8 @@ impl Store {
                 squad_id      TEXT REFERENCES squads(id) ON DELETE CASCADE,
                 task          TEXT,
                 cell_id       TEXT,
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                entity_uri    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_mailbox_messages_created ON mailbox_messages(created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_mailbox_messages_priority ON mailbox_messages(priority);
@@ -1077,6 +1168,32 @@ impl Store {
                 drained_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (message_id, client_id)
             );
+            -- RAL-320: a user's personal drain state for the same
+            -- `mailbox_messages` rows, kept separate from the client-scoped
+            -- `mailbox_drains` above because a personal-mailbox view is
+            -- per-user, not per-client (a user may poll from many clients).
+            CREATE TABLE IF NOT EXISTS user_mailbox_drains (
+                message_id    TEXT NOT NULL REFERENCES mailbox_messages(id) ON DELETE CASCADE,
+                user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                drained_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (message_id, user_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_mailbox_drains_user ON user_mailbox_drains(user_name);
+            -- RAL-320: a user's personal subscription to an `EntityUri`
+            -- (squad/task/cell/proof/review/review-worktree). Following a
+            -- parent cascades to its children via `EntityUri::covers()` at
+            -- read time -- no expansion is stored here. `notify_tiers` is a
+            -- per-follow override of which `MailboxPriority` tiers reach the
+            -- follower (see `crate::mailbox::{parse_tiers, tiers_to_csv}`).
+            CREATE TABLE IF NOT EXISTS follows (
+                id            TEXT PRIMARY KEY,
+                user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                entity_uri    TEXT NOT NULL,
+                notify_tiers  TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                UNIQUE (user_name, entity_uri)
+            );
+            CREATE INDEX IF NOT EXISTS idx_follows_user ON follows(user_name);
             -- Ark escalation dedup is entity-scoped and durable. Mailbox
             -- drain state is client-scoped and cannot provide this guarantee.
             CREATE TABLE IF NOT EXISTS ark_notifications (
@@ -1090,8 +1207,140 @@ impl Store {
                 swept_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mailbox_drains_client ON mailbox_drains(client_id);
+            -- RAL-318: the Triage type registry (user-facing name for the
+            -- Arbiter subsystem's classification categories). Mirrors
+            -- `machine_providers`' register/list/get/deregister shape -- see
+            -- `crate::triage`. The built-in `unclassified` row (seeded below,
+            -- every startup) can never be deregistered.
+            CREATE TABLE IF NOT EXISTS triage_types (
+                name          TEXT PRIMARY KEY,
+                label         TEXT NOT NULL DEFAULT '',
+                description   TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL
+            );
+            -- RAL-318: a cell's Arbiter-classified (or inline-declared) Triage
+            -- type(s), resolved once at `ralphus submit` time and persisted so
+            -- a daemon restart never re-classifies (single-attempt, no
+            -- retry). One row per (cell, type) -- a cell can carry more than
+            -- one type (e.g. both \"bug\" and \"investigation\"), each pooled
+            -- independently -- so the primary key includes `triage_type`
+            -- rather than being one row per cell.
+            CREATE TABLE IF NOT EXISTS triage_cell_types (
+                squad_id      TEXT NOT NULL,
+                task_idx      INTEGER NOT NULL,
+                idx           INTEGER NOT NULL,
+                triage_type   TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, idx, triage_type)
+            );
+            -- RAL-318: cells pending a pooled Triage review, keyed by
+            -- (project, triage_type). Drained (deleted) the moment a pool's
+            -- count threshold or a cron schedule fires and a review is
+            -- created from whatever is currently pooled.
+            CREATE TABLE IF NOT EXISTS triage_pool_cells (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                project       TEXT NOT NULL,
+                triage_type   TEXT NOT NULL,
+                squad_id      TEXT NOT NULL,
+                task_idx      INTEGER NOT NULL,
+                idx           INTEGER NOT NULL,
+                branch        TEXT NOT NULL,
+                upstream      TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_triage_pool_cells_key
+                ON triage_pool_cells(project, triage_type);
+            -- RAL-318: per-(project, triage_type) pool count threshold.
+            -- Absent means \"no count-based trigger configured\" -- a pool with
+            -- neither a threshold nor a schedule simply accumulates.
+            CREATE TABLE IF NOT EXISTS triage_pool_thresholds (
+                project         TEXT NOT NULL,
+                triage_type     TEXT NOT NULL,
+                threshold_count INTEGER NOT NULL,
+                updated_at_ms   INTEGER NOT NULL,
+                PRIMARY KEY (project, triage_type)
+            );
+            -- RAL-318: one independent cron-style schedule entry for a
+            -- (project, triage_type) pool. `anchor_date_ms` establishes
+            -- interval parity (e.g. \"every other Monday\") together with
+            -- `every_n` -- a bare cron expression alone can only express
+            -- \"every Monday\". `occurrence_count`/`last_checked_ms` are
+            -- scheduler-owned cursor state (see `crate::scheduler`'s Triage
+            -- tick): advanced one cron occurrence at a time so parity is
+            -- always computed incrementally, never by replaying history.
+            CREATE TABLE IF NOT EXISTS triage_schedules (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                project           TEXT NOT NULL,
+                triage_type       TEXT NOT NULL,
+                cron_expr         TEXT NOT NULL,
+                anchor_date_ms    INTEGER NOT NULL,
+                every_n           INTEGER NOT NULL DEFAULT 1,
+                occurrence_count  INTEGER NOT NULL DEFAULT 0,
+                last_checked_ms   INTEGER,
+                created_at_ms     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_triage_schedules_key
+                ON triage_schedules(project, triage_type);
+            -- RAL-318: the Arbiter's own cost ledger. The Arbiter is a
+            -- daemon-singleton with no cell_id/guardian_id to hang a cost row
+            -- off (unlike `guardian_costs`), so this is a standalone table --
+            -- reuses that table's insert-line-item -> sum -> compare-to-cap
+            -- enforcement pattern, not its columns/foreign keys. `kind` is
+            -- \"classification\" or \"health_check\".
+            CREATE TABLE IF NOT EXISTS arbiter_costs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind          TEXT NOT NULL,
+                tokens_in     INTEGER NOT NULL DEFAULT 0,
+                tokens_out    INTEGER NOT NULL DEFAULT 0,
+                cost_usd      REAL NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL
+            );
+            -- RAL-337: which squad owns a task worktree branch. A
+            -- `ralphus:new-worktree/<base_branch>` placeholder is resolved
+            -- against this table so a *new* squad gets its own branch
+            -- (`<base_branch>-2`, `-3`, ...) instead of silently inheriting the
+            -- branch -- and therefore the finished commits -- of whichever
+            -- squad materialized it first, while a *restart of the owning
+            -- squad* still resolves back to the row it already claimed. See
+            -- `crate::worktree_claims`.
+            CREATE TABLE IF NOT EXISTS task_worktree_claims (
+                project       TEXT NOT NULL,
+                base_branch   TEXT NOT NULL,
+                branch        TEXT NOT NULL,
+                squad_id      TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (project, branch)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wt_claims_family
+                ON task_worktree_claims(project, base_branch);
+            CREATE INDEX IF NOT EXISTS idx_wt_claims_squad
+                ON task_worktree_claims(project, base_branch, squad_id);
             ",
         )?;
+        // RAL-318: the built-in `unclassified` Triage type always exists and
+        // can never be deregistered (see `crate::triage::deregister_triage_type`).
+        // Re-seeded (harmlessly, via INSERT OR IGNORE) on every startup rather
+        // than gated on first-ever-creation like `secret_env_names`'s defaults,
+        // since this one row is a permanent invariant, not a user-editable
+        // starter set.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO triage_types(name, label, description, created_at_ms)
+             VALUES(?,?,?,?)",
+            params![
+                crate::triage::UNCLASSIFIED_TYPE,
+                "Unclassified",
+                "Fallback type for a cell the Arbiter could not classify, or that failed classification.",
+                now_ms()
+            ],
+        )?;
+        if !triage_types_preexisting {
+            for (name, label, description) in crate::triage::DEFAULT_TRIAGE_TYPES {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO triage_types(name, label, description, created_at_ms) VALUES(?,?,?,?)",
+                    params![name, label, description, now_ms()],
+                )?;
+            }
+        }
         if !secret_env_names_preexisting {
             for name in crate::secret_env_names::DEFAULT_SECRET_ENV_NAMES {
                 self.conn.execute(
@@ -1257,6 +1506,20 @@ impl Store {
             "ALTER TABLE proofs ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
+            // RAL-326: prompt-cache write/read tokens, kept out of
+            // `tokens_in` so that column keeps meaning uncached input. `0`
+            // on every pre-RAL-326 row and on any backend whose harness
+            // reports no cache breakdown -- indistinguishable, and
+            // deliberately so: both mean "nothing to show here".
+            "ALTER TABLE cells ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cells ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+            // RAL-326: whether the recorded usage is a live mid-run snapshot
+            // (process lost/cancelled/timed out before a terminal usage
+            // event) rather than the backend's own final accounting.
+            "ALTER TABLE cells ADD COLUMN cost_is_estimated INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN cost_is_estimated INTEGER NOT NULL DEFAULT 0",
             // RAL-180: persist the effective read-only system prompt the board
             // shows in the details pane, separate from a cell's authored
             // `system_prompt` config so re-runs don't accidentally re-synthesise
@@ -1305,6 +1568,10 @@ impl Store {
             // NULL = never stamped (pre-RAL-250 project, deliberately not
             // backfilled -- the ticket's explicit no-migration decision).
             "ALTER TABLE projects ADD COLUMN skip_base_updates INTEGER",
+            // A project's authoritative remote provisioning source. `path`
+            // remains the daemon-local checkout for compatibility and local
+            // execution; no migration guesses this value from that checkout.
+            "ALTER TABLE projects ADD COLUMN clone_url TEXT",
             // RAL-304: context-window/auto-compact resolved caps, delivered
             // to the backend via its own mechanism (env var/CLI arg/settings
             // file) -- see `ralphus_core::schema::agent_supports_maximum_context`.
@@ -1322,6 +1589,20 @@ impl Store {
             // submission-time derivation -- both cases still need the
             // branch-string join as a fallback.
             "ALTER TABLE cells ADD COLUMN review_guardian_id TEXT",
+            // RAL-333: tool-output token cap, delivered to the backend via
+            // its own mechanism (env var/CLI arg/settings file) -- see
+            // `ralphus_core::schema::agent_supports_tool_output_max_tokens`.
+            "ALTER TABLE cells ADD COLUMN tool_output_max_tokens INTEGER",
+            "ALTER TABLE proofs ADD COLUMN tool_output_max_tokens INTEGER",
+            // RAL-332: UI-level convenience gate only -- there is no verified
+            // login yet (RAL-252), so this does not stop anyone holding the
+            // daemon's shared bearer token from calling the same endpoints
+            // directly. See `crate::users`'s module doc comment.
+            "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
+            // RAL-332: per-row Cartographer visibility -- see
+            // `crate::cartographer::Note::admin_only`'s doc comment. `0` for
+            // every pre-RAL-332 row, unrestricted exactly as before.
+            "ALTER TABLE cartographer_events ADD COLUMN admin_only INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1496,6 +1777,11 @@ impl Store {
             // the explicit resume-automation trigger), at the same point
             // `state` is set back to `Running` for a fresh attempt.
             "ALTER TABLE cells ADD COLUMN detached_at_ms INTEGER",
+            // Cross-cell session sharing (RAL-248) used to be implicit in any
+            // `depends_on` link with no opt-out; this makes it opt-in. Resolved
+            // at submit from the cell's/task's `share_session` TOML field --
+            // see `ralphus_core::schema::resolve_cell_share_session`.
+            "ALTER TABLE cells ADD COLUMN share_session INTEGER NOT NULL DEFAULT 0",
             // RAL-291: failure detail for a task-level failure with no
             // underlying cell/proof error to point to (e.g. the RAL-156
             // no-commits-since-baseline guard) -- mirrors the `cells.error`
@@ -1549,6 +1835,43 @@ impl Store {
             // stamped (pre-RAL-307 project, deliberately not backfilled, same
             // as `skip_base_updates`).
             "ALTER TABLE projects ADD COLUMN match_pr_branch_name INTEGER",
+            // RAL-317: per-review opt-in to auto-submit/grow the PR stack as
+            // each branch reaches a terminal (`done`/`conflict_resolved`)
+            // merge state, instead of requiring the manual `review pr
+            // submit` call. NULL = inherit the project/global default, same
+            // layering as `match_pr_branch_name`.
+            "ALTER TABLE guardians ADD COLUMN auto_submit_pr_stack INTEGER",
+            // RAL-317: the `auto_submit_pr_stack` value a project stamped
+            // from the live global config at first registration, so a later
+            // global change doesn't retroactively flip an already-created
+            // project. NULL = never stamped (pre-RAL-317 project,
+            // deliberately not backfilled, same as `match_pr_branch_name`).
+            "ALTER TABLE projects ADD COLUMN auto_submit_pr_stack INTEGER",
+            // RAL-317: a one-shot, per-branch failure marker for the most
+            // recent auto-submit attempt on this branch (best-effort side
+            // channel -- never blocks a Guardian merge transition). NULL
+            // means no failure to report; cleared again by the next
+            // successful auto-submit attempt on this branch.
+            "ALTER TABLE guardian_branches ADD COLUMN auto_submit_error TEXT",
+            // RAL-318: distinguishes a review the Arbiter created by draining a
+            // Triage pool (`crate::guardian::GUARDIAN_ORIGIN_ARBITER`) from one
+            // an explicit `[[review]]` block declared
+            // (`crate::guardian::GUARDIAN_ORIGIN_EXPLICIT`, the default for
+            // every existing/manually-created row).
+            "ALTER TABLE guardians ADD COLUMN origin TEXT NOT NULL DEFAULT 'explicit'",
+            // RAL-320: the `EntityUri` a mailbox message is about, so a
+            // user's personal follows can match against it (see
+            // `crate::mailbox::personal_mailbox_messages_for_user`). NULL for
+            // pre-RAL-320 rows and for messages with no addressable entity.
+            "ALTER TABLE mailbox_messages ADD COLUMN entity_uri TEXT",
+            // RAL-320: per-user preference, consulted by the `ralphus submit`
+            // auto-follow hook -- when set, every entity a user submits is
+            // followed automatically using `default_notify_tiers` below.
+            "ALTER TABLE users ADD COLUMN auto_follow INTEGER NOT NULL DEFAULT 0",
+            // RAL-320: the `MailboxPriority` tier set (CSV, see
+            // `crate::mailbox::{parse_tiers, tiers_to_csv}`) a new follow
+            // defaults to when the caller doesn't specify one explicitly.
+            "ALTER TABLE users ADD COLUMN default_notify_tiers TEXT NOT NULL DEFAULT 'urgent,high,normal'",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1817,12 +2140,16 @@ impl Store {
                     cell.auto_compact_threshold,
                     task.auto_compact_threshold,
                 );
+                let tool_output_max_tokens =
+                    ralphus_core::schema::resolve_cell_tool_output_max_tokens(task, cell)
+                        .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+                let share_session = ralphus_core::schema::resolve_cell_share_session(task, cell);
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, upstream, queue_rank, env_overrides, machine)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, tool_output_max_tokens, upstream, queue_rank, env_overrides, machine, share_session)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -1845,6 +2172,7 @@ impl Store {
                         maximum_budget_usd,
                         maximum_context,
                         auto_compact_threshold,
+                        tool_output_max_tokens,
                         cell.upstream,
                         // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -1858,6 +2186,7 @@ impl Store {
                         // has to re-derive inheritance, and so a later edit to the
                         // task file can't silently move an in-flight squad's machine.
                         ralphus_core::schema::resolve_cell_machine(task, cell),
+                        share_session,
                     ],
                 )?;
 
@@ -1871,6 +2200,7 @@ impl Store {
                         v_idx,
                         v,
                         task,
+                        Some(cell),
                         &resolved.program,
                     )?;
                 }
@@ -1895,6 +2225,7 @@ impl Store {
                     v_idx,
                     v,
                     task,
+                    None,
                     &task_proof_agent,
                 )?;
             }
@@ -1918,6 +2249,7 @@ impl Store {
             task: None,
             log_path: None,
             payload: serde_json::json!({"state": state.as_str(), "tasks": file.task.len()}),
+            admin_only: false,
         });
         Ok(())
     }
@@ -1968,6 +2300,7 @@ impl Store {
             task,
             log_path: None,
             payload: reference.map_or(serde_json::json!({}), |r| serde_json::json!({"ref": r})),
+            admin_only: false,
         });
         Ok(())
     }
@@ -2775,7 +3108,7 @@ impl Store {
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, tool_output_max_tokens
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -2817,6 +3150,10 @@ impl Store {
                         detached_at_ms: r.get::<_, Option<i64>>(25)?,
                         maximum_context: r.get::<_, Option<i64>>(26)?,
                         auto_compact_threshold: r.get::<_, Option<i64>>(27)?,
+                        cache_creation_tokens: r.get::<_, i64>(28)?,
+                        cache_read_tokens: r.get::<_, i64>(29)?,
+                        cost_is_estimated: r.get::<_, bool>(30)?,
+                        tool_output_max_tokens: r.get::<_, Option<i64>>(31)?,
                     },
                 ))
             })?
@@ -2925,7 +3262,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, tool_output_max_tokens FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -2949,6 +3286,10 @@ impl Store {
                         cost_usd: r.get::<_, f64>(14)?,
                         env_overrides: from_json_map(&r.get::<_, String>(15)?),
                         env_out_of_date: r.get::<_, bool>(16)?,
+                        cache_creation_tokens: r.get::<_, i64>(17)?,
+                        cache_read_tokens: r.get::<_, i64>(18)?,
+                        cost_is_estimated: r.get::<_, bool>(19)?,
+                        tool_output_max_tokens: r.get::<_, Option<i64>>(20)?,
                     },
                 ))
             })?
@@ -2968,7 +3309,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, tool_output_max_tokens FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -2988,6 +3329,10 @@ impl Store {
                     cost_usd: r.get::<_, f64>(11)?,
                     env_overrides: from_json_map(&r.get::<_, String>(12)?),
                     env_out_of_date: r.get::<_, bool>(13)?,
+                    cache_creation_tokens: r.get::<_, i64>(14)?,
+                    cache_read_tokens: r.get::<_, i64>(15)?,
+                    cost_is_estimated: r.get::<_, bool>(16)?,
+                    tool_output_max_tokens: r.get::<_, Option<i64>>(17)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3020,19 +3365,47 @@ impl Store {
         vcs: &str,
         match_pr_branch_name: Option<bool>,
     ) -> Result<()> {
+        self.register_project_with_clone_url_ex(
+            name,
+            description,
+            path,
+            vcs,
+            None,
+            match_pr_branch_name,
+        )
+    }
+
+    /// Register a project with the canonical clone URL providers use to
+    /// provision it on other machines. Omitting `clone_url` preserves any URL
+    /// already stored by an earlier registration.
+    pub fn register_project_with_clone_url_ex(
+        &self,
+        name: &str,
+        description: &str,
+        path: &str,
+        vcs: &str,
+        clone_url: Option<&str>,
+        match_pr_branch_name: Option<bool>,
+    ) -> Result<()> {
         // RAL-250: stamp the *current* global `skip_base_updates` value into a
         // brand-new project at first registration, so a later global change
         // does not retroactively flip it.
         let skip_base_updates = crate::config::global_review_config().skip_base_updates();
         let match_pr_branch_name = match_pr_branch_name
             .unwrap_or_else(|| crate::config::global_review_config().match_pr_branch_name());
-        self.register_project_with_stamp(
+        // RAL-317: same always-from-global stamping shape as
+        // `skip_base_updates` -- no explicit per-registration override exists
+        // for this one.
+        let auto_submit_pr_stack = crate::config::global_review_config().auto_submit_pr_stack();
+        self.register_project_with_clone_url_and_stamp(
             name,
             description,
             path,
             vcs,
+            clone_url,
             Some(skip_base_updates),
             Some(match_pr_branch_name),
+            Some(auto_submit_pr_stack),
         )
     }
 
@@ -3043,6 +3416,8 @@ impl Store {
     /// used to point `$RALPHUS_CONFIG_HOME` at a controlled value in a test
     /// (the same rationale `agent_profiles.rs::configuration_path_entries`
     /// documents for its own env parameter).
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn register_project_with_stamp(
         &self,
         name: &str,
@@ -3051,6 +3426,31 @@ impl Store {
         vcs: &str,
         skip_base_updates_stamp: Option<bool>,
         match_pr_branch_name_stamp: Option<bool>,
+        auto_submit_pr_stack_stamp: Option<bool>,
+    ) -> Result<()> {
+        self.register_project_with_clone_url_and_stamp(
+            name,
+            description,
+            path,
+            vcs,
+            None,
+            skip_base_updates_stamp,
+            match_pr_branch_name_stamp,
+            auto_submit_pr_stack_stamp,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_project_with_clone_url_and_stamp(
+        &self,
+        name: &str,
+        description: &str,
+        path: &str,
+        vcs: &str,
+        clone_url: Option<&str>,
+        skip_base_updates_stamp: Option<bool>,
+        match_pr_branch_name_stamp: Option<bool>,
+        auto_submit_pr_stack_stamp: Option<bool>,
     ) -> Result<()> {
         // An existing project being re-registered (an upsert update, not a
         // first insert) is deliberately left untouched -- the ticket's explicit
@@ -3072,18 +3472,25 @@ impl Store {
         } else {
             match_pr_branch_name_stamp
         };
+        let auto_submit_pr_stack_stamp = if exists {
+            None
+        } else {
+            auto_submit_pr_stack_stamp
+        };
         self.conn.execute(
-            "INSERT INTO projects(name, description, path, vcs, created_at_ms, skip_base_updates, match_pr_branch_name)
-             VALUES(?,?,?,?,?,?,?)
-             ON CONFLICT(name) DO UPDATE SET description=excluded.description, path=excluded.path, vcs=excluded.vcs",
+            "INSERT INTO projects(name, description, path, clone_url, vcs, created_at_ms, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack)
+             VALUES(?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(name) DO UPDATE SET description=excluded.description, path=excluded.path, clone_url=COALESCE(excluded.clone_url, projects.clone_url), vcs=excluded.vcs",
             params![
                 name,
                 description,
                 path,
+                clone_url,
                 vcs,
                 now_ms(),
                 skip_base_updates_stamp.map(i64::from),
-                match_pr_branch_name_stamp.map(i64::from)
+                match_pr_branch_name_stamp.map(i64::from),
+                auto_submit_pr_stack_stamp.map(i64::from)
             ],
         )?;
         crate::rlog!(
@@ -3101,6 +3508,46 @@ impl Store {
             task: None,
             log_path: None,
             payload: serde_json::json!({"name": name, "path": path, "vcs": vcs}),
+            admin_only: false,
+        });
+        Ok(())
+    }
+
+    /// Explicitly clear a registered project's clone URL (RAL-355).
+    ///
+    /// This is the one path that intentionally overrides
+    /// [`Self::register_project_with_clone_url_ex`]'s "omitting `clone_url`
+    /// preserves whatever is already stored" contract: an ordinary
+    /// re-registration from an older client that doesn't send the field must
+    /// never accidentally erase a previously registered URL, so clearing one
+    /// requires this separate, explicit call instead of a magic value (an
+    /// empty string) passed through the normal registration path -- the same
+    /// "if it's supported, expose it explicitly" reasoning the URL-clearing
+    /// design question called for.
+    ///
+    /// # Errors
+    /// If no project named `name` is registered.
+    pub fn clear_project_clone_url(&self, name: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET clone_url = NULL WHERE name = ?1",
+            params![name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        crate::rlog!(INFO, "ralphus [store] project \"{name}\" clone URL cleared");
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "project clone URL cleared",
+            scope: Some("project"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"name": name}),
+            admin_only: false,
         });
         Ok(())
     }
@@ -3122,6 +3569,14 @@ impl Store {
     /// semantics as [`Self::project_skip_base_updates_stamp`].
     pub fn project_match_pr_branch_name_stamp(&self, path: &str) -> Option<bool> {
         self.project_bool_stamp(path, "match_pr_branch_name")
+    }
+
+    /// RAL-317: the `auto_submit_pr_stack` value a project stamped (from the
+    /// live global config) when it was first registered, looked up by repo
+    /// path -- same lookup/ancestry semantics as
+    /// [`Self::project_skip_base_updates_stamp`].
+    pub fn project_auto_submit_pr_stack_stamp(&self, path: &str) -> Option<bool> {
+        self.project_bool_stamp(path, "auto_submit_pr_stack")
     }
 
     /// Shared lookup behind [`Self::project_skip_base_updates_stamp`] and
@@ -3163,15 +3618,16 @@ impl Store {
     pub fn get_project(&self, name: &str) -> Result<Option<ProjectView>> {
         self.conn
             .query_row(
-                "SELECT name, description, path, vcs, created_at_ms FROM projects WHERE name=?",
+                "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects WHERE name=?",
                 params![name],
                 |r| {
                     Ok(ProjectView {
                         name: r.get(0)?,
                         description: r.get(1)?,
                         path: r.get(2)?,
-                        vcs: r.get(3)?,
-                        created_at_ms: r.get(4)?,
+                        clone_url: r.get(3)?,
+                        vcs: r.get(4)?,
+                        created_at_ms: r.get(5)?,
                     })
                 },
             )
@@ -3182,7 +3638,7 @@ impl Store {
     /// All registered projects, newest first.
     pub fn list_projects(&self) -> Result<Vec<ProjectView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, description, path, vcs, created_at_ms FROM projects ORDER BY created_at_ms DESC, name",
+            "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects ORDER BY created_at_ms DESC, name",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -3190,8 +3646,9 @@ impl Store {
                     name: r.get(0)?,
                     description: r.get(1)?,
                     path: r.get(2)?,
-                    vcs: r.get(3)?,
-                    created_at_ms: r.get(4)?,
+                    clone_url: r.get(3)?,
+                    vcs: r.get(4)?,
+                    created_at_ms: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3530,6 +3987,11 @@ fn insert_proof(
     v_idx: usize,
     v: &ralphus_core::schema::ProofStep,
     task: &ralphus_core::schema::TaskDef,
+    // The proof step's real owning cell (`Some`) for a cell-scope proof, or
+    // `None` for a task-scope proof -- so `tool_output_max_tokens` resolves
+    // against the step's actual parent (RAL-333) rather than skipping the
+    // cell level the way `timeout_sec`/`budget_tokens` above still do.
+    owning_cell: Option<&ralphus_core::schema::CellDef>,
     agent: &str,
 ) -> Result<()> {
     let (kind, spec) = if let Some(c) = &v.command {
@@ -3545,14 +4007,21 @@ fn insert_proof(
     };
     let timeout_sec = resolve_timeout_sec(v.timeout_minutes, task.timeout_minutes);
     let budget_tokens = resolve_budget(v.budget_tokens, task.budget_tokens);
+    let tool_output_max_tokens = match owning_cell {
+        Some(cell) => {
+            ralphus_core::schema::resolve_cell_proof_tool_output_max_tokens(task, cell, v)
+        }
+        None => ralphus_core::schema::resolve_task_proof_tool_output_max_tokens(task, v),
+    }
+    .map(|val| i64::try_from(val).unwrap_or(i64::MAX));
     let effective_system_prompt = if kind == "prompt" {
         Some(effective_proof_system_prompt(None))
     } else {
         None
     };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, env_overrides)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, tool_output_max_tokens, env_overrides)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -3568,6 +4037,7 @@ fn insert_proof(
             NodeState::Pending.as_str(),
             timeout_sec,
             budget_tokens,
+            tool_output_max_tokens,
             // RAL-191: the step's TOML-declared `environment` seeds the same
             // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
@@ -3630,6 +4100,10 @@ pub struct CellRow {
     /// `ralphus_core::schema::agent_supports_auto_compact_threshold`.
     /// Accepted by a wider set of backends than [`Self::maximum_context`].
     pub auto_compact_threshold: Option<i64>,
+    /// Effective tool-output token cap (resolved from cell/task), or `None`
+    /// for no cap (RAL-333). Delivered to the backend via its own mechanism
+    /// -- see `ralphus_core::schema::agent_supports_tool_output_max_tokens`.
+    pub tool_output_max_tokens: Option<i64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this cell's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
@@ -3640,16 +4114,22 @@ pub struct CellRow {
     /// Resolved at submit so a later edit to the task file cannot move an
     /// in-flight squad's machine.
     pub machine: Option<String>,
+    /// Whether this cell may resume a completed dependency's agent session
+    /// (cross-cell session sharing), resolved at submit from the cell's/task's
+    /// `share_session` TOML field (off by default) -- see
+    /// `ralphus_core::schema::resolve_cell_share_session`.
+    pub share_session: bool,
 }
 
 /// Editable cell definition fields (from the details pane).
 ///
-/// `cwd`/`model`/`prompt`/`command` are nested `Option`s so a caller can say
-/// three different things per field: `None` -- the caller didn't mention
-/// this field, leave the column as it already is; `Some(None)` -- the caller
-/// gave an empty value, clear the column to NULL; `Some(Some(v))` -- set the
-/// column to `v`. `agent` can't be NULL (`cells.agent` is `NOT NULL`), so it
-/// only has the "untouched" (`None`) and "set" (`Some(v)`) states.
+/// `cwd`/`model`/`prompt`/`command`/`system_prompt` are nested `Option`s so a
+/// caller can say three different things per field: `None` -- the caller
+/// didn't mention this field, leave the column as it already is;
+/// `Some(None)` -- the caller gave an empty value, clear the column to NULL;
+/// `Some(Some(v))` -- set the column to `v`. `agent` can't be NULL
+/// (`cells.agent` is `NOT NULL`), so it only has the "untouched" (`None`) and
+/// "set" (`Some(v)`) states.
 #[derive(Debug, Clone)]
 pub struct CellEdit<'a> {
     /// Working directory.
@@ -3662,6 +4142,15 @@ pub struct CellEdit<'a> {
     pub prompt: Option<Option<&'a str>>,
     /// Shell command.
     pub command: Option<Option<&'a str>>,
+    /// Per-cell auto-compact trigger, in tokens (RAL-304).
+    pub auto_compact_threshold: Option<Option<i64>>,
+    /// Appended system prompt (RAL-341). The caller (`edit_squad`'s `"cell"`
+    /// arm) is responsible for rejecting this up front when the cell's
+    /// effective agent doesn't support it -- see
+    /// `ralphus_core::schema::agent_supports_system_prompt` -- before this
+    /// ever reaches the store. `system_prompt_position` is out of scope for
+    /// editing (RAL-341): it stays whatever it was set to at submit time.
+    pub system_prompt: Option<Option<&'a str>>,
 }
 
 /// Editable task definition fields. Same nested-`Option` nullable-field
@@ -3783,7 +4272,7 @@ impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.tool_output_max_tokens, s.share_session
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -3813,6 +4302,8 @@ impl Store {
                     machine: r.get(17)?,
                     maximum_context: r.get(18)?,
                     auto_compact_threshold: r.get(19)?,
+                    tool_output_max_tokens: r.get(20)?,
+                    share_session: r.get(21)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3975,7 +4466,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens FROM proofs
+            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, tool_output_max_tokens FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -3987,6 +4478,7 @@ impl Store {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<i64>>(4)?,
                     r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4067,6 +4559,7 @@ impl Store {
                 "old": old,
                 "new": state.as_str(),
             }),
+            admin_only: false,
         });
         Ok(())
     }
@@ -4088,9 +4581,7 @@ impl Store {
         state: NodeState,
         output: &str,
         agent_session_id: Option<&str>,
-        tokens_in: i64,
-        tokens_out: i64,
-        cost_usd: f64,
+        usage: RecordedUsage,
     ) -> Result<()> {
         // Query old state and vid together before the UPDATE so we have both for
         // logging (vid doesn't change, but reading it before avoids a second round trip).
@@ -4106,15 +4597,18 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cost_usd=?
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, cost_is_estimated=?
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
                 output,
                 agent_session_id,
-                tokens_in,
-                tokens_out,
-                cost_usd,
+                usage.tokens_in,
+                usage.tokens_out,
+                usage.cache_creation_tokens,
+                usage.cache_read_tokens,
+                usage.cost_usd,
+                usage.cost_is_estimated,
                 squad_id,
                 task_idx,
                 scope,
@@ -4235,6 +4729,13 @@ impl Store {
     /// `prompt` / `command` should be non-empty when both are touched (the
     /// other is cleared); the caller (`edit_squad`'s `"cell"` arm) resolves
     /// that XOR before building `edit`.
+    ///
+    /// `effective_system_prompt` is recomputed whenever either `prompt` (set,
+    /// not cleared to a command) or `system_prompt` is touched: editing
+    /// `system_prompt` directly recomputes from the *new* value (bypassing
+    /// the recompute-from-authored-value path), while editing only `prompt`
+    /// keeps recomputing from whatever `system_prompt` is already stored --
+    /// the same precedence create-time submission uses (RAL-341).
     pub fn edit_cell_fields(
         &self,
         squad_id: &str,
@@ -4268,8 +4769,18 @@ impl Store {
         let prompt_value = edit.prompt.flatten();
         let command_touched = edit.command.is_some();
         let command_value = edit.command.flatten();
-        let effective_system_prompt = prompt_value
-            .map(|_| effective_cell_system_prompt(authored_system_prompt.as_deref(), &subprojects));
+        let auto_compact_threshold_touched = edit.auto_compact_threshold.is_some();
+        let auto_compact_threshold_value = edit.auto_compact_threshold.flatten();
+        let system_prompt_touched = edit.system_prompt.is_some();
+        let system_prompt_value = edit.system_prompt.flatten();
+        let effective_authored_system_prompt = if system_prompt_touched {
+            system_prompt_value
+        } else {
+            authored_system_prompt.as_deref()
+        };
+        let effective_system_prompt_touched = system_prompt_touched || prompt_value.is_some();
+        let effective_system_prompt = effective_system_prompt_touched
+            .then(|| effective_cell_system_prompt(effective_authored_system_prompt, &subprojects));
 
         let n = self.conn.execute(
             "UPDATE cells SET
@@ -4278,7 +4789,9 @@ impl Store {
                 model = CASE WHEN :model_touched THEN :model ELSE model END,
                 prompt = CASE WHEN :prompt_touched THEN :prompt ELSE prompt END,
                 command = CASE WHEN :command_touched THEN :command ELSE command END,
-                effective_system_prompt = CASE WHEN :prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END
+                system_prompt = CASE WHEN :system_prompt_touched THEN :system_prompt ELSE system_prompt END,
+                effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
+                auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
                 ":cwd_touched": cwd_touched,
@@ -4291,7 +4804,12 @@ impl Store {
                 ":prompt": prompt_value,
                 ":command_touched": command_touched,
                 ":command": command_value,
+                ":system_prompt_touched": system_prompt_touched,
+                ":system_prompt": system_prompt_value,
+                ":effective_system_prompt_touched": effective_system_prompt_touched,
                 ":effective_system_prompt": effective_system_prompt,
+                ":auto_compact_threshold_touched": auto_compact_threshold_touched,
+                ":auto_compact_threshold": auto_compact_threshold_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":idx": idx,
@@ -4852,6 +5370,7 @@ impl Store {
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
             self.conn.execute(
                 "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND state='running'",
@@ -5563,7 +6082,21 @@ impl Store {
         tx.execute("DELETE FROM tasks WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![squad_id])?;
         tx.execute(
+            "DELETE FROM hidden_items WHERE squad_id=?",
+            params![squad_id],
+        )?;
+        tx.execute(
             "DELETE FROM mailbox_messages WHERE squad_id=?",
+            params![squad_id],
+        )?;
+        // RAL-320: follows are keyed by `EntityUri` string, not a `squad_id`
+        // FK column, so a deleted squad's follows (and its tasks'/cells'/
+        // proofs') need an explicit sweep rather than `ON DELETE CASCADE`.
+        tx.execute(
+            "DELETE FROM follows WHERE entity_uri = 'squad:'||?1
+                OR entity_uri LIKE 'task:'||?1||':%'
+                OR entity_uri LIKE 'cell:'||?1||':%'
+                OR entity_uri LIKE 'proof:'||?1||':%'",
             params![squad_id],
         )?;
         let n = tx.execute("DELETE FROM squads WHERE id=?", params![squad_id])?;
@@ -5606,6 +6139,7 @@ impl Store {
             tx.execute("DELETE FROM cells", [])?;
             tx.execute("DELETE FROM tasks", [])?;
             tx.execute("DELETE FROM ghosts", [])?;
+            tx.execute("DELETE FROM hidden_items", [])?;
             tx.execute("DELETE FROM mailbox_messages", [])?;
             let squads_deleted = tx.execute("DELETE FROM squads", [])?;
             tx.execute("DELETE FROM guardian_branches", [])?;
@@ -5645,6 +6179,7 @@ impl Store {
             tx.execute("DELETE FROM cells WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM tasks WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM hidden_items WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM mailbox_messages WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM squads WHERE id=?", params![id])?;
         }
@@ -5733,14 +6268,17 @@ impl Store {
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cost_usd=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 outcome.state.as_str(),
-                outcome.tokens_in,
-                outcome.tokens_out,
-                outcome.cost_usd,
+                outcome.usage.tokens_in,
+                outcome.usage.tokens_out,
+                outcome.usage.cache_creation_tokens,
+                outcome.usage.cache_read_tokens,
+                outcome.usage.cost_usd,
+                outcome.usage.cost_is_estimated,
                 outcome.error.as_deref(),
                 outcome.agent_session_id.as_deref(),
                 entering_terminal,
@@ -5768,6 +6306,21 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT sid FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// A cell's currently stored `agent` program (RAL-341). Used by
+    /// `edit_squad`'s `"cell"` arm to resolve the *effective* agent a
+    /// `system_prompt` edit would run under when the caller isn't also
+    /// changing `agent` in the same request.
+    pub fn get_cell_agent(&self, squad_id: &str, task_idx: i64, cell_idx: i64) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT agent FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, task_idx, cell_idx],
                 |r| r.get::<_, String>(0),
             )
@@ -6000,6 +6553,61 @@ impl Store {
             })
     }
 
+    /// Resolve `(squad_id, task_name, cell_sid)` into a `cell:...`
+    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 follows can match
+    /// against it. `None` when the triple doesn't match a row — mirrors
+    /// [`Self::set_cell_agent_session_id_live`]'s same best-effort lookup.
+    #[must_use]
+    pub fn cell_entity_uri(
+        &self,
+        squad_id: &str,
+        task_name: &str,
+        cell_sid: &str,
+    ) -> Option<String> {
+        let (task_idx, cell_idx): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT c.task_idx, c.idx FROM cells c
+                 JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
+                 WHERE c.squad_id=?1 AND t.name=?2 AND c.sid=?3",
+                params![squad_id, task_name, cell_sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()??;
+        Some(
+            crate::entity_uri::EntityUri::Cell {
+                squad_id: squad_id.to_string(),
+                task_idx,
+                cell_idx,
+            }
+            .to_string(),
+        )
+    }
+
+    /// Resolve `(squad_id, task_name)` into a `task:...`
+    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 follows can match
+    /// against it. `None` when the pair doesn't match a row.
+    #[must_use]
+    pub fn task_entity_uri(&self, squad_id: &str, task_name: &str) -> Option<String> {
+        let task_idx: i64 = self
+            .conn
+            .query_row(
+                "SELECT idx FROM tasks WHERE squad_id=?1 AND name=?2",
+                params![squad_id, task_name],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()??;
+        Some(
+            crate::entity_uri::EntityUri::Task {
+                squad_id: squad_id.to_string(),
+                task_idx,
+            }
+            .to_string(),
+        )
+    }
+
     /// Persist a cell's CLI-agent session/thread id as soon as it's known —
     /// before the cell finishes — so "Open Agent" activates immediately
     /// rather than only once the whole cell completes. Called from
@@ -6047,15 +6655,21 @@ impl Store {
         squad_id: &str,
         task_name: &str,
         cell_sid: &str,
-        tokens_in: i64,
-        tokens_out: i64,
-        cost_usd: f64,
+        usage: crate::runner::LiveUsage,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE cells SET tokens_in=?, tokens_out=?, cost_usd=?
+            "UPDATE cells SET tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?
              WHERE squad_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE squad_id=? AND name=?)",
             params![
-                tokens_in, tokens_out, cost_usd, squad_id, cell_sid, squad_id, task_name
+                usage.tokens_in,
+                usage.tokens_out,
+                usage.cache_creation_tokens,
+                usage.cache_read_tokens,
+                usage.cost_usd,
+                squad_id,
+                cell_sid,
+                squad_id,
+                task_name
             ],
         )?;
         Ok(())
@@ -6788,6 +7402,7 @@ impl Store {
             task: None,
             log_path: None,
             payload: serde_json::json!({"items": ordered.len()}),
+            admin_only: false,
         });
         Ok(ordered)
     }
@@ -6826,8 +7441,53 @@ impl Store {
                 "position": position,
                 "mode": if absolute { "absolute" } else { "relative" },
             }),
+            admin_only: false,
         });
         self.reorder_queue(&desired)
+    }
+}
+
+/// The token/cost figures recorded for one cell or proof-step run (RAL-326).
+///
+/// Bundled rather than passed as loose parameters because both write paths
+/// ([`Store::record_cell_result`] via [`CellOutcome`], and
+/// [`Store::set_proof_result`]) need the same six values, and
+/// [`Store::set_proof_result`] already carries enough positional arguments
+/// without them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RecordedUsage {
+    /// Uncached input tokens.
+    pub tokens_in: i64,
+    /// Output tokens.
+    pub tokens_out: i64,
+    /// Prompt-cache *write* tokens -- input billed at the cache-creation
+    /// rate. Deliberately not folded into `tokens_in`, which keeps meaning
+    /// exactly what it always has. `0` for a backend whose harness reports
+    /// no cache breakdown, and for every row written before RAL-326.
+    pub cache_creation_tokens: i64,
+    /// Prompt-cache *read* tokens -- input served from an existing cache
+    /// entry at the discounted rate. See `cache_creation_tokens`.
+    pub cache_read_tokens: i64,
+    /// Cost in USD.
+    pub cost_usd: f64,
+    /// `true` when the figures above are the last live mid-run snapshot
+    /// rather than the backend's own terminal accounting -- the process was
+    /// lost, cancelled, timed out, or killed before a final usage event
+    /// arrived, so what got recorded is priced by the runner's approximate
+    /// estimate and stops at whatever turn died.
+    pub cost_is_estimated: bool,
+}
+
+impl From<&crate::runner::RunnerResult> for RecordedUsage {
+    fn from(r: &crate::runner::RunnerResult) -> Self {
+        Self {
+            tokens_in: r.tokens_in,
+            tokens_out: r.tokens_out,
+            cache_creation_tokens: r.cache_creation_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cost_usd: r.cost_usd,
+            cost_is_estimated: r.cost_is_estimated,
+        }
     }
 }
 
@@ -6836,12 +7496,8 @@ impl Store {
 pub struct CellOutcome {
     /// Final cell state.
     pub state: NodeState,
-    /// Input tokens used.
-    pub tokens_in: i64,
-    /// Output tokens used.
-    pub tokens_out: i64,
-    /// Cost in USD.
-    pub cost_usd: f64,
+    /// Tokens/cost this run spent.
+    pub usage: RecordedUsage,
     /// Error detail, if failed.
     pub error: Option<String>,
     /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex exec
@@ -7313,6 +7969,58 @@ command = "cargo test"
             .expect("task row must survive migration with new nullable columns");
         assert!(agent.is_none());
         assert!(model.is_none());
+    }
+
+    #[test]
+    fn migration_adds_nullable_clone_url_column_to_projects() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                name          TEXT PRIMARY KEY,
+                description   TEXT NOT NULL DEFAULT '',
+                path          TEXT NOT NULL,
+                vcs           TEXT NOT NULL DEFAULT 'git',
+                created_at_ms INTEGER NOT NULL,
+                skip_base_updates INTEGER
+             );
+             INSERT INTO projects (name, description, path, vcs, created_at_ms, skip_base_updates)
+             VALUES ('legacy-proj', 'pre-RAL-355 project', '/srv/legacy-proj', 'git', 0, NULL);",
+        )
+        .expect("create legacy projects table (pre-clone_url)");
+
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
+        };
+        store
+            .init_schema()
+            .expect("migration must add the nullable clone_url column");
+
+        let clone_url: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT clone_url FROM projects WHERE name='legacy-proj'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("legacy project row must survive migration with the new column");
+        assert!(
+            clone_url.is_none(),
+            "a pre-existing project row must read back with no clone_url rather than erroring"
+        );
+
+        // The row is also usable through the ordinary read path afterward --
+        // not just readable via a raw SQL query against the migrated column.
+        let project = store
+            .get_project("legacy-proj")
+            .expect("get_project must succeed on a migrated legacy row")
+            .expect("legacy-proj must still be found");
+        assert!(project.clone_url.is_none());
+        assert_eq!(project.path, "/srv/legacy-proj");
     }
 
     #[test]
@@ -9206,9 +9914,12 @@ command = "y"
         // the node is no longer `running`/`pending`, so this must be a no-op.
         let outcome = CellOutcome {
             state: NodeState::Failed,
-            tokens_in: 7,
-            tokens_out: 9,
-            cost_usd: 1.5,
+            usage: RecordedUsage {
+                tokens_in: 7,
+                tokens_out: 9,
+                cost_usd: 1.5,
+                ..RecordedUsage::default()
+            },
             error: Some("late result".to_string()),
             agent_session_id: None,
         };
@@ -9238,9 +9949,12 @@ command = "y"
             .unwrap();
         let outcome = CellOutcome {
             state: NodeState::Done,
-            tokens_in: 3,
-            tokens_out: 4,
-            cost_usd: 0.1,
+            usage: RecordedUsage {
+                tokens_in: 3,
+                tokens_out: 4,
+                cost_usd: 0.1,
+                ..RecordedUsage::default()
+            },
             error: None,
             agent_session_id: None,
         };
@@ -9254,6 +9968,87 @@ command = "y"
         assert_eq!(cell.tokens_in, 3);
     }
 
+    /// RAL-326: prompt-cache tokens and the estimated-cost marker must survive
+    /// the round trip through `cells` and reach the board's `CellView`. They
+    /// are stored beside `tokens_in`, never folded into it -- an agentic cell
+    /// bills most of its input through the cache tiers, and folding would
+    /// silently redefine every existing `tokens_in` reading.
+    #[test]
+    fn record_cell_result_round_trips_cache_tokens_and_the_estimate_marker() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_cell_state(&squad, 0, 0, NodeState::Running)
+            .unwrap();
+        let outcome = CellOutcome {
+            state: NodeState::Failed,
+            usage: RecordedUsage {
+                tokens_in: 34,
+                tokens_out: 5374,
+                cache_creation_tokens: 320_114,
+                cache_read_tokens: 7_204_990,
+                cost_usd: 0.6807,
+                cost_is_estimated: true,
+            },
+            error: Some("lost pane".to_string()),
+            agent_session_id: None,
+        };
+        store.record_cell_result(&squad, 0, 0, &outcome).unwrap();
+
+        let squad_view = store.get_squad(&squad).unwrap();
+        let cell = &squad_view.tasks[0].cells[0];
+        assert_eq!(cell.tokens_in, 34, "uncached input is unchanged in meaning");
+        assert_eq!(cell.tokens_out, 5374);
+        assert_eq!(cell.cache_creation_tokens, 320_114);
+        assert_eq!(cell.cache_read_tokens, 7_204_990);
+        assert!(
+            cell.cost_is_estimated,
+            "a snapshot-derived figure must not read as a settled bill"
+        );
+    }
+
+    /// The proof-step twin of the round trip above -- `set_proof_result` is a
+    /// separate write path with its own columns, so it needs its own proof.
+    #[test]
+    fn set_proof_result_round_trips_cache_tokens_and_the_estimate_marker() {
+        let toml = concat!(
+            "[[task]]\nname=\"t\"\n",
+            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "[[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check\"\n"
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_proof_result(
+                &squad,
+                0,
+                "cell",
+                0,
+                0,
+                NodeState::Done,
+                "PASS",
+                None,
+                RecordedUsage {
+                    tokens_in: 11,
+                    tokens_out: 22,
+                    cache_creation_tokens: 33,
+                    cache_read_tokens: 44,
+                    cost_usd: 0.5,
+                    cost_is_estimated: true,
+                },
+            )
+            .unwrap();
+
+        let steps = store.proofs_for(&squad, 0, "cell", 0).unwrap();
+        let step = &steps[0];
+        assert_eq!(step.tokens_in, 11);
+        assert_eq!(step.tokens_out, 22);
+        assert_eq!(step.cache_creation_tokens, 33);
+        assert_eq!(step.cache_read_tokens, 44);
+        assert!(step.cost_is_estimated);
+    }
+
     #[test]
     fn record_cell_result_applies_to_a_never_started_pending_cell() {
         // Mirrors the "blocked by a failed dependency" scheduler path: the
@@ -9264,9 +10059,7 @@ command = "y"
             .unwrap();
         let outcome = CellOutcome {
             state: NodeState::Failed,
-            tokens_in: 0,
-            tokens_out: 0,
-            cost_usd: 0.0,
+            usage: crate::store::RecordedUsage::default(),
             error: Some("blocked by a failed dependency".to_string()),
             agent_session_id: None,
         };
@@ -9711,9 +10504,12 @@ command = "y"
                 0,
                 &CellOutcome {
                     state: NodeState::Done,
-                    tokens_in: 1,
-                    tokens_out: 2,
-                    cost_usd: 0.0,
+                    usage: RecordedUsage {
+                        tokens_in: 1,
+                        tokens_out: 2,
+                        cost_usd: 0.0,
+                        ..RecordedUsage::default()
+                    },
                     error: None,
                     agent_session_id: None,
                 },
@@ -9886,9 +10682,7 @@ command = "y"
                 1,
                 &CellOutcome {
                     state: NodeState::Failed,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    cost_usd: 0.0,
+                    usage: crate::store::RecordedUsage::default(),
                     error: Some("blocked by a failed dependency".to_string()),
                     agent_session_id: None,
                 },
@@ -10004,9 +10798,7 @@ command = "y"
                 0,
                 &CellOutcome {
                     state: NodeState::Failed,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    cost_usd: 0.0,
+                    usage: crate::store::RecordedUsage::default(),
                     error: Some("blocked by a failed dependency".to_string()),
                     agent_session_id: None,
                 },
@@ -10302,7 +11094,76 @@ command = "check-c"
         assert_eq!(p.name, "ralphus");
         assert_eq!(p.description, "the ralphus repo itself");
         assert_eq!(p.path, "C:/repos/ralphus");
+        assert_eq!(p.clone_url, None);
         assert_eq!(p.vcs, "git");
+    }
+
+    #[test]
+    fn project_clone_url_round_trips_and_omission_does_not_erase_it() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_clone_url_ex(
+                "ralphus",
+                "remote capable",
+                "C:/repos/ralphus",
+                "git",
+                Some("git@example.invalid:team/ralphus.git"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_project("ralphus")
+                .unwrap()
+                .unwrap()
+                .clone_url
+                .as_deref(),
+            Some("git@example.invalid:team/ralphus.git")
+        );
+
+        store
+            .register_project(
+                "ralphus",
+                "updated by an older client",
+                "C:/repos/ralphus-new",
+                "git",
+            )
+            .unwrap();
+        let project = store.get_project("ralphus").unwrap().unwrap();
+        assert_eq!(
+            project.clone_url.as_deref(),
+            Some("git@example.invalid:team/ralphus.git")
+        );
+        assert_eq!(project.path, "C:/repos/ralphus-new");
+    }
+
+    #[test]
+    fn clear_project_clone_url_erases_a_previously_registered_url() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_clone_url_ex(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                Some("git@example.invalid:team/ralphus.git"),
+                None,
+            )
+            .unwrap();
+        store.clear_project_clone_url("ralphus").unwrap();
+        let project = store.get_project("ralphus").unwrap().unwrap();
+        assert_eq!(project.clone_url, None);
+        // Clearing must not touch any other field.
+        assert_eq!(project.path, "C:/repos/ralphus");
+    }
+
+    #[test]
+    fn clear_project_clone_url_on_an_unregistered_project_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.clear_project_clone_url("nope"),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]
@@ -10337,7 +11198,15 @@ command = "check-c"
         // the new project row via the injectable seam -- `agent_profiles.rs`
         // documents why the process env can't be mutated in-test to supply it.
         store
-            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true), None)
+            .register_project_with_stamp(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                Some(true),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(
             store.project_skip_base_updates_stamp("C:/repos/ralphus"),
@@ -10354,7 +11223,15 @@ command = "check-c"
     fn reregistering_existing_project_does_not_restamp() {
         let store = Store::open_in_memory().unwrap();
         store
-            .register_project_with_stamp("ralphus", "", "C:/repos/ralphus", "git", Some(true), None)
+            .register_project_with_stamp(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                Some(true),
+                None,
+                None,
+            )
             .unwrap();
 
         // Re-register the same name with a *different* global value (`false`):
@@ -10368,6 +11245,7 @@ command = "check-c"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
                 None,
             )
             .unwrap();
@@ -10389,6 +11267,7 @@ command = "check-c"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
                 None,
             )
             .unwrap();
@@ -10458,6 +11337,97 @@ command = "check-c"
             Some(true),
             "re-registering must not overwrite the original creation-time stamp"
         );
+    }
+
+    #[test]
+    fn register_project_stamps_global_auto_submit_pr_stack_on_first_insert() {
+        let store = Store::open_in_memory().unwrap();
+        // No explicit per-registration override exists for this one (unlike
+        // `match_pr_branch_name`) -- it always stamps from the live global
+        // config, same shape as `skip_base_updates`.
+        store
+            .register_project_with_stamp(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap();
+        assert_eq!(
+            store.project_auto_submit_pr_stack_stamp("C:/repos/ralphus"),
+            Some(true)
+        );
+        // Unregistered path has no stamp.
+        assert_eq!(
+            store.project_auto_submit_pr_stack_stamp("C:/unrelated"),
+            None
+        );
+    }
+
+    #[test]
+    fn reregistering_existing_project_does_not_restamp_auto_submit_pr_stack() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_stamp(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap();
+        store
+            .register_project_with_stamp(
+                "ralphus",
+                "updated",
+                "C:/repos/ralphus",
+                "git",
+                None,
+                None,
+                Some(false),
+            )
+            .unwrap();
+        assert_eq!(
+            store.project_auto_submit_pr_stack_stamp("C:/repos/ralphus"),
+            Some(true),
+            "re-registering must not overwrite the original creation-time stamp"
+        );
+    }
+
+    #[test]
+    fn project_auto_submit_pr_stack_stamp_flows_into_new_guardians() {
+        // End-to-end: a project's stamped `auto_submit_pr_stack` default
+        // (RAL-317) is what a *new* guardian under that project's path
+        // freezes onto itself at creation time -- see
+        // `Store::create_guardian`'s `auto_submit_pr_stack_stamp` lookup in
+        // `guardian.rs`.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_stamp(
+                "ralphus",
+                "",
+                "C:/repos/ralphus",
+                "git",
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap();
+        let gid = store
+            .create_guardian("r", "main", "C:/repos/ralphus")
+            .unwrap();
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.auto_submit_pr_stack,
+            Some(true),
+            "the project's stamped default is frozen onto the new review"
+        );
+        assert!(g.effective_auto_submit_pr_stack);
     }
 
     #[test]

@@ -31,8 +31,13 @@
 ///   `ssh` ever sees them, which is exactly how `RALPHUS_EVENT:` marker lines
 ///   would end up interleaved with regular output.
 #[must_use]
-pub fn non_interactive_args(connect_timeout_secs: u32) -> Vec<String> {
-    vec![
+pub fn non_interactive_args(connect_timeout_secs: u32, config_file: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(path) = config_file.filter(|path| !path.trim().is_empty()) {
+        args.push("-F".to_string());
+        args.push(path.to_string());
+    }
+    args.extend([
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
@@ -44,16 +49,75 @@ pub fn non_interactive_args(connect_timeout_secs: u32) -> Vec<String> {
         "-o".to_string(),
         format!("ConnectTimeout={connect_timeout_secs}"),
         "-T".to_string(),
-    ]
+    ]);
+    args
 }
 
 /// Build a full `ssh <non-interactive flags> <target> -- <remote_command>`
 /// argument vector (everything after the `ssh` program name itself).
 #[must_use]
-pub fn command_args(target: &str, connect_timeout_secs: u32, remote_command: &str) -> Vec<String> {
-    let mut args = non_interactive_args(connect_timeout_secs);
+pub fn command_args(
+    target: &str,
+    connect_timeout_secs: u32,
+    remote_command: &str,
+    config_file: Option<&str>,
+) -> Vec<String> {
+    let mut args = non_interactive_args(connect_timeout_secs, config_file);
     args.push(target.to_string());
     args.push("--".to_string());
+    args.push(remote_command.to_string());
+    args
+}
+
+/// [`non_interactive_args`]'s pty-allocating sibling, for the `terminal` verb
+/// (RAL-355 Phase 10) -- the one place this provider deliberately wants a
+/// remote pseudo-terminal, since an interactive CLI-agent session needs one
+/// to render at all. Otherwise identical: key-based auth only, strict host-
+/// key checking, a bounded connect timeout. `-tt` (doubled) forces PTY
+/// allocation even though this process's own stdin is a pipe, not a real
+/// terminal -- plain `-t` only *requests* one and silently falls back to none
+/// when `ssh` can't detect a local tty, which is exactly this process's
+/// situation.
+#[must_use]
+pub fn pty_args(connect_timeout_secs: u32, config_file: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(path) = config_file.filter(|path| !path.trim().is_empty()) {
+        args.push("-F".to_string());
+        args.push(path.to_string());
+    }
+    args.extend([
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "PasswordAuthentication=no".to_string(),
+        "-o".to_string(),
+        "KbdInteractiveAuthentication=no".to_string(),
+        "-o".to_string(),
+        format!("ConnectTimeout={connect_timeout_secs}"),
+        "-tt".to_string(),
+    ]);
+    args
+}
+
+/// Build a full `ssh <pty flags> <target> <remote_command>` argument vector
+/// for the `terminal` verb. Unlike [`command_args`], `remote_command` is not
+/// preceded by `--` -- a `-tt` session's remote command is the interactive
+/// program itself (e.g. `claude --resume ...`), which `--` would otherwise
+/// place after `ssh`'s own option parsing in a way some `ssh` builds parse
+/// differently for a pty-allocated command versus a piped one; passing it as
+/// a single trailing argument (already fully shell-quoted by the caller, see
+/// [`crate::transport::shell_quote_single`]) avoids that ambiguity.
+#[must_use]
+pub fn pty_command_args(
+    target: &str,
+    connect_timeout_secs: u32,
+    remote_command: &str,
+    config_file: Option<&str>,
+) -> Vec<String> {
+    let mut args = pty_args(connect_timeout_secs, config_file);
+    args.push(target.to_string());
     args.push(remote_command.to_string());
     args
 }
@@ -120,7 +184,7 @@ mod tests {
 
     #[test]
     fn non_interactive_args_always_carry_batch_mode_and_strict_host_key_checking() {
-        let args = non_interactive_args(15);
+        let args = non_interactive_args(15, None);
         let joined = args.join(" ");
         assert!(joined.contains("BatchMode=yes"), "{joined}");
         assert!(joined.contains("StrictHostKeyChecking=yes"), "{joined}");
@@ -135,10 +199,38 @@ mod tests {
 
     #[test]
     fn command_args_places_target_then_double_dash_then_the_remote_command() {
-        let args = command_args("alice@host", 10, "cd /work && ralphus-runner");
+        let args = command_args("alice@host", 10, "cd /work && ralphus-runner", None);
         assert_eq!(args.last().unwrap(), "cd /work && ralphus-runner");
         assert_eq!(args[args.len() - 2], "--");
         assert_eq!(args[args.len() - 3], "alice@host");
+    }
+
+    #[test]
+    fn pty_args_forces_double_t_and_still_carries_the_non_interactive_options() {
+        let args = pty_args(15, None);
+        assert!(args.contains(&"-tt".to_string()), "{args:?}");
+        assert!(!args.contains(&"-T".to_string()), "{args:?}");
+        let joined = args.join(" ");
+        assert!(joined.contains("BatchMode=yes"), "{joined}");
+        assert!(joined.contains("StrictHostKeyChecking=yes"), "{joined}");
+        assert!(joined.contains("ConnectTimeout=15"), "{joined}");
+    }
+
+    #[test]
+    fn pty_command_args_places_target_then_the_command_with_no_double_dash() {
+        let args = pty_command_args("alice@host", 10, "'claude --resume x'", None);
+        assert_eq!(args.last().unwrap(), "'claude --resume x'");
+        assert_eq!(args[args.len() - 2], "alice@host");
+        assert!(!args.contains(&"--".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn explicit_config_file_precedes_mandatory_options() {
+        let args = non_interactive_args(15, Some("C:/fixture/ssh_config"));
+        assert_eq!(&args[..2], &["-F", "C:/fixture/ssh_config"]);
+        let joined = args.join(" ");
+        assert!(joined.contains("BatchMode=yes"), "{joined}");
+        assert!(joined.contains("StrictHostKeyChecking=yes"), "{joined}");
     }
 
     #[test]

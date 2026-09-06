@@ -159,7 +159,7 @@ fn merge_profiles(
 
 /// Parses `$RALPHUS_CONFIGURATION_PATH` (a `PATH`-separated list of
 /// `.ralphus.toml` files, left-to-right, later wins) -- the same env var
-/// `cli-rs/src/config.rs` and `runner/src/config.rs` already read for every
+/// `cli/src/config.rs` and `runner/src/config.rs` already read for every
 /// other config field. Agent profiles didn't honor it, so a profile placed
 /// via that established convention (rather than `$RALPHUS_CONFIG_HOME/config.toml`,
 /// or a `.ralphus.toml` an ancestor of the resolved project path) silently
@@ -409,6 +409,30 @@ fn validate_task_file_profiles_with(
                     message: format!(
                         "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
                          support auto_compact_threshold (only codex, pi, and claude-code \
+                         backends do)",
+                        selection.backend
+                    ),
+                    line: None,
+                });
+            }
+            // RAL-333: same deferral shape as maximum_context/
+            // auto_compact_threshold above -- `core` can't classify a custom
+            // profile's backend itself, so it only rejects
+            // `tool_output_max_tokens` for a RESERVED_AGENT_NAMES agent;
+            // check the resolved backend here. Cascades from the task, so
+            // it's checked at its effective (cell-or-task) value.
+            let has_tool_output_max_tokens =
+                cell.tool_output_max_tokens.is_some() || task.tool_output_max_tokens.is_some();
+            if selection.custom_profile
+                && has_tool_output_max_tokens
+                && !ralphus_core::schema::agent_supports_tool_output_max_tokens(&selection.backend)
+            {
+                errors.push(ValidationError {
+                    path: format!("task[{task_idx}].cell[{cell_idx}].tool_output_max_tokens"),
+                    kind: ErrorKind::InvalidValue,
+                    message: format!(
+                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
+                         support tool_output_max_tokens (only codex, pi, and claude-code \
                          backends do)",
                         selection.backend
                     ),
@@ -959,6 +983,87 @@ backend = "ollama"
             errors
                 .iter()
                 .any(|e| e.path.contains("auto_compact_threshold") && e.message.contains("ollama")),
+            "{errors:?}"
+        );
+    }
+
+    fn task_file_with_agent_and_tool_output_max_tokens(cwd: &Path, agent: &str) -> TaskFile {
+        let cwd = cwd.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\ntool_output_max_tokens=40000\n"
+        );
+        toml::from_str(&src).expect("parse task file")
+    }
+
+    #[test]
+    fn validate_task_file_profiles_allows_tool_output_max_tokens_for_claude_code_profile_backend() {
+        let project_root = tempdir("tool-output-max-tokens-claude-code-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-claude]
+backend = "claude-code"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_tool_output_max_tokens(&project_root, "custom-claude");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.path.contains("tool_output_max_tokens")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_rejects_tool_output_max_tokens_for_non_supporting_profile_backend()
+     {
+        let project_root = tempdir("tool-output-max-tokens-ollama-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-ollama]
+backend = "ollama"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_tool_output_max_tokens(&project_root, "custom-ollama");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.contains("tool_output_max_tokens") && e.message.contains("ollama")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_allows_tool_output_max_tokens_for_pi_profile_backend() {
+        let project_root = tempdir("tool-output-max-tokens-pi-profile");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-pi]
+backend = "pi"
+"#,
+        )
+        .expect("write project config");
+
+        let store = Store::open_in_memory().expect("open store");
+        let file = task_file_with_agent_and_tool_output_max_tokens(&project_root, "custom-pi");
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.path.contains("tool_output_max_tokens")),
             "{errors:?}"
         );
     }

@@ -4,7 +4,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::Duration;
 
 /// A tool call failed (escaped the workspace, I/O error, etc). The
@@ -128,6 +128,7 @@ impl Workspace {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| ToolError(format!("could not spawn command: {e}")))?;
+        let mut tree = ProcessTree::confine(&child);
 
         let Some(secs) = timeout_sec else {
             let output = child
@@ -148,7 +149,7 @@ impl Workspace {
                 }
                 Ok(None) => {
                     if start.elapsed() >= deadline {
-                        let _ = child.kill();
+                        tree.kill(&mut child);
                         let _ = child.wait();
                         return Ok(CommandOutput {
                             exit_code: 124,
@@ -173,9 +174,86 @@ fn shell_command(command: &str) -> Command {
 
 #[cfg(not(target_os = "windows"))]
 fn shell_command(command: &str) -> Command {
+    use std::os::unix::process::CommandExt as _;
     let mut c = Command::new("sh");
     c.arg("-c").arg(command);
+    // RAL-321: a fresh process group (pgid == the child's own pid) so
+    // `ProcessTree::kill`'s `killpg` reaches this command's own descendants
+    // on timeout, not just the `sh` wrapping them.
+    c.process_group(0);
     c
+}
+
+/// Confine a spawned child to its own process tree so a timeout can kill it
+/// *and every process it spawned* -- `run_bash`'s command is a shell wrapping
+/// something (`npm run build`, an `a && b` chain) that can spawn children of
+/// its own. Killing only the direct child (the shell) leaves those
+/// grandchildren running past the deadline and keeps their output pipes open.
+/// Mirrors `daemon/src/proof.rs`'s `ProcessTree`, reimplemented here since
+/// that type is private to the `daemon` crate.
+#[cfg(windows)]
+struct ProcessTree(Option<win32job::Job>);
+
+#[cfg(windows)]
+impl ProcessTree {
+    /// Must be called right after `spawn()` -- before the child has had a
+    /// chance to spawn anything of its own.
+    fn confine(child: &Child) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        let job = (|| -> Result<win32job::Job, win32job::JobError> {
+            let job = win32job::Job::create()?;
+            let mut info = win32job::ExtendedLimitInfo::new();
+            info.limit_kill_on_job_close();
+            job.set_extended_limit_info(&info)?;
+            job.assign_process(child.as_raw_handle() as isize)?;
+            Ok(job)
+        })();
+        match job {
+            Ok(job) => Self(Some(job)),
+            Err(e) => {
+                eprintln!(
+                    "[run_bash] could not confine command to a job object, \
+                     timeout kill may not reach its children: {e}"
+                );
+                Self(None)
+            }
+        }
+    }
+
+    /// Kill every process in the tree. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// means closing the job's only handle (via `Drop`) terminates every
+    /// process assigned to it.
+    fn kill(&mut self, child: &mut Child) {
+        self.0 = None;
+        // Belt-and-suspenders: if job confinement failed above, still kill
+        // the direct child so at least the shell itself stops.
+        let _ = child.kill();
+    }
+}
+
+#[cfg(unix)]
+struct ProcessTree;
+
+#[cfg(unix)]
+impl ProcessTree {
+    /// On Unix, tree confinement happens on the `Command` builder before
+    /// spawn (see `shell_command`'s `process_group(0)`), not on the spawned
+    /// `Child` -- so this is a no-op constructor kept only to give both
+    /// platforms the same call shape at the use site.
+    fn confine(_child: &Child) -> Self {
+        Self
+    }
+
+    /// Signal the whole process group the child was placed into at spawn,
+    /// not just the child itself, so a shell's already-spawned children die
+    /// with it instead of being orphaned past the timeout.
+    fn kill(&mut self, child: &mut Child) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.kill();
+    }
 }
 
 fn command_output(output: &std::process::Output) -> CommandOutput {

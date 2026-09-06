@@ -20,6 +20,7 @@ build/
 *.db-shm
 *.pid
 /.ralphus/
+/.docker-ssh-target/
 # Task worktrees created at runtime. (Guardian review worktrees now live under
 # .git/.ralphus_guardian/, which git already excludes — no entry needed.)
 /.worktrees/

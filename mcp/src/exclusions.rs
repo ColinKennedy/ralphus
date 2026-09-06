@@ -18,6 +18,13 @@ pub const EXCLUDED: &[(&[&str], &str)] = &[
          return from one MCP tool call.",
     ),
     (
+        &["cell", "remote-terminal"],
+        "Attaches this process's own stdin/stdout to a live WebSocket byte relay onto a remote \
+         cell's resumed Claude Code session (RAL-355 Phase 10) and blocks until the human ends \
+         the session -- the remote counterpart of `cell open-agent`'s exclusion above, same \
+         reason: a live, attached TTY session, not a value one MCP tool call could return.",
+    ),
+    (
         &["quick-start", "manager", "claude-code"],
         "Launches an interactive agent (Claude Code) preconfigured for the manager role and \
          drives it with an inherited TTY until the human ends the session -- the same reason \

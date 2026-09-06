@@ -1,12 +1,13 @@
-//! Mirrors `ralphus_cli::commands::cell::dispatch`. `cell open-agent` is
-//! excluded from the MCP tool surface (see `crate::exclusions`) so its
-//! `CellCommand::OpenAgent` arm is unreachable from a real tool call, but is
-//! still handled (as a defensive error, not a `panic!`/`unreachable!`) in
-//! case argv construction is ever wired up wrong.
+//! Mirrors `ralphus_cli::commands::cell::dispatch`. `cell open-agent` and
+//! `cell remote-terminal` are excluded from the MCP tool surface (see
+//! `crate::exclusions`) so their `CellCommand` arms are unreachable from a
+//! real tool call, but are still handled (as a defensive error, not a
+//! `panic!`/`unreachable!`) in case argv construction is ever wired up wrong.
 
 use ralphus_cli::client::DaemonClient;
 use ralphus_cli::commands::CommandError;
 use ralphus_cli::commands::cell::{self, CellCommand};
+use ralphus_cli::commands::env;
 use ralphus_cli::selector::{SelectorError, squad_view_uri};
 use serde_json::{Value, json};
 
@@ -15,6 +16,10 @@ use super::{ExecResult, usage};
 pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
         CellCommand::Help | CellCommand::UsageError(_) => Err(usage("no such tool")),
+        CellCommand::Env { selector, scope } => {
+            let resolved = cell::resolve_scoped(client, &selector, "cell")?;
+            Ok(client.env_view(&env::cell_path(&resolved, &scope))?)
+        }
         CellCommand::Show { selector } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
             let squad = client.squad(&resolved.squad_id)?;
@@ -82,6 +87,8 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
             model,
             prompt,
             command,
+            auto_compact_threshold,
+            system_prompt,
         } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
             Ok(client.edit_cell(
@@ -93,6 +100,8 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
                 model.as_deref(),
                 prompt.as_deref(),
                 command.as_deref(),
+                auto_compact_threshold.as_deref(),
+                system_prompt.as_deref(),
             )?)
         }
         CellCommand::Terminal { selector, mode } => {
@@ -121,6 +130,9 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
         }
         CellCommand::OpenAgent { .. } => Err(usage(
             "cell open-agent is excluded from the MCP tool surface",
+        )),
+        CellCommand::RemoteTerminal { .. } => Err(usage(
+            "cell remote-terminal is excluded from the MCP tool surface",
         )),
         CellCommand::ResumeAutomation { selector } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;

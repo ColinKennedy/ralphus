@@ -393,6 +393,92 @@ def cmd_cleanup(uri: str) -> None:
     _reply(ok=True)
 
 
+def cmd_read_file(request: dict[str, Any]) -> None:
+    """Return a file's contents (RAL-355 Phase 2/4 remainder).
+
+    A missing/unreadable file is *not* special-cased -- the daemon layer
+    already treats any failure here as "absent" rather than distinguishing
+    why, per `docs/machine-providers.md`.
+    """
+    path = request.get("path") or ""
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        _fail(f"could not read {path!r}: {exc}")
+        return
+    _reply(ok=True, stdout=content)
+
+
+def cmd_write_file(request: dict[str, Any]) -> None:
+    """Write `content` to `path`, creating parent directories as needed."""
+    path = request.get("path") or ""
+    content = request.get("content")
+    if content is None:
+        _fail("write-file request is missing \"content\"")
+        return
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        _fail(f"could not write {path!r}: {exc}")
+        return
+    _reply(ok=True)
+
+
+def cmd_remove_path(request: dict[str, Any]) -> None:
+    """Delete a file, or a directory tree when `recursive`.
+
+    A path that does not exist is success, not an error.
+    """
+    path = request.get("path") or ""
+    recursive = bool(request.get("recursive"))
+    p = Path(path)
+    try:
+        if recursive and p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            p.unlink()
+    except OSError as exc:
+        _fail(f"could not remove {path!r}: {exc}")
+        return
+    _reply(ok=True)
+
+
+def cmd_capabilities(uri: str) -> None:
+    """Report what this provider supports (RAL-355 Phase 0 remainder).
+
+    Optional and best-effort by contract -- a provider that omits this verb
+    entirely is treated identically to "no capability information
+    available", not an error.
+    """
+    _reply(
+        ok=True,
+        capabilities={
+            "os": os.name,
+            "arch": None,
+            "supported_ops": [
+                "provision",
+                "exec",
+                "status",
+                "stream",
+                "cancel",
+                "channel",
+                "run",
+                "read-file",
+                "write-file",
+                "remove-path",
+                "ping",
+                "cleanup",
+                "capabilities",
+            ],
+            "async_exec": True,
+            "terminal": False,
+            "runner_version": None,
+        },
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("verb")
@@ -401,9 +487,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", type=int, default=0)
     args, _unknown = parser.parse_known_args(argv)
 
-    # Only `provision` and `exec` carry a stdin payload.
+    # Payload-carrying verbs read stdin; handle-scoped/no-payload verbs don't.
     payload: dict[str, Any] = {}
-    if args.verb in {"provision", "exec", "run"}:
+    if args.verb in {"provision", "exec", "run", "read-file", "write-file", "remove-path"}:
         raw = sys.stdin.read()
         if raw.strip():
             try:
@@ -430,6 +516,14 @@ def main(argv: list[str] | None = None) -> int:
         cmd_ping(args.uri)
     elif args.verb == "cleanup":
         cmd_cleanup(args.uri)
+    elif args.verb == "read-file":
+        cmd_read_file(payload)
+    elif args.verb == "write-file":
+        cmd_write_file(payload)
+    elif args.verb == "remove-path":
+        cmd_remove_path(payload)
+    elif args.verb == "capabilities":
+        cmd_capabilities(args.uri)
     elif args.verb == "_worker":
         cmd_worker(args.handle)
     else:

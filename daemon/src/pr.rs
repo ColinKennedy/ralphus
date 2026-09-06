@@ -461,6 +461,23 @@ impl Store {
         }
     }
 
+    /// RAL-317: bulk soft-drop every currently open PR row for `guardian_id`
+    /// (used by `review pr unlink`) -- the guardian-wide undo for "start this
+    /// review's PR stack over". Silently a no-op if there's nothing open,
+    /// matching the bulk-friendly precedent set by
+    /// [`crate::guardian::Store::set_branch_enabled_by_name`] rather than
+    /// [`Self::drop_pull_request`]'s single-row `NotFound` on no match.
+    /// Dropped rows remain visible as history via `PrStackView`/
+    /// `group_into_stacks` -- this never hard-deletes (mirrors
+    /// [`Self::drop_pull_request`]).
+    pub fn bulk_drop_open_pull_requests(&self, guardian_id: &str, reason: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET state='dropped', dropped_reason=?, updated_at_ms=? WHERE guardian_id=? AND state='open'",
+            params![reason, now_ms(), guardian_id],
+        )?;
+        Ok(n)
+    }
+
     /// Pick a `branch_alias` guaranteed not to collide with any other PR
     /// row already recorded for this `(forge, repo)`, appending a numeric
     /// suffix (`-002`, `-003`, ...) as needed (RAL-190). `exclude` is the
@@ -564,6 +581,24 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardians SET forge_stack_number=? WHERE id=?",
             params![number, guardian_id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-317: reset this guardian's registered GitHub-native PR stack
+    /// number back to unset (used by `review pr unlink`), so the next auto
+    /// or manual submission creates a fresh stack instead of trying to
+    /// append to one whose PRs were just unlinked. The counterpart to
+    /// [`Self::set_guardian_forge_stack_number`], which has no way to clear
+    /// -- it only ever overwrites with a new number.
+    pub fn clear_guardian_forge_stack_number(&self, guardian_id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET forge_stack_number=NULL WHERE id=?",
+            params![guardian_id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -875,6 +910,7 @@ fn synthesize_pr_text(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: trace_context.map(str::to_string),
         resume_agent_session_id: None,
@@ -882,6 +918,10 @@ fn synthesize_pr_text(
         env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
@@ -1339,6 +1379,7 @@ pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"count": n}),
+                    admin_only: false,
                 });
             }
             Ok(_) => {}
@@ -1515,6 +1556,7 @@ fn log_pr_merge_check_failure(
         task: None,
         log_path: None,
         payload: serde_json::json!({"pr_id": pr.id, "error": error}),
+        admin_only: false,
     });
 }
 
@@ -1571,6 +1613,7 @@ fn settle_pr_merge_states(
                 payload: serde_json::json!({
                     "pr_ids": live_prs.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
                 }),
+                admin_only: false,
             });
         }
         return approved;
@@ -1605,6 +1648,7 @@ fn settle_pr_merge_states(
                 "branch_id": pr.branch_id,
                 "guardian_status": current_guardian.status,
             }),
+            admin_only: false,
         });
         crate::rlog!(
             WARNING,
@@ -1736,6 +1780,7 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
                     "alias": pr.branch_alias,
                     "sha": local_sha,
                 }),
+                admin_only: false,
             });
         }
         crate::rlog!(
@@ -2033,6 +2078,7 @@ pub fn check_and_apply_forge_reorder(
                 "base_applied": base_applied,
                 "interrupted_local": interrupted_local
             }),
+            admin_only: false,
         });
         if interrupted_local {
             let _ = guard.set_guardian_notice(
@@ -2332,6 +2378,7 @@ fn poll_pr_base_drift_once(store: &Arc<Mutex<Store>>) {
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"count": n}),
+                    admin_only: false,
                 });
             }
             Ok(_) => {}
@@ -2530,6 +2577,7 @@ fn submit_stacked_branch_pr(
                 "pr_number": created_pr.number,
                 "pr_url": created_pr.url,
             }),
+            admin_only: false,
         });
     }
     // So a later branch in the same batch (or the whole-stack loop) chains
@@ -2780,6 +2828,7 @@ fn submit_stack_for_guardian(
             task: None,
             log_path: None,
             payload: serde_json::json!({"created": created.len(), "resynced": resynced}),
+            admin_only: false,
         });
     }
 
@@ -2844,6 +2893,166 @@ fn submit_stack_for_guardian(
     }
 
     Ok(created)
+}
+
+// ---------------------------------------------------------------------------
+// RAL-317: per-branch auto-submit trigger
+// ---------------------------------------------------------------------------
+
+/// Submit/grow this guardian's PR stack for every branch that has reached a
+/// terminal merge state (`done`/`conflict_resolved`) and doesn't already have
+/// a live open PR. This is [`submit_stack_for_guardian`] -- the exact
+/// machinery the manual "submit whole stack" (`branch_id: None`) request
+/// already exercises -- restricted to terminal branches only: a still-
+/// rebasing sibling has no `review_branch` yet and would fail
+/// `submit_stacked_branch_pr`'s precondition, so it is simply excluded from
+/// consideration here rather than aborting the branches that ARE ready.
+fn auto_submit_terminal_branches(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+) -> std::result::Result<Vec<PullRequestView>, String> {
+    let guardian = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let client = crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg)?;
+    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
+    let pr_branch_convention = forge_cfg.resolved_pr_branch_convention().to_string();
+
+    let mut ordered_enabled: Vec<&BranchView> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled && matches!(b.merge_status.as_str(), "done" | "conflict_resolved"))
+        .collect();
+    ordered_enabled.sort_by_key(|b| b.position);
+    if ordered_enabled.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let existing_prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let mut alias_by_branch = open_alias_by_branch(&existing_prs);
+
+    let stack_id = store
+        .lock()
+        .expect("poisoned")
+        .next_id("guardian_pr_stack_seq", "prstack")
+        .map_err(|e| e.to_string())?;
+
+    submit_stack_for_guardian(
+        store,
+        runner,
+        &client,
+        id,
+        &root,
+        &remote_name,
+        &guardian,
+        &ordered_enabled,
+        &mut alias_by_branch,
+        &base_branch_name,
+        &existing_prs,
+        &pr_branch_convention,
+        None,
+        &stack_id,
+        None,
+    )
+}
+
+/// RAL-317: called from [`crate::guardian_merge::promote_branch_terminal`]
+/// every time a branch reaches a terminal (`done`/`conflict_resolved`) merge
+/// state. A no-op unless the review's
+/// [`GuardianView::effective_auto_submit_pr_stack`] setting is on. Never
+/// fails or blocks the caller's merge transition -- errors are logged and
+/// recorded per-branch via [`Store::set_branch_auto_submit_error`] instead of
+/// propagated, and a success clears any previously-recorded error.
+///
+/// Does a cheap, local-only diff first -- comparing the branch's current
+/// review-ref sha against its existing open PR row's `last_pushed_sha`, no
+/// push/forge call involved -- so a re-entrant call for a branch whose state
+/// hasn't actually changed since its last successful auto-submit is a no-op
+/// before any network I/O happens (also clearing a stale failure marker, if
+/// any -- the branch's state is fine now regardless of how it got there).
+/// This is the anti-spam mechanism: no separate time-based debounce is
+/// needed.
+pub fn maybe_auto_submit_branch(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+) {
+    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if !guardian.effective_auto_submit_pr_stack {
+        return;
+    }
+    let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+        return;
+    };
+    if !branch.enabled {
+        return;
+    }
+    let Some(review_ref) = branch.review_branch.as_deref() else {
+        return;
+    };
+    let root = PathBuf::from(&guardian.git_root);
+    let Ok(current_sha) = git(&root, &["rev-parse", review_ref]).map(|s| s.trim().to_string())
+    else {
+        return;
+    };
+
+    let existing_prs = match store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let already_covered = existing_prs.iter().any(|pr| {
+        pr.branch_id.as_deref() == Some(branch_id)
+            && pr.state == "open"
+            && pr.last_pushed_sha.as_deref() == Some(current_sha.as_str())
+    });
+    if already_covered {
+        // The branch's state is already correctly reflected on the forge
+        // (e.g. a human ran `review pr submit` manually in the meantime) --
+        // clear any stale failure marker from a past attempt rather than
+        // leaving a resolved problem shown as still-failing.
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_branch_auto_submit_error(id, branch_id, None);
+        return;
+    }
+
+    match auto_submit_terminal_branches(store, runner, id) {
+        Ok(_) => {
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .set_branch_auto_submit_error(id, branch_id, None);
+        }
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack failed: {e}"
+            );
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .set_branch_auto_submit_error(id, branch_id, Some(&e));
+        }
+    }
 }
 
 fn submit_pull_requests_inner(
@@ -3196,6 +3405,7 @@ pub fn pull_pr_commits(
             task: None,
             log_path: None,
             payload: serde_json::json!({"pr_id": pr_id}),
+            admin_only: false,
         });
     }
     Ok(true)
@@ -3235,6 +3445,7 @@ pub fn start_pull_pr_commits(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"pr_id": pid, "pulled": pulled}),
+                    admin_only: false,
                 });
             }
             Err(e) => {
@@ -3251,6 +3462,7 @@ pub fn start_pull_pr_commits(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"pr_id": pid, "error": e}),
+                    admin_only: false,
                 });
             }
         },
@@ -3519,6 +3731,7 @@ pub fn start_submit_pull_requests(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"count": prs.len()}),
+                    admin_only: false,
                 });
             }
             Err(e) => {
@@ -3535,6 +3748,7 @@ pub fn start_submit_pull_requests(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"error": e}),
+                    admin_only: false,
                 });
             }
         }
@@ -3572,6 +3786,7 @@ pub fn start_action_pr_feedback(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"pr_id": pid, "comments": n}),
+                    admin_only: false,
                 });
             }
             Err(e) => {
@@ -3588,6 +3803,7 @@ pub fn start_action_pr_feedback(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"pr_id": pid, "error": e}),
+                    admin_only: false,
                 });
             }
         },
@@ -3678,6 +3894,7 @@ mod tests {
             resolved_env: std::collections::BTreeMap::new(),
             inherited_env: std::collections::BTreeMap::new(),
             started_at_ms: None,
+            auto_submit_error: None,
         }
     }
 
@@ -3905,10 +4122,10 @@ mod tests {
     #[test]
     fn guard_against_clobber_allows_first_push_and_blocks_divergence() {
         let root = tmp_dir("guard-root");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         gwrite(&root, "base.txt", "base\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["commit", "--message", "base"]);
 
         let remote_dir = tmp_dir("guard-remote");
         g(&remote_dir, &["init", "--bare"]);
@@ -3935,7 +4152,7 @@ mod tests {
         g(&clone_dir, &["checkout", "pr-x"]);
         gwrite(&clone_dir, "reviewer.txt", "fix\n");
         g(&clone_dir, &["add", "."]);
-        g(&clone_dir, &["commit", "-m", "reviewer fix"]);
+        g(&clone_dir, &["commit", "--message", "reviewer fix"]);
         g(&clone_dir, &["push", "origin", "pr-x"]);
 
         // Local `main` no longer contains the remote's unique commit -- blocked.
@@ -3959,14 +4176,14 @@ mod tests {
     #[test]
     fn guard_against_clobber_allows_overwriting_the_tip_it_last_pushed() {
         let root = tmp_dir("guard-lastpushed-root");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         gwrite(&root, "base.txt", "base\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["commit", "--message", "base"]);
         g(&root, &["checkout", "-b", "feature"]);
         gwrite(&root, "feat.txt", "feat\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "feat"]);
+        g(&root, &["commit", "--message", "feat"]);
 
         let remote_dir = tmp_dir("guard-lastpushed-remote");
         g(&remote_dir, &["init", "--bare"]);
@@ -3977,7 +4194,7 @@ mod tests {
         // Amending rewrites the SHA exactly the way replaying it would.
         gwrite(&root, "feat.txt", "feat rewritten\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "--amend", "-m", "feat rewritten"]);
+        g(&root, &["commit", "--amend", "--message", "feat rewritten"]);
         assert_ne!(g(&root, &["rev-parse", "feature"]).trim(), pushed);
 
         // Ancestry says divergence; the recorded tip says it is ours to replace.
@@ -3996,14 +4213,14 @@ mod tests {
     #[test]
     fn guard_against_clobber_allows_a_remote_whose_commits_were_all_replayed() {
         let root = tmp_dir("guard-replay-root");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         gwrite(&root, "base.txt", "base\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["commit", "--message", "base"]);
         g(&root, &["checkout", "-b", "feature"]);
         gwrite(&root, "feat.txt", "feat\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "feat"]);
+        g(&root, &["commit", "--message", "feat"]);
 
         let remote_dir = tmp_dir("guard-replay-remote");
         g(&remote_dir, &["init", "--bare"]);
@@ -4014,7 +4231,7 @@ mod tests {
         g(&root, &["checkout", "main"]);
         gwrite(&root, "other.txt", "other\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base advances"]);
+        g(&root, &["commit", "--message", "base advances"]);
         g(&root, &["checkout", "feature"]);
         g(&root, &["rebase", "main"]);
 
@@ -4032,14 +4249,14 @@ mod tests {
     /// row pointing at it.
     fn sync_status_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
         let root = tmp_dir("sync-root");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         gwrite(&root, "base.txt", "base\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["commit", "--message", "base"]);
         g(&root, &["checkout", "-b", "review-branch"]);
         gwrite(&root, "feat.txt", "feat\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "feat"]);
+        g(&root, &["commit", "--message", "feat"]);
         g(&root, &["checkout", "main"]);
 
         let remote_dir = tmp_dir("sync-remote");
@@ -4114,14 +4331,14 @@ mod tests {
     /// the worktree or the PR side, via [`rebase_with_conflict`].
     fn conflict_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
         let root = tmp_dir("sync-conflict-root");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         gwrite(&root, "shared.txt", "line1\nline2\nline3\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["commit", "--message", "base"]);
         g(&root, &["checkout", "-b", "review-branch"]);
         gwrite(&root, "shared.txt", "line1\nline2-review\nline3\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "feat"]);
+        g(&root, &["commit", "--message", "feat"]);
         g(&root, &["checkout", "main"]);
 
         let remote_dir = tmp_dir("sync-conflict-remote");
@@ -4182,7 +4399,7 @@ mod tests {
         g(dir, &["checkout", &new_base]);
         gwrite(dir, "shared.txt", "line1\nline2-newbase\nline3\n");
         g(dir, &["add", "."]);
-        g(dir, &["commit", "-m", "advance base (conflicting)"]);
+        g(dir, &["commit", "--message", "advance base (conflicting)"]);
         g(dir, &["checkout", target_branch]);
 
         let run_rebase = |d: &Path| -> std::process::Output {
@@ -4237,7 +4454,7 @@ mod tests {
             g(dir, &["rebase", "--continue"]);
         }
 
-        g(dir, &["branch", "-D", &new_base]);
+        g(dir, &["branch", "--delete", "--force", &new_base]);
     }
 
     #[test]
@@ -4269,7 +4486,7 @@ mod tests {
         g(&clone_dir, &["checkout", "pr-y"]);
         gwrite(&clone_dir, "reviewer.txt", "fix\n");
         g(&clone_dir, &["add", "."]);
-        g(&clone_dir, &["commit", "-m", "reviewer fix"]);
+        g(&clone_dir, &["commit", "--message", "reviewer fix"]);
         g(&clone_dir, &["push", "origin", "pr-y"]);
 
         let status = compute_sync_status(&store, &pr_id).unwrap();
@@ -4288,7 +4505,7 @@ mod tests {
         g(&root, &["checkout", "review-branch"]);
         gwrite(&root, "more.txt", "more\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "more work"]);
+        g(&root, &["commit", "--message", "more work"]);
         g(&root, &["checkout", "main"]);
 
         let status = compute_sync_status(&store, &pr_id).unwrap();
@@ -4320,7 +4537,7 @@ mod tests {
         g(&root, &["checkout", "main"]);
         gwrite(&root, "unrelated.txt", "unrelated\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "advance base"]);
+        g(&root, &["commit", "--message", "advance base"]);
         g(&root, &["checkout", "review-branch"]);
         g(&root, &["rebase", "main"]);
         g(&root, &["checkout", "main"]);
@@ -4356,7 +4573,10 @@ mod tests {
         g(&clone_dir, &["checkout", "newbase"]);
         gwrite(&clone_dir, "external.txt", "external\n");
         g(&clone_dir, &["add", "."]);
-        g(&clone_dir, &["commit", "-m", "advance base externally"]);
+        g(
+            &clone_dir,
+            &["commit", "--message", "advance base externally"],
+        );
         g(&clone_dir, &["checkout", "pr-y"]);
         g(&clone_dir, &["rebase", "newbase"]);
         g(&clone_dir, &["push", "--force", "origin", "pr-y"]);
@@ -4466,7 +4686,7 @@ mod tests {
         g(&root, &["checkout", "review-branch"]);
         gwrite(&root, "local-only.txt", "local\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "local work"]);
+        g(&root, &["commit", "--message", "local work"]);
         g(&root, &["checkout", "main"]);
 
         // ...while the PR branch independently gains a different commit,
@@ -4483,7 +4703,7 @@ mod tests {
         g(&clone_dir, &["checkout", "pr-y"]);
         gwrite(&clone_dir, "reviewer-only.txt", "reviewer\n");
         g(&clone_dir, &["add", "."]);
-        g(&clone_dir, &["commit", "-m", "reviewer work"]);
+        g(&clone_dir, &["commit", "--message", "reviewer work"]);
         g(&clone_dir, &["push", "origin", "pr-y"]);
 
         let status = compute_sync_status(&store, &pr_id).unwrap();
@@ -4661,7 +4881,7 @@ mod tests {
         g(&root, &["checkout", "review-branch"]);
         gwrite(&root, "resolved.txt", "resolved\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "conflict resolution"]);
+        g(&root, &["commit", "--message", "conflict resolution"]);
         g(&root, &["checkout", "main"]);
         let new_local_sha = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
 
@@ -4697,7 +4917,7 @@ mod tests {
         g(&root, &["checkout", "main"]);
         gwrite(&root, "base-advance.txt", "moved\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "base advances"]);
+        g(&root, &["commit", "--message", "base advances"]);
         g(&root, &["checkout", "review-branch"]);
         g(&root, &["rebase", "main"]);
         g(&root, &["checkout", "main"]);
@@ -4746,7 +4966,7 @@ mod tests {
         g(&root, &["checkout", "review-branch"]);
         gwrite(&root, "half-done.txt", "wip\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "mid-merge"]);
+        g(&root, &["commit", "--message", "mid-merge"]);
         g(&root, &["checkout", "main"]);
 
         sync_open_pr_branches(&store, &gid);
@@ -4809,14 +5029,14 @@ mod tests {
         g(&clone_dir, &["checkout", "pr-y"]);
         gwrite(&clone_dir, "reviewer.txt", "fix\n");
         g(&clone_dir, &["add", "."]);
-        g(&clone_dir, &["commit", "-m", "reviewer fix"]);
+        g(&clone_dir, &["commit", "--message", "reviewer fix"]);
         g(&clone_dir, &["push", "origin", "pr-y"]);
         let remote_sha_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
 
         g(&root, &["checkout", "review-branch"]);
         gwrite(&root, "resolved.txt", "resolved\n");
         g(&root, &["add", "."]);
-        g(&root, &["commit", "-m", "conflict resolution"]);
+        g(&root, &["commit", "--message", "conflict resolution"]);
         g(&root, &["checkout", "main"]);
 
         sync_open_pr_branches(&store, &gid);
@@ -6014,5 +6234,367 @@ mod tests {
     #[test]
     fn parse_suggested_pr_rejects_garbage() {
         assert!(parse_suggested_pr("no json here").is_none());
+    }
+
+    // ── RAL-317: maybe_auto_submit_branch (per-branch auto-submit trigger) ──
+    //
+    // These deliberately never push over a real git transport or hit a real
+    // (or mock-HTTP) forge -- there's no portable, hang-proof way to fake a
+    // local push target that `crate::forge::resolve_remote`'s host/path
+    // parser also accepts (a plain local remote path doesn't parse as a
+    // forge host; `git remote get-url` itself resolves `url.*.insteadOf`
+    // rewrites, so that trick can't decouple "real local push target" from
+    // "forge-parseable URL" either -- and this workspace's Windows dev
+    // environment has no `git-daemon` to fall back on). Every existing
+    // `pr.rs` test that touches `submit_stacked_branch_pr`'s push+create
+    // path has the same gap, so these follow the same scope precedent:
+    // exercise `maybe_auto_submit_branch`'s own decision logic (effective-
+    // option gate, cheap local-only diff, error bookkeeping) with a real
+    // git repo but no reachable forge, rather than the full submission
+    // machinery it delegates to on a cache miss.
+
+    struct NoopRunner;
+    impl Runner for NoopRunner {
+        fn run(&self, _spec: &RunnerSpec) -> crate::runner::RunnerResult {
+            // `synthesize_pr_text` falls back to a plain title/summary
+            // whenever the runner doesn't report success -- these tests
+            // don't need a real agent call, just a deterministic PR body.
+            crate::runner::RunnerResult::failure("noop runner: no agent available in this test")
+        }
+    }
+
+    /// A repo with one commit on `main` and a `feature/x` branch with one
+    /// commit ahead of it (checked back out to `main` before returning).
+    /// Deliberately has no `origin` remote configured -- see the module note
+    /// above for why these tests never attempt a real push/forge call.
+    fn setup_auto_submit_repo(tag: &str) -> PathBuf {
+        let root = tmp_dir(tag);
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+
+        g(&root, &["checkout", "-b", "feature/x"]);
+        gwrite(&root, "x.txt", "from x\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add x"]);
+        g(&root, &["checkout", "main"]);
+        root
+    }
+
+    /// Set up a guardian with one enabled, `done` branch whose review ref is
+    /// `feature/x`, returning `(guardian_id, branch_id, feature/x's tip sha)`.
+    fn setup_terminal_branch(
+        store: &Arc<Mutex<Store>>,
+        root: &Path,
+        auto_submit: bool,
+    ) -> (String, String, String) {
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        if auto_submit {
+            store
+                .lock()
+                .unwrap()
+                .set_guardian_auto_submit_pr_stack(&gid, Some(true))
+                .unwrap();
+        }
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "feature/x")
+            .unwrap();
+        let bid = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .unwrap()
+            .set_branch_review(&gid, &bid, "feature/x", "")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_branch_status(&gid, &bid, crate::guardian::MergeStatus::Done, None)
+            .unwrap();
+        let tip = g(root, &["rev-parse", "feature/x"]).trim().to_string();
+        (gid, bid, tip)
+    }
+
+    #[test]
+    fn maybe_auto_submit_branch_is_noop_when_effective_option_is_off() {
+        let root = setup_auto_submit_repo("auto-submit-off");
+        let store = Arc::new(Mutex::new(store()));
+        // effective_auto_submit_pr_stack defaults to false (no override, no
+        // registered project default) -- left untouched deliberately.
+        let (gid, bid, _tip) = setup_terminal_branch(&store, &root, false);
+
+        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+
+        let prs = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+        assert!(prs.is_empty(), "auto-submit must be a no-op when disabled");
+        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(
+            gv.branches
+                .iter()
+                .find(|b| b.id == bid)
+                .unwrap()
+                .auto_submit_error,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maybe_auto_submit_branch_skips_forge_entirely_when_already_covered_by_a_matching_pr() {
+        let root = setup_auto_submit_repo("auto-submit-covered");
+        let store = Arc::new(Mutex::new(store()));
+        let (gid, bid, tip) = setup_terminal_branch(&store, &root, true);
+
+        // Simulate a PR already open for this exact branch state (whether
+        // from a prior successful auto-submit, or a human running
+        // `review pr submit` manually) -- `last_pushed_sha` matches the
+        // branch's current tip exactly.
+        store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some(&bid),
+                "github",
+                "acme/widget",
+                "feature-x-review",
+                "main",
+                "Add x",
+                "",
+                Some(5),
+                None,
+            )
+            .unwrap();
+        let existing_id = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap()[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .unwrap()
+            .update_pull_request_ex(
+                &existing_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(tip.as_str())),
+                None,
+            )
+            .unwrap();
+
+        // This guardian has NO git remote configured at all -- if
+        // `maybe_auto_submit_branch` attempted forge resolution despite
+        // already being covered, it would fail fast and record an error
+        // (proven by the next test), so "no error recorded" here is direct
+        // evidence the cheap diff short-circuited before any forge call.
+        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+
+        let prs = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap();
+        assert_eq!(
+            prs.len(),
+            1,
+            "must not create a second pr for the same branch state"
+        );
+        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(
+            gv.branches
+                .iter()
+                .find(|b| b.id == bid)
+                .unwrap()
+                .auto_submit_error,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maybe_auto_submit_branch_records_error_on_forge_resolution_failure_without_touching_branch_status()
+     {
+        let root = setup_auto_submit_repo("auto-submit-fail");
+        let store = Arc::new(Mutex::new(store()));
+        // No git remote configured -- `resolve_remote` fails fast (no
+        // network attempted, no hang) with "could not read remote 'origin'".
+        let (gid, bid, _tip) = setup_terminal_branch(&store, &root, true);
+
+        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+
+        // The failed forge resolution must never be surfaced as a merge-
+        // blocking error: the branch's own terminal status (already
+        // recorded by the caller before this side effect ever runs) and the
+        // guardian's overall status are both untouched.
+        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(gv.status, "collecting");
+        let branch = gv.branches.iter().find(|b| b.id == bid).unwrap();
+        assert_eq!(branch.merge_status, "done");
+        assert!(
+            branch.auto_submit_error.is_some(),
+            "a forge resolution failure must be recorded as a per-branch marker"
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .list_pull_requests_for_guardian(&gid)
+                .unwrap()
+                .is_empty(),
+            "a failed submission must not leave a partial pr row behind"
+        );
+
+        // Once the branch's state is otherwise covered (e.g. a human
+        // resubmitted manually), the stale failure marker is cleared even
+        // though it was never cleared by a fresh auto-submit success --
+        // `maybe_auto_submit_branch`'s cheap-diff path clears it too, since
+        // finding the state already healthy is itself evidence there's
+        // nothing left to report as failing.
+        store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some(&bid),
+                "github",
+                "acme/widget",
+                "feature-x-review",
+                "main",
+                "Add x",
+                "",
+                Some(9),
+                None,
+            )
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .unwrap()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap()[0]
+            .id
+            .clone();
+        let tip = g(&root, &["rev-parse", "feature/x"]).trim().to_string();
+        store
+            .lock()
+            .unwrap()
+            .update_pull_request_ex(
+                &pr_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(tip.as_str())),
+                None,
+            )
+            .unwrap();
+
+        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(
+            gv.branches
+                .iter()
+                .find(|b| b.id == bid)
+                .unwrap()
+                .auto_submit_error,
+            None,
+            "the marker must clear once the branch's state is covered again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── RAL-317: review pr unlink (bulk drop + stack-number clear) ─────────
+
+    #[test]
+    fn bulk_drop_open_pull_requests_drops_only_open_rows_and_is_a_noop_when_none_are_open() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let open_id = s
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let already_merged_id = s
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000002"),
+                "github",
+                "acme/widget",
+                "b",
+                "main",
+                "B",
+                "",
+                Some(2),
+                None,
+            )
+            .unwrap();
+        s.update_pull_request(&already_merged_id, None, None, None, Some("merged"))
+            .unwrap();
+
+        let dropped = s.bulk_drop_open_pull_requests(&gid, "unlinked").unwrap();
+        assert_eq!(dropped, 1, "only the still-open row is dropped");
+
+        let open_pr = s.get_pull_request(&open_id).unwrap();
+        assert_eq!(open_pr.state, "dropped");
+        let merged_pr = s.get_pull_request(&already_merged_id).unwrap();
+        assert_eq!(
+            merged_pr.state, "merged",
+            "an already-merged row is left untouched, not force-dropped"
+        );
+
+        // Calling it again with nothing left open is a silent no-op, not an
+        // error (matches the bulk-friendly precedent, unlike the single-row
+        // `drop_pull_request`'s `NotFound`).
+        assert_eq!(s.bulk_drop_open_pull_requests(&gid, "unlinked").unwrap(), 0);
+
+        // Dropped rows remain visible as history via `PrStackView`.
+        let stacks = group_into_stacks(s.list_pull_requests_for_guardian(&gid).unwrap());
+        let all_prs: Vec<_> = stacks.iter().flat_map(|s| &s.prs).collect();
+        assert_eq!(all_prs.len(), 2, "dropped rows are never hard-deleted");
+    }
+
+    #[test]
+    fn clear_guardian_forge_stack_number_resets_to_unset() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        s.set_guardian_forge_stack_number(&gid, 42).unwrap();
+        assert_eq!(s.get_guardian_forge_stack_number(&gid).unwrap(), Some(42));
+
+        s.clear_guardian_forge_stack_number(&gid).unwrap();
+        assert_eq!(s.get_guardian_forge_stack_number(&gid).unwrap(), None);
+
+        assert!(matches!(
+            s.clear_guardian_forge_stack_number("nope"),
+            Err(StoreError::NotFound)
+        ));
     }
 }

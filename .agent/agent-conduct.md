@@ -61,6 +61,40 @@ This applies to code comments and docstrings project-wide. Architecture
 narrative in `AGENTS.md` files is a separate case — those documents are meant
 to record where things came from.
 
+## External CLI calls use long flags
+
+Every invocation this repo makes of another command-line tool -- `git`, `gh`,
+`glab`, `cargo`, `docker`, `mkdocs`, `cygpath`, whatever comes next -- spells
+its options in long form. `cargo build --package ralphus-daemon`, not
+`cargo build -p ralphus-daemon`; `git commit --message`, not `git commit -m`.
+This holds in `scripts/`, in daemon-spawned subprocess code, and in the test
+helpers that shell out to `git`.
+
+A short flag is a lookup for every later reader, and the daemon's subprocess
+call sites are the worst place to pay that cost: they run unattended, so a
+misread flag surfaces as a broken squad rather than a compile error. Long
+flags also survive review -- `--set-upstream` is checkable at a glance in a
+diff, `-u` is not.
+
+Convert only where the tool documents an equivalent. Verify against the
+tool's own `--help` rather than assuming a long form exists; several common
+ones do not, and these stay short:
+
+- `git -C <path>` and `git -c <key>=<val>` -- no long forms.
+- `git checkout -b`/`-B` and `git worktree add -b`/`-B` -- `--branch` is
+  rejected by both.
+- `git ls-tree -r`/`-z`, `git ls-files -z`, `git clean -d` -- no long forms
+  (`--recursive`/`--directories` are rejected).
+- `ssh`, `ssh-keygen`, `scp`, `tmux` -- these accept single-dash options
+  only, repo-wide.
+- `sh -c` / `cmd /C` -- the shell's own invocation flag.
+- POSIX coreutils in `scripts/*.sh` (`mkdir -p`, `rm -rf`, `tail -n`): the
+  GNU long forms are not portable, and these scripts are documented as
+  macOS/Linux, where BSD versions reject them.
+
+Shell test operators (`[ -f ]`, `[ -z ]`, `read -r`) are not external tool
+calls and are out of scope.
+
 ## Commit messages
 
 Omit the `Claude-Session: https://claude.ai/code/session_...` trailer. Keep
@@ -73,6 +107,25 @@ right — but frame the options as literal command sequences or observable
 behavior ("the worktree keeps up with pushes; local commits are never lost"),
 not ref-mechanics vocabulary like "detached HEAD". Prefer `AskUserQuestion`
 options with command-sequence previews over prose descriptions.
+
+## New TOML fields: ask before validating
+
+Whenever a new field is added to the task-file schema (`core/src/schema.rs`),
+ask the user whether it should be validated in `core/src/validate.rs`, and
+if so, how — before writing the validation logic, not after. A field can be
+free-form text, a closed set of literals (reject anything outside the set,
+like `system_prompt_position`), a numeric range (reject `<= 0`, like
+`maximum_budget_usd`), cross-checked against another field, or deliberately
+left unvalidated and only sanity-checked server-side at write time (the
+existing precedent for `[[review]] proof_scope`'s own daemon-side setter,
+which stores whatever string it's given and only filters at *read* time).
+None of these is the obviously-correct default — guessing one produces
+either an over-strict validator that rejects a value the user actually
+wanted, or a silently-lenient one that lets a typo through to the daemon.
+
+Ask concretely: name the candidate value shapes (an enum's literal list, a
+numeric bound, "no validation") rather than asking "should this be
+validated?" in the abstract.
 
 ## Report what you could not verify
 

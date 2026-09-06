@@ -46,7 +46,7 @@ detailed usage and exit before doing any command work.
 ## Selectors
 
 Most `show`/action commands take a **selector** instead of raw ids/indices
-(`cli/src/ralphus/selector.py`). Anywhere this reference writes `<selector>`,
+(`cli/src/selector.rs`). Anywhere this reference writes `<selector>`,
 `<squad_id>`, or a queue item path, the **ralphus URI** form below is accepted
 too — including the bare `squad_id` positionals of the `squad *` family, `status`,
 `graph`, and `queue set-status`/`reorder`/`set-position`.
@@ -201,7 +201,7 @@ aborts the remaining batch).
 | `cell set-status <selector> <state>` | Override a cell's status |
 | `cell restart <selector>` | Restart a cell and its downstream |
 | `cell restart-proof <selector> --from <i>` | Restart cell-level proof steps from index `i` |
-| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command]` | Edit a cell's fields |
+| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt]` | Edit a cell's fields |
 | `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
 
 ## proof
@@ -224,6 +224,7 @@ aborts the remaining batch).
 | `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
+| `review reopen <selector>` | Reopen a cancelled review, immediately staging in whatever branches are already ready |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |
@@ -530,8 +531,9 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
     - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
-        - edit selector [str] --agent [name] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a cell's fields.}
+        - edit selector [str] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a cell's fields.}
         - open-agent selector [str]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
+        - remote-terminal selector [str]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
         - restart selector [str]  {Restart a cell (and its downstream), dirtying dependent squads.}
         - restart-proof selector [str] --from [index]  {Restart a cell's proof steps from an index onwards.}
         - resume-automation selector [str]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
@@ -541,7 +543,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) terminal selector [str] --mode [open|readonly]  {Print the command to resume a cell's conversation locally.}
         - (read-only-safe) worktree selector [str]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
-        - (read-only-safe) health --enable-developer-checks (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama).}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --json (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9).}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
@@ -553,7 +555,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
     - (read-only-safe) listen selector [str] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
-        - cleanup machine [str]  {Tear down one provisioned workspace on a machine provider (RAL-201).}
+        - cleanup machine [str] --branch [name] --project [name]  {Tear down one project's provisioned workspace on a machine provider -- the whole project directory, or just --branch's worktree (RAL-201, reshaped by RAL-355 Phase 2).}
         - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
         - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
@@ -562,7 +564,7 @@ use; see `READ_ONLY_NOTE`.
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
-        - git --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
+        - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
     - proof  {Inspect and act on proof steps.}
         - edit selector [str] --model [name]  {Edit a proof step's model override.}
@@ -610,8 +612,10 @@ use; see `READ_ONLY_NOTE`.
             - pull-from-pr pr_id [str]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
             - (read-only-safe) show pr_id [str]  {Show one PR row.}
             - submit selector [str] --alias [name] --combined --description [text] --position [integer] --title [text] --use-worktree-branch-name  {Submit a PR/MR for one stacked branch or the combined worktree.}
+            - unlink selector [str]  {Bulk-drop every currently open PR row for a review and clear its registered forge PR stack number, so a later submission starts a fresh stack instead of appending to one whose PRs were just unlinked (RAL-317).}
             - update pr_id [str] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
         - rename selector [str] name [str]  {Rename a review.}
+        - reopen selector [str]  {Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
         - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
@@ -646,6 +650,12 @@ use; see `READ_ONLY_NOTE`.
         - restart-proof selector [str] --from [index]  {Restart a task's proof steps from an index onwards.}
         - set-status selector [str] state [str]  {Manually override a task's status.}
         - (read-only-safe) show selector [str]  {Show a single task node's detail.}
+    - triage  {Register and inspect Triage types -- the Arbiter subsystem's automatic-review classification categories (RAL-318).}
+        - type  {Register and inspect Triage types (RAL-318).}
+            - deregister name [str]  {Remove a Triage type. The built-in "unclassified" type can never be deregistered.}
+            - (read-only-safe) get name [str]  {Show one registered Triage type by exact name.}
+            - (read-only-safe) list  {List every registered Triage type, including the built-in "unclassified" type.}
+            - register name [str] --description [text] --label [text]  {Register (or update) a Triage type -- the categories the Arbiter classifies a Triage-opted-in cell into (RAL-318).}
     - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
     - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
 ```

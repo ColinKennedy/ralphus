@@ -7,7 +7,7 @@ rem
 rem   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
 rem                                            seconds each; all four are Rust)
 rem
-rem All four binaries are Rust -- there is no Python venv sync step. `cli\`
+rem All four binaries are Rust -- there is no Python venv sync step. `cli-py\`
 rem still exists for `docsgen\` (Playwright screenshots, dev-only, never
 rem shipped).
 rem
@@ -75,7 +75,7 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
 rem 1. Build all four Rust bins in debug (fast incremental rebuild picks up
 rem    board.html and any CLI/runner source edit alike).
 echo == cargo build (debug) daemon + librarian + runner + cli ==
-cargo build -p ralphus-daemon -p ralphus-librarian -p ralphus-runner -p ralphus-cli --manifest-path "%root%\Cargo.toml"
+cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
 
 rem 2. Point RALPHUS_RUNNER_CMD at the just-built debug runner exe.

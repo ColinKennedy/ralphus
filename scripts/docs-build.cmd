@@ -13,7 +13,7 @@ set "root=%~dp0.."
 for %%I in ("%root%") do set "root=%%~fI"
 
 echo == syncing docs venv (uv) ==
-pushd "%root%\cli"
+pushd "%root%\cli-py"
 uv sync --extra docs >nul
 if errorlevel 1 (popd & exit /b 1)
 
@@ -22,7 +22,7 @@ uv run ralphus-docs-lint
 if errorlevel 1 (popd & exit /b 1)
 
 echo == mkdocs build ==
-uv run mkdocs build -f "%root%\docs\site\mkdocs.yml"
+uv run mkdocs build --config-file "%root%\docs\site\mkdocs.yml"
 if errorlevel 1 (popd & exit /b 1)
 popd
 

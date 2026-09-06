@@ -9,8 +9,12 @@ rem UI change; review and commit the resulting PNG diffs.
 set "root=%~dp0.."
 for %%I in ("%root%") do set "root=%%~fI"
 
+echo == building ralphus-librarian (debug) ==
+cargo build --package ralphus-librarian --manifest-path "%root%\Cargo.toml"
+if errorlevel 1 exit /b 1
+
 echo == syncing docs venv (uv) ==
-pushd "%root%\cli"
+pushd "%root%\cli-py"
 uv sync --extra docs >nul
 if errorlevel 1 (popd & exit /b 1)
 

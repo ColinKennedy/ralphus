@@ -187,7 +187,7 @@ pub(crate) fn push_feedback_branch(
     if force {
         args.push("--force");
     }
-    args.push("-u");
+    args.push("--set-upstream");
     args.push(&remote);
     args.push(&refspec);
     wt.git(&args)?;
@@ -383,7 +383,7 @@ fn purge_carry_refs(root: &Workspace, id: &str) {
     )
     .unwrap_or_default();
     for name in listed.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = root.git(&["update-ref", "-d", name]);
+        let _ = root.git(&["update-ref", "--delete", name]);
     }
 }
 
@@ -417,7 +417,7 @@ impl CarryRefs {
 impl Drop for CarryRefs {
     fn drop(&mut self) {
         for (root, name) in &self.pins {
-            let _ = git(root, &["update-ref", "-d", name]);
+            let _ = git(root, &["update-ref", "--delete", name]);
         }
     }
 }
@@ -475,7 +475,7 @@ fn regen_from_feature_worktree(
                 "ralphus [guardian] worktree recovery: feature branch '{branch}' is absent; \
                  creating '{rev}' from feature-worktree HEAD {sha} — prior review commits lost"
             );
-            let _ = root.git(&["branch", "-D", rev]);
+            let _ = root.git(&["branch", "--delete", "--force", rev]);
             root.git(&["branch", rev, &sha])
                 .map_err(|e| format!("cannot create branch '{rev}' at {sha}: {e}"))?;
             root.git(&["worktree", "add", "--force", &wt_str, rev])
@@ -565,7 +565,7 @@ where
         // Remove any stale tracking entry for this path (quick no-op when not
         // registered). This handles [State 4] when git's remove succeeds on a
         // ghost entry; if it does not, the lazy prune below is the fallback.
-        let _ = root.git(&["worktree", "remove", "-f", &wt_str]);
+        let _ = root.git(&["worktree", "remove", "--force", &wt_str]);
 
         if branch_exists(root, branch) {
             // [State 4] If a stale tracking entry blocks the add, prune and retry.
@@ -611,7 +611,7 @@ where
         }
         let checkout = faults
             .checkout_error()
-            .map_or_else(|| wt.git(&["checkout", "-f", "-B", rev, branch]), Err);
+            .map_or_else(|| wt.git(&["checkout", "--force", "-B", rev, branch]), Err);
         if checkout.is_ok() {
             return Ok(());
         }
@@ -623,12 +623,13 @@ where
     // Remove any existing tracking entry for this path.
     // One `-f` handles dirty/untracked files; a second `-f` handles locked
     // worktrees (belt-and-suspenders after the explicit unlock above).
-    let remove = faults
-        .remove_error()
-        .map_or_else(|| root.git(&["worktree", "remove", "-f", &wt_str]), Err);
+    let remove = faults.remove_error().map_or_else(
+        || root.git(&["worktree", "remove", "--force", &wt_str]),
+        Err,
+    );
     log_worktree_remove_attempt(&wt_str, 1, &remove);
     let remove = faults.remove_error().map_or_else(
-        || root.git(&["worktree", "remove", "-f", "-f", &wt_str]),
+        || root.git(&["worktree", "remove", "--force", "--force", &wt_str]),
         Err,
     );
     log_worktree_remove_attempt(&wt_str, 2, &remove);
@@ -690,10 +691,10 @@ where
     // [State 3] Review branch missing: `-B` creates it.
     // [State 5] Branch mismatch: `-B` resets to the correct starting point.
     // [State 6] Detached HEAD: `checkout` reattaches to a named branch.
-    // `-f` discards local modifications.
+    // `--force` discards local modifications.
     let checkout = faults
         .checkout_error()
-        .map_or_else(|| wt.git(&["checkout", "-f", "-B", rev, branch]), Err);
+        .map_or_else(|| wt.git(&["checkout", "--force", "-B", rev, branch]), Err);
     match checkout {
         Ok(_) => Ok(()),
         Err(checkout_err) => {
@@ -821,6 +822,122 @@ fn count_markers(wt: &Workspace, files: &[String]) -> usize {
         .sum()
 }
 
+/// RAL-330: per-file `(added, deleted)` line counts from `git diff --numstat`,
+/// run with `extra_args` appended (e.g. `[old, new]` for a commit-to-commit
+/// diff, or a single ref to diff against the current working tree/index).
+/// Binary files report `-`/`-` for both counts and are silently dropped —
+/// this check can't reason about binary content either way, so treating `-`
+/// as `0` would make a binary file's real content loss invisible instead of
+/// just unverifiable.
+fn diff_numstat(
+    wt: &Workspace,
+    extra_args: &[&str],
+) -> std::collections::BTreeMap<String, (u64, u64)> {
+    // RAL-330: `--no-renames` is load-bearing, not cosmetic. With rename
+    // detection on (git's default for `git diff`), a renamed path is
+    // reported as `dir/{old => new}` -- a display string, not a usable
+    // pathspec. `lost`'s entries flow straight into `git rerere forget` as
+    // literal arguments (see the call site above); a `{old => new}` string
+    // matches nothing there, so `forget` silently no-ops and the poisoned
+    // rerere entry survives to replay on the very next retry.
+    let mut args = vec!["diff", "--numstat", "--no-renames"];
+    args.extend_from_slice(extra_args);
+    wt.git(&args)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let added = parts.next()?.parse::<u64>().ok()?;
+            let deleted = parts.next()?.parse::<u64>().ok()?;
+            let path = parts.next()?.to_string();
+            Some((path, (added, deleted)))
+        })
+        .collect()
+}
+
+/// RAL-330: file paths changed by `git diff --name-only`, run with
+/// `extra_args` appended the same way as [`diff_numstat`].
+fn diff_name_set(wt: &Workspace, extra_args: &[&str]) -> HashSet<String> {
+    // RAL-330: `--no-renames`, same reason as `diff_numstat` -- this set is
+    // intersected against `diff_numstat`'s (also de-abbreviated) paths, so
+    // the two must agree on path identity for a renamed file.
+    let mut args = vec!["diff", "--name-only", "--no-renames"];
+    args.extend_from_slice(extra_args);
+    wt.git(&args)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// RAL-330: verify that a rebase step about to be finished — because no
+/// conflict markers remain, whether `git rerere`'s fast path replayed a
+/// cached resolution or a real agent fix was just staged — has not silently
+/// dropped any of `REBASE_HEAD`'s own real content.
+///
+/// Anchored on git's own `REBASE_HEAD` (the commit currently being replayed)
+/// rather than on either side's named base branch, so it is blind to the
+/// task's base branch differing from the review's upstream, and to the task
+/// and review having unrelated commit histories/counts (squash, a
+/// review-worktree commit upstreamed from an unrelated PR branch, ...) — see
+/// RAL-330's ticket for the concerns this addresses.
+///
+/// Only checks files the *new base* never touched at all between
+/// `REBASE_HEAD`'s old and new parent: those had no legitimate reason to
+/// change during this replay, so their diff against the new base must
+/// exactly match their diff against the old parent. Files the new base did
+/// touch are a genuine conflict zone where a correct merge is expected to
+/// differ from either side alone, so this deliberately does not verify them
+/// — exact-equality there would false-positive on every correctly-resolved
+/// conflict, not just a lossy one.
+///
+/// Returns the paths that lost content, or `None` if nothing looks wrong —
+/// including when there is no `REBASE_HEAD` to check against, which means
+/// this isn't actually a paused per-commit rebase step.
+fn detect_rebase_step_content_loss(wt: &Workspace) -> Option<Vec<String>> {
+    let rebase_head = wt
+        .git(&["rev-parse", "REBASE_HEAD"])
+        .ok()?
+        .trim()
+        .to_string();
+    if rebase_head.is_empty() {
+        return None;
+    }
+    let old_parent = format!("{rebase_head}^");
+    let new_base = wt.git(&["rev-parse", "HEAD"]).ok()?.trim().to_string();
+
+    let original = diff_numstat(wt, &[old_parent.as_str(), rebase_head.as_str()]);
+    if original.is_empty() {
+        return None;
+    }
+    let base_delta = diff_name_set(wt, &[old_parent.as_str(), new_base.as_str()]);
+    let replayed = diff_numstat(wt, &[new_base.as_str()]);
+
+    let lost: Vec<String> = original
+        .iter()
+        .filter(|(path, _)| !base_delta.contains(*path))
+        .filter(|(path, stat)| replayed.get(*path).copied() != Some(**stat))
+        .map(|(path, _)| path.clone())
+        .collect();
+
+    if lost.is_empty() { None } else { Some(lost) }
+}
+
+/// RAL-330: whether `REBASE_HEAD`'s own patch (against its true parent) is
+/// empty — i.e. this step genuinely has nothing left to contribute, the
+/// legitimate case `--empty=drop`/`--skip` exist for. `true` when there is no
+/// `REBASE_HEAD` to check (preserves [`advance_rebase`]'s prior behavior for
+/// a state this function was never meant to gate).
+fn rebase_head_commit_is_empty(wt: &Workspace) -> bool {
+    match wt.git(&["rev-parse", "REBASE_HEAD"]) {
+        Ok(sha) => {
+            let sha = sha.trim();
+            diff_numstat(wt, &[&format!("{sha}^"), sha]).is_empty()
+        }
+        Err(_) => true,
+    }
+}
+
 /// Advance a paused rebase with `git rebase --continue`. On failure, only
 /// falls back to `--skip` when no conflict is actually present — i.e. the
 /// failure was genuinely about the just-applied commit becoming empty (or
@@ -830,8 +947,20 @@ fn count_markers(wt: &Workspace, files: &[String]) -> usize {
 /// conflicted files present means a new commit needs the resolver loop to
 /// pick it up — skipping it here would silently discard that commit's
 /// changes instead of ever resolving them.
+///
+/// RAL-330: even then, `--skip` only runs when `REBASE_HEAD`'s own commit is
+/// confirmed empty. `--continue` can fail for reasons that have nothing to do
+/// with the commit's content (a failing hook, a transient git error) while
+/// the index is still fully staged for a *non-empty* commit; unconditionally
+/// skipping in that case would silently discard the whole commit instead of
+/// just the conflict `--skip` is meant to bypass. When the commit is not
+/// confirmed empty, this leaves the rebase paused rather than guessing —
+/// the caller's resolver loop will see it as still in progress and retry.
 fn advance_rebase(wt: &Workspace) {
-    if wt.git(&["rebase", "--continue"]).is_err() && conflicted_files(wt).is_empty() {
+    if wt.git(&["rebase", "--continue"]).is_err()
+        && conflicted_files(wt).is_empty()
+        && rebase_head_commit_is_empty(wt)
+    {
         let _ = wt.git(&["rebase", "--skip"]);
     }
 }
@@ -1104,6 +1233,7 @@ fn record_guardian_call_cost(
             task: None,
             log_path: None,
             payload: serde_json::json!({"cumulative_cost_usd": cumulative, "cap": cap, "kind": kind}),
+            admin_only: false,
         });
         return Err(format!(
             "review cost ${cumulative:.4} exceeded maximum_budget_usd cap ${cap:.4}"
@@ -1266,6 +1396,7 @@ fn synthesize_proof_instructions(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -1284,6 +1415,10 @@ fn synthesize_proof_instructions(
         // from the guardian row directly rather than always defaulting local.
         machine: review_machine,
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
     let result = runner.run_cancellable(&spec, cancel);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
@@ -1350,15 +1485,174 @@ fn log_merge_cancelled(store: &Arc<Mutex<Store>>, id: &str) {
         task: None,
         log_path: None,
         payload: serde_json::json!({}),
+        admin_only: false,
     });
 }
 
+/// Shared tail for every "the rebase has no conflicts left" path in
+/// [`resolve_conflicts_with_agent`] (mid-loop, and the post-loop recheck
+/// after the attempt cap is hit): records the resolved conflict counts, logs
+/// it, then runs (or skips, per `gate`) the dedicated final-proof pass.
+#[allow(clippy::too_many_arguments)]
+fn finish_branch_resolved(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch_id: &str,
+    branch: &str,
+    runner: &dyn Runner,
+    wt: &Workspace,
+    resolved: &ResolvedResolverAgent,
+    gate: &ProofGate,
+    cancel: &CancelToken,
+    found: i64,
+    committed: i64,
+    last_session_id: Option<String>,
+) -> std::result::Result<(Option<String>, String), String> {
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
+        let _ = guard.set_branch_conflicts(id, branch_id, Some(found), Some(0), Some(committed));
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} conflicts resolved branch={branch:?} committed={committed}"
+    );
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "guardian",
+            message: "conflicts resolved",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"branch": branch, "committed": committed}),
+            admin_only: false,
+        });
+    }
+    // RAL-168: gated by Proof scope -- a branch that just had real conflicts
+    // resolved is never "auto-clean", so only `scope` (not `skip_auto_clean`)
+    // matters here.
+    if !gate.allows_after_conflict() {
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {id} final proof skipped branch={branch:?} scope={:?}",
+            gate.scope
+        );
+        return Ok((
+            last_session_id,
+            "resolved by agent; final proof skipped (Proof scope)".to_string(),
+        ));
+    }
+    let (quality_note, ghost_prefix) =
+        proof_extras(store, id, branch, branch_id, runner, resolved, cancel);
+    let (proof_session_id, proof_detail) = run_final_proof(
+        store,
+        id,
+        branch_id,
+        runner,
+        wt,
+        branch,
+        resolved,
+        &quality_note,
+        &ghost_prefix,
+        cancel,
+    );
+    Ok((proof_session_id.or(last_session_id), proof_detail))
+}
+
+/// How many resolution passes a single conflicting commit gets before the
+/// branch gives up on it. The second (and any later) pass resumes the same
+/// agent session as the first (see `current_commit_session_id` below) rather
+/// than starting cold, so this isn't "try 2 unrelated times" -- it's "let the
+/// agent take one follow-up swing with everything it already knows about this
+/// commit's conflicts."
+const MAX_ATTEMPTS_PER_COMMIT: u32 = 2;
+
+/// Give up resolving the commit the rebase is currently stopped on, after it
+/// used up its [`MAX_ATTEMPTS_PER_COMMIT`]-pass budget. Everything logged here
+/// is deterministic from the worktree's own state at this exact moment -- the
+/// caller runs `git rebase --abort` the instant this returns, which makes the
+/// worktree look clean/finished as if nothing had failed, so this is the last
+/// chance to record what was actually still broken.
+fn give_up_on_stuck_commit(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch: &str,
+    wt: &Workspace,
+    found: i64,
+    committed: i64,
+    attempts: u32,
+) -> String {
+    let final_files = conflicted_files(wt);
+    let final_remaining = i64::try_from(count_markers(wt, &final_files)).unwrap_or(i64::MAX);
+    let in_progress = rebase_in_progress(wt);
+    let rebase_head = wt
+        .git(&["rev-parse", "REBASE_HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // `rebase_command_progress` (git's own todo-list done/total, read from
+    // `rebase-merge/done` and `rebase-merge/git-rebase-todo`) is captured here,
+    // before the caller's abort runs, so the log states outright how much of
+    // the stack was left rather than leaving that to be reconstructed after
+    // the fact from whatever the worktree happens to look like post-cleanup.
+    let command_progress = rebase_command_progress(wt);
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} conflict resolver exhausted its \
+         {attempts}/{MAX_ATTEMPTS_PER_COMMIT}-attempt budget on this commit \
+         branch={branch:?} found={found} committed={committed} \
+         remaining_files={final_files:?} remaining_markers={final_remaining} \
+         rebase_in_progress={in_progress} rebase_head={rebase_head:?} \
+         rebase_commands_done_of_total={command_progress:?} -- about to run \
+         `git rebase --abort`, which will make the worktree look clean/finished \
+         afterward even though it is not"
+    );
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "guardian",
+            message: "conflict resolver exhausted its attempt budget on this commit",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            admin_only: false,
+            payload: serde_json::json!({
+                "branch": branch,
+                "found": found,
+                "committed": committed,
+                "attempts": attempts,
+                "max_attempts": MAX_ATTEMPTS_PER_COMMIT,
+                "remaining_files": final_files,
+                "remaining_markers": final_remaining,
+                "rebase_in_progress": in_progress,
+                "rebase_head": rebase_head,
+                "rebase_commands_done": command_progress.map(|(done, _)| done),
+                "rebase_commands_total": command_progress.map(|(_, total)| total),
+            }),
+        });
+    }
+    "conflict resolver exhausted its attempt budget on this commit".to_string()
+}
+
 /// Drive an agent to resolve the in-progress rebase conflicts in `wt`, then
-/// `git add` + `rebase --continue`, looping until the rebase completes or a cap
-/// is hit. Once every conflict marker is resolved and committed, runs a
-/// dedicated final-proof agent call (RAL-149) before returning --
-/// see [`run_final_proof`]. Returns `Ok((agent_session_id, proof_detail))`
-/// when fully resolved and proofed (pass or fail; the proof call never blocks the
+/// `git add` + `rebase --continue`, looping until the rebase completes. Each
+/// conflicting commit gets up to [`MAX_ATTEMPTS_PER_COMMIT`] resolution passes
+/// before the branch gives up on that commit specifically -- not a single cap
+/// shared across the whole branch's rebase, so a long stack of clean commits
+/// can't burn through the same budget a single stuck conflict needs. Once
+/// every conflict marker is resolved and committed, runs a dedicated
+/// final-proof agent call (RAL-149) before returning -- see
+/// [`run_final_proof`]. Returns `Ok((agent_session_id, proof_detail))` when
+/// fully resolved and proofed (pass or fail; the proof call never blocks the
 /// rebase from completing -- see [`run_final_proof`]'s doc comment).
 #[allow(clippy::too_many_arguments)]
 fn resolve_conflicts_with_agent(
@@ -1379,29 +1673,29 @@ fn resolve_conflicts_with_agent(
     // task dependency graph (Q2's "one level up" lookup is task-graph only),
     // so the only context to inject here is this branch's *own* prior ghost --
     // e.g. from an earlier resolve pass or a rebuild after the base branch
-    // shifted (`rebuild_on_base_shift`). Computed once and reused across loop
-    // iterations, same as `quality_note` above.
+    // shifted (`rebuild_on_base_shift`). The URI is computed once here and
+    // reused both by the per-iteration read below (inside the loop) and by
+    // the `guard.upsert_ghost(&ghost_uri, ...)` write further down.
     let ghost_uri = crate::ghost::review_uri(id, Some(branch_id));
-    let ghost_prefix = {
-        let guard = store.lock().expect("poisoned");
-        guard
-            .get_ghost(&ghost_uri)
-            .ok()
-            .flatten()
-            .and_then(|g| crate::ghost::format_context_block(Some(&g), &[]))
-            .unwrap_or_default()
-    };
 
     // Seed the live progress (RAL-72): found = current conflicting commit's marker
     // block count, fixed = files resolved in working tree (not staged), committed =
-    // hunks staged for the *current* conflicting commit. Both found and committed are
-    // scoped to whichever commit the rebase is presently stopped on: found is
-    // recomputed fresh from disk every loop iteration below, and committed is reset to
-    // 0 every time the rebase advances to its next commit (RAL-144) -- neither value
-    // accumulates across commits within the branch's rebase.
+    // hunks staged for the *current* conflicting commit. found, committed,
+    // commit_attempts, and current_commit_session_id are all scoped to whichever
+    // commit the rebase is presently stopped on: found is recomputed fresh from
+    // disk every loop iteration below, and the other three reset every time the
+    // rebase advances to its next commit (RAL-144) -- none of them accumulate
+    // across commits within the branch's rebase.
     let mut found = i64::try_from(count_markers(wt, &conflicted_files(wt))).unwrap_or(i64::MAX);
     let mut committed = 0i64;
     let mut last_session_id: Option<String> = None;
+    // Resolution passes used on the commit currently being worked on, capped at
+    // MAX_ATTEMPTS_PER_COMMIT.
+    let mut commit_attempts: u32 = 0;
+    // The resolver's own agent session for the commit currently being worked
+    // on, so a retry resumes that conversation instead of starting cold. Reset
+    // to `None` whenever the rebase advances to a new commit.
+    let mut current_commit_session_id: Option<String> = None;
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} conflicts starting branch={branch:?} found={found} \
@@ -1427,6 +1721,7 @@ fn resolve_conflicts_with_agent(
                 "agent": agent,
                 "model": model,
             }),
+            admin_only: false,
         });
     }
 
@@ -1444,7 +1739,7 @@ fn resolve_conflicts_with_agent(
         .join("ralphus")
         .join(format!("{wt_basename}.live_session"));
 
-    for _ in 0..32 {
+    loop {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
             return Err("cancelled".to_string());
@@ -1455,71 +1750,80 @@ fn resolve_conflicts_with_agent(
             // through clean commits. If it is still in progress, drive it forward;
             // once it reports no rebase in progress we are done.
             if rebase_in_progress(wt) {
+                // RAL-330: before trusting this step's already-staged resolution
+                // (most commonly rerere's fast path, which never goes through
+                // this function's own agent call at all), verify it didn't
+                // silently drop real content. `found == 0` here only means "git
+                // has no unmerged files right now" -- true either because the
+                // conflict was resolved correctly, or because whatever resolved
+                // it made the diff disappear entirely.
+                if let Some(lost) = detect_rebase_step_content_loss(wt) {
+                    let rebase_head = wt
+                        .git(&["rev-parse", "REBASE_HEAD"])
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [guardian] review {id} rerere fast-path content-preservation \
+                         check failed branch={branch:?} rebase_head={rebase_head:?} lost={lost:?}"
+                    );
+                    {
+                        let guard = store.lock().expect("poisoned");
+                        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                            level: crate::logging::LogLevel::WARNING,
+                            source: "guardian",
+                            message: "rerere fast-path content-preservation check failed",
+                            scope: Some("branch"),
+                            squad_id: None,
+                            guardian_id: Some(id),
+                            cell_id: None,
+                            task: None,
+                            log_path: None,
+                            payload: serde_json::json!({
+                                "branch": branch,
+                                "rebase_head": rebase_head,
+                                "lost_paths": lost,
+                            }),
+                            admin_only: false,
+                        });
+                    }
+                    // Poison the specific bad cache entries so a retry sees a
+                    // real conflict and goes through the agent instead of
+                    // replaying the same lossy resolution again.
+                    let mut forget_args = vec!["rerere", "forget"];
+                    forget_args.extend(lost.iter().map(String::as_str));
+                    let _ = wt.git(&forget_args);
+                    let _ = wt.git(&["rebase", "--abort"]);
+                    return Err(format!(
+                        "rerere fast-path would have dropped content in {lost:?} for branch \
+                         {branch} (RAL-330 content-preservation check) -- aborted rebase; a \
+                         retry will resolve these paths with the agent instead of replaying \
+                         the cached resolution"
+                    ));
+                }
                 advance_rebase(wt);
                 // RAL-144: advancing to the next commit -- nothing was found or
                 // committed for it yet.
                 committed = 0;
+                commit_attempts = 0;
+                current_commit_session_id = None;
                 continue;
             }
-            {
-                let guard = store.lock().expect("poisoned");
-                let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
-                let _ = guard.set_branch_conflicts(
-                    id,
-                    branch_id,
-                    Some(found),
-                    Some(0),
-                    Some(committed),
-                );
-            }
-            crate::rlog!(
-                INFO,
-                "ralphus [guardian] review {id} conflicts resolved branch={branch:?} committed={committed}"
-            );
-            {
-                let guard = store.lock().expect("poisoned");
-                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::INFO,
-                    source: "guardian",
-                    message: "conflicts resolved",
-                    scope: Some("branch"),
-                    squad_id: None,
-                    guardian_id: Some(id),
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({"branch": branch, "committed": committed}),
-                });
-            }
-            // RAL-168: gated by Proof scope -- a branch that just had real
-            // conflicts resolved is never "auto-clean", so only `scope`
-            // (not `skip_auto_clean`) matters here.
-            if !gate.allows_after_conflict() {
-                crate::rlog!(
-                    INFO,
-                    "ralphus [guardian] review {id} final proof skipped branch={branch:?} scope={:?}",
-                    gate.scope
-                );
-                return Ok((
-                    last_session_id,
-                    "resolved by agent; final proof skipped (Proof scope)".to_string(),
-                ));
-            }
-            let (quality_note, ghost_prefix) =
-                proof_extras(store, id, branch, branch_id, runner, resolved, cancel);
-            let (proof_session_id, proof_detail) = run_final_proof(
+            return finish_branch_resolved(
                 store,
                 id,
                 branch_id,
+                branch,
                 runner,
                 wt,
-                branch,
                 resolved,
-                &quality_note,
-                &ghost_prefix,
+                gate,
                 cancel,
+                found,
+                committed,
+                last_session_id,
             );
-            return Ok((proof_session_id.or(last_session_id), proof_detail));
         }
         // Fast path: rerere (or a prior agent pass) may have already resolved
         // the file content even though the index still shows UU entries.
@@ -1558,15 +1862,31 @@ fn resolve_conflicts_with_agent(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"branch": branch, "files": files.len()}),
+                    admin_only: false,
                 });
             }
-            wt.git(&["add", "-A"])?;
+            wt.git(&["add", "--all"])?;
             advance_rebase(wt);
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
+            commit_attempts = 0;
+            current_commit_session_id = None;
             continue;
         }
 
+        // RAL-136: re-read the ghost note fresh on every iteration (rather than
+        // once before the loop) so a retry within this same call sees whatever
+        // an earlier iteration just published via `guard.upsert_ghost` below,
+        // instead of a stale pre-loop snapshot.
+        let ghost_prefix = {
+            let guard = store.lock().expect("poisoned");
+            guard
+                .get_ghost(&ghost_uri)
+                .ok()
+                .flatten()
+                .and_then(|g| crate::ghost::format_context_block(Some(&g), &[]))
+                .unwrap_or_default()
+        };
         let prompt = format!(
             "{ghost_prefix}Resolve all merge conflict markers in these files from branch '{branch}': {}. \
              Read each file, intelligently merge both sides of every conflict block \
@@ -1603,6 +1923,11 @@ fn resolve_conflicts_with_agent(
              `git commit`, `git push`, or any other git command besides `git add -A`. The \
              orchestrator advances the rebase as soon as it sees RALPHUS_STAGE: DONE in your \
              output.";
+        // This is either the commit's first pass (commit_attempts was reset to
+        // 0 the last time the rebase advanced) or a retry -- in which case
+        // current_commit_session_id carries the previous pass's session so the
+        // agent resumes its own conversation instead of starting cold.
+        commit_attempts += 1;
         let spec = RunnerSpec {
             // RAL-102: unique per (guardian, branch) so the tmux session this
             // resolves through (see `crate::tmux::session_name`) never
@@ -1628,9 +1953,10 @@ fn resolve_conflicts_with_agent(
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             proof: false,
             trace_context: None,
-            resume_agent_session_id: None,
+            resume_agent_session_id: current_commit_session_id.clone(),
             assigned_agent_session_id: None,
             // RAL-191: the resolver edits this branch's own worktree, so it
             // runs under the branch's resolved environment. Profile env is
@@ -1648,6 +1974,10 @@ fn resolve_conflicts_with_agent(
             // than silently running in the wrong place, but is still wrong.
             machine: wt.machine().map(str::to_string),
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -1678,6 +2008,46 @@ fn resolve_conflicts_with_agent(
             }
         });
 
+        // Spawn a second thread that re-scans the worktree for remaining
+        // conflict markers every couple seconds while the agent call below is
+        // in flight. `count_markers`/`conflicted_files` are plain git+filesystem
+        // reads -- they need no cooperation from the agent, since it is editing
+        // files on disk in this same worktree the whole time -- so
+        // `conflicts_fixed` can track real progress instead of sitting frozen
+        // at 0 until the (possibly many-minute) call returns.
+        let marker_stop = Arc::new(AtomicBool::new(false));
+        let marker_stop_clone = Arc::clone(&marker_stop);
+        let marker_store = Arc::clone(store);
+        let marker_wt = wt.clone();
+        let marker_files = files.clone();
+        let marker_id = id.to_string();
+        let marker_branch_id = branch_id.to_string();
+        let marker_watcher = std::thread::spawn(move || {
+            while !marker_stop_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                if marker_stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let remaining =
+                    i64::try_from(count_markers(&marker_wt, &marker_files)).unwrap_or(i64::MAX);
+                let fixed = markers_before.saturating_sub(remaining).max(0);
+                let guard = marker_store.lock().expect("poisoned");
+                let _ = guard.set_guardian_conflicts(
+                    &marker_id,
+                    Some(found),
+                    Some(fixed),
+                    Some(committed),
+                );
+                let _ = guard.set_branch_conflicts(
+                    &marker_id,
+                    &marker_branch_id,
+                    Some(found),
+                    Some(fixed),
+                    Some(committed),
+                );
+            }
+        });
+
         // RAL-259: the resolver agent is actually beginning to run — stamp the
         // branch's Live-View start time (COALESCE so the fix pass, fired first
         // within this attempt, wins over the final-proof call that may follow).
@@ -1689,6 +2059,8 @@ fn resolve_conflicts_with_agent(
 
         stop.store(true, Ordering::Relaxed);
         let _ = watcher.join();
+        marker_stop.store(true, Ordering::Relaxed);
+        let _ = marker_watcher.join();
 
         record_guardian_call_cost(store, id, Some(branch_id), "resolve_conflict", &result)?;
 
@@ -1703,7 +2075,8 @@ fn resolve_conflicts_with_agent(
         }
 
         if let Some(sid) = result.agent_session_id.clone() {
-            last_session_id = Some(sid);
+            last_session_id = Some(sid.clone());
+            current_commit_session_id = Some(sid);
         }
         if !result.is_done() {
             let err = result
@@ -1727,9 +2100,27 @@ fn resolve_conflicts_with_agent(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"branch": branch, "error": err}),
+                    admin_only: false,
                 });
             }
-            return Err(format!("conflict resolver failed: {err}"));
+            if commit_attempts >= MAX_ATTEMPTS_PER_COMMIT {
+                return Err(give_up_on_stuck_commit(
+                    store,
+                    id,
+                    branch,
+                    wt,
+                    found,
+                    committed,
+                    commit_attempts,
+                ));
+            }
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} conflict resolver attempt \
+                 {commit_attempts}/{MAX_ATTEMPTS_PER_COMMIT} failed branch={branch:?}: {err} \
+                 -- retrying, resuming session={current_commit_session_id:?}"
+            );
+            continue;
         }
 
         // RAL-136: persist the resolver's self-summarized handoff note, if it
@@ -1763,6 +2154,7 @@ fn resolve_conflicts_with_agent(
                         task: None,
                         log_path: None,
                         payload: serde_json::json!({"branch": branch, "len": ghost_text.len()}),
+                        admin_only: false,
                     });
                 }
             }
@@ -1801,11 +2193,14 @@ fn resolve_conflicts_with_agent(
                     task: None,
                     log_path: None,
                     payload: serde_json::json!({"branch": branch, "committed": committed}),
+                    admin_only: false,
                 });
             }
             advance_rebase(wt);
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
+            commit_attempts = 0;
+            current_commit_session_id = None;
             continue;
         }
 
@@ -1826,12 +2221,57 @@ fn resolve_conflicts_with_agent(
             );
         }
         if remaining > 0 {
-            // Markers still present — let the loop retry up to the cap rather than
-            // failing immediately. The agent may need more than one pass to fully
-            // clear all conflicts (e.g. partial resolution or a multi-file case).
+            // Markers still present. Logged (not just silently retried) because
+            // this is exactly the kind of per-pass detail that's otherwise
+            // invisible until the commit finally resolves or exhausts its
+            // attempt budget -- these counts are all deterministic right here,
+            // no reason to only find out post hoc.
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} conflict resolver pass incomplete \
+                 branch={branch:?} markers_before={markers_before} fixed={fixed} \
+                 remaining={remaining} files={files:?}"
+            );
+            {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::WARNING,
+                    source: "guardian",
+                    message: "conflict resolver pass incomplete, retrying",
+                    scope: Some("branch"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "branch": branch,
+                        "markers_before": markers_before,
+                        "fixed": fixed,
+                        "remaining": remaining,
+                        "files": files,
+                    }),
+                    admin_only: false,
+                });
+            }
+            if commit_attempts >= MAX_ATTEMPTS_PER_COMMIT {
+                return Err(give_up_on_stuck_commit(
+                    store,
+                    id,
+                    branch,
+                    wt,
+                    found,
+                    committed,
+                    commit_attempts,
+                ));
+            }
+            // The agent may need a follow-up pass to fully clear all conflicts
+            // (e.g. partial resolution or a multi-file case) -- resuming its own
+            // session (current_commit_session_id was set above) rather than
+            // starting cold.
             continue;
         }
-        wt.git(&["add", "-A"])?;
+        wt.git(&["add", "--all"])?;
         // All hunks in this batch are now staged; accumulate them as committed.
         committed += markers_before;
         {
@@ -1849,8 +2289,9 @@ fn resolve_conflicts_with_agent(
         advance_rebase(wt);
         // RAL-144: advancing to the next commit -- nothing committed for it yet.
         committed = 0;
+        commit_attempts = 0;
+        current_commit_session_id = None;
     }
-    Err("exceeded conflict-resolution attempts".to_string())
 }
 
 /// RAL-149/168: dedicated final-proof agent call. Runs once a
@@ -1903,6 +2344,7 @@ fn run_final_proof(
             task: None,
             log_path: None,
             payload: serde_json::json!({"branch": branch}),
+            admin_only: false,
         });
     }
     crate::rlog!(
@@ -1946,6 +2388,7 @@ fn run_final_proof(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: true,
         trace_context: None,
         resume_agent_session_id: None,
@@ -1961,6 +2404,10 @@ fn run_final_proof(
         // identical fix in `resolve_conflicts_with_agent` above.
         machine: wt.machine().map(str::to_string),
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
     // branch's Live-View start time. COALESCE means a branch that already
@@ -1998,6 +2445,7 @@ fn run_final_proof(
             task: None,
             log_path: None,
             payload: serde_json::json!({"branch": branch, "passed": passed}),
+            admin_only: false,
         });
     }
 
@@ -2151,8 +2599,10 @@ fn branch_wt_dir(
 /// at `from_position` (which is assumed to already have the desired HEAD). Runs
 /// check gates on each branch; finalises the combined worktree at the end.
 ///
-/// Used by [`run_feedback`] to apply the downstream-rebase logic after a
-/// routed change lands on one branch.
+/// Used by [`pull_pr_commits`] and [`rebase_on_manual_push`] to apply the
+/// downstream-rebase logic after a change lands on one branch outside a normal
+/// merge pass. [`run_feedback`] applies the same logic via its own inline copy
+/// of this loop rather than calling this helper.
 #[allow(clippy::too_many_arguments)]
 fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     store: &Arc<Mutex<Store>>,
@@ -2165,6 +2615,16 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     set_status: &F,
     cancel: &CancelToken,
 ) {
+    // Re-affirm `Merging` here rather than trusting the caller's earlier stamp:
+    // both callers (`run_feedback`, `rebase_on_manual_push`) set it once before
+    // dispatching a potentially slow resolver-agent call, and a concurrent
+    // failure elsewhere (e.g. a racing "Merge / rebase" click hitting a
+    // transient worktree error) can overwrite the guardian to `MergeFailed` in
+    // that window. Without this, nothing corrects it back for the rest of this
+    // restack -- every branch below keeps advancing to `done`/`conflict_resolved`
+    // while the top-level status stays stuck on the stale failure until
+    // `finalize_review` finally overwrites it at the very end.
+    set_status(GuardianStatus::Merging, None);
     // RAL-103: this is a forced regeneration (feedback routing or a detected
     // manual push) -- clear the stale manual-checks commands up front so
     // `checks_state` drops out of "ready" for the whole restack, instead of
@@ -2522,6 +2982,7 @@ pub(crate) fn kickoff_merge(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({ "pending_branches": unfinished }),
+                admin_only: false,
             });
         }
         return Ok(StartMergeOutcome::Deferred);
@@ -2553,6 +3014,7 @@ pub(crate) fn kickoff_merge(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({"branches": guardian.branches.len()}),
+                admin_only: false,
             }
         } else {
             crate::cartographer::CartographerEntry {
@@ -2566,6 +3028,7 @@ pub(crate) fn kickoff_merge(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             }
         };
         let _ = guard.cartographer_log(entry);
@@ -2660,6 +3123,60 @@ pub fn restart_guardian_merge(
         return reply(500, &error_body("store_error", &e.to_string()));
     }
     start_merge(store, runner, id, sem, cancellations)
+}
+
+/// Reopen a `cancelled` review (status → `collecting`) and immediately try an
+/// incremental staged merge (RAL-265, [`run_merge_staged`]) -- the same pass
+/// a task completion would have triggered via `start_reviews`
+/// (`daemon/src/scheduler.rs`) had this review not been cancelled at the
+/// time. Deliberately *not* the all-or-nothing [`start_merge`] that the
+/// manual "Merge / rebase" button uses: that path waits for every enabled
+/// branch's cell to finish before rebasing anything, so a review reopened
+/// while one branch is still pending would sit doing nothing until that last
+/// cell completes, even though every earlier branch's cell finished (and
+/// would already have been rebased into the review) while the review was
+/// dormant. Staging the ready prefix now catches it up immediately instead
+/// of waiting on that last cell or the periodic maintenance sweep.
+///
+/// There is no live worker to cancel-and-wait for first, unlike
+/// [`restart_guardian_merge`]: a cancelled review's merge worker already
+/// exited before the `cancelled` status was written (see
+/// `stop_merge_worker_for_cancel`). `claim_guardian_merge` still gates the
+/// `collecting` → `merging` transition, so a concurrent trigger (another
+/// reopen call, a task completing at the same moment) can't double-run the
+/// staged pass.
+pub fn reopen_cancelled_guardian_merge(
+    store: Arc<Mutex<Store>>,
+    runner: Arc<dyn Runner>,
+    id: &str,
+    sem: Arc<Semaphore>,
+    cancellations: Cancellations,
+) -> Reply {
+    if let Err(e) = store
+        .lock()
+        .expect("store mutex poisoned")
+        .reopen_cancelled_guardian(id)
+    {
+        return reply(500, &error_body("store_error", &e.to_string()));
+    }
+    let claimed = store
+        .lock()
+        .expect("store mutex poisoned")
+        .claim_guardian_merge(id)
+        .unwrap_or(false);
+    if !claimed {
+        // Lost the claim to a concurrent trigger (e.g. a task completing at
+        // the same instant) -- that other caller's pass covers this reopen.
+        return reply(202, "{\"status\":\"merging\"}");
+    }
+    let sid = id.to_string();
+    std::thread::spawn(move || {
+        let _permit = sem.acquire();
+        let token = cancellations.register(&format!("guardian:{sid}"));
+        run_merge_staged(&store, runner.as_ref(), &sid, &token);
+        cancellations.remove(&format!("guardian:{sid}"));
+    });
+    reply(202, "{\"status\":\"merging\"}")
 }
 
 /// Halt an in-flight merge for `id` at its next checkpoint, leaving the review
@@ -3025,6 +3542,7 @@ pub fn run_merge_staged(
             task: None,
             log_path: None,
             payload: serde_json::json!({}),
+            admin_only: false,
         });
     }
 
@@ -3475,23 +3993,37 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         }
         let root = Workspace::for_guardian(store, id, PathBuf::from(&proj));
         let wt_base = root.at(worktree_dir(proj, id));
-        let base_sha = match resolve_base(&root, &guardian.base_branch) {
-            Ok(s) => s,
-            Err(e) => {
-                set_status(
-                    GuardianStatus::MergeFailed,
-                    Some(&format!(
-                        "{proj}: base branch '{}': {e}",
-                        guardian.base_branch
-                    )),
-                );
-                return;
+        // The base commit this project's stack was actually rebased onto, as
+        // recorded by [`staged_merge_pass`] before it built -- deliberately not
+        // a fresh resolve. The base branch can advance while a pass is still
+        // resolving conflicts and running proofs; overwriting the baseline with
+        // that newer tip would leave `rebuild_on_base_shift` comparing equal, so
+        // the review would sit in `in_review` permanently stale against a base
+        // it was never built on. Keeping the built-against commit lets the
+        // maintenance sweep see the shift and rebuild.
+        let base_sha = match guardian.base_commits.get(proj) {
+            Some(sha) => sha.clone(),
+            None => {
+                let sha = match resolve_base(&root, &guardian.base_branch) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        set_status(
+                            GuardianStatus::MergeFailed,
+                            Some(&format!(
+                                "{proj}: base branch '{}': {e}",
+                                guardian.base_branch
+                            )),
+                        );
+                        return;
+                    }
+                };
+                let _ = store
+                    .lock()
+                    .expect("poisoned")
+                    .set_guardian_project_base_commit(id, proj, &sha);
+                sha
             }
         };
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_project_base_commit(id, proj, &base_sha);
         // Combined worktree points at the head of this project's last branch.
         let prev_ref = project_branches[proj]
             .last()
@@ -3608,6 +4140,7 @@ pub fn run_merge_cancellable(
                 "base": base,
                 "branches": guardian.branches.iter().filter(|b| b.enabled).count(),
             }),
+            admin_only: false,
         });
     }
 
@@ -4090,11 +4623,15 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                         nothing.then(|| "no new commits over base (already merged?)".to_string()),
                     ),
                 };
-                let guard = store.lock().expect("poisoned");
-                let _ = guard.set_branch_status(id, &ob.id, status, detail.as_deref());
-                if let Some(ref sid) = session_id {
-                    let _ = guard.set_branch_resolver_session_id(id, &ob.id, sid);
-                }
+                promote_branch_terminal(
+                    store,
+                    runner,
+                    id,
+                    &ob.id,
+                    status,
+                    detail.as_deref(),
+                    session_id.as_deref(),
+                );
             }
             Err(e) => {
                 // RAL-213: a cancelled merge is already logged by `drive_rebase`'s
@@ -4220,6 +4757,7 @@ pub fn run_feedback(
             task: None,
             log_path: None,
             payload: serde_json::json!({"position": position}),
+            admin_only: false,
         });
     }
 
@@ -4319,6 +4857,7 @@ pub fn run_feedback(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -4329,6 +4868,10 @@ pub fn run_feedback(
         // `resolve_conflicts_with_agent`.
         machine: wt.machine().map(str::to_string),
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
     let no_commit = is_no_commit_intent(feedback);
     // Stash any pre-existing dirty state so we only include the agent's own
@@ -4346,7 +4889,7 @@ pub fn run_feedback(
                 &format!("guardian/{id}/{review_branch}"),
                 "feedback",
             );
-            wt.git(&["stash", "push", "--include-untracked", "-m", &name])
+            wt.git(&["stash", "push", "--include-untracked", "--message", &name])
                 .ok()
                 .map(|_| name)
         }
@@ -4362,7 +4905,7 @@ pub fn run_feedback(
     let mut pushed_sha: Option<String> = None;
     let mut push_error: Option<String> = None;
     if committed {
-        let _ = wt.git(&["add", "-A"]);
+        let _ = wt.git(&["add", "--all"]);
 
         // RAL-<new>: give the target branch itself the same dedicated
         // final-proof pass a cleanly-rebased branch already gets during a
@@ -4387,7 +4930,7 @@ pub fn run_feedback(
             );
             proof_note = Some(note);
             // The proof pass may itself have edited files.
-            let _ = wt.git(&["add", "-A"]);
+            let _ = wt.git(&["add", "--all"]);
         }
 
         // RAL-<new>: extend the branch's single squashed commit in place
@@ -4405,7 +4948,7 @@ pub fn run_feedback(
             // feedback text into the subject line where it makes
             // `git log --oneline` and rebase-todo listings unreadable.
             let subject = format!("fix: apply review feedback ({feature})");
-            let _ = wt.git(&["commit", "-m", &subject, "-m", feedback]);
+            let _ = wt.git(&["commit", "--message", &subject, "--message", feedback]);
         }
 
         // RAL-<new>: push the review branch itself -- force only when we did
@@ -4506,6 +5049,7 @@ pub fn run_feedback(
                 "no_commit": no_commit,
                 "committed": committed,
             }),
+            admin_only: false,
         });
     }
     if no_commit {
@@ -4515,6 +5059,16 @@ pub fn run_feedback(
         set_status(GuardianStatus::InReview, None);
         return outcome;
     }
+
+    // Re-affirm `Merging` before restacking downstream: the target branch's
+    // resolver call above can run long enough for a concurrent failure
+    // elsewhere (e.g. a racing "Merge / rebase" click hitting a transient
+    // worktree error) to overwrite the guardian to `MergeFailed` in the
+    // meantime. Without this, nothing corrects it back for the rest of this
+    // restack -- every downstream branch below keeps advancing to
+    // `done`/`conflict_resolved` while the top-level status stays stuck on
+    // the stale failure until `finalize_review` finally overwrites it below.
+    set_status(GuardianStatus::Merging, None);
 
     // RAL-103: applying feedback is a forced regeneration too -- clear the
     // stale manual-checks commands now so `checks_state` drops out of "ready"
@@ -4732,7 +5286,7 @@ pub fn pull_pr_commits(
     }
 
     let base_for_rebase = match last_synced_sha {
-        Some(sha) if root.git(&["cat-file", "-e", sha]).is_ok() => sha.to_string(),
+        Some(sha) if root.git(&["cat-file", "--exists", sha]).is_ok() => sha.to_string(),
         _ => root
             .git(&["merge-base", &current_tip, &fetched])
             .map_err(|e| format!("no common history with fetched PR branch: {e}"))?
@@ -4779,6 +5333,7 @@ pub fn pull_pr_commits(
                 "alias": alias,
                 "fetched": fetched,
             }),
+            admin_only: false,
         });
     }
 
@@ -5079,6 +5634,7 @@ pub fn rebase_on_manual_push(
                         task: None,
                         log_path: None,
                         payload: serde_json::json!({"position": position, "old": prev, "new": current}),
+                        admin_only: false,
                     });
                 }
                 changed.push(position);
@@ -5136,6 +5692,7 @@ pub fn rebase_on_manual_push(
             task: None,
             log_path: None,
             payload: serde_json::json!({"from_position": from_position}),
+            admin_only: false,
         });
     }
     // RAL-213: a manual-push restack is a separate reviewer-driven flow, not a
@@ -5241,6 +5798,7 @@ fn approve_base_already_landed(store: &Arc<Mutex<Store>>, id: &str) -> bool {
             task: None,
             log_path: None,
             payload: serde_json::json!({}),
+            admin_only: false,
         });
     }
     approved
@@ -5410,13 +5968,15 @@ fn stack_pick(
                         .then(|| "no new commits over base (already merged?)".to_string()),
                 ),
             };
-            {
-                let guard = store.lock().expect("poisoned");
-                let _ = guard.set_branch_status(id, branch_id, status, detail.as_deref());
-                if let Some(ref sid) = session_id {
-                    let _ = guard.set_branch_resolver_session_id(id, branch_id, sid);
-                }
-            }
+            promote_branch_terminal(
+                store,
+                runner,
+                id,
+                branch_id,
+                status,
+                detail.as_deref(),
+                session_id.as_deref(),
+            );
             // RAL-91: collapse this branch's commits to one when its project opts in.
             if squash {
                 if let Err(e) = squash_review_commits(wt, newbase, feature_branch) {
@@ -5458,16 +6018,6 @@ fn finalize_review(
 ) -> std::result::Result<Option<String>, String> {
     let combined_str = rebuild_combined(store, root, wt_base, id, prev_ref)?;
     final_checks(store, id, root, &combined_str, cancel)
-}
-
-/// The URL a remote machine should clone a *project* from. This is the one
-/// remote-name resolution with no review branch in scope -- it provisions a
-/// project checkout, not a review's PR -- so it uses only the
-/// branch-independent tail of the shared precedence
-/// ([`crate::forge::default_remote_name`]), never `@{u}`.
-pub(crate) fn remote_clone_url(root: &Path) -> std::result::Result<String, String> {
-    let remote_name = crate::forge::default_remote_name(&crate::config::resolve_forge(root));
-    git(root, &["remote", "get-url", &remote_name]).map(|s| s.trim().to_string())
 }
 
 /// Run the review's check gates against the finished combined worktree.
@@ -5873,7 +6423,7 @@ fn cleanup_review_worktrees(
                 // Unlock first so that a locked worktree does not block removal.
                 let _ = root.git(&["worktree", "unlock", path]);
                 // Two --force flags handle dirty/untracked (first) and locked (second).
-                let _ = root.git(&["worktree", "remove", "-f", "-f", path]);
+                let _ = root.git(&["worktree", "remove", "--force", "--force", path]);
             }
         }
     }
@@ -5887,7 +6437,7 @@ fn cleanup_review_worktrees(
     root.remove_path(root.root().join(".ralphus_guardian").join(id), true);
     root.remove_path(root.root().join(".ralphus_guardian"), true);
     for branch in old_review_branches {
-        let _ = root.git(&["branch", "-D", branch]);
+        let _ = root.git(&["branch", "--delete", "--force", branch]);
     }
     // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
     // machine sitting right next to the correctly-routed calls in this same
@@ -5908,8 +6458,38 @@ fn cleanup_review_worktrees(
         ])
         .unwrap_or_default();
     for branch in refs.lines().map(str::trim).filter(|b| !b.is_empty()) {
-        let _ = root.git(&["branch", "-D", branch]);
+        let _ = root.git(&["branch", "--delete", "--force", branch]);
     }
+}
+
+/// RAL-317: record a branch's terminal (`Done`/`ConflictResolved`) merge
+/// outcome and, if the review's effective `auto_submit_pr_stack` setting is
+/// on, auto-submit/grow its PR stack to include the newly-terminal branch.
+/// Shared by every site that can move a branch to a terminal status --
+/// `stack_pick` (the real per-branch stacked-rebase path `run_merge_staged`
+/// drives) and `run_merge_shared`'s legacy/shared-worktree fallback -- so the
+/// auto-submit hook is written once rather than duplicated per call site. The
+/// PR-stack side effect (`crate::pr::maybe_auto_submit_branch`) is a
+/// best-effort side channel: it never fails or blocks this transition, and
+/// any failure is recorded per-branch (`BranchView::auto_submit_error`)
+/// rather than surfaced here.
+fn promote_branch_terminal(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+    status: MergeStatus,
+    detail: Option<&str>,
+    session_id: Option<&str>,
+) {
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.set_branch_status(id, branch_id, status, detail);
+        if let Some(sid) = session_id {
+            let _ = guard.set_branch_resolver_session_id(id, branch_id, sid);
+        }
+    }
+    crate::pr::maybe_auto_submit_branch(store, runner, id, branch_id);
 }
 
 /// Mark a branch failed and the guardian merge-failed with a reason.
@@ -6053,7 +6633,8 @@ fn drive_rebase(
         // unrelated untracked file (a still-in-progress build artifact, a
         // resumable worktree's own bookkeeping) has no business being swept
         // away by a rebase that would have succeeded without it.
-        let _ = wt.git(&["clean", "-fd"]);
+        let _ = wt.git(&["rebase", "--abort"]);
+        let _ = wt.git(&["clean", "--force", "-d"]);
         result = wt.git(&args);
     }
     match result {
@@ -6116,6 +6697,7 @@ fn drive_rebase(
                         task: None,
                         log_path: None,
                         payload: serde_json::json!({"branch": feature}),
+                        admin_only: false,
                     });
                 }
                 let resolved = resolver_backend(store, id)?;
@@ -6178,7 +6760,7 @@ fn squash_review_commits(
         .join("\n");
     let msg = format!("{feature} (squashed {count} commits)\n\n{body}");
     wt.git(&["reset", "--soft", newbase])?;
-    if let Err(e) = wt.git(&["commit", "--no-verify", "-m", &msg]) {
+    if let Err(e) = wt.git(&["commit", "--no-verify", "--message", &msg]) {
         // Restore the pre-squash tip so the stack is not left in a dirty state.
         let _ = wt.git(&["reset", "--soft", "ORIG_HEAD"]);
         return Err(e);
@@ -6734,6 +7316,7 @@ fn generate_final_summary(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -6744,6 +7327,10 @@ fn generate_final_summary(
         // `resolve_conflicts_with_agent`.
         machine: ws_root.machine().map(str::to_string),
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
@@ -7063,6 +7650,7 @@ fn generate_manual_commands(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -7071,6 +7659,10 @@ fn generate_manual_commands(
         // RAL-201: matches whichever workspace `cwd` above was derived from.
         machine,
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -7164,6 +7756,7 @@ fn generate_manual_commands(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({"command": cmd}),
+                admin_only: false,
             });
     Some(if ok {
         format!("auto-built via inferred build command: {cmd}")
@@ -7251,6 +7844,7 @@ pub(crate) fn resolve_check_input(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -7259,6 +7853,10 @@ pub(crate) fn resolve_check_input(
         // RAL-201: route to the review's assigned machine, matching `cwd`.
         machine,
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
 
     let result = runner.run(&spec);
@@ -7344,6 +7942,231 @@ mod tests {
         );
     }
 
+    fn write_file(root: &Path, rel: &str, content: &str) {
+        std::fs::write(root.join(rel), content).expect("write test file");
+    }
+
+    fn rev_parse(root: &Path, rev: &str) -> String {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(root)
+                .output()
+                .expect("git rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // RAL-330: rerere fast-path content-preservation guard
+    //
+    // `REBASE_HEAD` is faked directly (`.git/REBASE_HEAD`) rather than driving
+    // a real conflicting rebase to that exact paused state — `git rev-parse
+    // REBASE_HEAD` just reads that file, so this exercises the same plumbing
+    // the production code relies on while keeping each scenario a
+    // deterministic, hand-built commit graph instead of depending on git's
+    // own conflict-resolution behavior to land in a specific spot.
+    // -----------------------------------------------------------------------
+
+    /// Builds: `old_parent` (root) -> `rebase_head` (modifies shared.txt,
+    /// adds new_file.txt) on one side, and `old_parent` -> `new_base` (adds
+    /// other.txt, optionally also touches shared.txt) on the other. `HEAD` is
+    /// left checked out on `new_base`, and `.git/REBASE_HEAD` is set to
+    /// `rebase_head` -- i.e. exactly the state the resolver loop sees while
+    /// paused partway through replaying `rebase_head` onto `new_base`.
+    /// Returns `(root, rebase_head_sha)`.
+    fn setup_fake_rebase_pause(new_base_also_touches_shared: bool) -> (PathBuf, String) {
+        let root = tmp_dir("ral330");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+
+        write_file(&root, "shared.txt", "line1\nBASE\nline3\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--quiet", "--message", "base"]);
+        let old_parent = rev_parse(&root, "HEAD");
+
+        // The commit the resolver loop is (pretend-)paused on replaying.
+        write_file(&root, "shared.txt", "line1\nFEATURE\nline3\n");
+        write_file(&root, "new_file.txt", "brand new content\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--quiet", "--message", "rebase_head"]);
+        let rebase_head = rev_parse(&root, "HEAD");
+
+        // The base this step is landing on -- built from old_parent directly,
+        // so it never saw rebase_head's own changes.
+        g(&root, &["checkout", "--quiet", &old_parent]);
+        if new_base_also_touches_shared {
+            write_file(&root, "shared.txt", "line1\nMAIN\nline3\n");
+            g(&root, &["add", "shared.txt"]);
+        }
+        write_file(&root, "other.txt", "unrelated base content\n");
+        g(&root, &["add", "other.txt"]);
+        g(&root, &["commit", "--quiet", "--message", "new_base"]);
+
+        std::fs::write(
+            root.join(".git").join("REBASE_HEAD"),
+            format!("{rebase_head}\n"),
+        )
+        .expect("write REBASE_HEAD");
+
+        (root, rebase_head)
+    }
+
+    #[test]
+    fn detect_rebase_step_content_loss_none_when_everything_is_staged() {
+        let (root, _rebase_head) = setup_fake_rebase_pause(false);
+        let wt = Workspace::local(&root);
+
+        // Stage exactly what a correct replay of rebase_head onto new_base
+        // would produce: shared.txt's own change (new_base never touched it)
+        // plus the brand-new file.
+        write_file(&root, "shared.txt", "line1\nFEATURE\nline3\n");
+        write_file(&root, "new_file.txt", "brand new content\n");
+        g(&root, &["add", "shared.txt", "new_file.txt"]);
+
+        assert_eq!(detect_rebase_step_content_loss(&wt), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_rebase_step_content_loss_flags_a_dropped_unrelated_file() {
+        let (root, _rebase_head) = setup_fake_rebase_pause(false);
+        let wt = Workspace::local(&root);
+
+        // Stage shared.txt's change correctly, but never stage new_file.txt
+        // -- simulating whatever mechanism drops it (rerere fast-path replay,
+        // or a short-circuit that fails to re-stage every resolved file).
+        write_file(&root, "shared.txt", "line1\nFEATURE\nline3\n");
+        g(&root, &["add", "shared.txt"]);
+
+        assert_eq!(
+            detect_rebase_step_content_loss(&wt),
+            Some(vec!["new_file.txt".to_string()]),
+            "a brand-new file the new base never touched must not silently vanish"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_rebase_step_content_loss_ignores_the_genuine_conflict_zone() {
+        // new_base ALSO touches shared.txt this time, so it's a real conflict
+        // zone: a correct merge is expected to differ from rebase_head's own
+        // version, and must not be flagged just because the text changed.
+        let (root, _rebase_head) = setup_fake_rebase_pause(true);
+        let wt = Workspace::local(&root);
+
+        // A plausible correct three-way resolution: neither side verbatim.
+        write_file(&root, "shared.txt", "line1\nFEATURE and MAIN\nline3\n");
+        write_file(&root, "new_file.txt", "brand new content\n");
+        g(&root, &["add", "shared.txt", "new_file.txt"]);
+
+        assert_eq!(
+            detect_rebase_step_content_loss(&wt),
+            None,
+            "a real conflict's resolution differing from either side alone is not loss"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_rebase_step_content_loss_reports_real_paths_not_rename_display_syntax() {
+        // RAL-330: `lost`'s entries are fed straight into `git rerere forget`
+        // as literal pathspecs (see the call site above `detect_rebase_step_
+        // content_loss`). If `rebase_head`'s own commit renamed a file, git's
+        // default rename detection would otherwise report it as a single
+        // `dir/{old => new}` display string -- not a usable pathspec, so
+        // `rerere forget` silently matches nothing and the poisoned cache
+        // entry survives to replay again on the very next retry.
+        let root = tmp_dir("ral330-rename");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+
+        std::fs::create_dir_all(root.join("dir")).expect("mkdir dir");
+        write_file(&root, "dir/old_name.rs", "line1\nline2\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--quiet", "--message", "base"]);
+        let old_parent = rev_parse(&root, "HEAD");
+
+        // The commit the resolver loop is (pretend-)paused on replaying:
+        // renames the file and edits it, so git's default rename detection
+        // pairs the two paths up in this commit's own diff.
+        g(&root, &["mv", "dir/old_name.rs", "dir/new_name.rs"]);
+        write_file(&root, "dir/new_name.rs", "line1\nline2\nline3\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--quiet", "--message", "rebase_head"]);
+        let rebase_head = rev_parse(&root, "HEAD");
+
+        // new_base: built from old_parent directly, so it never saw
+        // rebase_head's rename at all -- and HEAD stays checked out here,
+        // simulating a fast-path replay that dropped the rename entirely
+        // (the file is left exactly as new_base already has it).
+        g(&root, &["checkout", "--quiet", &old_parent]);
+        write_file(&root, "other.txt", "unrelated base content\n");
+        g(&root, &["add", "other.txt"]);
+        g(&root, &["commit", "--quiet", "--message", "new_base"]);
+
+        std::fs::write(
+            root.join(".git").join("REBASE_HEAD"),
+            format!("{rebase_head}\n"),
+        )
+        .expect("write REBASE_HEAD");
+
+        let wt = Workspace::local(&root);
+        let lost = detect_rebase_step_content_loss(&wt).expect("must flag the dropped rename");
+
+        assert!(
+            lost.iter().all(|p| !p.contains("=>") && !p.contains('{')),
+            "lost paths must be real, usable pathspecs -- got {lost:?}"
+        );
+        assert!(
+            lost.contains(&"dir/new_name.rs".to_string()),
+            "the renamed file's new content must be flagged as dropped -- got {lost:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebase_head_commit_is_empty_false_for_a_real_change() {
+        let (root, _rebase_head) = setup_fake_rebase_pause(false);
+        let wt = Workspace::local(&root);
+        assert!(!rebase_head_commit_is_empty(&wt));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebase_head_commit_is_empty_true_for_an_actually_empty_commit() {
+        let root = tmp_dir("ral330-empty");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        write_file(&root, "shared.txt", "content\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--quiet", "--message", "base"]);
+        g(
+            &root,
+            &["commit", "--quiet", "--allow-empty", "--message", "empty"],
+        );
+        let empty_sha = rev_parse(&root, "HEAD");
+        std::fs::write(
+            root.join(".git").join("REBASE_HEAD"),
+            format!("{empty_sha}\n"),
+        )
+        .expect("write REBASE_HEAD");
+
+        let wt = Workspace::local(&root);
+        assert!(rebase_head_commit_is_empty(&wt));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // -----------------------------------------------------------------------
     // Guardian cost tracking (RAL-193)
     // -----------------------------------------------------------------------
@@ -7353,7 +8176,10 @@ mod tests {
             status: "done".into(),
             tokens_in,
             tokens_out,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd,
+            cost_is_estimated: false,
             summary: String::new(),
             error: None,
             proofed: None,
@@ -7545,7 +8371,10 @@ mod tests {
                 status: "done".into(),
                 tokens_in: 1,
                 tokens_out: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: self.0.to_string(),
                 error: None,
                 proofed: None,
@@ -7646,10 +8475,10 @@ mod tests {
         let base = tmp_dir(tag);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        g(&repo, &["init", "-b", "main"]);
+        g(&repo, &["init", "--initial-branch", "main"]);
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "base"]);
+        g(&repo, &["commit", "--message", "base"]);
         let fwt = base.join("fwt");
         g(
             &repo,
@@ -7657,7 +8486,7 @@ mod tests {
         );
         std::fs::write(fwt.join("feat.txt"), "feat\n").unwrap();
         g(&fwt, &["add", "."]);
-        g(&fwt, &["commit", "-m", "feature"]);
+        g(&fwt, &["commit", "--message", "feature"]);
         (base, repo, fwt)
     }
 
@@ -7800,7 +8629,10 @@ mod tests {
         // 3. Directory `rwt` survives (CWD lock / external process).
         let tracking = repo.join(".git").join("worktrees").join("rwt");
         std::fs::remove_dir_all(&tracking).ok();
-        g(&repo, &["branch", "-D", "guardian/g/wt-feature-a"]);
+        g(
+            &repo,
+            &["branch", "--delete", "--force", "guardian/g/wt-feature-a"],
+        );
         // rwt directory still exists with its .git file.
 
         worktree_add_or_reset(
@@ -8250,10 +9082,10 @@ mod tests {
         let base = tmp_dir("relink-collide");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        g(&repo, &["init", "-b", "main"]);
+        g(&repo, &["init", "--initial-branch", "main"]);
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "base"]);
+        g(&repo, &["commit", "--message", "base"]);
 
         let wt1 = repo
             .join(".git")
@@ -8331,10 +9163,10 @@ mod tests {
         let base = tmp_dir("cleanup-g56-g560");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        g(&repo, &["init", "-b", "main"]);
+        g(&repo, &["init", "--initial-branch", "main"]);
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "base"]);
+        g(&repo, &["commit", "--message", "base"]);
 
         let g56_id = "guardian-000000000056";
         let g560_id = "guardian-000000000560";
@@ -8427,14 +9259,14 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir temp root");
 
         // Set up a repo with a feature branch.
-        git(&root, &["init", "-b", "main"]).expect("git init");
+        git(&root, &["init", "--initial-branch", "main"]).expect("git init");
         git(&root, &["config", "user.email", "t@t.com"]).expect("git config email");
         git(&root, &["config", "user.name", "t"]).expect("git config name");
-        git(&root, &["commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
+        git(&root, &["commit", "--allow-empty", "--message", "initial"]).expect("initial commit");
         git(&root, &["checkout", "-b", "feat-test"]).expect("create branch");
         std::fs::write(root.join("f.txt"), "hello\n").expect("write f.txt");
         git(&root, &["add", "f.txt"]).expect("git add");
-        git(&root, &["commit", "-m", "add f"]).expect("git commit");
+        git(&root, &["commit", "--message", "add f"]).expect("git commit");
         git(&root, &["checkout", "main"]).expect("checkout main");
 
         // Create a worktree the normal way — this produces a valid admin entry.
@@ -8500,7 +9332,7 @@ mod tests {
         let base = tmp_dir("drive-rebase-blocker");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        g(&repo, &["init", "-b", "main"]);
+        g(&repo, &["init", "--initial-branch", "main"]);
         // `drive_rebase` below shells out through `GitVcs::exec_raw`, which
         // (correctly, for real repos) never injects an identity -- so this
         // throwaway repo needs one in its own local config, not just on the
@@ -8513,7 +9345,7 @@ mod tests {
         // Initial base commit — no blocker.txt yet.
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "initial"]);
+        g(&repo, &["commit", "--message", "initial"]);
         let old_base_str = git(&repo, &["rev-parse", "HEAD"]).unwrap();
         let old_base = old_base_str.trim();
 
@@ -8521,13 +9353,13 @@ mod tests {
         g(&repo, &["checkout", "-b", "feature/a"]);
         std::fs::write(repo.join("feat.txt"), "feat\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "add feature"]);
+        g(&repo, &["commit", "--message", "add feature"]);
         g(&repo, &["checkout", "main"]);
 
         // Main moves forward and introduces blocker.txt.
         std::fs::write(repo.join("blocker.txt"), "on main\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "main adds blocker.txt"]);
+        g(&repo, &["commit", "--message", "main adds blocker.txt"]);
         let new_base_str = git(&repo, &["rev-parse", "HEAD"]).unwrap();
         let new_base = new_base_str.trim();
 
@@ -9213,7 +10045,7 @@ mod tests {
         // more so it has a distinctive, greppable subject.
         std::fs::write(awt.join("a-extra.txt"), "a\n").unwrap();
         g(&awt, &["add", "."]);
-        g(&awt, &["commit", "-m", "commit-a-only"]);
+        g(&awt, &["commit", "--message", "commit-a-only"]);
 
         // feature/b is stacked on top of feature/a's tip -- its worktree HEAD
         // contains commit-a-only plus its own new commit.
@@ -9231,7 +10063,7 @@ mod tests {
         );
         std::fs::write(bwt.join("b.txt"), "b\n").unwrap();
         g(&bwt, &["add", "."]);
-        g(&bwt, &["commit", "-m", "commit-b-only"]);
+        g(&bwt, &["commit", "--message", "commit-b-only"]);
 
         // feature/c is stacked on top of feature/b's tip.
         let cwt = base.join("cwt");
@@ -9248,7 +10080,7 @@ mod tests {
         );
         std::fs::write(cwt.join("c.txt"), "c\n").unwrap();
         g(&cwt, &["add", "."]);
-        g(&cwt, &["commit", "-m", "commit-c-only"]);
+        g(&cwt, &["commit", "--message", "commit-c-only"]);
 
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
         let id = {
@@ -9341,7 +10173,7 @@ mod tests {
         );
         std::fs::write(bwt.join("b.txt"), "b\n").unwrap();
         g(&bwt, &["add", "."]);
-        g(&bwt, &["commit", "-m", "commit-b-only"]);
+        g(&bwt, &["commit", "--message", "commit-b-only"]);
 
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
         let id = {
@@ -9424,7 +10256,10 @@ mod tests {
             );
             std::fs::write(wt.join(format!("{}.txt", name.replace('/', "-"))), "x\n").unwrap();
             g(&wt, &["add", "."]);
-            g(&wt, &["commit", "-m", &format!("commit-{name}-only")]);
+            g(
+                &wt,
+                &["commit", "--message", &format!("commit-{name}-only")],
+            );
             worktrees.push((name.to_string(), wt));
             prev = name.to_string();
         }
@@ -9511,7 +10346,7 @@ mod tests {
         );
         std::fs::write(bwt.join("b.txt"), "b\n").unwrap();
         g(&bwt, &["add", "."]);
-        g(&bwt, &["commit", "-m", "commit-b-only"]);
+        g(&bwt, &["commit", "--message", "commit-b-only"]);
 
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
         let id = {
@@ -9688,7 +10523,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "captured".to_string(),
                 error: None,
                 proofed: None,
@@ -9724,7 +10562,12 @@ mod tests {
         };
         g(
             repo,
-            &["branch", "-f", &format!("guardian/{id}/wt-{branch}"), tip],
+            &[
+                "branch",
+                "--force",
+                &format!("guardian/{id}/wt-{branch}"),
+                tip,
+            ],
         );
         id
     }
@@ -9864,23 +10707,23 @@ mod tests {
         let base = tmp_dir("live-conflicts");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        g(&repo, &["init", "-b", "main"]);
+        g(&repo, &["init", "--initial-branch", "main"]);
         std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "base"]);
+        g(&repo, &["commit", "--message", "base"]);
 
         // Feature branch changes shared.txt one way...
         g(&repo, &["checkout", "-b", "feature/a"]);
         std::fs::write(repo.join("shared.txt"), "feature\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "feature change"]);
+        g(&repo, &["commit", "--message", "feature change"]);
 
         // ...while main changes it another way, so rebasing feature/a onto
         // main conflicts on shared.txt.
         g(&repo, &["checkout", "main"]);
         std::fs::write(repo.join("shared.txt"), "main\n").unwrap();
         g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "main change"]);
+        g(&repo, &["commit", "--message", "main change"]);
 
         g(&repo, &["checkout", "feature/a"]);
         let status = std::process::Command::new("git")
@@ -10066,7 +10909,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: self.0.clone(),
                 error: None,
                 proofed: None,

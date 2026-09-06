@@ -105,6 +105,20 @@ pub struct TaskDef {
     /// [`agent_supports_auto_compact_threshold`].
     #[serde(default)]
     pub auto_compact_threshold: Option<u64>,
+    /// Task-level cap on how many tokens a single tool-call output (e.g. a
+    /// large file read) may inject into the agent's context (RAL-333),
+    /// delivered to the backend via its own mechanism (e.g. Claude Code's
+    /// `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` env var, Codex's
+    /// `-c tool_output_token_limit=...`, Pi's `models.json` `maxTokens`).
+    /// Cells inherit this unless they set their own
+    /// `tool_output_max_tokens`. Ralphus never truncates the output itself --
+    /// it only configures the backend's own mechanism and defers entirely to
+    /// however that backend behaves once the cap is set. Only accepted for a
+    /// backend with a real delivery mechanism -- see
+    /// [`agent_supports_tool_output_max_tokens`] -- checked at validation
+    /// time.
+    #[serde(default)]
+    pub tool_output_max_tokens: Option<u64>,
     /// Retry count.
     #[serde(default)]
     pub max_retries: Option<u32>,
@@ -140,6 +154,16 @@ pub struct TaskDef {
     /// `set_status → Done` override (RAL-74), which always bypasses the guard.
     #[serde(default)]
     pub no_commit_required: bool,
+    /// Whether a cell may resume a completed dependency's agent session
+    /// (cross-cell session sharing) rather than start fresh, when the
+    /// scheduler's own model-mismatch guard allows it -- see
+    /// `daemon::scheduler::sharing_blocked_reason`. Off by default: sharing
+    /// used to be implicit in any `depends_on` link with no way to opt out,
+    /// which surprised a user running Codex under two different models on
+    /// dependent cells. Applies to every cell in this task unless a cell sets
+    /// its own [`CellDef::share_session`], which wins.
+    #[serde(default)]
+    pub share_session: Option<bool>,
     /// The agent cells.
     #[serde(default)]
     pub cell: Vec<CellDef>,
@@ -228,6 +252,13 @@ pub struct CellDef {
     /// [`TaskDef::auto_compact_threshold`].
     #[serde(default)]
     pub auto_compact_threshold: Option<u64>,
+    /// Per-cell cap on how many tokens a single tool-call output may inject
+    /// into the agent's context (RAL-333). Falls back to the task-level
+    /// `tool_output_max_tokens` when unset. See
+    /// [`TaskDef::tool_output_max_tokens`] for the delivery mechanism and the
+    /// backend-support restriction.
+    #[serde(default)]
+    pub tool_output_max_tokens: Option<u64>,
     /// Per-cell wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
@@ -263,6 +294,60 @@ pub struct CellDef {
     /// same git repository; cross-repo upstreams are skipped with a warning.
     #[serde(default)]
     pub upstream: Option<String>,
+    /// Override the task-level [`TaskDef::share_session`] for this cell only.
+    #[serde(default)]
+    pub share_session: Option<bool>,
+    /// Opts this cell into Triage (RAL-318): rather than naming an explicit
+    /// `[[review]]` block via [`Self::review`], the cell is pooled by the
+    /// daemon's Arbiter subsystem, keyed by `(project, triage type)`, and a
+    /// review is created automatically once that pool's count threshold or
+    /// one of its cron schedules fires. Mutually independent of `review` --
+    /// nothing stops a task file from setting both on different cells, but
+    /// setting both on the *same* cell is meaningless (checked nowhere
+    /// special; `review` simply wins since Triage pooling only ever looks at
+    /// cells that set `triage = true`). Requires the owning task's `project`
+    /// to be set (see `core::validate::validate_cells`), since a pool is
+    /// keyed by project.
+    #[serde(default)]
+    pub triage: bool,
+    /// Inline triage type name(s) for this cell's auto-review -- a bare
+    /// string (`"security"`) for the common single-type case, or an array
+    /// (`["bug", "investigation"]`) when a cell belongs to more than one
+    /// pool at once (e.g. a fix that is simultaneously a bug fix and a
+    /// piece of research). Each name is matched at `ralphus submit` time
+    /// against the daemon's triage-type registry. Only meaningful when
+    /// [`Self::triage`] is `true`. Unset means the Arbiter classifies this
+    /// cell into type(s) itself, once, at submit time, against the
+    /// registered types' label + description text -- a classification
+    /// failure permanently assigns the built-in `unclassified` type rather
+    /// than retrying. When set, this cell is pooled into every one of its
+    /// named types' `(project, triage_type)` pools independently.
+    #[serde(default, deserialize_with = "deserialize_triage_type")]
+    pub triage_type: Option<Vec<String>>,
+}
+
+/// Deserializes `triage_type` as either a bare TOML string (sugar for a
+/// single-element list) or an array of strings, so the common one-type case
+/// (`triage_type = "security"`) stays as simple to write as before
+/// multi-type support existed, while `triage_type = ["bug", "feature"]`
+/// works too. Only invoked when the key is present -- `#[serde(default)]`
+/// on the field handles the absent case.
+fn deserialize_triage_type<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Some(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    }))
 }
 
 /// Sentinel prefix for `upstream = "<<task:task-name>>"` or
@@ -432,7 +517,7 @@ pub fn text_placeholders(text: &str) -> Vec<&str> {
 /// `cwd` was recorded in. Newly authored TOML is held to a stricter rule:
 /// `core::validate` rejects a bare (unwrapped) placeholder cwd and requires
 /// the wrapped `<<...>>` form, which is also the only form
-/// `cli-rs/src/tutor.rs` teaches -- it is the only shape that still composes
+/// `cli/src/tutor.rs` teaches -- it is the only shape that still composes
 /// when the same marker needs to be repeated inside another field (e.g. an
 /// `environment` value reusing a cell's worktree path).
 #[must_use]
@@ -485,6 +570,20 @@ pub fn is_worktree_upstream_sentinel(upstream: &str) -> bool {
 /// brand-new guardian and never attaches to a previous submission's review. The
 /// `<key>` is only a grouping alias, not a stable cross-submission link.
 pub const REVIEW_LINK_PREFIX: &str = "ralphus:new-review/";
+
+/// Valid values for `[[review]] proof_scope` and the CLI's `ralphus review
+/// settings --proof-scope`: which branches actually run their proof steps
+/// during a Guardian merge. See [`ReviewDef::proof_scope`].
+pub const PROOF_SCOPE_EACH_BRANCH: &str = "each_branch";
+pub const PROOF_SCOPE_FINAL_BRANCH: &str = "final_branch";
+pub const PROOF_SCOPE_NOTHING: &str = "nothing";
+
+/// Every accepted `proof_scope` literal, in the order shown to a user.
+pub const PROOF_SCOPE_VALUES: &[&str] = &[
+    PROOF_SCOPE_EACH_BRANCH,
+    PROOF_SCOPE_FINAL_BRANCH,
+    PROOF_SCOPE_NOTHING,
+];
 
 /// If `id` is a new-review placeholder (`ralphus:new-review/<key>`), return its
 /// `<key>` trimmed of surrounding whitespace. Returns `None` for a plain id or a
@@ -613,6 +712,14 @@ pub fn parse_machine(machine: &str) -> Result<MachineRef<'_>, MachineParseError>
     Ok(MachineRef::Provider { scheme, uri })
 }
 
+/// Whether cross-cell session sharing is enabled for a cell: its own
+/// [`CellDef::share_session`], else the owning task's
+/// [`TaskDef::share_session`], else `false` (off by default).
+#[must_use]
+pub fn resolve_cell_share_session(task: &TaskDef, cell: &CellDef) -> bool {
+    cell.share_session.or(task.share_session).unwrap_or(false)
+}
+
 /// The effective `machine` for a cell: its own value, else the owning
 /// task's, else `None` (meaning [`LOCAL_MACHINE`]). Mirrors how `agent` and
 /// `model` inherit in [`ResolvedAgent::resolve`].
@@ -652,6 +759,35 @@ pub fn resolve_cell_proof_machine(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .or_else(|| resolve_cell_machine(task, cell))
+}
+
+/// The effective `tool_output_max_tokens` for a cell: its own value, else
+/// the owning task's, else `None` (no cap). Mirrors [`resolve_cell_machine`]'s
+/// cell-then-task inheritance shape (RAL-333).
+#[must_use]
+pub fn resolve_cell_tool_output_max_tokens(task: &TaskDef, cell: &CellDef) -> Option<u64> {
+    cell.tool_output_max_tokens.or(task.tool_output_max_tokens)
+}
+
+/// The effective `tool_output_max_tokens` for a task-scope proof step (one
+/// with no owning cell): the step's own value, else the task's (RAL-333).
+#[must_use]
+pub fn resolve_task_proof_tool_output_max_tokens(task: &TaskDef, proof: &ProofStep) -> Option<u64> {
+    proof.tool_output_max_tokens.or(task.tool_output_max_tokens)
+}
+
+/// The effective `tool_output_max_tokens` for a cell-scope proof step: the
+/// step's own value, else the owning cell's resolved value (which itself
+/// falls back to the task's) (RAL-333).
+#[must_use]
+pub fn resolve_cell_proof_tool_output_max_tokens(
+    task: &TaskDef,
+    cell: &CellDef,
+    proof: &ProofStep,
+) -> Option<u64> {
+    proof
+        .tool_output_max_tokens
+        .or_else(|| resolve_cell_tool_output_max_tokens(task, cell))
 }
 
 /// A top-level review (guardian) declaration via `[[review]]`.
@@ -712,6 +848,17 @@ pub struct ReviewDef {
     /// fails it.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
+    /// This review's own Proof-scope override: which branches run their
+    /// proof steps during the Guardian merge -- one of
+    /// [`PROOF_SCOPE_EACH_BRANCH`]/[`PROOF_SCOPE_FINAL_BRANCH`]/
+    /// [`PROOF_SCOPE_NOTHING`] (see [`PROOF_SCOPE_VALUES`]). Unset inherits
+    /// the project-level `.ralphus.toml [review] proof_scope` default, then
+    /// `"each_branch"`. Equivalent to setting it later via `ralphus review
+    /// settings <selector> --proof-scope <value>`, but declared up front so
+    /// the review is created with the right scope from its first merge
+    /// rather than needing a follow-up command.
+    #[serde(default)]
+    pub proof_scope: Option<String>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
@@ -788,6 +935,14 @@ pub struct ProofStep {
     /// affinity rules require every step under one task to agree.
     #[serde(default)]
     pub machine: Option<String>,
+    /// Per-proof-step cap on how many tokens a single tool-call output may
+    /// inject into the agent's context (RAL-333). Falls back to the owning
+    /// cell's resolved value for a cell-scope step, or the task's for a
+    /// task-scope one -- see [`resolve_task_proof_tool_output_max_tokens`]/
+    /// [`resolve_cell_proof_tool_output_max_tokens`]. See
+    /// [`TaskDef::tool_output_max_tokens`] for the delivery mechanism.
+    #[serde(default)]
+    pub tool_output_max_tokens: Option<u64>,
     /// Extra CLI args for the proof-prompt invocation (e.g. `--append-system-prompt`).
     #[serde(default)]
     pub arguments: Vec<String>,
@@ -851,7 +1006,7 @@ pub const SYSTEM_PROMPT_POSITION_APPEND: &str = "append";
 /// after a built-in.
 ///
 /// UPDATE THIS whenever a new agent backend/harness is added (see also
-/// `ralphus agent list` / `cli-rs/src/agents.rs` and `PROFILE_BACKENDS` in
+/// `ralphus agent list` / `cli/src/agents.rs` and `PROFILE_BACKENDS` in
 /// `daemon/src/agent_profiles.rs`, which enumerate backends too) --
 /// otherwise the new name stays eligible to collide with a future custom
 /// profile, and `check_system_prompt` in `core/src/validate.rs` will
@@ -947,6 +1102,36 @@ pub fn agent_supports_auto_compact_threshold(agent: &str) -> bool {
     )
 }
 
+/// Whether `agent` is a backend with a real delivery mechanism for
+/// `tool_output_max_tokens` -- a cap on how many tokens a single tool-call
+/// output may inject into the agent's context (RAL-333).
+///
+/// The Claude Code CLI (`claude-code`/`claude-cli`) maps it to the
+/// `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` env var (file-read tool output
+/// specifically); the Codex CLI (`codex`/`codex-cli`) maps it to
+/// `-c tool_output_token_limit=...` (any tool output, stored in history);
+/// Pi maps it to a `models.json`
+/// `providers.<provider>.modelOverrides.<model-id>.maxTokens` override
+/// (requiring a `"<provider>/<model-id>"` resolved model, same requirement as
+/// [`agent_supports_maximum_context`]). Every other backend has no such
+/// mechanism, so validation rejects `tool_output_max_tokens` for it.
+///
+/// Ralphus never enforces this cap itself -- it only configures each
+/// backend's own native mechanism and defers entirely to that backend's own
+/// behavior once the cap is set.
+///
+/// On the runner side, each supported backend overrides
+/// `ModelBackend::supports_tool_output_max_tokens` to match this set -- the
+/// two checks are independent (`core` cannot see `runner`'s trait impls) and
+/// must be kept in sync by hand.
+#[must_use]
+pub fn agent_supports_tool_output_max_tokens(agent: &str) -> bool {
+    matches!(
+        agent,
+        "codex" | "codex-cli" | "pi" | "claude-code" | "claude-cli"
+    )
+}
+
 impl ResolvedAgent {
     /// Merge task defaults with cell overrides (cell wins).
     #[must_use]
@@ -996,12 +1181,14 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             max_retries: None,
             priority: None,
             timeout_minutes: None,
             depends_on: vec![],
             environment: BTreeMap::new(),
             no_commit_required: false,
+            share_session: None,
             cell: vec![],
             proof: vec![],
         }
@@ -1033,6 +1220,10 @@ mod tests {
             proof: vec![],
             review: None,
             upstream: None,
+            share_session: None,
+            tool_output_max_tokens: None,
+            triage: false,
+            triage_type: None,
         }
     }
 
@@ -1108,6 +1299,41 @@ mod tests {
     }
 
     #[test]
+    fn review_proof_scope_deserializes_and_defaults_to_none() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "<<review:backend>>"
+
+            [[review]]
+            id = "backend"
+            proof_scope = "final_branch"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert_eq!(
+            parsed.review[0].proof_scope.as_deref(),
+            Some("final_branch")
+        );
+
+        let toml_unset = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/repo/.wt/feat"
+            prompt = "do work"
+            review = "<<review:backend>>"
+
+            [[review]]
+            id = "backend"
+        "#;
+        let parsed_unset: TaskFile = toml::from_str(toml_unset).expect("should deserialize");
+        assert_eq!(parsed_unset.review[0].proof_scope, None);
+    }
+
+    #[test]
     fn review_action_cleanup_command_and_input_deserialize() {
         let toml = r#"
             [[task]]
@@ -1163,6 +1389,44 @@ mod tests {
         let action = &parsed.review[0].action[0];
         assert!(action.cleanup_command.is_none());
         assert!(action.input.is_empty());
+    }
+
+    #[test]
+    fn triage_type_deserializes_bare_string_as_single_element_list() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            project = "p"
+            [[task.cell]]
+            cwd = "/repo"
+            prompt = "do work"
+            triage = true
+            triage_type = "security"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert_eq!(
+            parsed.task[0].cell[0].triage_type.as_deref(),
+            Some(["security".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn triage_type_deserializes_array_of_strings() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            project = "p"
+            [[task.cell]]
+            cwd = "/repo"
+            prompt = "do work"
+            triage = true
+            triage_type = ["bug", "investigation"]
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        assert_eq!(
+            parsed.task[0].cell[0].triage_type.as_deref(),
+            Some(["bug".to_string(), "investigation".to_string()].as_slice())
+        );
     }
 
     #[test]
@@ -1317,6 +1581,21 @@ mod tests {
     fn auto_compact_threshold_rejected_for_bare_claude_and_ollama() {
         assert!(!agent_supports_auto_compact_threshold("claude"));
         assert!(!agent_supports_auto_compact_threshold("ollama"));
+    }
+
+    #[test]
+    fn tool_output_max_tokens_supported_by_claude_code_codex_and_pi() {
+        for agent in ["claude-code", "claude-cli", "codex", "codex-cli", "pi"] {
+            assert!(agent_supports_tool_output_max_tokens(agent), "{agent}");
+        }
+    }
+
+    #[test]
+    fn tool_output_max_tokens_rejected_for_bare_claude_ollama_and_raw() {
+        assert!(!agent_supports_tool_output_max_tokens("claude"));
+        assert!(!agent_supports_tool_output_max_tokens("anthropic"));
+        assert!(!agent_supports_tool_output_max_tokens("ollama"));
+        assert!(!agent_supports_tool_output_max_tokens("raw"));
     }
 
     #[test]
@@ -1663,6 +1942,79 @@ mod tests {
         assert_eq!(
             resolve_task_proof_machine(task, &task.proof[0]).as_deref(),
             Some("incredibuild:A"),
+            "a task-scope proof follows the task"
+        );
+    }
+
+    #[test]
+    fn cell_tool_output_max_tokens_overrides_task_and_unset_falls_through_to_none() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            tool_output_max_tokens = 1000
+            [[task.cell]]
+            cwd = "/tmp"
+            command = "x"
+            [[task.cell]]
+            cwd = "/tmp"
+            command = "y"
+            tool_output_max_tokens = 500
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let task = &parsed.task[0];
+        assert_eq!(
+            resolve_cell_tool_output_max_tokens(task, &task.cell[0]),
+            Some(1000),
+            "an unset cell value inherits the task's"
+        );
+        assert_eq!(
+            resolve_cell_tool_output_max_tokens(task, &task.cell[1]),
+            Some(500),
+            "an explicit cell value wins"
+        );
+
+        let bare = r#"
+            [[task]]
+            name = "t"
+            [[task.cell]]
+            cwd = "/tmp"
+            command = "x"
+        "#;
+        let parsed: TaskFile = toml::from_str(bare).expect("should deserialize");
+        let task = &parsed.task[0];
+        assert_eq!(
+            resolve_cell_tool_output_max_tokens(task, &task.cell[0]),
+            None,
+            "no cap anywhere means no cap, represented as None"
+        );
+    }
+
+    #[test]
+    fn proof_tool_output_max_tokens_inherits_from_its_owner() {
+        let toml = r#"
+            [[task]]
+            name = "t"
+            tool_output_max_tokens = 1000
+            [[task.cell]]
+            cwd = "/tmp"
+            command = "x"
+            tool_output_max_tokens = 2000
+            [[task.cell.proof]]
+            command = "cargo test"
+            [[task.proof]]
+            command = "cargo fmt"
+        "#;
+        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
+        let task = &parsed.task[0];
+        let cell = &task.cell[0];
+        assert_eq!(
+            resolve_cell_proof_tool_output_max_tokens(task, cell, &cell.proof[0]),
+            Some(2000),
+            "a cell-scope proof follows its cell, not the task"
+        );
+        assert_eq!(
+            resolve_task_proof_tool_output_max_tokens(task, &task.proof[0]),
+            Some(1000),
             "a task-scope proof follows the task"
         );
     }

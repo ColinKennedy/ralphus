@@ -181,9 +181,18 @@ impl ModelBackend for AgentBackend {
             summary: result.text,
             tokens_in: result.tokens_in,
             tokens_out: result.tokens_out,
+            // RAL-326: this tool loop never attaches `cache_control` to any
+            // content block, so Anthropic writes no cache entry and reports
+            // both cache tiers as zero; Ollama's OpenAI-shaped `usage` has no
+            // cache breakdown at all. Nothing to read on either path.
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
             agent_session_id: None,
             abandoned_background_job: None,
+            // RAL-339: the hand-rolled tool loop has no compaction concept
+            // of its own -- it never resumes a backend-native session.
+            compaction_thrash: None,
         })
     }
 }

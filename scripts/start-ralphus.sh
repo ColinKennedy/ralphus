@@ -44,7 +44,7 @@ fi
 
 to_win_path() {
   if command -v cygpath >/dev/null 2>&1; then
-    cygpath -w "$1"
+    cygpath --windows "$1"
   else
     printf '%s\n' "$1"
   fi

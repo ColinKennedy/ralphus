@@ -25,6 +25,10 @@ pub fn execute(cmd: MachineCommand, client: &DaemonClient) -> ExecResult {
         MachineCommand::List => Ok(client.list_machines()?),
         MachineCommand::Get { scheme } => Ok(client.get_machine(&scheme)?),
         MachineCommand::Remove { scheme } => Ok(client.deregister_machine(&scheme)?),
-        MachineCommand::Cleanup { machine } => Ok(client.cleanup_machine(&machine)?),
+        MachineCommand::Cleanup {
+            machine,
+            project,
+            branch,
+        } => Ok(client.cleanup_machine(&machine, &project, branch.as_deref())?),
     }
 }

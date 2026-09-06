@@ -1,6 +1,7 @@
 //! Mirrors `ralphus_cli::commands::proof::dispatch`.
 
 use ralphus_cli::client::DaemonClient;
+use ralphus_cli::commands::env;
 use ralphus_cli::commands::proof::{self, ProofCommand};
 use ralphus_cli::selector::squad_view_uri;
 
@@ -9,6 +10,10 @@ use super::{ExecResult, usage};
 pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
         ProofCommand::Help | ProofCommand::UsageError(_) => Err(usage("no such tool")),
+        ProofCommand::Env { selector } => {
+            let resolved = proof::resolve_scoped(client, &selector, "proof")?;
+            Ok(client.env_view(&env::proof_path(&resolved))?)
+        }
         ProofCommand::Show { selector } => {
             let resolved = proof::resolve_scoped(client, &selector, "proof")?;
             let squad = client.squad(&resolved.squad_id)?;

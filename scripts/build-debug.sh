@@ -6,7 +6,7 @@
 #   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
 #                                            seconds each; all four are Rust)
 #
-# All four binaries are Rust -- there is no Python venv sync step. `cli/`
+# All four binaries are Rust -- there is no Python venv sync step. `cli-py/`
 # still exists for `docsgen/` (Playwright screenshots, dev-only, never
 # shipped).
 #
@@ -71,7 +71,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # 1. Build all four Rust bins in debug (fast incremental rebuild picks up
 #    board.html and any CLI/runner source edit alike).
 echo "== cargo build (debug) daemon + librarian + runner + cli =="
-cargo build -p ralphus-daemon -p ralphus-librarian -p ralphus-runner -p ralphus-cli --manifest-path "$root/Cargo.toml"
+cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "$root/Cargo.toml"
 
 ext=""; [ -f "$root/target/debug/ralphus-daemon.exe" ] && ext=".exe"
 

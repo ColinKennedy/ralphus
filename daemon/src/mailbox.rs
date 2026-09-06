@@ -56,6 +56,41 @@ impl MailboxPriority {
     }
 }
 
+/// Every priority tier, most urgent first -- the default a follow/user
+/// preference is given when a caller wants "notify me about everything"
+/// (RAL-320).
+#[must_use]
+pub fn all_tiers() -> Vec<MailboxPriority> {
+    vec![
+        MailboxPriority::Urgent,
+        MailboxPriority::High,
+        MailboxPriority::Normal,
+    ]
+}
+
+/// Parse a comma-separated tier list (`follows.notify_tiers`,
+/// `users.default_notify_tiers`), silently dropping any unrecognized token --
+/// matching this file's "malformed data never blocks" precedent.
+#[must_use]
+pub fn parse_tiers(csv: &str) -> Vec<MailboxPriority> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(MailboxPriority::parse)
+        .collect()
+}
+
+/// The stable comma-separated storage form of a tier list, e.g.
+/// `"urgent,high"`.
+#[must_use]
+pub fn tiers_to_csv(tiers: &[MailboxPriority]) -> String {
+    tiers
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// One mailbox message as shown to a specific requesting client — `read`
 /// reflects that client's own drain state, not a global property of the
 /// message (a broadcast message can be read by one client and unread by
@@ -78,6 +113,32 @@ pub struct MailboxMessageView {
     pub created_at_ms: i64,
     /// Whether the requesting client has already drained this message.
     pub read: bool,
+    /// The entity this message concerns, in `crate::entity_uri::EntityUri`
+    /// string form, when the enqueuing call site named one (RAL-320) --
+    /// what a personal follow's `covers()` check matches against. `None` for
+    /// messages enqueued before this field existed, or with no addressable
+    /// entity.
+    pub entity_uri: Option<String>,
+}
+
+/// Shared row-mapper for `mailbox_messages` queries that select the eight
+/// columns `id, priority, message, squad_id, task, cell_id, created_at_ms,
+/// <read-bool>, entity_uri` in that order -- both
+/// [`Store::mailbox_messages_for_client`] and
+/// [`Store::personal_mailbox_messages_for_user`] shape their `SELECT` to
+/// match this so they can share one mapper.
+fn row_to_message_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxMessageView> {
+    Ok(MailboxMessageView {
+        id: r.get(0)?,
+        priority: r.get(1)?,
+        message: r.get(2)?,
+        squad_id: r.get(3)?,
+        task: r.get(4)?,
+        cell_id: r.get(5)?,
+        created_at_ms: r.get(6)?,
+        read: r.get(7)?,
+        entity_uri: r.get(8)?,
+    })
 }
 
 impl Store {
@@ -118,7 +179,11 @@ impl Store {
     /// Enqueue a new mailbox message, broadcast to every currently and
     /// future registered client. Returns the new message's id. Entity
     /// references are all optional — a squad-wide or system-wide escalation
-    /// may not have a specific task/cell to point at.
+    /// may not have a specific task/cell to point at. `entity_uri` (RAL-320)
+    /// is the `crate::entity_uri::EntityUri` string form of the same
+    /// entity, when the call site can name one -- it's what a personal
+    /// follow's `covers()` check matches against; pass `None` when there's
+    /// no addressable entity.
     pub fn enqueue_mailbox_message(
         &self,
         priority: MailboxPriority,
@@ -126,12 +191,13 @@ impl Store {
         squad_id: Option<&str>,
         task: Option<&str>,
         cell_id: Option<&str>,
+        entity_uri: Option<&str>,
     ) -> Result<String> {
         let id = self.next_id("mailbox_message_seq", "mailbox")?;
         self.conn.execute(
-            "INSERT INTO mailbox_messages(id, priority, message, squad_id, task, cell_id, created_at_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, priority.as_str(), message, squad_id, task, cell_id, now_ms()],
+            "INSERT INTO mailbox_messages(id, priority, message, squad_id, task, cell_id, created_at_ms, entity_uri)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, priority.as_str(), message, squad_id, task, cell_id, now_ms(), entity_uri],
         )?;
         Ok(id)
     }
@@ -148,7 +214,7 @@ impl Store {
         let priority_str = priority.map(MailboxPriority::as_str);
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
-                    d.client_id IS NOT NULL AS read
+                    d.client_id IS NOT NULL AS read, m.entity_uri
              FROM mailbox_messages m
              LEFT JOIN mailbox_drains d ON d.message_id = m.id AND d.client_id = ?1
              WHERE (?2 = 0 OR d.client_id IS NULL)
@@ -156,20 +222,117 @@ impl Store {
              ORDER BY m.created_at_ms ASC",
         )?;
         let rows = stmt
-            .query_map(params![client_id, unread_only, priority_str], |r| {
-                Ok(MailboxMessageView {
-                    id: r.get(0)?,
-                    priority: r.get(1)?,
-                    message: r.get(2)?,
-                    squad_id: r.get(3)?,
-                    task: r.get(4)?,
-                    cell_id: r.get(5)?,
-                    created_at_ms: r.get(6)?,
-                    read: r.get(7)?,
-                })
-            })?
+            .query_map(
+                params![client_id, unread_only, priority_str],
+                row_to_message_view,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// List mailbox messages visible to `user_name` through their personal
+    /// follows (RAL-320) -- deliberately "opt-in": a user with zero follows
+    /// sees nothing here, never "everything", since the personal mailbox is
+    /// a filtered view layered over the broadcast one, not a second copy of
+    /// it. A message matches when some follow's entity
+    /// [`crate::entity_uri::EntityUri::covers`] the message's own
+    /// `entity_uri` (a message with no `entity_uri` never matches any
+    /// follow) and the message's priority is one of that follow's
+    /// `notify_tiers`. `unread_only`/`priority` mirror
+    /// [`Self::mailbox_messages_for_client`]; "read" here reflects
+    /// [`Self::drain_personal_mailbox_messages`]'s per-user drain state, not
+    /// any broadcast client's.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn personal_mailbox_messages_for_user(
+        &self,
+        user_name: &str,
+        unread_only: bool,
+        priority: Option<MailboxPriority>,
+    ) -> Result<Vec<MailboxMessageView>> {
+        let follows = self.list_follows(user_name)?;
+        if follows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let priority_str = priority.map(MailboxPriority::as_str);
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
+                    d.user_name IS NOT NULL AS read, m.entity_uri
+             FROM mailbox_messages m
+             LEFT JOIN user_mailbox_drains d ON d.message_id = m.id AND d.user_name = ?1
+             WHERE m.entity_uri IS NOT NULL
+               AND (?2 = 0 OR d.user_name IS NULL)
+               AND (?3 IS NULL OR m.priority = ?3)
+             ORDER BY m.created_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![user_name, unread_only, priority_str],
+                row_to_message_view,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|msg| {
+                let Some(msg_uri) = msg.entity_uri.as_deref().and_then(crate::entity_uri::parse)
+                else {
+                    return false;
+                };
+                follows.iter().any(|f| {
+                    crate::entity_uri::parse(&f.entity_uri).is_some_and(|followed| {
+                        followed.covers(&msg_uri)
+                            && f.notify_tiers.iter().any(|t| t.as_str() == msg.priority)
+                    })
+                })
+            })
+            .collect())
+    }
+
+    /// Mark messages as drained (read) for `user_name`'s personal mailbox --
+    /// mirrors [`Self::drain_mailbox_messages`]'s per-client shape, but keyed
+    /// on `user_mailbox_drains` (per-user) instead of `mailbox_drains`
+    /// (per-broadcast-client), since a personal follow and a broadcast
+    /// client track read state independently over the same underlying
+    /// messages.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn drain_personal_mailbox_messages(
+        &self,
+        user_name: &str,
+        message_ids: Option<&[String]>,
+    ) -> Result<usize> {
+        let ids: Vec<String> = match message_ids {
+            Some(ids) if !ids.is_empty() => {
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!("SELECT id FROM mailbox_messages WHERE id IN ({placeholders})");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let bound: Vec<&dyn rusqlite::ToSql> =
+                    ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                stmt.query_map(bound.as_slice(), |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            Some(_) => Vec::new(),
+            None => self
+                .personal_mailbox_messages_for_user(user_name, true, None)?
+                .into_iter()
+                .map(|m| m.id)
+                .collect(),
+        };
+        let at_ms = now_ms();
+        let mut drained = 0usize;
+        for id in &ids {
+            let n = self.conn.execute(
+                "INSERT OR IGNORE INTO user_mailbox_drains(message_id, user_name, drained_at_ms)
+                 VALUES(?1, ?2, ?3)",
+                params![id, user_name, at_ms],
+            )?;
+            drained += n;
+        }
+        Ok(drained)
     }
 
     /// Mark messages as drained (read) for `client_id`. `message_ids: None`
@@ -256,6 +419,7 @@ mod tests {
                 Some("squad-000000000001"),
                 Some("build"),
                 Some("cell-1"),
+                None,
             )
             .unwrap();
 
@@ -282,7 +446,7 @@ mod tests {
         let client_a = store.register_mailbox_client().unwrap();
         let client_b = store.register_mailbox_client().unwrap();
         store
-            .enqueue_mailbox_message(MailboxPriority::High, "stalled", None, None, None)
+            .enqueue_mailbox_message(MailboxPriority::High, "stalled", None, None, None, None)
             .unwrap();
 
         let drained = store.drain_mailbox_messages(&client_a, None).unwrap();
@@ -310,10 +474,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let client_id = store.register_mailbox_client().unwrap();
         store
-            .enqueue_mailbox_message(MailboxPriority::Urgent, "u", None, None, None)
+            .enqueue_mailbox_message(MailboxPriority::Urgent, "u", None, None, None, None)
             .unwrap();
         store
-            .enqueue_mailbox_message(MailboxPriority::Normal, "n", None, None, None)
+            .enqueue_mailbox_message(MailboxPriority::Normal, "n", None, None, None, None)
             .unwrap();
 
         let urgent_only = store
@@ -328,7 +492,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let client_id = store.register_mailbox_client().unwrap();
         let msg_id = store
-            .enqueue_mailbox_message(MailboxPriority::Normal, "m", None, None, None)
+            .enqueue_mailbox_message(MailboxPriority::Normal, "m", None, None, None, None)
             .unwrap();
 
         let drained = store

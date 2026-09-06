@@ -114,6 +114,7 @@ impl Store {
             task: None,
             log_path: None,
             payload: serde_json::json!({ "name": name }),
+            admin_only: false,
         });
         Ok(())
     }
@@ -191,6 +192,7 @@ impl Store {
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({ "old": old, "new": new }),
+                admin_only: false,
             });
         }
         Ok(())
@@ -220,6 +222,7 @@ impl Store {
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({ "name": name }),
+                admin_only: false,
             });
         }
         Ok(n > 0)

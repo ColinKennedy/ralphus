@@ -38,6 +38,20 @@ or transport (see **channel**).
 | **carry-forward** / **carry refs** | Reusing a previous build's already-resolved conflict commits when a review is rebuilt, so the same conflict isn't resolved twice. |
 | **combined worktree** | The read-only worktree at the head of the full stack — what a reviewer reads and what check gates run against. |
 
+## Arbiter and Triage (RAL-318)
+
+The internal-name/user-facing-name split here mirrors **review**/**guardian**
+above: users see "Triage", the code says "Arbiter".
+
+| Term | Meaning |
+|---|---|
+| **Arbiter** | The *internal* name for the daemon subsystem that classifies a Triage-opted-in cell into a registered **triage type** and pools cells toward an automatic review. Exactly one Arbiter exists per daemon — never per-project. Its own module is `daemon/src/arbiter.rs` (classification, the `ralphus check health` round-trip); the type registry and pool bookkeeping live in `daemon/src/triage.rs`. Cartographer notes it logs use `Note::new("arbiter")`. |
+| **Triage** | The *user-facing* name for the same subsystem, and the cell-level opt-in: `[[task.cell]] triage = true`, optionally with an inline `triage_type`. What the board's Triage tab and `ralphus triage type …` name. |
+| **triage type** | A registered category (`name`/`label`/`description`) a Triage-opted-in cell is classified into. Store-backed and CLI-mutable (`ralphus triage type register/list/get/deregister`) — mirrors the **machine** **provider** registry's pattern, deliberately *not* the **agent profile** pattern (config-file-only, no CLI mutation). The built-in `unclassified` type always exists and can never be deregistered — the permanent fallback for a classification failure (single attempt, no retry) or a submission with no registered types at all. |
+| **Triage pool** | Cells opted into Triage, pooled by `(project, triage type)` until that pool's count threshold or one of its cron schedule entries fires — "first to fire wins", and firing resets the pool. New, persisted, cross-submission state (`triage_pool_cells`/`triage_pool_thresholds`/`triage_schedules`) — distinct from `derive_reviews`' existing per-*submission* grouping of explicit `[[review]]` cells, which holds no state between submissions. |
+| **resolver** (agent/model) | A **review**'s own conflict-resolving `agent`/`model` — the `ReviewDef` schema/wire fields are plain `agent`/`model`, but the CLI's `ralphus review settings --resolver-agent --resolver-model` and `.ralphus.toml`'s `[review] default_resolver_agent` both carry the `resolver-` prefix precisely to disambiguate from the **Arbiter**'s own `agent`/`model`/`maximum_budget_usd` (`[arbiter]` config, CLI-immutable) — resolving conflicts is not classifying work, so neither namespace is prefixed with the other (no `resolver_arbiter`/`arbiter_agent`); they simply never collide. |
+| **origin** (guardian) | `GuardianView::origin`: `"explicit"` for a review created from an authored `[[review]]` block (or any other non-Arbiter path), `"arbiter"` for one created by draining a fired Triage pool. Backs the board's Arbiter badge and Reviews sidebar filter. |
+
 ## Machines and providers (RAL-185)
 
 | Term | Meaning |
@@ -50,6 +64,7 @@ or transport (see **channel**).
 | **channel** | A provider's *reused transport*: one long-lived process serving many commands instead of a fresh spawn per command. Opt-in per provider (`--channel`), with automatic fallback to per-command spawns. **Deliberately not called a "cell"**, which is already taken above. |
 | **workspace** | A directory *plus the machine it lives on* (`crate::workspace::Workspace`). Introduced because a bare path answers "which folder" but not "which host". |
 | **local** | Reserved machine value meaning the daemon's own host. Also the implicit default. |
+| **target** | One statically-configured `[machine.targets.<name>]` entry (RAL-355 Phase 2): a `machine` value plus that machine's durable `remote_root` and runner policy. Config-file-only for v1 (`daemon/src/machine_targets.rs`, global scope only — no project-local override, unlike **agent profile**). A target's `machine` field holds the *full* `<scheme>:<uri>` value, never just the **uri** half, to avoid colliding with that already-taken term. |
 
 ## Storage and identity
 
@@ -66,6 +81,7 @@ or transport (see **channel**).
 | **seat** | Secure-dist only: the `user@hostname` a license is locked to, so a copied `ralphus.lic` won't start elsewhere. Deliberately *not* called a **machine** — that word already means "where work runs" (RAL-185), and a seat names a person on a host, not a work destination. A license with no seat runs anywhere. |
 | **env override** | One layer of the environment-variable hierarchy applied to a spawned subprocess: `squad < task < cell` for cells, extended by `…< proof scope < that individual step` for proof steps (RAL-150/172/191). A child layer wins per-key over its parents. Seeded from a TOML `environment` table at submit, or set later via the matching `POST …/env` endpoint — the two are indistinguishable once stored. |
 | **agent profile** | A named `.ralphus.toml` entry under `[agent.profiles.<name>]` that resolves a task/cell `agent = "<name>"` to a concrete backend, optional executable override, and scoped per-cell environment. The profile is daemon config, not task-TOML schema. |
+| **resolved environment** | RAL-324: what one surface's environment variables actually come out as once every layer feeding it is folded together, lowest-precedence first — as opposed to an **env override**, which is a single layer. Read-only: served by the `GET` twin of each `POST .../env` route, rendered by the board's "🔎 Resolved env" popup and `ralphus <noun> env`. Values are masked only for names registered in the Secrets tab. |
 | **tombstone** | An env override whose value is `null` rather than a string: "remove this inherited variable entirely", as opposed to *clearing* the override (which restores the inherited value). Only review-branch overrides (RAL-191) have one, because only they layer over an environment inherited from a *different* entity — the branch's source cell. |
 | **out of date** (env overrides) | RAL-271: a cosmetic, non-blocking badge on a task/cell/proof step whose own env overrides changed since it last ran/retried or had its status explicitly set. Purely informational — never invalidates a prior proof result. Not to be confused with `--drift` (PR/worktree divergence, RAL-190) or `--stale` (Live View pane liveness, RAL-170) — distinct concepts with their own colors, see `docs/colors.md`. |
 | **ticket** | RAL-222: a short-lived (30s), single-use nonce that gates `/api/events` (SSE) in place of the long-lived bearer token, since `EventSource` cannot set an `Authorization` header. Minted via `POST /api/events/ticket`, consumed on first use. Distinct from the informal use of "ticket" for a Jira issue (RAL-…) elsewhere in this repo's docs/commit messages — context disambiguates. |
@@ -79,23 +95,27 @@ RAL-252 is done` comments at each one.
 
 | Term | Meaning |
 |---|---|
-| **user** | A registered placeholder identity (`crate::users`, `users` table): just a name, no password, no session, no permissions. Grants nothing on its own — a caller can claim any registered name. **Distinct from a licensing seat** — see **seat** above, which names a person on a host for `secure-dist` locking, not a request identity. |
+| **user** | A registered placeholder identity (`crate::users`, `users` table): just a name, no password, no session, no permissions beyond `is_admin`'s convenience gating below. Grants nothing on its own — a caller can claim any registered name. **Distinct from a licensing seat** — see **seat** above, which names a person on a host for `secure-dist` locking, not a request identity. |
 | **default_user** | The `[daemon]` config scalar (`.ralphus.toml`) naming which registered **user** a request is attributed to when it names none explicitly. |
+| **hidden item** | A per-user view preference recording that one **squad** or **review** should be omitted from that user's normal views. It never changes the entity or another user's view. |
+| **is_admin** | RAL-332: a boolean flag on a registered **user** gating the board's Machines/Triage/Projects/Users/Secrets tabs and their underlying endpoints, plus admin-only **Cartographer** row visibility. A UI-level convenience gate, not a real security boundary — anyone holding the daemon's shared bearer token can already reach every endpoint it gates directly (no verified login until RAL-252). |
 | **UserContext** | The type (`daemon/src/agent_access.rs`) carrying a request's claimed user identity (`id: Option<String>`) through `AgentAccess`. Not a verified identity. |
 | **AgentAccess** | The trait deciding which agents a `UserContext` may select (`GET /api/agents`). Only implementation today, `DefaultAgentAccess`, ignores the user and is permissive by design. |
 
-## User identity (placeholder, pre-RAL-252)
+## Personal follows and notification preferences (RAL-320)
 
-There is no multi-user authentication in ralphus today. These names exist as
-a seam for RAL-252 to fill in — see `TODO: Replace with user auth once
-RAL-252 is done` comments at each one.
+A per-**user** subscription layer over the existing **mailbox** (RAL-241) —
+not a second notification system. CLI-only surface (`ralphus mailbox
+follow`/`unfollow`/`follows`/`preferences`/`set-preferences`/`personal`/
+`personal-drain`); no board UI, no external delivery channel.
 
 | Term | Meaning |
 |---|---|
-| **user** | A registered placeholder identity (`crate::users`, `users` table): just a name, no password, no session, no permissions. Grants nothing on its own — a caller can claim any registered name. **Distinct from a licensing seat** — see **seat** above, which names a person on a host for `secure-dist` locking, not a request identity. |
-| **default_user** | The `[daemon]` config scalar (`.ralphus.toml`) naming which registered **user** a request is attributed to when it names none explicitly. |
-| **UserContext** | The type (`daemon/src/agent_access.rs`) carrying a request's claimed user identity (`id: Option<String>`) through `AgentAccess`. Not a verified identity. |
-| **AgentAccess** | The trait deciding which agents a `UserContext` may select (`GET /api/agents`). Only implementation today, `DefaultAgentAccess`, ignores the user and is permissive by design. |
+| **follow** | One row (`follows` table, `daemon/src/follows.rs`) binding a **user** to an **entity URI** (squad/task/cell/proof/review — "review worktree" is the same `guardian:<id>` URI) plus that follow's own selected notify tiers. Re-following the same entity updates its tiers in place rather than creating a duplicate. Following a parent entity **cascades**: its notifications also cover every entity nested under it (a squad follow covers its tasks, cells, and proof steps). |
+| **notify tiers** (on a follow) | The subset of the mailbox's existing `urgent`/`high`/`normal` priority tiers a given follow cares about — the filter a personal mailbox message must clear to reach that follower. Distinct from **default notify tiers** (a user-level default, not tied to one follow). |
+| **personal mailbox** | The per-user *view* over the same broadcast mailbox message stream (RAL-241's `mailbox_messages`), filtered down to messages whose entity is covered by one of that user's follows and whose priority clears that follow's notify tiers. Not a separate message store — same rows, a narrower read. |
+| **auto-follow** | A persisted per-**user** preference (`users.auto_follow`): when set, submitting a squad automatically creates a follow (at that user's **default notify tiers**) on the submitted entity, so a user doesn't have to manually follow their own work. |
+| **default notify tiers** (user preference) | A per-**user** preference (`users.default_notify_tiers`) used as the notify-tier fallback whenever a follow doesn't specify its own tiers explicitly (including auto-follow's implicit follow). |
 
 ## Scheduling
 
@@ -144,6 +164,8 @@ Already carrying weight; pick something else:
 - **review** / **guardian** — the same thing; don't add a third name.
 - **proof** — the pipeline step. Use "check" for a review's gates, which is what they're already called.
 - **machine** — where work runs (RAL-185). Use **seat** for a licensing identity (`user@hostname`).
+- **Arbiter** / **Triage** — the same subsystem; don't add a third name (mirrors **review**/**guardian**). "Triage" is user-facing, "Arbiter" is internal.
+- **resolver** — a review's own conflict-resolving agent/model (RAL-318 disambiguation). Don't reuse it for the Arbiter's classification agent/model, or vice versa — prefix neither with the other.
 
 ## See also
 
