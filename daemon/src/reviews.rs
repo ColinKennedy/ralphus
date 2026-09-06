@@ -340,10 +340,10 @@ struct Membership {
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
     auto_submit_pr_stack: Option<bool>,
-    /// Declared `[[review.auto_build]]` steps (RAL-342): zero or more build
-    /// steps, each either a static `command` or an agent-invocation shape,
-    /// mutually exclusive with `skip_auto_build`.
-    auto_build: Vec<ralphus_core::schema::AutoBuildDef>,
+    /// Optional `[review.auto_build]` declaration (RAL-342): either a static
+    /// `command` or an agent-invocation shape, mutually exclusive with
+    /// `skip_auto_build`.
+    auto_build: Option<ralphus_core::schema::AutoBuildDef>,
     /// Explicit opt-out of the auto_build requirement (`[[review]]
     /// skip_auto_build = true`, RAL-342), mutually exclusive with `auto_build`.
     skip_auto_build: bool,
@@ -674,7 +674,7 @@ pub fn derive_reviews(
                 .and_then(|r| r.proof_scope.clone())
                 .filter(|s| !s.trim().is_empty()),
             auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
-            auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
+            auto_build: rv.and_then(|r| r.auto_build.clone()),
             skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
         });
     }
@@ -986,18 +986,17 @@ fn into_guardian_auto_build(
     }
 }
 
-/// Persist this review's declared build steps (RAL-342), from the first member
-/// that sets `[[review.auto_build]]` entries, or -- failing that -- the first
-/// member that sets `skip_auto_build = true`. Currently only the first step
-/// is persisted; multiple steps will be supported in the future. A no-op when
-/// no member declares either, leaving the guardian to fall back to the
-/// project-config default at merge time.
+/// Persist this review's declared build step (RAL-342), from the first member
+/// that sets `[review.auto_build]`, or -- failing that -- the first member
+/// that sets `skip_auto_build = true`. A no-op when no member declares
+/// either, leaving the guardian to fall back to the project-config default at
+/// merge time.
 fn apply_auto_build(
     store: &Store,
     gid: &str,
     members: &[&Membership],
 ) -> std::result::Result<(), ReviewError> {
-    if let Some(def) = members.iter().find_map(|m| m.auto_build.first()) {
+    if let Some(def) = members.iter().find_map(|m| m.auto_build.as_ref()) {
         store
             .set_guardian_auto_build(gid, Some(&into_guardian_auto_build(def)))
             .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -1028,7 +1027,7 @@ fn require_auto_build_declaration(
 ) -> std::result::Result<(), ReviewError> {
     let declared = members
         .iter()
-        .any(|m| !m.auto_build.is_empty() || m.skip_auto_build);
+        .any(|m| m.auto_build.is_some() || m.skip_auto_build);
     if declared {
         return Ok(());
     }
@@ -1040,7 +1039,7 @@ fn require_auto_build_declaration(
         return Ok(());
     }
     Err(ReviewError::new(format!(
-        "{review_ref} must declare [[review.auto_build]] or skip_auto_build = true \
+        "{review_ref} must declare [review.auto_build] or skip_auto_build = true \
          (or configure a project-level auto_build default in .ralphus.toml)"
     )))
 }
@@ -1878,7 +1877,7 @@ mod tests {
             maximum_budget_usd,
             proof_scope: None,
             auto_submit_pr_stack: None,
-            auto_build: Vec::new(),
+            auto_build: None,
             skip_auto_build: false,
         }
     }
@@ -1971,7 +1970,7 @@ mod tests {
             ..Default::default()
         };
         let m = Membership {
-            auto_build: vec![def],
+            auto_build: Some(def),
             ..membership(None)
         };
         apply_auto_build(&store, &gid, &[&m]).unwrap();
@@ -2013,7 +2012,7 @@ mod tests {
             ..Default::default()
         };
         let m = Membership {
-            auto_build: vec![def],
+            auto_build: Some(def),
             ..membership(None)
         };
         let root = temp_repo();

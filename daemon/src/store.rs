@@ -1990,7 +1990,7 @@ impl Store {
             "ALTER TABLE proofs ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
             // RAL-342: this review's own declared build step, authored via
-            // `[[review.auto_build]]` and resolved once at submit time
+            // `[review.auto_build]` and resolved once at submit time
             // (`reviews::derive_reviews`) into a JSON-serialized
             // `GuardianAutoBuild`. NULL means the review declared
             // `skip_auto_build = true` instead -- unlike the
