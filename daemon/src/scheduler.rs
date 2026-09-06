@@ -24,6 +24,11 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often to check reviews for a base-branch shift and auto-rebuild them.
 pub const REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Guardian worktrees are expensive but not urgent maintenance. One sweep per
+/// day keeps a long-running daemon bounded without putting git worktree scans
+/// on the normal review-maintenance hot path.
+pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// How often to sweep for guardians whose debounced final change-summary
 /// regen request (RAL-208) has gone quiet long enough to fire the LLM call.
 /// Finer-grained than [`REVIEW_MAINT_INTERVAL`] since it's checked against
@@ -382,6 +387,7 @@ pub fn run_loop(
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
 ) {
     let mut last_maintenance = std::time::Instant::now();
+    let mut last_worktree_retirement = std::time::Instant::now();
     let mut last_summary_sweep = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
     let mut last_terminal_log_prune = std::time::Instant::now();
@@ -442,6 +448,10 @@ pub fn run_loop(
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
             last_maintenance = std::time::Instant::now();
+        }
+        if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
+            crate::guardian_merge::retire_stale_worktrees(&store);
+            last_worktree_retirement = std::time::Instant::now();
         }
         if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
             crate::guardian_merge::sweep_pending_summaries(&store, &sem);

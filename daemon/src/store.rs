@@ -576,6 +576,25 @@ pub struct ClearOutcome {
     pub squad_ids: Vec<String>,
 }
 
+/// A persisted path that may be owned by a cell, proof, or review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeClaim {
+    pub kind: String,
+    pub owner: String,
+    pub path: String,
+    pub state: String,
+}
+
+/// One review-worktree path and the timestamp of its owner's last activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardianWorktreeRecord {
+    pub guardian_id: String,
+    pub guardian_name: String,
+    pub project_root: String,
+    pub path: String,
+    pub last_activity_ms: i64,
+}
+
 // ── Store ────────────────────────────────────────────────────────────────────
 
 /// The task store.
@@ -3707,6 +3726,78 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET cwd=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![cwd, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Persisted review worktrees, including per-branch and combined paths.
+    pub(crate) fn guardian_worktree_records(&self) -> Result<Vec<GuardianWorktreeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.name, COALESCE(gb.project, g.git_root), gb.worktree,
+                    MAX(g.updated_at_ms, COALESCE(gb.started_at_ms, 0))
+             FROM guardians g
+             JOIN guardian_branches gb ON gb.guardian_id=g.id
+             WHERE gb.worktree IS NOT NULL
+             UNION ALL
+             SELECT id, name, git_root, combined_worktree, updated_at_ms
+             FROM guardians WHERE combined_worktree IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(GuardianWorktreeRecord {
+                    guardian_id: r.get(0)?,
+                    guardian_name: r.get(1)?,
+                    project_root: r.get(2)?,
+                    path: r.get(3)?,
+                    last_activity_ms: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every cell/proof/review claim whose persisted path can name a worktree.
+    /// Proof cwd selection mirrors `scheduler::run_proofs`.
+    pub(crate) fn worktree_claims(&self) -> Result<Vec<WorktreeClaim>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 'cell', c.squad_id || ':' || c.task_idx || ':' || c.idx, c.cwd, c.state
+             FROM cells c WHERE c.cwd IS NOT NULL
+             UNION ALL
+             SELECT 'proof', p.squad_id || ':' || p.task_idx || ':' || p.scope || ':' || p.cell_idx || ':' || p.idx,
+                    c.cwd, p.state
+             FROM proofs p JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+              AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
+                   (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
+                     WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
+             WHERE c.cwd IS NOT NULL
+             UNION ALL
+             SELECT 'review', g.id, gb.worktree, g.status
+             FROM guardians g JOIN guardian_branches gb ON gb.guardian_id=g.id
+             WHERE gb.worktree IS NOT NULL
+             UNION ALL
+             SELECT 'review', id, combined_worktree, status
+             FROM guardians WHERE combined_worktree IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(WorktreeClaim {
+                    kind: r.get(0)?,
+                    owner: r.get(1)?,
+                    path: r.get(2)?,
+                    state: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Forget a review path after git confirmed that worktree was removed.
+    pub(crate) fn clear_guardian_worktree_path(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET worktree=NULL WHERE worktree=?1",
+            params![path],
+        )?;
+        self.conn.execute(
+            "UPDATE guardians SET combined_worktree=NULL WHERE combined_worktree=?1",
+            params![path],
         )?;
         Ok(())
     }
