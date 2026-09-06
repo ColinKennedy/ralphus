@@ -6073,7 +6073,7 @@ fn finalize_review(
 ///
 /// Four-tier precedence (RAL-342, replacing the old RAL-110 AI-guessed build):
 /// skip (opt-out) → this review's own explicit `checks` gates → this review's
-/// declared `[[review.auto_build]]` step → the project's `.ralphus.toml`
+/// declared `[review.auto_build]` step → the project's `.ralphus.toml`
 /// `auto_build` default → nothing. Only one tier ever runs.
 ///
 /// Returns `Some(note)` when checks were opted out, a review auto_build ran, or
@@ -6128,7 +6128,7 @@ fn final_checks(
         return Ok(None);
     }
     // RAL-342: no explicit checks -- try this review's own declared
-    // `[[review.auto_build]]` step next, ahead of the project-wide default.
+    // `[review.auto_build]` step next, ahead of the project-wide default.
     // Per Q5, a failure here is advisory only (a UI notice + Cartographer log)
     // rather than a merge-failing `Err` -- unlike explicit `checks`, which the
     // user wrote as a hard gate, an auto_build declaration is a convenience
@@ -6158,7 +6158,7 @@ fn final_checks(
     }
 }
 
-/// Run this review's declared `[[review.auto_build]]` step (RAL-342) against the
+/// Run this review's declared `[review.auto_build]` step (RAL-342) against the
 /// finished combined worktree -- either a static shell `command`, or an agent
 /// invocation described by `def`'s remaining fields (exactly one shape is
 /// populated, enforced by `core::validate` at parse time).
@@ -11363,7 +11363,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// RAL-342: a review's own declared `[[review.auto_build]]` command runs
+    /// RAL-342: a review's own declared `[review.auto_build]` command runs
     /// ahead of (and instead of) the project-level `.ralphus.toml [review]
     /// auto_build` default when both are configured. The project default is
     /// set to a command that would fail, so if it ran instead of the
@@ -11433,7 +11433,7 @@ mod tests {
                 cache_read_tokens: 0,
                 compaction_input_tokens: 0,
                 compaction_count: 0,
-                cost_usd: 0.0,
+                cost_usd: self.cost_usd,
                 cost_is_estimated: false,
                 summary: String::new(),
                 error: Some("boom: agent exploded".to_string()),
@@ -11444,7 +11444,7 @@ mod tests {
         }
     }
 
-    /// RAL-342/Q5: a review-declared `[[review.auto_build]]` *agent* invocation
+    /// RAL-342/Q5: a review-declared `[review.auto_build]` *agent* invocation
     /// that fails must not fail the merge -- it surfaces as an advisory
     /// notice plus a Cartographer log entry, and `final_checks` still returns
     /// `Ok(Some(note))` (never `Err`) so the review reaches `InReview`. Cost

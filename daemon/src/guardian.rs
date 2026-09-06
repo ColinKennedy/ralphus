@@ -119,7 +119,7 @@ pub struct GuardianCheck {
 }
 
 /// This review's own declared build step (RAL-342), authored via
-/// `[[review.auto_build]]` and resolved once at submit time
+/// `[review.auto_build]` and resolved once at submit time
 /// (`reviews::derive_reviews`, converted from `ralphus_core::schema::AutoBuildDef`)
 /// into the JSON blob stored in the `guardians.auto_build_json` column. Either
 /// a static shell `command`, or an agent invocation described by the
@@ -746,7 +746,7 @@ pub struct GuardianView {
     /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
     /// `notice_kind: None`.
     pub notice_at_ms: Option<i64>,
-    /// This review's declared build step (RAL-342), from `[[review.auto_build]]`.
+    /// This review's declared build step (RAL-342), from `[review.auto_build]`.
     /// `None` means the review declared `skip_auto_build = true` instead --
     /// unlike [`Self::resolver_agent`]-style overrides, `None` here is never
     /// "inherit the project config default": every guardian created after
@@ -2028,7 +2028,7 @@ impl Store {
     }
 
     /// Set this review's declared build step (RAL-342), from
-    /// `[[review.auto_build]]`. Set once at review-derivation time
+    /// `[review.auto_build]`. Set once at review-derivation time
     /// (`reviews::derive_reviews`); blind-overwrite, not a read-then-merge
     /// like [`Self::set_guardian_build_env_overrides`], since the whole
     /// declaration is authored together in one TOML block. `None` records
