@@ -638,7 +638,7 @@ impl DaemonClient {
         self.get(&format!("/api/watches{qs}"))
     }
 
-    /// `POST /api/watches` -- watch (or re-watch, updating tiers in place)
+    /// `POST /api/watches` -- watch (or update the watch's tiers in place)
     /// an entity URI on the acting user's behalf. `notify_tiers` omitted or
     /// empty defaults to the acting user's `default_notify_tiers` preference.
     pub fn create_watch(

@@ -230,7 +230,7 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
         MailboxCommand::Unwatch { entity_uri, user } => {
             run_and_report(opts, Some("ralphus mailbox watches"), || {
                 let result = client.delete_watch(&entity_uri, user.as_deref())?;
-                emit(opts, &result, |_| println!("unwatched {entity_uri}"));
+                emit(opts, &result, |_| println!("stopped watching {entity_uri}"));
                 Ok(())
             })
         }
@@ -454,7 +454,10 @@ mod tests {
 
     #[test]
     fn watch_without_entity_uri_is_usage_error() {
-        matches!(parse(&v(&["watch"])), MailboxCommand::UsageError(_));
+        assert!(matches!(
+            parse(&v(&["watch"])),
+            MailboxCommand::UsageError(_)
+        ));
     }
 
     #[test]

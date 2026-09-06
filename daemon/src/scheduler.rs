@@ -1520,13 +1520,15 @@ fn enqueue_cell_failure_mailbox(
         None => format!("cell '{cell_id}' in task '{task_name}' (squad {squad_id}) failed"),
     };
     let entity_uri = guard.cell_entity_uri(squad_id, task_name, cell_id);
-    if let Ok(message_id) = guard.enqueue_mailbox_message(
+    let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
+    if let Ok(message_id) = guard.notify_watchers_with_context(
+        crate::monitor::NotifiableEventKind::SquadFailed,
+        &event_uri,
         crate::mailbox::MailboxPriority::Urgent,
         &text,
         Some(squad_id),
         Some(task_name),
         Some(cell_id),
-        entity_uri.as_deref(),
     ) {
         crate::cartographer::Note::new("scheduler")
             .level(crate::logging::LogLevel::INFO)
@@ -1581,13 +1583,15 @@ fn enqueue_proof_failure_mailbox(
     } else {
         guard.task_entity_uri(squad_id, task_name)
     };
-    if let Ok(message_id) = guard.enqueue_mailbox_message(
+    let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
+    if let Ok(message_id) = guard.notify_watchers_with_context(
+        crate::monitor::NotifiableEventKind::SquadFailed,
+        &event_uri,
         crate::mailbox::MailboxPriority::Urgent,
         &text,
         Some(squad_id),
         Some(task_name),
         cell_id,
-        entity_uri.as_deref(),
     ) {
         let mut note = crate::cartographer::Note::new("scheduler")
             .level(crate::logging::LogLevel::INFO)

@@ -887,8 +887,8 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         "watch",
         &["entity_uri [str]"],
         &["--tier [urgent|high|normal...]", "--user [name]"],
-        "Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications \
-         reach the mailbox; re-watching updates the notification tiers in place (RAL-320).",
+        "Watch an entity so its notifications reach the personal mailbox; re-watching updates \
+         the notification tiers in place (RAL-343).",
         false,
         false, // creates/updates a watch.
         &[],
@@ -897,7 +897,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         "unwatch",
         &["entity_uri [str]"],
         &["--user [name]"],
-        "Stop watching an entity (RAL-320).",
+        "Stop watching an entity (RAL-343).",
         false,
         false, // deletes a watch.
         &[],
@@ -906,7 +906,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         "watches",
         &[],
         &["--user [name]"],
-        "List the acting user's watches (RAL-320).",
+        "List the acting user's watches (RAL-343).",
         false,
         true, // read-only listing.
         &[],
@@ -915,7 +915,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         "preferences",
         &[],
         &["--user [name]"],
-        "Show a user's notification preferences: auto-watch and default notify tiers (RAL-320).",
+        "Show a user's notification preferences: automatic creator watches and default notify tiers.",
         false,
         true, // read-only.
         &[],
@@ -929,7 +929,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
             "--no-auto-watch",
             "--tier [urgent|high|normal...]",
         ],
-        "Set a user's auto-watch and default notification-tier preferences; requires exactly \
+        "Set a user's automatic-watch and default notification-tier preferences; requires exactly \
          one of --auto-watch/--no-auto-watch (RAL-320).",
         false,
         false, // mutates stored preferences.

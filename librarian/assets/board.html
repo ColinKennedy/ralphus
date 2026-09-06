@@ -641,6 +641,11 @@
       </div>
       <div id="prefs-visit-banner" style="display:none"></div>
       <div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)">
+        <b data-tip="Everything you watch, independent of who created it. Watchers receive typed mailbox notifications at their selected priority tiers.">Watches</b>
+        <label style="display:block;margin:10px 0" data-tip="Automatically watch new squads and reviews you create. Turning this off keeps all existing watches."><input id="auto-watch" type="checkbox" onchange="setAutoWatch(this.checked)"> Watch everything I create</label>
+        <div id="watched-items"><div class="empty">Loading…</div></div>
+      </div>
+      <div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)">
         <div style="margin-bottom:8px" data-tip="Switch between the light and dark board theme. Saved to this browser only.">Theme</div>
         <button class="icon-btn" onclick="toggleTheme()" id="prefs-theme-btn" aria-label="Toggle theme" data-tip="Toggle the board theme — the flashbang icon is the bright light theme, the night-vision goggles are the dark theme.\nUse it if the current theme is hard on your eyes or to match your surroundings."></button>
       </div>
@@ -1403,6 +1408,14 @@
        * @property {boolean} is_admin
        */
       /**
+       * @typedef {object} WatchView
+       * @property {string} id
+       * @property {string} user_name
+       * @property {string} entity_uri
+       * @property {string[]} notify_tiers
+       * @property {number} created_at_ms
+       */
+      /**
        * `GET /api/whoami` response (RAL-332).
        * @typedef {object} WhoAmI
        * @property {string|null} name
@@ -1660,6 +1673,7 @@
       CLICK_HANDLERS.editUserProfile = (e, ds) => editUserProfile(ds.name || "");
       CLICK_HANDLERS.toggleUserAdmin = (e, ds) => toggleUserAdmin(ds.name || "", ds.admin || "0");
       CLICK_HANDLERS.unhidePrefItem = (e, ds) => unhidePrefItem(ds.kind || "", ds.id || "");
+      CLICK_HANDLERS.toggleWatch = (e, ds) => toggleWatch(ds.entityUri || "");
       CLICK_HANDLERS.renameSecretEnvName = (e, ds) => renameSecretEnvName(ds.name || "");
       CLICK_HANDLERS.removeSecretEnvName = (e, ds) => removeSecretEnvName(ds.name || "");
       CLICK_HANDLERS.saveProjectEdit = (e, ds) => saveProjectEdit(ds.name || "");
@@ -1871,6 +1885,13 @@
       function defaultHiddenFilters() { return { q: "", type: new Set(HIDDEN_KINDS) }; }
       /** @type {HiddenItem[]} */
       let hiddenItems = [];
+      /** @type {WatchView[]} */
+      let watches = [];
+      /** @type {Map<string, WatchView[]>} */
+      let entityWatchers = new Map();
+      let autoWatch = true;
+      /** @type {string[]} */
+      let defaultWatchTiers = ["urgent", "high", "normal"];
       /** Message from the last failed load/unhide, shown inline above the table. */
       let hiddenError = "";
       let hiddenFilters = defaultHiddenFilters();
@@ -5036,6 +5057,8 @@
         e.preventDefault(); e.stopPropagation(); closeSquadMenu();
         const r = findSquad(id); if (!r) return;
         const items = [`<div data-click="renameSquad" data-squad-id="${esc(id)}" data-tip="Rename this squad — changes the display label only.">✎ Rename</div>`];
+        const squadUri = `squad:${id}`;
+        items.push(`<div data-click="toggleWatch" data-entity-uri="${esc(squadUri)}" data-tip="${isWatching(squadUri) ? "Stop receiving watcher notifications for this squad." : "Watch this whole squad and choose which mailbox priority tiers should notify you."}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
         items.push(hiddenSquadIds.has(id)
           ? `<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show this squad again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
           : `<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide this squad from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
@@ -7714,6 +7737,7 @@
           <div class="kv-row"><span class="k">label</span><span class="v">${esc(r.label || "—")}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${pill(squadDisplayState(r))}${["pending","queued"].includes(r.state) ? "" : squadLogsBtn(r.id) + squadTimelineBtn(r.id)}</span></div>
           ${timingRows(r.started_at_ms, r.finished_at_ms)}
+          <div class="kv-row"><span class="k">watchers</span><span class="v">${watchersHtml(`squad:${r.id}`)}</span></div>
           ${tasks}
           ${reviews}
           ${envOverridesSection(r)}
@@ -11421,6 +11445,8 @@
         menu.className = "ctx-menu"; menu.id = "squad-menu";
         const canCancel = G_CANCELLABLE.includes(g.status);
         const items = [`<div data-click="renameReview" data-guardian-id="${esc(id)}" data-tip="Rename this review — changes the display name only.">✎ Rename</div>`];
+        const reviewUri = `guardian:${id}`;
+        items.push(`<div data-click="toggleWatch" data-entity-uri="${esc(reviewUri)}" data-tip="${isWatching(reviewUri) ? "Stop receiving watcher notifications for this review." : "Watch this whole review and choose which mailbox priority tiers should notify you."}">${isWatching(reviewUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
         items.push(hiddenGuardianIds.has(id)
           ? `<div data-click="unhideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Show this review again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
           : `<div data-click="hideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Hide this review from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of reviews you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
@@ -12112,7 +12138,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           <div id="proof-scope-pending" style="display:${vPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveProofScope" data-guardian-id="${esc(g.id)}" data-tip="Save the Proof scope for this review.\nApplies immediately -- no rebase is triggered.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelProofScope" data-guardian-id="${esc(g.id)}" data-tip="Discard — revert to the last saved value.">Cancel</button></div>
         </div></div>`;
         el.innerHTML = `<div class="squad-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
-            <span style="flex:1"></span><button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
+            <span style="flex:1"></span>${watchersHtml(`guardian:${g.id}`)}<button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
           ${reviewCostSummary(g)}
@@ -14992,6 +15018,79 @@ Work submitted against it will fail — fix the machine or deregister the provid
         return prefsViewingAs ? { "X-Ralphus-User": prefsViewingAs } : {};
       }
       /**
+       * @returns {string}
+       */
+      function prefsUserName() { return prefsViewingAs || currentUserName || ""; }
+      /**
+       * @param {string} entityUri
+       * @returns {boolean}
+       */
+      function isWatching(entityUri) { return watches.some((w) => w.entity_uri === entityUri); }
+      /**
+       * @param {string} entityUri
+       * @returns {string}
+       */
+      function watchersHtml(entityUri) {
+        const rows = entityWatchers.get(entityUri) || [];
+        const names = rows.map((w) => w.user_name).join(", ") || "Nobody yet";
+        return `<details onclick="event.stopPropagation()"><summary data-tip="Show everyone watching this entity. The list refreshes through the board's live update cycle.">${rows.length} watcher${rows.length === 1 ? "" : "s"}</summary><span style="color:var(--muted);font-size:11px">${esc(names)}</span></details>`;
+      }
+      /**
+       * @param {string} entityUri
+       * @returns {Promise<void>}
+       */
+      async function toggleWatch(entityUri) {
+        closeSquadMenu();
+        if (isWatching(entityUri)) {
+          await fetch(`/api/watches/${entityUri}`, { method: "DELETE", headers: prefsUserHeaders() });
+        } else {
+          const answer = prompt("Notification tiers (comma-separated): urgent, high, normal", "urgent,high,normal");
+          if (answer === null) return;
+          const notify_tiers = answer.split(",").map((x) => x.trim().toLowerCase()).filter((x) => ["urgent", "high", "normal"].includes(x));
+          if (!notify_tiers.length) { alert("Choose at least one of urgent, high, normal."); return; }
+          await fetch("/api/watches", { method: "POST", headers: { ...prefsUserHeaders(), "Content-Type": "application/json" }, body: JSON.stringify({ entity_uri: entityUri, notify_tiers }) });
+        }
+        await pollWatches();
+        tick();
+      }
+      /**
+       * @param {boolean} enabled
+       * @returns {Promise<void>}
+       */
+      async function setAutoWatch(enabled) {
+        const name = prefsUserName();
+        if (!name) return;
+        const r = await fetch(`/api/users/${encodeURIComponent(name)}/preferences`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_follow: enabled, default_notify_tiers: defaultWatchTiers }) });
+        if (r.ok) autoWatch = enabled;
+        renderPrefs();
+      }
+      /**
+       * @returns {Promise<void>}
+       */
+      async function pollWatches() {
+        try {
+          const own = await fetch("/api/watches", { headers: prefsUserHeaders() });
+          if (own.ok) watches = (await own.json()).watches || [];
+          const uris = new Set(watches.map((w) => w.entity_uri));
+          if (selectedSquadId) uris.add(`squad:${selectedSquadId}`);
+          if (selectedGuardian) uris.add(`guardian:${selectedGuardian}`);
+          const pairs = await Promise.all([...uris].map(async (uri) => {
+            const r = await fetch(`/api/watches/${uri}`);
+            return /** @type {[string, WatchView[]]} */ ([uri, r.ok ? ((await r.json()).watches || []) : []]);
+          }));
+          entityWatchers = new Map(pairs);
+          const name = prefsUserName();
+          if (name) {
+            const p = await fetch(`/api/users/${encodeURIComponent(name)}/preferences`);
+            if (p.ok) {
+              const preferences = await p.json();
+              autoWatch = !!preferences.auto_follow;
+              defaultWatchTiers = preferences.default_notify_tiers || defaultWatchTiers;
+            }
+          }
+        } catch (_) { /* transient -- the next live refresh retries */ }
+      }
+      /**
        * Polls `GET /api/hidden` for the current (or, under RAL-332's "Edit
        * Profile", visited) user's hidden squads/reviews (RAL-328/RAL-329),
        * plus `GET /api/tasks`/`GET /api/guardians` to resolve their display names, and
@@ -15000,6 +15099,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       async function pollPrefs() {
         try {
+          await pollWatches();
           const [hiddenResp, tasksResp, guardiansResp] = await Promise.all([
             fetch("/api/hidden", { headers: prefsUserHeaders() }),
             fetch("/api/tasks"),
@@ -15099,6 +15199,18 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const resolvedAs = !prefsViewingAs && currentUserName
           ? ` <span style="color:var(--muted)" data-tip="Resolved from the X-Ralphus-User header, falling back to [daemon].default_user.">(resolved as ${esc(currentUserName)})</span>`
           : "";
+        /** @type {HTMLInputElement} */ (byId("auto-watch")).checked = autoWatch;
+        const watched = watches.map((w) => {
+          const [kind, id] = w.entity_uri.split(":", 2);
+          const squad = squads.find((s) => s.id === id);
+          const review = guardians.find((g) => g.id === id);
+          const name = kind === "squad" ? (squad?.label || id) : (review?.name || id);
+          const status = kind === "squad" ? (squad?.state || "unknown") : (review?.status || "unknown");
+          return `<tr><td>${kind === "squad" ? "Squad" : "Review"}</td><td>${esc(name)}</td><td>${pill(status)}</td><td>${esc(w.notify_tiers.join(", "))}</td><td><button class="btn" data-click="toggleWatch" data-entity-uri="${esc(w.entity_uri)}" data-tip="Stop watching this item. Existing mailbox messages are retained.">Unwatch</button></td></tr>`;
+        }).join("");
+        byId("watched-items").innerHTML = watched
+          ? `<table class="proj-table"><thead><tr><th>Type</th><th>Name</th><th>Status</th><th>Tiers</th><th></th></tr></thead><tbody>${watched}</tbody></table>`
+          : `<div class="empty">Nothing watched.</div>`;
         byId("prefs-summary").innerHTML =
           `${hiddenItems.length} hidden item${hiddenItems.length === 1 ? "" : "s"} in ${whose} view${resolvedAs} `
           + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollPrefs()" data-tip="Re-query the daemon for ${whose} hidden items.">⟳ Refresh</button>`;

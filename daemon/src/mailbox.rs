@@ -119,6 +119,8 @@ pub struct MailboxMessageView {
     /// messages enqueued before this field existed, or with no addressable
     /// entity.
     pub entity_uri: Option<String>,
+    /// Typed Monitor event that caused this message, when applicable.
+    pub event_kind: Option<String>,
 }
 
 /// Shared row-mapper for `mailbox_messages` queries that select the eight
@@ -138,6 +140,7 @@ fn row_to_message_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxMessage
         created_at_ms: r.get(6)?,
         read: r.get(7)?,
         entity_uri: r.get(8)?,
+        event_kind: r.get(9)?,
     })
 }
 
@@ -214,7 +217,7 @@ impl Store {
         let priority_str = priority.map(MailboxPriority::as_str);
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
-                    d.client_id IS NOT NULL AS read, m.entity_uri
+                    d.client_id IS NOT NULL AS read, m.entity_uri, m.event_kind
              FROM mailbox_messages m
              LEFT JOIN mailbox_drains d ON d.message_id = m.id AND d.client_id = ?1
              WHERE (?2 = 0 OR d.client_id IS NULL)
@@ -231,7 +234,7 @@ impl Store {
     }
 
     /// List mailbox messages visible to `user_name` through their personal
-    /// watches (RAL-320) -- deliberately "opt-in": a user with zero watches
+    /// watches -- deliberately "opt-in": a user with zero watches
     /// sees nothing here, never "everything", since the personal mailbox is
     /// a filtered view layered over the broadcast one, not a second copy of
     /// it. A message matches when some watch's entity
@@ -258,7 +261,7 @@ impl Store {
         let priority_str = priority.map(MailboxPriority::as_str);
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
-                    d.user_name IS NOT NULL AS read, m.entity_uri
+                    d.user_name IS NOT NULL AS read, m.entity_uri, m.event_kind
              FROM mailbox_messages m
              LEFT JOIN user_mailbox_drains d ON d.message_id = m.id AND d.user_name = ?1
              WHERE m.entity_uri IS NOT NULL
