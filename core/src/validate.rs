@@ -171,7 +171,7 @@ const TASK_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "maximum_context",
     "auto_compact_threshold",
-    "tool_output_max_tokens",
+    "maximum_tool_output_tokens",
     "max_retries",
     "priority",
     "timeout_minutes",
@@ -201,7 +201,7 @@ const CELL_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "maximum_context",
     "auto_compact_threshold",
-    "tool_output_max_tokens",
+    "maximum_tool_output_tokens",
     "timeout_minutes",
     "priority",
     "environment",
@@ -222,6 +222,7 @@ const REVIEW_KEYS: &[&str] = &[
     "action",
     "maximum_budget_usd",
     "proof_scope",
+    "auto_submit_pr_stack",
 ];
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
@@ -234,7 +235,7 @@ const PROOF_KEYS: &[&str] = &[
     "machine",
     "system_prompt",
     "system_prompt_position",
-    "tool_output_max_tokens",
+    "maximum_tool_output_tokens",
     "arguments",
     "budget_tokens",
     "timeout_minutes",
@@ -485,9 +486,16 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
         check_maximum_context(ctx, table, None, &path, header);
-        check_type(ctx, table, "tool_output_max_tokens", Ty::Int, &path, header);
-        check_positive_number(ctx, table, "tool_output_max_tokens", &path, header);
-        check_tool_output_max_tokens(ctx, table, None, &path, header);
+        check_type(
+            ctx,
+            table,
+            "maximum_tool_output_tokens",
+            Ty::Int,
+            &path,
+            header,
+        );
+        check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
+        check_maximum_tool_output_tokens(ctx, table, None, &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
@@ -714,9 +722,16 @@ fn validate_cells(
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
         check_maximum_context(ctx, table, task_agent, &path, header);
-        check_type(ctx, table, "tool_output_max_tokens", Ty::Int, &path, header);
-        check_positive_number(ctx, table, "tool_output_max_tokens", &path, header);
-        check_tool_output_max_tokens(ctx, table, task_agent, &path, header);
+        check_type(
+            ctx,
+            table,
+            "maximum_tool_output_tokens",
+            Ty::Int,
+            &path,
+            header,
+        );
+        check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
+        check_maximum_tool_output_tokens(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
@@ -1052,22 +1067,22 @@ fn check_maximum_context(
 }
 
 /// Enforce the tool-output-cap backend-support rule (RAL-333):
-/// `tool_output_max_tokens` is only accepted for a backend with a real
+/// `maximum_tool_output_tokens` is only accepted for a backend with a real
 /// delivery mechanism -- see
-/// [`agent_supports_tool_output_max_tokens`](crate::schema::agent_supports_tool_output_max_tokens).
+/// [`agent_supports_maximum_tool_output_tokens`](crate::schema::agent_supports_maximum_tool_output_tokens).
 /// Mirrors [`check_maximum_context`]'s shape, including the same
 /// `core`-can-only-classify-[`RESERVED_AGENT_NAMES`] deferral to the daemon
 /// for a custom `[agent.profiles.*]` entry. Used for task, cell, and proof
 /// tables alike -- a proof step has no `agent` field of its own, so callers
 /// pass the step's already-resolved effective agent as `task_agent`.
-fn check_tool_output_max_tokens(
+fn check_maximum_tool_output_tokens(
     ctx: &mut Ctx,
     table: &toml::Table,
     task_agent: Option<&str>,
     path: &str,
     header: Option<u32>,
 ) {
-    if !table.contains_key("tool_output_max_tokens") {
+    if !table.contains_key("maximum_tool_output_tokens") {
         return;
     }
 
@@ -1080,13 +1095,13 @@ fn check_tool_output_max_tokens(
         return;
     }
 
-    if !crate::schema::agent_supports_tool_output_max_tokens(agent) {
-        let line = ctx.key_line(header, "tool_output_max_tokens");
+    if !crate::schema::agent_supports_maximum_tool_output_tokens(agent) {
+        let line = ctx.key_line(header, "maximum_tool_output_tokens");
         ctx.error(
-            &format!("{path}.tool_output_max_tokens"),
+            &format!("{path}.maximum_tool_output_tokens"),
             ErrorKind::InvalidValue,
             format!(
-                "'tool_output_max_tokens' is only supported for the \
+                "'maximum_tool_output_tokens' is only supported for the \
                  'codex'/'pi'/'claude-code' agents right now, not '{agent}'. Remove this \
                  setting, or switch to one of those agents."
             ),
@@ -1149,6 +1164,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 );
             }
         }
+        check_type(ctx, table, "auto_submit_pr_stack", Ty::Bool, &rpath, header);
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -1664,9 +1680,16 @@ fn validate_proof_array(
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &vpath, None);
-        check_type(ctx, table, "tool_output_max_tokens", Ty::Int, &vpath, None);
-        check_positive_number(ctx, table, "tool_output_max_tokens", &vpath, None);
-        check_tool_output_max_tokens(ctx, table, agent, &vpath, None);
+        check_type(
+            ctx,
+            table,
+            "maximum_tool_output_tokens",
+            Ty::Int,
+            &vpath,
+            None,
+        );
+        check_positive_number(ctx, table, "maximum_tool_output_tokens", &vpath, None);
+        check_maximum_tool_output_tokens(ctx, table, agent, &vpath, None);
         check_type(ctx, table, "arguments", Ty::StrArray, &vpath, None);
         check_type(ctx, table, "restart_on", Ty::StrArray, &vpath, None);
 
@@ -2168,6 +2191,29 @@ command = "cargo build"
         );
     }
 
+    // ── [[review]] auto_submit_pr_stack (RAL-317) ──────────────────────────
+
+    #[test]
+    fn review_auto_submit_pr_stack_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_submit_pr_stack=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_auto_submit_pr_stack_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_submit_pr_stack=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType
+                    && e.message.contains("auto_submit_pr_stack")),
+            "{:?}",
+            r.errors
+        );
+    }
+
     #[test]
     fn proof_needs_exactly_one_kind() {
         let none = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"v\"\n";
@@ -2657,10 +2703,10 @@ command = "cargo build"
     }
 
     #[test]
-    fn tool_output_max_tokens_valid_for_claude_code_codex_and_pi() {
+    fn maximum_tool_output_tokens_valid_for_claude_code_codex_and_pi() {
         for agent in ["claude-code", "codex", "pi"] {
             let src = format!(
-                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"{agent}\"\ntool_output_max_tokens=50000\n"
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"{agent}\"\nmaximum_tool_output_tokens=50000\n"
             );
             let r = validate_toml(&src);
             assert!(r.is_ok(), "{agent}: {:?}", r.errors);
@@ -2668,12 +2714,12 @@ command = "cargo build"
     }
 
     #[test]
-    fn tool_output_max_tokens_rejected_for_ollama() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\ntool_output_max_tokens=50000\n";
+    fn maximum_tool_output_tokens_rejected_for_ollama() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\nmaximum_tool_output_tokens=50000\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
-                && e.path.contains("tool_output_max_tokens")
+                && e.path.contains("maximum_tool_output_tokens")
                 && e.message.contains("ollama")),
             "{:?}",
             r.errors
@@ -2681,8 +2727,8 @@ command = "cargo build"
     }
 
     #[test]
-    fn tool_output_max_tokens_rejected_at_task_level_for_unsupported_agent() {
-        let src = "[[task]]\nname=\"t\"\nagent=\"ollama\"\ntool_output_max_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    fn maximum_tool_output_tokens_rejected_at_task_level_for_unsupported_agent() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"ollama\"\nmaximum_tool_output_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -2694,57 +2740,57 @@ command = "cargo build"
     }
 
     #[test]
-    fn tool_output_max_tokens_at_task_level_inherits_to_cell() {
-        let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\ntool_output_max_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    fn maximum_tool_output_tokens_at_task_level_inherits_to_cell() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\nmaximum_tool_output_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn tool_output_max_tokens_must_be_positive() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\ntool_output_max_tokens=0\n";
+    fn maximum_tool_output_tokens_must_be_positive() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nmaximum_tool_output_tokens=0\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
-                && e.message.contains("tool_output_max_tokens")),
+                && e.message.contains("maximum_tool_output_tokens")),
             "{:?}",
             r.errors
         );
     }
 
     #[test]
-    fn tool_output_max_tokens_wrong_type_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\ntool_output_max_tokens=\"lots\"\n";
+    fn maximum_tool_output_tokens_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\nmaximum_tool_output_tokens=\"lots\"\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
     }
 
     #[test]
-    fn tool_output_max_tokens_deferred_to_daemon_for_custom_agent_profile() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"openrouter-deepseek\"\ntool_output_max_tokens=50000\n";
+    fn maximum_tool_output_tokens_deferred_to_daemon_for_custom_agent_profile() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"openrouter-deepseek\"\nmaximum_tool_output_tokens=50000\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn tool_output_max_tokens_valid_on_task_scope_and_cell_scope_proof_steps() {
+    fn maximum_tool_output_tokens_valid_on_task_scope_and_cell_scope_proof_steps() {
         let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\n\
                    [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   [[task.cell.proof]]\ncommand=\"cargo test\"\ntool_output_max_tokens=1000\n\
-                   [[task.proof]]\ncommand=\"cargo fmt\"\ntool_output_max_tokens=2000\n";
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmaximum_tool_output_tokens=1000\n\
+                   [[task.proof]]\ncommand=\"cargo fmt\"\nmaximum_tool_output_tokens=2000\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn tool_output_max_tokens_rejected_on_proof_step_for_unsupported_agent() {
+    fn maximum_tool_output_tokens_rejected_on_proof_step_for_unsupported_agent() {
         let src = "[[task]]\nname=\"t\"\nagent=\"ollama\"\n\
                    [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   [[task.cell.proof]]\ncommand=\"cargo test\"\ntool_output_max_tokens=1000\n";
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmaximum_tool_output_tokens=1000\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
-                && e.path.contains("tool_output_max_tokens")
+                && e.path.contains("maximum_tool_output_tokens")
                 && e.message.contains("ollama")),
             "{:?}",
             r.errors

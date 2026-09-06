@@ -183,7 +183,7 @@ impl NodeState {
 // ── Read views (serialized straight to the API) ──────────────────────────────
 
 /// One row from [`Store::proof_specs`]:
-/// `(idx, kind, spec, model, timeout_sec, budget_tokens, tool_output_max_tokens)`.
+/// `(idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens)`.
 pub type ProofSpecRow = (
     i64,
     String,
@@ -216,10 +216,10 @@ pub struct ProofView {
     pub model: Option<String>,
     /// Resolved tool-output token cap (RAL-333): this step's own value, or
     /// inherited from its owning cell/task, or `None` for no cap. See
-    /// `ralphus_core::schema::agent_supports_tool_output_max_tokens` for
+    /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens` for
     /// which backends accept this.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_output_max_tokens: Option<i64>,
+    pub maximum_tool_output_tokens: Option<i64>,
     /// Resolved agent program (inherited from the owning cell or task defaults).
     pub agent: String,
     /// Resumable CLI-agent cell/thread id captured when the step ran via a
@@ -327,10 +327,10 @@ pub struct CellView {
     pub auto_compact_threshold: Option<i64>,
     /// Resolved tool-output token cap (cell overrides task), or `None` for no
     /// cap (RAL-333). See
-    /// `ralphus_core::schema::agent_supports_tool_output_max_tokens` for
+    /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens` for
     /// which backends accept this.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_output_max_tokens: Option<i64>,
+    pub maximum_tool_output_tokens: Option<i64>,
     /// Failure detail, when the cell failed.
     pub error: Option<String>,
     /// Dependency references (within-task cell ids or `task/cell`).
@@ -824,7 +824,7 @@ impl Store {
                 maximum_budget_usd REAL,
                 maximum_context INTEGER,
                 auto_compact_threshold INTEGER,
-                tool_output_max_tokens INTEGER,
+                maximum_tool_output_tokens INTEGER,
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
@@ -850,7 +850,7 @@ impl Store {
                 agent_session_id TEXT,
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
-                tool_output_max_tokens INTEGER,
+                maximum_tool_output_tokens INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
                 materialized_env_overrides TEXT,
@@ -1591,9 +1591,9 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN review_guardian_id TEXT",
             // RAL-333: tool-output token cap, delivered to the backend via
             // its own mechanism (env var/CLI arg/settings file) -- see
-            // `ralphus_core::schema::agent_supports_tool_output_max_tokens`.
-            "ALTER TABLE cells ADD COLUMN tool_output_max_tokens INTEGER",
-            "ALTER TABLE proofs ADD COLUMN tool_output_max_tokens INTEGER",
+            // `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`.
+            "ALTER TABLE cells ADD COLUMN maximum_tool_output_tokens INTEGER",
+            "ALTER TABLE proofs ADD COLUMN maximum_tool_output_tokens INTEGER",
             // RAL-332: UI-level convenience gate only -- there is no verified
             // login yet (RAL-252), so this does not stop anyone holding the
             // daemon's shared bearer token from calling the same endpoints
@@ -2140,15 +2140,15 @@ impl Store {
                     cell.auto_compact_threshold,
                     task.auto_compact_threshold,
                 );
-                let tool_output_max_tokens =
-                    ralphus_core::schema::resolve_cell_tool_output_max_tokens(task, cell)
+                let maximum_tool_output_tokens =
+                    ralphus_core::schema::resolve_cell_maximum_tool_output_tokens(task, cell)
                         .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
                 let share_session = ralphus_core::schema::resolve_cell_share_session(task, cell);
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, tool_output_max_tokens, upstream, queue_rank, env_overrides, machine, share_session)
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, upstream, queue_rank, env_overrides, machine, share_session)
                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
@@ -2172,7 +2172,7 @@ impl Store {
                         maximum_budget_usd,
                         maximum_context,
                         auto_compact_threshold,
-                        tool_output_max_tokens,
+                        maximum_tool_output_tokens,
                         cell.upstream,
                         // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -3108,7 +3108,7 @@ impl Store {
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, tool_output_max_tokens
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -3153,7 +3153,7 @@ impl Store {
                         cache_creation_tokens: r.get::<_, i64>(28)?,
                         cache_read_tokens: r.get::<_, i64>(29)?,
                         cost_is_estimated: r.get::<_, bool>(30)?,
-                        tool_output_max_tokens: r.get::<_, Option<i64>>(31)?,
+                        maximum_tool_output_tokens: r.get::<_, Option<i64>>(31)?,
                     },
                 ))
             })?
@@ -3262,7 +3262,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, tool_output_max_tokens FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -3289,7 +3289,7 @@ impl Store {
                         cache_creation_tokens: r.get::<_, i64>(17)?,
                         cache_read_tokens: r.get::<_, i64>(18)?,
                         cost_is_estimated: r.get::<_, bool>(19)?,
-                        tool_output_max_tokens: r.get::<_, Option<i64>>(20)?,
+                        maximum_tool_output_tokens: r.get::<_, Option<i64>>(20)?,
                     },
                 ))
             })?
@@ -3309,7 +3309,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, tool_output_max_tokens FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -3332,7 +3332,7 @@ impl Store {
                     cache_creation_tokens: r.get::<_, i64>(14)?,
                     cache_read_tokens: r.get::<_, i64>(15)?,
                     cost_is_estimated: r.get::<_, bool>(16)?,
-                    tool_output_max_tokens: r.get::<_, Option<i64>>(17)?,
+                    maximum_tool_output_tokens: r.get::<_, Option<i64>>(17)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3988,7 +3988,7 @@ fn insert_proof(
     v: &ralphus_core::schema::ProofStep,
     task: &ralphus_core::schema::TaskDef,
     // The proof step's real owning cell (`Some`) for a cell-scope proof, or
-    // `None` for a task-scope proof -- so `tool_output_max_tokens` resolves
+    // `None` for a task-scope proof -- so `maximum_tool_output_tokens` resolves
     // against the step's actual parent (RAL-333) rather than skipping the
     // cell level the way `timeout_sec`/`budget_tokens` above still do.
     owning_cell: Option<&ralphus_core::schema::CellDef>,
@@ -4007,11 +4007,11 @@ fn insert_proof(
     };
     let timeout_sec = resolve_timeout_sec(v.timeout_minutes, task.timeout_minutes);
     let budget_tokens = resolve_budget(v.budget_tokens, task.budget_tokens);
-    let tool_output_max_tokens = match owning_cell {
+    let maximum_tool_output_tokens = match owning_cell {
         Some(cell) => {
-            ralphus_core::schema::resolve_cell_proof_tool_output_max_tokens(task, cell, v)
+            ralphus_core::schema::resolve_cell_proof_maximum_tool_output_tokens(task, cell, v)
         }
-        None => ralphus_core::schema::resolve_task_proof_tool_output_max_tokens(task, v),
+        None => ralphus_core::schema::resolve_task_proof_maximum_tool_output_tokens(task, v),
     }
     .map(|val| i64::try_from(val).unwrap_or(i64::MAX));
     let effective_system_prompt = if kind == "prompt" {
@@ -4020,7 +4020,7 @@ fn insert_proof(
         None
     };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, tool_output_max_tokens, env_overrides)
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, maximum_tool_output_tokens, env_overrides)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
@@ -4037,7 +4037,7 @@ fn insert_proof(
             NodeState::Pending.as_str(),
             timeout_sec,
             budget_tokens,
-            tool_output_max_tokens,
+            maximum_tool_output_tokens,
             // RAL-191: the step's TOML-declared `environment` seeds the same
             // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
@@ -4102,8 +4102,8 @@ pub struct CellRow {
     pub auto_compact_threshold: Option<i64>,
     /// Effective tool-output token cap (resolved from cell/task), or `None`
     /// for no cap (RAL-333). Delivered to the backend via its own mechanism
-    /// -- see `ralphus_core::schema::agent_supports_tool_output_max_tokens`.
-    pub tool_output_max_tokens: Option<i64>,
+    /// -- see `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`.
+    pub maximum_tool_output_tokens: Option<i64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this cell's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
@@ -4272,7 +4272,7 @@ impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.tool_output_max_tokens, s.share_session
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -4302,7 +4302,7 @@ impl Store {
                     machine: r.get(17)?,
                     maximum_context: r.get(18)?,
                     auto_compact_threshold: r.get(19)?,
-                    tool_output_max_tokens: r.get(20)?,
+                    maximum_tool_output_tokens: r.get(20)?,
                     share_session: r.get(21)?,
                 })
             })?
@@ -4466,7 +4466,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, tool_output_max_tokens FROM proofs
+            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt

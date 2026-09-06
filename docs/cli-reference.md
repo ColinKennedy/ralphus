@@ -531,7 +531,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
     - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
-        - edit selector [str] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --model [name] --prompt [text]  {Edit a cell's fields.}
+        - edit selector [str] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
+        - (read-only-safe) env selector [str] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
         - open-agent selector [str]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - remote-terminal selector [str]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
         - restart selector [str]  {Restart a cell (and its downstream), dirtying dependent squads.}
@@ -560,14 +561,22 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
-    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention.}
+    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal follows and notification preferences layered over the same mailbox (RAL-320).}
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
+        - follow entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Follow an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-following updates the notification tiers in place (RAL-320).}
+        - (read-only-safe) follows --user [name]  {List the acting user's follows (RAL-320).}
+        - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their follows (RAL-320).}
+        - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
+        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-follow and default notify tiers (RAL-320).}
+        - set-preferences --auto-follow --no-auto-follow --tier [urgent|high|normal...] --user [name]  {Set a user's auto-follow and default notification-tier preferences; requires exactly one of --auto-follow/--no-auto-follow (RAL-320).}
+        - unfollow entity_uri [str] --user [name]  {Stop following an entity (RAL-320).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
         - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
     - proof  {Inspect and act on proof steps.}
         - edit selector [str] --model [name]  {Edit a proof step's model override.}
+        - (read-only-safe) env selector [str]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - restart selector [str]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [str] state [str]  {Manually override a proof step's status.}
         - (read-only-safe) show selector [str]  {Show a single proof step's detail.}
@@ -597,6 +606,7 @@ use; see `READ_ONLY_NOTE`.
         - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-auto-build --skip-worktrees  {Create a new review.}
         - delete selector [str] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
+        - (read-only-safe) env selector [str] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - feedback selector [str] text [str]  {Post feedback on one branch, triggering a resolver re-attempt.}
         - force-start selector [str]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
@@ -618,7 +628,7 @@ use; see `READ_ONLY_NOTE`.
         - reopen selector [str]  {Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [str]  {Show a single review's detail.}
         - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
@@ -635,6 +645,7 @@ use; see `READ_ONLY_NOTE`.
         - cancel squad_id [str]  {Cancel a squad.}
         - delete squad_id [str] --yes  {Permanently delete a squad.}
         - edit squad_id [str] --label [text]  {Edit a squad's fields.}
+        - (read-only-safe) env squad_id [str]  {List a squad's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - (read-only-safe) list --name [substring] --sort [date|name] --status [states]  {List squads.}
         - (read-only-safe) logs squad_id [str]  {Show a squad's state-transition audit log.}
         - rename squad_id [str] label [str]  {Rename a squad's label.}
@@ -647,6 +658,7 @@ use; see `READ_ONLY_NOTE`.
     - submit file [str...] --activate --hold --label [text] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
         - edit selector [str] --model [name] --name [name] --project [name]  {Edit a task node's name/project/model.}
+        - (read-only-safe) env selector [str] --scope [task|proof]  {List a task's resolved environment variables, read-only (RAL-324); --scope proof shows what its task-scoped proof steps inherit.}
         - restart-proof selector [str] --from [index]  {Restart a task's proof steps from an index onwards.}
         - set-status selector [str] state [str]  {Manually override a task's status.}
         - (read-only-safe) show selector [str]  {Show a single task node's detail.}

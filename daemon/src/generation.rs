@@ -213,7 +213,7 @@ pub fn run_generation(req: &GenerateRequest) -> GenerationJob {
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,

@@ -74,8 +74,8 @@ pub struct CellSpec {
     /// RAL-333: resolved cap on how many tokens a single tool-call output may
     /// inject into the agent's context. `None` for no cap, or when
     /// unsupported by `agent` (the daemon rejects this combination at submit
-    /// time, per `core::validate`'s `agent_supports_tool_output_max_tokens`).
-    pub tool_output_max_tokens: Option<u64>,
+    /// time, per `core::validate`'s `agent_supports_maximum_tool_output_tokens`).
+    pub maximum_tool_output_tokens: Option<u64>,
     /// RAL-336: whether this cell's agent session may load the operator's
     /// personal settings/config (Claude Code's `~/.claude` settings, Codex's
     /// `~/.codex/config.toml`, Pi's on-disk config). Defaults to `false`
@@ -123,7 +123,7 @@ impl CellSpec {
         let tool_arg_truncate_chars = opt_u32(obj, "tool_arg_truncate_chars")?;
         let thrash_max_compactions = opt_u32(obj, "thrash_max_compactions")?;
         let thrash_min_turn_gap = opt_u32(obj, "thrash_min_turn_gap")?;
-        let tool_output_max_tokens = opt_uint(obj, "tool_output_max_tokens")?;
+        let maximum_tool_output_tokens = opt_uint(obj, "maximum_tool_output_tokens")?;
         let allow_personal_settings = opt_bool(obj, "allow_personal_settings")?.unwrap_or(false);
         let allow_personal_memory = opt_bool(obj, "allow_personal_memory")?.unwrap_or(false);
 
@@ -157,7 +157,7 @@ impl CellSpec {
             tool_arg_truncate_chars,
             thrash_max_compactions,
             thrash_min_turn_gap,
-            tool_output_max_tokens,
+            maximum_tool_output_tokens,
             allow_personal_settings,
             allow_personal_memory,
         })
@@ -438,7 +438,7 @@ mod tests {
         v["timeout_sec"] = serde_json::json!(60);
         v["proof"] = serde_json::json!(true);
         v["tool_arg_truncate_chars"] = serde_json::json!(400);
-        v["tool_output_max_tokens"] = serde_json::json!(20000);
+        v["maximum_tool_output_tokens"] = serde_json::json!(20000);
         let spec = CellSpec::from_json(&v.to_string()).unwrap();
         assert_eq!(spec.command.as_deref(), Some("echo hi"));
         assert_eq!(spec.agent, "ollama");
@@ -447,13 +447,13 @@ mod tests {
         assert_eq!(spec.budget_tokens, Some(1000));
         assert!(spec.proof);
         assert_eq!(spec.tool_arg_truncate_chars, Some(400));
-        assert_eq!(spec.tool_output_max_tokens, Some(20000));
+        assert_eq!(spec.maximum_tool_output_tokens, Some(20000));
     }
 
     #[test]
-    fn tool_output_max_tokens_is_none_when_omitted() {
+    fn maximum_tool_output_tokens_is_none_when_omitted() {
         let spec = CellSpec::from_json(&base().to_string()).unwrap();
-        assert_eq!(spec.tool_output_max_tokens, None);
+        assert_eq!(spec.maximum_tool_output_tokens, None);
     }
 
     #[test]

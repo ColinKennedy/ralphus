@@ -278,8 +278,7 @@ fn resolve_squad_branch(
         .record_task_worktree_claim(&project.name, base_branch, &candidate, squad_id)
         .map_err(|e| e.to_string())?;
     if candidate != base_branch {
-        // ralphus[ignore-rlog-pair]: the Store-owning caller records the
-        // structured workflow outcome for this squad.
+        // ralphus[ignore-rlog-pair]: the Store-owning scheduler caller records this squad's structured workflow outcome.
         crate::rlog!(
             INFO,
             "ralphus [scheduler] worktree branch \"{base_branch}\" is already owned by another \
@@ -728,7 +727,7 @@ fn synthetic_cell_row(ctx: PlaceholderContext<'_>) -> CellRow {
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         upstream: None,
         machine: ctx.machine.map(str::to_string),
         share_session: false,
@@ -1353,7 +1352,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,

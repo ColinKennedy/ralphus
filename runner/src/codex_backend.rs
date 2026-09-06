@@ -108,14 +108,14 @@ impl ModelBackend for CodexBackend {
         true
     }
 
-    fn supports_tool_output_max_tokens(&self) -> bool {
+    fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
 }
 
 /// RAL-304/RAL-333: the `-c key=value` argument pairs that deliver
 /// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold`/
-/// `RunOptions::tool_output_max_tokens` to `codex` -- there is no dedicated
+/// `RunOptions::maximum_tool_output_tokens` to `codex` -- there is no dedicated
 /// flag for any of these, only config-override keys (mirrors
 /// `developer_instructions`'s precedent for `system_prompt`). Must be spliced
 /// into the arg list before `exec` -- see the caller's comment.
@@ -129,7 +129,7 @@ fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
         args.push("-c".to_string());
         args.push(format!("model_auto_compact_token_limit={v}"));
     }
-    if let Some(v) = options.tool_output_max_tokens {
+    if let Some(v) = options.maximum_tool_output_tokens {
         args.push("-c".to_string());
         args.push(format!("tool_output_token_limit={v}"));
     }
@@ -623,9 +623,9 @@ mod tests {
     }
 
     #[test]
-    fn context_limit_args_maps_tool_output_max_tokens_as_a_config_override() {
+    fn context_limit_args_maps_maximum_tool_output_tokens_as_a_config_override() {
         let options = RunOptions {
-            tool_output_max_tokens: Some(20_000),
+            maximum_tool_output_tokens: Some(20_000),
             ..Default::default()
         };
         let args = context_limit_args(&options);
@@ -684,6 +684,6 @@ mod tests {
     fn apply_codex_home_env_is_a_noop_when_none() {
         let mut cmd = Command::new("echo");
         apply_codex_home_env(&mut cmd, None);
-        assert!(cmd.get_envs().find(|(k, _)| *k == "CODEX_HOME").is_none());
+        assert!(!cmd.get_envs().any(|(k, _)| k == "CODEX_HOME"));
     }
 }

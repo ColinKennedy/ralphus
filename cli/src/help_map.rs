@@ -581,6 +581,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &["selector [str]"],
         &[
             "--auto-pr-feedback/--no-auto-pr-feedback",
+            "--auto-submit-pr-stack/--no-auto-submit-pr-stack",
             "--base-branch [branch]",
             "--match-pr-branch-name/--no-match-pr-branch-name",
             "--resolver-agent [name]",

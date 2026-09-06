@@ -236,7 +236,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,

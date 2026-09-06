@@ -1134,7 +1134,7 @@ impl DaemonClient {
         )
     }
 
-    /// `GuardianSettings` bundles the nine optional settings fields so this
+    /// `GuardianSettings` bundles the ten optional settings fields so this
     /// method's signature doesn't grow another positional parameter.
     pub fn guardian_settings(
         &self,
@@ -1175,6 +1175,11 @@ impl DaemonClient {
             &mut body,
             "match_pr_branch_name",
             settings.match_pr_branch_name,
+        );
+        set_if_some(
+            &mut body,
+            "auto_submit_pr_stack",
+            settings.auto_submit_pr_stack,
         );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
@@ -1425,6 +1430,9 @@ pub struct GuardianSettings<'a> {
     /// RAL-307: whether this review defaults a newly submitted PR's branch
     /// to the exact worktree/feature branch name.
     pub match_pr_branch_name: Option<bool>,
+    /// RAL-317: whether this review's PR stack is auto-submitted/grown as
+    /// each branch reaches a terminal merge state.
+    pub auto_submit_pr_stack: Option<bool>,
 }
 
 #[cfg(test)]

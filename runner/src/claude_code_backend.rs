@@ -107,7 +107,7 @@ impl ModelBackend for ClaudeCodeBackend {
             &base_args,
             workspace,
             options.auto_compact_threshold,
-            options.tool_output_max_tokens,
+            options.maximum_tool_output_tokens,
             claude_config_dir.as_deref(),
         )
         .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
@@ -213,7 +213,7 @@ impl ModelBackend for ClaudeCodeBackend {
         true
     }
 
-    fn supports_tool_output_max_tokens(&self) -> bool {
+    fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
 }
@@ -254,7 +254,7 @@ const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 
 /// The env var Claude Code's CLI reads to cap how many tokens a single
 /// file-read tool result may inject into the conversation -- the real
-/// delivery mechanism `RunOptions::tool_output_max_tokens` maps onto for this
+/// delivery mechanism `RunOptions::maximum_tool_output_tokens` maps onto for this
 /// backend (RAL-333).
 const FILE_READ_MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS";
 
@@ -264,7 +264,7 @@ fn spawn(
     args: &[String],
     workspace: &Workspace,
     auto_compact_threshold: Option<u64>,
-    tool_output_max_tokens: Option<u64>,
+    maximum_tool_output_tokens: Option<u64>,
     claude_config_dir: Option<&std::path::Path>,
 ) -> std::io::Result<Child> {
     if compound {
@@ -281,7 +281,7 @@ fn spawn(
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 apply_auto_compact_env(&mut cmd, auto_compact_threshold);
-                apply_tool_output_max_tokens_env(&mut cmd, tool_output_max_tokens);
+                apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
                 apply_claude_config_dir_env(&mut cmd, claude_config_dir);
                 cmd.spawn()
             }
@@ -293,7 +293,7 @@ fn spawn(
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 apply_auto_compact_env(&mut cmd, auto_compact_threshold);
-                apply_tool_output_max_tokens_env(&mut cmd, tool_output_max_tokens);
+                apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
                 apply_claude_config_dir_env(&mut cmd, claude_config_dir);
                 cmd.spawn()
             }
@@ -306,7 +306,7 @@ fn spawn(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_auto_compact_env(&mut cmd, auto_compact_threshold);
-        apply_tool_output_max_tokens_env(&mut cmd, tool_output_max_tokens);
+        apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
         apply_claude_config_dir_env(&mut cmd, claude_config_dir);
         cmd.spawn()
     }
@@ -323,10 +323,13 @@ fn apply_auto_compact_env(cmd: &mut Command, auto_compact_threshold: Option<u64>
 }
 
 /// Sets [`FILE_READ_MAX_OUTPUT_TOKENS_ENV`] on `cmd` when
-/// `tool_output_max_tokens` is set -- a no-op otherwise, same shape as
+/// `maximum_tool_output_tokens` is set -- a no-op otherwise, same shape as
 /// [`apply_auto_compact_env`] (RAL-333).
-fn apply_tool_output_max_tokens_env(cmd: &mut Command, tool_output_max_tokens: Option<u64>) {
-    if let Some(v) = tool_output_max_tokens {
+fn apply_maximum_tool_output_tokens_env(
+    cmd: &mut Command,
+    maximum_tool_output_tokens: Option<u64>,
+) {
+    if let Some(v) = maximum_tool_output_tokens {
         cmd.env(FILE_READ_MAX_OUTPUT_TOKENS_ENV, v.to_string());
     }
 }
@@ -991,11 +994,7 @@ mod tests {
     fn apply_auto_compact_env_is_a_noop_when_threshold_is_none() {
         let mut cmd = Command::new("echo");
         apply_auto_compact_env(&mut cmd, None);
-        assert!(
-            cmd.get_envs()
-                .find(|(k, _)| *k == AUTO_COMPACT_WINDOW_ENV)
-                .is_none()
-        );
+        assert!(!cmd.get_envs().any(|(k, _)| k == AUTO_COMPACT_WINDOW_ENV));
     }
 
     // ── format_tool_input truncation length (RAL-303) ─────────────────────
@@ -1655,11 +1654,7 @@ mod tests {
     fn apply_claude_config_dir_env_is_a_noop_when_none() {
         let mut cmd = Command::new("echo");
         apply_claude_config_dir_env(&mut cmd, None);
-        assert!(
-            cmd.get_envs()
-                .find(|(k, _)| *k == "CLAUDE_CONFIG_DIR")
-                .is_none()
-        );
+        assert!(!cmd.get_envs().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
     }
 
     #[test]

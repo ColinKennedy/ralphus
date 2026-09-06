@@ -378,6 +378,16 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 `ralphus review settings <selector> --proof-scope
                 <value>`, but declared up front so the review is
                 created with the right scope from its first merge.
+ auto_submit_pr_stack
+        bool    Opt this review into auto-submitting/growing its PR
+                stack as each branch reaches a terminal merge state,
+                instead of requiring a manual `review pr submit`.
+                Unset inherits the project-level .ralphus.toml
+                [review] auto_submit_pr_stack default, then false.
+                Equivalent to setting it later via `ralphus review
+                settings <selector> --auto-submit-pr-stack`, but
+                declared up front so the review is created with the
+                right behavior from its first merge.
 
  [[review.action]]  (zero or more per [[review]])
  User-declared labelled buttons shown in the review pane.
@@ -388,6 +398,48 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  command string  ONE-OF Verbatim shell command run in a terminal.
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
                  to expand into a runnable command before running.
+
+---------------------------------------------------------------
+ Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]
+---------------------------------------------------------------
+ Instead of declaring a [[review]] block and wiring
+ `review = "<<review:<id>>>"` onto every cell, a [[task.cell]] can
+ set `triage = true` and skip [[review]] entirely. The daemon's
+ Arbiter classifies the cell into a registered Triage type and
+ pools it by (project, triage_type); once that pool's cell-count
+ threshold or one of its cron schedules fires, the whole pool
+ drains into a fresh review automatically. There is no explicit
+ [[review]] block to author and no manual `ralphus review ...`
+ step -- you just submit, and once enough related work has piled
+ up (or on schedule) it folds into an auto-created review for you.
+
+ Key         Type             Notes
+ triage      bool             Opt this cell into Triage instead of
+                               naming an explicit `review`. Requires
+                               the owning task's `project` to be
+                               set (pools are keyed by project).
+                               Setting both `triage` and `review` on
+                               the SAME cell is meaningless -- `review`
+                               simply wins.
+ triage_type string OR        Which Triage type pool(s) this cell
+             array<string>    joins, e.g. `triage_type = "security"`,
+                               or `triage_type = ["bug", "investigation"]`
+                               for a cell belonging to more than one
+                               pool at once. Each name must already be
+                               a registered Triage type (see
+                               `ralphus triage type list`) --
+                               validation rejects an unregistered
+                               name. Only meaningful when
+                               `triage = true`. Unset lets the
+                               Arbiter classify the cell into a type
+                               itself at submit time, permanently
+                               falling back to the built-in
+                               `unclassified` type if classification
+                               fails, times out, or is ambiguous.
+
+ Triage types, per-pool count thresholds, and cron drain schedules
+ are admin-managed (`ralphus triage type ...` / the board's Triage
+ tab), not declared in the task TOML.
 
 ---------------------------------------------------------------
  [[task.proof]]  and  [[task.cell.proof]]   (zero or more)
@@ -792,6 +844,8 @@ pub fn task_tutor() -> String {
         "ralphus task",
         "ralphus agent",
         "ralphus submit",
+        "ralphus review",
+        "ralphus triage",
     ]
     .into_iter()
     .fold(

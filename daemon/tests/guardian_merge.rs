@@ -3597,13 +3597,20 @@ struct NeverResolvesRunner {
 }
 impl Runner for NeverResolvesRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
-        if spec.task == "resolve" {
+        // Other branches in the same merge (e.g. a cleanly-rebasing one still
+        // proved per RAL-168) call this runner too and would otherwise steal
+        // session numbers out from under the "resolve" sequence this test
+        // asserts on -- so only "resolve" calls consume the shared counter.
+        let is_resolve = spec.task == "resolve";
+        if is_resolve {
             self.specs.lock().unwrap().push(spec.clone());
         }
-        let call = {
+        let agent_session_id = if is_resolve {
             let mut n = self.calls.lock().unwrap();
             *n += 1;
-            *n
+            Some(format!("sess-{n}"))
+        } else {
+            Some("sess-other-task".to_string())
         };
         RunnerResult {
             status: "done".into(),
@@ -3616,7 +3623,7 @@ impl Runner for NeverResolvesRunner {
             summary: "still conflicted".into(),
             error: None,
             proofed: None,
-            agent_session_id: Some(format!("sess-{call}")),
+            agent_session_id,
             ghost: None,
         }
     }

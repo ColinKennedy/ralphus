@@ -94,6 +94,10 @@ pub enum ReviewCommand {
         /// submitted PR's branch defaults to the worktree/feature branch
         /// name.
         match_pr_branch_name: Option<bool>,
+        /// RAL-317: this review's own override for whether the PR stack is
+        /// auto-submitted/grown as each branch reaches a terminal merge
+        /// state.
+        auto_submit_pr_stack: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -336,6 +340,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
             let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
+            let auto_submit_pr_stack = take_tri_bool(&mut scanner, "--auto-submit-pr-stack");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -348,6 +353,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
+                auto_submit_pr_stack,
             })
         }
         Some("env") => {
@@ -1234,6 +1240,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             skip_auto_clean,
             skip_base_updates,
             match_pr_branch_name,
+            auto_submit_pr_stack,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1247,6 +1254,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
+                auto_submit_pr_stack,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -2681,6 +2689,31 @@ mod tests {
                 match_pr_branch_name,
                 ..
             } => assert_eq!(match_pr_branch_name, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_auto_submit_pr_stack_tri_state() {
+        match parse(&v(&["settings", "g1", "--auto-submit-pr-stack"])) {
+            ReviewCommand::Settings {
+                auto_submit_pr_stack,
+                ..
+            } => assert_eq!(auto_submit_pr_stack, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1", "--no-auto-submit-pr-stack"])) {
+            ReviewCommand::Settings {
+                auto_submit_pr_stack,
+                ..
+            } => assert_eq!(auto_submit_pr_stack, Some(false)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings {
+                auto_submit_pr_stack,
+                ..
+            } => assert_eq!(auto_submit_pr_stack, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -622,19 +622,30 @@ pub fn run_schedule_tick(store: &std::sync::Arc<std::sync::Mutex<Store>>) {
                 &sched.project,
                 &sched.triage_type,
             ) {
-                Ok(Some(gid)) => crate::rlog!(
-                    INFO,
-                    "ralphus [scheduler] triage schedule {} ({}, {}) fired -> review {gid}",
-                    sched.id,
-                    sched.project,
-                    sched.triage_type
-                ),
+                Ok(Some(gid)) => crate::cartographer::Note::new("scheduler")
+                    .guardian(&gid)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        format!(
+                            "triage schedule {} ({}, {}) fired -> review {gid}",
+                            sched.id, sched.project, sched.triage_type
+                        ),
+                        serde_json::json!({
+                            "schedule_id": sched.id,
+                            "project": sched.project,
+                            "triage_type": sched.triage_type,
+                            "guardian_id": gid,
+                        }),
+                    ),
                 Ok(None) => {}
-                Err(e) => crate::rlog!(
-                    WARNING,
-                    "ralphus [scheduler] triage schedule {} fire failed: {e}",
-                    sched.id
-                ),
+                Err(e) => crate::cartographer::Note::new("scheduler")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .emit(
+                        &guard,
+                        format!("triage schedule {} fire failed: {e}", sched.id),
+                        serde_json::json!({"schedule_id": sched.id, "error": e.to_string()}),
+                    ),
             }
         }
         drop(guard);

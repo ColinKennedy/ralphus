@@ -923,6 +923,67 @@ fn detect_rebase_step_content_loss(wt: &Workspace) -> Option<Vec<String>> {
     if lost.is_empty() { None } else { Some(lost) }
 }
 
+/// RAL-330: run [`detect_rebase_step_content_loss`] against `REBASE_HEAD`
+/// and, if it flags a loss, log it, poison the offending `rerere` cache
+/// entries, abort the rebase, and return the failure -- shared by every call
+/// site in [`resolve_conflicts_with_agent`]'s loop that is about to advance
+/// past a step it just considers resolved (stage-done signal, the marker-count
+/// fallback, and the loop's own top-of-iteration rerere fast path), since
+/// `REBASE_HEAD` still names the commit-in-flight right up until
+/// [`advance_rebase`] is called and stops being checkable afterward.
+fn guard_against_rebase_step_content_loss(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch: &str,
+    wt: &Workspace,
+) -> std::result::Result<(), String> {
+    let Some(lost) = detect_rebase_step_content_loss(wt) else {
+        return Ok(());
+    };
+    let rebase_head = wt
+        .git(&["rev-parse", "REBASE_HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} content-preservation check failed branch={branch:?} \
+         rebase_head={rebase_head:?} lost={lost:?}"
+    );
+    {
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "guardian",
+            message: "content-preservation check failed",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "branch": branch,
+                "rebase_head": rebase_head,
+                "lost_paths": lost,
+            }),
+            admin_only: false,
+        });
+    }
+    // Poison the specific bad cache entries so a retry sees a real conflict
+    // and goes through the agent instead of replaying the same lossy
+    // resolution again.
+    let mut forget_args = vec!["rerere", "forget"];
+    forget_args.extend(lost.iter().map(String::as_str));
+    let _ = wt.git(&forget_args);
+    let _ = wt.git(&["rebase", "--abort"]);
+    Err(format!(
+        "a resolution would have dropped content in {lost:?} for branch {branch} (RAL-330 \
+         content-preservation check) -- aborted rebase; a retry will resolve these paths with \
+         the agent instead of replaying the same result"
+    ))
+}
+
 /// RAL-330: whether `REBASE_HEAD`'s own patch (against its true parent) is
 /// empty — i.e. this step genuinely has nothing left to contribute, the
 /// legitimate case `--empty=drop`/`--skip` exist for. `true` when there is no
@@ -1396,7 +1457,7 @@ fn synthesize_proof_instructions(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -1757,51 +1818,7 @@ fn resolve_conflicts_with_agent(
                 // has no unmerged files right now" -- true either because the
                 // conflict was resolved correctly, or because whatever resolved
                 // it made the diff disappear entirely.
-                if let Some(lost) = detect_rebase_step_content_loss(wt) {
-                    let rebase_head = wt
-                        .git(&["rev-parse", "REBASE_HEAD"])
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [guardian] review {id} rerere fast-path content-preservation \
-                         check failed branch={branch:?} rebase_head={rebase_head:?} lost={lost:?}"
-                    );
-                    {
-                        let guard = store.lock().expect("poisoned");
-                        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                            level: crate::logging::LogLevel::WARNING,
-                            source: "guardian",
-                            message: "rerere fast-path content-preservation check failed",
-                            scope: Some("branch"),
-                            squad_id: None,
-                            guardian_id: Some(id),
-                            cell_id: None,
-                            task: None,
-                            log_path: None,
-                            payload: serde_json::json!({
-                                "branch": branch,
-                                "rebase_head": rebase_head,
-                                "lost_paths": lost,
-                            }),
-                            admin_only: false,
-                        });
-                    }
-                    // Poison the specific bad cache entries so a retry sees a
-                    // real conflict and goes through the agent instead of
-                    // replaying the same lossy resolution again.
-                    let mut forget_args = vec!["rerere", "forget"];
-                    forget_args.extend(lost.iter().map(String::as_str));
-                    let _ = wt.git(&forget_args);
-                    let _ = wt.git(&["rebase", "--abort"]);
-                    return Err(format!(
-                        "rerere fast-path would have dropped content in {lost:?} for branch \
-                         {branch} (RAL-330 content-preservation check) -- aborted rebase; a \
-                         retry will resolve these paths with the agent instead of replaying \
-                         the cached resolution"
-                    ));
-                }
+                guard_against_rebase_step_content_loss(store, id, branch, wt)?;
                 advance_rebase(wt);
                 // RAL-144: advancing to the next commit -- nothing was found or
                 // committed for it yet.
@@ -1866,6 +1883,7 @@ fn resolve_conflicts_with_agent(
                 });
             }
             wt.git(&["add", "--all"])?;
+            guard_against_rebase_step_content_loss(store, id, branch, wt)?;
             advance_rebase(wt);
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
@@ -1953,7 +1971,7 @@ fn resolve_conflicts_with_agent(
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: current_commit_session_id.clone(),
@@ -2196,6 +2214,7 @@ fn resolve_conflicts_with_agent(
                     admin_only: false,
                 });
             }
+            guard_against_rebase_step_content_loss(store, id, branch, wt)?;
             advance_rebase(wt);
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
@@ -2286,6 +2305,7 @@ fn resolve_conflicts_with_agent(
         // already applied) — `advance_rebase` falls back to `--skip` in that case.
         // Either way the loop re-checks and resolves any further conflicting
         // commits.
+        guard_against_rebase_step_content_loss(store, id, branch, wt)?;
         advance_rebase(wt);
         // RAL-144: advancing to the next commit -- nothing committed for it yet.
         committed = 0;
@@ -2388,7 +2408,7 @@ fn run_final_proof(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: true,
         trace_context: None,
         resume_agent_session_id: None,
@@ -4857,7 +4877,7 @@ pub fn run_feedback(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -7316,7 +7336,7 @@ fn generate_final_summary(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -7619,11 +7639,18 @@ fn generate_manual_commands(
         ) {
             Ok(r) => r,
             Err(message) => {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [guardian] review {id} manual-commands generation: \
-                     unresolvable resolver agent: {message}"
-                );
+                crate::cartographer::Note::new("guardian")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .guardian(id)
+                    .scope("guardian")
+                    .emit(
+                        &store.lock().expect("poisoned"),
+                        format!(
+                            "review {id} manual-commands generation: unresolvable \
+                             resolver agent: {message}"
+                        ),
+                        serde_json::json!({"error": message}),
+                    );
                 return None;
             }
         }
@@ -7650,7 +7677,7 @@ fn generate_manual_commands(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -7844,7 +7871,7 @@ pub(crate) fn resolve_check_input(
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
-        tool_output_max_tokens: None,
+        maximum_tool_output_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,

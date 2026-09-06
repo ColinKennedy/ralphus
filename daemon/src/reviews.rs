@@ -337,13 +337,16 @@ struct Membership {
     /// Optional Proof-scope override declared on the review (`[[review]]
     /// proof_scope`), one of `each_branch`/`final_branch`/`nothing`.
     proof_scope: Option<String>,
+    /// Optional auto-submit-PR-stack override declared on the review
+    /// (`[[review]] auto_submit_pr_stack`, RAL-317).
+    auto_submit_pr_stack: Option<bool>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
 /// insertion uses), alongside each cell's cwd and declared review opt-in.
 type CellReviewInfo<'a> = Vec<(Option<String>, Option<&'a str>)>;
 
-fn rows_from_file<'a>(file: &'a TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInfo<'a>) {
+fn rows_from_file(file: &TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInfo<'_>) {
     let mut cells = Vec::new();
     let mut tasks = Vec::new();
     let mut cell_info: CellReviewInfo = Vec::new();
@@ -377,7 +380,7 @@ fn rows_from_file<'a>(file: &'a TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellRe
                 maximum_budget_usd: None,
                 maximum_context: None,
                 auto_compact_threshold: None,
-                tool_output_max_tokens: None,
+                maximum_tool_output_tokens: None,
                 upstream: s.upstream.clone(),
                 machine: ralphus_core::schema::resolve_cell_machine(task, s),
                 share_session: false,
@@ -663,6 +666,7 @@ pub fn derive_reviews(
             proof_scope: rv
                 .and_then(|r| r.proof_scope.clone())
                 .filter(|s| !s.trim().is_empty()),
+            auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
         });
     }
 
@@ -905,6 +909,13 @@ fn apply_resolver(
     if let Some(scope) = members.iter().find_map(|m| m.proof_scope.clone()) {
         store
             .set_guardian_proof_scope(gid, Some(&scope))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own auto-submit-PR-stack override, authored via
+    // `[[review]] auto_submit_pr_stack` (RAL-317).
+    if let Some(enabled) = members.iter().find_map(|m| m.auto_submit_pr_stack) {
+        store
+            .set_guardian_auto_submit_pr_stack(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -1372,7 +1383,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -1493,6 +1504,7 @@ mod tests {
             machine: None,
             maximum_budget_usd,
             proof_scope: None,
+            auto_submit_pr_stack: None,
         }
     }
 
@@ -1538,6 +1550,39 @@ mod tests {
         let m = membership(None);
         apply_resolver(&store, &gid, &[&m]).unwrap();
         assert_eq!(store.get_guardian(&gid).unwrap().proof_scope, None);
+    }
+
+    // ── [[review]] auto_submit_pr_stack wiring (RAL-317) ────────────────────
+
+    #[test]
+    fn apply_resolver_sets_auto_submit_pr_stack_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            auto_submit_pr_stack: Some(true),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().auto_submit_pr_stack,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn apply_resolver_leaves_auto_submit_pr_stack_at_its_creation_stamp_when_no_member_declares_one()
+     {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        // `create_guardian` already stamps a concrete `Some(false)` at creation
+        // (no project default here) -- `apply_resolver` must leave that alone.
+        let before = store.get_guardian(&gid).unwrap().auto_submit_pr_stack;
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().auto_submit_pr_stack,
+            before
+        );
     }
 
     // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────

@@ -143,10 +143,10 @@ pub struct RunnerSpec {
     pub auto_compact_threshold: Option<u64>,
     /// Tool-output token cap (RAL-333), delivered to the backend via its own
     /// mechanism (env var/CLI arg/settings file -- see
-    /// `ralphus_core::schema::agent_supports_tool_output_max_tokens`). `None`
+    /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`). `None`
     /// means no cap.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_output_max_tokens: Option<u64>,
+    pub maximum_tool_output_tokens: Option<u64>,
     /// True when this spec is an `agent`-kind proof step rather than a
     /// normal cell: the runner wraps `prompt` with verdict-reporting
     /// instructions and returns a `proofed` result instead of just "ran".
@@ -475,8 +475,8 @@ impl RunnerSpec {
             auto_compact_threshold: row
                 .auto_compact_threshold
                 .and_then(|v| u64::try_from(v).ok()),
-            tool_output_max_tokens: row
-                .tool_output_max_tokens
+            maximum_tool_output_tokens: row
+                .maximum_tool_output_tokens
                 .and_then(|v| u64::try_from(v).ok()),
             proof: false,
             trace_context: None,
@@ -526,9 +526,9 @@ impl RunnerSpec {
         // task, a cell-scope proof against its owning cell. Unlike
         // `maximum_context`/`auto_compact_threshold` below, proof steps do
         // carry this field (see `ralphus_core::schema::
-        // resolve_task_proof_tool_output_max_tokens`/
-        // `resolve_cell_proof_tool_output_max_tokens`).
-        tool_output_max_tokens: Option<u64>,
+        // resolve_task_proof_maximum_tool_output_tokens`/
+        // `resolve_cell_proof_maximum_tool_output_tokens`).
+        maximum_tool_output_tokens: Option<u64>,
     ) -> Self {
         let (thrash_max_compactions, thrash_min_turn_gap) = resolved_thrash_thresholds();
         let agent_isolation = crate::config::resolve_agent_isolation(std::path::Path::new(cwd));
@@ -554,7 +554,7 @@ impl RunnerSpec {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens,
+            maximum_tool_output_tokens,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -622,7 +622,7 @@ impl RunnerSpec {
             auto_compact_threshold: None,
             // Command-kind proof steps never reach a `ModelBackend`, so there
             // is no tool-output cap to configure here either.
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -1855,6 +1855,7 @@ pub(crate) fn forward_runner_event(
         Err(e) => {
             let registered = crate::redact::redact_all(json);
             let redacted = ralphus_core::redact::redact_secrets(&registered);
+            // ralphus[ignore-rlog-pair]: malformed subprocess output is deliberately kept out of Cartographer -- see the test asserting only well-formed markers are recorded.
             crate::rlog!(
                 WARNING,
                 "ralphus [runner] malformed RALPHUS_EVENT: {e} ({redacted:?})"
@@ -2122,7 +2123,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2159,7 +2160,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2195,7 +2196,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: Some(100_000),
             auto_compact_threshold: Some(80_000),
-            tool_output_max_tokens: Some(40_000),
+            maximum_tool_output_tokens: Some(40_000),
             upstream: None,
             machine: None,
             share_session: false,
@@ -2203,11 +2204,11 @@ mod tests {
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(spec.maximum_context, Some(100_000));
         assert_eq!(spec.auto_compact_threshold, Some(80_000));
-        assert_eq!(spec.tool_output_max_tokens, Some(40_000));
+        assert_eq!(spec.maximum_tool_output_tokens, Some(40_000));
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"maximum_context\":100000"));
         assert!(json.contains("\"auto_compact_threshold\":80000"));
-        assert!(json.contains("\"tool_output_max_tokens\":40000"));
+        assert!(json.contains("\"maximum_tool_output_tokens\":40000"));
     }
 
     #[test]
@@ -2231,7 +2232,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2268,7 +2269,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -2397,7 +2398,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2455,7 +2456,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2488,7 +2489,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2573,7 +2574,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2615,7 +2616,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2651,7 +2652,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -2693,7 +2694,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -3258,7 +3259,7 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -3341,7 +3342,7 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4031,7 +4032,7 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -4168,7 +4169,7 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,

@@ -68,7 +68,7 @@ impl ModelBackend for PiBackend {
             options.model,
             options.maximum_context,
             options.auto_compact_threshold,
-            options.tool_output_max_tokens,
+            options.maximum_tool_output_tokens,
         )?;
 
         let program = self.program_override.clone().unwrap_or_else(|| {
@@ -116,7 +116,7 @@ impl ModelBackend for PiBackend {
         true
     }
 
-    fn supports_tool_output_max_tokens(&self) -> bool {
+    fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
 }
@@ -143,12 +143,12 @@ impl ModelBackend for PiBackend {
 ///   `auto_compact_threshold` is only accepted alongside `maximum_context`.
 ///
 /// RAL-333 reuses the same `modelOverrides.<model-id>` entry for
-/// `tool_output_max_tokens`, writing it as `maxTokens` -- the model catalog's
+/// `maximum_tool_output_tokens`, writing it as `maxTokens` -- the model catalog's
 /// own generation-budget field, and the closest thing `pi` has to a
-/// per-tool-output cap. When `tool_output_max_tokens` is unset but
+/// per-tool-output cap. When `maximum_tool_output_tokens` is unset but
 /// `maximum_context` is set, `maxTokens` defaults to 75% of `maximum_context`
 /// (per the ticket's confirmed scope) rather than being left unwritten -- an
-/// explicit `tool_output_max_tokens` always overrides that default.
+/// explicit `maximum_tool_output_tokens` always overrides that default.
 ///
 /// A no-op when none of the three fields is set, so a `pi` cell that never
 /// touches them never requires `PI_CODING_AGENT_DIR` at all.
@@ -166,17 +166,17 @@ fn apply_context_settings(
     model: Option<&str>,
     maximum_context: Option<u64>,
     auto_compact_threshold: Option<u64>,
-    tool_output_max_tokens: Option<u64>,
+    maximum_tool_output_tokens: Option<u64>,
 ) -> Result<(), BackendError> {
     if maximum_context.is_none()
         && auto_compact_threshold.is_none()
-        && tool_output_max_tokens.is_none()
+        && maximum_tool_output_tokens.is_none()
     {
         return Ok(());
     }
     let dir = dir.ok_or_else(|| {
         BackendError(
-            "pi: maximum_context/auto_compact_threshold/tool_output_max_tokens require \
+            "pi: maximum_context/auto_compact_threshold/maximum_tool_output_tokens require \
              PI_CODING_AGENT_DIR to be set"
                 .to_string(),
         )
@@ -186,7 +186,7 @@ fn apply_context_settings(
         model,
         maximum_context,
         auto_compact_threshold,
-        tool_output_max_tokens,
+        maximum_tool_output_tokens,
     )
 }
 
@@ -196,7 +196,7 @@ fn apply_context_settings(
 /// to exercise the `PI_CODING_AGENT_DIR` lookup in-process.
 ///
 /// Validates every field (provider-qualified model for `maximum_context`
-/// and/or `tool_output_max_tokens`; `auto_compact_threshold <
+/// and/or `maximum_tool_output_tokens`; `auto_compact_threshold <
 /// maximum_context` when both are set) before writing anything, so a
 /// rejected cell never leaves one file updated and the other not.
 fn apply_context_settings_in(
@@ -204,13 +204,13 @@ fn apply_context_settings_in(
     model: Option<&str>,
     maximum_context: Option<u64>,
     auto_compact_threshold: Option<u64>,
-    tool_output_max_tokens: Option<u64>,
+    maximum_tool_output_tokens: Option<u64>,
 ) -> Result<(), BackendError> {
-    let provider_model = (maximum_context.is_some() || tool_output_max_tokens.is_some())
+    let provider_model = (maximum_context.is_some() || maximum_tool_output_tokens.is_some())
         .then(|| {
             split_provider_model(model).ok_or_else(|| {
                 BackendError(
-                    "pi: maximum_context/tool_output_max_tokens require the cell's `model` to be \
+                    "pi: maximum_context/maximum_tool_output_tokens require the cell's `model` to be \
                      \"<provider>/<model-id>\" so the override can target pi's models.json -- \
                      there is no default provider to fall back to"
                         .to_string(),
@@ -236,12 +236,12 @@ fn apply_context_settings_in(
         })
         .transpose()?;
 
-    // RAL-333: an explicit tool_output_max_tokens always wins; otherwise
+    // RAL-333: an explicit maximum_tool_output_tokens always wins; otherwise
     // default to 75% of maximum_context (pi's own maxTokens/contextWindow
     // ratio in its example model catalog), written only when
     // maximum_context is itself set.
     let effective_max_tokens =
-        tool_output_max_tokens.or_else(|| maximum_context.map(|ctx| ctx * 3 / 4));
+        maximum_tool_output_tokens.or_else(|| maximum_context.map(|ctx| ctx * 3 / 4));
 
     if let Some((provider, model_id)) = provider_model {
         if let Some(v) = maximum_context {
@@ -1061,7 +1061,7 @@ mod tests {
         let models: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap())
                 .unwrap();
-        // RAL-333: no explicit tool_output_max_tokens was given, so the
+        // RAL-333: no explicit maximum_tool_output_tokens was given, so the
         // pre-existing maxTokens is overwritten with 75% of maximum_context
         // rather than preserved.
         assert_eq!(
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[test]
     fn apply_context_settings_defaults_max_tokens_to_75_percent_of_maximum_context() {
-        // maximum_context alone (no explicit tool_output_max_tokens) must
+        // maximum_context alone (no explicit maximum_tool_output_tokens) must
         // still synthesize a maxTokens default of 75% of maximum_context,
         // per the ticket's confirmed scope (RAL-333).
         let dir = temp_settings_dir("synthesized-default");
@@ -1290,11 +1290,7 @@ mod tests {
     fn apply_isolated_config_dir_env_is_a_noop_when_none() {
         let mut cmd = Command::new("echo");
         apply_isolated_config_dir_env(&mut cmd, None);
-        assert!(
-            cmd.get_envs()
-                .find(|(k, _)| *k == "PI_CODING_AGENT_DIR")
-                .is_none()
-        );
+        assert!(!cmd.get_envs().any(|(k, _)| k == "PI_CODING_AGENT_DIR"));
     }
 
     #[test]

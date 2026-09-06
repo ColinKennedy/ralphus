@@ -855,7 +855,7 @@
        * @property {boolean} [cost_is_estimated] - RAL-326: true when the tokens/cost above are the last live mid-run snapshot rather than the backend's own final accounting, because the process was lost/cancelled/timed out before a terminal usage event.
        * @property {{[key: string]: string}} [env_overrides] - RAL-191: environment-variable overrides set on this individual proof step — the narrowest layer, merged on top of the owning scope's `proof_env_overrides` and its ancestors. Absent for the vast majority of steps.
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this step's own `env_overrides` (or its owning scope's `proof_env_overrides`) has been edited since the step last ran/retried or had its status explicitly set. No behavioral effect.
-       * @property {number} [tool_output_max_tokens] - RAL-333: resolved tool-output token cap, or absent for no cap. Resolved against this step's real parent (owning cell for a cell-scope step, owning task for a task-scope step) -- see `agent_supports_tool_output_max_tokens`.
+       * @property {number} [maximum_tool_output_tokens] - RAL-333: resolved tool-output token cap, or absent for no cap. Resolved against this step's real parent (owning cell for a cell-scope step, owning task for a task-scope step) -- see `agent_supports_maximum_tool_output_tokens`.
        */
       /**
        * @typedef {object} CellView
@@ -874,7 +874,7 @@
        * @property {number} [maximum_budget_usd]
        * @property {number} [maximum_context] - RAL-304: resolved context-window token limit, or absent for no cap. Only ever set for a backend with a real delivery mechanism (codex, pi) -- see `agent_supports_maximum_context`.
        * @property {number} [auto_compact_threshold] - RAL-304: resolved auto-compact trigger threshold in tokens, or absent for no explicit threshold. Accepted by a wider set of backends than `maximum_context` (codex, pi, and claude-code) -- see `agent_supports_auto_compact_threshold`.
-       * @property {number} [tool_output_max_tokens] - RAL-333: resolved tool-output token cap (cell overrides task), or absent for no cap -- see `agent_supports_tool_output_max_tokens`.
+       * @property {number} [maximum_tool_output_tokens] - RAL-333: resolved tool-output token cap (cell overrides task), or absent for no cap -- see `agent_supports_maximum_tool_output_tokens`.
        * @property {string|null} [error]
        * @property {ProofView[]} [proof]
        * @property {string[]} [depends_on]
@@ -2427,10 +2427,10 @@
       // in the submitted TOML, not editable here. Only shown when at least one
       // is set, since most cells set neither.
       const CONTEXT_LIMITS_TIP = "Context-window controls delivered to the backend at cell start, resolved from the cell (or its owning task) at submit time.\nmax = the context-window ceiling itself (maximum_context) — only codex and pi backends have a real lever for this.\ncompact @ = the token count at which the backend auto-compacts its own history (auto_compact_threshold) — also supported by claude-code, via its CLAUDE_CODE_AUTO_COMPACT_WINDOW env var.\nWho/when: check this on a long-running cell to see whether/where it's set up to compact instead of just running until it hits the wall and fails.\nRead-only here — edit the TOML and resubmit to change it.";
-      // RAL-333: read-only — set via `tool_output_max_tokens` in the
+      // RAL-333: read-only — set via `maximum_tool_output_tokens` in the
       // submitted TOML, not editable here. Only shown when set, since most
       // cells/proof steps leave it unset.
-      const TOOL_OUTPUT_MAX_TOKENS_TIP = "Caps how many tokens a single tool-call result (e.g. a large file read) can inject into the agent's context, delivered via each backend's own mechanism: claude-code's CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS env var, codex's tool_output_token_limit config, or pi's models.json maxTokens.\nWho/when: check this to see whether a cell/proof step is guarded against one huge tool output blowing out its context and forcing an auto-compact.\nRead-only here — edit the TOML and resubmit to change it.";
+      const MAXIMUM_TOOL_OUTPUT_TOKENS_TIP = "Caps how many tokens a single tool-call result (e.g. a large file read) can inject into the agent's context, delivered via each backend's own mechanism: claude-code's CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS env var, codex's tool_output_token_limit config, or pi's models.json maxTokens.\nWho/when: check this to see whether a cell/proof step is guarded against one huge tool output blowing out its context and forcing an auto-compact.\nRead-only here — edit the TOML and resubmit to change it.";
       // Same idea as TOKENS_COST_TIP/LIFETIME_COST_TIP above, for proof steps
       // (RAL-172): a proof step's own token/cost usage is now tracked
       // per-attempt server-side, and its lifetime total is loaded the same
@@ -6578,7 +6578,7 @@
           <div class="kv-row" data-tip="${PROOF_TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(v)}${estimatedBadge(v.cost_is_estimated)}</span></div>
           <div class="kv-row" data-tip="${PROOF_LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="${proofCartoElId}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(proofCartoKey)}" data-carto-kind="proof" data-el-id="${esc(proofCartoElId)}" data-squad-id="${esc(r.id)}" data-tip="${PROOF_LIFETIME_COST_TIP}">Σ load total</button></span></div>
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
-          ${toolOutputMaxTokensRow(v)}
+          ${maximumToolOutputTokensRow(v)}
           ${specSection}${systemPromptSection}${terminalBtns}
           ${envSection}`;
       }
@@ -6618,16 +6618,16 @@
         return `<div class="kv-row" data-tip="${CONTEXT_LIMITS_TIP}"><span class="k">context limits</span><span class="v">${parts.join(" · ")}</span></div>`;
       }
       /**
-       * Renders the RAL-333 tool-output token cap row (`tool_output_max_tokens`)
+       * Renders the RAL-333 tool-output token cap row (`maximum_tool_output_tokens`)
        * for the cell/proof-step details pane, or an empty string when unset —
        * most cells/proof steps leave it unset, so the row is omitted rather
        * than shown empty.
        * @param {CellView|ProofView} s
        * @returns {string}
        */
-      function toolOutputMaxTokensRow(s) {
-        if (s.tool_output_max_tokens == null) return "";
-        return `<div class="kv-row" data-tip="${TOOL_OUTPUT_MAX_TOKENS_TIP}"><span class="k">tool output cap</span><span class="v">${s.tool_output_max_tokens.toLocaleString()} tokens</span></div>`;
+      function maximumToolOutputTokensRow(s) {
+        if (s.maximum_tool_output_tokens == null) return "";
+        return `<div class="kv-row" data-tip="${MAXIMUM_TOOL_OUTPUT_TOKENS_TIP}"><span class="k">tool output cap</span><span class="v">${s.maximum_tool_output_tokens.toLocaleString()} tokens</span></div>`;
       }
       /**
        * Renders the cell-level details pane.
@@ -6690,7 +6690,7 @@
           <div class="kv-row" data-tip="${TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(s)}${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}${estimatedBadge(s.cost_is_estimated)}</span></div>
           <div class="kv-row" data-tip="${LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="cum-cost-${esc(s.id)}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(s.id)}" data-carto-kind="cell" data-el-id="cum-cost-${esc(s.id)}" data-squad-id="${esc(r.id)}" data-tip="${LIFETIME_COST_TIP}">Σ load total</button></span></div>
           ${contextLimitsRow(s)}
-          ${toolOutputMaxTokensRow(s)}
+          ${maximumToolOutputTokensRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
           ${systemPromptSection}
