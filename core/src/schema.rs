@@ -884,10 +884,9 @@ pub struct ReviewDef {
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
-    /// This review's own declared build steps (RAL-342), run at merge/finalize
+    /// This review's own declared build step (RAL-342), run at merge/finalize
     /// time ahead of the project-level `.ralphus.toml [review] auto_build`
-    /// default. Mutually exclusive with `skip_auto_build`. When multiple
-    /// entries are present, they run in order.
+    /// default. Mutually exclusive with `skip_auto_build`.
     ///
     /// Submitting a task TOML that creates a `[[review]]` must set exactly one
     /// of `auto_build`, `skip_auto_build`, or rely on a project-level
@@ -896,7 +895,7 @@ pub struct ReviewDef {
     /// validation only checks this table's own shape; see
     /// [`AutoBuildDef`]).
     #[serde(default)]
-    pub auto_build: Vec<AutoBuildDef>,
+    pub auto_build: Option<AutoBuildDef>,
     /// Declares that this review deliberately has no build step. Mutually
     /// exclusive with `auto_build`; satisfies the submit-time requirement
     /// that every review say something about how (or whether) it builds.
@@ -934,12 +933,13 @@ pub struct AutoBuildDef {
     #[serde(default)]
     pub system_prompt_position: Option<String>,
     /// Backend for the agent call, e.g. `"claude"` (only valid alongside
-    /// `prompt`). Unset falls back to this step's parent [`ReviewDef`]'s agent,
-    /// then the daemon's default resolver agent.
+    /// `prompt`). Unset falls back to the guardian's own resolver agent, then
+    /// the daemon's default resolver agent.
     #[serde(default)]
     pub agent: Option<String>,
     /// Model the agent call runs (only valid alongside `prompt`). Unset falls
-    /// back to this step's parent [`ReviewDef`]'s model, then the daemon's default.
+    /// back to the guardian's own resolver model, then the daemon's default.
+    #[serde(default)]
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -1425,13 +1425,13 @@ mod tests {
 
             [[review]]
             id = "backend"
-            [[review.auto_build]]
+            [review.auto_build]
             command = "cargo build"
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let def = parsed.review[0]
             .auto_build
-            .first()
+            .as_ref()
             .expect("auto_build should be set");
         assert_eq!(def.command.as_deref(), Some("cargo build"));
         assert!(def.prompt.is_none());
@@ -1450,7 +1450,7 @@ mod tests {
 
             [[review]]
             id = "backend"
-            [[review.auto_build]]
+            [review.auto_build]
             prompt = "figure out how to build this and do it"
             system_prompt = "be thorough"
             system_prompt_position = "append"
@@ -1460,7 +1460,7 @@ mod tests {
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let def = parsed.review[0]
             .auto_build
-            .first()
+            .as_ref()
             .expect("auto_build should be set");
         assert!(def.command.is_none());
         assert_eq!(
@@ -1488,7 +1488,7 @@ mod tests {
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         assert!(!parsed.review[0].skip_auto_build);
-        assert!(parsed.review[0].auto_build.is_empty());
+        assert!(parsed.review[0].auto_build.is_none());
 
         let toml_skip = r#"
             [[task]]

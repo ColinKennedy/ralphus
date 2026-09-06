@@ -1204,16 +1204,17 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
     }
 }
 
-/// Validate `[[review.auto_build]]` entries (RAL-342): declares this review's build
-/// steps, either verbatim `command` or agent-driven `prompt` (mutually
+/// Validate `[review.auto_build]` (RAL-342): declares this review's build
+/// step, either a verbatim `command` or an agent-driven `prompt` (mutually
 /// exclusive with each other, mirroring [`validate_review_action_array`]'s
-/// `prompt`/`command` XOR). If any entries are present, they're mutually
-/// exclusive with `skip_auto_build`. An empty `[[review.auto_build]]` entry is
-/// rejected -- it can't be distinguished from a typo'd/half-written declaration.
-/// Whether neither `auto_build` nor `skip_auto_build` is set at all is NOT an
-/// error here: that's only knowable once project-level `.ralphus.toml` config
-/// is in the picture too, which is a daemon-level, submit-time check (mirrors
-/// [`check_machine`]'s core/daemon split).
+/// `prompt`/`command` XOR), and mutually exclusive with `skip_auto_build`.
+/// An empty `[review.auto_build]` table is rejected outright -- it can't be
+/// distinguished from a typo'd/half-written declaration, so it doesn't get
+/// to silently mean "unset". Whether *neither* `auto_build` nor
+/// `skip_auto_build` is set at all is NOT an error here: that's only
+/// knowable once project-level `.ralphus.toml` config is in the picture too,
+/// which is a daemon-level, submit-time check (mirrors [`check_machine`]'s
+/// core/daemon split).
 fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
     let skip_auto_build = table
         .get("skip_auto_build")
@@ -1223,116 +1224,103 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
     let Some(value) = table.get("auto_build") else {
         return;
     };
-
-    let Some(arr) = value.as_array() else {
+    let Some(auto_build) = value.as_table() else {
         ctx.error(
             &format!("{rpath}.auto_build"),
             ErrorKind::WrongType,
-            "[[review.auto_build]] must be an array of tables",
+            "'auto_build' must be a table",
             ctx.key_line(header, "auto_build"),
         );
         return;
     };
 
-    if skip_auto_build && !arr.is_empty() {
+    if skip_auto_build {
         ctx.error(
             rpath,
             ErrorKind::ConflictingKeys,
-            "cannot set both [[review.auto_build]] and skip_auto_build; use exactly one",
+            "cannot set both 'auto_build' and 'skip_auto_build'; use exactly one",
             ctx.key_line(header, "auto_build"),
         );
         return;
     }
 
-    for (idx, item) in arr.iter().enumerate() {
-        let Some(auto_build) = item.as_table() else {
-            ctx.error(
-                &format!("{rpath}.auto_build[{idx}]"),
-                ErrorKind::WrongType,
-                "[[review.auto_build]] entry must be a table",
-                None,
-            );
-            continue;
-        };
-
-        if auto_build.is_empty() {
-            ctx.error(
-                &format!("{rpath}.auto_build[{idx}]"),
-                ErrorKind::MissingRequired,
-                "[[review.auto_build]] entry must not be empty -- set 'command' or 'prompt'",
-                None,
-            );
-            continue;
-        }
-
-        let abpath = format!("{rpath}.auto_build[{idx}]");
-        unknown_keys(ctx, auto_build, AUTO_BUILD_KEYS, &abpath, None);
-
-        let has_command = auto_build.contains_key("command");
-        let has_prompt = auto_build.contains_key("prompt");
-        match (has_prompt, has_command) {
-            (true, true) => ctx.error(
-                &abpath,
-                ErrorKind::ConflictingKeys,
-                "[[review.auto_build]] entry cannot set both 'command' and 'prompt'; use exactly one",
-                None,
-            ),
-            (false, false) => ctx.error(
-                &abpath,
-                ErrorKind::MissingRequired,
-                "[[review.auto_build]] entry requires either 'command' or 'prompt'",
-                None,
-            ),
-            _ => {
-                check_type(ctx, auto_build, "command", Ty::Str, &abpath, None);
-                check_type(ctx, auto_build, "prompt", Ty::Str, &abpath, None);
-            }
-        }
-
-        // `system_prompt`/`system_prompt_position`/`agent`/`model` only make sense
-        // alongside an agent-driven `prompt`, never a verbatim `command`.
-        if has_command {
-            for key in ["system_prompt", "system_prompt_position", "agent", "model"] {
-                if auto_build.contains_key(key) {
-                    ctx.error(
-                        &format!("{abpath}.{key}"),
-                        ErrorKind::InvalidValue,
-                        format!(
-                            "[[review.auto_build]][{idx}].{key}' is only valid alongside 'prompt', not 'command'"
-                        ),
-                        None,
-                    );
-                }
-            }
-        }
-
-        check_type(ctx, auto_build, "system_prompt", Ty::Str, &abpath, None);
-        check_type(
-            ctx,
-            auto_build,
-            "system_prompt_position",
-            Ty::Str,
-            &abpath,
-            None,
+    if auto_build.is_empty() {
+        ctx.error(
+            &format!("{rpath}.auto_build"),
+            ErrorKind::MissingRequired,
+            "'[review.auto_build]' must not be empty -- set 'command' or 'prompt'",
+            ctx.key_line(header, "auto_build"),
         );
-        check_type(ctx, auto_build, "agent", Ty::Str, &abpath, None);
-        check_type(ctx, auto_build, "model", Ty::Str, &abpath, None);
+        return;
+    }
 
-        if let Some(pos) = auto_build
-            .get("system_prompt_position")
-            .and_then(toml::Value::as_str)
-        {
-            if pos != crate::schema::SYSTEM_PROMPT_POSITION_APPEND {
+    let abpath = format!("{rpath}.auto_build");
+    unknown_keys(ctx, auto_build, AUTO_BUILD_KEYS, &abpath, None);
+
+    let has_command = auto_build.contains_key("command");
+    let has_prompt = auto_build.contains_key("prompt");
+    match (has_prompt, has_command) {
+        (true, true) => ctx.error(
+            &abpath,
+            ErrorKind::ConflictingKeys,
+            "'[review.auto_build]' cannot set both 'command' and 'prompt'; use exactly one",
+            None,
+        ),
+        (false, false) => ctx.error(
+            &abpath,
+            ErrorKind::MissingRequired,
+            "'[review.auto_build]' requires either 'command' or 'prompt'",
+            None,
+        ),
+        _ => {
+            check_type(ctx, auto_build, "command", Ty::Str, &abpath, None);
+            check_type(ctx, auto_build, "prompt", Ty::Str, &abpath, None);
+        }
+    }
+
+    // `system_prompt`/`system_prompt_position`/`agent`/`model` only make sense
+    // alongside an agent-driven `prompt`, never a verbatim `command`.
+    if has_command {
+        for key in ["system_prompt", "system_prompt_position", "agent", "model"] {
+            if auto_build.contains_key(key) {
                 ctx.error(
-                    &format!("{abpath}.system_prompt_position"),
+                    &format!("{abpath}.{key}"),
                     ErrorKind::InvalidValue,
                     format!(
-                        "'system_prompt_position' must be \"{}\" (the only supported position), got \"{pos}\"",
-                        crate::schema::SYSTEM_PROMPT_POSITION_APPEND
+                        "'[review.auto_build].{key}' is only valid alongside 'prompt', not 'command'"
                     ),
                     None,
                 );
             }
+        }
+    }
+
+    check_type(ctx, auto_build, "system_prompt", Ty::Str, &abpath, None);
+    check_type(
+        ctx,
+        auto_build,
+        "system_prompt_position",
+        Ty::Str,
+        &abpath,
+        None,
+    );
+    check_type(ctx, auto_build, "agent", Ty::Str, &abpath, None);
+    check_type(ctx, auto_build, "model", Ty::Str, &abpath, None);
+
+    if let Some(pos) = auto_build
+        .get("system_prompt_position")
+        .and_then(toml::Value::as_str)
+    {
+        if pos != crate::schema::SYSTEM_PROMPT_POSITION_APPEND {
+            ctx.error(
+                &format!("{abpath}.system_prompt_position"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'system_prompt_position' must be \"{}\" (the only supported position), got \"{pos}\"",
+                    crate::schema::SYSTEM_PROMPT_POSITION_APPEND
+                ),
+                None,
+            );
         }
     }
 }
@@ -3172,7 +3160,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_command_form_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\ncommand=\"cargo build\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -3182,7 +3170,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_agent_form_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\nprompt=\"build it\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\nagent=\"claude-code\"\nmodel=\"sonnet\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\nprompt=\"build it\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\nagent=\"claude-code\"\nmodel=\"sonnet\"\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
@@ -3202,7 +3190,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_command_and_prompt_conflict_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\nprompt=\"build it\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\ncommand=\"cargo build\"\nprompt=\"build it\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3215,7 +3203,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_and_skip_auto_build_conflict_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_auto_build=true\n[[review.auto_build]]\ncommand=\"cargo build\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_auto_build=true\n[review.auto_build]\ncommand=\"cargo build\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3228,7 +3216,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_empty_table_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3241,7 +3229,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_system_prompt_without_prompt_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\nsystem_prompt=\"be terse\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\ncommand=\"cargo build\"\nsystem_prompt=\"be terse\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3254,7 +3242,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_invalid_system_prompt_position_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\nprompt=\"build it\"\nsystem_prompt_position=\"prepend\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\nprompt=\"build it\"\nsystem_prompt_position=\"prepend\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3268,7 +3256,7 @@ command = "cargo build"
 
     #[test]
     fn review_auto_build_unknown_key_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\nfoo=\"bar\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[review.auto_build]\ncommand=\"cargo build\"\nfoo=\"bar\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
