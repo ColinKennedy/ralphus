@@ -84,7 +84,7 @@ impl EntityUri {
     }
 
     /// Whether watching `self` should also notify about `other` — the
-    /// parent-cascades-to-children rule RAL-320 watches rely on. An entity
+    /// parent-cascades-to-children rule Monitor watches rely on. An entity
     /// always covers itself; a `Squad` covers everything under its
     /// `squad_id`; a `Task` covers the `Cell`s/`Proof`s under its
     /// `(squad_id, task_idx)`; a `Cell` covers only the cell-scoped `Proof`s

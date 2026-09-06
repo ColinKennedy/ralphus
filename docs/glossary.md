@@ -111,21 +111,21 @@ RAL-252 is done` comments at each one.
 | **UserContext** | The type (`daemon/src/agent_access.rs`) carrying a request's claimed user identity (`id: Option<String>`) through `AgentAccess`. Not a verified identity. |
 | **AgentAccess** | The trait deciding which agents a `UserContext` may select (`GET /api/agents`). Only implementation today, `DefaultAgentAccess`, ignores the user and is permissive by design. |
 
-## Personal watches and notification preferences (RAL-320)
+## Monitor watches and notification preferences (RAL-343)
 
-A per-**user** subscription layer over the existing **mailbox** (RAL-241) —
-not a second notification system. Surfaced via the CLI (`ralphus mailbox
-watch`/`unwatch`/`watches`/`preferences`/`set-preferences`/`personal`/
-`personal-drain`) and, since RAL-362, a star on each row of the board's
-**Tasks tab**; no external delivery channel either way.
+A per-**user** subscription layer over the existing **mailbox** (RAL-241),
+not a second notification system. The internal subsystem is **Monitor**;
+user-facing actions and relations use **watch** / **watcher**.
 
 | Term | Meaning |
 |---|---|
-| **watch** | One row (`watches` table, `daemon/src/watches.rs`) binding a **user** to an **entity URI** (squad/task/cell/proof/review — "review worktree" is the same `guardian:<id>` URI) plus that watch's own selected notify tiers. Re-watching the same entity updates its tiers in place rather than creating a duplicate. Watching a parent entity **cascades**: its notifications also cover every entity nested under it (a squad watch covers its tasks, cells, and proof steps). |
-| **notify tiers** (on a watch) | The subset of the mailbox's existing `urgent`/`high`/`normal` priority tiers a given watch cares about — the filter a personal mailbox message must clear to reach that watcher. Distinct from **default notify tiers** (a user-level default, not tied to one watch). |
-| **personal mailbox** | The per-user *view* over the same broadcast mailbox message stream (RAL-241's `mailbox_messages`), filtered down to messages whose entity is covered by one of that user's watches and whose priority clears that watch's notify tiers. Not a separate message store — same rows, a narrower read. |
-| **auto-watch** | A persisted per-**user** preference (`users.auto_watch`): when set, submitting a squad automatically creates a watch (at that user's **default notify tiers**) on the submitted entity, so a user doesn't have to manually watch their own work. |
-| **default notify tiers** (user preference) | A per-**user** preference (`users.default_notify_tiers`) used as the notify-tier fallback whenever a watch doesn't specify its own tiers explicitly (including auto-watch's implicit watch). |
+| **Monitor** | The internal subsystem that records watches and emits the bounded set of typed squad/review events eligible for watcher notification. |
+| **watch** | One relation binding a **user** to a whole squad or review plus selected notify tiers. Re-watching updates tiers in place. A squad watch cascades to its tasks, cells, and proof steps through `EntityUri::covers`. The legacy SQLite table and user-preference column retain their `follows` / `auto_follow` names for database compatibility. |
+| **watcher** | A user who has a watch on the named squad or review. |
+| **notify tiers** (on a watch) | The subset of the mailbox's existing `urgent`/`high`/`normal` priority tiers a watch accepts. Distinct from **default notify tiers** (a user-level default). |
+| **personal mailbox** | The per-user *view* over the same broadcast mailbox rows, filtered to events covered by that user's watches and tiers. Because both views use the same event-tagged row, being an owner and watcher cannot create duplicate messages. |
+| **watch everything I create** | The default-on per-user preference persisted in the compatibility column `users.auto_follow`. It creates watches for future squads and reviews; disabling it does not remove existing watches. |
+| **default notify tiers** (user preference) | A per-user preference used when a watch does not specify its own tiers, including automatic creator watches. |
 
 ## Scheduling
 

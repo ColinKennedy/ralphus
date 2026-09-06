@@ -31,11 +31,11 @@ pub struct UserView {
     pub name: String,
     /// Registration time (Unix epoch milliseconds).
     pub created_at_ms: i64,
-    /// RAL-320: when set, `ralphus submit` auto-watches every entity this
+    /// When set, `ralphus submit` automatically watches every entity this
     /// user submits, using `default_notify_tiers` below.
     pub auto_watch: bool,
-    /// RAL-320: the tier set a new watch defaults to when the caller
-    /// doesn't specify one explicitly (including auto-watch-on-submit).
+    /// The tier set a new watch defaults to when the caller doesn't specify
+    /// one explicitly (including automatic watches on submission).
     pub default_notify_tiers: Vec<MailboxPriority>,
     /// RAL-332: UI-level convenience gate (admin-only tabs, Cartographer
     /// row visibility) -- see this module's doc comment for why it is not a

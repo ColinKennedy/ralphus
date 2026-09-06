@@ -44,6 +44,9 @@ def find_violations() -> list[str]:
     violations: list[str] = []
     for glob_pattern, pattern, comment_marker in CHECKS:
         for path in tracked_files(glob_pattern):
+            # `git ls-files` includes paths deleted by an uncommitted rename.
+            if not path.is_file():
+                continue
             text = path.read_text(encoding="utf-8")
             lines = text.splitlines()
             for lineno, line in enumerate(lines, start=1):
