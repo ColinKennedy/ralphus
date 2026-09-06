@@ -766,14 +766,20 @@ pub fn resolve_cell_proof_machine(
 /// cell-then-task inheritance shape (RAL-333).
 #[must_use]
 pub fn resolve_cell_maximum_tool_output_tokens(task: &TaskDef, cell: &CellDef) -> Option<u64> {
-    cell.maximum_tool_output_tokens.or(task.maximum_tool_output_tokens)
+    cell.maximum_tool_output_tokens
+        .or(task.maximum_tool_output_tokens)
 }
 
 /// The effective `maximum_tool_output_tokens` for a task-scope proof step (one
 /// with no owning cell): the step's own value, else the task's (RAL-333).
 #[must_use]
-pub fn resolve_task_proof_maximum_tool_output_tokens(task: &TaskDef, proof: &ProofStep) -> Option<u64> {
-    proof.maximum_tool_output_tokens.or(task.maximum_tool_output_tokens)
+pub fn resolve_task_proof_maximum_tool_output_tokens(
+    task: &TaskDef,
+    proof: &ProofStep,
+) -> Option<u64> {
+    proof
+        .maximum_tool_output_tokens
+        .or(task.maximum_tool_output_tokens)
 }
 
 /// The effective `maximum_tool_output_tokens` for a cell-scope proof step: the

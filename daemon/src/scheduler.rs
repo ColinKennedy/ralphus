@@ -2975,8 +2975,15 @@ fn run_proofs(
     let mut all_ok = true;
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
-    for (idx, kind, spec, proof_model, proof_timeout, proof_budget, proof_maximum_tool_output_tokens) in
-        specs
+    for (
+        idx,
+        kind,
+        spec,
+        proof_model,
+        proof_timeout,
+        proof_budget,
+        proof_maximum_tool_output_tokens,
+    ) in specs
     {
         if cancel.is_cancelled() {
             return ProofOutcome {

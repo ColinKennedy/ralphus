@@ -421,11 +421,13 @@ fn validate_task_file_profiles_with(
             // `maximum_tool_output_tokens` for a RESERVED_AGENT_NAMES agent;
             // check the resolved backend here. Cascades from the task, so
             // it's checked at its effective (cell-or-task) value.
-            let has_maximum_tool_output_tokens =
-                cell.maximum_tool_output_tokens.is_some() || task.maximum_tool_output_tokens.is_some();
+            let has_maximum_tool_output_tokens = cell.maximum_tool_output_tokens.is_some()
+                || task.maximum_tool_output_tokens.is_some();
             if selection.custom_profile
                 && has_maximum_tool_output_tokens
-                && !ralphus_core::schema::agent_supports_maximum_tool_output_tokens(&selection.backend)
+                && !ralphus_core::schema::agent_supports_maximum_tool_output_tokens(
+                    &selection.backend,
+                )
             {
                 errors.push(ValidationError {
                     path: format!("task[{task_idx}].cell[{cell_idx}].maximum_tool_output_tokens"),
@@ -996,7 +998,8 @@ backend = "ollama"
     }
 
     #[test]
-    fn validate_task_file_profiles_allows_maximum_tool_output_tokens_for_claude_code_profile_backend() {
+    fn validate_task_file_profiles_allows_maximum_tool_output_tokens_for_claude_code_profile_backend()
+     {
         let project_root = tempdir("tool-output-max-tokens-claude-code-profile");
         fs::write(
             project_root.join(".ralphus.toml"),
@@ -1008,7 +1011,8 @@ backend = "claude-code"
         .expect("write project config");
 
         let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-claude");
+        let file =
+            task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-claude");
         let errors = validate_task_file_profiles_with(&store, "", &file, None);
 
         assert!(
@@ -1033,13 +1037,15 @@ backend = "ollama"
         .expect("write project config");
 
         let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-ollama");
+        let file =
+            task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-ollama");
         let errors = validate_task_file_profiles_with(&store, "", &file, None);
 
         assert!(
             errors
                 .iter()
-                .any(|e| e.path.contains("maximum_tool_output_tokens") && e.message.contains("ollama")),
+                .any(|e| e.path.contains("maximum_tool_output_tokens")
+                    && e.message.contains("ollama")),
             "{errors:?}"
         );
     }
