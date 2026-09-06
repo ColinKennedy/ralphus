@@ -1919,7 +1919,7 @@ keeps the default newest-first order).
           "env_out_of_date": false,
           "started_at_ms": 1783120107300,
           "finished_at_ms": null,
-          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "maximum_context": null, "auto_compact_threshold": 80000, "tool_output_max_tokens": 40000, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false } ] } ],
+          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "maximum_context": null, "auto_compact_threshold": 80000, "maximum_tool_output_tokens": 40000, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false } ] } ],
           "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null, "env_out_of_date": false } ]
         }
       ]

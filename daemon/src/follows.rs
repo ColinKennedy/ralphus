@@ -80,9 +80,10 @@ impl Store {
             )?;
             (id, created_at_ms)
         };
-        crate::rlog!(
-            INFO,
-            "ralphus [store] {user_name:?} followed {entity_uri:?}"
+        crate::cartographer::Note::new("store").emit(
+            self,
+            format!("{user_name:?} followed {entity_uri:?}"),
+            serde_json::json!({"user_name": user_name, "entity_uri": entity_uri}),
         );
         Ok(FollowView {
             id,
@@ -104,9 +105,10 @@ impl Store {
             params![user_name, entity_uri],
         )?;
         if n > 0 {
-            crate::rlog!(
-                INFO,
-                "ralphus [store] {user_name:?} unfollowed {entity_uri:?}"
+            crate::cartographer::Note::new("store").emit(
+                self,
+                format!("{user_name:?} unfollowed {entity_uri:?}"),
+                serde_json::json!({"user_name": user_name, "entity_uri": entity_uri}),
             );
         }
         Ok(n > 0)

@@ -15,8 +15,10 @@ nav:
       - Logs: views/cartographer.md
       - Projects: views/projects.md
       - Machines: views/machines.md
+      - Triage: views/triage.md
       - Users: views/users.md
       - Secrets: views/secrets.md
+      - Preferences: views/prefs.md
 
 theme:
   name: material

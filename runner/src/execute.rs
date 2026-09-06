@@ -256,9 +256,9 @@ fn check_context_limit_support(spec: &CellSpec, backend: &dyn ModelBackend) -> R
             spec.agent
         ));
     }
-    if spec.tool_output_max_tokens.is_some() && !backend.supports_tool_output_max_tokens() {
+    if spec.maximum_tool_output_tokens.is_some() && !backend.supports_maximum_tool_output_tokens() {
         return Err(format!(
-            "agent {:?} does not support tool_output_max_tokens",
+            "agent {:?} does not support maximum_tool_output_tokens",
             spec.agent
         ));
     }
@@ -316,7 +316,7 @@ fn run_with_backend(
             tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
             thrash_max_compactions: spec.thrash_max_compactions,
             thrash_min_turn_gap: spec.thrash_min_turn_gap,
-            tool_output_max_tokens: spec.tool_output_max_tokens,
+            maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
             allow_personal_settings: spec.allow_personal_settings,
             allow_personal_memory: spec.allow_personal_memory,
         };
@@ -412,7 +412,7 @@ fn run_with_backend(
                 tool_arg_truncate_chars: spec.tool_arg_truncate_chars,
                 thrash_max_compactions: spec.thrash_max_compactions,
                 thrash_min_turn_gap: spec.thrash_min_turn_gap,
-                tool_output_max_tokens: spec.tool_output_max_tokens,
+                maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
                 allow_personal_settings: spec.allow_personal_settings,
                 allow_personal_memory: spec.allow_personal_memory,
             };
@@ -873,7 +873,7 @@ mod tests {
             tool_arg_truncate_chars: None,
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
         }
@@ -1102,7 +1102,7 @@ mod tests {
             tool_arg_truncate_chars: None,
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
         };

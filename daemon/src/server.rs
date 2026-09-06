@@ -2522,10 +2522,13 @@ fn apply_default_user_admin(store: &Store, cfg: &crate::config::DaemonConfig) {
         return;
     };
     let Some(name) = cfg.default_user.clone() else {
-        crate::rlog!(
-            WARNING,
-            "ralphus [startup] [daemon].default_user_is_admin is set but no default_user is configured -- nothing to promote/demote"
-        );
+        crate::cartographer::Note::new("startup")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                store,
+                "[daemon].default_user_is_admin is set but no default_user is configured -- nothing to promote/demote",
+                serde_json::json!({}),
+            );
         return;
     };
     if want_admin {
@@ -2533,18 +2536,24 @@ fn apply_default_user_admin(store: &Store, cfg: &crate::config::DaemonConfig) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(e) = store.create_user(&name) {
-                    crate::rlog!(
-                        ERROR,
-                        "ralphus [startup] could not register default_user {name:?}: {e}"
-                    );
+                    crate::cartographer::Note::new("startup")
+                        .level(crate::logging::LogLevel::ERROR)
+                        .emit(
+                            store,
+                            format!("could not register default_user {name:?}: {e}"),
+                            serde_json::json!({"user_name": name, "error": e.to_string()}),
+                        );
                     return;
                 }
             }
             Err(e) => {
-                crate::rlog!(
-                    ERROR,
-                    "ralphus [startup] could not look up default_user {name:?}: {e}"
-                );
+                crate::cartographer::Note::new("startup")
+                    .level(crate::logging::LogLevel::ERROR)
+                    .emit(
+                        store,
+                        format!("could not look up default_user {name:?}: {e}"),
+                        serde_json::json!({"user_name": name, "error": e.to_string()}),
+                    );
                 return;
             }
         }
@@ -2552,19 +2561,28 @@ fn apply_default_user_admin(store: &Store, cfg: &crate::config::DaemonConfig) {
     match store.is_admin(&name) {
         Ok(is_admin) if is_admin == want_admin => {}
         Ok(_) => match store.set_user_admin(&name, want_admin) {
-            Ok(()) => crate::rlog!(
-                INFO,
-                "ralphus [startup] set default_user {name:?} admin={want_admin} via [daemon].default_user_is_admin"
+            Ok(()) => crate::cartographer::Note::new("startup").emit(
+                store,
+                format!(
+                    "set default_user {name:?} admin={want_admin} via [daemon].default_user_is_admin"
+                ),
+                serde_json::json!({"user_name": name, "is_admin": want_admin}),
             ),
-            Err(e) => crate::rlog!(
-                ERROR,
-                "ralphus [startup] could not set default_user {name:?} admin={want_admin}: {e}"
-            ),
+            Err(e) => crate::cartographer::Note::new("startup")
+                .level(crate::logging::LogLevel::ERROR)
+                .emit(
+                    store,
+                    format!("could not set default_user {name:?} admin={want_admin}: {e}"),
+                    serde_json::json!({"user_name": name, "error": e.to_string()}),
+                ),
         },
-        Err(e) => crate::rlog!(
-            ERROR,
-            "ralphus [startup] could not check admin status for default_user {name:?}: {e}"
-        ),
+        Err(e) => crate::cartographer::Note::new("startup")
+            .level(crate::logging::LogLevel::ERROR)
+            .emit(
+                store,
+                format!("could not check admin status for default_user {name:?}: {e}"),
+                serde_json::json!({"user_name": name, "error": e.to_string()}),
+            ),
     }
 }
 

@@ -25,6 +25,8 @@ __all__ = [
     "PATH_MIGRATE",
     "PATH_PROVISION",
     "PATH_PURGE",
+    "PREFS_HIDDEN_ITEMS",
+    "PREFS_ROUTES",
     "PROJECTS_ROUTES",
     "PROJECTS_ROWS",
     "QUEUE_ITEMS",
@@ -42,6 +44,10 @@ __all__ = [
     "SECRETS_ROWS",
     "TASKS_ROUTES",
     "TASKS_SQUADS",
+    "TRIAGE_POOLS",
+    "TRIAGE_ROUTES",
+    "TRIAGE_SCHEDULES",
+    "TRIAGE_TYPES",
     "USERS_ROUTES",
     "USERS_ROWS",
     "Json",
@@ -50,6 +56,7 @@ __all__ = [
     "carto_row",
     "cell",
     "guardian",
+    "hidden_item_entry",
     "machine_provider",
     "message",
     "project",
@@ -59,6 +66,9 @@ __all__ = [
     "secret_env_name_entry",
     "squad",
     "task",
+    "triage_pool_entry",
+    "triage_schedule_entry",
+    "triage_type_entry",
     "user_entry",
 ]
 
@@ -420,6 +430,64 @@ def user_entry(name: str, *, created_at_ms: int) -> Json:
 
 def secret_env_name_entry(name: str, *, created_at_ms: int) -> Json:
     return {"name": name, "created_at_ms": created_at_ms}
+
+
+def triage_type_entry(name: str, *, label: str, description: str, created_at_ms: int) -> Json:
+    return {
+        "name": name,
+        "label": label,
+        "description": description,
+        "created_at_ms": created_at_ms,
+    }
+
+
+def triage_pool_entry(
+    project_name: str, triage_type: str, *, count: int, threshold: int | None
+) -> Json:
+    return {
+        "project": project_name,
+        "triage_type": triage_type,
+        "count": count,
+        "threshold": threshold,
+    }
+
+
+def triage_schedule_entry(
+    id_: int,
+    *,
+    project_name: str,
+    triage_type: str,
+    cron_expr: str,
+    anchor_date_ms: int,
+    every_n: int,
+    occurrence_count: int,
+    last_checked_ms: int | None,
+) -> Json:
+    return {
+        "id": id_,
+        "project": project_name,
+        "triage_type": triage_type,
+        "cron_expr": cron_expr,
+        "anchor_date_ms": anchor_date_ms,
+        "every_n": every_n,
+        "occurrence_count": occurrence_count,
+        "last_checked_ms": last_checked_ms,
+    }
+
+
+def hidden_item_entry(
+    kind: str,
+    *,
+    squad_id: str | None = None,
+    guardian_id: str | None = None,
+    hidden_at_ms: int,
+) -> Json:
+    return {
+        "kind": kind,
+        "squad_id": squad_id,
+        "guardian_id": guardian_id,
+        "hidden_at_ms": hidden_at_ms,
+    }
 
 
 def project(
@@ -1028,4 +1096,78 @@ PROJECTS_ROUTES: Routes = {
     "/api/projects/ralphus/validate": {"valid": True},
     "/api/projects/docs-site/validate": {"valid": True},
     "/api/projects/incredibuild-scripts/validate": {"valid": True},
+}
+
+# ---------------------------------------------------------------------------
+# Triage scenario (RAL-318) — two registered types, one pool close to its
+# count threshold, one pool with only a cron schedule configured.
+# ---------------------------------------------------------------------------
+
+TRIAGE_TYPES: tuple[Json, ...] = (
+    triage_type_entry(
+        "unclassified",
+        label="Unclassified",
+        description="Built-in fallback when classification fails, times out, or is ambiguous.",
+        created_at_ms=1_783_000_000_000,
+    ),
+    triage_type_entry(
+        "security",
+        label="Security",
+        description="Changes touching auth, secrets handling, or attack surface.",
+        created_at_ms=1_783_050_000_000,
+    ),
+    triage_type_entry(
+        "docs",
+        label="Docs",
+        description="Documentation-only changes with no code behavior impact.",
+        created_at_ms=1_783_060_000_000,
+    ),
+)
+
+TRIAGE_POOLS: tuple[Json, ...] = (
+    triage_pool_entry("ralphus", "security", count=4, threshold=5),
+    triage_pool_entry("ralphus", "docs", count=2, threshold=None),
+)
+
+TRIAGE_SCHEDULES: tuple[Json, ...] = (
+    triage_schedule_entry(
+        1,
+        project_name="ralphus",
+        triage_type="docs",
+        cron_expr="0 0 * * MON",
+        anchor_date_ms=1_782_000_000_000,
+        every_n=2,
+        occurrence_count=3,
+        last_checked_ms=1_783_142_000_000,
+    ),
+)
+
+TRIAGE_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/triage/types": {"types": list(TRIAGE_TYPES)},
+    "/api/triage/pools": {"pools": list(TRIAGE_POOLS)},
+    "/api/triage/schedules": {"schedules": list(TRIAGE_SCHEDULES)},
+}
+
+# ---------------------------------------------------------------------------
+# Preferences scenario (RAL-329) — a couple of hidden items in the current
+# user's own view.
+# ---------------------------------------------------------------------------
+
+PREFS_HIDDEN_ITEMS: tuple[Json, ...] = (
+    hidden_item_entry("squad", squad_id="squad-000000000002", hidden_at_ms=1_783_120_000_000),
+    hidden_item_entry(
+        "review", guardian_id="guardian-000000000007", hidden_at_ms=1_783_130_000_000
+    ),
+)
+
+PREFS_ROUTES: Routes = {
+    "/api/tasks": {"daemon": _daemon_status(), "squads": list(TASKS_SQUADS)},
+    "/api/guardians": [REVIEWS_GUARDIAN],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/hidden": {"hidden": list(PREFS_HIDDEN_ITEMS)},
 }

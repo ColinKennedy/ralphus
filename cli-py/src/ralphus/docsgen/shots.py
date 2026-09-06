@@ -205,6 +205,26 @@ def _secrets_overview(page: Page) -> None:
         _shoot(page, "secrets-overview")
 
 
+def _triage_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.TRIAGE_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/triage")
+        page.wait_for_selector("#triage .proj-table")
+        _shoot(page, "triage-overview")
+
+
+def _prefs_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.PREFS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/prefs")
+        page.wait_for_selector("#hidden-items .proj-table")
+        _shoot(page, "prefs-overview")
+
+
 SCENARIOS = (
     _tasks_overview,
     _tasks_session_detail,
@@ -216,6 +236,8 @@ SCENARIOS = (
     _machines_overview,
     _users_overview,
     _secrets_overview,
+    _triage_overview,
+    _prefs_overview,
 )
 
 

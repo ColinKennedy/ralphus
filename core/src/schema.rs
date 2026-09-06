@@ -111,14 +111,14 @@ pub struct TaskDef {
     /// `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` env var, Codex's
     /// `-c tool_output_token_limit=...`, Pi's `models.json` `maxTokens`).
     /// Cells inherit this unless they set their own
-    /// `tool_output_max_tokens`. Ralphus never truncates the output itself --
+    /// `maximum_tool_output_tokens`. Ralphus never truncates the output itself --
     /// it only configures the backend's own mechanism and defers entirely to
     /// however that backend behaves once the cap is set. Only accepted for a
     /// backend with a real delivery mechanism -- see
-    /// [`agent_supports_tool_output_max_tokens`] -- checked at validation
+    /// [`agent_supports_maximum_tool_output_tokens`] -- checked at validation
     /// time.
     #[serde(default)]
-    pub tool_output_max_tokens: Option<u64>,
+    pub maximum_tool_output_tokens: Option<u64>,
     /// Retry count.
     #[serde(default)]
     pub max_retries: Option<u32>,
@@ -254,11 +254,11 @@ pub struct CellDef {
     pub auto_compact_threshold: Option<u64>,
     /// Per-cell cap on how many tokens a single tool-call output may inject
     /// into the agent's context (RAL-333). Falls back to the task-level
-    /// `tool_output_max_tokens` when unset. See
-    /// [`TaskDef::tool_output_max_tokens`] for the delivery mechanism and the
+    /// `maximum_tool_output_tokens` when unset. See
+    /// [`TaskDef::maximum_tool_output_tokens`] for the delivery mechanism and the
     /// backend-support restriction.
     #[serde(default)]
-    pub tool_output_max_tokens: Option<u64>,
+    pub maximum_tool_output_tokens: Option<u64>,
     /// Per-cell wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
@@ -761,33 +761,39 @@ pub fn resolve_cell_proof_machine(
         .or_else(|| resolve_cell_machine(task, cell))
 }
 
-/// The effective `tool_output_max_tokens` for a cell: its own value, else
+/// The effective `maximum_tool_output_tokens` for a cell: its own value, else
 /// the owning task's, else `None` (no cap). Mirrors [`resolve_cell_machine`]'s
 /// cell-then-task inheritance shape (RAL-333).
 #[must_use]
-pub fn resolve_cell_tool_output_max_tokens(task: &TaskDef, cell: &CellDef) -> Option<u64> {
-    cell.tool_output_max_tokens.or(task.tool_output_max_tokens)
+pub fn resolve_cell_maximum_tool_output_tokens(task: &TaskDef, cell: &CellDef) -> Option<u64> {
+    cell.maximum_tool_output_tokens
+        .or(task.maximum_tool_output_tokens)
 }
 
-/// The effective `tool_output_max_tokens` for a task-scope proof step (one
+/// The effective `maximum_tool_output_tokens` for a task-scope proof step (one
 /// with no owning cell): the step's own value, else the task's (RAL-333).
 #[must_use]
-pub fn resolve_task_proof_tool_output_max_tokens(task: &TaskDef, proof: &ProofStep) -> Option<u64> {
-    proof.tool_output_max_tokens.or(task.tool_output_max_tokens)
+pub fn resolve_task_proof_maximum_tool_output_tokens(
+    task: &TaskDef,
+    proof: &ProofStep,
+) -> Option<u64> {
+    proof
+        .maximum_tool_output_tokens
+        .or(task.maximum_tool_output_tokens)
 }
 
-/// The effective `tool_output_max_tokens` for a cell-scope proof step: the
+/// The effective `maximum_tool_output_tokens` for a cell-scope proof step: the
 /// step's own value, else the owning cell's resolved value (which itself
 /// falls back to the task's) (RAL-333).
 #[must_use]
-pub fn resolve_cell_proof_tool_output_max_tokens(
+pub fn resolve_cell_proof_maximum_tool_output_tokens(
     task: &TaskDef,
     cell: &CellDef,
     proof: &ProofStep,
 ) -> Option<u64> {
     proof
-        .tool_output_max_tokens
-        .or_else(|| resolve_cell_tool_output_max_tokens(task, cell))
+        .maximum_tool_output_tokens
+        .or_else(|| resolve_cell_maximum_tool_output_tokens(task, cell))
 }
 
 /// A top-level review (guardian) declaration via `[[review]]`.
@@ -859,6 +865,17 @@ pub struct ReviewDef {
     /// rather than needing a follow-up command.
     #[serde(default)]
     pub proof_scope: Option<String>,
+    /// RAL-317: this review's own override for whether the PR stack is
+    /// auto-submitted/grown as each branch reaches a terminal merge state,
+    /// instead of requiring the manual "Pull in PR feedback"/`review pr
+    /// submit` action. Unset inherits the project-level `.ralphus.toml
+    /// [review] auto_submit_pr_stack` default, then `false`. Equivalent to
+    /// setting it later via `ralphus review settings <selector>
+    /// --auto-submit-pr-stack`, but declared up front so the review is
+    /// created with the right behavior from its first merge rather than
+    /// needing a follow-up command.
+    #[serde(default)]
+    pub auto_submit_pr_stack: Option<bool>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
@@ -938,11 +955,11 @@ pub struct ProofStep {
     /// Per-proof-step cap on how many tokens a single tool-call output may
     /// inject into the agent's context (RAL-333). Falls back to the owning
     /// cell's resolved value for a cell-scope step, or the task's for a
-    /// task-scope one -- see [`resolve_task_proof_tool_output_max_tokens`]/
-    /// [`resolve_cell_proof_tool_output_max_tokens`]. See
-    /// [`TaskDef::tool_output_max_tokens`] for the delivery mechanism.
+    /// task-scope one -- see [`resolve_task_proof_maximum_tool_output_tokens`]/
+    /// [`resolve_cell_proof_maximum_tool_output_tokens`]. See
+    /// [`TaskDef::maximum_tool_output_tokens`] for the delivery mechanism.
     #[serde(default)]
-    pub tool_output_max_tokens: Option<u64>,
+    pub maximum_tool_output_tokens: Option<u64>,
     /// Extra CLI args for the proof-prompt invocation (e.g. `--append-system-prompt`).
     #[serde(default)]
     pub arguments: Vec<String>,
@@ -1103,7 +1120,7 @@ pub fn agent_supports_auto_compact_threshold(agent: &str) -> bool {
 }
 
 /// Whether `agent` is a backend with a real delivery mechanism for
-/// `tool_output_max_tokens` -- a cap on how many tokens a single tool-call
+/// `maximum_tool_output_tokens` -- a cap on how many tokens a single tool-call
 /// output may inject into the agent's context (RAL-333).
 ///
 /// The Claude Code CLI (`claude-code`/`claude-cli`) maps it to the
@@ -1114,18 +1131,18 @@ pub fn agent_supports_auto_compact_threshold(agent: &str) -> bool {
 /// `providers.<provider>.modelOverrides.<model-id>.maxTokens` override
 /// (requiring a `"<provider>/<model-id>"` resolved model, same requirement as
 /// [`agent_supports_maximum_context`]). Every other backend has no such
-/// mechanism, so validation rejects `tool_output_max_tokens` for it.
+/// mechanism, so validation rejects `maximum_tool_output_tokens` for it.
 ///
 /// Ralphus never enforces this cap itself -- it only configures each
 /// backend's own native mechanism and defers entirely to that backend's own
 /// behavior once the cap is set.
 ///
 /// On the runner side, each supported backend overrides
-/// `ModelBackend::supports_tool_output_max_tokens` to match this set -- the
+/// `ModelBackend::supports_maximum_tool_output_tokens` to match this set -- the
 /// two checks are independent (`core` cannot see `runner`'s trait impls) and
 /// must be kept in sync by hand.
 #[must_use]
-pub fn agent_supports_tool_output_max_tokens(agent: &str) -> bool {
+pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
     matches!(
         agent,
         "codex" | "codex-cli" | "pi" | "claude-code" | "claude-cli"
@@ -1181,7 +1198,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             max_retries: None,
             priority: None,
             timeout_minutes: None,
@@ -1221,7 +1238,7 @@ mod tests {
             review: None,
             upstream: None,
             share_session: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             triage: false,
             triage_type: None,
         }
@@ -1584,18 +1601,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_max_tokens_supported_by_claude_code_codex_and_pi() {
+    fn maximum_tool_output_tokens_supported_by_claude_code_codex_and_pi() {
         for agent in ["claude-code", "claude-cli", "codex", "codex-cli", "pi"] {
-            assert!(agent_supports_tool_output_max_tokens(agent), "{agent}");
+            assert!(agent_supports_maximum_tool_output_tokens(agent), "{agent}");
         }
     }
 
     #[test]
-    fn tool_output_max_tokens_rejected_for_bare_claude_ollama_and_raw() {
-        assert!(!agent_supports_tool_output_max_tokens("claude"));
-        assert!(!agent_supports_tool_output_max_tokens("anthropic"));
-        assert!(!agent_supports_tool_output_max_tokens("ollama"));
-        assert!(!agent_supports_tool_output_max_tokens("raw"));
+    fn maximum_tool_output_tokens_rejected_for_bare_claude_ollama_and_raw() {
+        assert!(!agent_supports_maximum_tool_output_tokens("claude"));
+        assert!(!agent_supports_maximum_tool_output_tokens("anthropic"));
+        assert!(!agent_supports_maximum_tool_output_tokens("ollama"));
+        assert!(!agent_supports_maximum_tool_output_tokens("raw"));
     }
 
     #[test]
@@ -1947,28 +1964,28 @@ mod tests {
     }
 
     #[test]
-    fn cell_tool_output_max_tokens_overrides_task_and_unset_falls_through_to_none() {
+    fn cell_maximum_tool_output_tokens_overrides_task_and_unset_falls_through_to_none() {
         let toml = r#"
             [[task]]
             name = "t"
-            tool_output_max_tokens = 1000
+            maximum_tool_output_tokens = 1000
             [[task.cell]]
             cwd = "/tmp"
             command = "x"
             [[task.cell]]
             cwd = "/tmp"
             command = "y"
-            tool_output_max_tokens = 500
+            maximum_tool_output_tokens = 500
         "#;
         let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
         let task = &parsed.task[0];
         assert_eq!(
-            resolve_cell_tool_output_max_tokens(task, &task.cell[0]),
+            resolve_cell_maximum_tool_output_tokens(task, &task.cell[0]),
             Some(1000),
             "an unset cell value inherits the task's"
         );
         assert_eq!(
-            resolve_cell_tool_output_max_tokens(task, &task.cell[1]),
+            resolve_cell_maximum_tool_output_tokens(task, &task.cell[1]),
             Some(500),
             "an explicit cell value wins"
         );
@@ -1983,22 +2000,22 @@ mod tests {
         let parsed: TaskFile = toml::from_str(bare).expect("should deserialize");
         let task = &parsed.task[0];
         assert_eq!(
-            resolve_cell_tool_output_max_tokens(task, &task.cell[0]),
+            resolve_cell_maximum_tool_output_tokens(task, &task.cell[0]),
             None,
             "no cap anywhere means no cap, represented as None"
         );
     }
 
     #[test]
-    fn proof_tool_output_max_tokens_inherits_from_its_owner() {
+    fn proof_maximum_tool_output_tokens_inherits_from_its_owner() {
         let toml = r#"
             [[task]]
             name = "t"
-            tool_output_max_tokens = 1000
+            maximum_tool_output_tokens = 1000
             [[task.cell]]
             cwd = "/tmp"
             command = "x"
-            tool_output_max_tokens = 2000
+            maximum_tool_output_tokens = 2000
             [[task.cell.proof]]
             command = "cargo test"
             [[task.proof]]
@@ -2008,12 +2025,12 @@ mod tests {
         let task = &parsed.task[0];
         let cell = &task.cell[0];
         assert_eq!(
-            resolve_cell_proof_tool_output_max_tokens(task, cell, &cell.proof[0]),
+            resolve_cell_proof_maximum_tool_output_tokens(task, cell, &cell.proof[0]),
             Some(2000),
             "a cell-scope proof follows its cell, not the task"
         );
         assert_eq!(
-            resolve_task_proof_tool_output_max_tokens(task, &task.proof[0]),
+            resolve_task_proof_maximum_tool_output_tokens(task, &task.proof[0]),
             Some(1000),
             "a task-scope proof follows the task"
         );

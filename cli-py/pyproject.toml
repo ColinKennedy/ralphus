@@ -65,6 +65,7 @@ ignore_missing_imports = true
 [tool.deadcode]
 ignore_names = [
     "do_GET",
+    "do_POST",
 ]
 
 [tool.pytest.ini_options]

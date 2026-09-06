@@ -98,7 +98,9 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 # occurrence computation, no async runtime (MIT licensed, matches this
 # workspace's synchronous-by-design constraint -- see the note above about
 # rejecting `tokio-cron-scheduler`-shaped dependencies).
-cron = "0.17"
+# Pinned to 0.15.0: 0.16+ uses the `unsigned_is_multiple_of` std feature,
+# unstable below rustc 1.87 and this workspace's MSRV CI job pins 1.86.
+cron = "=0.15.0"
 # `ralphus cell remote-terminal` (RAL-355 Phase 10): puts this process's own
 # stdin/stdout into raw pty-passthrough mode for the CLI terminal-relay
 # client (`cli/src/terminal_relay.rs`). Windows console raw mode and POSIX

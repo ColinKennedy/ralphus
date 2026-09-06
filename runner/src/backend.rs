@@ -100,15 +100,15 @@ pub struct RunOptions<'a> {
     /// RAL-333: resolved cap on how many tokens a single tool-call output
     /// (e.g. a large file read) may inject into the agent's context, or
     /// `None` for no cap. Only ever `Some` for a backend whose
-    /// [`ModelBackend::supports_tool_output_max_tokens`] returns `true` --
-    /// `core`'s `agent_supports_tool_output_max_tokens` validation gate
+    /// [`ModelBackend::supports_maximum_tool_output_tokens`] returns `true` --
+    /// `core`'s `agent_supports_maximum_tool_output_tokens` validation gate
     /// rejects it for anything else before submission. Ralphus never
     /// truncates the output itself -- it only configures the backend's own
     /// native mechanism (an env var, a CLI arg, or an on-disk settings file --
     /// see `ClaudeCodeBackend`/`CodexBackend`/`PiBackend`'s own overrides for
     /// which) and defers entirely to that backend's behavior once the cap is
     /// set.
-    pub tool_output_max_tokens: Option<u64>,
+    pub maximum_tool_output_tokens: Option<u64>,
     /// RAL-336: whether this session may load the operator's personal
     /// settings/config. Defaults to `false` (isolated) via `RunOptions`'s
     /// `Default` derive. Only the claude-code/codex/pi backends read this;
@@ -197,16 +197,16 @@ pub trait ModelBackend {
     }
 
     /// RAL-333: whether this backend has a real delivery mechanism for
-    /// `RunOptions::tool_output_max_tokens` -- a way to cap how many tokens a
+    /// `RunOptions::maximum_tool_output_tokens` -- a way to cap how many tokens a
     /// single tool-call output may inject into the agent's context (an env
     /// var, a CLI arg, or an on-disk settings file -- see
     /// `ClaudeCodeBackend`/`CodexBackend`/`PiBackend`'s own overrides for
     /// which). Defaults to `false`, same shape as
     /// [`supports_maximum_context`](Self::supports_maximum_context).
-    /// `core::validate`'s `agent_supports_tool_output_max_tokens` is the
+    /// `core::validate`'s `agent_supports_maximum_tool_output_tokens` is the
     /// actual submit-time gate; this is the runner-side mirror, checked
     /// defensively in `execute.rs` before a cell is ever run.
-    fn supports_tool_output_max_tokens(&self) -> bool {
+    fn supports_maximum_tool_output_tokens(&self) -> bool {
         false
     }
 }

@@ -2975,8 +2975,15 @@ fn run_proofs(
     let mut all_ok = true;
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
-    for (idx, kind, spec, proof_model, proof_timeout, proof_budget, proof_tool_output_max_tokens) in
-        specs
+    for (
+        idx,
+        kind,
+        spec,
+        proof_model,
+        proof_timeout,
+        proof_budget,
+        proof_maximum_tool_output_tokens,
+    ) in specs
     {
         if cancel.is_cancelled() {
             return ProofOutcome {
@@ -3169,7 +3176,7 @@ fn run_proofs(
                     model,
                     proof_timeout.and_then(|s| u64::try_from(s).ok()),
                     proof_budget.and_then(|b| u64::try_from(b).ok()),
-                    proof_tool_output_max_tokens.and_then(|v| u64::try_from(v).ok()),
+                    proof_maximum_tool_output_tokens.and_then(|v| u64::try_from(v).ok()),
                 );
                 runner_spec.executable = selection.executable.clone();
                 runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
@@ -6059,7 +6066,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
         }
@@ -6188,7 +6195,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
-            tool_output_max_tokens: None,
+            maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
         };

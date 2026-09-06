@@ -130,6 +130,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             skip_auto_clean,
             skip_base_updates,
             match_pr_branch_name,
+            auto_submit_pr_stack,
         } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -143,6 +144,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
+                auto_submit_pr_stack,
             };
             Ok(client.guardian_settings(&resolved.guardian_id, &settings)?)
         }
