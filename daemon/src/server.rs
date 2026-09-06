@@ -450,13 +450,13 @@ struct UserPreferencesBody {
     default_notify_tiers: Option<Vec<String>>,
 }
 
-/// `GET /api/watches?user=` response body (RAL-320).
+/// `GET /api/watches?user=` response body.
 #[derive(Serialize)]
 struct WatchesResponse {
-    watches: Vec<crate::watches::WatchView>,
+    watches: Vec<crate::monitor::WatchView>,
 }
 
-/// `POST /api/watches?user=` body (RAL-320) -- `notify_tiers` omitted or
+/// `POST /api/watches?user=` body -- `notify_tiers` omitted or
 /// empty defaults to the acting user's `default_notify_tiers` preference
 /// (see `crate::users::UserView`), falling back to every tier if that user
 /// isn't registered either.
@@ -773,7 +773,7 @@ fn route_for_user(
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
         ("GET", ["api", "ghosts", owner_uri]) => ghost_get(daemon, owner_uri),
         ("POST", ["api", "mailbox", "register"]) => mailbox_register(daemon),
-        // RAL-320: personal watches + the per-user mailbox view they filter.
+        // Monitor watches + the per-user mailbox view they filter.
         // These literal "personal"/"watches" segments must stay ahead of the
         // client_id-parameterized mailbox routes just below, or the
         // client_id arm would swallow "personal" as if it were a client id.
@@ -783,10 +783,11 @@ fn route_for_user(
         ("POST", ["api", "mailbox", "personal", "drain"]) => {
             personal_mailbox_drain(daemon, query, body)
         }
-        ("GET", ["api", "watches"]) => list_watches_endpoint(daemon, query),
-        ("POST", ["api", "watches"]) => create_watch_endpoint(daemon, query, body),
+        ("GET", ["api", "watches"]) => list_watches_endpoint(daemon, query, user_header),
+        ("GET", ["api", "watches", entity_uri]) => watchers_endpoint(daemon, entity_uri),
+        ("POST", ["api", "watches"]) => create_watch_endpoint(daemon, query, user_header, body),
         ("DELETE", ["api", "watches", entity_uri]) => {
-            delete_watch_endpoint(daemon, query, entity_uri)
+            delete_watch_endpoint(daemon, query, user_header, entity_uri)
         }
         ("GET", ["api", "mailbox", client_id, "messages"]) => {
             mailbox_messages(daemon, client_id, query)
@@ -990,7 +991,7 @@ fn route_for_user(
         ) => proof_terminal_log_attempt(daemon, id, task_idx, scope, cell_idx, proof_idx, attempt),
         ("DELETE", ["api", "squads", id]) => delete_squad(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
-        ("POST", ["api", "guardians"]) => guardian_create(daemon, body),
+        ("POST", ["api", "guardians"]) => guardian_create(daemon, user_header, body),
         ("GET", ["api", "guardians", id]) => guardian_get(daemon, id),
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
         ("POST", ["api", "guardians", id, "rename"]) => guardian_rename(daemon, id, body),
@@ -2859,6 +2860,19 @@ fn require_acting_user(query: &str) -> Result<String, Reply> {
         .ok_or_else(|| error(400, "bad_request", "no user: pass ?user=<name>", vec![]))
 }
 
+/// Resolve a watch request's user from the CLI-compatible query parameter or
+/// the board's current-user header/default fallback.
+fn require_watch_user(
+    daemon: &Daemon,
+    query: &str,
+    user_header: Option<&str>,
+) -> Result<String, Reply> {
+    if let Some(user) = query_param(query, "user").map(url_decode) {
+        return Ok(user);
+    }
+    require_current_user(daemon, user_header)
+}
+
 /// Parse a list of tier-name strings, `400`-erroring on the first one that
 /// isn't `urgent`/`high`/`normal`.
 fn parse_notify_tiers(tiers: &[String]) -> Result<Vec<crate::mailbox::MailboxPriority>, Reply> {
@@ -2920,9 +2934,9 @@ fn set_user_preferences_endpoint(daemon: &Daemon, name: &str, body: &str) -> Rep
     }
 }
 
-/// `GET /api/watches?user=` (RAL-320) -- every watch the acting user owns.
-fn list_watches_endpoint(daemon: &Daemon, query: &str) -> Reply {
-    let user = match require_acting_user(query) {
+/// `GET /api/watches?user=` -- every watch the acting user owns.
+fn list_watches_endpoint(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply {
+    let user = match require_watch_user(daemon, query, user_header) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -2932,11 +2946,31 @@ fn list_watches_endpoint(daemon: &Daemon, query: &str) -> Reply {
     }
 }
 
-/// `POST /api/watches?user=` (RAL-320) -- watch (or re-watch, updating
+fn watchers_endpoint(daemon: &Daemon, entity_uri: &str) -> Reply {
+    if !is_watchable_entity(entity_uri) {
+        return error(
+            400,
+            "invalid_entity_uri",
+            "only whole squads and reviews can be watched",
+            vec![],
+        );
+    }
+    match daemon.lock().watchers_for_entity(entity_uri) {
+        Ok(watches) => json(200, &WatchesResponse { watches }),
+        Err(e) => error(500, "store_error", &e.to_string(), vec![]),
+    }
+}
+
+/// `POST /api/watches?user=` -- watch (or update the watch, changing
 /// tiers in place) an [`crate::entity_uri::EntityUri`] on the acting user's
 /// behalf.
-fn create_watch_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
-    let user = match require_acting_user(query) {
+fn create_watch_endpoint(
+    daemon: &Daemon,
+    query: &str,
+    user_header: Option<&str>,
+    body: &str,
+) -> Reply {
+    let user = match require_watch_user(daemon, query, user_header) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -2948,11 +2982,11 @@ fn create_watch_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
             vec![],
         );
     };
-    if crate::entity_uri::parse(&req.entity_uri).is_none() {
+    if !is_watchable_entity(&req.entity_uri) {
         return error(
             400,
             "bad_request",
-            "entity_uri is not a recognized ralphus entity URI",
+            "only whole squads and reviews can be watched",
             vec![],
         );
     }
@@ -2976,9 +3010,24 @@ fn create_watch_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
     }
 }
 
-/// `DELETE /api/watches/{entity_uri}?user=` (RAL-320).
-fn delete_watch_endpoint(daemon: &Daemon, query: &str, entity_uri: &str) -> Reply {
-    let user = match require_acting_user(query) {
+fn is_watchable_entity(entity_uri: &str) -> bool {
+    matches!(
+        crate::entity_uri::parse(entity_uri),
+        Some(
+            crate::entity_uri::EntityUri::Squad { .. }
+                | crate::entity_uri::EntityUri::Guardian { .. }
+        )
+    )
+}
+
+/// `DELETE /api/watches/{entity_uri}?user=`.
+fn delete_watch_endpoint(
+    daemon: &Daemon,
+    query: &str,
+    user_header: Option<&str>,
+    entity_uri: &str,
+) -> Reply {
+    let user = match require_watch_user(daemon, query, user_header) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -3411,6 +3460,13 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
                 }
                 .to_string();
                 let _ = store.create_watch(&user, &entity_uri, &u.default_notify_tiers);
+                if let Ok(guardian_ids) = store.guardians_for_squad(&squad_id) {
+                    for guardian_id in guardian_ids {
+                        let entity_uri =
+                            crate::entity_uri::EntityUri::Guardian { guardian_id }.to_string();
+                        let _ = store.create_watch(&user, &entity_uri, &u.default_notify_tiers);
+                    }
+                }
             }
         }
     }
@@ -8916,7 +8972,7 @@ fn guardian_list(daemon: &Daemon) -> Reply {
     }
 }
 
-fn guardian_create(daemon: &Daemon, body: &str) -> Reply {
+fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<CreateGuardianBody>(body) else {
         return error(
             400,
@@ -8925,6 +8981,7 @@ fn guardian_create(daemon: &Daemon, body: &str) -> Reply {
             vec![],
         );
     };
+    let auto_watch_user = current_user(daemon, user_header).ok().flatten();
     let store = daemon.lock();
     match store.create_guardian(&req.name, &req.base_branch, &req.git_root) {
         Ok(id) => {
@@ -8944,6 +9001,18 @@ fn guardian_create(daemon: &Daemon, body: &str) -> Reply {
                 .filter(|t| !t.is_empty())
             {
                 let _ = store.set_guardian_type(&id, t);
+            }
+            if let Some(user) = auto_watch_user {
+                if let Ok(Some(preferences)) = store.get_user(&user) {
+                    if preferences.auto_follow {
+                        let entity_uri = format!("guardian:{id}");
+                        let _ = store.create_watch(
+                            &user,
+                            &entity_uri,
+                            &preferences.default_notify_tiers,
+                        );
+                    }
+                }
             }
             json(201, &IdResponse { id })
         }
@@ -19003,28 +19072,15 @@ command=\"cargo test\"
         assert_eq!(r.status, 400, "{}", r.body);
     }
 
-    // ── RAL-320: personal watches + notification preferences ────────────────
+    // ── Monitor watches + notification preferences ─────────────────────────
 
     #[test]
     fn watches_require_an_acting_user() {
         let d = daemon();
         let body =
             serde_json::to_string(&serde_json::json!({"entity_uri": "squad:squad-1"})).unwrap();
-        // When no ?user= parameter is provided, the endpoint should reject the request
-        // unless a default_user is configured. To test the rejection path reliably,
-        // check that either:
-        // 1. No default_user is configured and it returns 400
-        // 2. OR the route succeeds (returns 200/201) because a default_user was resolved
-        let cfg = crate::config::load_daemon_config();
-        if cfg.default_user.is_some() {
-            // Default user is configured, so the request should succeed
-            assert_eq!(route(&d, "GET", "/api/watches", "").status, 200);
-            assert_eq!(route(&d, "POST", "/api/watches", &body).status, 201);
-        } else {
-            // No default user configured, so request should be rejected
-            assert_eq!(route(&d, "GET", "/api/watches", "").status, 400);
-            assert_eq!(route(&d, "POST", "/api/watches", &body).status, 400);
-        }
+        assert_eq!(route(&d, "GET", "/api/watches", "").status, 400);
+        assert_eq!(route(&d, "POST", "/api/watches", &body).status, 400);
     }
 
     #[test]
@@ -19033,6 +19089,18 @@ command=\"cargo test\"
         let body = serde_json::to_string(&serde_json::json!({"entity_uri": "not-a-uri"})).unwrap();
         let r = route(&d, "POST", "/api/watches?user=colin", &body);
         assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn watches_reject_child_entity_uris() {
+        let d = daemon();
+        let body = serde_json::to_string(&serde_json::json!({
+            "entity_uri": "task:squad-1:0"
+        }))
+        .unwrap();
+        let r = route(&d, "POST", "/api/watches?user=colin", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("only whole squads and reviews"));
     }
 
     #[test]

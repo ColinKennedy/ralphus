@@ -30,6 +30,7 @@ pub mod logging;
 pub mod machine_targets;
 pub mod machines;
 pub mod mailbox;
+pub mod monitor;
 pub mod otel;
 pub mod plan;
 pub mod pr;

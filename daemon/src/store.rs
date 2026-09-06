@@ -1240,7 +1240,8 @@ impl Store {
                 task          TEXT,
                 cell_id       TEXT,
                 created_at_ms INTEGER NOT NULL,
-                entity_uri    TEXT
+                entity_uri    TEXT,
+                event_kind    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_mailbox_messages_created ON mailbox_messages(created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_mailbox_messages_priority ON mailbox_messages(priority);
@@ -1954,6 +1955,7 @@ impl Store {
             // `crate::mailbox::personal_mailbox_messages_for_user`). NULL for
             // pre-RAL-320 rows and for messages with no addressable entity.
             "ALTER TABLE mailbox_messages ADD COLUMN entity_uri TEXT",
+            "ALTER TABLE mailbox_messages ADD COLUMN event_kind TEXT",
             // RAL-320: per-user preference, consulted by the `ralphus submit`
             // auto-watch hook -- when set, every entity a user submits is
             // watched automatically using `default_notify_tiers` below.
@@ -4830,6 +4832,13 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let _ = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+                &format!("squad:{squad_id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "squad attributes changed",
+                Some(squad_id),
+            );
             Ok(())
         }
     }
@@ -4868,6 +4877,13 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let _ = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("squad:{squad_id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "squad task changed",
+                Some(squad_id),
+            );
             Ok(())
         }
     }
@@ -4908,6 +4924,13 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let _ = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("squad:{squad_id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "squad proof changed",
+                Some(squad_id),
+            );
             Ok(())
         }
     }
@@ -5012,6 +5035,13 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let _ = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("squad:{squad_id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "squad cell changed",
+                Some(squad_id),
+            );
             Ok(())
         }
     }
@@ -5054,6 +5084,13 @@ impl Store {
             "UPDATE squads SET env_overrides=?, updated_at_ms=? WHERE id=?",
             params![to_json_map(&current), now_ms(), squad_id],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadContentChanged,
+            &format!("squad:{squad_id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "squad environment overrides changed",
+            Some(squad_id),
+        );
         Ok(current)
     }
 
@@ -5113,6 +5150,13 @@ impl Store {
             "UPDATE cells SET env_out_of_date=1 WHERE squad_id=? AND task_idx=?",
             params![squad_id, task_idx],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadContentChanged,
+            &format!("task:{squad_id}:{task_idx}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "task environment overrides changed",
+            Some(squad_id),
+        );
         Ok(current)
     }
 
@@ -5163,6 +5207,13 @@ impl Store {
             "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='task'",
             params![squad_id, task_idx],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadContentChanged,
+            &format!("task:{squad_id}:{task_idx}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "task proof environment overrides changed",
+            Some(squad_id),
+        );
         Ok(current)
     }
 
@@ -5215,6 +5266,13 @@ impl Store {
             "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
             params![squad_id, task_idx, cell_idx],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadContentChanged,
+            &format!("cell:{squad_id}:{task_idx}:{cell_idx}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "cell environment overrides changed",
+            Some(squad_id),
+        );
         Ok(current)
     }
 
@@ -5267,6 +5325,13 @@ impl Store {
             "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
             params![squad_id, task_idx, cell_idx],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadContentChanged,
+            &format!("cell:{squad_id}:{task_idx}:{cell_idx}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "cell proof environment overrides changed",
+            Some(squad_id),
+        );
         Ok(current)
     }
 
@@ -5470,6 +5535,14 @@ impl Store {
                 idx
             ],
         )?;
+        let entity_uri = format!("proof:{squad_id}:{task_idx}:{scope}:{cell_idx}:{idx}");
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadContentChanged,
+            &entity_uri,
+            crate::mailbox::MailboxPriority::Normal,
+            "proof environment overrides changed",
+            Some(squad_id),
+        );
         Ok(current)
     }
 

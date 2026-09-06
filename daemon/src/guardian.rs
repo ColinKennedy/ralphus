@@ -1687,6 +1687,22 @@ impl Store {
                 None => format!("review → {}", status.as_str()),
             };
             let _ = self.log_event(None, Some(id), "guardian", None, &msg);
+            let failed = matches!(status, GuardianStatus::MergeFailed);
+            let _ = self.notify_watchers(
+                if failed {
+                    crate::monitor::NotifiableEventKind::ReviewFailed
+                } else {
+                    crate::monitor::NotifiableEventKind::ReviewStatusChanged
+                },
+                &format!("guardian:{id}"),
+                if failed {
+                    crate::mailbox::MailboxPriority::Urgent
+                } else {
+                    crate::mailbox::MailboxPriority::Normal
+                },
+                &msg,
+                None,
+            );
             Ok(())
         }
     }
@@ -1713,6 +1729,13 @@ impl Store {
             "UPDATE guardians SET checks=?, updated_at_ms=? WHERE id=?",
             params![crate::store::to_json(checks), crate::store::now_ms(), id],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+            &format!("guardian:{id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "review checks changed",
+            None,
+        );
         Ok(())
     }
 
@@ -2019,6 +2042,13 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let _ = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+                &format!("guardian:{id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "review match-PR-branch-name setting changed",
+                None,
+            );
             Ok(())
         }
     }
@@ -2034,6 +2064,13 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let _ = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+                &format!("guardian:{id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "review auto-submit-PR-stack setting changed",
+                None,
+            );
             Ok(())
         }
     }
@@ -2406,6 +2443,13 @@ impl Store {
             "UPDATE guardians SET manual_commands=?, manual_commands_agent=?, manual_commands_model=?, updated_at_ms=? WHERE id=?",
             params![json, agent, model, crate::store::now_ms(), id],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+            &format!("guardian:{id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "review manual checks changed",
+            None,
+        );
         Ok(())
     }
 
@@ -2448,6 +2492,13 @@ impl Store {
             "UPDATE guardians SET action_hints=?, updated_at_ms=? WHERE id=?",
             params![json, crate::store::now_ms(), id],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+            &format!("guardian:{id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "review action checks changed",
+            None,
+        );
         Ok(())
     }
 
@@ -2477,6 +2528,13 @@ impl Store {
             "UPDATE guardians SET input_values=?, updated_at_ms=? WHERE id=?",
             params![json, crate::store::now_ms(), id],
         )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+            &format!("guardian:{id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "review check input values changed",
+            None,
+        );
         Ok(())
     }
 
@@ -4539,6 +4597,13 @@ mod tests {
     fn status_transitions_and_approve() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .create_watch(
+                "watcher",
+                &format!("guardian:{id}"),
+                &[crate::mailbox::MailboxPriority::Normal],
+            )
+            .unwrap();
         assert!(store.approve_guardian(&id).is_err()); // not in review yet
         store
             .set_guardian_status(&id, GuardianStatus::InReview, None)
@@ -4548,6 +4613,15 @@ mod tests {
             GuardianStatus::Approved
         );
         assert_eq!(store.get_guardian(&id).unwrap().status, "approved");
+        let expected_uri = format!("guardian:{id}");
+        let messages = store
+            .personal_mailbox_messages_for_user("watcher", false, None)
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| {
+            message.event_kind.as_deref() == Some("review_status_changed")
+                && message.entity_uri.as_deref() == Some(expected_uri.as_str())
+        }));
     }
 
     #[test]
