@@ -118,6 +118,38 @@ pub struct GuardianCheck {
     pub inputs: Vec<CheckInput>,
 }
 
+/// This review's own declared build step (RAL-342), authored via
+/// `[review.auto_build]` and resolved once at submit time
+/// (`reviews::derive_reviews`, converted from `ralphus_core::schema::AutoBuildDef`)
+/// into the JSON blob stored in the `guardians.auto_build_json` column. Either
+/// a static shell `command`, or an agent invocation described by the
+/// remaining fields -- exactly one of the two shapes is populated, enforced
+/// by `core::validate` at parse time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuardianAutoBuild {
+    /// Verbatim shell command to run against the combined worktree (mutually
+    /// exclusive with the agent-invocation fields below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Prompt forwarded to the build agent (mutually exclusive with `command`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Optional system prompt for the build agent invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Where `system_prompt` is spliced relative to the agent's own default
+    /// system prompt, e.g. `"prepend"` / `"append"` / `"replace"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_position: Option<String>,
+    /// Backend that runs the build agent invocation. `None` falls back to
+    /// this review's resolver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Model override for the build agent invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// Lifecycle state of a guardian/review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -714,6 +746,16 @@ pub struct GuardianView {
     /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
     /// `notice_kind: None`.
     pub notice_at_ms: Option<i64>,
+    /// This review's declared build step (RAL-342), from `[review.auto_build]`.
+    /// `None` means the review declared `skip_auto_build = true` instead --
+    /// unlike [`Self::resolver_agent`]-style overrides, `None` here is never
+    /// "inherit the project config default": every guardian created after
+    /// the RAL-342 migration has exactly one of this field or
+    /// [`Self::skip_auto_build`] set, enforced at submit time
+    /// (`reviews::require_auto_build_declaration`). A guardian created
+    /// before that migration shipped simply has no auto_build tier at
+    /// finalize time (see `guardian_merge::final_checks`).
+    pub auto_build: Option<GuardianAutoBuild>,
 }
 
 /// Aggregated merge progress across a guardian's branches, ported from
@@ -1985,6 +2027,44 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Set this review's declared build step (RAL-342), from
+    /// `[review.auto_build]`. Set once at review-derivation time
+    /// (`reviews::derive_reviews`); blind-overwrite, not a read-then-merge
+    /// like [`Self::set_guardian_build_env_overrides`], since the whole
+    /// declaration is authored together in one TOML block. `None` records
+    /// that the review declared `skip_auto_build = true` instead.
+    pub fn set_guardian_auto_build(
+        &self,
+        id: &str,
+        auto_build: Option<&GuardianAutoBuild>,
+    ) -> Result<()> {
+        let json =
+            auto_build.map(|b| serde_json::to_string(b).unwrap_or_else(|_| "{}".to_string()));
+        let n = self.conn.execute(
+            "UPDATE guardians SET auto_build_json=?, updated_at_ms=? WHERE id=?",
+            params![json, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// This review's declared build step -- see [`GuardianView::auto_build`].
+    pub fn guardian_auto_build(&self, id: &str) -> Result<Option<GuardianAutoBuild>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT auto_build_json FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        Ok(json.as_deref().and_then(|s| serde_json::from_str(s).ok()))
+    }
+
     /// Set this review's own Proof-scope override (RAL-168): one of
     /// `"each_branch"`/`"final_branch"`/`"nothing"`. `None` resets it to
     /// "inherit the project-level default".
@@ -3063,7 +3143,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -3076,7 +3156,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -3135,6 +3215,7 @@ impl Store {
             match_pr_branch_name: r.get::<_, Option<i64>>(45)?.map(|v| v != 0),
             auto_submit_pr_stack: r.get::<_, Option<i64>>(46)?.map(|v| v != 0),
             origin: r.get(47)?,
+            auto_build_json: r.get(48)?,
         })
     }
 
@@ -3353,6 +3434,13 @@ impl Store {
             branch_env_from_json(row.manual_checks_env_overrides.as_deref().unwrap_or("{}"));
         let build_env = apply_branch_env(&combined_env, &build_env_overrides);
         let manual_checks_env = apply_branch_env(&combined_env, &manual_checks_env_overrides);
+        // RAL-342: `None` here is a valid, distinct state (the review declared
+        // `skip_auto_build = true`, or predates this migration) -- unlike the
+        // `{}`-default env-override maps above, there is no fallback to apply.
+        let auto_build = row
+            .auto_build_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<GuardianAutoBuild>(json).ok());
 
         // RAL-168: resolve this review's own Proof-scope override (if any)
         // against the project-level `.ralphus.toml [review] default_proof_scope`
@@ -3499,6 +3587,7 @@ impl Store {
             notice_kind: row.notice_kind,
             notice_message: row.notice_message,
             notice_at_ms: row.notice_at_ms,
+            auto_build,
             attempt_tokens_in,
             attempt_tokens_out,
             attempt_cost_usd,
@@ -3829,6 +3918,12 @@ struct GuardianRow {
     /// (drained from a Triage pool) -- see [`GUARDIAN_ORIGIN_EXPLICIT`] /
     /// [`GUARDIAN_ORIGIN_ARBITER`].
     origin: String,
+    /// RAL-342: JSON-serialized [`GuardianAutoBuild`], this review's own
+    /// declared build step. `None` means the review declared
+    /// `skip_auto_build = true` instead, or predates the RAL-342 migration --
+    /// unlike the `Option`-typed overrides above, `None` here never means
+    /// "inherit the project config default".
+    auto_build_json: Option<String>,
 }
 
 #[cfg(test)]
@@ -4934,6 +5029,52 @@ mod tests {
         assert!(store.get_guardian(&id).unwrap().skip_auto_build);
         assert!(store.guardian_skip_auto_build(&id).unwrap());
         assert!(store.set_guardian_skip_auto_build("nope", true).is_err());
+    }
+
+    #[test]
+    fn auto_build_defaults_none_and_round_trips_both_shapes() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert!(store.get_guardian(&id).unwrap().auto_build.is_none());
+        assert!(store.guardian_auto_build(&id).unwrap().is_none());
+
+        let command_build = GuardianAutoBuild {
+            command: Some("make build".to_string()),
+            prompt: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            agent: None,
+            model: None,
+        };
+        store
+            .set_guardian_auto_build(&id, Some(&command_build))
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().auto_build,
+            Some(command_build.clone())
+        );
+        assert_eq!(store.guardian_auto_build(&id).unwrap(), Some(command_build));
+
+        let agent_build = GuardianAutoBuild {
+            command: None,
+            prompt: Some("build the project".to_string()),
+            system_prompt: Some("you are a build agent".to_string()),
+            system_prompt_position: Some("append".to_string()),
+            agent: Some("claude".to_string()),
+            model: Some("sonnet".to_string()),
+        };
+        store
+            .set_guardian_auto_build(&id, Some(&agent_build))
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().auto_build,
+            Some(agent_build)
+        );
+
+        store.set_guardian_auto_build(&id, None).unwrap();
+        assert!(store.get_guardian(&id).unwrap().auto_build.is_none());
+
+        assert!(store.set_guardian_auto_build("nope", None).is_err());
     }
 
     #[test]
