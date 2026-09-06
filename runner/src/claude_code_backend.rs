@@ -325,7 +325,10 @@ fn apply_auto_compact_env(cmd: &mut Command, auto_compact_threshold: Option<u64>
 /// Sets [`FILE_READ_MAX_OUTPUT_TOKENS_ENV`] on `cmd` when
 /// `maximum_tool_output_tokens` is set -- a no-op otherwise, same shape as
 /// [`apply_auto_compact_env`] (RAL-333).
-fn apply_maximum_tool_output_tokens_env(cmd: &mut Command, maximum_tool_output_tokens: Option<u64>) {
+fn apply_maximum_tool_output_tokens_env(
+    cmd: &mut Command,
+    maximum_tool_output_tokens: Option<u64>,
+) {
     if let Some(v) = maximum_tool_output_tokens {
         cmd.env(FILE_READ_MAX_OUTPUT_TOKENS_ENV, v.to_string());
     }
