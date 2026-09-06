@@ -2056,6 +2056,22 @@ policy, ghost handoff, and any stored cell/subproject addendum). It is
 omitted for command cells, and may also be absent on historical rows created
 before August 15, 2026.
 
+Each `CellView` also carries `triage_types` (RAL-318): the cell's resolved
+Triage type(s) (inline `triage_type`, or the Arbiter's own classification),
+alphabetical, or absent/empty for a cell that never opted into Triage
+(`triage = true`). This is resolved synchronously at submit time whether or
+not the cell has run yet, so a non-empty list does not by itself mean the
+cell is done -- pair it with `state`. The board's cell details pane uses it
+to show a "scheduled"/"queued for auto-review" placeholder in place of a
+real review link for a Triage cell whose pool hasn't drained into an actual
+review yet; once it has, the cell's `reviews` entry (below) takes over.
+
+Each entry in a cell's `reviews` list (`SquadReviewRef`) also carries
+`origin`: `"explicit"` (an authored `[[review]]`, or any other non-Triage
+creation path) or `"arbiter"` (RAL-318: the review was created automatically
+when a Triage pool's count threshold or cron schedule fired). Mirrors
+`GuardianView.origin`.
+
 ### `GET /api/resources`
 Per-task OS resource usage for the board's Resources tab (RAL-11). One entry per
 *running* cell that currently has a live `ralphus-runner` subprocess, with its

@@ -1040,6 +1040,14 @@ pub fn derive_triage_pools(
     }
 
     let mut touched_keys: HashSet<(String, String)> = HashSet::new();
+    // RAL-159 parity: cells that share a worktree with a Triage-opted-in cell
+    // (e.g. a "finalize" cell at the worktree root sharing it with a "work"
+    // cell that alone declares `triage = true`) must block the readiness
+    // gate (`Store::mark_ready_branches_with_done_cells`) the same way an
+    // implicit `derive_reviews` sibling does -- see the matching pass there.
+    // Populated as each Triage-opted-in cell resolves its worktree root below,
+    // then matched against every non-Triage cell in a second pass afterward.
+    let mut explicit_roots: Vec<(PathBuf, String)> = Vec::new();
     for (cell_def, row) in flat_cells.iter().zip(cells.iter()) {
         if !cell_def.triage {
             continue;
@@ -1088,6 +1096,9 @@ pub fn derive_triage_pools(
             worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
         let branch =
             worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+        if let Ok(root) = worktree_root(cwd_path) {
+            explicit_roots.push((root, branch.clone()));
+        }
         let upstream = worktree_upstream(cwd_path).map_err(|_| {
             ReviewError::new(format!(
                 "{cwd}: Triage pooling requires a git upstream tracking branch for '{branch}', \
@@ -1127,6 +1138,35 @@ pub fn derive_triage_pools(
                     serde_json::json!({"project": project_str, "triage_type": triage_type}),
                 );
             touched_keys.insert((project_str.clone(), triage_type.clone()));
+        }
+    }
+
+    // Second pass (RAL-159 parity, see the comment on `explicit_roots` above):
+    // any cell that did NOT itself opt into Triage, but whose cwd resolves to
+    // the same worktree root as one that did, gets that same branch recorded
+    // as its `review_branch` too -- purely so the readiness gate waits for it.
+    // It is deliberately never added to the triage pool itself (only actual
+    // Triage-opted-in cells are pool members); `reviews_by_branch`'s existing
+    // `cells.review_branch = guardian_branches.branch` fallback join is what
+    // then also surfaces it in the board's "in reviews" list once the pool
+    // fires and the branch is attached to a guardian, with no further wiring
+    // needed here.
+    if !explicit_roots.is_empty() {
+        for (cell_def, row) in flat_cells.iter().zip(cells.iter()) {
+            if cell_def.triage {
+                continue; // already handled above
+            }
+            let Some(cwd) = row.cwd.as_deref() else {
+                continue;
+            };
+            let Ok(root) = worktree_root(Path::new(cwd)) else {
+                continue;
+            };
+            if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
+                store
+                    .set_cell_review_branch(squad_id, row.task_idx, row.idx, branch)
+                    .map_err(|e| ReviewError::new(e.to_string()))?;
+            }
         }
     }
 
@@ -2018,5 +2058,166 @@ print(json.dumps(result))
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // ── RAL-159 parity for Triage pooling ───────────────────────────────────
+    //
+    // The same "work" cell opts into Triage (`triage = true`) while a
+    // downstream "finalize" cell in the same task shares its worktree but
+    // declares neither `triage` nor `review` -- the layout the tutorial
+    // recommends. The readiness gate (`Store::mark_ready_branches_with_done_cells`)
+    // must withhold `MergeStatus::Ready` on the Triage-derived guardian's
+    // branch until BOTH cells are done, exactly like the explicit
+    // `derive_reviews` path's `worktree_sharing_gates_branch_ready_until_all_sessions_done`.
+
+    /// Two cells at the exact same worktree cwd: only "work" opts into
+    /// Triage, "finalize" is a plain downstream cell with no review/triage
+    /// fields of its own.
+    #[test]
+    fn triage_pool_worktree_sibling_gates_review_ready_until_both_cells_done() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_triage_type("security", "Security", "")
+            .unwrap();
+
+        let cwd = root.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            "[[task]]\nname=\"t\"\n\
+             [[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nprompt=\"do it\"\ntriage=true\ntriage_type=\"security\"\n\
+             [[task.cell]]\nid=\"finalize\"\ncwd=\"{cwd}\"\nprompt=\"wrap up\"\ndepends_on=[\"work\"]\n"
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        // Simulate the submit pipeline's earlier classification step, which
+        // always runs before `derive_triage_pools`; only "work" opts in.
+        store
+            .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
+            .unwrap();
+        // Fire immediately: threshold of 1 on the pool this submission's own
+        // "work" cell resolves to.
+        let triage_project =
+            crate::reviews::project_root_of(&cwd).expect("cwd resolves to a git worktree project");
+        store
+            .set_triage_pool_threshold(&triage_project, "security", Some(1))
+            .unwrap();
+
+        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        assert_eq!(created.len(), 1, "threshold of 1 fires on submit");
+        let gid = created[0].clone();
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.branches.len(), 1);
+        assert_eq!(g.branches[0].branch, "feature");
+
+        // "work" (task 0, cell 0) finishes -- branch must stay `pending`:
+        // "finalize" (task 0, cell 1), the worktree sibling that never
+        // itself opted into Triage, hasn't finished yet.
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
+        assert_eq!(
+            n, 0,
+            "must not promote while the non-Triage worktree sibling is still pending"
+        );
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending"
+        );
+
+        // "finalize" finishes too -- now every worktree-sharing cell is done.
+        store
+            .set_cell_state(&squad_id, 0, 1, crate::store::NodeState::Done)
+            .unwrap();
+        let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
+        assert_eq!(n, 1, "promotes exactly the one branch");
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same as above, but "finalize"'s cwd is a nested SUBFOLDER of "work"'s
+    /// worktree root rather than the identical path -- still the same
+    /// worktree (`git rev-parse --show-toplevel` normalizes both to the same
+    /// root), so the gate must still wait for it.
+    #[test]
+    fn triage_pool_nested_cwd_sibling_gates_review_ready_until_both_cells_done() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_triage_type("security", "Security", "")
+            .unwrap();
+
+        let cwd = root.to_string_lossy().replace('\\', "/");
+        let sub_cwd = format!("{cwd}/sub");
+        let src = format!(
+            "[[task]]\nname=\"t\"\n\
+             [[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nprompt=\"do it\"\ntriage=true\ntriage_type=\"security\"\n\
+             [[task.cell]]\nid=\"finalize\"\ncwd=\"{sub_cwd}\"\nprompt=\"wrap up\"\ndepends_on=[\"work\"]\n"
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
+            .unwrap();
+        let triage_project =
+            crate::reviews::project_root_of(&cwd).expect("cwd resolves to a git worktree project");
+        store
+            .set_triage_pool_threshold(&triage_project, "security", Some(1))
+            .unwrap();
+
+        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        assert_eq!(created.len(), 1, "threshold of 1 fires on submit");
+        let gid = created[0].clone();
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.branches.len(), 1);
+        assert_eq!(g.branches[0].branch, "feature");
+
+        // "work" (root cwd) finishes -- branch must stay `pending`:
+        // "finalize" (nested `sub` cwd, same worktree, no triage/review of
+        // its own) hasn't finished yet.
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
+        assert_eq!(
+            n, 0,
+            "must not promote while the nested-cwd worktree sibling is still pending"
+        );
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending"
+        );
+
+        // "finalize" finishes too.
+        store
+            .set_cell_state(&squad_id, 0, 1, crate::store::NodeState::Done)
+            .unwrap();
+        let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
+        assert_eq!(n, 1, "promotes exactly the one branch");
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

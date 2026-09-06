@@ -340,6 +340,17 @@ pub struct CellView {
     /// Reviews (guardians) this cell participates in — those whose stack
     /// includes the cell's review branch (RAL-17). Empty for most cells.
     pub reviews: Vec<SquadReviewRef>,
+    /// This cell's resolved Triage type(s) (RAL-318), alphabetical, if it
+    /// opted into Triage via `triage = true` -- empty for a cell that never
+    /// opted in. Populated at submit time (inline `triage_type` or the
+    /// Arbiter's own classification) whether or not the cell has run yet, so
+    /// non-empty here does not by itself mean the cell is done -- check
+    /// `state`. Lets the board show a "scheduled"/"queued for auto-review"
+    /// placeholder for a Triage cell whose pool hasn't drained into an
+    /// actual review yet (see `Self::reviews`, which is what shows once it
+    /// has).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triage_types: Vec<String>,
     /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex
     /// resume`), captured from the owning backend's output. `None` for other
     /// agents or cells that have not yet completed.
@@ -464,6 +475,11 @@ pub struct SquadReviewRef {
     /// `None` for squad-level review refs (not tied to a branch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// `"explicit"` (an authored `[[review]]`, or any other non-Triage
+    /// creation path) or `"arbiter"` (RAL-318: created automatically when a
+    /// Triage pool's count threshold or cron schedule fired). Mirrors
+    /// `GuardianView::origin`.
+    pub origin: String,
 }
 
 /// One entry in the execution/transition log (CCTL-99).
@@ -2444,35 +2460,35 @@ impl Store {
     /// available and idempotent — even a squad that already reached a terminal
     /// state (`done`/`failed`/already `cancelled`) is (re-)flipped to
     /// `cancelled`, so it can never be picked up again by another trigger
-    /// (a restart, cross-squad gating, etc). In-flight nodes are flipped too;
-    /// the worker thread stops on its own via the cancel token, so it will
-    /// not re-run any node this flips.
+    /// (a restart, cross-squad gating, etc). Every task/cell/proof that did
+    /// not finish successfully — in-flight *and* already-`failed` ones — is
+    /// flipped to `cancelled` alongside it; the worker thread stops on its own
+    /// via the cancel token, so it will not re-run any node this flips.
     pub fn cancel(&self, id: &str) -> Result<SquadState> {
         self.squad_state(id)?;
         self.set_squad_state(id, SquadState::Cancelled)?;
-        self.cancel_nonterminal_nodes(id)?;
+        self.cancel_unfinished_nodes(id)?;
         Ok(SquadState::Cancelled)
     }
 
-    /// Flip every task/cell/proof still in a non-terminal state
-    /// (`pending`/`running`) to `cancelled`, so the board reflects a cancelled
-    /// squad immediately. Terminal nodes (`done`/`failed`/already `cancelled`) are
-    /// left untouched — a cell that already finished keeps its real outcome.
-    /// The worker thread stops on its own via the cancel token, so it will not
-    /// re-run any node this flips.
-    fn cancel_nonterminal_nodes(&self, squad_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE cells SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
-            params![squad_id],
-        )?;
-        self.conn.execute(
-            "UPDATE tasks SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
-            params![squad_id],
-        )?;
-        self.conn.execute(
-            "UPDATE proofs SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
-            params![squad_id],
-        )?;
+    /// Flip every task/cell/proof that did not finish successfully
+    /// (`pending`/`running`/`failed`) to `cancelled`, so the board reflects a
+    /// cancelled squad immediately and consistently across all three node
+    /// levels. This mirrors the squad row itself, which is (re-)flipped to
+    /// `cancelled` even from a terminal state (RAL-116): a squad whose cells
+    /// had already failed must not be left showing `failed` tasks and cells
+    /// under a `cancelled` squad. Only nodes carrying a real successful
+    /// outcome — `done`, and the deliberately user-set `ignored` — are left
+    /// untouched. The worker thread stops on its own via the cancel token, so
+    /// it will not re-run any node this flips.
+    fn cancel_unfinished_nodes(&self, squad_id: &str) -> Result<()> {
+        const UNFINISHED: &str = "('pending','running','failed')";
+        for table in ["cells", "tasks", "proofs"] {
+            self.conn.execute(
+                &format!("UPDATE {table} SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"),
+                params![squad_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -3017,7 +3033,9 @@ impl Store {
         // the daemon's single store lock, which is what made `GET /api/tasks`
         // slow enough to stall restart/status-flip requests queued behind it.
         let proofs_by_scope = self.proofs_by_scope(&id)?;
-        let mut cells_by_task = self.cells_by_task(&id, &review_by_branch, &proofs_by_scope)?;
+        let triage_by_cell = self.triage_types_by_cell(&id)?;
+        let mut cells_by_task =
+            self.cells_by_task(&id, &review_by_branch, &proofs_by_scope, &triage_by_cell)?;
         let mut tasks = Vec::with_capacity(task_rows.len());
         for (
             t_idx,
@@ -3081,7 +3099,7 @@ impl Store {
     /// The reviews (guardians) derived from a squad, oldest first.
     fn reviews_for_squad(&self, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, status FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id",
+            "SELECT id, name, status, origin FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id",
         )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
@@ -3090,6 +3108,7 @@ impl Store {
                     name: r.get(1)?,
                     status: r.get(2)?,
                     branch: None,
+                    origin: r.get(3)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3106,6 +3125,7 @@ impl Store {
         squad_id: &str,
         review_by_branch: &HashMap<(i64, i64), Vec<SquadReviewRef>>,
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
+        triage_by_cell: &HashMap<(i64, i64), Vec<String>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens
@@ -3116,6 +3136,10 @@ impl Store {
                 let task_idx: i64 = r.get(0)?;
                 let idx: i64 = r.get(1)?;
                 let reviews = review_by_branch
+                    .get(&(task_idx, idx))
+                    .cloned()
+                    .unwrap_or_default();
+                let triage_types = triage_by_cell
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
@@ -3139,6 +3163,7 @@ impl Store {
                         depends_on: from_json(&r.get::<_, String>(15)?),
                         proof: Vec::new(),
                         reviews,
+                        triage_types,
                         agent_session_id: r.get::<_, Option<String>>(17)?,
                         maximum_budget_usd: r.get::<_, Option<f64>>(18)?,
                         env_overrides: from_json_map(&r.get::<_, String>(19)?),
@@ -3198,7 +3223,7 @@ impl Store {
         let mut map: HashMap<(i64, i64), Vec<SquadReviewRef>> = HashMap::new();
 
         let mut direct_stmt = self.conn.prepare(
-            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch
+            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch, g.origin
              FROM cells s
              JOIN guardians g ON g.id = s.review_guardian_id
              WHERE s.squad_id = ? AND s.review_guardian_id IS NOT NULL",
@@ -3213,6 +3238,7 @@ impl Store {
                         name: r.get(3)?,
                         status: r.get(4)?,
                         branch: r.get::<_, Option<String>>(5)?,
+                        origin: r.get(6)?,
                     },
                 ))
             })?
@@ -3222,7 +3248,7 @@ impl Store {
         }
 
         let mut fallback_stmt = self.conn.prepare(
-            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch
+            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch, g.origin
              FROM cells s
              JOIN guardian_branches gb ON gb.branch = s.review_branch
              JOIN guardians g ON g.id = gb.guardian_id
@@ -3240,6 +3266,7 @@ impl Store {
                         name: r.get(3)?,
                         status: r.get(4)?,
                         branch: r.get::<_, Option<String>>(5)?,
+                        origin: r.get(6)?,
                     },
                 ))
             })?
@@ -3938,7 +3965,7 @@ fn effective_squad_state(conn: &Connection, raw: String, squad_id: &str) -> Resu
 /// `ralphus:new-worktree/<branch>` placeholder cwd -- `project` is already
 /// structurally required for those (see `core::validate`), so this path is
 /// only reached for plain-path tasks.
-fn fallback_project_identifier(cwd: Option<&str>) -> String {
+pub(crate) fn fallback_project_identifier(cwd: Option<&str>) -> String {
     cwd.and_then(|c| Path::new(c).file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
@@ -5663,7 +5690,7 @@ impl Store {
         if !dry_run {
             for r in &squads {
                 self.set_squad_state(&r.id, SquadState::Cancelled)?;
-                self.cancel_nonterminal_nodes(&r.id)?;
+                self.cancel_unfinished_nodes(&r.id)?;
                 let _ = self.log_event(Some(&r.id), None, "squad", None, "cancelled");
             }
         }
@@ -8348,7 +8375,7 @@ name = "empty"
     }
 
     #[test]
-    fn cancel_flips_nonterminal_nodes_but_preserves_finished_ones() {
+    fn cancel_flips_unfinished_nodes_but_preserves_succeeded_ones() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         store.set_squad_state(&id, SquadState::Running).unwrap();
@@ -8363,6 +8390,34 @@ name = "empty"
         assert_eq!(squad.tasks[0].state, "cancelled");
         // …but the cell that already completed keeps its real outcome.
         assert_eq!(squad.tasks[0].cells[0].state, "done");
+    }
+
+    #[test]
+    fn cancel_flips_already_failed_tasks_cells_and_proofs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        // The squad already burned down to failure before the user hit cancel:
+        // the task and its cell are terminal-failed, the proof never ran.
+        store.set_squad_state(&id, SquadState::Failed).unwrap();
+        store.set_task_state(&id, 0, NodeState::Failed).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
+
+        store.cancel(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.state, "cancelled");
+        assert_eq!(squad.tasks[0].state, "cancelled");
+        assert_eq!(squad.tasks[0].cells[0].state, "cancelled");
+    }
+
+    #[test]
+    fn cancel_preserves_ignored_nodes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Ignored).unwrap();
+
+        store.cancel(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "ignored");
     }
 
     // RAL-157: two independent tasks, for solo/unsolo tests.
