@@ -7,7 +7,7 @@
 //! topological order. The upstream branch is always the worktree's git
 //! upstream tracking branch — a hard error if the worktree has none.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use opentelemetry::Context;
@@ -1108,7 +1108,12 @@ pub fn derive_triage_pools(
         store
             .set_cell_review_branch(squad_id, row.task_idx, row.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        let project_str = project.to_string_lossy().into_owned();
+        // RAL-318 Bug 3 fix: resolve to the registered project's stable name
+        // when one's path matches this worktree root, rather than the raw
+        // git-reported path -- keeps this key in agreement with whatever
+        // `resolve_pool_key_input` computes for a threshold set against the
+        // same project by name (`crate::server`'s pool/schedule handlers).
+        let project_str = crate::triage::pool_key_for_path(store, &project);
         // A cell resolved to more than one type (inline `triage_type` list,
         // or a multi-type Arbiter classification) is pooled into every one
         // of its types' `(project, triage_type)` pools independently --
@@ -1204,6 +1209,21 @@ pub(crate) fn create_review_from_triage_pool(
     let drained = store
         .drain_triage_pool(project, triage_type)
         .map_err(|e| ReviewError::new(e.to_string()))?;
+    // Defense in depth: `drain_triage_pool` already excludes a failed cell,
+    // but a failed cell must never reach a review under any circumstance
+    // (RAL-318 bug 2), so re-check here too in case some future code path
+    // ever inserts into `triage_pool_cells` without going through the same
+    // drain filter (e.g. a hypothetical manual "force-fire" admin action).
+    let mut viable = Vec::with_capacity(drained.len());
+    for cell in drained {
+        let effective = store
+            .effective_state_for_cell(&cell.squad_id, cell.task_idx, cell.idx)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        if effective.as_deref() != Some("failed") {
+            viable.push(cell);
+        }
+    }
+    let drained = viable;
     if drained.is_empty() {
         return Ok(None);
     }
@@ -1249,6 +1269,197 @@ pub(crate) fn create_review_from_triage_pool(
     Ok(Some(gid))
 }
 
+/// Startup repair (RAL-318 bug 3) for Triage pool/threshold/schedule keys
+/// stored under the pre-fix path-based key instead of the resolved project
+/// name (see `crate::triage::pool_key_for_path`). Called once per daemon
+/// restart, alongside the other startup recovery passes in `server::serve`
+/// -- naturally idempotent (once every row's key already matches its
+/// corrected form, re-running this is a no-op, the same "runs every
+/// startup, self-heals" idiom `Store::init_schema`'s other backfills use),
+/// so there is no separate "have I run this" marker to track.
+///
+/// A pooled cell whose proof has definitively failed is dropped from the
+/// pool outright rather than migrated (a failed cell can never pass review);
+/// it remains visible forever in the Triage candidate list with a "failed"
+/// status regardless (`Store::triage_candidates`). Every other pooled cell
+/// is moved onto its corrected key. Thresholds and cron schedules are moved
+/// the same way; if two old keys collide onto the same corrected key with
+/// two *different* non-null threshold values, the corrected key's threshold
+/// is left unset rather than guessed -- a threshold is always the user's
+/// deliberate choice, never invented here -- and the conflict is logged so
+/// it can be resolved explicitly via `ralphus triage pool threshold`.
+/// Finally, every corrected key's count is checked against its (possibly
+/// just-carried-forward) threshold, so a pool that's now counted correctly
+/// and already past its threshold fires a review immediately, instead of
+/// waiting for the next unrelated submission to touch that key.
+pub fn repair_triage_pool_keys(store: &Store) {
+    let mut touched_keys: HashSet<(String, String)> = HashSet::new();
+
+    let cells = match store.all_pooled_cells() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [triage] pool-key repair: failed to list pooled cells: {e}"
+            );
+            Vec::new()
+        }
+    };
+    for (old_project, triage_type, cell) in cells {
+        let effective = match store.effective_state_for_cell(
+            &cell.squad_id,
+            cell.task_idx,
+            cell.idx,
+        ) {
+            Ok(s) => s.unwrap_or_default(),
+            Err(e) => {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] pool-key repair: failed to read cell state for {}/{}/{}: {e}",
+                    cell.squad_id,
+                    cell.task_idx,
+                    cell.idx
+                );
+                continue;
+            }
+        };
+        if effective == "failed" {
+            if let Err(e) = store.remove_triage_pool_cell(
+                &old_project,
+                &triage_type,
+                &cell.squad_id,
+                cell.task_idx,
+                cell.idx,
+            ) {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] pool-key repair: failed to drop failed cell from pool: {e}"
+                );
+            }
+            continue;
+        }
+        let new_project = crate::triage::pool_key_for_path(store, Path::new(&old_project));
+        if new_project != old_project {
+            if let Err(e) = store.rekey_triage_pool_cell(
+                &old_project,
+                &triage_type,
+                &cell.squad_id,
+                cell.task_idx,
+                cell.idx,
+                &new_project,
+            ) {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] pool-key repair: failed to rekey pooled cell: {e}"
+                );
+                continue;
+            }
+        }
+        touched_keys.insert((new_project, triage_type));
+    }
+
+    let thresholds = match store.all_triage_pool_thresholds() {
+        Ok(t) => t,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [triage] pool-key repair: failed to list thresholds: {e}"
+            );
+            Vec::new()
+        }
+    };
+    let mut by_new_key: HashMap<(String, String), Vec<(String, i64)>> = HashMap::new();
+    for (old_project, triage_type, value) in thresholds {
+        let new_project = crate::triage::pool_key_for_path(store, Path::new(&old_project));
+        by_new_key
+            .entry((new_project, triage_type))
+            .or_default()
+            .push((old_project, value));
+    }
+    for ((new_project, triage_type), old_rows) in by_new_key {
+        touched_keys.insert((new_project.clone(), triage_type.clone()));
+        for (old_project, _) in &old_rows {
+            if *old_project != new_project {
+                let _ = store.set_triage_pool_threshold(old_project, &triage_type, None);
+            }
+        }
+        let mut distinct_values: Vec<i64> = old_rows.iter().map(|(_, v)| *v).collect();
+        distinct_values.sort_unstable();
+        distinct_values.dedup();
+        match distinct_values.as_slice() {
+            [value] => {
+                if let Err(e) =
+                    store.set_triage_pool_threshold(&new_project, &triage_type, Some(*value))
+                {
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [triage] pool-key repair: failed to carry threshold forward for ({new_project}, {triage_type}): {e}"
+                    );
+                }
+            }
+            [] => {}
+            _ => {
+                let _ = store.set_triage_pool_threshold(&new_project, &triage_type, None);
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [triage] pool-key repair: ({new_project}, {triage_type}) had conflicting thresholds {old_rows:?} under different old keys -- left unset, set it explicitly with `ralphus triage pool threshold`"
+                );
+                crate::cartographer::Note::new("arbiter").emit(
+                    store,
+                    format!(
+                        "Triage pool key repair found conflicting thresholds for ({new_project}, {triage_type}); left unset"
+                    ),
+                    serde_json::json!({
+                        "project": new_project,
+                        "triage_type": triage_type,
+                        "conflicting": old_rows,
+                    }),
+                );
+            }
+        }
+    }
+
+    if let Ok(schedules) = store.list_triage_schedules(None) {
+        for sched in schedules {
+            let new_project = crate::triage::pool_key_for_path(store, Path::new(&sched.project));
+            if new_project != sched.project {
+                touched_keys.insert((new_project.clone(), sched.triage_type.clone()));
+                if let Err(e) = store.rekey_triage_schedule(sched.id, &new_project) {
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [triage] pool-key repair: failed to rekey schedule {}: {e}",
+                        sched.id
+                    );
+                }
+            }
+        }
+    }
+
+    for (project, triage_type) in touched_keys {
+        let count = match store.triage_pool_count(&project, &triage_type) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let threshold = match store.get_triage_pool_threshold(&project, &triage_type) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if threshold.is_some_and(|t| count >= t) {
+            match create_review_from_triage_pool(store, &project, &triage_type) {
+                Ok(Some(gid)) => crate::rlog!(
+                    INFO,
+                    "ralphus [triage] pool-key repair fired ({project}, {triage_type}) -> review {gid}"
+                ),
+                Ok(None) => {}
+                Err(e) => crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] pool-key repair: failed to fire ({project}, {triage_type}): {e}"
+                ),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1257,7 +1468,7 @@ mod tests {
 
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_resolver,
-        create_review_from_triage_pool, derive_triage_pools, rebase_onto,
+        create_review_from_triage_pool, derive_triage_pools, rebase_onto, repair_triage_pool_keys,
         workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::Store;
@@ -1917,6 +2128,187 @@ print(json.dumps(result))
         );
     }
 
+    #[test]
+    fn create_review_from_triage_pool_never_includes_a_failed_cell() {
+        let mut store = Store::open_in_memory().unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n[[task.cell.proof]]\ncommand=\"cargo test\"\n",
+        )
+        .unwrap();
+        let failed_squad = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&failed_squad, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        store
+            .set_proof_state(
+                &failed_squad,
+                0,
+                "cell",
+                0,
+                0,
+                crate::store::NodeState::Failed,
+            )
+            .unwrap();
+
+        store
+            .record_triage_pool_cell("proj", "security", &failed_squad, 0, 0, "b-failed", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", "squad-ok", 0, 0, "b-ok", "main")
+            .unwrap();
+
+        let gid = create_review_from_triage_pool(&store, "proj", "security")
+            .unwrap()
+            .expect("one viable cell remains, must still create a review");
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.branches.len(),
+            1,
+            "the failed cell's branch must never be attached to the review"
+        );
+        assert_eq!(g.branches[0].branch, "b-ok");
+    }
+
+    #[test]
+    fn repair_triage_pool_keys_rekeys_a_stale_path_based_pool_and_fires_when_now_past_threshold() {
+        let root = temp_repo();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+
+        let stale_key = root.to_string_lossy().replace('\\', "/");
+        store
+            .record_triage_pool_cell(&stale_key, "bug", "squad-x", 0, 0, "b1", "main")
+            .unwrap();
+        store
+            .set_triage_pool_threshold(&stale_key, "bug", Some(1))
+            .unwrap();
+
+        repair_triage_pool_keys(&store);
+
+        assert_eq!(store.triage_pool_count(&stale_key, "bug").unwrap(), 0);
+        assert!(
+            store
+                .get_triage_pool_threshold(&stale_key, "bug")
+                .unwrap()
+                .is_none()
+        );
+        // Its single cell, now correctly counted under "proj", already met
+        // its carried-forward threshold of 1 -- the repair fires a real
+        // review immediately rather than waiting for a future submission.
+        assert!(store.triage_pool_keys().unwrap().is_empty());
+        let guardians = store.list_guardians().unwrap();
+        assert_eq!(guardians.len(), 1);
+        assert_eq!(
+            guardians[0].origin,
+            crate::guardian::GUARDIAN_ORIGIN_ARBITER
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_triage_pool_keys_drops_a_failed_cell_without_migrating_it() {
+        let root = temp_repo();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n[[task.cell.proof]]\ncommand=\"cargo test\"\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        store
+            .set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Failed)
+            .unwrap();
+
+        let stale_key = root.to_string_lossy().replace('\\', "/");
+        store
+            .record_triage_pool_cell(&stale_key, "bug", &squad_id, 0, 0, "b1", "main")
+            .unwrap();
+
+        repair_triage_pool_keys(&store);
+
+        assert!(
+            store.triage_pool_keys().unwrap().is_empty(),
+            "a failed cell must be dropped from the pool, never migrated to the corrected key"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_triage_pool_keys_carries_forward_a_single_consistent_threshold() {
+        let root = temp_repo();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let key_a = root.to_string_lossy().replace('\\', "/");
+        let key_b = root.to_string_lossy().into_owned();
+        store
+            .set_triage_pool_threshold(&key_a, "bug", Some(3))
+            .unwrap();
+        store
+            .set_triage_pool_threshold(&key_b, "bug", Some(3))
+            .unwrap();
+
+        repair_triage_pool_keys(&store);
+
+        assert_eq!(
+            store.get_triage_pool_threshold("proj", "bug").unwrap(),
+            Some(3)
+        );
+        assert!(
+            store
+                .get_triage_pool_threshold(&key_a, "bug")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_triage_pool_threshold(&key_b, "bug")
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_triage_pool_keys_leaves_conflicting_thresholds_unset() {
+        let root = temp_repo();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let key_a = root.to_string_lossy().replace('\\', "/");
+        let key_b = root.to_string_lossy().into_owned();
+        store
+            .set_triage_pool_threshold(&key_a, "bug", Some(3))
+            .unwrap();
+        store
+            .set_triage_pool_threshold(&key_b, "bug", Some(5))
+            .unwrap();
+
+        repair_triage_pool_keys(&store);
+
+        assert!(
+            store
+                .get_triage_pool_threshold("proj", "bug")
+                .unwrap()
+                .is_none(),
+            "conflicting thresholds set under different old keys must never be silently merged"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn task_file_toml(cwd: &Path, triage_type: &str) -> String {
         let cwd = cwd.to_string_lossy().replace('\\', "/");
         format!(
@@ -1957,6 +2349,10 @@ print(json.dumps(result))
         let keys = store.triage_pool_keys().unwrap();
         assert_eq!(keys.len(), 1);
         let (project, triage_type) = keys[0].clone();
+        assert_eq!(
+            project, "proj",
+            "pool key must resolve to the registered project's name (RAL-318 bug 3), not its raw worktree path"
+        );
         assert_eq!(triage_type, "security");
         assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 1);
 
@@ -2017,15 +2413,17 @@ print(json.dumps(result))
 
         let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
         assert!(created.is_empty(), "no threshold configured yet");
-        // The pool key's `project` is the git worktree root path (see
-        // `worktree_project`), not the registered project's logical name --
-        // read it back from the pool keys rather than assuming it matches
-        // the registration name, same as `derive_triage_pools_pools_a_local_cell_and_fires_on_threshold`.
+        // The pool key's `project` resolves to the registered project's name
+        // (RAL-318 bug 3 fix), so it agrees with a threshold set against
+        // "proj" by name via `resolve_pool_key_input`.
         let mut keys = store.triage_pool_keys().unwrap();
         keys.sort();
         assert_eq!(
-            keys.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
-            vec!["bug", "investigation"]
+            keys,
+            vec![
+                ("proj".to_string(), "bug".to_string()),
+                ("proj".to_string(), "investigation".to_string()),
+            ]
         );
         let project = keys[0].0.clone();
         assert_eq!(store.triage_pool_count(&project, "bug").unwrap(), 1);

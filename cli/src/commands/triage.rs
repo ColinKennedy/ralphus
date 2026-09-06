@@ -12,7 +12,21 @@ use crate::flags::Scanner;
 #[derive(Debug, Clone)]
 pub enum TriageCommand {
     Help,
+    Pool(TriagePoolCommand),
     Type(TriageTypeCommand),
+    UsageError(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum TriagePoolCommand {
+    Help,
+    List,
+    Threshold {
+        project: String,
+        triage_type: String,
+        /// `None` clears a previously configured threshold.
+        threshold: Option<i64>,
+    },
     UsageError(String),
 }
 
@@ -39,8 +53,49 @@ pub fn parse(args: &[String]) -> TriageCommand {
     let scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => TriageCommand::Help,
+        Some("pool") => TriageCommand::Pool(parse_pool(&scanner.remaining())),
         Some("type") => TriageCommand::Type(parse_type(&scanner.remaining())),
         Some(other) => TriageCommand::UsageError(format!("unknown triage subcommand: {other}")),
+    }
+}
+
+fn parse_pool(args: &[String]) -> TriagePoolCommand {
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => TriagePoolCommand::Help,
+        Some("list") => TriagePoolCommand::List,
+        Some("threshold") => {
+            let threshold = match scanner.take_parsed::<i64>("--threshold") {
+                Ok(v) => v,
+                Err(e) => return TriagePoolCommand::UsageError(e.0),
+            };
+            let clear = scanner.take_bool("--clear");
+            if threshold.is_some() && clear {
+                return TriagePoolCommand::UsageError(
+                    "--threshold and --clear are mutually exclusive".to_string(),
+                );
+            }
+            if threshold.is_none() && !clear {
+                return TriagePoolCommand::UsageError(
+                    "threshold requires either --threshold <n> or --clear".to_string(),
+                );
+            }
+            let rest = scanner.remaining();
+            let mut rest = rest.into_iter();
+            let (Some(project), Some(triage_type)) = (rest.next(), rest.next()) else {
+                return TriagePoolCommand::UsageError(
+                    "threshold requires <project> and <triage_type> arguments".to_string(),
+                );
+            };
+            TriagePoolCommand::Threshold {
+                project,
+                triage_type,
+                threshold,
+            }
+        }
+        Some(other) => {
+            TriagePoolCommand::UsageError(format!("unknown triage pool subcommand: {other}"))
+        }
     }
 }
 
@@ -106,7 +161,53 @@ pub fn dispatch(cmd: TriageCommand, opts: &GlobalOpts) -> i32 {
             println!("usage error: {m}");
             2
         }
+        TriageCommand::Pool(c) => dispatch_pool(c, opts),
         TriageCommand::Type(c) => dispatch_type(c, opts),
+    }
+}
+
+fn dispatch_pool(cmd: TriagePoolCommand, opts: &GlobalOpts) -> i32 {
+    let client = opts.client();
+    match cmd {
+        TriagePoolCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["triage", "pool"])
+                    .expect("triage pool help exists")
+            );
+            0
+        }
+        TriagePoolCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        TriagePoolCommand::List => match client.list_triage_pools() {
+            Ok(payload) => {
+                render_triage_pool_list(&payload);
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                2
+            }
+        },
+        TriagePoolCommand::Threshold {
+            project,
+            triage_type,
+            threshold,
+        } => match client.set_triage_pool_threshold(&project, &triage_type, threshold) {
+            Ok(_) => {
+                match threshold {
+                    Some(t) => println!("set threshold for ({project}, {triage_type}) to {t}"),
+                    None => println!("cleared threshold for ({project}, {triage_type})"),
+                }
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
     }
 }
 
@@ -169,6 +270,26 @@ fn dispatch_type(cmd: TriageTypeCommand, opts: &GlobalOpts) -> i32 {
                 1
             }
         },
+    }
+}
+
+fn render_triage_pool_list(payload: &Value) {
+    let pools = payload["pools"].as_array().cloned().unwrap_or_default();
+    if pools.is_empty() {
+        println!("no triage pools");
+        return;
+    }
+    for p in &pools {
+        let threshold = p["threshold"]
+            .as_i64()
+            .map_or_else(|| "none".to_string(), |t| t.to_string());
+        println!(
+            "{:<24}  {:<16}  count={:<4}  threshold={}",
+            p["project"].as_str().unwrap_or_default(),
+            p["triage_type"].as_str().unwrap_or_default(),
+            p["count"].as_i64().unwrap_or_default(),
+            threshold
+        );
     }
 }
 
@@ -283,6 +404,85 @@ mod tests {
         matches!(
             parse(&v(&["type", "bogus"])),
             TriageCommand::Type(TriageTypeCommand::UsageError(_))
+        );
+    }
+
+    #[test]
+    fn parses_pool_list() {
+        matches!(
+            parse(&v(&["pool", "list"])),
+            TriageCommand::Pool(TriagePoolCommand::List)
+        );
+    }
+
+    #[test]
+    fn parses_pool_threshold_set() {
+        match parse(&v(&[
+            "pool",
+            "threshold",
+            "proj",
+            "bug",
+            "--threshold",
+            "4",
+        ])) {
+            TriageCommand::Pool(TriagePoolCommand::Threshold {
+                project,
+                triage_type,
+                threshold,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(triage_type, "bug");
+                assert_eq!(threshold, Some(4));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pool_threshold_clear() {
+        match parse(&v(&["pool", "threshold", "proj", "bug", "--clear"])) {
+            TriageCommand::Pool(TriagePoolCommand::Threshold {
+                project,
+                triage_type,
+                threshold,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(triage_type, "bug");
+                assert_eq!(threshold, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pool_threshold_requires_either_threshold_or_clear() {
+        matches!(
+            parse(&v(&["pool", "threshold", "proj", "bug"])),
+            TriageCommand::Pool(TriagePoolCommand::UsageError(_))
+        );
+    }
+
+    #[test]
+    fn pool_threshold_rejects_both_threshold_and_clear() {
+        matches!(
+            parse(&v(&[
+                "pool",
+                "threshold",
+                "proj",
+                "bug",
+                "--threshold",
+                "4",
+                "--clear"
+            ])),
+            TriageCommand::Pool(TriagePoolCommand::UsageError(_))
+        );
+    }
+
+    #[test]
+    fn pool_threshold_requires_project_and_type() {
+        matches!(
+            parse(&v(&["pool", "threshold", "--threshold", "4"])),
+            TriageCommand::Pool(TriagePoolCommand::UsageError(_))
         );
     }
 }

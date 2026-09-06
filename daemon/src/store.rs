@@ -2784,6 +2784,46 @@ impl Store {
         Ok(raw.and_then(|s| NodeState::parse(&s)))
     }
 
+    /// The effective (proof-aware) state of one cell -- see
+    /// [`effective_cell_state`]'s doc comment for why the persisted
+    /// `cells.state` alone can misreport a cell whose proof failed as
+    /// `done`. Used by Triage pooling (`crate::triage`) to decide whether a
+    /// pooled cell is still a viable candidate (pending/running, or done and
+    /// passed) or has definitively failed and must never count toward a
+    /// threshold or be swept into an auto-review. `None` if the cell doesn't
+    /// exist.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn effective_state_for_cell(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        let Some(raw) = self
+            .conn
+            .query_row(
+                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT state FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+        )?;
+        let proof_states: Vec<String> = stmt
+            .query_map(params![squad_id, task_idx, idx], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some(effective_cell_state(
+            &raw,
+            proof_states.iter().map(String::as_str),
+        )))
+    }
+
     /// Current state of one task, or `None` if it doesn't exist. Same purpose
     /// as [`Store::cell_state`], for `server::restart_task_proof`.
     pub fn task_state(&self, squad_id: &str, task_idx: i64) -> Result<Option<NodeState>> {
@@ -3189,7 +3229,8 @@ impl Store {
                 .get(&(task_idx, "cell".to_string(), idx))
                 .cloned()
                 .unwrap_or_default();
-            cell.state = effective_cell_state(&cell.state, &cell.proof);
+            cell.state =
+                effective_cell_state(&cell.state, cell.proof.iter().map(|p| p.state.as_str()));
             map.entry(task_idx).or_default().push(cell);
         }
         Ok(map)
@@ -3880,19 +3921,18 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// cell being finished while its proof checklist is still running or
 /// has failed. This folds proof progress back in for display only, without
 /// touching the persisted column the scheduler relies on.
-fn effective_cell_state(raw: &str, proof: &[ProofView]) -> String {
+fn effective_cell_state<'a>(raw: &str, proof_states: impl IntoIterator<Item = &'a str>) -> String {
     if raw != "done" {
         return raw.to_string();
     }
-    if proof.iter().any(|v| v.state == "failed") {
+    let states: Vec<&str> = proof_states.into_iter().collect();
+    if states.contains(&"failed") {
         return "failed".to_string();
     }
-    if proof.iter().any(|v| {
-        !matches!(
-            v.state.as_str(),
-            "done" | "failed" | "cancelled" | "ignored"
-        )
-    }) {
+    if states
+        .iter()
+        .any(|s| !matches!(*s, "done" | "failed" | "cancelled" | "ignored"))
+    {
         return "running".to_string();
     }
     raw.to_string()
