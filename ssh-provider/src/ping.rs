@@ -30,6 +30,7 @@ pub fn run(uri: &str, config: &EffectiveConfig) -> Result<Option<String>, String
         &target.target_string(),
         config.connect_timeout_secs,
         &format!("echo {PING_MARKER}"),
+        config.ssh_config_file.as_deref(),
     );
     let out = Command::new("ssh")
         .args(&ssh_args)
@@ -62,6 +63,8 @@ mod tests {
             extra_excludes: vec![],
             connect_timeout_secs: crate::config::DEFAULT_CONNECT_TIMEOUT_SECS,
             remote_runner_cmd: crate::config::DEFAULT_REMOTE_RUNNER_CMD.to_string(),
+            ssh_config_file: None,
+            target_runner_config: None,
         }
     }
 

@@ -48,6 +48,44 @@ pub fn resume_pi_agent_command(program: &str, session_id: &str) -> String {
     format!("& '{safe_program}' --session '{safe_session}' --approve")
 }
 
+/// POSIX-shell equivalent of [`resume_agent_command`], for a remote Linux
+/// target reached over SSH (RAL-355 Phase 10). Same flag shape and the same
+/// unconditional permission-prompt bypass as the local, PowerShell-quoted
+/// version -- only the quoting convention differs (POSIX single-quote
+/// escaping, `'\''`, not PowerShell's doubled `''`). Claude Code only for
+/// now; the Codex/Pi analogs are deliberately not added until their remote
+/// terminal paths are actually exercised (matching this workspace's existing
+/// precedent of deferring an unexercised harness's event/command shape
+/// rather than guessing at it).
+#[must_use]
+pub fn resume_agent_command_posix(program: &str, session_id: &str) -> String {
+    format!(
+        "{} --resume {} --dangerously-skip-permissions",
+        posix_quote_single(program),
+        posix_quote_single(session_id)
+    )
+}
+
+/// POSIX single-quote a value: wraps it in `'...'`, ending/re-opening the
+/// quote around any embedded `'` (the standard POSIX-shell escape, since a
+/// single-quoted string cannot itself contain an escaped quote).
+fn posix_quote_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// True when `agent` identifies a Claude Code-family backend, resumable via
+/// [`resume_agent_command`]/[`resume_agent_command_posix`] (RAL-355 Phase
+/// 10: the remote terminal relay is Claude Code-only for its first version,
+/// and needs to distinguish this from Codex/Pi/`ollama`/`raw`, none of which
+/// resume the same way).
+#[must_use]
+pub fn is_claude_agent(agent: Option<&str>) -> bool {
+    matches!(
+        agent,
+        Some("claude" | "anthropic" | "claude-code" | "claude-cli")
+    )
+}
+
 /// True when `agent` identifies a Codex-family backend (`codex`/`codex-cli`).
 #[must_use]
 pub fn is_codex_agent(agent: Option<&str>) -> bool {
@@ -80,6 +118,21 @@ mod tests {
     }
 
     #[test]
+    fn resume_agent_command_posix_always_skips_permissions() {
+        let cmd = resume_agent_command_posix("claude", "abc-123");
+        assert!(cmd.contains("--dangerously-skip-permissions"));
+        assert!(cmd.contains("--resume 'abc-123'"));
+        assert!(cmd.starts_with("'claude'"));
+    }
+
+    #[test]
+    fn resume_agent_command_posix_escapes_single_quotes() {
+        let cmd = resume_agent_command_posix("my'claude", "sess'123");
+        assert!(cmd.contains("my'\\''claude"), "{cmd}");
+        assert!(cmd.contains("sess'\\''123"), "{cmd}");
+    }
+
+    #[test]
     fn resume_codex_agent_command_always_bypasses_approvals() {
         let cmd = resume_codex_agent_command("codex", "thread-abc-123");
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
@@ -104,6 +157,22 @@ mod tests {
         assert!(cmd.contains("--session 'session-123'"));
         assert!(cmd.contains("--approve"));
         assert!(cmd.contains("& 'pi'"));
+    }
+
+    #[test]
+    fn is_claude_agent_matches_every_alias() {
+        assert!(is_claude_agent(Some("claude")));
+        assert!(is_claude_agent(Some("anthropic")));
+        assert!(is_claude_agent(Some("claude-code")));
+        assert!(is_claude_agent(Some("claude-cli")));
+    }
+
+    #[test]
+    fn is_claude_agent_false_for_other_backends_and_unset() {
+        assert!(!is_claude_agent(Some("codex")));
+        assert!(!is_claude_agent(Some("pi")));
+        assert!(!is_claude_agent(Some("ollama")));
+        assert!(!is_claude_agent(None));
     }
 
     #[test]

@@ -18,8 +18,9 @@ provider's business.
 > **Status:** implemented — registry, `machine` syntax, validation, remote
 > cell/proof execution, and every documented verb (`provision`, `exec`,
 > `status`, `stream`, `cancel`, `run`, `read-file`, `write-file`,
-> `remove-path`, `ping`, `channel`, `cleanup`), each dispatched genericly
-> through the same registry with no daemon-side branching on scheme. Guardian
+> `remove-path`, `ping`, `capabilities`, `channel`, `cleanup`), each
+> dispatched genericly through the same registry with no daemon-side
+> branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
 > Phase 3/RAL-201) — the merge worktree, stacked rebase, conflict-resolution
 > agent, chat/feedback/summary agent invocations, and check gates all route
@@ -148,18 +149,22 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 | `status` | `--uri --handle` | none | For an async handle: `{"state": "running"}`, or `{"state": "done"\|"failed", "result": {...}}` (`result` is the same `RunnerResult` shape as `exec`). |
 | `stream` | `--uri --handle [--since N]` | none | `{"output": "...", "next": N}` — output since the cursor. Optional; omitting it costs Live View, not execution. |
 | `cancel` | `--uri --handle` | none | Stop the work behind a handle. Reply is the standard `{"ok": true, "protocol_version": 1}` envelope — no extra fields. |
+| `job-cleanup` | `--uri --handle` | none | Explicitly delete one terminal job's retained state. This is separate from worktree `cleanup`; providers may retain failed-job diagnostics according to their policy. |
 | `run` | `--uri` | [`RunRequest`](../daemon/src/remote_runner.rs) (`cwd: String`, `program: String`, `args: Vec<String>`) | Run one VCS command in a workspace. Reply `{"exit_code": 0, "stdout": "..."}`. |
 | `read-file` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: false`) | Return a file's contents. Reply `{"stdout": "<file content>"}`. A missing/unreadable file is **not** an error at the daemon layer — callers treat it as "absent" — but the provider still replies however it normally would (`ok: false` is fine; the daemon maps any failure to "absent"). |
 | `write-file` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: "<text to write>"`, `recursive: false`) | Write `content` to `path`, creating parent directories as needed. Reply is the standard envelope. |
 | `remove-path` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: bool`) | Delete a file, or a directory tree when `recursive` is `true`. A path that does not exist is success, not an error. |
 | `ping` | `--uri` | none | Confirm the machine is reachable and ready, doing no work. Reply `{"ok": true, "detail": "..."}`. Called on demand from the board's Machines tab, never polled. |
+| `capabilities` | `--uri` | none | **Optional.** Report what this provider/machine pairing supports. Reply `{"capabilities": {...}}` — see [`Capabilities`](../daemon/src/remote_runner.rs) (`os?`, `arch?`, `supported_ops: [String]`, `async_exec: bool`, `terminal: bool`, `runner_version?`). Every field is best-effort (`None`/omitted means "unknown", never "no"). A provider that does not implement this verb is not a failure — the daemon reads that the same way as "no capability information available", not an error. Must never have side effects (no runner upload, no workspace mutation) even when answering `runner_version` or `async_exec` would otherwise tempt one. |
 | `channel` | `--uri` | newline-delimited `RunRequest`s | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
-| `cleanup` | `--uri` | none | Tear the workspace down (see "The `cleanup` verb and its retention policy" below). |
+| `cleanup` | `--uri` | [`CleanupRequest`](../daemon/src/remote_runner.rs) (`project: String`, `clone_url: String`, `branch?: String`, `remote_root?: String`) | Tear one workspace down — one worktree when `branch` is given, the whole project directory (repository plus every worktree) when it is omitted. Reply `{"removed": "<abs path on this machine>"}`. See "The `cleanup` verb and its retention policy" below. |
+| `terminal` | `--uri --command --cols --lines` | none (raw byte stream, not JSON) | **The one verb that is not JSON request/response.** Runs `--command` on the target under an allocated pty (e.g. `ssh -tt`), with `--cols`/`--lines` setting the pty's *initial* size only (no live resize forwarding — see below). From the moment the pty connects, this process's own stdin/stdout **are** the terminal byte stream: read stdin, write it to the pty; read the pty, write it to stdout; until either side closes. Success/failure is this process's own exit code, not a trailing JSON line — see "The `terminal` verb" below. |
 
 The cell spec arrives on stdin for `exec`; the provision request arrives on
-stdin for `provision`; the file/run requests above arrive on stdin for their
-own verb. Handle-scoped verbs (`status`/`stream`/`cancel`) and `ping`/`cleanup`
-take no stdin payload.
+stdin for `provision`; the file/run/cleanup requests above arrive on stdin
+for their own verb. Handle-scoped verbs (`status`/`stream`/`cancel`/
+`job-cleanup`) and `ping` take no stdin payload. `terminal` takes no stdin
+payload either — its whole request is the four flags above.
 
 **Synchronous vs async `exec`.** A provider that can only block returns
 `result` and is done — no `status`/`stream`/`cancel` needed. A provider that
@@ -173,24 +178,94 @@ automatically** by the daemon — a local cell's worktree
 (`.git/.ralphus_worktrees/<branch>`) is never auto-deleted either, so a remote
 workspace keeps the same property rather than being reclaimed the instant a
 squad ends. An operator reclaims one explicitly, once they are actually done
-inspecting it:
+inspecting it. Since RAL-355 Phase 4 a single machine can hold many projects
+and many worktrees per project (`<remote_root>/projects/<name>-<hash>/
+worktrees/<branch>-<suffix>`), so `cleanup` targets one project's registered
+name plus its clone URL, optionally scoped to a single `branch`:
 
 ```bash
+# Remove one branch's worktree only:
 curl -X POST http://127.0.0.1:7890/api/machines/cleanup \
-  -d '{"machine": "incredibuild:A"}'
+  -d '{"machine": "incredibuild:A", "project": "ralphus", "branch": "RAL-169-foo"}'
 # or
-ralphus machine cleanup incredibuild:A
+ralphus machine cleanup incredibuild:A --project ralphus --branch RAL-169-foo
+
+# Remove the whole project directory (repository plus every worktree):
+ralphus machine cleanup incredibuild:A --project ralphus
 ```
 
 **Retention on failure: nothing is discarded.** The daemon keeps no record of
 a provisioned workspace to roll back or retry against — `provision` is
 idempotent and re-derives the same workspace deterministically every time
-(from `squad_id`/`cell_id`/the requested branch), so there is nothing to
-"forget" on a failed cleanup. If your `cleanup` implementation fails partway
-through (permissions, a process still holding the directory open, a dead
-machine), leave the workspace exactly as it was and reply `{"ok": false,
-"error": "..."}` — the daemon surfaces that reason verbatim to the caller
-rather than swallowing it, so a human can retry or investigate.
+(from the project's name/clone URL and the requested branch), so there is
+nothing to "forget" on a failed cleanup. If your `cleanup` implementation
+fails partway through (permissions, a process still holding the directory
+open, a dead machine), leave the workspace exactly as it was and reply
+`{"ok": false, "error": "..."}` — the daemon surfaces that reason verbatim to
+the caller rather than swallowing it, so a human can retry or investigate. On
+success, reply `{"removed": "<abs path>"}` so the operator sees exactly what
+was torn down.
+
+### The `terminal` verb
+
+`terminal` (RAL-355 Phase 10) exists for exactly one purpose: a remote Open
+Agent terminal relay, so a browser or CLI client can attach an interactive
+terminal to a **remote** cell's resumed Claude Code session. It is the one
+verb in the whole contract that is not JSON request/response — see the note
+in the verb table above. A trailing JSON envelope would land in the middle of
+a human's terminal session as garbled text, so there is nothing to parse:
+success or failure is reported through this process's own exit code after
+the byte-relay ends, not through anything on stdout.
+
+The daemon never calls `terminal` directly through `ProviderRunner::invoke` —
+it spawns the provider program with `terminal --uri <uri> --command <cmd>
+--cols <n> --lines <n>` and piped stdio (`ProviderRunner::spawn_terminal`),
+then relays bytes between that child's stdin/stdout and a WebSocket
+connection itself. `--command` is the already-built resume command (e.g.
+`'claude' --resume '<session-id>' --dangerously-skip-permissions`, POSIX-quoted
+— see `ralphus_core::agent_resume::resume_agent_command_posix`), not
+something the provider constructs.
+
+**Claude Code only, this release.** The daemon's ticket-mint route
+(`POST /api/squads/{id}/cells/{task}/{cell}/terminal-ticket`) refuses any
+cell whose `agent` isn't Claude Code-family, and any cell that has no
+recorded `agent_session_id` yet (nothing to resume). Codex/Pi remote
+terminals are deferred until their resume paths are actually exercised
+remotely, matching this codebase's existing precedent of not guessing at an
+unexercised harness's shape.
+
+**No live resize forwarding.** `--cols`/`--lines` set the pty's *initial*
+size only, via `COLUMNS`/`LINES` on the remote command. A later browser
+resize does not propagate — the ssh-provider implementation's own `ssh`
+child has no local pty of its own to detect the change and forward it via
+`SIGWINCH`, and taking on a local pty-allocation dependency for that is out
+of scope for this first version. This is a disclosed limitation, not a bug.
+
+**Session lifecycle: dies on disconnect.** There is no reattach. A closed
+WebSocket connection (tab closed, network drop, CLI client exited) kills the
+spawned `terminal` child and the `ssh -tt` underneath it — ending the remote
+session outright. To resume, a human runs the existing headless Resume
+Automation, or opens a fresh terminal relay connection (same as local Open
+Agent's own resume path already works).
+
+### Failure classification
+
+Every remote call site here still returns a plain error message
+(`Result<_, String>`) — a provider does not need to structure its errors any
+particular way. But once an error reaches the daemon, `daemon/src/scheduler.rs`
+classifies a *failed remote cell's* message into a
+[`RemoteFailureKind`](../daemon/src/remote_failure.rs) (`unreachable`,
+`prerequisite_failed`, `provision_failed`, `launch_failed`, `lost`,
+`cancelled`, `timed_out`, `invalid_result`, or `unknown`) via message-text
+heuristics, and records it as `failure_kind` on the cell's "cell completed"
+Cartographer event — so a human or a future retry policy can tell "the
+machine was unreachable" from "the workspace failed to provision" from "this
+was cancelled" without parsing prose. Local cell failures never get a
+`failure_kind` (`null`) — the classification only models remote
+infrastructure failure modes, not local agent/proof outcomes. This is
+heuristic, not a wire-protocol requirement: writing a clear, specific error
+message (as every example above already does) is what makes classification
+land correctly, not a schema a provider must conform to.
 
 ### Restart safety
 
@@ -317,6 +392,75 @@ Three requirements are easy to miss, and the first two fail *silently*:
   remote environment gets a disconnected trace rather than one end-to-end
   waterfall — visible, but only if you go looking.
 
+### Conformance tiers (RAL-355 Phase 12)
+
+Five tiers, each strictly larger than the last. A provider implements
+whichever tier its use case needs — the daemon degrades gracefully at every
+verb boundary rather than requiring the whole set.
+
+1. **Minimum, synchronous execution**: `ping`, `provision`, and `exec`
+   returning a final `result` (never a `handle`). Usable, but blocking —
+   no Live View, no mid-run cancellation, no daemon-restart reconciliation
+   of in-flight work.
+2. **Preferred, controllable execution**: tier 1 plus `status`, `stream`,
+   `cancel`, `run`, and `cleanup`, with `exec` returning a `handle` instead
+   of blocking. This is what buys Live View, mid-run cancellation, and
+   surviving a daemon restart without losing track of in-flight work.
+3. **File operations, for remote Review parity**: `read-file`, `write-file`,
+   and `remove-path`. Required for a review whose worktree lives on this
+   machine — Guardian's stacked-rebase merge logic hand-writes `.git`
+   worktree link files and reads conflict markers back out of files, which
+   `run` alone (structured VCS commands only) cannot do.
+4. **Optional performance**: `channel`, for connection reuse across the ~23
+   `run` calls one branch's merge issues. A provider that omits it is spawned
+   per command instead and works identically, just with more per-call
+   overhead — the daemon falls back automatically if a channel cannot be
+   opened or stops answering.
+5. **Terminal capability, for remote Open Agent**: the `terminal` verb (RAL-355
+   Phase 10) — the one verb in the whole contract that isn't JSON
+   request/response (see "The `terminal` verb" above). The daemon still
+   brokers the actual client-facing relay itself, over its own WebSocket
+   listener; a provider's job is only to turn `terminal --uri --command
+   --cols --lines` into a byte-for-byte pty tunnel on its own stdin/stdout. A
+   provider reports whether it implements this tier via `terminal: bool` in
+   `capabilities` (`ssh-provider` reports `true`; a provider with no
+   interactive-terminal story reports `false`, or omits the field entirely,
+   both read the same as "not supported").
+
+`capabilities`'s own `supported_ops`/`async_exec` fields are how a provider
+reports which of tiers 1–4 it actually implements, so an operator (or a
+future daemon-side check) can see a gap at registration/health time instead
+of discovering it mid-Cell.
+
+### Conformance test suite
+
+`daemon/tests/provider_conformance.rs` exercises tiers 1–3 generically,
+through the same `ProviderRunner` client the daemon itself uses to talk to
+any provider — so it proves the same thing the daemon would otherwise only
+discover the hard way, mid-Cell, if a provider got a verb's shape wrong.
+Run against two providers:
+
+- `examples/providers/loopback.py` (this doc's own worked example) —
+  unconditionally, on every `cargo test`.
+- The real, compiled `ralphus-ssh-provider` binary against the SSH Docker
+  fixture — opt-in, `#[ignore]`d by default:
+  ```powershell
+  $env:RALPHUS_SSH_DOCKER_TEST = '1'
+  $env:RALPHUS_SSH_CONFIG_FILE = (Resolve-Path .docker-ssh-target/ssh_config)
+  cargo test -p ralphus-daemon --test provider_conformance -- --ignored --nocapture
+  ```
+
+Checks `ping`, `capabilities` (tolerating its absence), `provision`
+(idempotent, using a non-VCS source so neither target needs a real
+repository), a `write-file`/`read-file`/`remove-path` round-trip under the
+provisioned workspace, `exec` terminating with a recognizable
+`"done"`/`"failed"` status (a missing `ralphus-runner` install is a
+conformant `"failed"` result, not a broken provider — this suite proves the
+*envelope* is well-formed, not that a real agent ran), and that `cleanup`
+returns a well-formed response either way. Writing a new provider? Point
+this suite at it (swap `ProviderRunner::new`'s program/args) before
+registering it with a real daemon.
+
 ## Publishing
 
 **The daemon never publishes on a machine's behalf.** Deciding what to
@@ -378,16 +522,16 @@ reaches any host you already have SSH access to — no agent to install, no
 port to open, no second daemon to keep alive. It is the first real (not
 throwaway-example) provider in the repo.
 
-> **Status: `exec` only.** `provision`/`stream`/`status`/`cancel`/`cleanup`
-> daemon-side dispatch is a separate ticket (RAL-201) — check its status
-> before assuming those verbs are wired up. This provider's `exec` runs
-> **synchronously**: it blocks until the remote cell finishes and replies
-> with `result` directly, so nothing on the daemon side needs to poll
-> `status`/`stream`/`cancel` for it regardless of RAL-201. It also implements
-> `ping`, since the daemon already dispatches that verb independently (the
-> board's Machines tab "Check" button) — everything else replies with an
-> explicit "not implemented, see RAL-201" error rather than a bare "unknown
-> verb".
+> **Status: `exec`, `status`, `stream`, `cancel`, `job-cleanup`, `ping`, and
+> `provision` are implemented.** Configured targets use durable asynchronous
+> execution; legacy invocations without a matching target policy preserve the
+> synchronous `exec` result path. Project/worktree `cleanup`, `run`, and
+> `channel` remain explicit unsupported-verb errors.
+> `provision` (RAL-355 Phase 4) durably clones/fetches a project and creates
+> a `git worktree` per task branch under the machine's configured
+> `remote_root` (see the "Configuration" and "target" glossary entry) —
+> everything else replies with an explicit "not implemented, see RAL-201"
+> error rather than a bare "unknown verb".
 
 ### The `<uri>` forms
 
@@ -429,6 +573,169 @@ for an SSH-reachable dev/build box. A Windows *daemon host* is fully
 supported (that's the transport-selection split above); a Windows *remote
 target* is not exercised by this provider today.
 
+### What `provision` actually does (RAL-355 Phase 4)
+
+Unlike `exec`'s ephemeral-shaped, hash-of-local-path workspace (derived
+under `RALPHUS_SSH_REMOTE_BASE`, recreated per cell), `provision` maintains
+a **durable, deterministic** clone that persists and is reused across every
+task that touches the same project on the same machine — the daemon's own
+local worktree pattern (`daemon/src/worktrees.rs::ensure_worktree`), mirrored
+onto the remote boundary. `remote_root` comes from the request payload (the
+daemon resolves it from the matching `[machine.targets.*]` entry before
+dispatch — see `daemon/src/machine_targets.rs`), never from an environment
+variable on this provider's own process the way `exec`'s
+`RALPHUS_SSH_REMOTE_BASE` does; a machine with no configured target refuses
+the request before it ever reaches this provider.
+
+One remote `sh` invocation, holding an `flock` on a per-project lock file for
+its whole duration (so two concurrent `provision` calls for the same project
+never race), does all of the following:
+
+1. Derives the deterministic project directory:
+   `<remote_root>/projects/<project-name>-<url-hash>/` — the URL hash means a
+   changed `clone_url` provisions under a *new* identity rather than silently
+   repointing an old clone (see `ssh-provider/src/layout.rs`).
+2. If `<project-dir>/repository` doesn't exist yet: clones the URL there
+   (`git clone --origin origin`) and writes an advisory `metadata.json`
+   alongside it.
+3. If it already exists: verifies `git remote get-url origin` still matches
+   the requested URL exactly — refusing to adopt a directory whose origin
+   doesn't match (a hash collision, or manual tampering) rather than fetching
+   into what might be the wrong repository — then fetches.
+4. Creates `<project-dir>/worktrees/<branch>-<suffix>/` via
+   `git worktree add` off the shared clone (reusing an existing worktree for
+   that branch rather than recreating it), tracking the resolved
+   `upstream`/base reference the daemon supplied. The suffix keeps two
+   branches that would otherwise sanitize to the same directory name (e.g.
+   `feature/x` and `bugfix/x`) from colliding.
+5. Replies with the absolute worktree path as `workspace`.
+
+Every project name, URL, branch, and upstream value is passed through
+`transport::shell_quote_single` before it reaches the remote shell — never
+interpolated raw. This is the one verb in the whole provider where getting
+that wrong would matter most, since `provision` is the verb a task file's
+own `project`/branch-shaped fields could otherwise reach a shell through.
+
+Only `kind == "git"` is supported; a non-git project's `provision` request is
+refused with a clear "not supported" error rather than attempting something
+undefined. There is no immutable base object ID pinning yet (the daemon
+sends a ref name, not a resolved SHA) — deliberately deferred in favor of
+matching the local path's own ref-based behavior for the first working
+version; see `REMOTE_IMPROVEMENTS.local.md`'s Phase 4 notes if that
+robustness increment is picked up later.
+
+### Runner installation policy
+
+Each configured target defaults to an already-installed runner and verifies
+the command with `--version` before provisioning or execution:
+
+```toml
+[machine.targets.buildbox]
+machine = "ssh:buildbox"
+remote_root = "/srv/ralphus"
+
+[machine.targets.buildbox.runner]
+mode = "installed"
+command = "ralphus-runner"
+```
+
+Upload mode is explicit and maps remote target triples to daemon-host artifact
+paths. The provider probes the remote OS and architecture before selecting an
+artifact; it never copies a runner found beside the daemon and fails when no
+matching mapping exists.
+
+```toml
+[machine.targets.buildbox.runner]
+mode = "upload"
+
+[machine.targets.buildbox.runner.artifacts]
+x86_64-unknown-linux-musl = "C:/ralphus-artifacts/linux/ralphus-runner"
+x86_64-pc-windows-msvc = "C:/ralphus-artifacts/windows/ralphus-runner.exe"
+```
+
+Uploaded runners live at
+`<remote_root>/runners/<target-triple>/<sha256>/ralphus-runner`. The provider
+uploads to a protected temporary file, verifies SHA-256 on the target, marks it
+executable, and atomically renames it. Content-addressed paths keep old or
+currently-running versions intact. `scripts/build-remote-runner.ps1` produces
+the Windows MSVC artifact and checksum; `scripts/build-remote-runner.sh`
+produces the static Linux musl artifact and checksum. Static linking remains
+OS- and architecture-specific—it does not make either artifact portable to the
+other target.
+
+### Per-agent executable overrides
+
+An agent profile's explicit executable override (`[agent.profiles.*]`, or a
+cell's own `executable` field) resolves to a path on the **daemon's own**
+filesystem. Forwarding that verbatim to a remote machine is essentially
+never correct — `/Users/alice/.claude/local/claude` almost certainly doesn't
+exist on `buildbox`. So before dispatch, `daemon/src/remote_runner.rs`'s
+`ProviderRunner::resolve_remote_executable` refuses a path-shaped override
+(anything containing `/` or `\`) for a remote cell unless the target
+configures a deliberate replacement, keyed by agent name:
+
+```toml
+[machine.targets.buildbox.agents]
+claude-code = "claude"
+codex = "/opt/tools/codex-wrapper"
+```
+
+A bare command name (no `/`/`\`) is always forwarded unchanged — the remote
+runner resolves it on the remote account's own `PATH`, or falls back to its
+usual `RALPHUS_CLAUDE_COMMAND`-style environment default, exactly as a local
+cell would. `[machine.targets.<name>.agents]` is optional; most targets
+never need it.
+
+### Durable asynchronous jobs
+
+For configured targets, `exec` stores a protected spec and durable state below
+`<remote_root>/jobs/<squad-hash>/<cell-hash>/<opaque-handle>/`, launches the
+runner in a new POSIX session, then returns the handle. State includes creation
+time, supervisor PID plus Linux `/proc` start time, output high-water mark,
+combined runner output, and an atomically published final result. Repeating the
+same in-flight squad/cell dispatch returns its existing handle; a replacement
+is created only after the recorded process identity is no longer alive.
+
+`stream` returns complete output lines in chunks no larger than 64 KiB and a
+numeric byte cursor, so repeating a cursor is idempotent and polling cannot load
+an unbounded transcript into provider memory. It forwards `RALPHUS_EVENT:`
+lines on provider stderr while keeping the provider's single JSON reply on
+stdout. `status` reads only durable target state and therefore works from a new
+provider process after restart.
+
+The daemon sends resolved cell/proof and agent-profile environment values in
+an explicit `execution_environment` object on provider stdin. It does not add
+them to the local provider process environment. The SSH provider removes that
+object from the stored runner spec, writes a separate mode-`0600`-equivalent
+shell environment file over SSH stdin, sources it while preserving the remote
+account's ordinary environment, and deletes it before starting the runner.
+Cancellation, abandoned startup, and lost-job reconciliation also remove that
+transient file; a daemon crash can therefore leave it only temporarily in the
+protected job directory until one of those recovery paths runs.
+
+Resolved secret values never enter provider/SSH arguments or remote shell
+command text. Stream chunks, provider errors/results, and every string nested
+in a structured runner event pass through the same registered-value and
+credential-pattern redaction used by local pane snapshots before they can
+reach Cartographer, durable pane text, or returned diagnostics.
+
+On Linux, `cancel` sends TERM and then KILL to the runner's entire process
+group, verifies the recorded PID/start-time identity is gone, and records the
+request time, requester, and outcome before publishing a terminal cancelled
+result. Windows-target process-tree cancellation is not implemented by this
+POSIX SSH backend.
+
+Job-state cleanup is intentionally distinct from workspace cleanup and is an
+explicit provider operation:
+
+```bash
+ralphus-ssh-provider job-cleanup --uri buildbox --handle <handle>
+```
+
+It refuses a starting/running job and preserves `lost` or corrupt state for
+diagnosis. Recursive deletion is limited to the validated, normalized path for
+that handle beneath the configured remote root.
+
 ### Non-interactive auth, by construction
 
 Every `ssh` invocation this provider makes carries `BatchMode=yes`,
@@ -452,6 +759,7 @@ ssh-copy-id <user>@<host>                     # or otherwise install your public
 | `RALPHUS_SSH_EXCLUDE` | *(none)* | Comma-separated patterns **added to** the default build/vendor exclude list — additive, not a replacement. |
 | `RALPHUS_SSH_CONNECT_TIMEOUT_SECS` | `15` | `ssh -o ConnectTimeout=`. |
 | `RALPHUS_SSH_REMOTE_RUNNER_CMD` | `ralphus-runner` | The command run on the remote host, mirroring the daemon's own `RALPHUS_RUNNER_CMD`. |
+| `RALPHUS_SSH_CONFIG_FILE` | OpenSSH default | Optional client configuration passed with `ssh -F`; useful for isolated targets and daemon service accounts. |
 
 ### Registering it
 
@@ -498,6 +806,10 @@ machine = "ssh:alice@build-box"
   RALPHUS_SSH_LIVE_TEST_TARGET=127.0.0.1 cargo test -p ralphus-ssh-provider \
       --test exec_live_ssh -- --ignored --nocapture
   ```
+- `ssh-provider/tests/docker_ssh_target.rs` exercises durable async startup,
+  duplicate suppression, cursor streaming, restart-safe status, Linux
+  descendant cancellation, post-cancel Git integrity, and job cleanup against
+  the isolated Docker SSH fixture.
 
 ## See also
 
@@ -507,5 +819,15 @@ machine = "ssh:alice@build-box"
 - `ssh-provider/` — the SSH provider (RAL-200): `src/uri.rs` (uri parsing),
   `src/transport.rs` (per-OS source-transfer command construction),
   `src/ssh.rs` (non-interactive `ssh` invocation + failure interpretation),
-  `src/exec.rs` (the `exec` verb orchestration).
-- `REMOTE.local.md` — the phased implementation plan and open questions.
+  `src/exec.rs` (the legacy synchronous `exec` path), `src/job.rs` (durable
+  asynchronous job lifecycle), `src/layout.rs` (RAL-355
+  Phase 2/4: deterministic remote storage paths), `src/provision.rs`
+  (RAL-355 Phase 4: the `provision` verb orchestration).
+- `daemon/src/machine_targets.rs` — RAL-355 Phase 2: `[machine.targets.*]`
+  config (`remote_root`, runner policy) a `provision` request is resolved
+  against.
+- `REMOTE.local.md` — RAL-185's original phased implementation plan
+  (machine provider registry foundation) and open questions.
+- `REMOTE_IMPROVEMENTS.local.md` — RAL-355's phased plan for what's built on
+  top of that foundation: authoritative project clone URLs, durable remote
+  storage, persistent Git provisioning, async remote execution, and more.

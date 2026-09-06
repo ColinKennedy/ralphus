@@ -71,9 +71,16 @@ impl ModelBackend for HarnessBackend {
             summary: tail(&stdout, SUMMARY_TAIL_CHARS),
             tokens_in: 0,
             tokens_out: 0,
+            // An external harness's stdout is opaque text, so there is no
+            // usage of any kind to read -- cache tokens included (RAL-326).
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
             agent_session_id: None,
             abandoned_background_job: None,
+            // RAL-339: a generic external harness has no recognized
+            // compaction signal at all.
+            compaction_thrash: None,
         })
     }
 }

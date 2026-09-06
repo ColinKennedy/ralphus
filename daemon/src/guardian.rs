@@ -398,6 +398,12 @@ pub struct BranchView {
     /// re-stamped per merge attempt (mirrors cell `started_at_ms`, RAL-210);
     /// persists after the resolver finishes so completed reviews still show it.
     pub started_at_ms: Option<i64>,
+    /// RAL-317: a one-shot failure marker for this branch's most recent
+    /// auto-submit-PR-stack attempt (best-effort side channel -- never blocks
+    /// a Guardian merge transition). `None` means no failure to report;
+    /// cleared again by the next successful auto-submit attempt on this
+    /// branch. Rendered as a per-branch badge next to the branch's PR link.
+    pub auto_submit_error: Option<String>,
 }
 
 /// One message in a guardian's feedback thread (RAL-22, scoped per-branch by RAL-272).
@@ -417,6 +423,18 @@ pub struct MessageView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 }
+
+/// [`GuardianView::origin`] value for a review created from an authored
+/// `[[review]]` block (or any other non-Arbiter path, e.g. the board's
+/// "+ Create Review" / `ralphus review create`). The default for every
+/// existing row and every fresh `INSERT INTO guardians` that doesn't name the
+/// column explicitly (RAL-318).
+pub const GUARDIAN_ORIGIN_EXPLICIT: &str = "explicit";
+
+/// [`GuardianView::origin`] value for a review the Arbiter created by
+/// draining a Triage pool once its count threshold or a cron schedule fired
+/// (RAL-318). See `crate::reviews::derive_triage_pools`.
+pub const GUARDIAN_ORIGIN_ARBITER: &str = "arbiter";
 
 /// A guardian/review, for display.
 #[derive(Debug, Clone, Serialize)]
@@ -575,6 +593,27 @@ pub struct GuardianView {
     /// value PR submission actually gates on unless a per-submission
     /// `PrRequest::use_worktree_branch_name` overrides it.
     pub effective_match_pr_branch_name: bool,
+    /// RAL-317: this review's own override for whether the PR stack is
+    /// auto-submitted/grown as each branch reaches a terminal
+    /// (`done`/`conflict_resolved`) merge state, instead of requiring the
+    /// manual `review pr submit` call. `None` means "inherit the
+    /// project/global default" (resolved into
+    /// [`Self::effective_auto_submit_pr_stack`] at hydration time). Stamped
+    /// from the owning project's effective value at review creation, then
+    /// editable per-review afterward (board checkbox / `review settings`),
+    /// same shape as [`Self::match_pr_branch_name`].
+    pub auto_submit_pr_stack: Option<bool>,
+    /// RAL-317: [`Self::auto_submit_pr_stack`] resolved against the
+    /// project-level `.ralphus.toml [review] auto_submit_pr_stack` default,
+    /// this project's creation-time stamp, and the live global config -- the
+    /// value the per-branch auto-submit trigger actually gates on.
+    pub effective_auto_submit_pr_stack: bool,
+    /// RAL-318: `"explicit"` for a review created from an authored
+    /// `[[review]]` block (or the board's "+ Create Review"), `"arbiter"` for
+    /// one the Arbiter created by draining a Triage pool. See
+    /// [`GUARDIAN_ORIGIN_EXPLICIT`] / [`GUARDIAN_ORIGIN_ARBITER`]. The
+    /// board's Reviews sidebar filter and Arbiter badge key off this.
+    pub origin: String,
     /// `true` once the review is built and awaiting human approval
     /// (`status == "in_review"`). Ported from board.html's "ready to act on"
     /// banner condition (`renderReadyBanner`, minus its client-only dismissed
@@ -829,10 +868,18 @@ impl Store {
             .or(stamp)
             .or(live_global.match_pr_branch_name)
             .unwrap_or(false);
+        // RAL-317: same stamping shape as `match_pr_branch_name` above -- a
+        // concrete value from the start, not a perpetual "inherit" fallback.
+        let auto_submit_pr_stack_stamp = self.project_auto_submit_pr_stack_stamp(git_root);
+        let auto_submit_pr_stack = explicit_project
+            .auto_submit_pr_stack
+            .or(auto_submit_pr_stack_stamp)
+            .or(live_global.auto_submit_pr_stack)
+            .unwrap_or(false);
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name)
-             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?,?)",
-            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name)],
+            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack)
+             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?)",
+            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack)],
         )?;
         Ok(id)
     }
@@ -895,6 +942,7 @@ impl Store {
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
         }
         Ok(ids)
@@ -1577,8 +1625,16 @@ impl Store {
         )?;
         self.conn
             .execute("DELETE FROM ghosts WHERE guardian_id=?", params![id])?;
+        self.conn
+            .execute("DELETE FROM hidden_items WHERE guardian_id=?", params![id])?;
         self.conn.execute(
             "DELETE FROM guardian_input_resolutions WHERE guardian_id=?",
+            params![id],
+        )?;
+        // RAL-320: follows are keyed by `EntityUri` string, not a `guardian_id`
+        // FK column, so a deleted review's follows need an explicit sweep.
+        self.conn.execute(
+            "DELETE FROM follows WHERE entity_uri = 'guardian:'||?1",
             params![id],
         )?;
         let n = self
@@ -1741,6 +1797,26 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardians SET resolver_agent=?, resolver_model=?, updated_at_ms=? WHERE id=?",
             params![agent, model, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Stamp a guardian's origin (RAL-318) -- [`GUARDIAN_ORIGIN_EXPLICIT`] or
+    /// [`GUARDIAN_ORIGIN_ARBITER`]. Called once, right after
+    /// `create_guardian_for_squad`, by `crate::reviews::derive_triage_pools`
+    /// for an Arbiter-created review; every other creation path leaves the
+    /// column at its `explicit` default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_origin(&self, id: &str, origin: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET origin=? WHERE id=?",
+            params![origin, id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -1978,6 +2054,21 @@ impl Store {
     pub fn set_guardian_match_pr_branch_name(&self, id: &str, enabled: Option<bool>) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardians SET match_pr_branch_name=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own override for whether the PR stack is
+    /// auto-submitted/grown as each branch reaches a terminal merge state
+    /// (RAL-317). `None` resets it to "inherit the project/global default".
+    pub fn set_guardian_auto_submit_pr_stack(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET auto_submit_pr_stack=?, updated_at_ms=? WHERE id=?",
             params![enabled.map(i64::from), crate::store::now_ms(), id],
         )?;
         if n == 0 {
@@ -2468,6 +2559,28 @@ impl Store {
         Ok(())
     }
 
+    /// RAL-317: set or clear this branch's one-shot auto-submit-PR-stack
+    /// failure marker (`None` clears it, e.g. on the next successful
+    /// attempt). Best-effort side channel -- see [`BranchView::auto_submit_error`]
+    /// -- so it deliberately doesn't call [`Self::log_event`] the way
+    /// [`Self::set_branch_status`] does; the caller logs the failure itself.
+    pub fn set_branch_auto_submit_error(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_branches SET auto_submit_error=? WHERE guardian_id=? AND id=?",
+            params![error, guardian_id, branch_id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// RAL-259: reset a branch's `started_at_ms`, marking the start of a fresh
     /// merge attempt. Called at the entry of each per-branch resolution pass
     /// (`guardian_merge::drive_rebase`) so a re-merge/re-restart re-stamps from
@@ -2880,7 +2993,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -2893,7 +3006,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -2950,6 +3063,8 @@ impl Store {
             notice_message: r.get(43)?,
             notice_at_ms: r.get(44)?,
             match_pr_branch_name: r.get::<_, Option<i64>>(45)?.map(|v| v != 0),
+            auto_submit_pr_stack: r.get::<_, Option<i64>>(46)?.map(|v| v != 0),
+            origin: r.get(47)?,
         })
     }
 
@@ -2970,7 +3085,7 @@ impl Store {
                     s.idx AS source_cell_idx,
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
                     gb.is_empty, s.machine AS source_cell_machine,
-                    gb.env_overrides, gb.started_at_ms
+                    gb.env_overrides, gb.started_at_ms, gb.auto_submit_error
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -3031,6 +3146,7 @@ impl Store {
                     resolved_env: BTreeMap::new(),
                     inherited_env: BTreeMap::new(),
                     started_at_ms: r.get(22)?,
+                    auto_submit_error: r.get(23)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3223,6 +3339,17 @@ impl Store {
             .or(live_global.match_pr_branch_name)
             .unwrap_or(false);
 
+        // RAL-317: same layering as `effective_match_pr_branch_name` above,
+        // for whether the PR stack is auto-submitted/grown as each branch
+        // reaches a terminal merge state.
+        let auto_submit_pr_stack_stamp = self.project_auto_submit_pr_stack_stamp(&row.git_root);
+        let effective_auto_submit_pr_stack = row
+            .auto_submit_pr_stack
+            .or(explicit_project.auto_submit_pr_stack)
+            .or(auto_submit_pr_stack_stamp)
+            .or(live_global.auto_submit_pr_stack)
+            .unwrap_or(false);
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -3284,6 +3411,9 @@ impl Store {
             effective_skip_base_updates,
             match_pr_branch_name: row.match_pr_branch_name,
             effective_match_pr_branch_name,
+            auto_submit_pr_stack: row.auto_submit_pr_stack,
+            effective_auto_submit_pr_stack,
+            origin: row.origin,
             ready,
             merge_progress,
             summary_state,
@@ -3476,6 +3606,35 @@ impl Store {
         }
     }
 
+    /// Reopen a `cancelled` guardian back to `collecting` so a fresh merge can
+    /// be attempted. Distinct from [`Self::reset_guardian_to_collecting`]
+    /// (which resumes an in-flight `merging`/`in_review` guardian whose
+    /// worker must be stopped first): a cancelled review's merge worker was
+    /// already stopped before the `cancelled` write landed (see
+    /// `stop_merge_worker_for_cancel`), so there is nothing to interrupt here
+    /// -- only the terminal status itself blocks a fresh start.
+    pub fn reopen_cancelled_guardian(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET status='collecting', detail=NULL, updated_at_ms=? \
+             WHERE id=? AND status='cancelled'",
+            params![crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            let status = self.guardian_status_str(id)?; // propagate NotFound if missing
+            return Err(StoreError::InvalidTransition(format!(
+                "can only reopen a guardian that is cancelled, it is {status}"
+            )));
+        }
+        let _ = self.log_event(
+            None,
+            Some(id),
+            "guardian",
+            None,
+            "review → collecting (reopened)",
+        );
+        Ok(())
+    }
+
     /// Halt a guardian's in-flight merge (RAL-249), leaving it in the
     /// recoverable `merge_stopped` state rather than cancelled. Only valid from
     /// `merging`; the calling worker must already have been told to stop (via
@@ -3592,6 +3751,14 @@ struct GuardianRow {
     /// branch defaults to the worktree/feature branch name. `None` inherits
     /// the project/global default.
     match_pr_branch_name: Option<bool>,
+    /// RAL-317: per-review override for whether the PR stack is
+    /// auto-submitted/grown as each branch reaches a terminal merge state.
+    /// `None` inherits the project/global default.
+    auto_submit_pr_stack: Option<bool>,
+    /// RAL-318: `"explicit"` (an authored `[[review]]` block) or `"arbiter"`
+    /// (drained from a Triage pool) -- see [`GUARDIAN_ORIGIN_EXPLICIT`] /
+    /// [`GUARDIAN_ORIGIN_ARBITER`].
+    origin: String,
 }
 
 #[cfg(test)]
@@ -3711,6 +3878,7 @@ mod tests {
             resolved_env: BTreeMap::new(),
             inherited_env: BTreeMap::new(),
             started_at_ms: None,
+            auto_submit_error: None,
         }
     }
 
@@ -4429,6 +4597,24 @@ mod tests {
     }
 
     #[test]
+    fn origin_defaults_explicit_and_sets_to_arbiter() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.origin, GUARDIAN_ORIGIN_EXPLICIT);
+        store
+            .set_guardian_origin(&id, GUARDIAN_ORIGIN_ARBITER)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.origin, GUARDIAN_ORIGIN_ARBITER);
+        assert!(
+            store
+                .set_guardian_origin("nope", GUARDIAN_ORIGIN_ARBITER)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn deleting_a_guardian_clears_its_messages() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
@@ -4543,6 +4729,30 @@ mod tests {
 
         // A terminal/cancelled review can't be stopped.
         assert!(store.stop_guardian_merge(&id).is_err());
+    }
+
+    #[test]
+    fn reopen_cancelled_guardian_only_accepts_cancelled() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        // Not cancelled yet: reopen must be rejected.
+        assert!(store.reopen_cancelled_guardian(&id).is_err());
+        assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
+
+        store.claim_guardian_merge(&id).unwrap();
+        assert_eq!(
+            store.cancel_guardian(&id).unwrap(),
+            GuardianStatus::Cancelled
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().status, "cancelled");
+
+        store.reopen_cancelled_guardian(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
+
+        // Already reopened: a second reopen call must be rejected.
+        assert!(store.reopen_cancelled_guardian(&id).is_err());
     }
 
     #[test]
@@ -4714,6 +4924,43 @@ mod tests {
             "the project's stamped default is frozen onto the new review"
         );
         assert!(g.effective_match_pr_branch_name);
+    }
+
+    #[test]
+    fn auto_submit_pr_stack_is_stamped_false_at_creation_when_no_project_default() {
+        // Same creation-time stamping shape as `match_pr_branch_name` (RAL-307)
+        // above -- a concrete value from the owning project's effective
+        // default, not a perpetual "inherit" `NULL` -- with no registered
+        // project, that resolves to the live global default, `false`.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.auto_submit_pr_stack, Some(false));
+        assert!(!g.effective_auto_submit_pr_stack);
+    }
+
+    #[test]
+    fn auto_submit_pr_stack_toggles_independently_per_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_auto_submit_pr_stack(&id, Some(true))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.auto_submit_pr_stack, Some(true));
+        assert!(g.effective_auto_submit_pr_stack);
+
+        // Resetting back to None restores "inherit the project/global default".
+        store.set_guardian_auto_submit_pr_stack(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.auto_submit_pr_stack, None);
+        assert!(!g.effective_auto_submit_pr_stack);
+
+        assert!(
+            store
+                .set_guardian_auto_submit_pr_stack("nope", Some(true))
+                .is_err()
+        );
     }
 
     #[test]

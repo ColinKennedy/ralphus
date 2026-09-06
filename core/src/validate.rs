@@ -171,12 +171,14 @@ const TASK_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "maximum_context",
     "auto_compact_threshold",
+    "tool_output_max_tokens",
     "max_retries",
     "priority",
     "timeout_minutes",
     "depends_on",
     "environment",
     "no_commit_required",
+    "share_session",
     "cell",
     "proof",
 ];
@@ -199,12 +201,16 @@ const CELL_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "maximum_context",
     "auto_compact_threshold",
+    "tool_output_max_tokens",
     "timeout_minutes",
     "priority",
     "environment",
     "proof",
     "review",
     "upstream",
+    "share_session",
+    "triage",
+    "triage_type",
 ];
 const REVIEW_KEYS: &[&str] = &[
     "id",
@@ -215,6 +221,7 @@ const REVIEW_KEYS: &[&str] = &[
     "upstream",
     "action",
     "maximum_budget_usd",
+    "proof_scope",
 ];
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
@@ -227,6 +234,7 @@ const PROOF_KEYS: &[&str] = &[
     "machine",
     "system_prompt",
     "system_prompt_position",
+    "tool_output_max_tokens",
     "arguments",
     "budget_tokens",
     "timeout_minutes",
@@ -244,6 +252,9 @@ enum Ty {
     Int,
     Float,
     StrArray,
+    /// A bare string, or an array of strings -- e.g. `triage_type`, which
+    /// accepts `"security"` as sugar for `["security"]`.
+    StrOrStrArray,
 }
 
 fn type_name(v: &toml::Value) -> &'static str {
@@ -276,6 +287,11 @@ fn check_type(
         Ty::StrArray => v
             .as_array()
             .is_some_and(|a| a.iter().all(toml::Value::is_str)),
+        Ty::StrOrStrArray => {
+            v.is_str()
+                || v.as_array()
+                    .is_some_and(|a| a.iter().all(toml::Value::is_str))
+        }
     };
     if ok {
         return;
@@ -286,6 +302,7 @@ fn check_type(
         Ty::Int => "integer",
         Ty::Float => "number",
         Ty::StrArray => "array of strings",
+        Ty::StrOrStrArray => "string or array of strings",
     };
     let line = ctx.key_line(header, key);
     ctx.error(
@@ -468,12 +485,16 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
         check_maximum_context(ctx, table, None, &path, header);
+        check_type(ctx, table, "tool_output_max_tokens", Ty::Int, &path, header);
+        check_positive_number(ctx, table, "tool_output_max_tokens", &path, header);
+        check_tool_output_max_tokens(ctx, table, None, &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
         check_environment(ctx, table, &path, header);
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
+        check_type(ctx, table, "share_session", Ty::Bool, &path, header);
 
         let task_agent = table.get("agent").and_then(toml::Value::as_str);
         let task_project = table.get("project").and_then(toml::Value::as_str);
@@ -487,7 +508,12 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             &task_cell_index,
             ctx,
         );
-        validate_proof_array(table.get("proof"), &format!("{path}.proof"), ctx);
+        validate_proof_array(
+            table.get("proof"),
+            &format!("{path}.proof"),
+            task_agent,
+            ctx,
+        );
     }
 }
 
@@ -518,6 +544,7 @@ fn validate_cells(
     let mut ids: HashMap<String, usize> = HashMap::new();
     let mut dep_edges: Vec<(usize, String)> = Vec::new();
     let mut has_placeholder = false;
+    let mut has_auto_review = false;
 
     for (s, item) in arr.iter().enumerate() {
         let path = format!("{task_path}.cell[{s}]");
@@ -687,6 +714,9 @@ fn validate_cells(
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
         check_maximum_context(ctx, table, task_agent, &path, header);
+        check_type(ctx, table, "tool_output_max_tokens", Ty::Int, &path, header);
+        check_positive_number(ctx, table, "tool_output_max_tokens", &path, header);
+        check_tool_output_max_tokens(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
@@ -702,10 +732,25 @@ fn validate_cells(
         check_upstream(ctx, table, &path, header);
         check_upstream_task_ref_exists(ctx, table, &path, header, task_cell_index);
 
+        check_type(ctx, table, "share_session", Ty::Bool, &path, header);
+
         check_type(ctx, table, "review", Ty::Str, &path, header);
         check_review(ctx, table, &path, header);
 
-        validate_proof_array(table.get("proof"), &format!("{path}.proof"), ctx);
+        check_type(ctx, table, "triage", Ty::Bool, &path, header);
+        check_type(ctx, table, "triage_type", Ty::StrOrStrArray, &path, header);
+        check_triage(ctx, table, &path, header, &mut has_auto_review);
+
+        let cell_agent = table
+            .get("agent")
+            .and_then(toml::Value::as_str)
+            .or(task_agent);
+        validate_proof_array(
+            table.get("proof"),
+            &format!("{path}.proof"),
+            cell_agent,
+            ctx,
+        );
     }
 
     if has_placeholder && task_project.is_none() {
@@ -714,6 +759,16 @@ fn validate_cells(
             ErrorKind::MissingRequired,
             "task 'project' is required when any cell uses a placeholder cwd \
              (\"ralphus:new-worktree/<branch>\")",
+            task_header,
+        );
+    }
+
+    if has_auto_review && task_project.is_none() {
+        ctx.error(
+            task_path,
+            ErrorKind::MissingRequired,
+            "task 'project' is required when any cell opts into Triage (\"triage = true\"), \
+             since a Triage pool is keyed by project",
             task_header,
         );
     }
@@ -996,6 +1051,50 @@ fn check_maximum_context(
     }
 }
 
+/// Enforce the tool-output-cap backend-support rule (RAL-333):
+/// `tool_output_max_tokens` is only accepted for a backend with a real
+/// delivery mechanism -- see
+/// [`agent_supports_tool_output_max_tokens`](crate::schema::agent_supports_tool_output_max_tokens).
+/// Mirrors [`check_maximum_context`]'s shape, including the same
+/// `core`-can-only-classify-[`RESERVED_AGENT_NAMES`] deferral to the daemon
+/// for a custom `[agent.profiles.*]` entry. Used for task, cell, and proof
+/// tables alike -- a proof step has no `agent` field of its own, so callers
+/// pass the step's already-resolved effective agent as `task_agent`.
+fn check_tool_output_max_tokens(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    task_agent: Option<&str>,
+    path: &str,
+    header: Option<u32>,
+) {
+    if !table.contains_key("tool_output_max_tokens") {
+        return;
+    }
+
+    let agent = table
+        .get("agent")
+        .and_then(toml::Value::as_str)
+        .or(task_agent)
+        .unwrap_or(crate::schema::DEFAULT_AGENT);
+    if !crate::schema::RESERVED_AGENT_NAMES.contains(&agent) {
+        return;
+    }
+
+    if !crate::schema::agent_supports_tool_output_max_tokens(agent) {
+        let line = ctx.key_line(header, "tool_output_max_tokens");
+        ctx.error(
+            &format!("{path}.tool_output_max_tokens"),
+            ErrorKind::InvalidValue,
+            format!(
+                "'tool_output_max_tokens' is only supported for the \
+                 'codex'/'pi'/'claude-code' agents right now, not '{agent}'. Remove this \
+                 setting, or switch to one of those agents."
+            ),
+            line,
+        );
+    }
+}
+
 /// Validate top-level `[[review]]` blocks. Only the TOML shape is checked here;
 /// whether a cell's `review` id actually matches a declared review is a
 /// daemon-level preflight.
@@ -1031,6 +1130,25 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_machine(ctx, table, &rpath, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &rpath, header);
         check_positive_number(ctx, table, "maximum_budget_usd", &rpath, header);
+        check_type(ctx, table, "proof_scope", Ty::Str, &rpath, header);
+        if let Some(scope) = table.get("proof_scope").and_then(toml::Value::as_str) {
+            if !crate::schema::PROOF_SCOPE_VALUES.contains(&scope) {
+                let line = ctx.key_line(header, "proof_scope");
+                ctx.error(
+                    &format!("{rpath}.proof_scope"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'proof_scope' must be one of {} -- got \"{scope}\"",
+                        crate::schema::PROOF_SCOPE_VALUES
+                            .iter()
+                            .map(|v| format!("\"{v}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    line,
+                );
+            }
+        }
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -1249,6 +1367,70 @@ fn check_review(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u
     }
 }
 
+/// Validate a cell's Triage opt-in (RAL-318): `triage = true` pools this cell
+/// for an automatic review instead of naming an explicit `[[review]]` block,
+/// optionally with an inline `triage_type` naming which pool(s) -- a bare
+/// string, or an array of strings when the cell belongs to more than one
+/// type's pool at once (e.g. `["bug", "investigation"]`).
+///
+/// `triage_type` naming a *registered* type is checked elsewhere: `core` has
+/// no daemon access, so this only checks structure -- non-empty (each named
+/// type, and the list as a whole), and only set when `triage` opts in.
+/// `ralphus validate` does a best-effort check against a live daemon's
+/// registry when one is reachable (see `cli`); a submission naming an
+/// unregistered type always fails at `ralphus submit` regardless, since the
+/// daemon is unconditionally in the loop there.
+///
+/// Sets `*has_auto_review = true` when this cell opts in, so the caller can
+/// run the task-level "`project` is required" check once after the loop.
+fn check_triage(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    path: &str,
+    header: Option<u32>,
+    has_auto_review: &mut bool,
+) {
+    let triage = table
+        .get("triage")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    if triage {
+        *has_auto_review = true;
+    }
+    let Some(value) = table.get("triage_type") else {
+        return;
+    };
+    let types: Vec<&str> = match value {
+        toml::Value::String(s) => vec![s.as_str()],
+        // Non-string array elements are already reported by this key's
+        // `Ty::StrOrStrArray` type check -- filtered out here rather than
+        // bailing, so a mix of valid and invalid elements still gets this
+        // check's emptiness feedback on the valid ones.
+        toml::Value::Array(a) => a.iter().filter_map(toml::Value::as_str).collect(),
+        // Wrong type entirely -- already reported by the type check above.
+        _ => return,
+    };
+    if types.is_empty() || types.iter().any(|t| t.trim().is_empty()) {
+        let line = ctx.key_line(header, "triage_type");
+        ctx.error(
+            &format!("{path}.triage_type"),
+            ErrorKind::InvalidValue,
+            "'triage_type' must not be empty, and none of its named types may be empty",
+            line,
+        );
+        return;
+    }
+    if !triage {
+        let line = ctx.key_line(header, "triage_type");
+        ctx.error(
+            &format!("{path}.triage_type"),
+            ErrorKind::ConflictingKeys,
+            "'triage_type' requires 'triage = true'",
+            line,
+        );
+    }
+}
+
 /// Build a submission-wide index of task name -> its cells' `id`s, from
 /// every `[[task]]` in `arr` (not just one). This is what lets
 /// [`check_upstream_task_ref_exists`] resolve an `upstream = "<<task:...>>"`
@@ -1256,7 +1438,7 @@ fn check_review(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u
 /// `[[task]]` block it physically appears before or after -- and, since
 /// `ralphus submit a.toml b.toml` joins multiple files' raw TOML text into
 /// one string before this module ever sees it (`texts.join("\n\n")` in
-/// `cli-rs`'s `cmd_submit`), a cross-*file* reference within one submission
+/// `cli`'s `cmd_submit`), a cross-*file* reference within one submission
 /// resolves here too, for free: by the time `validate_toml` runs, `arr` is
 /// already every `[[task]]` from every joined file, indistinguishable from
 /// one file with the same content.
@@ -1421,7 +1603,12 @@ fn has_cycle(adj: &[Vec<usize>]) -> bool {
 
 // ── proof steps ─────────────────────────────────────────────────────────────
 
-fn validate_proof_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+fn validate_proof_array(
+    value: Option<&toml::Value>,
+    path: &str,
+    agent: Option<&str>,
+    ctx: &mut Ctx,
+) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
@@ -1477,6 +1664,9 @@ fn validate_proof_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) 
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &vpath, None);
+        check_type(ctx, table, "tool_output_max_tokens", Ty::Int, &vpath, None);
+        check_positive_number(ctx, table, "tool_output_max_tokens", &vpath, None);
+        check_tool_output_max_tokens(ctx, table, agent, &vpath, None);
         check_type(ctx, table, "arguments", Ty::StrArray, &vpath, None);
         check_type(ctx, table, "restart_on", Ty::StrArray, &vpath, None);
 
@@ -1798,6 +1988,26 @@ command = "cargo build"
     }
 
     #[test]
+    fn share_session_accepted_on_task_and_cell() {
+        let src = "[[task]]\nname=\"t\"\nshare_session=true\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nshare_session=false\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn share_session_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\nshare_session=\"yes\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("share_session")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn priority_accepted_on_task_and_cell() {
         let src = "[[task]]\nname=\"t\"\npriority=2\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\npriority=0\n";
         let r = validate_toml(src);
@@ -1914,6 +2124,45 @@ command = "cargo build"
                 .iter()
                 .any(|e| e.kind == ErrorKind::InvalidValue
                     && e.message.contains("maximum_budget_usd")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] proof_scope ────────────────────────────────────────────
+
+    #[test]
+    fn review_proof_scope_accepted_for_every_valid_value() {
+        for scope in ["each_branch", "final_branch", "nothing"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"{scope}\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{scope}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_proof_scope_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=1\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("proof_scope")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_proof_scope_unknown_value_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"bogus\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("proof_scope")),
             "{:?}",
             r.errors
         );
@@ -2405,6 +2654,101 @@ command = "cargo build"
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"openrouter-deepseek\"\nmaximum_context=100000\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn tool_output_max_tokens_valid_for_claude_code_codex_and_pi() {
+        for agent in ["claude-code", "codex", "pi"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"{agent}\"\ntool_output_max_tokens=50000\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{agent}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn tool_output_max_tokens_rejected_for_ollama() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"ollama\"\ntool_output_max_tokens=50000\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.path.contains("tool_output_max_tokens")
+                && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn tool_output_max_tokens_rejected_at_task_level_for_unsupported_agent() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"ollama\"\ntool_output_max_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn tool_output_max_tokens_at_task_level_inherits_to_cell() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\ntool_output_max_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn tool_output_max_tokens_must_be_positive() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\ntool_output_max_tokens=0\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("tool_output_max_tokens")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn tool_output_max_tokens_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"codex\"\ntool_output_max_tokens=\"lots\"\n";
+        let r = validate_toml(src);
+        assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
+    fn tool_output_max_tokens_deferred_to_daemon_for_custom_agent_profile() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"openrouter-deepseek\"\ntool_output_max_tokens=50000\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn tool_output_max_tokens_valid_on_task_scope_and_cell_scope_proof_steps() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\n\
+                   [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\ntool_output_max_tokens=1000\n\
+                   [[task.proof]]\ncommand=\"cargo fmt\"\ntool_output_max_tokens=2000\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn tool_output_max_tokens_rejected_on_proof_step_for_unsupported_agent() {
+        let src = "[[task]]\nname=\"t\"\nagent=\"ollama\"\n\
+                   [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\ntool_output_max_tokens=1000\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.path.contains("tool_output_max_tokens")
+                && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]
@@ -2966,6 +3310,13 @@ command = "cargo build"
     }
 
     #[test]
+    fn triage_true_with_project_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
     fn placeholder_cwd_without_project_is_rejected() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
@@ -2976,6 +3327,105 @@ command = "cargo build"
             "{:?}",
             r.errors
         );
+    }
+
+    #[test]
+    fn triage_true_with_inline_type_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"security\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn triage_true_without_project_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
+                && e.message.contains("project")
+                && e.message.contains("Triage")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triage_type_without_triage_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage_type=\"security\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::ConflictingKeys && e.message.contains("triage_type")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triage_type_empty_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("triage_type")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triage_true_with_multiple_inline_types_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=[\"bug\",\"investigation\"]\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn triage_type_empty_array_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=[]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("triage_type")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triage_type_array_with_an_empty_element_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=[\"bug\",\"\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("triage_type")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triage_type_wrong_element_type_in_array_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=[\"bug\",1]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("triage_type")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triage_false_is_default_and_valid_without_project() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]

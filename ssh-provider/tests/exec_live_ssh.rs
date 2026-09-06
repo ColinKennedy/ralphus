@@ -64,6 +64,8 @@ fn ralphus_event_and_llm_invoke_markers_survive_the_ssh_round_trip() {
         extra_excludes: vec![],
         connect_timeout_secs: 10,
         remote_runner_cmd: String::new(), // filled in below once the target is known reachable
+        ssh_config_file: std::env::var("RALPHUS_SSH_CONFIG_FILE").ok(),
+        target_runner_config: None,
     };
 
     if let Err(e) = ping::run(&target, &config) {
@@ -128,6 +130,8 @@ fn the_built_binary_forwards_ralphus_event_lines_onto_its_own_stderr() {
         extra_excludes: vec![],
         connect_timeout_secs: 10,
         remote_runner_cmd: String::new(),
+        ssh_config_file: std::env::var("RALPHUS_SSH_CONFIG_FILE").ok(),
+        target_runner_config: None,
     };
     if let Err(e) = ping::run(&target, &probe_config) {
         println!("SKIP: {target:?} is not reachable over ssh right now: {e}");

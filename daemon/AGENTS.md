@@ -8,9 +8,34 @@ layout (`store.rs`, `server.rs`, `scheduler.rs`, `guardian.rs`,
 
 Logging conventions (Cartographer + stderr sink) that this crate is the
 primary owner of are documented at [[../.agent/logging-policy|logging-policy.md]]
-rather than here, since they're shared with `runner/` and `cli-rs/`.
+rather than here, since they're shared with `runner/` and `cli/`.
 Daemon-specific runtime gotchas (port clash, live-Ollama test gating,
 `Pending` vs `Queued` on submit) are in [[../.agent/gotchas|gotchas.md]].
+
+## Tmux cell process-tree confinement (RAL-321)
+
+On Windows, `tmux.rs`'s `confine` module assigns each cell's `new-session`
+client `Child` to a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+immediately after spawn, keyed by session name in a process-global registry.
+Job membership is inherited automatically by any child the client process
+spawns (the psmux server, then the shell, then the runner/agent CLI), so
+`Tmux::kill_session` dropping that job kills the whole real process tree, not
+just the top `tmux.exe`/client box — `force_kill_tmux_processes` remains only
+as a last-resort fallback for the server process itself. This relies on the
+assignment completing before the client has a chance to spawn the psmux
+server (the same accepted race `daemon/src/proof.rs`'s `ProcessTree` already
+documents for check-gate commands); it's confirmed to hold in practice by
+`runner.rs`'s `live_tmux_cancel_kills_the_real_process_tree` test, which
+starts a real tmux-wrapped cell, cancels it, and polls for the real OS PID to
+die.
+
+**No equivalent confinement exists for the tmux path on Unix** — real tmux
+uses `setsid()` for its server, which defeats process-group inheritance from
+the client, so a Unix fix would need a different mechanism (e.g. resolving
+and signalling the session's pane PIDs directly) and is not implemented.
+`runner/src/tools.rs::run_bash`'s non-tmux timeout-kill path does have a
+working Unix implementation (`process_group(0)` + `killpg`), since that path
+doesn't go through tmux/psmux at all.
 
 ## Testing — Rust integration tests
 

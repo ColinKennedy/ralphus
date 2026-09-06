@@ -1019,7 +1019,7 @@ pub(crate) fn resolve_remote_name(root: &Path, base_branch: &str, cfg: &ForgeCon
 /// Steps 3-4 of [`resolve_remote_name`] on their own: the branch-independent
 /// fallback, `[forge].remote` else `"origin"`. Exposed separately for the
 /// callers that have no review branch to key steps 1-2 off at all (see
-/// `guardian_merge::remote_clone_url`, which resolves a *project's* clone URL
+/// project provisioning, which uses a project's registered clone URL
 /// for remote-machine provisioning), so they share this crate's one definition
 /// of the default rather than open-coding `unwrap_or("origin")` again.
 #[must_use]
@@ -1672,7 +1672,7 @@ mod tests {
     #[test]
     fn remote_from_base_branch_detects_a_real_configured_remote() {
         let root = tmp_dir("remote-detect");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &["remote", "add", "origin", "https://example.com/a/b.git"],
@@ -1696,7 +1696,7 @@ mod tests {
     #[test]
     fn remote_from_base_branch_is_none_for_a_plain_branch_or_unknown_remote() {
         let root = tmp_dir("remote-detect-none");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &["remote", "add", "origin", "https://example.com/a/b.git"],
@@ -1720,7 +1720,7 @@ mod tests {
     #[test]
     fn resolve_remote_name_falls_back_to_default_for_a_slash_namespaced_branch_name() {
         let root = tmp_dir("effective-remote-namespaced");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &["remote", "add", "origin", "https://example.com/a/b.git"],
@@ -1739,7 +1739,7 @@ mod tests {
     #[test]
     fn resolve_remote_name_prefers_base_branchs_own_remote_prefix_over_the_config_default() {
         let root = tmp_dir("effective-remote");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &["remote", "add", "origin", "https://example.com/a/b.git"],
@@ -1767,7 +1767,7 @@ mod tests {
     #[test]
     fn resolve_remote_name_honors_a_bare_local_branchs_own_at_u_upstream() {
         let root = tmp_dir("effective-remote-at-u");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &["remote", "add", "origin", "https://example.com/a/b.git"],
@@ -1776,7 +1776,7 @@ mod tests {
             &root,
             &["remote", "add", "alt", "https://alt.example.com/a/b.git"],
         );
-        g(&root, &["commit", "--allow-empty", "-m", "init"]);
+        g(&root, &["commit", "--allow-empty", "--message", "init"]);
         g(&root, &["branch", "foo_branch_name"]);
         g(&root, &["config", "branch.foo_branch_name.remote", "alt"]);
         g(
@@ -1812,7 +1812,7 @@ mod tests {
     /// opened against the wrong forge instance).
     fn two_forge_repo(tag: &str, alt_remote: &str) -> std::path::PathBuf {
         let root = tmp_dir(tag);
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &[
@@ -1853,7 +1853,7 @@ mod tests {
     #[test]
     fn resolve_remote_resolves_the_forge_host_from_a_bare_branchs_at_u_upstream() {
         let root = two_forge_repo("forge-host-at-u", "alt");
-        g(&root, &["commit", "--allow-empty", "-m", "init"]);
+        g(&root, &["commit", "--allow-empty", "--message", "init"]);
         g(&root, &["branch", "foo_branch_name"]);
         g(&root, &["config", "branch.foo_branch_name.remote", "alt"]);
         g(
@@ -1908,7 +1908,7 @@ mod tests {
     #[test]
     fn remote_from_branch_upstream_never_reads_the_current_checkouts_upstream() {
         let root = two_forge_repo("at-u-empty-guard", "alt");
-        g(&root, &["commit", "--allow-empty", "-m", "init"]);
+        g(&root, &["commit", "--allow-empty", "--message", "init"]);
         // Give the *checked-out* branch an upstream on `alt`. An empty
         // base_branch must not pick that up: `format!("{base_branch}@{{u}}")`
         // would otherwise degrade to a bare `@{u}`.
@@ -1939,7 +1939,7 @@ mod tests {
     fn resolve_remote_name_falls_back_to_forge_cfg_remote_when_base_branch_has_no_remote_and_no_at_u()
      {
         let root = tmp_dir("effective-remote-cfg-fallback");
-        g(&root, &["init", "-b", "main"]);
+        g(&root, &["init", "--initial-branch", "main"]);
         g(
             &root,
             &["remote", "add", "origin", "https://example.com/a/b.git"],

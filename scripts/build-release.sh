@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Build the four ralphus executables into ./dist as copyable standalone
-# binaries -- all four are Rust:
+# Build the five ralphus executables into ./dist as copyable standalone
+# binaries -- all five are Rust:
 #
 #   daemon    -> dist/ralphus-daemon[.exe]
 #   librarian -> dist/ralphus-librarian[.exe]
 #   CLI       -> dist/ralphus[.exe]
 #   runner    -> dist/ralphus-runner[.exe]
+#   SSH       -> dist/ralphus-ssh-provider[.exe]
 #
-# All four link SQLite in where needed (rusqlite `bundled`) and need no
-# system libraries or bundled interpreter -- a plain `cargo build --release`
-# produces one self-contained exe per binary, no _internal/ directory to
-# keep each exe beside. `cli/` still exists for `docsgen/` (Playwright
+# All five need no adjacent interpreter/runtime directory; SQLite is linked
+# into the binaries that use it (`rusqlite`'s `bundled` feature). A plain
+# `cargo build --release` produces one executable per binary, no _internal/ directory to
+# keep each exe beside. `cli-py/` still exists for `docsgen/` (Playwright
 # screenshots, dev-only, never shipped) -- see AGENTS.md.
 set -euo pipefail
 
@@ -24,15 +25,15 @@ mkdir -p "$dist"
 # here too (RAL-288's relay design, superseded and removed) even though
 # nothing below builds it anymore, so a stale one never lingers.
 rm -rf "$dist/ralphus" "$dist/ralphus-runner"
-for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-attach; do
+for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh-provider ralphus-attach; do
   for ext in "" ".exe"; do
     [ -f "$dist/${stale}${ext}" ] && rm -f "$dist/${stale}${ext}"
   done
 done
 
 echo "== building Rust executables (release) =="
-cargo build --release -p ralphus-daemon -p ralphus-librarian -p ralphus-cli -p ralphus-runner --manifest-path "$root/Cargo.toml"
-for bin in ralphus-daemon ralphus-librarian ralphus ralphus-runner; do
+cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml"
+for bin in ralphus-daemon ralphus-librarian ralphus ralphus-runner ralphus-ssh-provider; do
   for ext in "" ".exe"; do
     src="$root/target/release/${bin}${ext}"
     [ -f "$src" ] && cp "$src" "$dist/"
@@ -47,6 +48,7 @@ echo "  $dist/ralphus-daemon[.exe]"
 echo "  $dist/ralphus-librarian[.exe]"
 echo "  $dist/ralphus[.exe]"
 echo "  $dist/ralphus-runner[.exe]"
+echo "  $dist/ralphus-ssh-provider[.exe]"
 echo
 echo "Put $dist on PATH to get the 'ralphus' CLI and have RALPHUS_RUNNER_CMD"
 echo "resolve 'ralphus-runner' automatically; or point RALPHUS_RUNNER_CMD at"

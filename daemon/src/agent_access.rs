@@ -47,7 +47,7 @@ pub struct AvailableAgent {
 /// Built-in backends worth surfacing as a bare selectable option. Mirrors
 /// `agent_profiles::PROFILE_BACKENDS` minus `"raw"` -- `raw` is only ever
 /// meaningful via a profile that also supplies an `executable`
-/// (`cli-rs/src/agents.rs`'s own description), never bare.
+/// (`cli/src/agents.rs`'s own description), never bare.
 const BUILTIN_AGENTS: &[&str] = &[
     "claude",
     "claude-code",

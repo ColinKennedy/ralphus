@@ -13,6 +13,31 @@
 //! override, then whatever `tmux` resolves to on `PATH`, then an embedded
 //! fallback binary (see [`embedded`] — Windows-only today, gated behind the
 //! `embedded-tmux` feature since no verified binary is bundled yet).
+//!
+//! ## Process-tree confinement on cancel (RAL-321, Windows-only)
+//!
+//! A cell's real OS process tree is `tmux.exe` (server) → the pane's
+//! persistent shell → the injected `ralphus-runner.exe` → the agent CLI or
+//! `cmd /C <command>` → further children. [`Tmux::kill_session`] used to
+//! only free the *name* from tmux's own session table
+//! (`force_kill_tmux_processes` catching, at best, the top `tmux.exe` box) —
+//! everything underneath kept running. [`new_detached_session_with_command`]
+//! now confines the `new-session` client to a Windows Job Object
+//! (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) at spawn time, the same shape
+//! `daemon/src/proof.rs`'s `ProcessTree` uses for Guardian check gates; the
+//! psmux server it starts (and everything the server later spawns into the
+//! pane) inherits that job membership automatically, since Windows adds any
+//! child of a job member to the same job unless the parent explicitly
+//! requests `CREATE_BREAKAWAY_FROM_JOB` (nothing here does). `kill_session`
+//! drops the registered job, killing the whole tree in one shot.
+//!
+//! This only works on Windows: real (POSIX) tmux detaches its server via
+//! `setsid()`, which breaks simple process/job-membership inheritance, so
+//! there is no equivalent confinement on Unix — a cancelled cell's tree can
+//! still leak there. [`Tmux::kill_session`]'s existing
+//! `force_kill_tmux_processes` fallback (a literal `tmux.exe`-name sweep)
+//! remains as a last resort for sessions the job either wasn't attached to
+//! (confinement failed at spawn) or predate this fix.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -90,8 +115,11 @@ fn extract_test_pid(name: &str) -> Option<u32> {
 /// Whether OS process `pid` is still alive — best-effort, and fails *open*
 /// (treats a lookup failure as "alive") so [`sweep_dead_test_sessions`] never
 /// mistakenly kills a session whose owning process it simply couldn't check.
+/// `pub(crate)` so `daemon/src/runner.rs`'s live-tmux tests can reuse it to
+/// assert real OS process death after cancel (RAL-321), instead of
+/// reimplementing the same platform-specific liveness check.
 #[cfg(test)]
-fn test_pid_is_alive(pid: u32) -> bool {
+pub(crate) fn test_pid_is_alive(pid: u32) -> bool {
     if cfg!(target_os = "windows") {
         let script = format!(
             "(Get-Process -Id {pid} -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Id)"
@@ -514,6 +542,80 @@ pub fn resolve_tmux_program() -> Result<String, TmuxError> {
     embedded::extract().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Session-name-keyed registry of the Windows Job Objects
+/// [`Tmux::kill_session`] uses to actually terminate a session's real
+/// process tree (RAL-321) — see the module doc comment's "Process-tree
+/// confinement on cancel" section. Keyed by session name rather than held on
+/// `Tmux` itself since [`Tmux::resolve`]/[`Tmux::from_program`] are cheap and
+/// called fresh at every call site (no long-lived instance to hang state
+/// off); a session name is already the daemon-wide-unique key
+/// [`Tmux::kill_session`] has to work with.
+#[cfg(windows)]
+mod confine {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static JOBS: Mutex<Option<HashMap<String, win32job::Job>>> = Mutex::new(None);
+
+    fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<String, win32job::Job>>> {
+        JOBS.lock().expect("tmux job registry poisoned")
+    }
+
+    /// Confine `child` (the `new-session` client) to a fresh kill-on-close
+    /// job and remember it under `name`. Must be called as soon as possible
+    /// after `spawn()` — before the client has had a chance to start the
+    /// psmux server itself — so the server (and, transitively, everything it
+    /// later spawns into the pane) inherits job membership at its own
+    /// creation. Best-effort: a failure to create/assign the job is logged
+    /// and simply leaves `name` unconfined; `kill_session` still frees the
+    /// session name in that case, it just falls back to
+    /// `force_kill_tmux_processes` alone, exactly as it did before this fix.
+    pub(super) fn confine(name: &str, child: &std::process::Child) {
+        use std::os::windows::io::AsRawHandle;
+        let job = (|| -> Result<win32job::Job, win32job::JobError> {
+            let job = win32job::Job::create()?;
+            let mut info = win32job::ExtendedLimitInfo::new();
+            info.limit_kill_on_job_close();
+            job.set_extended_limit_info(&info)?;
+            job.assign_process(child.as_raw_handle() as isize)?;
+            Ok(job)
+        })();
+        match job {
+            Ok(job) => {
+                lock()
+                    .get_or_insert_with(HashMap::new)
+                    .insert(name.to_string(), job);
+            }
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [tmux] could not confine session {name} to a job object, cancellation may not reach its full process tree: {e}"
+                );
+            }
+        }
+    }
+
+    /// Drop `name`'s registered job, if any — `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// means dropping the job's only handle terminates every process ever
+    /// assigned to (or spawned under, via inheritance into) it, including
+    /// the psmux server itself. A no-op if `name` was never confined (job
+    /// creation failed at spawn time) or was already reaped by an earlier
+    /// call — [`Tmux::kill_session`] can be invoked more than once per
+    /// attempt.
+    pub(super) fn kill(name: &str) {
+        if let Some(map) = lock().as_mut() {
+            map.remove(name);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod confine {
+    pub(super) fn confine(_name: &str, _child: &std::process::Child) {}
+    pub(super) fn kill(_name: &str) {}
+}
+
 /// Splits a command-line string like `"tmux"` or `"wsl.exe tmux"` into a
 /// program and any leading fixed arguments — the same whitespace-split
 /// convention `RALPHUS_RUNNER_CMD`/`SubprocessRunner::new` already uses for
@@ -584,6 +686,36 @@ impl Tmux {
             .args(args)
             .stdin(Stdio::null())
             .output()
+            .map_err(|e| TmuxError(format!("could not run '{}': {e}", self.program)))?;
+        if !output.status.success() {
+            return Err(TmuxError(format!(
+                "tmux {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Like [`Self::run`], but confines the spawned client process to a
+    /// fresh Windows Job Object under `session_name` before waiting on it —
+    /// see the module doc comment's "Process-tree confinement on cancel"
+    /// section. Used only for the `new-session` call in
+    /// [`Self::new_detached_session_with_command`], the one client spawn
+    /// whose process tree must survive to be killable later. A no-op on
+    /// non-Windows (confinement doesn't exist there — see [`confine`]).
+    fn run_confined(&self, args: &[&str], session_name: &str) -> Result<String, TmuxError> {
+        let child = Command::new(&self.program)
+            .args(&self.prefix_args)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| TmuxError(format!("could not run '{}': {e}", self.program)))?;
+        confine::confine(session_name, &child);
+        let output = child
+            .wait_with_output()
             .map_err(|e| TmuxError(format!("could not run '{}': {e}", self.program)))?;
         if !output.status.success() {
             return Err(TmuxError(format!(
@@ -702,7 +834,10 @@ impl Tmux {
             new_session_args.extend(env_override_flags(env));
         }
         let ns_refs: Vec<&str> = new_session_args.iter().map(String::as_str).collect();
-        self.run(&ns_refs)?;
+        // RAL-321: confine the `new-session` client at spawn time so
+        // `kill_session` can later kill this session's whole real process
+        // tree, not just free its name — see the module doc comment.
+        self.run_confined(&ns_refs, name)?;
         // Best-effort: without this, tmux discards a dead pane's content
         // immediately, which would race the daemon's own sentinel-based
         // completion detection.
@@ -782,6 +917,12 @@ impl Tmux {
     /// immediately reuses the name it just killed).
     pub fn kill_session(&self, name: &str) -> Result<(), TmuxError> {
         if !self.has_session(name) {
+            // Still drop any job registered for `name` (RAL-321) even though
+            // tmux itself already forgot the session — otherwise a caller
+            // that calls this on an already-gone name (a legitimate,
+            // idempotent use per this method's own doc comment) leaks that
+            // map entry for the rest of the daemon's lifetime.
+            confine::kill(name);
             return Ok(());
         }
         self.run(&["kill-session", "-t", name])?;
@@ -794,6 +935,17 @@ impl Tmux {
             }
             std::thread::sleep(POLL_INTERVAL);
         }
+        // RAL-321: drop this session's confining job (if
+        // `new_detached_session_with_command` managed to create one at spawn
+        // time) *before* the belt-and-suspenders `force_kill_tmux_processes`
+        // sweep below. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` terminates the
+        // whole tree the job ever gained a member in -- the psmux server and
+        // everything it later spawned into the pane (the persistent shell,
+        // the injected `ralphus-runner.exe`, the agent CLI or `cmd /C
+        // <command>`, and their own children) -- which
+        // `force_kill_tmux_processes`'s literal `tmux.exe`-name match alone
+        // can never reach. See the module doc comment.
+        confine::kill(name);
         // `kill-session` on the Windows tmux-alternative this project targets
         // (psmux) frees the *name* from its own registry but never actually
         // terminates the backing OS process (confirmed: see
@@ -803,7 +955,10 @@ impl Tmux {
         // CPU). `has_session(name)` is confirmed false above, so any
         // `tmux.exe` still alive under this exact deterministic session name
         // is unambiguously a zombie, never a live session we might still
-        // need -- safe to force-terminate directly.
+        // need -- safe to force-terminate directly. Kept as a fallback for
+        // sessions the job above either wasn't attached to (confinement
+        // failed at spawn) or predate this fix -- it remains necessary, not
+        // superseded by `confine::kill`.
         let killed = force_kill_tmux_processes(name);
         if killed > 0 {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome

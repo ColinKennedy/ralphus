@@ -1,9 +1,9 @@
 # Container execution mode (RAL-225)
 
 The real `claude`/`codex` CLIs are launched with full permission-bypass flags
-(`--dangerously-skip-permissions` in `cli/src/ralphus/runner/claude_code_backend.py`,
+(`--dangerously-skip-permissions` in `runner/src/claude_code_backend.rs`,
 `--dangerously-bypass-approvals-and-sandbox` in
-`cli/src/ralphus/runner/codex_backend.py`) — full tool access, bounded only by
+`runner/src/codex_backend.rs`) — full tool access, bounded only by
 whatever `cwd` and prompt they're given. Validating a cell's `cwd` string
 (RAL-224) bounds where an agent *starts*; it does not bound what the resulting
 process can *reach* once running — `cd ..`, an absolute path in a tool call, a
@@ -16,7 +16,7 @@ outside its intended workspace by the operating system itself.
 
 A sibling project's actual pattern for this problem is a coarser
 **container-per-workspace** model, not per-agent sandboxing. Container mode
-adopts the same shape: the daemon, the librarian, and the Python runner (and
+adopts the same shape: the daemon, the librarian, and the runner (and
 therefore every locally-executed agent subprocess the runner spawns) run
 inside **one hardened container**, with the container's filesystem view
 confined to a single bind-mounted workspace root.

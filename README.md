@@ -14,26 +14,35 @@ model-agnostic runner that can be exercised end-to-end by local models.
 
 ## Architecture
 
-Three separately-buildable, copyable executables:
+Four standalone, copyable executables, all Rust:
 
-| Executable    | Language               | Role |
-| ------------- | ---------------------- | ---- |
-| `ralphus`     | Python + pydantic-ai   | CLI: validate & submit tasks; run agent sessions (runner). |
-| daemon        | Rust                   | Authoritative task store (SQLite), scheduler, HTTP/JSON API. |
-| librarian     | Rust + plain HTML/JS   | Web UI over the daemon's API. Fast to iterate; no build step. |
+| Executable | Crate | Role |
+| ---------- | ----- | ---- |
+| `ralphus-daemon` | `daemon/` | Authoritative task store (SQLite), scheduler, HTTP/JSON API. |
+| `ralphus-librarian` | `librarian/` | Web UI over the daemon's API (plain HTML/JS, no build step). |
+| `ralphus` | `cli/` | CLI: validate/submit/status/... — a thin HTTP client over the daemon's API. |
+| `ralphus-runner` | `runner/` | Executes one cell/proof step; spawned per-cell by the daemon. |
 
 The daemon owns all state; the CLI and librarian are clients of its
-[HTTP/JSON API](docs/daemon-api.md). See `PLAN.local.md` for the build plan,
-`FINDINGS.local.md` for research on the predecessor, and `FOLLOW.local.md` for
-decisions to revisit.
+[HTTP/JSON API](docs/daemon-api.md). Seven more supporting crates
+(`core`, `auth`, `keygen`, `ssh-provider`, `mcp`, and the `bench-*` trio) round
+out the 11-member Rust workspace — see the Architecture table in `AGENTS.md`
+for the full breakdown. `cli/` is a separate Python project kept only for doc
+screenshot generation and bench-graph rendering; it is never shipped. See
+`PLAN.local.md` for the build plan, `FINDINGS.local.md` for research on the
+predecessor, and `FOLLOW.local.md` for decisions to revisit. Everything this
+repo depends on to build or run — Rust toolchain, git, tmux/psmux, optional
+agent CLIs, and more — is inventoried in [`docs/dependencies.md`](docs/dependencies.md).
 
 ## Repository layout
 
 ```
 core/        Rust: shared schema, validation, and DTO types
-daemon/      Rust: store + scheduler + HTTP API  (bin: ralphus-daemon)
-librarian/   Rust: web UI server                 (bin: ralphus-librarian)
-cli/         Python: the `ralphus` CLI + runner
+daemon/      Rust: store + scheduler + HTTP API      (bin: ralphus-daemon)
+librarian/   Rust: web UI server                     (bin: ralphus-librarian)
+cli/      Rust: the `ralphus` CLI                 (bin: ralphus)
+runner/      Rust: the cell/proof runner             (bin: ralphus-runner)
+cli/         Python: docsgen + bench-graph tooling — dev-only, never shipped
 docs/        API contract and design docs
 ```
 
@@ -47,7 +56,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-Python (from `cli/`, managed with [uv](https://docs.astral.sh/uv/)):
+Python (dev-only tooling — doc screenshots and bench-graph rendering, not the
+shipped CLI; from `cli/`, managed with [uv](https://docs.astral.sh/uv/)):
 
 ```bash
 uv sync --dev
@@ -58,6 +68,17 @@ uv run privata src
 uv run privata tests
 uv run deadcode src tests
 uv run pytest
+```
+
+Web (lints/type-checks `librarian/assets/board.html`'s inline JS; from repo
+root, Node 22+):
+
+```bash
+npm install --no-audit --no-fund
+npm run lint
+npm run typecheck
+npm run knip
+npm test
 ```
 
 ## Quick start
@@ -74,35 +95,39 @@ ralphus-librarian serve            # open http://127.0.0.1:7474
 # 3. Submit a task from the CLI (in another terminal)
 ralphus validate task.toml         # optional: check it first
 ralphus submit task.toml --label demo
-ralphus status                     # list runs; `ralphus status <run-id>` for detail
+ralphus status                     # list squads; `ralphus status <squad-id>` for detail
 ralphus check health                # check the local setup
 ```
 
-A minimal `task.toml` (a deterministic command session — no model needed):
+A minimal `task.toml` (a deterministic command cell — no model needed):
 
 ```toml
 [[task]]
 name = "hello"
-[[task.session]]
+[[task.cell]]
 cwd = "/absolute/path/to/a/dir"     # must be a real directory
 command = "echo hello > out.txt"
-[[task.verify]]
+[[task.cell.proof]]
 command = "test -f out.txt"          # fmt/lint/test-style gate
 ```
 
-For an AI session, replace `command` with a `prompt` and pick a model — local:
+For an AI cell, replace `command` with a `prompt` and pick a model — local:
 
 ```toml
-[[task.session]]
+[[task.cell]]
 cwd = "/absolute/path/to/repo"
 agent = "ollama"
 model = "qwen3:8b"
 prompt = "Create hello.txt containing: hi"
 ```
 
-The daemon spawns the runner via `RALPHUS_RUNNER_CMD` (default `ralphus-runner`);
-in a dev checkout point it at `cli/.venv/Scripts/ralphus-runner` (install the
-runner extra with `uv sync --extra runner` for AI sessions).
+The daemon spawns the runner via `RALPHUS_RUNNER_CMD` (default `ralphus-runner`
+resolved from `PATH`); in a dev checkout built with `scripts/build-debug.sh`
+this is already pointed at the just-built debug `ralphus-runner` exe for you.
+`ollama` needs a reachable Ollama server (default `http://localhost:11434/v1`);
+`claude-code`/`codex`/`pi` need the corresponding CLI installed. See
+[`docs/dependencies.md`](docs/dependencies.md) for the full breakdown of which
+agent backends need what.
 
 ## Status
 

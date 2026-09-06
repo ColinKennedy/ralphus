@@ -40,6 +40,11 @@ where one exists.
 | GET | `/api/resolve` | [Resolve a ralphus URI](#get-apiresolve-ral-188) to positional coordinates; `?uri=` |
 | GET | `/api/ghosts/{owner_uri}` | [Fetch a ghost](#get-apighostsowner_uri) by its owning cell/review URI |
 | POST | `/api/ghosts/copy` | [Copy a ghost](#post-apighostscopy) onto another owner, independent of the dependency graph |
+| GET | `/api/hidden` | [List the current user's hidden squads and reviews](#hidden-items-ral-328) |
+| POST | `/api/hidden/squads/{id}` | [Hide a squad for the current user](#hidden-items-ral-328) |
+| DELETE | `/api/hidden/squads/{id}` | [Re-enable a squad for the current user](#hidden-items-ral-328) |
+| POST | `/api/hidden/reviews/{id}` | [Hide a review for the current user](#hidden-items-ral-328) |
+| DELETE | `/api/hidden/reviews/{id}` | [Re-enable a review for the current user](#hidden-items-ral-328) |
 
 **Squads**
 | Method | Path | What |
@@ -70,6 +75,7 @@ where one exists.
 | POST | `/api/squads/{id}/tasks/{ti}/proof/{vi}/restart` | Restart a task's proof steps from `vi` |
 | POST | `/api/squads/{id}/tasks/{ti}/restart/preview` | [Dry-run preview](#post-apisquadsidtaskstirestartpreview) of a task restart's downstream impact |
 | POST | `/api/squads/{id}/tasks/{ti}/restart` | [Restart a whole task](#post-apisquadsidtaskstirestart) + its downstream (RAL-150) |
+| GET | `/api/squads/{id}/env` | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for the squad, secret values masked (RAL-324) |
 | POST | `/api/squads/{id}/env` | [Set/unset persistent environment-variable overrides](#post-apisquadsidenv) on the squad (RAL-150) |
 | POST | `/api/squads/{id}/tasks/{ti}/env` | Set/unset env overrides on a task ([hierarchical env overrides](#hierarchical-env-overrides-taskcellproof-layers)) |
 | POST | `/api/squads/{id}/tasks/{ti}/proof/env` | Set/unset env overrides on a task's own proof steps |
@@ -77,9 +83,11 @@ where one exists.
 | POST | `/api/squads/{id}/cells/{ti}/{si}/env` | Set/unset env overrides on a cell |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/proof/env` | Set/unset env overrides on a cell's own proof steps |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/env` | Set/unset env overrides on **one** cell-scoped proof step (RAL-191) |
+| GET | *(each of the six `.../env` paths above)* | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that surface, secret values masked (RAL-324) |
 | POST | `/api/squads/{id}/tasks/{ti}/solo` | [Solo a task](#post-apisquadsidtaskstisolo) (RAL-157) — pauses every other task in the squad until un-soloed |
 | POST | `/api/squads/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apisquadsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | `?mode=open\|readonly`: spawn a resume terminal (`claude --resume`, `codex resume`, or `pi --session`, depending on the cell's agent) **on the daemon host**. `?mode=agent` on a **finished** cell does the same; on a **still-running** cell (RAL-288 Stage 6) it detaches the cell cleanly first, waits for it to genuinely stop, then opens the real agent inside a tmux session that survives closing the terminal — see [below](#post-apisquadsidcellstisiopen-terminalmodeagent) |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/terminal-ticket` | [Mint a one-shot ticket for the **remote** Open Agent terminal relay](#post-apisquadsidcellstisiterminal-ticket) (RAL-355 Phase 10) — a WebSocket alternative to `open-terminal?mode=agent` for cells running on a `machine`, since that route only ever spawns a window on the daemon's own desktop |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/resume-automation` | Hand a detached cell back to unattended execution, continuing its exact same agent session rather than starting fresh (RAL-288 Stage 6) — see [below](#post-apisquadsidcellstisiresume-automation) |
 | POST | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/open-terminal` | Same, for a proof step's resolved cell |
 | GET | `/api/squads/{id}/cells/{ti}/{si}/debug-events` | [This cell's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
@@ -109,6 +117,10 @@ where one exists.
 | POST | `/api/guardians/{id}/branches/{branch_id}/dismiss_reenable` | Dismiss the "can re-enable" notice |
 | POST | `/api/guardians/{id}/branches/{branch_id}/move` | [Move a branch to another review](#post-apiguardiansidbranchesposmove) (RAL-118) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/env` | [Set/unset/clear this review worktree's env overrides](#post-apiguardiansidbranchesbidenv--review-worktree-overrides) (RAL-191) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/env` | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that review worktree (RAL-324) |
+| GET | `/api/guardians/{id}/build-env` | Resolved environment variables for the finalize-time auto-build step (RAL-324) |
+| GET | `/api/guardians/{id}/tests-env` | Resolved environment variables for the check gates (tests) — the build step's layer under its own entry point (RAL-324) |
+| GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
@@ -119,6 +131,7 @@ where one exists.
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
 | POST | `/api/guardians/{id}/approve` | Approve an in_review guardian |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
+| POST | `/api/guardians/{id}/reopen` | Reopen a cancelled review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
 | POST | `/api/guardians/{id}/run-manual-commands` | Spawn manual-check commands **on the daemon host** |
 | POST | `/api/guardians/{id}/run-action-hint` | Spawn a `command`-kind action hint **on the daemon host**; `prompt`-kind is `501` |
 | POST | `/api/guardians/{id}/resolve-input` | [Delegate a named check input to the resolver agent](#post-apiguardiansidresolve-input) ("set it for me", RAL-164) |
@@ -420,9 +433,21 @@ can't complete cleanly (a real conflict, or otherwise-diverged local
 history), it is aborted and squad resolution fails with an error naming the
 worktree, leaving it exactly as it was for a human to resolve by hand.
 
+`path` remains the daemon host's local checkout. `clone_url` is the
+authoritative source a machine provider uses to clone the project on another
+machine; Ralphus does not infer it from `path`'s configured Git remotes.
+Existing path-only registrations remain valid for local work, but remote Git
+provisioning rejects them until a clone URL is registered. The request also
+accepts `url` as an alias for `clone_url`. Omitting `clone_url`/`url`
+preserves whatever URL is already registered (so an older client that
+doesn't know the field yet can't accidentally erase it); to remove a
+previously registered URL, set `"clear_clone_url": true` instead (`ralphus
+project git --clear-url`) -- `400` if the request sets both a URL and
+`clear_clone_url` at once.
+
 Request:
 ```json
-{ "name": "ralphus", "description": "the ralphus repo", "path": "C:/Users/me/ralphus", "vcs": "git" }
+{ "name": "ralphus", "description": "the ralphus repo", "path": "C:/Users/me/ralphus", "clone_url": "git@github.com:owner/ralphus.git", "vcs": "git" }
 ```
 `vcs` defaults to `"git"` (only kind implemented today). `400` if `path` is not
 a directory or is not a git working tree. `match_pr_branch_name` (RAL-307,
@@ -437,19 +462,31 @@ independently editable per-review. Response `201`:
 ```json
 { "name": "ralphus" }
 ```
+An `http(s)://` `clone_url`/`url` carrying an inline password
+(`https://user:pass@host/repo.git`) is accepted, not rejected, but the
+response then carries a `warnings` array naming the risk with the password
+itself redacted (`https://***@host/repo.git`); the daemon's own log line
+about it is redacted the same way, so the warning is never itself a leak
+path:
+```json
+{ "name": "ralphus", "warnings": ["clone URL embeds inline credentials (https://***@host/repo.git); consider an SSH key or credential helper instead"] }
+```
+An SSH URL (`git@host:org/repo.git`) or an `http(s)://` URL with a bare
+username and no password (`https://token@host/repo.git`) never triggers
+this -- there is no separate secret sitting in the URL text to warn about.
 
 ### `GET /api/projects`
 List every registered project.
 
 ```json
-{ "projects": [ { "name": "ralphus", "description": "...", "path": "...", "vcs": "git", "created_at_ms": 0 } ] }
+{ "projects": [ { "name": "ralphus", "description": "...", "path": "...", "clone_url": "git@github.com:owner/ralphus.git", "vcs": "git", "created_at_ms": 0 } ] }
 ```
 
 ### `GET /api/projects/{name}`
 A single registered project by its exact name.
 
 ```json
-{ "name": "ralphus", "description": "the ralphus repo", "path": "C:/Users/me/ralphus", "vcs": "git", "created_at_ms": 0 }
+{ "name": "ralphus", "description": "the ralphus repo", "path": "C:/Users/me/ralphus", "clone_url": "git@github.com:owner/ralphus.git", "vcs": "git", "created_at_ms": 0 }
 ```
 `404` if no project is registered under that exact name (this is an exact
 lookup, unlike the fuzzy `resolve_project` matching used internally when a
@@ -487,9 +524,10 @@ List the agents selectable for a project -- built-in backends plus whatever
 dropdown; not review-specific, so any future agent picker can read from it
 too.
 
-Query params: `cwd` (required, a project/worktree path), `user` (optional --
-see `AgentAccess`/`UserContext` below; inert today, accepted so the wire
-contract doesn't need to change once real per-user auth exists).
+Query params: `cwd` (required, a project/worktree path). The optional
+caller-claimed identity is sent in `X-Ralphus-User`, with `[daemon].default_user`
+as the fallback. It is passed to `AgentAccess`/`UserContext` but remains inert
+until authenticated identity and access policy exist.
 
 `default_agent` is the effective `[review].default_resolver_agent`
 (`.ralphus.toml`, global layered under `cwd`'s project config; unset resolves
@@ -562,17 +600,66 @@ Poll a generation job started by `POST /api/generate`.
 ```
 `404` if `id` names no job this daemon process has ever started.
 
-### `GET /api/users`
-List every registered placeholder user (see the **User identity** glossary
-section -- this is not authentication; a name grants no permissions).
+### Admin flag and admin-only endpoints (RAL-332)
+
+`GET /api/users`, `POST /api/users`, `DELETE /api/users/{name}`,
+`POST /api/users/{name}/rename`, `POST /api/users/{name}/admin`,
+`POST /api/users/{name}/visit`, everything under `/api/machines`,
+everything under `/api/triage`, everything under `/api/secret-env-names`,
+and `POST /api/projects` (registering/editing a project) all require the
+current placeholder identity (`X-Ralphus-User`, falling back to
+`[daemon].default_user`) to be a registered admin (`is_admin: true`).
+Non-admin (or unresolved-identity) callers get `403 admin_required`.
+`GET /api/projects`, `GET /api/projects/{name}`,
+`GET /api/projects/{name}/validate`, and `GET /api/projects/{name}/branches`
+are **not** gated -- they back the Simple task form's project/branch pickers
+for every user, not just admins.
+
+**This is a UI-level convenience gate, not a real security boundary.**
+There is no verified login yet (RAL-252); anyone holding the daemon's shared
+bearer token (`crate::token`) can already reach every one of these endpoints
+directly. It exists only to keep the board's admin-only tabs consistent with
+what the server actually accepts.
+
+**Bootstrap exception:** before any user anywhere has ever been promoted,
+every admin-gated endpoint above behaves as if the caller already is one --
+otherwise a fresh instance could never register its first user or promote
+one, since every path to doing so would itself be admin-gated. This window
+closes permanently the instant any user is promoted, from any caller.
+
+**Config-driven alternative:** `[daemon].default_user_is_admin` (a boolean)
+applies once at daemon startup, before the bootstrap exception's window
+would otherwise need to be used manually. `true` registers `default_user`
+if needed and promotes it; `false` demotes it if it currently holds admin.
+Config is the source of truth every restart, so this both promotes and
+demotes to match it -- a hand-granted admin (via the board's Users tab)
+is reverted on the next restart if this field says otherwise. Leaving the
+field unset never touches admin status.
+
+### `GET /api/whoami`
+The caller's own resolved identity and admin flag -- lets a client (the
+board) decide whether to show admin-only UI without needing to already know
+its own claimed name.
 
 ```json
-{ "users": [ { "name": "colin", "created_at_ms": 0 } ] }
+{ "name": "colin", "is_admin": true }
+```
+`name` is `null` when no identity resolves at all (no header, no
+`default_user`); `is_admin` is `false` in that case too. Never errors.
+
+### `GET /api/users`
+List every registered placeholder user (see the **User identity** glossary
+section -- this is not authentication; a name grants no permissions on its
+own beyond `is_admin`'s convenience gating above). Admin-only (RAL-332).
+
+```json
+{ "users": [ { "name": "colin", "created_at_ms": 0, "is_admin": true } ] }
 ```
 
 ### `POST /api/users`
 Register a user by name. Idempotent (re-registering an existing name is a
-no-op).
+no-op, and never changes an existing `is_admin` value). Admin-only
+(RAL-332, bootstrap-exempt).
 
 Request: `{ "name": "colin" }`. `400` if `name` is empty. Response `200`:
 ```json
@@ -580,12 +667,65 @@ Request: `{ "name": "colin" }`. `400` if `name` is empty. Response `200`:
 ```
 
 ### `DELETE /api/users/{name}`
-Remove a registered user by exact name.
+Remove a registered user by exact name. Admin-only (RAL-332).
 
 ```json
 { "deleted": true }
 ```
 `404` if no user is registered under that exact name.
+
+### `POST /api/users/{name}/admin`
+Sets or clears `name`'s admin flag. Admin-only (RAL-332, bootstrap-exempt --
+this is exactly how the first admin gets promoted on a fresh instance).
+
+Request: `{ "is_admin": true }`. Response `200`:
+```json
+{ "name": "colin", "is_admin": true }
+```
+`404` if no user is registered under that exact name.
+
+### `POST /api/users/{name}/visit`
+Records that an admin opened "Edit Profile" for `name` -- i.e. viewed the
+board's Preferences page scoped to `name` instead of their own identity, by
+sending `X-Ralphus-User: <name>` on `GET`/`DELETE /api/hidden*` while that
+page is open. Audit-only: this endpoint does not itself read or change
+anything for either user. Admin-only (RAL-332). Writes an admin-only
+Cartographer row (`source: "users"`, `message: "admin viewed user
+profile"`).
+
+Response `200`:
+```json
+{ "admin": "colin", "target": "alice" }
+```
+`404` if `name` is not registered.
+
+### Hidden items (RAL-328)
+
+All hidden-item endpoints resolve the current placeholder identity from the
+`X-Ralphus-User` request header, falling back to `[daemon].default_user` when
+the header is absent. The name must be registered through `POST /api/users`.
+This is caller-claimed identity, not authentication.
+
+`GET /api/hidden` returns that user's complete set, newest first:
+
+```json
+{
+  "hidden": [
+    { "kind": "squad", "squad_id": "squad-000000000001", "guardian_id": null, "hidden_at_ms": 0 },
+    { "kind": "review", "squad_id": null, "guardian_id": "guardian-000000000001", "hidden_at_ms": 0 }
+  ]
+}
+```
+
+`POST /api/hidden/squads/{id}` and `POST /api/hidden/reviews/{id}` hide an
+entity. Repeating the request is a no-op and preserves the first
+`hidden_at_ms`; the response is `{ "hidden": true }`. The corresponding
+`DELETE` endpoints re-enable it idempotently and return `{ "hidden": false }`.
+Deleting a squad or review also deletes every user's preference for it.
+
+These endpoints return `400 current_user_required` when neither identity
+source is set, `400 unknown_user` for an unregistered identity, and `404` when
+a hide request names an entity that does not exist.
 
 ### `GET /api/secret-env-names`
 List the user-configurable set of env-var **names** treated as secret
@@ -699,10 +839,13 @@ anything. Response `200`:
 
 ### `POST /api/machines/cleanup`
 Tear down one provisioned workspace (RAL-201) by invoking its `cleanup` verb.
-Body names the **full** `machine` value, not just a scheme, since one provider
-backs many independent workspaces (one per `uri`):
+Body names the **full** `machine` value plus the registered `project`, since
+Phase 4 lets one provider hold many projects' worth of durable clones, each
+with many worktrees — `machine` alone no longer identifies a single
+workspace. `branch` scopes to one worktree; omit it to remove the whole
+project directory (repository plus every worktree):
 ```json
-{ "machine": "incredibuild:A" }
+{ "machine": "incredibuild:A", "project": "ralphus", "branch": "RAL-169-foo" }
 ```
 **Never called automatically by the daemon** — a workspace is retained after a
 squad finishes exactly like a local worktree is, so this is an explicit,
@@ -710,14 +853,51 @@ operator-initiated reclaim. `502 provider_error` on failure, with the
 provider's own reason verbatim; nothing is discarded on failure since the
 daemon keeps no record of the workspace to roll back (`provision` re-derives
 it deterministically every time). `400` if `machine` resolves to `local`
-(there is nothing to clean up) or names an unregistered/unresolvable machine.
+(there is nothing to clean up), names an unregistered/unresolvable machine,
+`project` is empty, or the named project has no registered clone URL. `404`
+if `project` names no registered project.
 Response `200`:
 ```json
-{ "ok": true }
+{ "ok": true, "removed": "/srv/ralphus/projects/ralphus-a1b2c3d4e5f60708" }
 ```
 
 See [`docs/machine-providers.md`](machine-providers.md) for the provider
 contract (verbs, JSON envelope, versioning) and the publishing model.
+
+### `GET /api/machines/targets/health`
+Check every configured `[machine.targets.*]` entry (RAL-355 Phase 9):
+`ralphus check health --all-remotes`'s daemon-side counterpart. Always
+computed live — never cached or polled, so calling this is itself the
+"user-triggered check" the CLI/board surface. Bounded to 8 concurrent
+per-target probes. Each target's checks stop at the first failure that would
+make every later check fail identically (an unreachable machine skips
+straight past `capabilities`/`remote_root`/git checks rather than repeating
+the same connectivity failure five times).
+```json
+{
+  "ok": true,
+  "any_fail": false,
+  "targets": [
+    {
+      "target": "devbox",
+      "machine": "ssh:devbox",
+      "checks": [
+        { "name": "ssh_reachable", "status": "pass", "detail": "reachable" },
+        { "name": "capabilities", "status": "pass", "detail": "os=linux, arch=x86_64, async_exec=true, terminal=false" },
+        { "name": "remote_root", "status": "pass", "detail": "create/read/rename/delete all succeeded under \"/srv/ralphus\"" },
+        { "name": "git_version", "status": "pass", "detail": "git version 2.43.0" },
+        { "name": "git_user.name", "status": "pass", "detail": "Ralphus Bot" },
+        { "name": "git_user.email", "status": "warn", "detail": "no global git user.email is set for the remote account -- commits will fail until it is, unless every repository sets it per-repo instead" },
+        { "name": "push_credentials", "status": "warn", "detail": "not verified -- no safe, non-mutating way to confirm push authorization exists yet" }
+      ]
+    }
+  ]
+}
+```
+`500 internal_error` only on a config-loading failure (a malformed
+`.ralphus.toml`) — an individual target's own failures are reported inside
+its own `checks`, never as an overall error, so one unreachable machine
+never hides every other target's results.
 
 ### `POST /api/clear`
 Bulk-delete tasks and reviews (RAL-13).
@@ -843,6 +1023,39 @@ resume from yet. Backend-agnostic — the same flow applies to claude, codex,
 and pi. Cell-scoped only, same as before — no equivalent route reaches a
 proof step or a review branch resolver.
 
+### `POST /api/squads/{id}/cells/{ti}/{si}/terminal-ticket`
+Mints a short-lived, single-use ticket for the **remote** Open Agent terminal
+relay (RAL-355 Phase 10) — the WebSocket-based counterpart to
+`open-terminal?mode=agent` for cells that run on a `machine`, since that
+route only ever spawns a terminal window on the daemon's own desktop, which
+makes no sense for a cell that isn't running there. No body.
+
+Eligibility is checked at mint time (and re-checked, independently, when the
+WebSocket connection actually opens — see below): the cell must carry a
+`machine`, its `agent` must be Claude Code-family, and it must have a
+recorded `agent_session_id` to resume. `400 not_remote` /
+`400 unsupported_agent` / `409 no_claude_session` cover those three cases in
+order. `503 relay_unavailable` means the daemon's terminal-relay listener
+itself never came up (its own port was unavailable when the daemon started —
+this disables *only* the remote terminal relay, not the rest of the daemon).
+
+On success:
+```json
+{ "ticket": "<opaque, single-use, short-lived>", "port": 7891, "path": "/terminal" }
+```
+`port` is the daemon-host port the relay listens on (the main API port + 1,
+same host). A client connects a WebSocket to
+`ws://<daemon-host>:<port><path>?ticket=<ticket>&squad_id=<id>&task_idx=<ti>&cell_idx=<si>&cols=<n>&lines=<n>`
+(`cols`/`lines` optional, default `80`/`24`). The ticket is consumed on the
+first connection attempt regardless of outcome — a rejected connection (bad
+ticket, cell no longer eligible, relay busy) still burns it; mint a fresh one
+to retry. Once connected, the relay sends/receives raw bytes as WebSocket
+binary frames — this is a byte-for-byte terminal, not a JSON API, matching
+the provider-side `terminal` verb's own raw-passthrough contract (see
+`docs/machine-providers.md`). The session ends the moment the connection
+closes — there is no reattach; open a fresh ticket + connection to resume
+(see `docs/machine-providers.md`'s "Session lifecycle" note).
+
 ### `POST /api/squads/{id}/cells/{ti}/{si}/resume-automation`
 Hands a detached cell (see above) back to unattended execution, continuing
 the *exact same* agent conversation rather than starting fresh — unlike a
@@ -940,6 +1153,71 @@ TOML-declared value is indistinguishable from one set later via the API,
 participates in the same precedence chain, and can be changed or unset the
 same way.
 
+#### `GET .../env` — resolved environment views (RAL-324)
+
+Every `POST .../env` route in this document has a read-only `GET` twin on the
+**same path** that returns what that surface actually resolves to, rather than
+the one layer it owns. Three extra `GET`-only paths round out the set:
+`/api/guardians/{id}/build-env`, `/api/guardians/{id}/tests-env` (the check
+gates, which run under the build step's own override layer — there is
+deliberately no `POST .../tests-env` to edit), and
+`/api/guardians/{id}/manual-checks-env`.
+
+```json
+{
+  "scope": "cell",
+  "label": "cell 0/1 of squad-000000000001",
+  "layers": ["agent profile", "squad", "task", "cell"],
+  "vars": [
+    {
+      "name": "API_URL",
+      "value": "https://staging",
+      "redacted": false,
+      "source": "cell",
+      "layers": [
+        {"layer": "squad", "value": "https://prod", "redacted": false, "effective": false},
+        {"layer": "cell",  "value": "https://staging", "redacted": false, "effective": true}
+      ]
+    },
+    {"name": "MY_TOKEN", "value": "[REDACTED]", "redacted": true, "source": "squad", "layers": [...]}
+  ],
+  "redacted_count": 1,
+  "note": "Values are masked only for env-var names registered in the Secrets tab. ...",
+  "warning": null
+}
+```
+
+`layers` is the precedence order, lowest first — the same order the scheduler
+merges in, so the last layer naming a variable wins. Each `vars` entry carries
+every layer that mentioned it, so a shadowed parent value stays visible.
+
+**Redaction.** A value is masked iff its **name** is registered in the Secrets
+tab (`GET /api/secret-env-names`, RAL-281), applied through the shared
+`ralphus_core::redact::redact_env_value`. There is deliberately no
+"looks like a secret" name heuristic: an unregistered credential-looking
+variable is shown in full, which is what `note` says out loud. Because the
+masking happens in the daemon, the board's popup and `ralphus <noun> env`
+receive byte-identical payloads and neither can be used to bypass the other.
+
+**Not included**, by design: the runner process's inherited OS environment,
+placeholder expansion (`{{worktree}}` and friends are shown unexpanded — the
+scheduler materializes them at dispatch), and any key a layer tombstones away
+(it is not part of the resolved environment, so it is not listed as one).
+`warning` is set when a layer could not be resolved and was left out — today
+only an agent profile whose backend/config does not resolve.
+
+A non-integer index is a `400`; an unknown squad/task/cell/proof step/
+guardian/branch is a `404`.
+
+**CLI:** `ralphus squad env <squad_id>`, `ralphus task env <selector> [--scope
+task|proof]`, `ralphus cell env <selector> [--scope cell|proof]`, `ralphus
+proof env <selector>`, and `ralphus review env <selector> [--scope
+build|tests|manual-checks|worktree]`. All five are read-only and build the
+same paths above (`cli/src/commands/env.rs`).
+
+**Board:** a "🔎 Resolved env" button on every `environment overrides` section
+and on a review's `check gates` section, opening a read-only popup table.
+
 #### `POST /api/guardians/{id}/branches/{bid}/env` — review-worktree overrides
 
 A review worktree is assembled from a cell's work, so by default it runs
@@ -1014,10 +1292,14 @@ respectively — `build_env`/`manual_checks_env` are `combined_env` with that
 section's own overrides applied, mirroring `BranchView.resolved_env`.
 
 **CLI:** `ralphus review build-env <selector> --set KEY=VAL --unset KEY --clear
-KEY` and the `manual-checks-env` equivalent. The CLI never prints a resolved or
-overridden environment-variable *value* anywhere (only key names and
-override/tombstone/inherited status) — see `DaemonClient._json_or_raise`'s
-redaction of every `/api/guardians...` response in `cli/src/ralphus/client.py`.
+KEY` and the `manual-checks-env` equivalent. These *override-editing* commands
+never print a resolved or overridden environment-variable *value* (only key
+names and override/tombstone/inherited status) — see
+`redact_guardian_env_values`'s redaction of every map-shaped `env` field in a
+`/api/guardians...` response in `cli/src/client.rs`. `ralphus review env`
+(RAL-324) is the deliberate exception and the one place values are printed:
+its row-shaped payload carries the daemon's own Secrets-tab masking, which is
+exactly what the board shows.
 
 ### `POST /api/squads/{id}/add-dependency`
 Wire up a manual cross-squad dependency after submission (RAL-105), e.g. from the
@@ -1094,6 +1376,19 @@ Update per-review opt-out/override settings — only the fields present in the
 body are changed, everything else is left as-is. Returns the updated
 `GuardianView`. Most fields are documented by their name alone (see
 `GuardianSettingsBody` in `daemon/src/server.rs` for the exhaustive list).
+
+`auto_submit_pr_stack` (RAL-317, optional boolean) opts this review into
+auto-submitting/growing its PR stack as each branch reaches a terminal
+(`done`/`conflict_resolved`) merge state, instead of requiring the manual
+`POST .../pull-requests` (or `review pr submit`) call. `null`/omitted inherits
+the project/global default (same "stamped from the project's effective value
+at review creation, then independently editable per-review" shape as
+`match_pr_branch_name` above); `GuardianView.effective_auto_submit_pr_stack`
+is the resolved value the trigger actually gates on. A per-branch auto-submit
+failure never blocks this review's merge -- it's recorded as a one-shot
+`BranchView.auto_submit_error` marker, cleared again the next time that
+branch's state is found already covered by an open PR (whether via a fresh
+auto-submit or a manual `review pr submit`).
 
 RAL-213: if the review is currently `merging`, the settings write also stops
 the in-flight merge and starts a fresh one (the same safe cancel → wait →
@@ -1400,6 +1695,22 @@ recorded before this grouping existed falls back to its own PR id, so it
 still surfaces as a (single-PR) stack rather than being silently dropped from
 history.
 
+### `POST /api/guardians/{id}/pull-requests/unlink`
+
+Guardian-wide "start this review's PR stack over" (RAL-317, `review pr
+unlink`): bulk soft-drops every currently `open` PR row for this review
+(`state='dropped', dropped_reason='unlinked'`) and clears its registered
+GitHub-native PR stack number, so the next submission (auto or manual)
+creates a fresh stack instead of trying to append to one whose PRs were just
+unlinked. Never hard-deletes -- dropped rows remain visible as history via
+`GET .../pull-request-stacks` (`PrStackView`/grouped by `stack_id`), same as
+a PR dropped for merging out-of-band (RAL-300). A PR already `merged`/
+`closed` is left untouched, not force-dropped. No request body. `404` if the
+guardian doesn't exist. `200`:
+```json
+{ "dropped": 2 }
+```
+
 ### `POST /api/guardians/{id}/stop`
 
 Halt an in-progress rebase (status `merging`) at its next checkpoint, leaving
@@ -1415,6 +1726,32 @@ Returns `{"status":"merge_stopped"}` on success. Because the state flip is
 guarded on the review actually being `merging`, a merge that had already
 completed before the worker was stopped is left in `in_review` (the endpoint
 reports a `store_error`), rather than being mis-labelled as stopped.
+
+### `POST /api/guardians/{id}/reopen`
+
+Reopen a `cancelled` review: flips `cancelled → collecting` and immediately
+tries an incremental **staged** merge pass (RAL-265,
+`guardian_merge::run_merge_staged`) — the same pass a task completion would
+have triggered via the scheduler's `start_reviews` had this review not been
+cancelled at the time. This is deliberately not the all-or-nothing pass `POST
+/api/guardians/{id}/merge` uses: that path waits for *every* enabled
+branch's upstream cell to finish before rebasing anything, so a review
+reopened while one branch is still pending would sit idle until that last
+cell completes even though earlier branches were already done (and would
+already be rebased in, had the review never been cancelled). Reopening
+stages that ready prefix in immediately instead of waiting on the last cell
+or the periodic maintenance sweep. There is no live merge worker to stop
+first — a cancelled review's worker already exited before the `cancelled`
+status was written.
+
+`404` if the guardian doesn't exist; `500` (`store_error`) if the guardian
+isn't currently `cancelled` (mirrors `cancel_and_merge`'s own error mapping
+for an invalid transition). On success: `202 {"status":"merging"}` — a
+background staged-merge worker was started (respecting the daemon's normal
+worker concurrency cap, so a busy daemon queues rather than blocking this
+call). The worker rebases the contiguous prefix of branches whose cells are
+already done and returns the review to `collecting` if any branch is still
+pending — it only reaches `in_review` once every enabled branch is done.
 
 ### `GET /api/pull-requests`
 Look up the ralphus PR row for a given forge PR/MR (the PR → worktree
@@ -1582,7 +1919,7 @@ keeps the default newest-first order).
           "env_out_of_date": false,
           "started_at_ms": 1783120107300,
           "finished_at_ms": null,
-          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "maximum_context": null, "auto_compact_threshold": 80000, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false } ] } ],
+          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "maximum_context": null, "auto_compact_threshold": 80000, "tool_output_max_tokens": 40000, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false } ] } ],
           "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null, "env_out_of_date": false } ]
         }
       ]
@@ -1793,7 +2130,7 @@ schedulable unit:
 exist; `500` (`code: "cycle"`) on a dependency cycle — should not happen for an
 already-submitted squad (submission itself rejects cycles), but the underlying
 `plan()` call is fallible so this stays honest rather than unwrapping. Rendering
-(ASCII/DOT) happens entirely client-side; see `cli/src/ralphus/graphview.py`.
+(ASCII/DOT) happens entirely client-side; see `cli/src/graphview.rs`.
 
 ### `GET /api/graph`
 The cross-squad `[[default]] depends_on` gating graph (`ralphus graph --global`):
@@ -1925,7 +2262,8 @@ it's the more specific ask. A malformed `entity` string is a `400`.
       "cell_id": null,
       "task": null,
       "log_path": null,
-      "payload": {}
+      "payload": {},
+      "admin_only": false
     }
   ],
   "total": 128
@@ -1936,6 +2274,16 @@ it's the more specific ask. A malformed `entity` string is a `400`.
 a durable terminal-log attempt file (`crate::terminal_log`, RAL-154) — rather
 than embedding that file's content in the row itself. `null` for every other
 event.
+
+`admin_only` (RAL-332) restricts a row to admin viewers: this endpoint
+resolves the caller's identity from `X-Ralphus-User` (falling back to
+`default_user`) and silently excludes `admin_only` rows unless that identity
+is a registered admin -- no error, no count of what was hidden, the same
+shape as a filter that matched nothing. Today only RAL-328's per-user
+hide/unhide rows (`source: "hidden"`) and RAL-332's "Edit Profile" audit rows
+(`source: "users"`) are marked this way. `GET /api/cartographer/{id}` applies
+the same rule and returns `404` (not `403`) for an admin-only row a
+non-admin caller asks for by id, indistinguishable from a missing one.
 
 Retention is enforced by two independently configurable caps under
 `[cartographer]` in `.ralphus.toml` (`retention_days`, default 30;

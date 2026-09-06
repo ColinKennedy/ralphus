@@ -47,6 +47,8 @@ role in the table below, then use it.
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
 | `--out-of-date` | `#d4a72c` | *(shared)* | semantic (a task/cell/proof step's env overrides changed since it last ran, RAL-271) |
 | `--detached` | `#d2a8ff` | *(shared)* | semantic (a cell cleanly stopped mid-task for a real interactive agent session to take over, not Done/Failed/Cancelled, RAL-288) |
+| `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
+| `--terminal-bg` | `#000000` | *(shared)* | surface (the remote terminal relay's xterm.js panel background, RAL-355 Phase 10) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -227,6 +229,19 @@ only because no existing role fit this new concept (see "Adding a new UI
 element" below). Clears automatically the next time the cell is dispatched
 (a restart, or the explicit resume-automation trigger).
 
+### Arbiter-created review — `--arbiter` only (RAL-318)
+The Reviews panel marks a review with a small "⚙ Arbiter" badge when its
+`origin` is `"arbiter"` — created automatically by the Arbiter/Triage
+subsystem when a pooled cell count threshold or cron schedule fired, rather
+than from an authored `[[review]]` block or any other pre-existing creation
+path (the `explicit` origin, true of essentially every review that exists
+today). This is provenance — "the Arbiter made this, not a human/task file" —
+not a status (`--running`/`--done`/etc. already cover review state), a
+caution (`--ignored` is reserved for the real `ignored` status), or a
+selection/linked-movement cue (`--accent`/`--teal`); `--arbiter` exists only
+because no existing role fit this new concept (see "Adding a new UI element"
+below).
+
 ### Inherited resolved value — italic text only (no new color)
 A detail-pane field whose displayed value is a resolved fallback from a parent
 scope (for example, a cell `agent` inherited from its task, or a proof
@@ -236,6 +251,17 @@ text in italics (`font-style: italic`) with the normal primary text color
 the UI Tooltip Rule in `CLAUDE.md`). Do **not** recolor inherited values to
 `--muted`, `--ignored`, or any status hue — inheritance is provenance, not a
 disabled state, warning, or status.
+
+### Terminal surface — `--terminal-bg` only (RAL-355 Phase 10)
+The remote Open Agent terminal relay's xterm.js panel always renders on a
+fixed near-black background (`--terminal-bg`), not `--bg`/`--panel` — a
+terminal pane conventionally stays dark regardless of the surrounding
+theme, the same way a real terminal emulator's background doesn't follow
+the host OS's light/dark setting, and xterm.js's own ANSI color rendering
+assumes a dark backdrop. Shared across both themes (not overridden in
+`[data-theme="light"]`) for that reason. Set via xterm.js's own `theme`
+option (a JS value, not CSS) by reading the CSS variable's resolved value
+at runtime, so there is still exactly one place this color is defined.
 
 ### Text & surfaces
 - Primary text: `--text`. Secondary/muted/disabled text: `--muted`.

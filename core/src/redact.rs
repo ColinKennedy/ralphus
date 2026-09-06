@@ -256,6 +256,124 @@ fn is_id_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_'
 }
 
+/// The literal inserted in place of a URL's redacted inline credentials.
+pub const REDACTED_URL_CREDENTIAL: &str = "***";
+
+/// Split `url`'s authority component (the `user:pass@host[:port]` segment
+/// right after `scheme://`) out, if it has one. Returns `(scheme_and_slashes,
+/// authority, rest)` so callers can rebuild the string around whichever part
+/// they need to inspect or replace, without re-parsing.
+fn split_authority(url: &str) -> Option<(&str, &str, &str)> {
+    let scheme_end = url.find("://")?;
+    let (prefix, after) = url.split_at(scheme_end + 3);
+    let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let (authority, rest) = after.split_at(authority_end);
+    Some((prefix, authority, rest))
+}
+
+/// True when `url` is an `http(s)://` project clone URL with a password
+/// inlined in its authority (`https://user:pass@host/repo.git`) — a real
+/// project-registration project clone URL should never carry one, since a
+/// leaked project registry entry (a Cartographer payload, a shared board, a
+/// support bundle) would then leak the password too. An SSH-shorthand URL
+/// (`git@host:org/repo.git`) or a bare userinfo without a password
+/// (`https://git@host/repo.git`, common for token-as-username hosting) does
+/// not trip this — only `scheme://user:pass@` shapes carry an inline secret.
+#[must_use]
+pub fn https_url_has_embedded_password(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return false;
+    }
+    let Some((_, authority, _)) = split_authority(url) else {
+        return false;
+    };
+    match authority.rfind('@') {
+        Some(at) => authority[..at].contains(':'),
+        None => false,
+    }
+}
+
+/// Replace inline `user:pass@`/`user@` credentials in `url`'s authority with
+/// [`REDACTED_URL_CREDENTIAL`], leaving the scheme, host, port, and path
+/// intact. Returns `url` unchanged when it has no `scheme://…@…` shape (e.g.
+/// an SSH shorthand, or a URL with no userinfo at all) — there is nothing to
+/// redact in that case.
+#[must_use]
+pub fn redact_url_credentials(url: &str) -> String {
+    let Some((prefix, authority, rest)) = split_authority(url) else {
+        return url.to_string();
+    };
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{prefix}{REDACTED_URL_CREDENTIAL}@{}{rest}",
+        &authority[at + 1..]
+    )
+}
+
+/// One environment variable as a read-only viewer shows it (RAL-324).
+///
+/// Produced only by [`redact_env_map`], so every caller — the daemon's HTTP
+/// API, the board's env-viewer popup, and `ralphus env` — displays the same
+/// masked value for the same variable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EnvVarDisplay {
+    /// The variable's name, never masked.
+    pub name: String,
+    /// The value as it may be displayed — [`REDACTED`] when `redacted`.
+    pub value: String,
+    /// Whether `name` is registered as secret, so `value` is the placeholder
+    /// rather than the real value.
+    pub redacted: bool,
+}
+
+/// Mask one environment variable's value for display (RAL-324).
+///
+/// `secret_names` is the daemon's user-registered secret env-var **name**
+/// list (RAL-281's Secrets tab, `ralphus_daemon::secret_env_names`), which is
+/// the only thing that decides whether a variable is secret here: an exact
+/// name match masks the whole value with [`REDACTED`]. Deliberately *not*
+/// [`is_secret_env_key`] — a viewer that hid variables the Secrets tab does
+/// not list would disagree with what the same list scrubs from pane text.
+///
+/// A non-secret value still goes through [`redact_secrets`], which catches a
+/// credential assignment embedded *inside* the value (e.g. a wrapper command
+/// stored as `sh -c "ANTHROPIC_API_KEY=sk-… run"`). Returns the displayable
+/// value and whether the name match masked it outright.
+#[must_use]
+pub fn redact_env_value(
+    name: &str,
+    value: &str,
+    secret_names: &std::collections::BTreeSet<String>,
+) -> (String, bool) {
+    if secret_names.contains(name) {
+        return (REDACTED.to_string(), true);
+    }
+    (redact_secrets(value).into_owned(), false)
+}
+
+/// Mask a whole environment map for display, entry by entry through
+/// [`redact_env_value`] (RAL-324). Output order follows the map's own key
+/// order, so a `BTreeMap` input yields alphabetical rows.
+#[must_use]
+pub fn redact_env_map(
+    env: &std::collections::BTreeMap<String, String>,
+    secret_names: &std::collections::BTreeSet<String>,
+) -> Vec<EnvVarDisplay> {
+    env.iter()
+        .map(|(name, value)| {
+            let (value, redacted) = redact_env_value(name, value, secret_names);
+            EnvVarDisplay {
+                name: name.clone(),
+                value,
+                redacted,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +507,113 @@ mod tests {
         let line = "NODE_ENV=production node index.js";
         let out = redact_secrets(line);
         assert_eq!(out, line);
+    }
+
+    #[test]
+    fn https_url_with_inline_password_is_flagged() {
+        assert!(https_url_has_embedded_password(
+            "https://user:hunter2@example.invalid/team/proj.git"
+        ));
+    }
+
+    #[test]
+    fn https_url_with_bare_username_is_not_flagged() {
+        // A token-as-username hosting convention (e.g. some CI systems) has
+        // no separate password segment, so nothing is inline to leak.
+        assert!(!https_url_has_embedded_password(
+            "https://ghp_abc123@example.invalid/team/proj.git"
+        ));
+    }
+
+    #[test]
+    fn plain_https_url_is_not_flagged() {
+        assert!(!https_url_has_embedded_password(
+            "https://example.invalid/team/proj.git"
+        ));
+    }
+
+    #[test]
+    fn ssh_shorthand_url_is_not_flagged() {
+        // `git@host:org/repo.git` has no `://`; its leading `git@` is a fixed
+        // service account name, not a credential.
+        assert!(!https_url_has_embedded_password(
+            "git@example.invalid:team/proj.git"
+        ));
+    }
+
+    #[test]
+    fn ssh_scheme_url_is_not_flagged() {
+        // Only http(s) is in scope -- `ssh://` auth is key-based, not a
+        // password sitting in the URL text.
+        assert!(!https_url_has_embedded_password(
+            "ssh://user:pass@example.invalid/team/proj.git"
+        ));
+    }
+
+    #[test]
+    fn redact_url_credentials_masks_the_password_but_keeps_host_and_path() {
+        let out = redact_url_credentials("https://user:hunter2@example.invalid/team/proj.git");
+        assert_eq!(out, "https://***@example.invalid/team/proj.git");
+    }
+
+    #[test]
+    fn redact_url_credentials_is_a_noop_without_an_at_sign() {
+        let url = "https://example.invalid/team/proj.git";
+        assert_eq!(redact_url_credentials(url), url);
+    }
+
+    #[test]
+    fn redact_url_credentials_is_a_noop_for_ssh_shorthand() {
+        let url = "git@example.invalid:team/proj.git";
+        assert_eq!(redact_url_credentials(url), url);
+    }
+
+    fn names(list: &[&str]) -> std::collections::BTreeSet<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn redact_env_value_masks_a_registered_name() {
+        let (value, redacted) = redact_env_value("MY_TOKEN", "s3kr3t", &names(&["MY_TOKEN"]));
+        assert_eq!(value, REDACTED);
+        assert!(redacted);
+    }
+
+    #[test]
+    fn redact_env_value_shows_an_unregistered_name_even_when_it_looks_secret() {
+        // RAL-324: the Secrets tab's list is the only source of truth --
+        // there is deliberately no name heuristic here, so a secret-looking
+        // but unregistered variable displays in the clear.
+        let (value, redacted) = redact_env_value("STRIPE_API_KEY", "sk-live", &names(&[]));
+        assert_eq!(value, "sk-live");
+        assert!(!redacted);
+    }
+
+    #[test]
+    fn redact_env_value_still_scrubs_a_credential_assignment_inside_the_value() {
+        let (value, redacted) = redact_env_value(
+            "WRAPPER_CMD",
+            "sh -c \"ANTHROPIC_API_KEY='sk-abc' run\"",
+            &names(&[]),
+        );
+        assert!(!value.contains("sk-abc"), "{value}");
+        assert!(!redacted, "the name itself is not registered");
+    }
+
+    #[test]
+    fn redact_env_map_masks_only_registered_names_and_keeps_key_order() {
+        let env: std::collections::BTreeMap<String, String> =
+            [("B_PLAIN", "visible"), ("A_TOKEN", "hidden")]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+        let rows = redact_env_map(&env, &names(&["A_TOKEN"]));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "A_TOKEN");
+        assert_eq!(rows[0].value, REDACTED);
+        assert!(rows[0].redacted);
+        assert_eq!(rows[1].name, "B_PLAIN");
+        assert_eq!(rows[1].value, "visible");
+        assert!(!rows[1].redacted);
     }
 }

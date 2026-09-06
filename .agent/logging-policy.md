@@ -1,6 +1,6 @@
 # Logging Policy (RAL-79, amended by Cartographer / RAL-98)
 
-Cross-cutting across `daemon/`, `runner/`, and `cli-rs/` — this is the canonical
+Cross-cutting across `daemon/`, `runner/`, and `cli/` — this is the canonical
 copy; those folders' `AGENTS.md` link here rather than duplicating it.
 
 There are now two layers, and both fire together — this reconciles the original
@@ -121,7 +121,7 @@ not on whether `tracing` appears in its tree.
 | `llm` | `runner/src/execute.rs` | Cell/proof start (squad/cell/agent/model/prompt_len/prompt_hash), system-prompt applied (len/position), done (tokens/cost) or error — at the execute layer |
 | `llm-invoke` | `runner/src/agent_backend.rs` | The actual model API call (via `llm_client::run_agent`) start (agent/model/prompt_len/hash), done (elapsed/tokens), or error — at the model API call layer |
 | `runner` | `runner/src/main.rs` | Runner invoked (squad/cell/agent/model/proof) |
-| `cli` | `cli-rs/src/main.rs` | CLI subcommand invoked with its parsed `Command` |
+| `cli` | `cli/src/main.rs` | CLI subcommand invoked with its parsed `Command` |
 
 **Required events** — any new code path that touches these must emit the corresponding log line, and — per the Cartographer amendment above — a matching structured record wherever a `Store` is reachable:
 - All entity state transitions (squad, task, cell, proof)

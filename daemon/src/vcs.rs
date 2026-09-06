@@ -278,7 +278,7 @@ mod tests {
         );
         assert!(
             Command::new("git")
-                .args(["init", "-q"])
+                .args(["init", "--quiet"])
                 .current_dir(&dir)
                 .status()
                 .expect("git init")
@@ -295,7 +295,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
             Command::new("git")
-                .args(["init", "-q", "-b", "main"])
+                .args(["init", "--quiet", "--initial-branch", "main"])
                 .current_dir(&dir)
                 .status()
                 .expect("git init")
@@ -310,7 +310,7 @@ mod tests {
                 "-c",
                 "user.email=t@t",
                 "commit",
-                "-m",
+                "--message",
                 "x",
             ]
             .as_slice(),

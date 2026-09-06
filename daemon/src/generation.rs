@@ -213,6 +213,7 @@ pub fn run_generation(req: &GenerateRequest) -> GenerationJob {
         maximum_budget_usd: None,
         maximum_context: None,
         auto_compact_threshold: None,
+        tool_output_max_tokens: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -220,6 +221,10 @@ pub fn run_generation(req: &GenerateRequest) -> GenerationJob {
         env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
     };
     let runner = SubprocessRunner::from_env();
     let result = runner.run(&spec);

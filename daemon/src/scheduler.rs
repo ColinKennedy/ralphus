@@ -55,6 +55,12 @@ const RESUME_AUTOMATION_PROMPT: &str = "Continue the task from exactly where \
 /// (`in_review`/`merging` only) to keep GitHub/GitLab API usage trivial.
 pub const FORGE_REORDER_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often to advance Triage pool cron schedules (RAL-318, see
+/// `crate::triage::run_schedule_tick`). A minute is fine granularity for a
+/// scheduler whose entries fire on the order of days/weeks/months; it also
+/// bounds how stale the board's "current pool state" view can be.
+pub const TRIAGE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
+
 fn resolve_agent_selection(
     agent: &str,
     cwd: &str,
@@ -65,23 +71,34 @@ fn resolve_agent_selection(
 /// Whether a resolved backend name is Claude Code (`claude-code`, `claude-cli`).
 ///
 /// `pub(crate)`, not private: also used below (RAL-288 Stage 1) to decide
-/// whether to pre-assign a fresh Claude session id before dispatch, and by
-/// [`sharing_blocked_reason`]'s cross-backend-mismatch check.
+/// whether to pre-assign a fresh Claude session id before dispatch.
 pub(crate) fn is_claude_code_backend(backend: &str) -> bool {
     backend == "claude-code" || backend == "claude-cli"
 }
 
-/// RAL-248: returns a human reason when the current cell must NOT resume a
+/// Backends whose resumed session is keyed to the model it started with, so
+/// resuming under a *different* model is unsafe rather than merely redundant
+/// -- see [`sharing_blocked_reason`].
+const MODEL_SENSITIVE_RESUME_BACKENDS: &[&str] = &["claude-code", "codex", "pi"];
+
+/// RAL-248 (extended for Codex/Pi after a live report of Codex itself warning
+/// about a mid-session model switch — cross-cell sharing had resumed a
+/// dependency's Codex session under a different model with no guard at all):
+/// returns a human reason when the current cell must NOT resume a
 /// dependency's agent session — `None` when sharing is safe.
 ///
-/// The only blocking case today: two `claude-code` cells on different models.
-/// Claude Code keys its session cache on the model, so
-/// `claude -p --resume <id> --model <other>` silently starts a cold session,
-/// discarding the very context cross-cell sharing exists to carry forward.
-/// Any other pairing (a non-claude-code cell, or matching models) resumes
-/// fine — a fresh `--append-system-prompt`/prompt is applied on top of the
-/// resumed session without corrupting it (RAL-248 AC3; the claude-code
-/// backend already passes both flags together).
+/// Blocked whenever both sides resolve to the *same* model-sensitive backend
+/// (see [`MODEL_SENSITIVE_RESUME_BACKENDS`]) but different models. Claude
+/// Code keys its session cache on the model, so `claude -p --resume <id>
+/// --model <other>` silently starts a cold session, discarding the very
+/// context cross-cell sharing exists to carry forward; Codex and Pi don't
+/// go cold, but resuming under a changed model is still not the safe,
+/// well-understood case cross-cell sharing was built for, so it's blocked
+/// the same way. Any other pairing (different backends entirely, a backend
+/// outside this list, or matching models) resumes fine — a fresh
+/// `--append-system-prompt`/prompt is applied on top of the resumed session
+/// without corrupting it (RAL-248 AC3; the claude-code backend already
+/// passes both flags together).
 #[must_use]
 fn sharing_blocked_reason(
     current_backend: &str,
@@ -89,12 +106,12 @@ fn sharing_blocked_reason(
     dep_backend: &str,
     dep_model: Option<&str>,
 ) -> Option<String> {
-    if is_claude_code_backend(current_backend)
-        && is_claude_code_backend(dep_backend)
+    if current_backend == dep_backend
+        && MODEL_SENSITIVE_RESUME_BACKENDS.contains(&current_backend)
         && current_model != dep_model
     {
         Some(format!(
-            "claude-code model mismatch (dependency {} vs this cell {})",
+            "{current_backend} model mismatch (dependency {} vs this cell {})",
             dep_model.unwrap_or("default"),
             current_model.unwrap_or("default")
         ))
@@ -126,6 +143,12 @@ enum SessionShare {
 /// finished when `i` starts are its `plan.deps[i]` — so the prior session (if
 /// any) has to come from one of them. We share the first session-bearing,
 /// guard-passing dependency's id.
+///
+/// Gated on `row.share_session` (opt-in, off by default): sharing used to be
+/// implicit in any `depends_on` link with no way to turn it off, which
+/// surprised a user running Codex under two different models on dependent
+/// cells (see [`sharing_blocked_reason`]'s doc comment for that report). A
+/// cell that hasn't opted in never even reaches the dependency scan below.
 fn resolve_shared_session_id(
     store: &Arc<Mutex<Store>>,
     squad_id: &str,
@@ -135,6 +158,9 @@ fn resolve_shared_session_id(
     i: usize,
     current_backend: &str,
 ) -> SessionShare {
+    if !row.share_session {
+        return SessionShare::None;
+    }
     // Collect each dependency's stored session id in one short DB read, then
     // release the store lock before doing any config-file I/O below
     // (`resolve_agent_selection` reads `.ralphus.toml` from disk, which must
@@ -292,7 +318,10 @@ impl Semaphore {
                 state.waiting.retain(|&(_, s)| s != seq);
                 // Another ranked waiter may now be the front (the permit
                 // count changed, and our entry just left the queue) — wake
-                // everyone so they can re-check.
+                // everyone so they can re-check. Drop the lock explicitly
+                // before notifying, so other threads can make progress while
+                // being woken up, avoiding a potential deadlock.
+                drop(state);
                 self.available.notify_all();
                 return SemaphorePermit { sem: self };
             }
@@ -357,6 +386,7 @@ pub fn run_loop(
     let mut last_prune = std::time::Instant::now();
     let mut last_terminal_log_prune = std::time::Instant::now();
     let mut last_forge_reorder_poll = std::time::Instant::now();
+    let mut last_triage_schedule_check = std::time::Instant::now();
     // Ark persists its per-project due times, so calling once at startup is
     // cheap for projects whose configured interval has not elapsed.
     crate::ark::periodic_sweep(&store, &cancellations, &sem);
@@ -470,6 +500,10 @@ pub fn run_loop(
             crate::pr::poll_forge_reorders(&store, &sem, &cancellations);
             last_forge_reorder_poll = std::time::Instant::now();
         }
+        if last_triage_schedule_check.elapsed() >= TRIAGE_SCHEDULE_INTERVAL {
+            crate::triage::run_schedule_tick(&store);
+            last_triage_schedule_check = std::time::Instant::now();
+        }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -569,6 +603,7 @@ fn claim_ready(store: &Arc<Mutex<Store>>, cancellations: &Cancellations) -> Vec<
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
             claimed.push(squad_id);
         }
@@ -817,6 +852,7 @@ fn execute_squad_inner(
             task: None,
             log_path: None,
             payload: serde_json::json!({"cells": cells.len(), "tasks": tasks.len()}),
+            admin_only: false,
         });
     }
 
@@ -1268,9 +1304,7 @@ fn execute_squad_inner(
                 let row = &cells[i];
                 let outcome = CellOutcome {
                     state: NodeState::Failed,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    cost_usd: 0.0,
+                    usage: crate::store::RecordedUsage::default(),
                     error: Some("blocked by a failed dependency".to_string()),
                     agent_session_id: None,
                 };
@@ -1286,9 +1320,7 @@ fn execute_squad_inner(
                 let row = &cells[i];
                 let outcome = CellOutcome {
                     state: NodeState::Cancelled,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    cost_usd: 0.0,
+                    usage: crate::store::RecordedUsage::default(),
                     error: Some("blocked by a cancelled dependency".to_string()),
                     agent_session_id: None,
                 };
@@ -1307,6 +1339,7 @@ fn execute_squad_inner(
                     task: Some(&row.task_name),
                     log_path: None,
                     payload: serde_json::json!({}),
+                    admin_only: false,
                 });
             }
 
@@ -1504,12 +1537,14 @@ fn enqueue_cell_failure_mailbox(
         }
         None => format!("cell '{cell_id}' in task '{task_name}' (squad {squad_id}) failed"),
     };
+    let entity_uri = guard.cell_entity_uri(squad_id, task_name, cell_id);
     if let Ok(message_id) = guard.enqueue_mailbox_message(
         crate::mailbox::MailboxPriority::Urgent,
         &text,
         Some(squad_id),
         Some(task_name),
         Some(cell_id),
+        entity_uri.as_deref(),
     ) {
         crate::cartographer::Note::new("scheduler")
             .level(crate::logging::LogLevel::INFO)
@@ -1554,12 +1589,23 @@ fn enqueue_proof_failure_mailbox(
     } else {
         format!("task-level proof for task '{task_name}' (squad {squad_id}) failed")
     };
+    // Best-effort: no `proof_idx` is threaded to this helper (a task-scope
+    // proof outcome is an aggregate across steps), so the finest entity we
+    // can address is the owning cell (for a cell-scope proof) or task (for a
+    // task-scope one) — a follow on the specific failing proof step won't
+    // match, but a squad/task/cell follow still will.
+    let entity_uri = if scope == "cell" {
+        cell_id.and_then(|cid| guard.cell_entity_uri(squad_id, task_name, cid))
+    } else {
+        guard.task_entity_uri(squad_id, task_name)
+    };
     if let Ok(message_id) = guard.enqueue_mailbox_message(
         crate::mailbox::MailboxPriority::Urgent,
         &text,
         Some(squad_id),
         Some(task_name),
         cell_id,
+        entity_uri.as_deref(),
     ) {
         let mut note = crate::cartographer::Note::new("scheduler")
             .level(crate::logging::LogLevel::INFO)
@@ -1659,6 +1705,7 @@ fn run_cell_worker(
                 "agent": row.agent,
                 "model": row.model,
             }),
+            admin_only: false,
         });
     }
     // Acquire a global slot; released when `_permit` drops at function end.
@@ -1715,9 +1762,7 @@ fn run_cell_worker(
         Err(message) => {
             let outcome = crate::store::CellOutcome {
                 state: crate::store::NodeState::Failed,
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd: 0.0,
+                usage: crate::store::RecordedUsage::default(),
                 error: Some(message.clone()),
                 agent_session_id: None,
             };
@@ -1761,6 +1806,10 @@ fn run_cell_worker(
                     task_name: &row.task_name,
                     cell_id: &row.cell_id,
                     machine: row.machine.as_deref(),
+                    // Env-override placeholder expansion never touches machine
+                    // targets (that's only read by remote worktree
+                    // provisioning) -- empty is correct here, not a stub.
+                    targets: &std::collections::BTreeMap::new(),
                 },
                 &merged,
             )
@@ -1816,6 +1865,7 @@ fn run_cell_worker(
                 task: Some(&row.task_name),
                 log_path: None,
                 payload: serde_json::json!({"agent_session_id": session_id}),
+                admin_only: false,
             });
         }
         spec.resume_agent_session_id = Some(session_id);
@@ -1905,9 +1955,7 @@ fn run_cell_worker(
     if let Some(rebase_err) = try_upstream_rebase(row, cells) {
         let outcome = crate::store::CellOutcome {
             state: crate::store::NodeState::Failed,
-            tokens_in: 0,
-            tokens_out: 0,
-            cost_usd: 0.0,
+            usage: crate::store::RecordedUsage::default(),
             error: Some(rebase_err.clone()),
             agent_session_id: None,
         };
@@ -1925,6 +1973,7 @@ fn run_cell_worker(
                 task: Some(&row.task_name),
                 log_path: None,
                 payload: serde_json::json!({"error": rebase_err}),
+                admin_only: false,
             });
             enqueue_cell_failure_mailbox(
                 &guard,
@@ -1971,9 +2020,7 @@ fn run_cell_worker(
         progress.lock().expect("progress mutex poisoned").status[i] = CellState::Detached;
         let outcome = CellOutcome {
             state: result.node_state(),
-            tokens_in: result.tokens_in,
-            tokens_out: result.tokens_out,
-            cost_usd: result.cost_usd,
+            usage: (&result).into(),
             error: None,
             agent_session_id: result.agent_session_id.clone(),
         };
@@ -1993,9 +2040,13 @@ fn run_cell_worker(
             payload: serde_json::json!({
                 "tokens_in": result.tokens_in,
                 "tokens_out": result.tokens_out,
+                "cache_creation_tokens": result.cache_creation_tokens,
+                "cache_read_tokens": result.cache_read_tokens,
                 "cost_usd": result.cost_usd,
+                "cost_is_estimated": result.cost_is_estimated,
                 "agent_session_id": result.agent_session_id,
             }),
+            admin_only: false,
         });
         return;
     }
@@ -2009,9 +2060,7 @@ fn run_cell_worker(
     );
     let outcome = CellOutcome {
         state: result.node_state(),
-        tokens_in: result.tokens_in,
-        tokens_out: result.tokens_out,
-        cost_usd: result.cost_usd,
+        usage: (&result).into(),
         error: result.error.clone(),
         agent_session_id: result.agent_session_id.clone(),
     };
@@ -2036,9 +2085,23 @@ fn run_cell_worker(
                 "status": result.status,
                 "tokens_in": result.tokens_in,
                 "tokens_out": result.tokens_out,
+                // RAL-326: the board's "lifetime" total sums these straight
+                // off this payload, so a cache-token column missing here is
+                // a cache-token column missing there.
+                "cache_creation_tokens": result.cache_creation_tokens,
+                "cache_read_tokens": result.cache_read_tokens,
                 "cost_usd": result.cost_usd,
+                "cost_is_estimated": result.cost_is_estimated,
                 "error": result.error,
+                // RAL-355 Phase 0: only meaningful for a remote cell -- a
+                // local cell's failure (agent error, proof failure) isn't a
+                // *remote infrastructure* failure this classification models.
+                "failure_kind": (!result.is_done() && row.machine.is_some())
+                    .then_some(result.error.as_deref())
+                    .flatten()
+                    .map(crate::remote_failure::classify),
             }),
+            admin_only: false,
         });
         if outcome.state == NodeState::Failed {
             enqueue_cell_failure_mailbox(
@@ -2269,11 +2332,16 @@ fn run_proof_only_worker(
     }
 }
 
-/// The RAL-156 no-new-commits guard, RAL-293-amended: for a git-backed task
-/// (per [`Store::task_commit_guard_info`]'s registered `project`) that hasn't
+/// The RAL-156 no-new-commits guard, RAL-293-amended, made machine-aware for
+/// RAL-355 Phase 8: for a git-backed task (per
+/// [`Store::task_commit_guard_info`]'s registered `project`) that hasn't
 /// opted out via `no_commit_required`, fails closed unless at least one of
-/// the task's cells has a `cwd` whose `HEAD` is ahead of its own
-/// `@{upstream}` tracking ref (`crate::proof::any_cwd_ahead_of_upstream`).
+/// the task's cells has a workspace whose `HEAD` is ahead of its own
+/// `@{upstream}` tracking ref
+/// (`crate::reviews::any_workspace_ahead_of_upstream`). Each cell's own
+/// resolved `machine` (`CellRow::machine`) decides whether that check runs
+/// locally or against a configured remote provider — local and remote cells
+/// are read identically through [`crate::workspace::Workspace::git`].
 ///
 /// This reads live git state rather than a squad-run-scoped baseline sha
 /// captured once at cell-start, so it doesn't need (and isn't gated on) any
@@ -2291,9 +2359,9 @@ fn run_proof_only_worker(
 /// event per the Logging Policy, and records the same message on
 /// [`TaskView::error`](crate::store::TaskView::error) via
 /// [`Store::set_task_error`] (RAL-291) so the board can show it without a
-/// human needing to open the Logs modal. `git` subprocess calls run outside
-/// the store lock, matching this module's "subprocess waits happen outside
-/// the store lock" rule.
+/// human needing to open the Logs modal. `git` subprocess/provider calls run
+/// outside the store lock, matching this module's "subprocess waits happen
+/// outside the store lock" rule.
 fn check_task_no_commits_guard(
     store: &Arc<Mutex<Store>>,
     squad_id: &str,
@@ -2316,12 +2384,17 @@ fn check_task_no_commits_guard(
     if info.no_commit_required || !is_git {
         return true;
     }
-    let cwds: Vec<&str> = cells
+    let workspaces: Vec<crate::workspace::Workspace> = cells
         .iter()
         .filter(|s| s.task_idx == task_idx)
-        .filter_map(|s| s.cwd.as_deref())
+        .filter_map(|s| {
+            s.cwd.as_deref().map(|cwd| {
+                crate::workspace::Workspace::on(cwd, s.machine.as_deref())
+                    .with_store(Arc::clone(store))
+            })
+        })
         .collect();
-    if crate::proof::any_cwd_ahead_of_upstream(&cwds) {
+    if crate::reviews::any_workspace_ahead_of_upstream(&workspaces) {
         return true;
     }
     crate::rlog!(
@@ -2340,13 +2413,14 @@ fn check_task_no_commits_guard(
         task: Some(task_name),
         log_path: None,
         payload: serde_json::json!({
-            "cells_checked": cwds.len(),
+            "cells_checked": workspaces.len(),
         }),
+        admin_only: false,
     });
     let error = format!(
         "task failed: no commits since baseline ({} cell{} checked)",
-        cwds.len(),
-        if cwds.len() == 1 { "" } else { "s" }
+        workspaces.len(),
+        if workspaces.len() == 1 { "" } else { "s" }
     );
     let _ = guard.set_task_error(squad_id, task_idx, Some(&error));
     false
@@ -2595,6 +2669,7 @@ fn start_reviews(
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({}),
+                admin_only: false,
             });
         }
         let store = Arc::clone(store);
@@ -2795,6 +2870,7 @@ fn finalize_all_failed(
         task: None,
         log_path: None,
         payload: serde_json::json!({"reason": reason}),
+        admin_only: false,
     });
     for task in tasks {
         let _ = guard.set_task_state(squad_id, task.idx, NodeState::Failed);
@@ -2899,7 +2975,9 @@ fn run_proofs(
     let mut all_ok = true;
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
-    for (idx, kind, spec, proof_model, proof_timeout, proof_budget) in specs {
+    for (idx, kind, spec, proof_model, proof_timeout, proof_budget, proof_tool_output_max_tokens) in
+        specs
+    {
         if cancel.is_cancelled() {
             return ProofOutcome {
                 all_ok,
@@ -2961,6 +3039,9 @@ fn run_proofs(
                         task_name,
                         cell_id: cell_sid.unwrap_or(scope),
                         machine: cell_machine,
+                        // See the sibling call site above: env-override
+                        // placeholder expansion never reads machine targets.
+                        targets: &std::collections::BTreeMap::new(),
                     },
                     &merged,
                 )
@@ -2982,170 +3063,160 @@ fn run_proofs(
             merged
         };
         register_secret_named_env_values(store, &env_overrides);
-        let (passed, output, proof_claude_id, proof_tokens_in, proof_tokens_out, proof_cost_usd) =
-            match kind.as_str() {
-                "command" => {
-                    crate::rlog!(
-                        DEBUG,
-                        "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind=command starting"
-                    );
-                    {
-                        let guard = store.lock().expect("store mutex poisoned");
-                        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                            level: crate::logging::LogLevel::DEBUG,
-                            source: "scheduler",
-                            message: "proof starting",
-                            scope: Some("proof"),
-                            squad_id: Some(squad_id),
-                            guardian_id: None,
-                            cell_id: None,
-                            task: Some(task_name),
-                            log_path: None,
-                            payload: serde_json::json!({
-                                "task_idx": task_idx,
-                                "proof_scope": scope,
-                                "cell_idx": cell_idx,
-                                "idx": idx,
-                                "kind": "command",
-                            }),
-                        });
-                    }
-                    set_proof_running(store, squad_id, task_idx, scope, cell_idx, idx);
-                    // RAL-151: run through the same `Runner` (tmux-wrapped) path
-                    // a `prompt`-kind proof step already does, rather than
-                    // `proof::run_command_proof_capture` directly, so it can
-                    // be watched live and reuses the exact same peek/pane-
-                    // capture endpoints (keyed by `proof-{scope}-{idx}`, which
-                    // `server.rs::proof_tmux_keys` already assumes for any
-                    // proof kind).
-                    let proof_span =
-                        otel::start_span("scheduler.proof_command", &cx, SpanKind::Internal);
-                    let mut runner_spec = RunnerSpec::for_command_proof(
+        let (passed, output, proof_claude_id, proof_usage) = match kind.as_str() {
+            "command" => {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind=command starting"
+                );
+                {
+                    let guard = store.lock().expect("store mutex poisoned");
+                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::DEBUG,
+                        source: "scheduler",
+                        message: "proof starting",
+                        scope: Some("proof"),
+                        squad_id: Some(squad_id),
+                        guardian_id: None,
+                        cell_id: None,
+                        task: Some(task_name),
+                        log_path: None,
+                        payload: serde_json::json!({
+                            "task_idx": task_idx,
+                            "proof_scope": scope,
+                            "cell_idx": cell_idx,
+                            "idx": idx,
+                            "kind": "command",
+                        }),
+                        admin_only: false,
+                    });
+                }
+                set_proof_running(store, squad_id, task_idx, scope, cell_idx, idx);
+                // RAL-151: run through the same `Runner` (tmux-wrapped) path
+                // a `prompt`-kind proof step already does, rather than
+                // `proof::run_command_proof_capture` directly, so it can
+                // be watched live and reuses the exact same peek/pane-
+                // capture endpoints (keyed by `proof-{scope}-{idx}`, which
+                // `server.rs::proof_tmux_keys` already assumes for any
+                // proof kind).
+                let proof_span =
+                    otel::start_span("scheduler.proof_command", &cx, SpanKind::Internal);
+                let mut runner_spec = RunnerSpec::for_command_proof(
+                    squad_id,
+                    task_name,
+                    &format!("proof-{scope}-{idx}"),
+                    cwd,
+                    &spec,
+                    &selection.backend,
+                    proof_timeout.and_then(|s| u64::try_from(s).ok()),
+                );
+                runner_spec.executable = selection.executable.clone();
+                runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
+                runner_spec.env_overrides = std::mem::take(&mut env_overrides);
+                // RAL-185: a proof step runs where its owning cell/task does.
+                runner_spec.machine = cell_machine.map(str::to_string);
+                let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
+                let passed = result.is_done();
+                let output = match &result.error {
+                    Some(err) if result.summary.is_empty() => err.clone(),
+                    Some(err) => format!("{}\n{err}", result.summary),
+                    None => result.summary.clone(),
+                };
+                let usage = crate::store::RecordedUsage::from(&result);
+                (passed, output, None, usage)
+            }
+            "prompt" => {
+                let model = proof_model.as_deref().or(cell_model);
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind=prompt agent={cell_agent} model={} starting",
+                    model.unwrap_or("default"),
+                );
+                {
+                    let guard = store.lock().expect("store mutex poisoned");
+                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::DEBUG,
+                        source: "scheduler",
+                        message: "proof starting",
+                        scope: Some("proof"),
+                        squad_id: Some(squad_id),
+                        guardian_id: None,
+                        cell_id: None,
+                        task: Some(task_name),
+                        log_path: None,
+                        payload: serde_json::json!({
+                            "task_idx": task_idx,
+                            "proof_scope": scope,
+                            "cell_idx": cell_idx,
+                            "idx": idx,
+                            "kind": "prompt",
+                            "agent": cell_agent,
+                            "model": model,
+                        }),
+                        admin_only: false,
+                    });
+                }
+                set_proof_running(store, squad_id, task_idx, scope, cell_idx, idx);
+                let proof_span =
+                    otel::start_span("scheduler.proof_prompt", &cx, SpanKind::Internal);
+                let mut runner_spec = RunnerSpec::for_proof(
+                    squad_id,
+                    task_name,
+                    &format!("proof-{scope}-{idx}"),
+                    cwd,
+                    &spec,
+                    &selection.backend,
+                    model,
+                    proof_timeout.and_then(|s| u64::try_from(s).ok()),
+                    proof_budget.and_then(|b| u64::try_from(b).ok()),
+                    proof_tool_output_max_tokens.and_then(|v| u64::try_from(v).ok()),
+                );
+                runner_spec.executable = selection.executable.clone();
+                runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
+                runner_spec.env_overrides = std::mem::take(&mut env_overrides);
+                // RAL-185: a proof step runs where its owning cell/task does.
+                runner_spec.machine = cell_machine.map(str::to_string);
+                {
+                    let guard = store.lock().expect("store mutex poisoned");
+                    let _ = guard.set_proof_effective_system_prompt(
                         squad_id,
-                        task_name,
-                        &format!("proof-{scope}-{idx}"),
-                        cwd,
-                        &spec,
-                        &selection.backend,
-                        proof_timeout.and_then(|s| u64::try_from(s).ok()),
+                        task_idx,
+                        scope,
+                        cell_idx,
+                        idx,
+                        runner_spec.effective_system_prompt().as_deref(),
                     );
-                    runner_spec.executable = selection.executable.clone();
-                    runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
-                    runner_spec.env_overrides = std::mem::take(&mut env_overrides);
-                    // RAL-185: a proof step runs where its owning cell/task does.
-                    runner_spec.machine = cell_machine.map(str::to_string);
-                    let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
-                    let passed = result.is_done();
-                    let output = match &result.error {
-                        Some(err) if result.summary.is_empty() => err.clone(),
-                        Some(err) => format!("{}\n{err}", result.summary),
-                        None => result.summary.clone(),
-                    };
-                    (
-                        passed,
-                        output,
-                        None,
-                        result.tokens_in,
-                        result.tokens_out,
-                        result.cost_usd,
-                    )
                 }
-                "prompt" => {
-                    let model = proof_model.as_deref().or(cell_model);
-                    crate::rlog!(
-                        DEBUG,
-                        "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind=prompt agent={cell_agent} model={} starting",
-                        model.unwrap_or("default"),
-                    );
-                    {
-                        let guard = store.lock().expect("store mutex poisoned");
-                        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                            level: crate::logging::LogLevel::DEBUG,
-                            source: "scheduler",
-                            message: "proof starting",
-                            scope: Some("proof"),
-                            squad_id: Some(squad_id),
-                            guardian_id: None,
-                            cell_id: None,
-                            task: Some(task_name),
-                            log_path: None,
-                            payload: serde_json::json!({
-                                "task_idx": task_idx,
-                                "proof_scope": scope,
-                                "cell_idx": cell_idx,
-                                "idx": idx,
-                                "kind": "prompt",
-                                "agent": cell_agent,
-                                "model": model,
-                            }),
-                        });
-                    }
-                    set_proof_running(store, squad_id, task_idx, scope, cell_idx, idx);
-                    let proof_span =
-                        otel::start_span("scheduler.proof_prompt", &cx, SpanKind::Internal);
-                    let mut runner_spec = RunnerSpec::for_proof(
-                        squad_id,
-                        task_name,
-                        &format!("proof-{scope}-{idx}"),
-                        cwd,
-                        &spec,
-                        &selection.backend,
-                        model,
-                        proof_timeout.and_then(|s| u64::try_from(s).ok()),
-                        proof_budget.and_then(|b| u64::try_from(b).ok()),
-                    );
-                    runner_spec.executable = selection.executable.clone();
-                    runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
-                    runner_spec.env_overrides = std::mem::take(&mut env_overrides);
-                    // RAL-185: a proof step runs where its owning cell/task does.
-                    runner_spec.machine = cell_machine.map(str::to_string);
-                    {
-                        let guard = store.lock().expect("store mutex poisoned");
-                        let _ = guard.set_proof_effective_system_prompt(
-                            squad_id,
-                            task_idx,
-                            scope,
-                            cell_idx,
-                            idx,
-                            runner_spec.effective_system_prompt().as_deref(),
-                        );
-                    }
-                    let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
-                    let passed = result.proof_passed();
-                    let output = match &result.error {
-                        Some(err) if result.summary.is_empty() => err.clone(),
-                        Some(err) => format!("{}\n{err}", result.summary),
-                        None => result.summary.clone(),
-                    };
-                    (
-                        passed,
-                        output,
-                        result.agent_session_id,
-                        result.tokens_in,
-                        result.tokens_out,
-                        result.cost_usd,
-                    )
-                }
-                "brain" | "approval" | "unknown" => continue, // deferred (intentional; not yet built)
-                other => {
-                    // Not producible by any currently-supported schema path (see
-                    // `core/src/schema.rs::ProofStep` and `insert_proof`) — most
-                    // likely stale data left behind by a since-renamed/removed proof
-                    // kind. Left to fall into the `continue` above like brain/approval,
-                    // this stayed `pending` forever, which `effective_cell_state`
-                    // folds into a cell that reads "running" indefinitely even
-                    // though the squad itself has already finished. Fail it instead so
-                    // the state is honest and terminal.
-                    let msg = format!(
-                        "proof kind '{other}' is not recognized by this daemon build and can never run (likely stale data from an older schema)"
-                    );
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind={other} unrecognized; failing: {msg}"
-                    );
-                    (false, msg, None, 0, 0, 0.0)
-                }
-            };
+                let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
+                let passed = result.proof_passed();
+                let output = match &result.error {
+                    Some(err) if result.summary.is_empty() => err.clone(),
+                    Some(err) => format!("{}\n{err}", result.summary),
+                    None => result.summary.clone(),
+                };
+                let usage = crate::store::RecordedUsage::from(&result);
+                (passed, output, result.agent_session_id, usage)
+            }
+            "brain" | "approval" | "unknown" => continue, // deferred (intentional; not yet built)
+            other => {
+                // Not producible by any currently-supported schema path (see
+                // `core/src/schema.rs::ProofStep` and `insert_proof`) — most
+                // likely stale data left behind by a since-renamed/removed proof
+                // kind. Left to fall into the `continue` above like brain/approval,
+                // this stayed `pending` forever, which `effective_cell_state`
+                // folds into a cell that reads "running" indefinitely even
+                // though the squad itself has already finished. Fail it instead so
+                // the state is honest and terminal.
+                let msg = format!(
+                    "proof kind '{other}' is not recognized by this daemon build and can never run (likely stale data from an older schema)"
+                );
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind={other} unrecognized; failing: {msg}"
+                );
+                (false, msg, None, crate::store::RecordedUsage::default())
+            }
+        };
         steps_run += 1;
         if passed {
             steps_passed += 1;
@@ -3176,9 +3247,7 @@ fn run_proofs(
                 state,
                 &output,
                 proof_claude_id.as_deref(),
-                proof_tokens_in,
-                proof_tokens_out,
-                proof_cost_usd,
+                proof_usage,
             );
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: if passed {
@@ -3201,10 +3270,14 @@ fn run_proofs(
                     "idx": idx,
                     "kind": kind,
                     "status": if passed { "done" } else { "failed" },
-                    "tokens_in": proof_tokens_in,
-                    "tokens_out": proof_tokens_out,
-                    "cost_usd": proof_cost_usd,
+                    "tokens_in": proof_usage.tokens_in,
+                    "tokens_out": proof_usage.tokens_out,
+                    "cache_creation_tokens": proof_usage.cache_creation_tokens,
+                    "cache_read_tokens": proof_usage.cache_read_tokens,
+                    "cost_usd": proof_usage.cost_usd,
+                    "cost_is_estimated": proof_usage.cost_is_estimated,
                 }),
+                admin_only: false,
             });
         }
         if !passed {
@@ -3349,7 +3422,10 @@ mod tests {
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 2,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.5,
+                    cost_is_estimated: false,
                     summary: "ok".to_string(),
                     error: None,
                     proofed: spec.proof.then_some(true),
@@ -3381,7 +3457,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.1,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -3519,7 +3598,16 @@ mod tests {
 
     impl Runner for DetachRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
-            RunnerResult::detached(3, 7, 0.25, Some("sess-detach-1".to_string()))
+            RunnerResult::detached(
+                crate::runner::LiveUsage {
+                    tokens_in: 3,
+                    tokens_out: 7,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    cost_usd: 0.25,
+                },
+                Some("sess-detach-1".to_string()),
+            )
         }
     }
 
@@ -3608,13 +3696,25 @@ mod tests {
                 Some("x") => {
                     use std::sync::atomic::Ordering;
                     if !self.detached_once.swap(true, Ordering::SeqCst) {
-                        return RunnerResult::detached(1, 1, 0.01, Some("sess-a".to_string()));
+                        return RunnerResult::detached(
+                            crate::runner::LiveUsage {
+                                tokens_in: 1,
+                                tokens_out: 1,
+                                cache_creation_tokens: 0,
+                                cache_read_tokens: 0,
+                                cost_usd: 0.01,
+                            },
+                            Some("sess-a".to_string()),
+                        );
                     }
                     RunnerResult {
                         status: "done".to_string(),
                         tokens_in: 0,
                         tokens_out: 0,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
                         cost_usd: 0.0,
+                        cost_is_estimated: false,
                         summary: "ok".to_string(),
                         error: None,
                         proofed: None,
@@ -3638,7 +3738,10 @@ mod tests {
                         status: "done".to_string(),
                         tokens_in: 0,
                         tokens_out: 0,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
                         cost_usd: 0.0,
+                        cost_is_estimated: false,
                         summary: "ok".to_string(),
                         error: None,
                         proofed: None,
@@ -3849,7 +3952,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: None,
@@ -4137,7 +4243,7 @@ mod tests {
 
         // Give both cells time to be dispatched and pile up behind the held
         // permit before it frees.
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(300));
         drop(held);
         assert_completes_within(Duration::from_secs(5), move || handle.join().unwrap());
 
@@ -4252,7 +4358,10 @@ mod tests {
                             status: "done".to_string(),
                             tokens_in: 1,
                             tokens_out: 1,
+                            cache_creation_tokens: 0,
+                            cache_read_tokens: 0,
                             cost_usd: 0.0,
+                            cost_is_estimated: false,
                             summary: "a retried ok".to_string(),
                             error: None,
                             proofed: None,
@@ -4267,7 +4376,10 @@ mod tests {
                         status: "done".to_string(),
                         tokens_in: 1,
                         tokens_out: 1,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
                         cost_usd: 0.0,
+                        cost_is_estimated: false,
                         summary: "b finished".to_string(),
                         error: None,
                         proofed: None,
@@ -4386,7 +4498,10 @@ mod tests {
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: "b done".to_string(),
                     error: None,
                     proofed: None,
@@ -4403,7 +4518,10 @@ mod tests {
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: "proof passed".to_string(),
                     error: None,
                     proofed: None,
@@ -4418,7 +4536,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: None,
@@ -4556,7 +4677,10 @@ mod tests {
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: "b done".to_string(),
                     error: None,
                     proofed: None,
@@ -4574,7 +4698,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: None,
@@ -4698,7 +4825,10 @@ mod tests {
                     status: "done".to_string(),
                     tokens_in: 0,
                     tokens_out: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.0,
+                    cost_is_estimated: false,
                     summary: format!("did {cmd}"),
                     error: None,
                     proofed: None,
@@ -5297,7 +5427,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -5362,7 +5495,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -5509,7 +5645,10 @@ mod tests {
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 2,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
                     cost_usd: 0.5,
+                    cost_is_estimated: false,
                     summary: "ok".to_string(),
                     error: None,
                     proofed: spec.proof.then_some(true),
@@ -5626,7 +5765,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.5,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -5910,12 +6052,14 @@ mod tests {
             model: None,
             system_prompt: None,
             system_prompt_position: None,
+            share_session: false,
             depends_on: vec![],
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
         }
@@ -6005,17 +6149,17 @@ mod tests {
 
         // Two branches that both modify the same file — guaranteed conflict
         // when "work" is rebased onto "dep".
-        git(&["init", "-b", "main"]);
+        git(&["init", "--initial-branch", "main"]);
         std::fs::write(root.join("shared.txt"), "base\n").expect("write");
         git(&["add", "shared.txt"]);
-        git(&["commit", "-m", "base"]);
+        git(&["commit", "--message", "base"]);
         git(&["checkout", "-b", "dep"]);
         std::fs::write(root.join("shared.txt"), "from dep\n").expect("write dep");
-        git(&["commit", "-am", "dep changes"]);
+        git(&["commit", "--all", "--message", "dep changes"]);
         git(&["checkout", "main"]);
         git(&["checkout", "-b", "work"]);
         std::fs::write(root.join("shared.txt"), "from work\n").expect("write work");
-        git(&["commit", "-am", "work changes"]);
+        git(&["commit", "--all", "--message", "work changes"]);
         git(&["checkout", "main"]);
 
         // One worktree per branch, mirroring what the scheduler sets up.
@@ -6037,12 +6181,14 @@ mod tests {
             model: None,
             system_prompt: None,
             system_prompt_position: None,
+            share_session: false,
             depends_on: vec![],
             timeout_sec: None,
             budget_tokens: None,
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
         };
@@ -6109,7 +6255,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -6248,10 +6397,10 @@ mod tests {
                 .expect("git");
             assert!(status.success(), "git {args:?} failed in {}", dir.display());
         };
-        run(&["init", "-b", "main"]);
+        run(&["init", "--initial-branch", "main"]);
         std::fs::write(dir.join("base.txt"), "base\n").unwrap();
         run(&["add", "."]);
-        run(&["commit", "-m", "base"]);
+        run(&["commit", "--message", "base"]);
         // RAL-293: pin a local `base` branch to the same commit and make
         // `main` track it, standing in for the `?upstream=` tracking ref a
         // real worktree materializes (`worktrees::set_explicit_upstream`) --
@@ -6387,7 +6536,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -6519,12 +6671,15 @@ mod tests {
             };
             std::fs::write(Path::new(&spec.cwd).join("new.txt"), "x\n").unwrap();
             git(&["add", "."]);
-            git(&["commit", "-m", "cell work"]);
+            git(&["commit", "--message", "cell work"]);
             RunnerResult {
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.0,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: spec.proof.then_some(true),
@@ -6682,7 +6837,7 @@ mod tests {
             .status()
             .expect("git add");
         std::process::Command::new("git")
-            .args(["commit", "-m", "earlier run's work"])
+            .args(["commit", "--message", "earlier run's work"])
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
@@ -6831,21 +6986,22 @@ mod tests {
     // ── RAL-248 cross-cell session sharing ────────────────────────────────
 
     #[test]
-    fn sharing_blocked_reason_guards_only_claude_code_model_mismatch() {
-        // Matching models (both explicit, both None/default) → share.
-        assert_eq!(
-            sharing_blocked_reason("claude-code", Some("a"), "claude-code", Some("a")),
-            None
-        );
-        assert_eq!(
-            sharing_blocked_reason("claude-code", None, "claude-code", None),
-            None
-        );
-        // Two claude-code cells on different models → block.
-        assert!(
-            sharing_blocked_reason("claude-code", Some("a"), "claude-code", Some("b")).is_some()
-        );
-        // One side not claude-code → never blocked, regardless of models.
+    fn sharing_blocked_reason_guards_model_sensitive_backends_on_mismatch() {
+        // Matching models (both explicit, both None/default) → share, for
+        // every model-sensitive backend.
+        for backend in ["claude-code", "codex", "pi"] {
+            assert_eq!(
+                sharing_blocked_reason(backend, Some("a"), backend, Some("a")),
+                None
+            );
+            assert_eq!(sharing_blocked_reason(backend, None, backend, None), None);
+            // Same backend, different models → block.
+            assert!(
+                sharing_blocked_reason(backend, Some("a"), backend, Some("b")).is_some(),
+                "{backend} should block on model mismatch"
+            );
+        }
+        // Different backends entirely → never blocked, regardless of models.
         assert_eq!(
             sharing_blocked_reason("claude", Some("a"), "claude-code", Some("b")),
             None
@@ -6856,6 +7012,12 @@ mod tests {
         );
         assert_eq!(
             sharing_blocked_reason("claude", None, "codex", Some("b")),
+            None
+        );
+        // A backend outside the model-sensitive list, e.g. plain command/raw
+        // cells, is never blocked even on a same-name "mismatch".
+        assert_eq!(
+            sharing_blocked_reason("raw", Some("a"), "raw", Some("b")),
             None
         );
     }
@@ -6882,7 +7044,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.5,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: None,
@@ -6906,7 +7071,7 @@ mod tests {
 
     #[test]
     fn cell_resumes_a_completed_dependency_session() {
-        let toml = "[[task]]\nname=\"t\"\n\
+        let toml = "[[task]]\nname=\"t\"\nshare_session=true\n\
             [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
             [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
         let (store, id) = store_with(toml);
@@ -6927,8 +7092,66 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_model_mismatch_starts_fresh() {
+    fn session_sharing_is_off_by_default() {
+        // Same fixture as `cell_resumes_a_completed_dependency_session` but
+        // without `share_session=true` -- cross-cell sharing used to be
+        // implicit in any `depends_on` link with no way to opt out, which
+        // surprised a user running Codex under two different models on
+        // dependent cells. It must now stay off until a task/cell opts in.
         let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
+            [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = SessionShareRunner {
+            provider: "provider".into(),
+            session_id: "sess-1".into(),
+            seen: Arc::clone(&seen),
+        };
+        execute_squad(&store, &runner, &id);
+        assert_eq!(session_share_recorded(&seen, "consumer"), None);
+    }
+
+    #[test]
+    fn cell_level_share_session_overrides_task_default() {
+        // Task opts every cell in; the consumer opts itself back out.
+        let toml = "[[task]]\nname=\"t\"\nshare_session=true\n\
+            [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
+            [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\nshare_session=false\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = SessionShareRunner {
+            provider: "provider".into(),
+            session_id: "sess-1".into(),
+            seen: Arc::clone(&seen),
+        };
+        execute_squad(&store, &runner, &id);
+        assert_eq!(session_share_recorded(&seen, "consumer"), None);
+    }
+
+    #[test]
+    fn cell_level_share_session_opts_in_when_task_default_is_off() {
+        // Task says nothing (off by default); the consumer opts itself in.
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
+            [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\nshare_session=true\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = SessionShareRunner {
+            provider: "provider".into(),
+            session_id: "sess-1".into(),
+            seen: Arc::clone(&seen),
+        };
+        execute_squad(&store, &runner, &id);
+        assert_eq!(
+            session_share_recorded(&seen, "consumer"),
+            Some("sess-1".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_code_model_mismatch_starts_fresh() {
+        let toml = "[[task]]\nname=\"t\"\nshare_session=true\n\
             [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
             [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-opus-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
         let (store, id) = store_with(toml);
@@ -6946,7 +7169,7 @@ mod tests {
 
     #[test]
     fn dependency_without_a_session_id_means_fresh_cell() {
-        let toml = "[[task]]\nname=\"t\"\n\
+        let toml = "[[task]]\nname=\"t\"\nshare_session=true\n\
             [[task.cell]]\nid=\"provider\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"make\"\n\
             [[task.cell]]\nid=\"consumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\ncommand=\"verify\"\ndepends_on=[\"provider\"]\n";
         let (store, id) = store_with(toml);
@@ -6989,7 +7212,10 @@ mod tests {
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
                 cost_usd: 0.5,
+                cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: None,
@@ -7042,7 +7268,7 @@ mod tests {
 
     #[test]
     fn a_resuming_cell_is_not_also_pre_assigned_a_fresh_session_id() {
-        let toml = "[[task]]\nname=\"t\"\n\
+        let toml = "[[task]]\nname=\"t\"\nshare_session=true\n\
             [[task.cell]]\nid=\"fresh\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\nprompt=\"do work\"\n\
             [[task.cell]]\nid=\"resumer\"\ncwd=\".\"\nagent=\"claude-code\"\nmodel=\"claude-sonnet-5\"\nprompt=\"continue\"\ndepends_on=[\"fresh\"]\n";
         let (store, id) = store_with(toml);

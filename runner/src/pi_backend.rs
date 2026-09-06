@@ -27,10 +27,48 @@ impl ModelBackend for PiBackend {
         workspace: &Workspace,
         options: &RunOptions<'_>,
     ) -> Result<BackendOutcome, BackendError> {
+        // RAL-336: pi exposes only one config-directory lever
+        // (`PI_CODING_AGENT_DIR`) that can't cleanly separate personal
+        // settings from personal memory, so isolation engages whenever
+        // either opt-in is off, favoring over-isolation. `known_config_dir`
+        // resolves once here and feeds both `apply_context_settings` (so it
+        // never touches the operator's real directory once isolated) and
+        // `spawn`'s own env override.
+        let isolate = !options.allow_personal_settings || !options.allow_personal_memory;
+        let ambient_dir = std::env::var_os("PI_CODING_AGENT_DIR").map(std::path::PathBuf::from);
+        let isolated_dir = if isolate {
+            let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "pi");
+            // Best-effort: preserve a stored login so isolation doesn't force
+            // a re-auth. Preserved regardless of the two opt-ins -- this is
+            // about *authentication*, not personal settings/memory.
+            crate::agent_isolation::preserve_auth_file(ambient_dir.as_deref(), &dir, "auth.json");
+            if options.allow_personal_settings {
+                // Settings opted back in but memory did not -- copy the
+                // settings/model-override files (not any memory file) into
+                // the isolated dir so personal settings still take effect.
+                crate::agent_isolation::preserve_auth_file(
+                    ambient_dir.as_deref(),
+                    &dir,
+                    "settings.json",
+                );
+                crate::agent_isolation::preserve_auth_file(
+                    ambient_dir.as_deref(),
+                    &dir,
+                    "models.json",
+                );
+            }
+            Some(dir)
+        } else {
+            None
+        };
+        let known_config_dir = isolated_dir.clone().or_else(|| ambient_dir.clone());
+
         apply_context_settings(
+            known_config_dir.as_deref(),
             options.model,
             options.maximum_context,
             options.auto_compact_threshold,
+            options.tool_output_max_tokens,
         )?;
 
         let program = self.program_override.clone().unwrap_or_else(|| {
@@ -43,11 +81,25 @@ impl ModelBackend for PiBackend {
         // the new cell's task text, not a generic "continue".
         let args = build_args(prompt, options);
 
-        let mut child = spawn(&program, compound, &args, workspace)
-            .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
+        let mut child = spawn(
+            &program,
+            compound,
+            &args,
+            workspace,
+            isolated_dir.as_deref(),
+        )
+        .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
 
         print_header(options.model, workspace);
-        let outcome = drive_json_events(&mut child, workspace)?;
+        let thrash_thresholds = crate::thrash::ThrashThresholds {
+            max_compactions: options
+                .thrash_max_compactions
+                .unwrap_or(crate::thrash::DEFAULT_MAX_COMPACTIONS),
+            min_turn_gap: options
+                .thrash_min_turn_gap
+                .unwrap_or(crate::thrash::DEFAULT_MIN_TURN_GAP),
+        };
+        let outcome = drive_json_events(&mut child, workspace, thrash_thresholds)?;
 
         if !self.keep_temporary_files {
             let _ = std::fs::remove_file(live_session_path(workspace.root()));
@@ -61,6 +113,10 @@ impl ModelBackend for PiBackend {
     }
 
     fn supports_auto_compact_threshold(&self) -> bool {
+        true
+    }
+
+    fn supports_tool_output_max_tokens(&self) -> bool {
         true
     }
 }
@@ -86,27 +142,51 @@ impl ModelBackend for PiBackend {
 ///   Converting one into the other needs the ceiling itself, so
 ///   `auto_compact_threshold` is only accepted alongside `maximum_context`.
 ///
-/// A no-op when neither field is set, so a `pi` cell that never touches
-/// them never requires `PI_CODING_AGENT_DIR` at all.
+/// RAL-333 reuses the same `modelOverrides.<model-id>` entry for
+/// `tool_output_max_tokens`, writing it as `maxTokens` -- the model catalog's
+/// own generation-budget field, and the closest thing `pi` has to a
+/// per-tool-output cap. When `tool_output_max_tokens` is unset but
+/// `maximum_context` is set, `maxTokens` defaults to 75% of `maximum_context`
+/// (per the ticket's confirmed scope) rather than being left unwritten -- an
+/// explicit `tool_output_max_tokens` always overrides that default.
+///
+/// A no-op when none of the three fields is set, so a `pi` cell that never
+/// touches them never requires `PI_CODING_AGENT_DIR` at all.
+///
+/// `dir` is the resolved directory to operate against -- the caller
+/// (`run()`) resolves it once, before this is called, from either the
+/// ambient `PI_CODING_AGENT_DIR` or (RAL-336) an isolated per-worktree
+/// directory when isolation is on, so this always writes wherever `pi`
+/// itself will actually be pointed for the same invocation rather than
+/// reading process env directly (this workspace forbids `unsafe_code`, and
+/// `std::env::set_var` is the only way to make an in-process
+/// `PI_CODING_AGENT_DIR` read see an isolated path).
 fn apply_context_settings(
+    dir: Option<&Path>,
     model: Option<&str>,
     maximum_context: Option<u64>,
     auto_compact_threshold: Option<u64>,
+    tool_output_max_tokens: Option<u64>,
 ) -> Result<(), BackendError> {
-    if maximum_context.is_none() && auto_compact_threshold.is_none() {
+    if maximum_context.is_none()
+        && auto_compact_threshold.is_none()
+        && tool_output_max_tokens.is_none()
+    {
         return Ok(());
     }
-    let dir = std::env::var("PI_CODING_AGENT_DIR").map_err(|_| {
+    let dir = dir.ok_or_else(|| {
         BackendError(
-            "pi: maximum_context/auto_compact_threshold require PI_CODING_AGENT_DIR to be set"
+            "pi: maximum_context/auto_compact_threshold/tool_output_max_tokens require \
+             PI_CODING_AGENT_DIR to be set"
                 .to_string(),
         )
     })?;
     apply_context_settings_in(
-        Path::new(&dir),
+        dir,
         model,
         maximum_context,
         auto_compact_threshold,
+        tool_output_max_tokens,
     )
 }
 
@@ -115,21 +195,22 @@ fn apply_context_settings(
 /// workspace forbids `unsafe_code`, so a test can't use `std::env::set_var`
 /// to exercise the `PI_CODING_AGENT_DIR` lookup in-process.
 ///
-/// Validates both fields (provider-qualified model for `maximum_context`;
-/// `auto_compact_threshold < maximum_context` when both are set) before
-/// writing anything, so a rejected cell never leaves one file updated and
-/// the other not.
+/// Validates every field (provider-qualified model for `maximum_context`
+/// and/or `tool_output_max_tokens`; `auto_compact_threshold <
+/// maximum_context` when both are set) before writing anything, so a
+/// rejected cell never leaves one file updated and the other not.
 fn apply_context_settings_in(
     dir: &Path,
     model: Option<&str>,
     maximum_context: Option<u64>,
     auto_compact_threshold: Option<u64>,
+    tool_output_max_tokens: Option<u64>,
 ) -> Result<(), BackendError> {
-    let provider_model = maximum_context
-        .map(|_| {
+    let provider_model = (maximum_context.is_some() || tool_output_max_tokens.is_some())
+        .then(|| {
             split_provider_model(model).ok_or_else(|| {
                 BackendError(
-                    "pi: maximum_context requires the cell's `model` to be \
+                    "pi: maximum_context/tool_output_max_tokens require the cell's `model` to be \
                      \"<provider>/<model-id>\" so the override can target pi's models.json -- \
                      there is no default provider to fall back to"
                         .to_string(),
@@ -155,8 +236,20 @@ fn apply_context_settings_in(
         })
         .transpose()?;
 
-    if let (Some(v), Some((provider, model_id))) = (maximum_context, provider_model) {
-        write_model_context_window(dir, provider, model_id, v)?;
+    // RAL-333: an explicit tool_output_max_tokens always wins; otherwise
+    // default to 75% of maximum_context (pi's own maxTokens/contextWindow
+    // ratio in its example model catalog), written only when
+    // maximum_context is itself set.
+    let effective_max_tokens =
+        tool_output_max_tokens.or_else(|| maximum_context.map(|ctx| ctx * 3 / 4));
+
+    if let Some((provider, model_id)) = provider_model {
+        if let Some(v) = maximum_context {
+            write_model_context_window(dir, provider, model_id, v)?;
+        }
+        if let Some(v) = effective_max_tokens {
+            write_model_max_tokens(dir, provider, model_id, v)?;
+        }
     }
     if let Some(v) = reserve_tokens {
         write_compaction_reserve_tokens(dir, v)?;
@@ -175,7 +268,9 @@ fn split_provider_model(model: Option<&str>) -> Option<(&str, &str)> {
 /// Merges `providers.<provider>.modelOverrides.<model_id>.contextWindow`
 /// into `dir`'s `models.json`, preserving every other key at every level
 /// (other providers, other models' overrides, and any other fields already
-/// set on this same model's override, e.g. a user's own `maxTokens`/`cost`).
+/// set on this same model's override, e.g. a user's own `cost`). Note that
+/// `maxTokens` is not among the preserved fields once `maximum_context` is
+/// set -- see [`write_model_max_tokens`]'s 75%-default behavior (RAL-333).
 fn write_model_context_window(
     dir: &Path,
     provider: &str,
@@ -190,6 +285,26 @@ fn write_model_context_window(
         &["providers", provider, "modelOverrides", model_id],
     )?;
     model_entry.insert("contextWindow".to_string(), Value::from(context_window));
+    write_json_object(&path, &root)
+}
+
+/// Merges `providers.<provider>.modelOverrides.<model_id>.maxTokens` into
+/// `dir`'s `models.json`, preserving every other key the same way
+/// [`write_model_context_window`] does (RAL-333).
+fn write_model_max_tokens(
+    dir: &Path,
+    provider: &str,
+    model_id: &str,
+    max_tokens: u64,
+) -> Result<(), BackendError> {
+    let path = dir.join("models.json");
+    let mut root = read_json_object(&path)?;
+    let model_entry = nested_object(
+        &mut root,
+        &path,
+        &["providers", provider, "modelOverrides", model_id],
+    )?;
+    model_entry.insert("maxTokens".to_string(), Value::from(max_tokens));
     write_json_object(&path, &root)
 }
 
@@ -290,46 +405,67 @@ fn build_args(prompt: &str, options: &RunOptions<'_>) -> Vec<String> {
     args
 }
 
+/// `isolated_config_dir` is `Some` only when RAL-336 isolation is engaged for
+/// this run -- it sets `PI_CODING_AGENT_DIR` on the child to redirect it away
+/// from the operator's real directory. `None` leaves the child's inherited
+/// `PI_CODING_AGENT_DIR` (if any) untouched, preserving today's behavior when
+/// both isolation opt-ins are on.
 fn spawn(
     program: &str,
     compound: bool,
     args: &[String],
     workspace: &Workspace,
+    isolated_config_dir: Option<&Path>,
 ) -> std::io::Result<Child> {
     if compound {
         let shell = shellcmd::resolve_shell(None);
         let _ = shellcmd::detect_parent_shell(&Env::from_process());
         let line = shellcmd::build_compound_command_line(&shell, program, args);
         match shellcmd::shell_spawn_args(&shell, &line) {
-            SpawnArgs::RawShellLine(raw) => Command::new("cmd")
-                .arg("/C")
-                .arg(raw)
-                .current_dir(workspace.root())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn(),
+            SpawnArgs::RawShellLine(raw) => {
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/C")
+                    .arg(raw)
+                    .current_dir(workspace.root())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
+                cmd.spawn()
+            }
             SpawnArgs::Argv(argv) => {
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
                 cmd.current_dir(workspace.root())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                    .stderr(Stdio::piped());
+                apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
+                cmd.spawn()
             }
         }
     } else {
-        Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(workspace.root())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
+        cmd.spawn()
+    }
+}
+
+/// Sets `PI_CODING_AGENT_DIR` on `cmd` when isolation resolved a redirect
+/// directory -- a no-op otherwise, mirroring
+/// `claude_code_backend.rs::apply_auto_compact_env`'s shape.
+fn apply_isolated_config_dir_env(cmd: &mut Command, isolated_config_dir: Option<&Path>) {
+    if let Some(dir) = isolated_config_dir {
+        cmd.env("PI_CODING_AGENT_DIR", dir);
     }
 }
 
 fn drive_json_events(
     child: &mut Child,
     workspace: &Workspace,
+    thrash_thresholds: crate::thrash::ThrashThresholds,
 ) -> Result<BackendOutcome, BackendError> {
     let stderr = child.stderr.take();
     let stderr_thread = stderr.map(|s| {
@@ -353,12 +489,43 @@ fn drive_json_events(
         .ok_or_else(|| BackendError("pi: no stdout pipe".to_string()))?;
     let reader = BufReader::new(stdout);
 
-    let mut state = ParseState::default();
+    let mut state = ParseState {
+        thrash: crate::thrash::ThrashTracker::new(thrash_thresholds),
+        ..ParseState::default()
+    };
     for line in reader.lines().map_while(Result::ok) {
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         process_event(&event, &mut state, workspace.root());
+        // RAL-339: stop reading at the compaction boundary itself -- a safe
+        // stop point -- instead of waiting for pi's own stdout to reach EOF,
+        // which could be arbitrarily many further (thrashing) turns away.
+        if state.compaction_thrash.is_some() {
+            break;
+        }
+    }
+
+    if let Some(detail) = state.compaction_thrash {
+        // RAL-339: the run is thrashing -- kill the child now rather than
+        // wait for a natural exit that may be arbitrarily far off, then fail
+        // the cell with whatever was captured live so far.
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(t) = stderr_thread {
+            let _ = t.join();
+        }
+        return Ok(BackendOutcome {
+            summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+            tokens_in: state.tokens_in,
+            tokens_out: state.tokens_out,
+            cache_creation_tokens: state.cache_creation_tokens,
+            cache_read_tokens: state.cache_read_tokens,
+            cost_usd: state.cost_usd,
+            agent_session_id: state.agent_session_id,
+            abandoned_background_job: None,
+            compaction_thrash: Some(detail),
+        });
     }
 
     let status = child.wait().map_err(|e| BackendError(format!("pi: {e}")))?;
@@ -376,9 +543,12 @@ fn drive_json_events(
         summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
         tokens_in: state.tokens_in,
         tokens_out: state.tokens_out,
+        cache_creation_tokens: state.cache_creation_tokens,
+        cache_read_tokens: state.cache_read_tokens,
         cost_usd: state.cost_usd,
         agent_session_id: state.agent_session_id,
         abandoned_background_job: None,
+        compaction_thrash: None,
     })
 }
 
@@ -388,9 +558,19 @@ struct ParseState {
     latest_assistant_message: String,
     tokens_in: i64,
     tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
     cost_usd: f64,
     saw_terminal_event: bool,
     printed_text_delta: bool,
+    /// RAL-339: shared compaction-thrash counter for this run (see
+    /// `crate::thrash`).
+    thrash: crate::thrash::ThrashTracker,
+    /// RAL-339: set the moment [`Self::thrash`] reports the run has crossed
+    /// into thrash -- the outer read loop in [`drive_json_events`] checks
+    /// this after every event and stops (kills the child) rather than
+    /// waiting for stdout EOF.
+    compaction_thrash: Option<crate::thrash::ThrashDetail>,
 }
 
 fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
@@ -412,10 +592,22 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
             let usage = &event["usage"];
             let tokens_in = usage["input"].as_i64().unwrap_or(0);
             let tokens_out = usage["output"].as_i64().unwrap_or(0);
+            // RAL-326: pi's own `Usage` splits prompt-cache tokens out of
+            // `input` into `cacheWrite`/`cacheRead`, so `input` alone is only
+            // the uncached slice -- the same shape claude-code and codex use.
+            let cache_creation_tokens = usage["cacheWrite"].as_i64().unwrap_or(0);
+            let cache_read_tokens = usage["cacheRead"].as_i64().unwrap_or(0);
             let cost_usd = usage["cost"]["total"].as_f64().unwrap_or(0.0);
-            if tokens_in > 0 || tokens_out > 0 || cost_usd > 0.0 {
+            if tokens_in > 0
+                || tokens_out > 0
+                || cache_creation_tokens > 0
+                || cache_read_tokens > 0
+                || cost_usd > 0.0
+            {
                 state.tokens_in = tokens_in;
                 state.tokens_out = tokens_out;
+                state.cache_creation_tokens = cache_creation_tokens;
+                state.cache_read_tokens = cache_read_tokens;
                 state.cost_usd = cost_usd;
                 crate::cartographer::emit(
                     "pi",
@@ -425,6 +617,8 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                     serde_json::json!({
                         "tokens_in": tokens_in,
                         "tokens_out": tokens_out,
+                        "cache_creation_tokens": cache_creation_tokens,
+                        "cache_read_tokens": cache_read_tokens,
                         "cost_usd": cost_usd
                     }),
                 );
@@ -438,6 +632,9 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
         }
         Some("message_end") => {
             if event["message"]["role"].as_str() == Some("assistant") {
+                // RAL-339: this fires once per assistant turn -- the natural
+                // "turns since previous compaction" tick.
+                state.thrash.record_assistant_turn();
                 let text = extract_message_text(&event["message"]);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
@@ -514,6 +711,17 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                     "error_message": error_message,
                 }),
             );
+            // RAL-339: track compaction cadence and fail closed the moment
+            // it crosses into thrash -- see `crate::thrash` for the rule.
+            if let Some(detail) = state.thrash.record_compaction() {
+                eprintln!(
+                    "[thrash] autocompaction thrashing detected: {} compactions, \
+                     most recently {} turn(s) after the previous one",
+                    detail.compaction_count, detail.turns_since_previous_compaction
+                );
+                crate::thrash::emit_thrash_event("pi", &detail);
+                state.compaction_thrash = Some(detail);
+            }
         }
         _ => {}
     }
@@ -640,6 +848,49 @@ mod tests {
         assert!(state.saw_terminal_event);
     }
 
+    /// RAL-326: pi's own `Usage` splits prompt-cache tokens out of `input`
+    /// into `cacheWrite`/`cacheRead`, so reading `input` alone captures only
+    /// the uncached slice of what was billed.
+    #[test]
+    fn process_event_captures_pis_prompt_cache_token_split() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{
+                    "input":12,
+                    "output":34,
+                    "cacheWrite":900,
+                    "cacheRead":41_000,
+                    "cost":{"total":0.56}
+                }
+            }),
+            &mut state,
+            root,
+        );
+        assert_eq!(state.tokens_in, 12, "uncached input keeps its old meaning");
+        assert_eq!(state.cache_creation_tokens, 900);
+        assert_eq!(state.cache_read_tokens, 41_000);
+    }
+
+    /// A turn served entirely from pi's cache must still be recorded -- the
+    /// pre-RAL-326 guard keyed on input/output/cost alone and dropped it.
+    #[test]
+    fn process_event_records_a_pi_turn_billed_entirely_to_the_cache() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{"input":0,"output":0,"cacheRead":41_000,"cost":{"total":0.0}}
+            }),
+            &mut state,
+            root,
+        );
+        assert_eq!(state.cache_read_tokens, 41_000);
+    }
+
     #[test]
     fn process_event_handles_compaction_events_without_panicking_or_mutating_usage() {
         // Compaction carries no session/usage/result data relevant to
@@ -666,6 +917,56 @@ mod tests {
         assert_eq!(state.tokens_in, 0);
         assert_eq!(state.tokens_out, 0);
         assert!(!state.saw_terminal_event);
+    }
+
+    /// RAL-339: the default thresholds (N=3, M=2) -- three compactions with
+    /// zero assistant turns between the second and third must fail closed at
+    /// the third compaction's own event, not later.
+    #[test]
+    fn process_event_flags_thrash_on_the_default_thresholds() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        let compaction_end = serde_json::json!({
+            "type":"compaction_end",
+            "reason":"threshold",
+            "aborted":false,
+            "result":{"tokensBefore":164975,"estimatedTokensAfter":20000}
+        });
+        process_event(&compaction_end, &mut state, root);
+        assert_eq!(state.compaction_thrash, None);
+        process_event(&compaction_end, &mut state, root);
+        assert_eq!(state.compaction_thrash, None);
+        process_event(&compaction_end, &mut state, root);
+        let detail = state
+            .compaction_thrash
+            .expect("third rapid compaction should thrash");
+        assert_eq!(detail.compaction_count, 3);
+        assert_eq!(detail.turns_since_previous_compaction, 0);
+    }
+
+    /// RAL-339: the same three compactions, but with enough assistant turns
+    /// between each, must never thrash.
+    #[test]
+    fn process_event_does_not_flag_thrash_when_turns_separate_compactions_healthily() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        let compaction_end = serde_json::json!({
+            "type":"compaction_end",
+            "reason":"threshold",
+            "aborted":false,
+            "result":{"tokensBefore":164975,"estimatedTokensAfter":20000}
+        });
+        let assistant_turn = serde_json::json!({
+            "type":"message_end",
+            "message":{"role":"assistant","content":[{"type":"text","text":"working"}]}
+        });
+        for _ in 0..3 {
+            process_event(&compaction_end, &mut state, root);
+            assert_eq!(state.compaction_thrash, None);
+            process_event(&assistant_turn, &mut state, root);
+            process_event(&assistant_turn, &mut state, root);
+        }
+        assert_eq!(state.compaction_thrash, None);
     }
 
     #[test]
@@ -698,7 +999,8 @@ mod tests {
     #[test]
     fn apply_context_settings_writes_models_json_context_window() {
         let dir = temp_settings_dir("models-create");
-        apply_context_settings_in(&dir, Some("openrouter/deepseek"), Some(100_000), None).unwrap();
+        apply_context_settings_in(&dir, Some("openrouter/deepseek"), Some(100_000), None, None)
+            .unwrap();
 
         let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
         let json: Value = serde_json::from_str(&text).unwrap();
@@ -719,6 +1021,7 @@ mod tests {
             Some("openrouter/deepseek"),
             Some(100_000),
             Some(80_000),
+            None,
         )
         .unwrap();
 
@@ -751,15 +1054,19 @@ mod tests {
             Some("openrouter/deepseek"),
             Some(100_000),
             Some(80_000),
+            None,
         )
         .unwrap();
 
         let models: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap())
                 .unwrap();
+        // RAL-333: no explicit tool_output_max_tokens was given, so the
+        // pre-existing maxTokens is overwritten with 75% of maximum_context
+        // rather than preserved.
         assert_eq!(
             models["providers"]["openrouter"]["modelOverrides"]["deepseek"]["maxTokens"],
-            serde_json::json!(4096)
+            serde_json::json!(75_000)
         );
         assert_eq!(
             models["providers"]["openrouter"]["modelOverrides"]["deepseek"]["contextWindow"],
@@ -785,8 +1092,8 @@ mod tests {
     #[test]
     fn apply_context_settings_errors_without_provider_qualified_model() {
         let dir = temp_settings_dir("no-provider");
-        let err =
-            apply_context_settings_in(&dir, Some("deepseek"), Some(100_000), None).unwrap_err();
+        let err = apply_context_settings_in(&dir, Some("deepseek"), Some(100_000), None, None)
+            .unwrap_err();
         assert!(err.0.contains("provider"), "unexpected error: {}", err.0);
         assert!(!dir.join("models.json").exists());
 
@@ -796,8 +1103,9 @@ mod tests {
     #[test]
     fn apply_context_settings_errors_when_threshold_set_without_maximum_context() {
         let dir = temp_settings_dir("no-max");
-        let err = apply_context_settings_in(&dir, Some("openrouter/deepseek"), None, Some(80_000))
-            .unwrap_err();
+        let err =
+            apply_context_settings_in(&dir, Some("openrouter/deepseek"), None, Some(80_000), None)
+                .unwrap_err();
         assert!(
             err.0
                 .contains("auto_compact_threshold requires maximum_context"),
@@ -816,6 +1124,7 @@ mod tests {
             Some("openrouter/deepseek"),
             Some(80_000),
             Some(100_000),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -830,8 +1139,162 @@ mod tests {
     #[test]
     fn apply_context_settings_is_a_noop_when_neither_field_is_set() {
         // Deliberately doesn't touch PI_CODING_AGENT_DIR -- a `pi` cell that
-        // never sets either field must never require it.
-        assert!(apply_context_settings(None, None, None).is_ok());
+        // never sets any of the three fields must never require it.
+        assert!(apply_context_settings(None, None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn apply_context_settings_writes_models_json_max_tokens() {
+        let dir = temp_settings_dir("max-tokens-create");
+        apply_context_settings_in(&dir, Some("openrouter/deepseek"), None, None, Some(20_000))
+            .unwrap();
+
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["maxTokens"],
+            serde_json::json!(20_000)
+        );
+        assert!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["contextWindow"]
+                .is_null()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_context_settings_writes_both_context_window_and_max_tokens() {
+        let dir = temp_settings_dir("max-tokens-with-context");
+        apply_context_settings_in(
+            &dir,
+            Some("openrouter/deepseek"),
+            Some(100_000),
+            None,
+            Some(20_000),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["contextWindow"],
+            serde_json::json!(100_000)
+        );
+        assert_eq!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["maxTokens"],
+            serde_json::json!(20_000)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_context_settings_defaults_max_tokens_to_75_percent_of_maximum_context() {
+        // maximum_context alone (no explicit tool_output_max_tokens) must
+        // still synthesize a maxTokens default of 75% of maximum_context,
+        // per the ticket's confirmed scope (RAL-333).
+        let dir = temp_settings_dir("synthesized-default");
+        apply_context_settings_in(&dir, Some("openrouter/deepseek"), Some(100_000), None, None)
+            .unwrap();
+
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["maxTokens"],
+            serde_json::json!(75_000)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_context_settings_explicit_max_tokens_overrides_the_75_percent_default() {
+        let dir = temp_settings_dir("explicit-overrides-default");
+        apply_context_settings_in(
+            &dir,
+            Some("openrouter/deepseek"),
+            Some(100_000),
+            None,
+            Some(20_000),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["maxTokens"],
+            serde_json::json!(20_000)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_context_settings_errors_without_provider_qualified_model_for_max_tokens_alone() {
+        let dir = temp_settings_dir("no-provider-max-tokens");
+        let err = apply_context_settings_in(&dir, Some("deepseek"), None, None, Some(20_000))
+            .unwrap_err();
+        assert!(err.0.contains("provider"), "unexpected error: {}", err.0);
+        assert!(!dir.join("models.json").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_context_settings_errors_when_dir_is_none_but_a_field_is_set() {
+        let err =
+            apply_context_settings(None, Some("openrouter/deepseek"), Some(100_000), None, None)
+                .unwrap_err();
+        assert!(err.0.contains("PI_CODING_AGENT_DIR"), "{}", err.0);
+    }
+
+    #[test]
+    fn apply_context_settings_writes_into_the_given_dir_not_the_ambient_env_var() {
+        // RAL-336: `apply_context_settings` must operate against whatever
+        // `dir` the caller resolved (the isolated directory, when isolation
+        // is on) -- never fall back to reading `PI_CODING_AGENT_DIR` itself.
+        let dir = temp_settings_dir("explicit-dir");
+        apply_context_settings(
+            Some(&dir),
+            Some("openrouter/deepseek"),
+            Some(100_000),
+            None,
+            None,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["providers"]["openrouter"]["modelOverrides"]["deepseek"]["contextWindow"],
+            serde_json::json!(100_000)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── RAL-336 agent isolation ────────────────────────────────────────────
+
+    #[test]
+    fn apply_isolated_config_dir_env_sets_the_var_when_some() {
+        let dir = std::env::temp_dir().join("ralphus-pi-isolation-test");
+        let mut cmd = Command::new("echo");
+        apply_isolated_config_dir_env(&mut cmd, Some(&dir));
+        let val = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "PI_CODING_AGENT_DIR")
+            .and_then(|(_, v)| v);
+        assert_eq!(val, Some(dir.as_os_str()));
+    }
+
+    #[test]
+    fn apply_isolated_config_dir_env_is_a_noop_when_none() {
+        let mut cmd = Command::new("echo");
+        apply_isolated_config_dir_env(&mut cmd, None);
+        assert!(
+            cmd.get_envs()
+                .find(|(k, _)| *k == "PI_CODING_AGENT_DIR")
+                .is_none()
+        );
     }
 
     #[test]

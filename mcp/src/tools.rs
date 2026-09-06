@@ -1,5 +1,5 @@
 //! Builds the MCP tool registry directly from `help_map::registered_leaves()`
-//! (RAL-301) -- the same tree `cli-rs/tests/help_map_command_parity.rs`
+//! (RAL-301) -- the same tree `cli/tests/help_map_command_parity.rs`
 //! already made trustworthy against `commands::parse_args`, reused here per
 //! the ticket's own suggestion rather than re-declaring the command surface
 //! a third time.

@@ -55,16 +55,24 @@ struct RunnerEvent {
 }
 
 /// Live token/cost usage extracted from a runner event's payload (RAL-161),
-/// mirroring the `agent_session_id` capture alongside it.
+/// mirroring the `agent_session_id` capture alongside it. Also the shape
+/// [`Store::set_cell_live_usage`] persists and the one every
+/// snapshot-derived [`RunnerResult`] constructor
+/// ([`RunnerResult::cost_exceeded`], [`RunnerResult::detached`]) takes, so
+/// growing the set of tracked usage fields is a one-place edit.
 ///
-/// `pub(crate)` (not private): [`crate::remote_runner::ProviderRunner`] needs
-/// this too, to drive the same live cost-cap kill for a remote session that
+/// `pub` (not private): [`crate::remote_runner::ProviderRunner`] needs this
+/// too, to drive the same live cost-cap kill for a remote session that
 /// [`SubprocessRunner`] already does locally.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct LiveUsage {
-    pub(crate) tokens_in: i64,
-    pub(crate) tokens_out: i64,
-    pub(crate) cost_usd: f64,
+pub struct LiveUsage {
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    /// RAL-326: prompt-cache write/read tokens, carried alongside (never
+    /// folded into) `tokens_in`.
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
 }
 
 /// What [`forward_runner_event`] learned from one event, for the caller's own
@@ -133,6 +141,12 @@ pub struct RunnerSpec {
     /// `None` means no explicit threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_compact_threshold: Option<u64>,
+    /// Tool-output token cap (RAL-333), delivered to the backend via its own
+    /// mechanism (env var/CLI arg/settings file -- see
+    /// `ralphus_core::schema::agent_supports_tool_output_max_tokens`). `None`
+    /// means no cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output_max_tokens: Option<u64>,
     /// True when this spec is an `agent`-kind proof step rather than a
     /// normal cell: the runner wraps `prompt` with verdict-reporting
     /// instructions and returns a `proofed` result instead of just "ran".
@@ -206,6 +220,35 @@ pub struct RunnerSpec {
     /// default (200).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_arg_truncate_chars: Option<u32>,
+    /// RAL-339: the resolved `.ralphus.toml` `[thrash]` thresholds -- N
+    /// (compact count, `crate::config::ThrashConfig::max_compactions`) and M
+    /// (turn-gap, `crate::config::ThrashConfig::min_turn_gap`), forwarded
+    /// over the stdin wire contract the same way `tool_arg_truncate_chars`
+    /// is, so the runner's shared `ThrashTracker` (`runner/src/thrash.rs`)
+    /// knows when a run's compaction cadence counts as thrashing. Resolved
+    /// once here (daemon-side, the sole owner of `.ralphus.toml`) rather
+    /// than read by the runner subprocess itself. `None` means the runner
+    /// falls back to its own defaults (3 / 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thrash_max_compactions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thrash_min_turn_gap: Option<u32>,
+    /// RAL-336: the resolved `[agent_isolation] allow_personal_settings`
+    /// value (`crate::config::AgentIsolationConfig::allow_personal_settings`),
+    /// forwarded over the stdin wire contract so the spawned backend knows
+    /// whether it may read the operator's real personal settings (Claude Code
+    /// `--setting-sources`/`settings.json`, Codex `config.toml`, Pi
+    /// `settings.json`/`models.json`) instead of an isolated copy. Always
+    /// serialized (no `skip_serializing_if`) so the wire contract has no
+    /// ambiguous "unset" state -- defaults to `false` (isolated) wherever this
+    /// spec isn't resolved from `.ralphus.toml` (proof/internal invocations).
+    pub allow_personal_settings: bool,
+    /// RAL-336: the resolved `[agent_isolation] allow_personal_memory` value
+    /// (`crate::config::AgentIsolationConfig::allow_personal_memory`) --
+    /// same rationale as [`Self::allow_personal_settings`], but for the
+    /// operator's personal memory (Claude Code's global `CLAUDE.md`/history,
+    /// Codex/Pi's equivalent). Defaults to `false` (isolated).
+    pub allow_personal_memory: bool,
 }
 
 /// Generate a fresh RFC 4122 version-4 (random) UUID, formatted as the
@@ -348,6 +391,15 @@ fn resolved_tool_arg_truncate_chars() -> u32 {
     crate::config::load_live_view_config().tool_arg_truncate_chars()
 }
 
+/// RAL-339: the effective `.ralphus.toml` `[thrash]` thresholds (N, M), read
+/// fresh at spec-construction time -- mirrors
+/// [`resolved_tool_arg_truncate_chars`]'s "read live so a config change takes
+/// effect on a squad's next cell without a daemon restart" reasoning.
+fn resolved_thrash_thresholds() -> (u32, u32) {
+    let cfg = crate::config::load_thrash_config();
+    (cfg.max_compactions(), cfg.min_turn_gap())
+}
+
 impl RunnerSpec {
     /// Build a spec from a stored cell row.
     ///
@@ -400,6 +452,10 @@ impl RunnerSpec {
             .system_prompt_position
             .clone()
             .or_else(|| system_prompt.as_ref().map(|_| "append".to_string()));
+        let (thrash_max_compactions, thrash_min_turn_gap) = resolved_thrash_thresholds();
+        let agent_isolation = crate::config::resolve_agent_isolation(std::path::Path::new(
+            row.cwd.as_deref().unwrap_or(""),
+        ));
         Self {
             squad_id: squad_id.to_string(),
             task: row.task_name.clone(),
@@ -419,6 +475,9 @@ impl RunnerSpec {
             auto_compact_threshold: row
                 .auto_compact_threshold
                 .and_then(|v| u64::try_from(v).ok()),
+            tool_output_max_tokens: row
+                .tool_output_max_tokens
+                .and_then(|v| u64::try_from(v).ok()),
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -428,6 +487,10 @@ impl RunnerSpec {
             // cell to its machine. `None` for every pre-RAL-185 row.
             machine: row.machine.clone(),
             tool_arg_truncate_chars: Some(resolved_tool_arg_truncate_chars()),
+            thrash_max_compactions: Some(thrash_max_compactions),
+            thrash_min_turn_gap: Some(thrash_min_turn_gap),
+            allow_personal_settings: agent_isolation.allow_personal_settings(),
+            allow_personal_memory: agent_isolation.allow_personal_memory(),
         }
     }
 
@@ -458,7 +521,17 @@ impl RunnerSpec {
         model: Option<&str>,
         timeout_sec: Option<u64>,
         budget_tokens: Option<u64>,
+        // The proof step's resolved tool-output token cap (RAL-333), already
+        // resolved against its real parent -- a task-scope proof against the
+        // task, a cell-scope proof against its owning cell. Unlike
+        // `maximum_context`/`auto_compact_threshold` below, proof steps do
+        // carry this field (see `ralphus_core::schema::
+        // resolve_task_proof_tool_output_max_tokens`/
+        // `resolve_cell_proof_tool_output_max_tokens`).
+        tool_output_max_tokens: Option<u64>,
     ) -> Self {
+        let (thrash_max_compactions, thrash_min_turn_gap) = resolved_thrash_thresholds();
+        let agent_isolation = crate::config::resolve_agent_isolation(std::path::Path::new(cwd));
         Self {
             squad_id: squad_id.to_string(),
             task: task.to_string(),
@@ -481,6 +554,7 @@ impl RunnerSpec {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -488,6 +562,10 @@ impl RunnerSpec {
             env_overrides: BTreeMap::new(),
             machine: None,
             tool_arg_truncate_chars: Some(resolved_tool_arg_truncate_chars()),
+            thrash_max_compactions: Some(thrash_max_compactions),
+            thrash_min_turn_gap: Some(thrash_min_turn_gap),
+            allow_personal_settings: agent_isolation.allow_personal_settings(),
+            allow_personal_memory: agent_isolation.allow_personal_memory(),
         }
     }
 
@@ -542,6 +620,9 @@ impl RunnerSpec {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            // Command-kind proof steps never reach a `ModelBackend`, so there
+            // is no tool-output cap to configure here either.
+            tool_output_max_tokens: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -552,6 +633,14 @@ impl RunnerSpec {
             // `runner::execute::run_cell`'s `command` branch), so there is no
             // tool-call rendering here to configure.
             tool_arg_truncate_chars: None,
+            // Nor is there anything to compact -- no `ModelBackend` means no
+            // compaction events at all.
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            // Same rationale: no `ModelBackend` reached, so isolation is
+            // inert here.
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         }
     }
 }
@@ -567,9 +656,26 @@ pub struct RunnerResult {
     /// Output tokens used.
     #[serde(default)]
     pub tokens_out: i64,
+    /// RAL-326: prompt-cache *write* tokens -- input billed at the
+    /// cache-creation rate. Deliberately not folded into `tokens_in`, which
+    /// keeps meaning "uncached input". `0` for a backend whose harness
+    /// reports no cache breakdown.
+    #[serde(default)]
+    pub cache_creation_tokens: i64,
+    /// RAL-326: prompt-cache *read* tokens -- input served from an existing
+    /// cache entry. See `cache_creation_tokens`.
+    #[serde(default)]
+    pub cache_read_tokens: i64,
     /// Cost in USD.
     #[serde(default)]
     pub cost_usd: f64,
+    /// RAL-326: `true` when the usage figures above are the last live
+    /// mid-run snapshot rather than the backend's own terminal accounting --
+    /// the cell's process was lost, cancelled, timed out, or killed before a
+    /// final usage event arrived. The board badges such a row as estimated so
+    /// a snapshot is never read as a settled bill.
+    #[serde(default)]
+    pub cost_is_estimated: bool,
     /// Short summary of what happened.
     #[serde(default)]
     pub summary: String,
@@ -603,7 +709,10 @@ impl RunnerResult {
             status: "failed".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: String::new(),
             error: Some(error.into()),
             proofed: None,
@@ -620,12 +729,19 @@ impl RunnerResult {
     /// would regress the board's already-live numbers back to `$0.0000` on
     /// the final write.
     #[must_use]
-    pub fn cost_exceeded(tokens_in: i64, tokens_out: i64, cost_usd: f64, cap: f64) -> Self {
+    pub fn cost_exceeded(usage: LiveUsage, cap: f64) -> Self {
+        let cost_usd = usage.cost_usd;
         Self {
             status: "failed".to_string(),
-            tokens_in,
-            tokens_out,
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
             cost_usd,
+            // The cap fires off a live snapshot, never a terminal usage
+            // event, so what it records is an estimate by construction
+            // (RAL-326).
+            cost_is_estimated: true,
             summary: String::new(),
             error: Some(format!(
                 "terminated: cost ${cost_usd:.4} exceeded maximum_budget_usd cap ${cap:.4}"
@@ -642,17 +758,17 @@ impl RunnerResult {
     /// [`Self::cost_exceeded`]'s reasoning -- the board's numbers must not
     /// regress to zero just because the cell paused rather than finished.
     #[must_use]
-    pub fn detached(
-        tokens_in: i64,
-        tokens_out: i64,
-        cost_usd: f64,
-        agent_session_id: Option<String>,
-    ) -> Self {
+    pub fn detached(usage: LiveUsage, agent_session_id: Option<String>) -> Self {
         Self {
             status: "detached".to_string(),
-            tokens_in,
-            tokens_out,
-            cost_usd,
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cost_usd: usage.cost_usd,
+            // Same reasoning as `cost_exceeded`: a detach point is a live
+            // snapshot, not a final accounting (RAL-326).
+            cost_is_estimated: true,
             summary: String::new(),
             error: None,
             proofed: None,
@@ -1295,11 +1411,7 @@ impl SubprocessRunner {
         // RAL-161: the last live usage snapshot seen from a runner event, so
         // an over-budget kill can carry the real tokens/cost through to
         // `record_cell_result` instead of zeroing them out.
-        let mut current_usage = LiveUsage {
-            tokens_in: 0,
-            tokens_out: 0,
-            cost_usd: 0.0,
-        };
+        let mut current_usage = LiveUsage::default();
         // RAL-161: when a cost cap is configured, this loop's own cadence
         // (the check itself is a cheap in-memory float comparison) is driven
         // by the configurable, tighter `[budget].poll_interval_ms` instead of
@@ -1331,12 +1443,7 @@ impl SubprocessRunner {
                     attempt_spec.squad_id,
                     attempt_spec.cell_id
                 );
-                break RunnerResult::detached(
-                    current_usage.tokens_in,
-                    current_usage.tokens_out,
-                    current_usage.cost_usd,
-                    resumable_agent_session_id.clone(),
-                );
+                break RunnerResult::detached(current_usage, resumable_agent_session_id.clone());
             }
             if timed_out(started.elapsed(), deadline) {
                 let _ = tmux.kill_session(session_name);
@@ -1364,12 +1471,7 @@ impl SubprocessRunner {
                         "tmux session killed: cost limit exceeded",
                         session_name,
                     );
-                    break RunnerResult::cost_exceeded(
-                        current_usage.tokens_in,
-                        current_usage.tokens_out,
-                        current_usage.cost_usd,
-                        cap,
-                    );
+                    break RunnerResult::cost_exceeded(current_usage, cap);
                 }
             }
             if first_tick || last_tmux_poll.elapsed() >= TMUX_POLL_INTERVAL {
@@ -1591,12 +1693,14 @@ impl SubprocessRunner {
             spec.squad_id,
             threshold_ms / 1000,
         );
+        let entity_uri = guard.cell_entity_uri(&spec.squad_id, &spec.task, &spec.cell_id);
         if let Ok(message_id) = guard.enqueue_mailbox_message(
             crate::mailbox::MailboxPriority::High,
             &text,
             Some(&spec.squad_id),
             Some(&spec.task),
             Some(&spec.cell_id),
+            entity_uri.as_deref(),
         ) {
             crate::cartographer::Note::new("runner")
                 .level(crate::logging::LogLevel::WARNING)
@@ -1746,16 +1850,19 @@ pub(crate) fn forward_runner_event(
     let Some(store) = cartographer else {
         return ForwardedEvent::default();
     };
-    let event: RunnerEvent = match serde_json::from_str(json) {
+    let mut event: RunnerEvent = match serde_json::from_str(json) {
         Ok(e) => e,
         Err(e) => {
+            let registered = crate::redact::redact_all(json);
+            let redacted = ralphus_core::redact::redact_secrets(&registered);
             crate::rlog!(
                 WARNING,
-                "ralphus [runner] malformed RALPHUS_EVENT: {e} ({json:?})"
+                "ralphus [runner] malformed RALPHUS_EVENT: {e} ({redacted:?})"
             );
             return ForwardedEvent::default();
         }
     };
+    redact_event(&mut event);
     let level = event
         .level
         .as_deref()
@@ -1813,19 +1920,32 @@ pub(crate) fn forward_runner_event(
             .get("tokens_out")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+        // RAL-326: absent for a backend that reports no cache breakdown, and
+        // for any pre-RAL-326 runner still emitting the two-field payload.
+        let cache_creation_tokens = event
+            .payload
+            .get("cache_creation_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let cache_read_tokens = event
+            .payload
+            .get("cache_read_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let usage = LiveUsage {
+            tokens_in,
+            tokens_out,
+            cache_creation_tokens,
+            cache_read_tokens,
+            cost_usd,
+        };
         let _ = guard.set_cell_live_usage(
             event.squad_id.as_deref().unwrap_or(squad_id),
             event.task.as_deref().unwrap_or(task),
             event.cell_id.as_deref().unwrap_or(cell_id),
-            tokens_in,
-            tokens_out,
-            cost_usd,
+            usage,
         );
-        live_usage = Some(LiveUsage {
-            tokens_in,
-            tokens_out,
-            cost_usd,
-        });
+        live_usage = Some(usage);
     }
     if event.message != LIVE_USAGE_MESSAGE {
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -1839,12 +1959,44 @@ pub(crate) fn forward_runner_event(
             task: Some(event.task.as_deref().unwrap_or(task)),
             log_path: None,
             payload: event.payload,
+            admin_only: false,
         });
     }
     ForwardedEvent {
         agent_session_id: captured_agent_session_id,
         live_usage,
     }
+}
+
+fn redact_event(event: &mut RunnerEvent) {
+    fn text(value: &mut String) {
+        let registered = crate::redact::redact_all(value);
+        *value = ralphus_core::redact::redact_secrets(&registered).into_owned();
+    }
+    fn value(node: &mut serde_json::Value) {
+        match node {
+            serde_json::Value::String(string) => text(string),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(value),
+            serde_json::Value::Object(fields) => fields.values_mut().for_each(value),
+            _ => {}
+        }
+    }
+
+    text(&mut event.source);
+    text(&mut event.message);
+    for field in [
+        &mut event.level,
+        &mut event.scope,
+        &mut event.squad_id,
+        &mut event.cell_id,
+        &mut event.task,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        text(field);
+    }
+    value(&mut event.payload);
 }
 
 /// Fold the last-known live usage snapshot into a result that reports none
@@ -1866,10 +2018,23 @@ pub(crate) fn forward_runner_event(
 /// [`RunnerResult::cost_exceeded`] already carries real figures, so this is a
 /// no-op for it.
 fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
-    if result.tokens_in == 0 && result.tokens_out == 0 && result.cost_usd == 0.0 {
+    if result.tokens_in == 0
+        && result.tokens_out == 0
+        && result.cache_creation_tokens == 0
+        && result.cache_read_tokens == 0
+        && result.cost_usd == 0.0
+    {
         result.tokens_in = live.tokens_in;
         result.tokens_out = live.tokens_out;
+        result.cache_creation_tokens = live.cache_creation_tokens;
+        result.cache_read_tokens = live.cache_read_tokens;
         result.cost_usd = live.cost_usd;
+        // RAL-326: what lands here is a mid-run snapshot priced by
+        // `claude_code_backend::estimate_cost_usd`'s approximate table, not
+        // the backend's own final figure -- and it stops at whatever turn the
+        // process died on. Marking it keeps the board from presenting a
+        // permanently-recorded guess as an authoritative bill.
+        result.cost_is_estimated = true;
     }
 }
 
@@ -1957,8 +2122,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let json = serde_json::to_string(&spec).unwrap();
@@ -1992,8 +2159,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         // No `[live_view]` config file in the test environment, so this
@@ -2026,15 +2195,19 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: Some(100_000),
             auto_compact_threshold: Some(80_000),
+            tool_output_max_tokens: Some(40_000),
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(spec.maximum_context, Some(100_000));
         assert_eq!(spec.auto_compact_threshold, Some(80_000));
+        assert_eq!(spec.tool_output_max_tokens, Some(40_000));
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"maximum_context\":100000"));
         assert!(json.contains("\"auto_compact_threshold\":80000"));
+        assert!(json.contains("\"tool_output_max_tokens\":40000"));
     }
 
     #[test]
@@ -2058,8 +2231,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(
@@ -2093,6 +2268,7 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -2100,6 +2276,10 @@ mod tests {
             env_overrides: BTreeMap::new(),
             machine: None,
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         }
     }
 
@@ -2217,8 +2397,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let effective = RunnerSpec::from_row("run-1", &row)
             .effective_system_prompt()
@@ -2242,6 +2424,7 @@ mod tests {
             Some("qwen3:8b"),
             Some(300),
             Some(10000),
+            None,
         )
         .effective_system_prompt()
         .expect("prompt proofs should have a system prompt");
@@ -2272,8 +2455,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         assert!(
             RunnerSpec::from_row("run-1", &row)
@@ -2303,8 +2488,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let json = serde_json::to_string(&RunnerSpec::from_row("run-1", &row)).unwrap();
         assert!(!json.contains("system_prompt"));
@@ -2322,6 +2509,7 @@ mod tests {
             Some("qwen3:8b"),
             Some(300),
             Some(10000),
+            None,
         );
         assert!(spec.proof);
         assert_eq!(spec.timeout_sec, Some(300));
@@ -2338,7 +2526,10 @@ mod tests {
             status: "done".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: String::new(),
             error: None,
             proofed: Some(true),
@@ -2382,8 +2573,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -2422,8 +2615,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -2456,8 +2651,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -2496,8 +2693,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert!(
@@ -2541,6 +2740,38 @@ mod tests {
         assert_eq!(row.squad_id.as_deref(), Some("run-1"));
         assert_eq!(row.cell_id.as_deref(), Some("s0"));
         assert_eq!(row.payload, serde_json::json!({"prompt_len": 42}));
+    }
+
+    #[test]
+    fn forward_runner_event_redacts_registered_secrets_before_cartographer() {
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            crate::redact::register("phase7-event-secret");
+            let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+            forward_runner_event(
+                Some(&store),
+                "run-1",
+                "s0",
+                "build",
+                &serde_json::json!({
+                    "source": "remote-runner",
+                    "message": "saw phase7-event-secret",
+                    "payload": {
+                        "nested": ["phase7-event-secret", {"detail": "x phase7-event-secret y"}]
+                    }
+                })
+                .to_string(),
+            );
+            let page = store
+                .lock()
+                .unwrap()
+                .cartographer_query(&crate::cartographer::CartographerFilter::recent(10))
+                .unwrap();
+            let rendered = format!("{:?}", page.rows);
+            assert!(!rendered.contains("phase7-event-secret"), "{rendered}");
+            assert!(rendered.contains(crate::redact::REDACTED), "{rendered}");
+            crate::redact::clear_for_tests();
+        });
     }
 
     /// A task file with one `build` task holding one `worker` cell — the
@@ -2622,7 +2853,13 @@ prompt = "make it build"
                 "source": source,
                 "message": "live usage",
                 "level": "info",
-                "payload": {"tokens_in": tokens_in, "tokens_out": 7, "cost_usd": 1.25},
+                "payload": {
+                    "tokens_in": tokens_in,
+                    "tokens_out": 7,
+                    "cache_creation_tokens": 11,
+                    "cache_read_tokens": 13,
+                    "cost_usd": 1.25,
+                },
             })
             .to_string();
 
@@ -2633,6 +2870,8 @@ prompt = "make it build"
                 Some(LiveUsage {
                     tokens_in,
                     tokens_out: 7,
+                    cache_creation_tokens: 11,
+                    cache_read_tokens: 13,
                     cost_usd: 1.25,
                 }),
                 "{source}: the snapshot the cost cap reads must be returned"
@@ -2641,6 +2880,11 @@ prompt = "make it build"
             let cell = &squad.tasks[0].cells[0];
             assert_eq!(cell.tokens_in, tokens_in, "{source}: tokens_in persisted");
             assert_eq!(cell.tokens_out, 7, "{source}: tokens_out persisted");
+            assert_eq!(
+                (cell.cache_creation_tokens, cell.cache_read_tokens),
+                (11, 13),
+                "{source}: RAL-326 cache tokens persisted"
+            );
             assert!(
                 (cell.cost_usd - 1.25).abs() < f64::EPSILON,
                 "{source}: cost_usd persisted, got {}",
@@ -2868,14 +3112,21 @@ prompt = "make it build"
         let live = LiveUsage {
             tokens_in: 8_685_138,
             tokens_out: 49_415,
+            cache_creation_tokens: 320_114,
+            cache_read_tokens: 7_204_990,
             cost_usd: 0.0,
         };
         let mut lost = RunnerResult::failure("runner produced no result file");
         backfill_live_usage(&mut lost, live);
         assert_eq!(lost.tokens_in, 8_685_138);
         assert_eq!(lost.tokens_out, 49_415);
+        assert_eq!(lost.cache_creation_tokens, 320_114);
+        assert_eq!(lost.cache_read_tokens, 7_204_990);
         // Codex reports no cost anywhere, so this stays 0 — rendered "N/A".
         assert_eq!(lost.cost_usd, 0.0);
+        // RAL-326: a backfilled snapshot is never the backend's own final
+        // accounting, so it must carry the estimate marker the board badges.
+        assert!(lost.cost_is_estimated);
     }
 
     #[test]
@@ -2883,6 +3134,8 @@ prompt = "make it build"
         let live = LiveUsage {
             tokens_in: 10,
             tokens_out: 2,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.5,
         };
         // A completed run's own numbers are authoritative, even though the
@@ -2890,7 +3143,10 @@ prompt = "make it build"
         let mut done = RunnerResult {
             tokens_in: 7,
             tokens_out: 1,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.25,
+            cost_is_estimated: false,
             ..RunnerResult::failure("x")
         };
         backfill_live_usage(&mut done, live);
@@ -2899,11 +3155,26 @@ prompt = "make it build"
             (7, 1, 0.25)
         );
         // `cost_exceeded` already carries real figures: a no-op.
-        let mut capped = RunnerResult::cost_exceeded(99, 9, 1.5, 1.0);
+        let mut capped = RunnerResult::cost_exceeded(
+            LiveUsage {
+                tokens_in: 99,
+                tokens_out: 9,
+                cache_creation_tokens: 4,
+                cache_read_tokens: 5,
+                cost_usd: 1.5,
+            },
+            1.0,
+        );
         backfill_live_usage(&mut capped, live);
         assert_eq!(
-            (capped.tokens_in, capped.tokens_out, capped.cost_usd),
-            (99, 9, 1.5)
+            (
+                capped.tokens_in,
+                capped.tokens_out,
+                capped.cache_creation_tokens,
+                capped.cache_read_tokens,
+                capped.cost_usd
+            ),
+            (99, 9, 4, 5, 1.5)
         );
     }
 
@@ -2987,8 +3258,10 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let spec = RunnerSpec::from_row(&run_id, &row);
         // See the sibling `..._for_a_command_kind_spec` test: cancel on
@@ -3068,8 +3341,10 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         };
         let result = runner.run(&RunnerSpec::from_row(&run_id, &row));
         assert!(!result.is_done());
@@ -3236,6 +3511,7 @@ prompt = "make it build"
             "claude",
             None,
             Some(60),
+            None,
             None,
         );
         let result = runner.run(&spec);
@@ -3456,6 +3732,7 @@ prompt = "make it build"
             None,
             Some(1),
             None,
+            None,
         );
         let started = Instant::now();
         let result = runner.run(&spec);
@@ -3510,6 +3787,7 @@ prompt = "make it build"
             None,
             None,
             None,
+            None,
         );
         let cancel = CancelToken::new();
         let cancel_clone = cancel.clone();
@@ -3520,6 +3798,107 @@ prompt = "make it build"
         let result = runner.run_cancellable(&spec, &cancel);
         assert!(!result.is_done());
         assert_eq!(result.error.as_deref(), Some("cancelled"));
+    }
+
+    #[cfg_attr(
+        windows,
+        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
+    )]
+    #[test]
+    fn live_tmux_cancel_kills_the_real_process_tree() {
+        // RAL-321: `Tmux::kill_session` used to only free the tmux/psmux
+        // session *name* -- the pane's real process tree (the psmux server
+        // and everything it spawned into the pane) kept running underneath
+        // it. `live_tmux_run_via_tmux_is_cancellable` above only asserts the
+        // runner reports "cancelled"; this asserts the actual OS process is
+        // gone too, via `crate::tmux::find_server_pid` +
+        // `crate::tmux::test_pid_is_alive` (both Windows-only, see their own
+        // doc comments -- there is no equivalent confinement on Unix, see
+        // `tmux.rs`'s module doc comment).
+        if !tmux_and_python_available() {
+            println!("SKIP: tmux and/or python not found on PATH");
+            return;
+        }
+        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tmux::sweep_dead_test_sessions_once();
+        let run_id = crate::tmux::unique_test_tag("run-tmux-killtree");
+        let _cleanup = SnapshotCleanup {
+            squad_id: run_id.clone(),
+            task: "build".to_string(),
+            cell_id: "killtree-session".to_string(),
+        };
+        let session_name = crate::tmux::session_name(&run_id, "build", "killtree-session");
+        let runner = SubprocessRunner {
+            program: "python".to_string(),
+            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
+            registry: None,
+            cartographer: None,
+            detachments: None,
+        };
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let spec = RunnerSpec::for_proof(
+            &run_id,
+            "build",
+            "killtree-session",
+            &cwd,
+            "do something",
+            "claude",
+            None,
+            None,
+            None,
+            None,
+        );
+        let cancel = CancelToken::new();
+        let cancel_for_worker = cancel.clone();
+        let worker = std::thread::spawn(move || runner.run_cancellable(&spec, &cancel_for_worker));
+
+        if !cfg!(target_os = "windows") {
+            // No process-table lookup off Windows (`find_server_pid` always
+            // returns `None` there), so there is nothing to assert real OS
+            // death against -- still exercise the cancel path itself.
+            std::thread::sleep(Duration::from_millis(300));
+            cancel.cancel();
+            let result = worker.join().unwrap();
+            assert!(!result.is_done());
+            assert_eq!(result.error.as_deref(), Some("cancelled"));
+            return;
+        }
+
+        let deadline = Instant::now() + PID_POLL_BUDGET;
+        let pid = loop {
+            if let Some(pid) = crate::tmux::find_server_pid(&session_name) {
+                break Some(pid);
+            }
+            if worker.is_finished() || Instant::now() >= deadline {
+                break crate::tmux::find_server_pid(&session_name);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        .expect("tmux server pid should be found while the session is running");
+        assert!(
+            crate::tmux::test_pid_is_alive(pid),
+            "tmux server pid={pid} should be alive before cancel"
+        );
+
+        cancel.cancel();
+        let result = worker.join().unwrap();
+        assert!(!result.is_done());
+        assert_eq!(result.error.as_deref(), Some("cancelled"));
+
+        // Bounded poll, not a fixed sleep: `kill_session`'s own wait loop
+        // already bounds how long `has-session` takes to clear, so this
+        // should resolve almost immediately once `run_cancellable` returns --
+        // the point of RAL-321 is that this used to never become true at all.
+        let death_deadline = Instant::now() + Duration::from_secs(10);
+        while crate::tmux::test_pid_is_alive(pid) && Instant::now() < death_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !crate::tmux::test_pid_is_alive(pid),
+            "tmux server pid={pid} should be dead after cancel (RAL-321: process-tree confinement)"
+        );
     }
 
     #[test]
@@ -3551,6 +3930,7 @@ prompt = "make it build"
             &cwd,
             "do something",
             "claude",
+            None,
             None,
             None,
             None,
@@ -3651,6 +4031,7 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -3658,6 +4039,10 @@ prompt = "make it build"
             env_overrides: BTreeMap::new(),
             machine: None,
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 
@@ -3783,6 +4168,7 @@ prompt = "make it build"
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -3790,6 +4176,10 @@ prompt = "make it build"
             env_overrides: BTreeMap::new(),
             machine: None,
             tool_arg_truncate_chars: None,
+            thrash_max_compactions: None,
+            thrash_min_turn_gap: None,
+            allow_personal_settings: false,
+            allow_personal_memory: false,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 

@@ -23,6 +23,17 @@ pub struct ChatMessage {
     pub image: Option<String>,
 }
 
+/// Token usage reported by a direct chat call, when the provider's response
+/// shape carries it. `0`/`0` when the provider didn't report usage (e.g.
+/// Ollama's OpenAI-compatible endpoint on older builds) -- callers computing
+/// a dollar cost from this (see `crate::arbiter`) then get `$0`, which is
+/// accurate for a local Ollama call anyway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatUsage {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
 /// Dispatch a chat call to the appropriate provider without spawning a
 /// subprocess. Returns the model's reply text on success, or `Err(reason)`
 /// when the backend is unsupported or the provider call fails.
@@ -36,6 +47,19 @@ pub fn call_direct(
     system: &str,
     messages: &[ChatMessage],
 ) -> Result<String, String> {
+    call_direct_with_usage(agent, model, system, messages).map(|(text, _)| text)
+}
+
+/// [`call_direct`], additionally returning token usage (RAL-318: the
+/// Arbiter's classification/health-check calls use this to record a real
+/// dollar cost against its `maximum_budget_usd` cap). Every other existing
+/// caller of `call_direct` is unaffected -- it just discards the usage half.
+pub fn call_direct_with_usage(
+    agent: &str,
+    model: Option<&str>,
+    system: &str,
+    messages: &[ChatMessage],
+) -> Result<(String, ChatUsage), String> {
     let msg_count = messages.len();
     // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
     crate::rlog!(
@@ -81,8 +105,13 @@ fn parse_data_uri(uri: &str) -> (&str, &str) {
     ("image/jpeg", uri)
 }
 
-/// POST to the Anthropic Claude Messages API and return the first text block.
-fn call_claude(model: &str, system: &str, messages: &[ChatMessage]) -> Result<String, String> {
+/// POST to the Anthropic Claude Messages API and return the first text block
+/// plus its reported token usage.
+fn call_claude(
+    model: &str,
+    system: &str,
+    messages: &[ChatMessage],
+) -> Result<(String, ChatUsage), String> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
 
@@ -139,12 +168,17 @@ fn call_claude(model: &str, system: &str, messages: &[ChatMessage]) -> Result<St
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("Claude API JSON parse: {e}"))?;
 
-    v["content"]
+    let text = v["content"]
         .as_array()
         .and_then(|arr| arr.iter().find(|c| c["type"] == "text"))
         .and_then(|c| c["text"].as_str())
         .map(str::to_string)
-        .ok_or_else(|| format!("unexpected Claude response shape: {body}"))
+        .ok_or_else(|| format!("unexpected Claude response shape: {body}"))?;
+    let usage = ChatUsage {
+        tokens_in: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
+        tokens_out: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+    };
+    Ok((text, usage))
 }
 
 /// POST to Ollama's OpenAI-compatible `/v1/chat/completions` endpoint.
@@ -153,7 +187,7 @@ fn call_ollama(
     model: &str,
     system: &str,
     messages: &[ChatMessage],
-) -> Result<String, String> {
+) -> Result<(String, ChatUsage), String> {
     let mut all_msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
     all_msgs.push(json!({"role": "system", "content": system}));
     all_msgs.extend(messages.iter().map(|m| {
@@ -195,12 +229,17 @@ fn call_ollama(
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("Ollama API JSON parse: {e}"))?;
 
-    v["choices"]
+    let text = v["choices"]
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|c| c["message"]["content"].as_str())
         .map(str::to_string)
-        .ok_or_else(|| format!("unexpected Ollama response shape: {body}"))
+        .ok_or_else(|| format!("unexpected Ollama response shape: {body}"))?;
+    let usage = ChatUsage {
+        tokens_in: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        tokens_out: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+    };
+    Ok((text, usage))
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //! the daemon<->runner wire contract is unchanged from the Python runner.
 
 pub mod agent_backend;
+pub mod agent_isolation;
 pub mod backend;
 pub mod cartographer;
 pub mod claude_code_backend;
@@ -20,4 +21,5 @@ pub mod pi_backend;
 pub mod providers;
 pub mod shellcmd;
 pub mod spec;
+pub mod thrash;
 pub mod tools;

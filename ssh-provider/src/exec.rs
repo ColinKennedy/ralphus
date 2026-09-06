@@ -35,11 +35,14 @@ use crate::uri::{self, SshTarget};
 /// vars itself (keeps [`run`] testable by construction, even though the
 /// process-spawning it does still requires a live target for end-to-end
 /// coverage -- see `tests/exec.rs`).
+#[derive(Clone)]
 pub struct EffectiveConfig {
     pub remote_base: String,
     pub extra_excludes: Vec<String>,
     pub connect_timeout_secs: u32,
     pub remote_runner_cmd: String,
+    pub ssh_config_file: Option<String>,
+    pub target_runner_config: Option<String>,
 }
 
 impl EffectiveConfig {
@@ -59,6 +62,12 @@ impl EffectiveConfig {
                 .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
             remote_runner_cmd: std::env::var("RALPHUS_SSH_REMOTE_RUNNER_CMD")
                 .unwrap_or_else(|_| DEFAULT_REMOTE_RUNNER_CMD.to_string()),
+            ssh_config_file: std::env::var("RALPHUS_SSH_CONFIG_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            target_runner_config: std::env::var("RALPHUS_TARGET_RUNNER_CONFIG")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 }
@@ -81,6 +90,11 @@ impl EffectiveConfig {
 /// distinction between an infrastructure failure and a normal task outcome.
 pub fn run(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Value, String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
+    let runner_command =
+        match crate::runner_install::policy_from_env(config.target_runner_config.as_deref())? {
+            Some(policy) => crate::runner_install::ensure(&target, &policy, config)?,
+            None => config.remote_runner_cmd.clone(),
+        };
 
     let spec: Value = serde_json::from_str(spec_json)
         .map_err(|e| format!("could not parse the cell spec on stdin: {e}"))?;
@@ -106,7 +120,13 @@ pub fn run(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Value
     let remote_spec_json = serde_json::to_string(&Value::Object(spec_obj))
         .map_err(|e| format!("could not re-serialize the rewritten cell spec: {e}"))?;
 
-    run_remote_cell(&target, &remote_dir, &remote_spec_json, config)
+    run_remote_cell(
+        &target,
+        &remote_dir,
+        &remote_spec_json,
+        &runner_command,
+        config,
+    )
 }
 
 /// Sync `local_dir`'s contents onto `target:remote_dir`, choosing the
@@ -148,7 +168,10 @@ fn sync_via_rsync(
     excludes: &[String],
     config: &EffectiveConfig,
 ) -> Result<(), String> {
-    let ssh_args = ssh::non_interactive_args(config.connect_timeout_secs);
+    let ssh_args = ssh::non_interactive_args(
+        config.connect_timeout_secs,
+        config.ssh_config_file.as_deref(),
+    );
     let args = transport::rsync_args(
         local_dir,
         &target.target_string(),
@@ -205,6 +228,7 @@ fn sync_via_tar_ssh(
         &target.target_string(),
         config.connect_timeout_secs,
         &remote_cmd,
+        config.ssh_config_file.as_deref(),
     );
     let ssh_out = Command::new("ssh")
         .args(&ssh_args)
@@ -251,17 +275,19 @@ fn run_remote_cell(
     target: &SshTarget,
     remote_dir: &str,
     remote_spec_json: &str,
+    runner_command: &str,
     config: &EffectiveConfig,
 ) -> Result<Value, String> {
     let remote_cmd = format!(
         "cd {} && {}",
         transport::shell_quote_single(remote_dir),
-        config.remote_runner_cmd
+        runner_command
     );
     let ssh_args = ssh::command_args(
         &target.target_string(),
         config.connect_timeout_secs,
         &remote_cmd,
+        config.ssh_config_file.as_deref(),
     );
     let mut child: Child = Command::new("ssh")
         .args(&ssh_args)
@@ -304,18 +330,33 @@ fn run_remote_cell(
         .unwrap_or_default();
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+    if stdout.trim().is_empty() {
         // No JSON at all -- the remote `ralphus-runner` never produced a
         // result, which is a transport/invocation problem (ssh itself
         // failing, or the remote command not found), not a task outcome.
         let base = ssh::interpret_failure("ssh", out.status.code(), &stderr_tail);
         return Err(format!("remote ralphus-runner produced no output: {base}"));
     }
-    serde_json::from_str::<Value>(trimmed).map_err(|e| {
+    parse_runner_result(&stdout)
+}
+
+/// The external CLI backends render human-readable conversation text on
+/// stdout before `main::finish` writes the runner contract's final JSON line.
+/// Local tmux execution avoids ambiguity by using `--result-file`; the
+/// synchronous SSH adapter has one combined remote stdout pipe, so its result
+/// is the final non-empty line. Earlier lines are terminal display, not part of
+/// the result document.
+fn parse_runner_result(stdout: &str) -> Result<Value, String> {
+    let final_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .ok_or_else(|| "remote ralphus-runner produced no output".to_string())?;
+    serde_json::from_str::<Value>(final_line).map_err(|e| {
         format!(
-            "remote ralphus-runner produced unparseable output: {e} ({})",
-            truncate(trimmed, 300)
+            "remote ralphus-runner produced unparseable final output line: {e} ({})",
+            truncate(final_line, 300)
         )
     })
 }
@@ -337,6 +378,8 @@ mod tests {
             extra_excludes: vec![],
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             remote_runner_cmd: DEFAULT_REMOTE_RUNNER_CMD.to_string(),
+            ssh_config_file: None,
+            target_runner_config: None,
         }
     }
 
@@ -362,5 +405,21 @@ mod tests {
     fn invalid_json_on_stdin_is_rejected() {
         let err = run("alice@host", "not json", &config()).unwrap_err();
         assert!(err.contains("parse"), "{err}");
+    }
+
+    #[test]
+    fn runner_result_is_the_final_non_empty_stdout_line() {
+        let result = parse_runner_result(
+            "Claude Code · model=test\nremote response\n{\"status\":\"done\",\"summary\":\"ok\"}\n",
+        )
+        .unwrap();
+        assert_eq!(result["status"], serde_json::json!("done"));
+        assert_eq!(result["summary"], serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn invalid_final_runner_line_is_actionable() {
+        let err = parse_runner_result("display text only\n").unwrap_err();
+        assert!(err.contains("final output line"), "{err}");
     }
 }

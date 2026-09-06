@@ -65,6 +65,26 @@ pub struct CellSpec {
     /// before truncating. `None` (e.g. a hand-authored spec that omits the
     /// key) falls back to the backend's own default.
     pub tool_arg_truncate_chars: Option<u32>,
+    /// RAL-339: resolved `.ralphus.toml` `[thrash]` thresholds -- N (compact
+    /// count) and M (turn-gap) -- forwarded from the daemon the same way
+    /// `tool_arg_truncate_chars` is. `None` falls back to
+    /// `crate::thrash`'s own defaults.
+    pub thrash_max_compactions: Option<u32>,
+    pub thrash_min_turn_gap: Option<u32>,
+    /// RAL-333: resolved cap on how many tokens a single tool-call output may
+    /// inject into the agent's context. `None` for no cap, or when
+    /// unsupported by `agent` (the daemon rejects this combination at submit
+    /// time, per `core::validate`'s `agent_supports_tool_output_max_tokens`).
+    pub tool_output_max_tokens: Option<u64>,
+    /// RAL-336: whether this cell's agent session may load the operator's
+    /// personal settings/config (Claude Code's `~/.claude` settings, Codex's
+    /// `~/.codex/config.toml`, Pi's on-disk config). Defaults to `false`
+    /// (isolated) when omitted, per the daemon's `resolve_agent_isolation`.
+    pub allow_personal_settings: bool,
+    /// RAL-336: whether this cell's agent session may load the operator's
+    /// personal cross-project memory (e.g. Claude Code's global `CLAUDE.md`).
+    /// Defaults to `false` (isolated) when omitted.
+    pub allow_personal_memory: bool,
 }
 
 impl CellSpec {
@@ -101,6 +121,11 @@ impl CellSpec {
         let resume_agent_session_id = opt_str(obj, "resume_agent_session_id")?;
         let assigned_agent_session_id = opt_str(obj, "assigned_agent_session_id")?;
         let tool_arg_truncate_chars = opt_u32(obj, "tool_arg_truncate_chars")?;
+        let thrash_max_compactions = opt_u32(obj, "thrash_max_compactions")?;
+        let thrash_min_turn_gap = opt_u32(obj, "thrash_min_turn_gap")?;
+        let tool_output_max_tokens = opt_uint(obj, "tool_output_max_tokens")?;
+        let allow_personal_settings = opt_bool(obj, "allow_personal_settings")?.unwrap_or(false);
+        let allow_personal_memory = opt_bool(obj, "allow_personal_memory")?.unwrap_or(false);
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -130,6 +155,11 @@ impl CellSpec {
             resume_agent_session_id,
             assigned_agent_session_id,
             tool_arg_truncate_chars,
+            thrash_max_compactions,
+            thrash_min_turn_gap,
+            tool_output_max_tokens,
+            allow_personal_settings,
+            allow_personal_memory,
         })
     }
 }
@@ -213,8 +243,23 @@ pub struct CellResult {
     pub tokens_in: i64,
     #[serde(default)]
     pub tokens_out: i64,
+    /// RAL-326: prompt-cache write/read tokens, kept out of `tokens_in` so
+    /// that field keeps meaning exactly what it always has. Zero for a
+    /// backend whose harness reports no cache breakdown.
+    #[serde(default)]
+    pub cache_creation_tokens: i64,
+    #[serde(default)]
+    pub cache_read_tokens: i64,
     #[serde(default)]
     pub cost_usd: f64,
+    /// RAL-326: set when `cost_usd`/the token counts are a *live snapshot*
+    /// rather than the backend's own authoritative final accounting -- the
+    /// cell's process was lost or killed before a terminal usage event
+    /// arrived, so the daemon fell back to the last mid-run estimate. The
+    /// board renders this as an "≈ estimated" badge so a snapshot value is
+    /// never read as a settled bill.
+    #[serde(default)]
+    pub cost_is_estimated: bool,
     #[serde(default)]
     pub summary: String,
     pub error: Option<String>,
@@ -230,7 +275,10 @@ impl CellResult {
             status: "done".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: summary.into(),
             error: None,
             proofed: None,
@@ -245,7 +293,10 @@ impl CellResult {
             status: "failed".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             cost_usd: 0.0,
+            cost_is_estimated: false,
             summary: summary.into(),
             error: Some(error.into()),
             proofed: None,
@@ -264,6 +315,8 @@ impl CellResult {
     pub fn detached(
         tokens_in: i64,
         tokens_out: i64,
+        cache_creation_tokens: i64,
+        cache_read_tokens: i64,
         cost_usd: f64,
         agent_session_id: Option<String>,
     ) -> Self {
@@ -271,7 +324,13 @@ impl CellResult {
             status: "detached".to_string(),
             tokens_in,
             tokens_out,
+            cache_creation_tokens,
+            cache_read_tokens,
             cost_usd,
+            // A detach carries whatever the live snapshot held at the detach
+            // point, never a terminal usage event -- so it is an estimate by
+            // construction (RAL-326).
+            cost_is_estimated: true,
             summary: String::new(),
             error: None,
             proofed: None,
@@ -379,6 +438,7 @@ mod tests {
         v["timeout_sec"] = serde_json::json!(60);
         v["proof"] = serde_json::json!(true);
         v["tool_arg_truncate_chars"] = serde_json::json!(400);
+        v["tool_output_max_tokens"] = serde_json::json!(20000);
         let spec = CellSpec::from_json(&v.to_string()).unwrap();
         assert_eq!(spec.command.as_deref(), Some("echo hi"));
         assert_eq!(spec.agent, "ollama");
@@ -387,6 +447,13 @@ mod tests {
         assert_eq!(spec.budget_tokens, Some(1000));
         assert!(spec.proof);
         assert_eq!(spec.tool_arg_truncate_chars, Some(400));
+        assert_eq!(spec.tool_output_max_tokens, Some(20000));
+    }
+
+    #[test]
+    fn tool_output_max_tokens_is_none_when_omitted() {
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert_eq!(spec.tool_output_max_tokens, None);
     }
 
     #[test]
@@ -401,6 +468,31 @@ mod tests {
         v["tool_arg_truncate_chars"] = serde_json::json!(u64::from(u32::MAX) + 1);
         let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("tool_arg_truncate_chars"));
+    }
+
+    #[test]
+    fn allow_personal_settings_and_memory_default_to_false_when_omitted() {
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert!(!spec.allow_personal_settings);
+        assert!(!spec.allow_personal_memory);
+    }
+
+    #[test]
+    fn allow_personal_settings_and_memory_parse_explicit_true() {
+        let mut v = base();
+        v["allow_personal_settings"] = serde_json::json!(true);
+        v["allow_personal_memory"] = serde_json::json!(true);
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
+        assert!(spec.allow_personal_settings);
+        assert!(spec.allow_personal_memory);
+    }
+
+    #[test]
+    fn allow_personal_settings_rejects_wrong_type() {
+        let mut v = base();
+        v["allow_personal_settings"] = serde_json::json!("yes");
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("allow_personal_settings"));
     }
 
     #[test]

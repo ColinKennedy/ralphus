@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use ralphus_cli::client::{DaemonClient, GuardianSettings};
 use ralphus_cli::commands::CommandError;
+use ralphus_cli::commands::env;
 use ralphus_cli::commands::review::{
     self, GuardianEnvArgs, ReviewActionCommand, ReviewBranchCommand, ReviewChecksCommand,
     ReviewCommand, ReviewPrCommand, ReviewUpstreamCommand,
@@ -103,6 +104,10 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_cancel(&resolved.guardian_id)?)
         }
+        ReviewCommand::Reopen { selector } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_reopen(&resolved.guardian_id)?)
+        }
         ReviewCommand::Delete { selector, yes } => {
             if !yes {
                 return Err(usage(
@@ -140,6 +145,11 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 match_pr_branch_name,
             };
             Ok(client.guardian_settings(&resolved.guardian_id, &settings)?)
+        }
+        ReviewCommand::Env { selector, scope } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let scope = scope.unwrap_or_else(|| env::default_review_scope(&resolved));
+            Ok(client.env_view(&env::review_path(&resolved, &scope, &selector)?)?)
         }
         ReviewCommand::BuildEnv(args) => exec_guardian_env(client, args, GuardianEnvSection::Build),
         ReviewCommand::ManualChecksEnv(args) => {
@@ -395,6 +405,10 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
         ReviewPrCommand::Comments { pr_id } => Ok(client.pr_comments(&pr_id)?),
         ReviewPrCommand::PullFeedback { pr_id } => Ok(client.pr_action_feedback(&pr_id)?),
         ReviewPrCommand::PullFromPr { pr_id } => Ok(client.pr_pull_from_pr(&pr_id)?),
+        ReviewPrCommand::Unlink { selector } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_unlink_prs(&resolved.guardian_id)?)
+        }
     }
 }
 

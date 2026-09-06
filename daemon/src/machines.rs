@@ -245,6 +245,7 @@ impl Store {
                 "program": program,
                 "protocol_version": protocol_version,
             }),
+            admin_only: false,
         });
         Ok(())
     }
@@ -336,6 +337,7 @@ impl Store {
                 task: None,
                 log_path: None,
                 payload: serde_json::json!({ "scheme": scheme }),
+                admin_only: false,
             });
         }
         Ok(n > 0)

@@ -164,6 +164,15 @@ pub struct ReviewConfig {
     /// per-submission `PrRequest::use_worktree_branch_name` wins over that.
     #[serde(default)]
     pub match_pr_branch_name: Option<bool>,
+    /// RAL-317: whether a review's PR stack is auto-submitted/grown as each
+    /// branch reaches a terminal (`done`/`conflict_resolved`) merge state,
+    /// instead of requiring the manual `review pr submit`/`guardian_submit_prs`
+    /// call. `None` means unset, which resolves to `false` (manual submission
+    /// stays required); per-project scalars win over the global layer, same as
+    /// `skip_worktrees`. A per-review override (see
+    /// `Guardian::auto_submit_pr_stack` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub auto_submit_pr_stack: Option<bool>,
 }
 
 impl ReviewConfig {
@@ -227,6 +236,13 @@ impl ReviewConfig {
         self.match_pr_branch_name.unwrap_or(false)
     }
 
+    /// Whether a review's PR stack is auto-submitted/grown as each branch
+    /// reaches a terminal merge state (unset resolves to `false`). RAL-317.
+    #[must_use]
+    pub fn auto_submit_pr_stack(&self) -> bool {
+        self.auto_submit_pr_stack.unwrap_or(false)
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -248,8 +264,75 @@ impl ReviewConfig {
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             skip_base_updates: over.skip_base_updates.or(self.skip_base_updates),
             match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
+            auto_submit_pr_stack: over.auto_submit_pr_stack.or(self.auto_submit_pr_stack),
         }
     }
+}
+
+/// The daemon-singleton Arbiter's own agent/model/budget config (`[arbiter]`
+/// table, RAL-318) -- wholly separate from a review's own conflict-resolver
+/// `agent`/`model` (`ReviewConfig::default_resolver_agent`, the CLI's
+/// `ralphus review settings --agent/--model`). Exactly one Arbiter exists per
+/// daemon, never per-project, so unlike [`ReviewConfig`] this has no
+/// per-project layering -- [`load_arbiter_config`] reads the global config
+/// file only.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ArbiterConfig {
+    /// Backend the Arbiter uses for classification calls and the `ralphus
+    /// check health` round-trip -- a built-in backend name (`"claude"`,
+    /// `"ollama"`, ...). `None` resolves to `"ollama"` (see [`Self::agent`]).
+    /// Only `"claude"`/`"anthropic"`/`"ollama"` are actually callable
+    /// headlessly today (`crate::chat_client::call_direct_with_usage`) --
+    /// any other value makes every classification permanently fall back to
+    /// `unclassified` and the health check fail with a clear message.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Model the Arbiter's `agent` runs. `None` lets the backend's own
+    /// default apply (see `crate::chat_client::call_direct`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The Arbiter's own USD spend cap, covering classification calls and the
+    /// `ralphus check health` round-trip cumulatively (RAL-318). `None` means
+    /// unbounded.
+    #[serde(default)]
+    pub maximum_budget_usd: Option<f64>,
+}
+
+impl ArbiterConfig {
+    /// The configured Arbiter backend, unset resolves to `"ollama"` --
+    /// mirrors [`ReviewConfig::default_resolver_agent`]'s own fallback.
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        self.agent.as_deref().unwrap_or("ollama")
+    }
+}
+
+/// Parse an `ArbiterConfig` from the given TOML text; the default (`ollama`,
+/// no model override, unbounded budget) when the `[arbiter]` table is absent.
+#[must_use]
+pub fn arbiter_from_toml_str(s: &str) -> ArbiterConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .arbiter
+        .unwrap_or_default()
+}
+
+/// Load the daemon-singleton Arbiter config from the global config file only
+/// (`$RALPHUS_CONFIG_HOME/config.toml`, or its `~/.config/ralphus/` default)
+/// -- deliberately no per-project layering, since the Arbiter is one daemon-
+/// wide singleton, never scoped per-project (RAL-318 explicit scope
+/// decision). Computed fresh at each call site (submission-time
+/// classification, the health-check handler, the scheduler's Triage tick)
+/// rather than cached in a long-lived struct -- every call site resolves
+/// identically, which is indistinguishable from a literal singleton object
+/// while matching this module's existing "load config fresh where needed"
+/// style (e.g. [`load_daemon_config`], [`load_budget_config`]).
+#[must_use]
+pub fn load_arbiter_config() -> ArbiterConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| arbiter_from_toml_str(&s))
+        .unwrap_or_default()
 }
 
 /// One scheduler down-time window (`[[daemon.downtime]]`, RAL-122): a UTC
@@ -290,6 +373,21 @@ pub struct DaemonConfig {
     /// carry a real authenticated identity instead of a config default.
     #[serde(default)]
     pub default_user: Option<String>,
+    /// Whether `default_user` should hold the admin flag (RAL-332). Applied
+    /// once at daemon startup (see `server::bootstrap_default_user_admin`):
+    /// `Some(true)` registers `default_user` if needed and promotes it;
+    /// `Some(false)` demotes it if it currently holds admin. `None` (unset)
+    /// leaves admin status untouched -- config is otherwise the source of
+    /// truth here, so a stale `false` (or a config that stops setting this
+    /// field) will demote an admin that was hand-granted via the board's
+    /// Users tab on the next restart.
+    ///
+    /// Exists because the board's Users tab is itself admin-gated: without
+    /// this, the very first admin can only be granted through a raw
+    /// `POST /api/users/{name}/admin` call (`require_admin`'s bootstrap
+    /// exception for "zero admins registered").
+    #[serde(default)]
+    pub default_user_is_admin: Option<bool>,
     /// The global concurrency cap shared by the scheduler, task-level proofs,
     /// and guardian review merges (see `crate::DEFAULT_MAX_CONCURRENT`). `None`
     /// means unset (so a lower layer can supply it); resolved callers use
@@ -602,6 +700,82 @@ pub fn load_live_view_config() -> LiveViewConfig {
     }
 }
 
+/// Autocompaction-thrash detection thresholds (`[thrash]` table, RAL-339).
+/// Governs when a cell/proof's runner fails a run outright for repeatedly
+/// compacting its own context without enough real progress between
+/// compactions to justify it -- see `runner/src/thrash.rs`'s
+/// `ThrashTracker` for the actual rule these two numbers feed. `None` means
+/// unset (so a lower layer can supply it); resolved callers use
+/// [`max_compactions`](Self::max_compactions)/[`min_turn_gap`](Self::min_turn_gap),
+/// which fall back to the runner's own defaults (3 compactions / 2 turns).
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ThrashConfig {
+    /// N: how many compactions must occur in one run before thrash detection
+    /// can fire at all.
+    #[serde(default)]
+    pub max_compactions: Option<u32>,
+    /// M: the previous-compaction gap (in assistant turns) below which a
+    /// compaction at/after `max_compactions` counts as thrash.
+    #[serde(default)]
+    pub min_turn_gap: Option<u32>,
+}
+
+impl ThrashConfig {
+    /// N. Defaults to 3 when unset.
+    #[must_use]
+    pub fn max_compactions(&self) -> u32 {
+        self.max_compactions
+            .unwrap_or(DEFAULT_THRASH_MAX_COMPACTIONS)
+    }
+
+    /// M. Defaults to 2 when unset.
+    #[must_use]
+    pub fn min_turn_gap(&self) -> u32 {
+        self.min_turn_gap.unwrap_or(DEFAULT_THRASH_MIN_TURN_GAP)
+    }
+}
+
+/// RAL-339: the defaults used whenever `[thrash]`'s fields are unset or
+/// invalid -- must stay in sync with `runner/src/thrash.rs`'s
+/// `DEFAULT_MAX_COMPACTIONS`/`DEFAULT_MIN_TURN_GAP` (the daemon and the
+/// runner each need their own copy: the daemon resolves `.ralphus.toml`,
+/// while the runner never reads project config directly, see
+/// `runner/src/config.rs`'s own doc comment for why).
+pub const DEFAULT_THRASH_MAX_COMPACTIONS: u32 = 3;
+pub const DEFAULT_THRASH_MIN_TURN_GAP: u32 = 2;
+
+/// Parse a `ThrashConfig` from the given TOML text; the default (3/2) when
+/// the `[thrash]` table is absent.
+#[must_use]
+pub fn thrash_from_toml_str(s: &str) -> ThrashConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .thrash
+        .unwrap_or_default()
+}
+
+/// Load the effective thrash config by layering the global config file under
+/// the nearest per-project `.ralphus.toml` (per-project scalars win),
+/// following the `[live_view]`/`[terminal_logs]`/`[cartographer]` pattern.
+#[must_use]
+pub fn load_thrash_config() -> ThrashConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| thrash_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| thrash_from_toml_str(&s))
+        .unwrap_or_default();
+    ThrashConfig {
+        max_compactions: local.max_compactions.or(global.max_compactions),
+        min_turn_gap: local.min_turn_gap.or(global.min_turn_gap),
+    }
+}
+
 /// Forge routing configuration (`[forge]` table, RAL-117). Lets a project pin
 /// which forge (GitHub/GitLab) and remote to submit PRs against, instead of
 /// relying purely on `git remote get-url` autodetection. `None` fields fall
@@ -734,6 +908,88 @@ impl EnvOverridesConfig {
     }
 }
 
+/// Agent isolation configuration (`[agent_isolation]` table, RAL-336). By
+/// default a ralphus-spawned agent session (Claude Code, Codex, Pi) is
+/// isolated from the operator's personal CLI configuration and memory on the
+/// host machine, regardless of what's present outside the cell's worktree.
+/// These two independent opt-ins let an operator explicitly re-enable one or
+/// both -- there is no combined flag, since a project may want its own
+/// checked-in settings honored without also pulling in the operator's
+/// personal cross-project memory, or vice versa. Some backends (Codex, Pi)
+/// only expose a single config-directory env var that doesn't cleanly
+/// separate settings from memory; for those, isolation engages whenever
+/// *either* opt-in is off, favoring over-isolation over silently leaking
+/// personal state.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct AgentIsolationConfig {
+    /// Whether a spawned agent session may load the operator's personal
+    /// settings/config (e.g. Claude Code's `~/.claude/settings.json`, Codex's
+    /// `~/.codex/config.toml`, Pi's on-disk config). `None`/`false` means
+    /// isolated (the default). Resolved callers use
+    /// [`allow_personal_settings`](Self::allow_personal_settings).
+    #[serde(default)]
+    pub allow_personal_settings: Option<bool>,
+    /// Whether a spawned agent session may load the operator's personal
+    /// cross-project memory (e.g. Claude Code's global `CLAUDE.md`). `None`/
+    /// `false` means isolated (the default). Resolved callers use
+    /// [`allow_personal_memory`](Self::allow_personal_memory).
+    #[serde(default)]
+    pub allow_personal_memory: Option<bool>,
+}
+
+impl AgentIsolationConfig {
+    /// Whether a spawned agent session may load the operator's personal
+    /// settings/config. Defaults to `false` (isolated) when unset.
+    #[must_use]
+    pub fn allow_personal_settings(&self) -> bool {
+        self.allow_personal_settings.unwrap_or(false)
+    }
+
+    /// Whether a spawned agent session may load the operator's personal
+    /// cross-project memory. Defaults to `false` (isolated) when unset.
+    #[must_use]
+    pub fn allow_personal_memory(&self) -> bool {
+        self.allow_personal_memory.unwrap_or(false)
+    }
+}
+
+/// Parse an `AgentIsolationConfig` from the given TOML text; the default
+/// (fully isolated) when the `[agent_isolation]` table is absent.
+#[must_use]
+pub fn agent_isolation_from_toml_str(s: &str) -> AgentIsolationConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .agent_isolation
+        .unwrap_or_default()
+}
+
+fn load_agent_isolation_file(path: &Path) -> AgentIsolationConfig {
+    std::fs::read_to_string(path)
+        .map(|s| agent_isolation_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
+/// Resolve the effective agent isolation config for a cell rooted at `cwd`:
+/// the global config layered under the nearest per-project `.ralphus.toml`
+/// (per-project scalars win), same layering as [`resolve_forge`].
+#[must_use]
+pub fn resolve_agent_isolation(cwd: &Path) -> AgentIsolationConfig {
+    let global = global_config_path()
+        .map(|p| load_agent_isolation_file(&p))
+        .unwrap_or_default();
+    let project = find_project_config(cwd)
+        .map(|p| load_agent_isolation_file(&p))
+        .unwrap_or_default();
+    AgentIsolationConfig {
+        allow_personal_settings: project
+            .allow_personal_settings
+            .or(global.allow_personal_settings),
+        allow_personal_memory: project
+            .allow_personal_memory
+            .or(global.allow_personal_memory),
+    }
+}
+
 /// Whether `key` is a syntactically valid environment-variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`) — required for a RAL-150 env override key.
 /// Enforced at the API boundary ([`crate::server`]'s env-override handler)
@@ -862,7 +1118,7 @@ const VALID_FIELD_TYPES: &[&str] = &["string", "number", "bool"];
 /// placeholders that only reference `{prompt}` or a declared field. Returns
 /// one error per problem found (never stops at the first) -- callers decide
 /// whether an error means "drop this template" ([`load_templates_config`])
-/// or "fail `check health`" (`cli-rs`'s `check_templates`).
+/// or "fail `check health`" (`cli`'s `check_templates`).
 #[must_use]
 pub fn validate_templates(templates: &[TemplateDef]) -> Vec<TemplateValidationError> {
     let mut errors = Vec::new();
@@ -1022,6 +1278,8 @@ struct ConfigFile {
     #[serde(default)]
     ark: Option<ArkConfigLayer>,
     #[serde(default)]
+    arbiter: Option<ArbiterConfig>,
+    #[serde(default)]
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
@@ -1034,9 +1292,13 @@ struct ConfigFile {
     #[serde(default)]
     live_view: Option<LiveViewConfig>,
     #[serde(default)]
+    thrash: Option<ThrashConfig>,
+    #[serde(default)]
     forge: Option<ForgeConfig>,
     #[serde(default)]
     env_overrides: Option<EnvOverridesConfig>,
+    #[serde(default)]
+    agent_isolation: Option<AgentIsolationConfig>,
     #[serde(default)]
     budget: Option<BudgetConfig>,
     #[serde(default)]
@@ -1140,28 +1402,70 @@ fn merge_downtime(global: Vec<DowntimeWindow>, local: Vec<DowntimeWindow>) -> Ve
     if local.is_empty() { global } else { local }
 }
 
-/// Load the effective daemon config by layering the global config file under
-/// the nearest per-project `.ralphus.toml` (per-project scalars win).
+/// Merges `over`'s fields on top of `base` (`over` wins field-by-field,
+/// falling back to `base` when unset) -- the same "higher-precedence layer
+/// wins" rule [`load_daemon_config`] applies across all three of its layers.
 #[must_use]
-pub fn load_daemon_config() -> DaemonConfig {
-    let global = global_config_path()
+fn merge_daemon_config(base: DaemonConfig, over: DaemonConfig) -> DaemonConfig {
+    DaemonConfig {
+        log_path: over.log_path.or(base.log_path),
+        log_level: over.log_level.or(base.log_level),
+        downtime: merge_downtime(base.downtime, over.downtime),
+        default_user: over.default_user.or(base.default_user),
+        default_user_is_admin: over.default_user_is_admin.or(base.default_user_is_admin),
+        max_concurrent: over.max_concurrent.or(base.max_concurrent),
+    }
+}
+
+/// Parses `$RALPHUS_CONFIGURATION_PATH` (a `PATH`-separated list of
+/// `.ralphus.toml` files, left-to-right, later wins) -- the same env var
+/// `cli/src/config.rs` and `runner/src/config.rs` already read for every
+/// other config field. See `agent_profiles.rs`'s copy of this same helper
+/// for why the env value is taken as a parameter rather than read directly
+/// (testability, given `std::env::set_var` is `unsafe` and forbidden here).
+fn configuration_path_entries(configuration_path_env: Option<&str>) -> Vec<PathBuf> {
+    let Some(raw) = configuration_path_env else {
+        return Vec::new();
+    };
+    std::env::split_paths(raw).collect()
+}
+
+/// Load the effective daemon config, lowest to highest precedence:
+/// `$RALPHUS_CONFIG_HOME/config.toml` (or its `~/.config/ralphus/` default),
+/// then `$RALPHUS_CONFIGURATION_PATH` entries in order, then the
+/// project-local `.ralphus.toml` found by walking up from `cwd` --
+/// matching the precedence `agent_profiles::load_profiles_for_path_with`
+/// and `machine_targets`'s equivalent already use. `load_daemon_config`
+/// used to skip the `$RALPHUS_CONFIGURATION_PATH` layer entirely, so a
+/// field (e.g. `default_user`) set only via that established convention
+/// silently never loaded.
+#[must_use]
+fn load_daemon_config_with(
+    cwd: Option<&Path>,
+    configuration_path_env: Option<&str>,
+) -> DaemonConfig {
+    let mut merged = global_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| daemon_from_toml_str(&s))
         .unwrap_or_default();
-    let local = std::env::current_dir()
-        .ok()
-        .as_deref()
+    for path in configuration_path_entries(configuration_path_env) {
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            merged = merge_daemon_config(merged, daemon_from_toml_str(&s));
+        }
+    }
+    let local = cwd
         .and_then(find_project_config)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| daemon_from_toml_str(&s))
         .unwrap_or_default();
-    DaemonConfig {
-        log_path: local.log_path.or(global.log_path),
-        log_level: local.log_level.or(global.log_level),
-        downtime: merge_downtime(global.downtime, local.downtime),
-        default_user: local.default_user.or(global.default_user),
-        max_concurrent: local.max_concurrent.or(global.max_concurrent),
-    }
+    merge_daemon_config(merged, local)
+}
+
+#[must_use]
+pub fn load_daemon_config() -> DaemonConfig {
+    let cwd = std::env::current_dir().ok();
+    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
+    load_daemon_config_with(cwd.as_deref(), raw.as_deref())
 }
 
 /// Parse a `CartographerConfig` from the given TOML text; the default (30
@@ -1647,6 +1951,34 @@ mod tests {
         );
     }
 
+    // ── arbiter (RAL-318) ──────────────────────────────────────────────────
+
+    #[test]
+    fn arbiter_config_unset_resolves_to_ollama_with_no_cap() {
+        let c = ArbiterConfig::default();
+        assert_eq!(c.agent(), "ollama");
+        assert_eq!(c.model, None);
+        assert_eq!(c.maximum_budget_usd, None);
+    }
+
+    #[test]
+    fn parse_arbiter_config() {
+        let c = arbiter_from_toml_str(
+            "[arbiter]\nagent = \"claude\"\nmodel = \"claude-haiku-4-5\"\nmaximum_budget_usd = 2.5\n",
+        );
+        assert_eq!(c.agent(), "claude");
+        assert_eq!(c.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(c.maximum_budget_usd, Some(2.5));
+    }
+
+    #[test]
+    fn arbiter_config_absent_table_is_default() {
+        assert_eq!(
+            arbiter_from_toml_str("[review]\nskip_worktrees = true\n"),
+            ArbiterConfig::default()
+        );
+    }
+
     // ── summary_format (RAL-124) ──────────────────────────────────────────
 
     #[test]
@@ -1784,6 +2116,76 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn load_daemon_config_with_reads_configuration_path_entries() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "ralphus-cfg-path-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join(".ralphus.toml");
+        std::fs::write(
+            &config_file,
+            "[daemon]\ndefault_user = \"from-configuration-path\"\n",
+        )
+        .unwrap();
+
+        // `cwd` is unrelated to `config_dir` -- no ancestor `.ralphus.toml`, so
+        // the only way `default_user` can resolve here is through the
+        // `$RALPHUS_CONFIGURATION_PATH` entry.
+        let cwd = std::env::temp_dir().join(format!(
+            "ralphus-cfg-path-unrelated-cwd-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let cfg = load_daemon_config_with(Some(&cwd), Some(config_file.to_str().unwrap()));
+        assert_eq!(cfg.default_user.as_deref(), Some("from-configuration-path"));
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn load_daemon_config_with_project_local_wins_over_configuration_path() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "ralphus-cfg-path-loser-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join(".ralphus.toml");
+        std::fs::write(
+            &config_file,
+            "[daemon]\ndefault_user = \"from-configuration-path\"\n",
+        )
+        .unwrap();
+
+        let project_root = std::env::temp_dir().join(format!(
+            "ralphus-cfg-path-project-local-winner-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(
+            project_root.join(".ralphus.toml"),
+            "[daemon]\ndefault_user = \"from-project-local\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_daemon_config_with(Some(&project_root), Some(config_file.to_str().unwrap()));
+        assert_eq!(cfg.default_user.as_deref(), Some("from-project-local"));
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&project_root);
     }
 
     // ── CartographerConfig (RAL-98) ──────────────────────────────────────
@@ -1960,6 +2362,61 @@ mod tests {
                 .or(global.tool_arg_truncate_chars),
         };
         assert_eq!(effective.tool_arg_truncate_chars(), 500);
+    }
+
+    // ── ThrashConfig (RAL-339) ─────────────────────────────────────────────
+
+    #[test]
+    fn thrash_defaults_when_absent() {
+        let c = thrash_from_toml_str("");
+        assert_eq!(c.max_compactions(), 3);
+        assert_eq!(c.min_turn_gap(), 2);
+    }
+
+    #[test]
+    fn thrash_parses_explicit_values() {
+        let c = thrash_from_toml_str("[thrash]\nmax_compactions = 5\nmin_turn_gap = 4\n");
+        assert_eq!(c.max_compactions(), 5);
+        assert_eq!(c.min_turn_gap(), 4);
+    }
+
+    #[test]
+    fn thrash_negative_value_falls_back_to_default() {
+        // A negative value can never deserialize into `Option<u32>` --
+        // confirms the "malformed config never blocks" fallback (and is what
+        // `ralphus check health`'s WARN message for this table promises).
+        let c = thrash_from_toml_str("[thrash]\nmax_compactions = -1\n");
+        assert_eq!(c.max_compactions(), 3);
+        assert_eq!(c.min_turn_gap(), 2);
+    }
+
+    #[test]
+    fn thrash_non_numeric_value_falls_back_to_default() {
+        let c = thrash_from_toml_str("[thrash]\nmin_turn_gap = \"nope\"\n");
+        assert_eq!(c.max_compactions(), 3);
+        assert_eq!(c.min_turn_gap(), 2);
+    }
+
+    #[test]
+    fn thrash_malformed_toml_is_default() {
+        let c = thrash_from_toml_str("not = = valid");
+        assert_eq!(c.max_compactions(), 3);
+        assert_eq!(c.min_turn_gap(), 2);
+    }
+
+    #[test]
+    fn thrash_project_wins_over_global() {
+        let global = thrash_from_toml_str("[thrash]\nmax_compactions = 10\nmin_turn_gap = 10\n");
+        let local = thrash_from_toml_str("[thrash]\nmax_compactions = 4\n");
+        let effective = ThrashConfig {
+            max_compactions: local.max_compactions.or(global.max_compactions),
+            min_turn_gap: local.min_turn_gap.or(global.min_turn_gap),
+        };
+        // The project set max_compactions but not min_turn_gap -- each
+        // scalar resolves independently, so the global min_turn_gap still
+        // shows through.
+        assert_eq!(effective.max_compactions(), 4);
+        assert_eq!(effective.min_turn_gap(), 10);
     }
 
     // ── Downtime windows (RAL-122) ────────────────────────────────────────
@@ -2229,6 +2686,57 @@ mod tests {
         );
     }
 
+    // ── AgentIsolationConfig (RAL-336) ────────────────────────────────────
+
+    #[test]
+    fn agent_isolation_defaults_to_fully_isolated_when_absent() {
+        let c = agent_isolation_from_toml_str("");
+        assert!(!c.allow_personal_settings());
+        assert!(!c.allow_personal_memory());
+    }
+
+    #[test]
+    fn agent_isolation_parses_explicit_values() {
+        let c = agent_isolation_from_toml_str(
+            "[agent_isolation]\nallow_personal_settings = true\nallow_personal_memory = true\n",
+        );
+        assert!(c.allow_personal_settings());
+        assert!(c.allow_personal_memory());
+    }
+
+    #[test]
+    fn agent_isolation_flags_are_independent() {
+        let c =
+            agent_isolation_from_toml_str("[agent_isolation]\nallow_personal_settings = true\n");
+        assert!(c.allow_personal_settings());
+        assert!(!c.allow_personal_memory());
+    }
+
+    #[test]
+    fn agent_isolation_malformed_toml_is_default() {
+        let c = agent_isolation_from_toml_str("not = = valid");
+        assert!(!c.allow_personal_settings());
+        assert!(!c.allow_personal_memory());
+    }
+
+    #[test]
+    fn resolve_agent_isolation_layers_global_under_project() {
+        let base =
+            std::env::temp_dir().join(format!("ralphus-agent-isolation-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join(".ralphus.toml"),
+            "[agent_isolation]\nallow_personal_settings = true\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_agent_isolation(&base);
+        assert!(resolved.allow_personal_settings());
+        assert!(!resolved.allow_personal_memory());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ── CorsConfig (RAL-220) ──────────────────────────────────────────────
 
     #[test]
@@ -2334,6 +2842,36 @@ mod tests {
         assert!(!global.clone().merge(project).match_pr_branch_name());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).match_pr_branch_name());
+    }
+
+    // ── auto_submit_pr_stack (RAL-317) ──────────────────────────────────────
+
+    #[test]
+    fn auto_submit_pr_stack_defaults_to_false_when_unset() {
+        assert!(!ReviewConfig::default().auto_submit_pr_stack());
+        assert!(!from_toml_str("[review]\nskip_worktrees = true\n").auto_submit_pr_stack());
+    }
+
+    #[test]
+    fn auto_submit_pr_stack_parses_explicit_true() {
+        let c = from_toml_str("[review]\nauto_submit_pr_stack = true\n");
+        assert_eq!(c.auto_submit_pr_stack, Some(true));
+        assert!(c.auto_submit_pr_stack());
+    }
+
+    #[test]
+    fn merge_auto_submit_pr_stack_project_wins() {
+        let global = ReviewConfig {
+            auto_submit_pr_stack: Some(true),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            auto_submit_pr_stack: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(!global.clone().merge(project).auto_submit_pr_stack());
+        // Project unset falls back to the global value.
+        assert!(global.merge(ReviewConfig::default()).auto_submit_pr_stack());
     }
 
     #[test]

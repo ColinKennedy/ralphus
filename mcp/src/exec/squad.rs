@@ -2,6 +2,7 @@
 
 use ralphus_cli::client::DaemonClient;
 use ralphus_cli::commands::CommandError;
+use ralphus_cli::commands::env;
 use ralphus_cli::commands::squad::SquadCommand;
 use ralphus_cli::commands::task::with_uri;
 use ralphus_cli::selector::{ResolvedSelector, squad_view_uri};
@@ -27,6 +28,7 @@ pub fn execute(cmd: SquadCommand, client: &DaemonClient) -> ExecResult {
             let uri = squad_view_uri(&squad, &resolved);
             Ok(with_uri(squad, uri))
         }
+        SquadCommand::Env { squad_id } => Ok(client.env_view(&env::squad_path(&squad_id))?),
         SquadCommand::Logs { squad_id } => Ok(client.squad_logs(&squad_id)?),
         SquadCommand::Timeline { squad_id, write } => {
             let timeline = client.squad_timeline(&squad_id)?;

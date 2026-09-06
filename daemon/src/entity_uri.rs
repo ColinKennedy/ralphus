@@ -82,6 +82,51 @@ impl EntityUri {
             _ => None,
         }
     }
+
+    /// Whether following `self` should also notify about `other` — the
+    /// parent-cascades-to-children rule RAL-320 follows rely on. An entity
+    /// always covers itself; a `Squad` covers everything under its
+    /// `squad_id`; a `Task` covers the `Cell`s/`Proof`s under its
+    /// `(squad_id, task_idx)`; a `Cell` covers only the cell-scoped `Proof`s
+    /// under its `(squad_id, task_idx, cell_idx)`. `Proof` and `Guardian`
+    /// are leaves — they cover only themselves.
+    #[must_use]
+    pub fn covers(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        match self {
+            Self::Squad { squad_id } => other.squad_id() == Some(squad_id.as_str()),
+            Self::Task { squad_id, task_idx } => match other {
+                Self::Cell {
+                    squad_id: s2,
+                    task_idx: t2,
+                    ..
+                }
+                | Self::Proof {
+                    squad_id: s2,
+                    task_idx: t2,
+                    ..
+                } => s2 == squad_id && t2 == task_idx,
+                _ => false,
+            },
+            Self::Cell {
+                squad_id,
+                task_idx,
+                cell_idx,
+            } => match other {
+                Self::Proof {
+                    squad_id: s2,
+                    task_idx: t2,
+                    proof_scope,
+                    cell_idx: c2,
+                    ..
+                } => proof_scope == "cell" && s2 == squad_id && t2 == task_idx && c2 == cell_idx,
+                _ => false,
+            },
+            Self::Proof { .. } | Self::Guardian { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for EntityUri {
@@ -276,5 +321,56 @@ mod tests {
     #[test]
     fn rejects_invalid_proof_scope() {
         assert_eq!(parse("proof:squad-1:0:bogus:-1:0"), None);
+    }
+
+    #[test]
+    fn covers_is_reflexive_for_every_kind() {
+        let cases = [
+            "squad:squad-1",
+            "task:squad-1:0",
+            "cell:squad-1:0:1",
+            "proof:squad-1:0:cell:1:0",
+            "guardian:g-1",
+        ];
+        for uri in cases {
+            let parsed = parse(uri).unwrap();
+            assert!(parsed.covers(&parsed), "{uri} should cover itself");
+        }
+    }
+
+    #[test]
+    fn squad_covers_every_descendant_in_the_same_squad() {
+        let squad = parse("squad:squad-1").unwrap();
+        assert!(squad.covers(&parse("task:squad-1:0").unwrap()));
+        assert!(squad.covers(&parse("cell:squad-1:2:1").unwrap()));
+        assert!(squad.covers(&parse("proof:squad-1:2:cell:1:0").unwrap()));
+        assert!(!squad.covers(&parse("task:squad-2:0").unwrap()));
+        assert!(!squad.covers(&parse("guardian:g-1").unwrap()));
+    }
+
+    #[test]
+    fn task_covers_only_its_own_cells_and_proofs() {
+        let task = parse("task:squad-1:2").unwrap();
+        assert!(task.covers(&parse("cell:squad-1:2:0").unwrap()));
+        assert!(task.covers(&parse("proof:squad-1:2:task:-1:0").unwrap()));
+        assert!(!task.covers(&parse("cell:squad-1:3:0").unwrap()));
+        assert!(!task.covers(&parse("squad:squad-1").unwrap()));
+    }
+
+    #[test]
+    fn cell_covers_only_its_own_cell_scoped_proofs() {
+        let cell = parse("cell:squad-1:2:1").unwrap();
+        assert!(cell.covers(&parse("proof:squad-1:2:cell:1:0").unwrap()));
+        assert!(!cell.covers(&parse("proof:squad-1:2:cell:0:0").unwrap()));
+        assert!(!cell.covers(&parse("proof:squad-1:2:task:-1:0").unwrap()));
+        assert!(!cell.covers(&parse("task:squad-1:2").unwrap()));
+    }
+
+    #[test]
+    fn proof_and_guardian_are_leaves() {
+        let proof = parse("proof:squad-1:0:cell:0:0").unwrap();
+        assert!(!proof.covers(&parse("squad:squad-1").unwrap()));
+        let guardian = parse("guardian:g-1").unwrap();
+        assert!(!guardian.covers(&parse("guardian:g-2").unwrap()));
     }
 }

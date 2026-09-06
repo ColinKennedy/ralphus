@@ -4,7 +4,7 @@
 (RAL-301), so an MCP client (Claude Code, other agent hosts) can drive
 squads/tasks/cells/proofs/reviews/etc. without the `ralphus` CLI binary
 installed at all. Talks to the daemon directly through `ralphus-cli`'s
-`DaemonClient`, reused as a library (`cli-rs` is both a `[[bin]]` and a
+`DaemonClient`, reused as a library (`cli` is both a `[[bin]]` and a
 `[lib]`) -- this crate never shells out to the compiled `ralphus` binary.
 
 ## Module map
@@ -26,7 +26,7 @@ installed at all. Talks to the daemon directly through `ralphus-cli`'s
   [github|gitlab]"`, ...) becomes a JSON-Schema property. `Tool::build_argv`
   converts an MCP tool call's JSON `arguments` back into the argv
   `ralphus_cli::commands::parse_args` expects, so argument
-  parsing/validation is still owned entirely by `cli-rs`, never
+  parsing/validation is still owned entirely by `cli`, never
   re-implemented here.
 - `src/exclusions.rs` -- the documented-reason exclusion list for CLI leaves
   that are genuinely not portable to one MCP request/response call (spawn an
@@ -41,7 +41,7 @@ installed at all. Talks to the daemon directly through `ralphus-cli`'s
   `dispatch` match arms one-for-one, but building a `serde_json::Value`
   response instead of printing (`dispatch` prints because CLI stdout *is*
   its product; an MCP tool call returns a value instead). Argv
-  parsing/selector resolution is fully reused from `cli-rs`
+  parsing/selector resolution is fully reused from `cli`
   (`commands::parse_args`, `selector::resolve_*`) -- only the final "call
   `DaemonClient`, shape a `Value`" step is duplicated, since that's the one
   place `dispatch` is inherently print-shaped. See `exec/mod.rs`'s doc
@@ -49,17 +49,17 @@ installed at all. Talks to the daemon directly through `ralphus-cli`'s
   print-capture/stdout-redirect bridge was considered and rejected (this
   workspace forbids `unsafe_code` workspace-wide, and there's no safe
   cross-platform way to redirect a process's own stdout on Windows without
-  it; a stray `println!` reused from `cli-rs` would also corrupt this
+  it; a stray `println!` reused from `cli` would also corrupt this
   crate's own stdout-is-the-MCP-wire contract).
 - `src/server.rs` -- wires `tools.rs` + `exec/` into the three MCP methods;
   owns the `--read-only` filter (only `read_only`-tagged tools are
-  listed/callable) mirroring `cli-rs`'s own `quick-start ... --read-only`
-  mechanism (see `cli-rs/AGENTS.md`'s Read-Only Quick-Start Safety List).
+  listed/callable) mirroring `cli`'s own `quick-start ... --read-only`
+  mechanism (see `cli/AGENTS.md`'s Read-Only Quick-Start Safety List).
 
 ## Adding a new CLI command
 
 Since `src/tools.rs` derives the tool list mechanically from
-`help_map::registered_leaves()`, a new leaf in `cli-rs/src/help_map.rs`
+`help_map::registered_leaves()`, a new leaf in `cli/src/help_map.rs`
 automatically gets an MCP tool with a schema for free -- the one thing that
 does **not** happen for free is execution: add a matching arm to the right
 `src/exec/*.rs` file (or `exclusions.rs`, with a real reason, if it's
@@ -72,7 +72,7 @@ moment a leaf has neither.
 `cargo test --all-targets` root `AGENTS.md` already asks developers to run
 and `.github/workflows/ci.yml`'s `rust` job already runs -- there is no
 separate CI-only parity script. It checks, bidirectionally, against
-`help_map::registered_leaves()` (the same tree `cli-rs`'s own
+`help_map::registered_leaves()` (the same tree `cli`'s own
 `help_map_command_parity.rs` proved is real and dispatchable):
 
 - every non-excluded CLI leaf has a corresponding tool

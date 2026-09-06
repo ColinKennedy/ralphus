@@ -152,6 +152,7 @@ mod tests {
             task: None,
             log_path: None,
             payload: serde_json::json!({}),
+            admin_only: false,
         }
     }
 

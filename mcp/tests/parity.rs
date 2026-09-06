@@ -6,7 +6,7 @@
 //!
 //! Bidirectional, against the single source of truth
 //! (`help_map::registered_leaves()`, the same tree
-//! `cli-rs/tests/help_map_command_parity.rs` already proved is real and
+//! `cli/tests/help_map_command_parity.rs` already proved is real and
 //! dispatchable):
 //! - every non-excluded CLI leaf has a corresponding MCP tool
 //! - every MCP tool corresponds to a real, dispatchable CLI leaf
@@ -81,7 +81,7 @@ fn no_excluded_leaf_secretly_has_a_tool() {
 }
 
 /// Picks a dummy JSON value for one chip, mirroring
-/// `cli-rs/tests/help_map_command_parity.rs::dummy_value_for` -- kept as its
+/// `cli/tests/help_map_command_parity.rs::dummy_value_for` -- kept as its
 /// own small copy rather than a shared crate, since the two tests serialize
 /// to different shapes (raw argv strings there, JSON `Value`s here) even
 /// though the underlying "what's a safe placeholder" logic is the same.
@@ -109,11 +109,14 @@ fn dummy_json(chip: &ralphus_mcp::chip::Chip) -> serde_json::Value {
     }
 }
 
-/// Same exception as `cli-rs/tests/help_map_command_parity.rs`'s
+/// Same exception as `cli/tests/help_map_command_parity.rs`'s
 /// `BUSINESS_RULE_ONLY_EXTRA_ARGS` and for the identical reason: `review
 /// squash` needs exactly one of two bare boolean flags, a business rule with
 /// no chip-level "required" signal to derive from.
-const BUSINESS_RULE_ONLY_EXTRA_BOOL: &[(&[&str], &str)] = &[(&["review", "squash"], "on")];
+const BUSINESS_RULE_ONLY_EXTRA_BOOL: &[(&[&str], &str)] = &[
+    (&["review", "squash"], "on"),
+    (&["mailbox", "set-preferences"], "auto_follow"),
+];
 
 #[test]
 fn every_tool_is_dispatchable_by_commands_parse_args() {
@@ -121,7 +124,7 @@ fn every_tool_is_dispatchable_by_commands_parse_args() {
     for tool in all_tools() {
         // Fills every positional and every value-taking option (all of
         // which are required-in-practice or harmless-if-extra -- see
-        // `cli-rs/tests/help_map_command_parity.rs`'s twin heuristic and its
+        // `cli/tests/help_map_command_parity.rs`'s twin heuristic and its
         // doc comment for why option chips can't distinguish "required"
         // from "optional"), but leaves bare boolean flags unset by default:
         // a handful of commands (`review squash`'s `--on`/`--off`) reject

@@ -249,23 +249,6 @@ pub fn run_command_proof_capture(
     result
 }
 
-/// Whether any of `cwds` has at least one commit its own `@{upstream}`
-/// tracking ref doesn't (RAL-293): the deterministic "did this task produce
-/// real, durable progress" check the finalizer runs for git-backed tasks, in
-/// place of trusting the agent's own self-report. Delegates the per-`cwd`
-/// question to [`crate::reviews::worktree_has_commits_ahead_of_upstream`],
-/// which reads live git state rather than a squad-run-scoped baseline sha —
-/// so it answers the same way whether the commit was made just now or by an
-/// earlier run that reused this same worktree. Fails closed per-`cwd`: one
-/// with no resolvable upstream counts as "no progress" for that cell, never
-/// as a pass.
-#[must_use]
-pub fn any_cwd_ahead_of_upstream(cwds: &[&str]) -> bool {
-    cwds.iter().any(|cwd| {
-        crate::reviews::worktree_has_commits_ahead_of_upstream(std::path::Path::new(cwd))
-    })
-}
-
 /// Cap captured output so a runaway verifier can't bloat the DB / UI.
 fn truncate_output(s: &str) -> String {
     const MAX: usize = 16 * 1024;
@@ -352,103 +335,5 @@ mod tests {
         assert!(out.ends_with("…(truncated)"));
         // Small output is returned verbatim.
         assert_eq!(truncate_output("short"), "short");
-    }
-
-    // ── RAL-293: no-new-commits guard helpers ────────────────────────────────
-
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static TEST_N: AtomicU32 = AtomicU32::new(0);
-
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let n = TEST_N.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("ral156-proof-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir tmp_dir");
-        dir
-    }
-
-    fn g(root: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .status()
-            .expect("git");
-        assert!(
-            status.success(),
-            "git {args:?} in {} failed",
-            root.display()
-        );
-    }
-
-    /// A fresh repo with one commit on `main`, tracking a local `base` branch
-    /// pinned to that same commit -- standing in for the `?upstream=` tracking
-    /// ref every real worktree materializes (`worktrees::set_explicit_upstream`).
-    fn init_repo(tag: &str) -> std::path::PathBuf {
-        let repo = tmp_dir(tag);
-        g(&repo, &["init", "-b", "main"]);
-        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
-        g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "base"]);
-        g(&repo, &["branch", "base"]);
-        g(&repo, &["branch", "--set-upstream-to=base", "main"]);
-        repo
-    }
-
-    #[test]
-    fn any_cwd_ahead_of_upstream_false_when_head_equals_upstream() {
-        let repo = init_repo("unchanged");
-        let cwd = repo.to_string_lossy().to_string();
-        assert!(!any_cwd_ahead_of_upstream(&[&cwd]));
-    }
-
-    #[test]
-    fn any_cwd_ahead_of_upstream_true_after_a_commit() {
-        let repo = init_repo("changed");
-        std::fs::write(repo.join("more.txt"), "more\n").unwrap();
-        g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "more"]);
-        let cwd = repo.to_string_lossy().to_string();
-        assert!(any_cwd_ahead_of_upstream(&[&cwd]));
-    }
-
-    #[test]
-    fn any_cwd_ahead_of_upstream_true_when_any_of_several_changed() {
-        // Two cells of the same task: the first's cwd never moved past its
-        // upstream; the second's got an extra commit on top -- standing in
-        // for "this cell made progress."
-        let unchanged = init_repo("multi-unchanged");
-        let changed = init_repo("multi-changed");
-        std::fs::write(changed.join("more.txt"), "more\n").unwrap();
-        g(&changed, &["add", "."]);
-        g(&changed, &["commit", "-m", "more"]);
-        let unchanged_cwd = unchanged.to_string_lossy().to_string();
-        let changed_cwd = changed.to_string_lossy().to_string();
-        assert!(any_cwd_ahead_of_upstream(&[&unchanged_cwd, &changed_cwd]));
-    }
-
-    #[test]
-    fn any_cwd_ahead_of_upstream_false_when_no_cwd_resolves() {
-        assert!(!any_cwd_ahead_of_upstream(&["/no/such/dir/ralphus-xyz"]));
-    }
-
-    #[test]
-    fn any_cwd_ahead_of_upstream_true_regardless_of_which_run_made_the_commit() {
-        // RAL-293's actual repro: the commit already existed before this
-        // check ever ran (e.g. made by an earlier squad run that reused this
-        // worktree) -- @{upstream} must still see it as progress, unlike the
-        // old squad-run-scoped baseline sha which only saw commits made
-        // *during* the run capturing it.
-        let repo = init_repo("prior-run");
-        std::fs::write(repo.join("prior-run.txt"), "already done\n").unwrap();
-        g(&repo, &["add", "."]);
-        g(&repo, &["commit", "-m", "prior run's work"]);
-        let cwd = repo.to_string_lossy().to_string();
-        assert!(any_cwd_ahead_of_upstream(&[&cwd]));
     }
 }

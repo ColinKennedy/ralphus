@@ -54,4 +54,4 @@ echo "   workspace root -> $RALPHUS_WORKSPACE_ROOT (mounted read-write at /works
 echo "   daemon         -> http://127.0.0.1:${daemon_port}"
 echo "   librarian      -> http://127.0.0.1:${librarian_port}"
 
-exec docker compose -f "$root/docker/docker-compose.yml" up --build "${compose_args[@]}"
+exec docker compose --file "$root/docker/docker-compose.yml" up --build "${compose_args[@]}"

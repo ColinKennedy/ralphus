@@ -25,6 +25,7 @@ mod review;
 mod show;
 mod squad;
 mod task;
+mod triage;
 
 use ralphus_cli::client::DaemonClient;
 use ralphus_cli::commands::{Command, CommandError, misc};
@@ -93,6 +94,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::Squad(c) => squad::execute(c, client),
         Command::Mailbox(c) => mailbox::execute(c, client),
         Command::QuickStart(_) => Err(usage("quick-start is excluded from the MCP tool surface")),
+        Command::Triage(c) => triage::execute(c, client),
         Command::UsageError(m) => Err(usage(m)),
     }
 }
@@ -377,8 +379,12 @@ fn exec_clear(client: &DaemonClient, args: misc::ClearArgs) -> ExecResult {
 
 fn exec_check(client: &DaemonClient, args: misc::CheckArgs) -> Value {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let results =
-        ralphus_cli::health::run_checks(client.base_url(), &cwd, args.enable_developer_checks);
+    let results = ralphus_cli::health::run_checks(
+        client.base_url(),
+        &cwd,
+        args.enable_developer_checks,
+        args.all_remotes,
+    );
     let checks: Vec<Value> = results
         .iter()
         .map(|r| {

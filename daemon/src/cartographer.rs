@@ -55,6 +55,11 @@ pub struct CartographerRow {
     /// Arbitrary structured detail, as a raw JSON string (already validated
     /// JSON — parsed lazily by consumers, not re-parsed here).
     pub payload: serde_json::Value,
+    /// RAL-332: restricts this row to admin viewers only (see
+    /// [`Note::admin_only`]) -- e.g. RAL-328's hide/unhide rows and this
+    /// ticket's "Edit Profile" rows. `false` (the default) is every
+    /// pre-RAL-332 row, unrestricted exactly as before.
+    pub admin_only: bool,
 }
 
 /// A filtered, paginated, sorted query against the Cartographer log.
@@ -88,6 +93,12 @@ pub struct CartographerFilter {
     pub offset: i64,
     /// Oldest-first when true; newest-first (the default) when false.
     pub ascending: bool,
+    /// RAL-332: include rows marked [`Note::admin_only`]. `false` (the
+    /// default) is the safe choice for every existing internal consumer
+    /// (scheduler reconciliation checks, `crate::timeline`, ...) -- only the
+    /// `/api/cartographer` HTTP handler sets this, and only once it has
+    /// confirmed the caller is an admin.
+    pub include_admin_only: bool,
 }
 
 impl CartographerFilter {
@@ -130,6 +141,7 @@ pub struct Note<'a> {
     cell_id: Option<&'a str>,
     task: Option<&'a str>,
     log_path: Option<&'a str>,
+    admin_only: bool,
 }
 
 impl<'a> Note<'a> {
@@ -146,6 +158,7 @@ impl<'a> Note<'a> {
             cell_id: None,
             task: None,
             log_path: None,
+            admin_only: false,
         }
     }
 
@@ -200,6 +213,18 @@ impl<'a> Note<'a> {
         self
     }
 
+    /// Restrict this row to admin viewers (RAL-332) -- excluded from the
+    /// Logs tab, and from `crate::cartographer::CartographerFilter`-based
+    /// queries generally, for anyone whose `is_admin` flag isn't set. Use
+    /// for rows that reveal one user's personal preference to every other
+    /// user (RAL-328's hide/unhide) or an admin's action on someone else's
+    /// account (RAL-332's "Edit Profile"/visit-as).
+    #[must_use]
+    pub fn admin_only(mut self) -> Self {
+        self.admin_only = true;
+        self
+    }
+
     /// Write the human-readable log line (`ralphus [source] message`) to the
     /// active log sink and persist the structured record to Cartographer.
     /// Failures to persist are swallowed (a missing structured record must
@@ -218,6 +243,7 @@ impl<'a> Note<'a> {
             task: self.task,
             log_path: self.log_path,
             payload,
+            admin_only: self.admin_only,
         });
     }
 }
@@ -235,6 +261,10 @@ pub struct CartographerEntry<'a> {
     pub task: Option<&'a str>,
     pub log_path: Option<&'a str>,
     pub payload: serde_json::Value,
+    /// RAL-332: see [`CartographerRow::admin_only`]. Direct `CartographerEntry`
+    /// construction sites (as opposed to [`Note`]) all set this to `false` --
+    /// only [`Note::admin_only`] ever sets it `true`.
+    pub admin_only: bool,
 }
 
 fn level_str(level: LogLevel) -> &'static str {
@@ -262,8 +292,8 @@ impl Store {
     pub fn cartographer_log(&self, entry: CartographerEntry<'_>) -> Result<()> {
         let at_ms = now_ms();
         self.conn.execute(
-            "INSERT INTO cartographer_events(at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO cartographer_events(at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload, admin_only)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 at_ms,
                 level_str(entry.level),
@@ -276,8 +306,17 @@ impl Store {
                 entry.task,
                 entry.log_path,
                 entry.payload.to_string(),
+                entry.admin_only,
             ],
         )?;
+        // RAL-332: the SSE broadcast below is not viewer-scoped (`EventBus`
+        // has no per-connection identity), so an admin_only row's full
+        // payload still reaches every connected browser over the wire even
+        // though the Logs tab's own `GET /api/cartographer`/`GET
+        // /api/cartographer/{id}` calls filter it out of what's ever
+        // rendered. Acceptable for a UI-level convenience gate (see
+        // `crate::users`'s module doc comment) -- closing this would need a
+        // per-connection-aware `EventBus`, out of scope here.
         self.event_bus().publish(CartographerRow {
             id: self.conn.last_insert_rowid(),
             at_ms,
@@ -291,6 +330,7 @@ impl Store {
             task: entry.task.map(str::to_string),
             log_path: entry.log_path.map(str::to_string),
             payload: entry.payload,
+            admin_only: entry.admin_only,
         });
         Ok(())
     }
@@ -315,6 +355,9 @@ impl Store {
         eq_clause!("guardian_id", filter.guardian_id);
         eq_clause!("cell_id", filter.cell_id);
         eq_clause!("task", filter.task);
+        if !filter.include_admin_only {
+            clauses.push("admin_only = 0".to_string());
+        }
         if let Some(q) = filter.q.as_ref() {
             clauses.push("message LIKE ? ESCAPE '\\'".to_string());
             let escaped = q
@@ -348,7 +391,7 @@ impl Store {
         let limit = filter.limit.clamp(1, 1000);
         let offset = filter.offset.max(0);
         let sql = format!(
-            "SELECT id, at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload
+            "SELECT id, at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload, admin_only
              FROM cartographer_events {where_sql}
              ORDER BY at_ms {order}, id {order}
              LIMIT {limit} OFFSET {offset}"
@@ -371,6 +414,7 @@ impl Store {
                     task: r.get(9)?,
                     log_path: r.get(10)?,
                     payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+                    admin_only: r.get::<_, i64>(12)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -409,11 +453,15 @@ impl Store {
     }
 
     /// Fetch one Cartographer row by id (used to resolve a click-through
-    /// target's full payload without re-issuing a filtered query).
+    /// target's full payload without re-issuing a filtered query). Returns
+    /// the row regardless of [`CartographerRow::admin_only`] -- callers that
+    /// need to hide admin-only rows from a non-admin viewer (RAL-332) check
+    /// that field themselves, the same way `cartographer_query`'s HTTP
+    /// handler does.
     pub fn cartographer_get(&self, id: i64) -> Result<Option<CartographerRow>> {
         self.conn
             .query_row(
-                "SELECT id, at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload
+                "SELECT id, at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload, admin_only
                  FROM cartographer_events WHERE id = ?",
                 params![id],
                 |r| {
@@ -432,6 +480,7 @@ impl Store {
                         log_path: r.get(10)?,
                         payload: serde_json::from_str(&payload_str)
                             .unwrap_or(serde_json::Value::Null),
+                        admin_only: r.get::<_, i64>(12)? != 0,
                     })
                 },
             )

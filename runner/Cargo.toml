@@ -30,3 +30,20 @@ sysinfo = { workspace = true }
 
 [dev-dependencies]
 ureq = { workspace = true }
+
+[target."cfg(windows)".dependencies]
+win32job = "2.0.3"
+
+[target."cfg(unix)".dependencies]
+# RAL-321: killing a `run_bash` command on timeout must kill its whole
+# process tree, not just the shell wrapping it, or already-spawned
+# grandchildren keep running and keep the output pipes open (the same class
+# of leak `daemon/src/proof.rs` fixed for Guardian check gates under
+# RAL-239). The shell is put in its own process group at spawn
+# (`std::process::Command::process_group`, no extra dependency needed for
+# that part) and, on timeout, the whole group is signalled with
+# `kill(-pgid, SIGKILL)` -- a syscall `std` doesn't expose. `nix` wraps it as
+# a safe function, since `unsafe_code = "forbid"` bans a raw libc call from
+# being written in this crate. Windows has the equivalent problem solved via
+# a `win32job` Job Object instead.
+nix = { version = "0.29", default-features = false, features = ["signal"] }

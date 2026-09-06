@@ -11,15 +11,15 @@ root="$(dirname "$(git -C "$_script_dir" rev-parse --path-format=absolute --git-
 unset _script_dir
 
 echo "== building ralphus-librarian (debug) =="
-( cd "$root" && cargo build -p ralphus-librarian )
+( cd "$root" && cargo build --package ralphus-librarian )
 
 echo "== syncing docs venv (uv) =="
-( cd "$root/cli" && uv sync --extra docs >/dev/null )
+( cd "$root/cli-py" && uv sync --extra docs >/dev/null )
 
 echo "== installing headless Chromium (Playwright) =="
-( cd "$root/cli" && uv run playwright install chromium )
+( cd "$root/cli-py" && uv run playwright install chromium )
 
 echo "== generating screenshots =="
-( cd "$root/cli" && uv run ralphus-docs-shots )
+( cd "$root/cli-py" && uv run ralphus-docs-shots )
 
 echo "== done -> $root/docs/site/pages/screenshots/ =="

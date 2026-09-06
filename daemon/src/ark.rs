@@ -319,7 +319,7 @@ fn notify_old_reviews(
         if store.claim_ark_notification("review", &id)? {
             store.enqueue_mailbox_message(MailboxPriority::High,
                 &format!("Ark found old review {id} ({name}) in {status}; inspect it before any worktree cleanup."),
-                None, None, None)?;
+                None, None, None, Some(&format!("guardian:{id}")))?;
             count += 1;
         }
     }
@@ -544,22 +544,22 @@ mod tests {
         run(&remote, &["init", "--bare"]);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-b", "main"]);
+        run(&repo, &["init", "--initial-branch", "main"]);
         run(&repo, &["config", "user.email", "ark@example.invalid"]);
         run(&repo, &["config", "user.name", "Ark Test"]);
         std::fs::write(repo.join("seed"), "seed").unwrap();
         run(&repo, &["add", "seed"]);
-        run(&repo, &["commit", "-m", "seed"]);
+        run(&repo, &["commit", "--message", "seed"]);
         run(
             &repo,
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
-        run(&repo, &["push", "-u", "origin", "main"]);
+        run(&repo, &["push", "--set-upstream", "origin", "main"]);
         run(&repo, &["branch", "feature"]);
         let wt = repo.join(".git").join(".ralphus").join("w").join("feature");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         run(&repo, &["worktree", "add", wt.to_str().unwrap(), "feature"]);
-        run(&wt, &["push", "-u", "origin", "feature"]);
+        run(&wt, &["push", "--set-upstream", "origin", "feature"]);
         (repo, wt)
     }
 
@@ -616,7 +616,7 @@ mod tests {
         let (repo, wt) = repo_with_pushed_worktree();
         std::fs::write(wt.join("ark-only.txt"), "not pushed").unwrap();
         run(&wt, &["add", "ark-only.txt"]);
-        run(&wt, &["commit", "-m", "local only"]);
+        run(&wt, &["commit", "--message", "local only"]);
         let candidate = Candidate {
             project_root: repo.clone(),
             worktree: wt.clone(),

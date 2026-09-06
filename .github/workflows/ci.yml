@@ -81,10 +81,10 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: cli
+        working-directory: cli-py
     steps:
       - uses: actions/checkout@v4
-      # Lint/type-check once, on the newest version cli/pyproject.toml's
+      # Lint/type-check once, on the newest version cli-py/pyproject.toml's
       # `requires-python = ">=3.11"` covers -- these tools don't need a
       # version matrix, only pytest (below) does.
       - name: Install Python 3.13
@@ -115,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: cli
+        working-directory: cli-py
     env:
       # Make every `uv` step use the matrix's interpreter, not just whatever uv
       # first finds that satisfies requires-python (>=3.11).
@@ -123,7 +123,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The versions cli/pyproject.toml's `requires-python = ">=3.11"` covers
+        # The versions cli-py/pyproject.toml's `requires-python = ">=3.11"` covers
         # in practice, plus a floating "3" leg that always resolves to the
         # newest available Python so CI stays forward-looking.
         python-version: ["3.11", "3.12", "3.13", "3"]
@@ -178,7 +178,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: cli
+        working-directory: cli-py
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

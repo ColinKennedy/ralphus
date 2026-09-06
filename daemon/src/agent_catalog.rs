@@ -34,8 +34,8 @@ pub struct CatalogAgent {
 }
 
 /// Built-in backends' known model choices, mirroring
-/// `cli-rs/src/agents.rs::KNOWN_AGENTS`. Kept as a small duplicate here
-/// since `daemon` cannot depend on `cli-rs` (the dependency runs the other
+/// `cli/src/agents.rs::KNOWN_AGENTS`. Kept as a small duplicate here
+/// since `daemon` cannot depend on `cli` (the dependency runs the other
 /// way). A backend absent from this table (e.g. `"ollama"`, `"codex"`)
 /// accepts any model name -- see [`CatalogAgent::models`].
 const BUILTIN_MODELS: &[(&str, &[&str])] =

@@ -128,8 +128,11 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
         // unique either way, so fall back rather than refusing to rebase.
         let scope = worktree_branch(cwd).unwrap_or_else(|_| "detached-head".to_string());
         let name = crate::stash::unique_stash_name(&scope, "rebase");
-        git(cwd, &["stash", "push", "--include-untracked", "-m", &name])
-            .map_err(|e| format!("git stash before rebase failed: {e}"))?;
+        git(
+            cwd,
+            &["stash", "push", "--include-untracked", "--message", &name],
+        )
+        .map_err(|e| format!("git stash before rebase failed: {e}"))?;
         Some(name)
     } else {
         None
@@ -185,26 +188,34 @@ pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, Strin
 /// equals `HEAD`, indistinguishable from "no progress". The
 /// `ralphus.<branch>.baseline` key lives in a config namespace git itself
 /// never writes to, so it survives that push untouched.
-fn worktree_baseline_ref(cwd: &Path) -> std::result::Result<String, String> {
-    if let Ok(branch) = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+fn workspace_baseline_ref(workspace: &Workspace) -> std::result::Result<String, String> {
+    if let Ok(branch) = workspace.git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
         let branch = branch.trim();
         if !branch.is_empty() {
-            if let Ok(marker) = git(
-                cwd,
-                &["config", "--get", &format!("ralphus.{branch}.baseline")],
-            ) {
+            if let Ok(marker) =
+                workspace.git(&["config", "--get", &format!("ralphus.{branch}.baseline")])
+            {
                 let marker = marker.trim();
-                if !marker.is_empty() && git(cwd, &["rev-parse", "--verify", marker]).is_ok() {
+                if !marker.is_empty() && workspace.git(&["rev-parse", "--verify", marker]).is_ok() {
                     return Ok(marker.to_string());
                 }
             }
         }
     }
-    worktree_upstream(cwd)
+    workspace
+        .git(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ])
+        .map(|s| s.trim().to_string())
+        .map_err(|_| "no upstream".to_string())
 }
 
-/// Whether `cwd`'s checked-out branch has at least one commit its durable
-/// baseline ([`worktree_baseline_ref`]) doesn't (RAL-293).
+/// Whether `workspace`'s checked-out branch has at least one commit its
+/// durable baseline ([`workspace_baseline_ref`]) doesn't (RAL-293, made
+/// machine-aware for RAL-355 Phase 8).
 ///
 /// This is the no-new-commits guard's (`crate::scheduler::check_task_no_commits_guard`)
 /// review-independent "did this task make real progress" signal: unlike a
@@ -215,16 +226,29 @@ fn worktree_baseline_ref(cwd: &Path) -> std::result::Result<String, String> {
 /// has no resolvable baseline (e.g. a plain checkout never routed through
 /// [`crate::worktrees::ensure_worktree`]) — mirrors the guard's existing
 /// fail-closed policy of treating an unanswerable question as "no progress"
-/// rather than silently passing.
+/// rather than silently passing. Local and remote workspaces are checked
+/// identically through [`Workspace::git`].
 #[must_use]
-pub(crate) fn worktree_has_commits_ahead_of_upstream(cwd: &Path) -> bool {
-    let Ok(baseline) = worktree_baseline_ref(cwd) else {
+pub(crate) fn workspace_has_commits_ahead_of_upstream(workspace: &Workspace) -> bool {
+    let Ok(baseline) = workspace_baseline_ref(workspace) else {
         return false;
     };
-    git(cwd, &["rev-list", "--count", &format!("{baseline}..HEAD")])
+    workspace
+        .git(&["rev-list", "--count", &format!("{baseline}..HEAD")])
         .ok()
-        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
         .is_some_and(|n| n > 0)
+}
+
+/// Whether *any* workspace in `workspaces` has commits ahead of its durable
+/// baseline (RAL-355 Phase 8). Used by the scheduler's no-new-commits guard,
+/// which fails a task only when every one of its cells' workspaces reports
+/// no progress.
+#[must_use]
+pub(crate) fn any_workspace_ahead_of_upstream(workspaces: &[Workspace]) -> bool {
+    workspaces
+        .iter()
+        .any(workspace_has_commits_ahead_of_upstream)
 }
 
 /// Whether the checked-out `HEAD` is already contained in its configured
@@ -310,6 +334,9 @@ struct Membership {
     machine: Option<String>,
     /// Optional USD spend cap declared on the review (RAL-193).
     maximum_budget_usd: Option<f64>,
+    /// Optional Proof-scope override declared on the review (`[[review]]
+    /// proof_scope`), one of `each_branch`/`final_branch`/`nothing`.
+    proof_scope: Option<String>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -350,8 +377,10 @@ fn rows_from_file<'a>(file: &'a TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellRe
                 maximum_budget_usd: None,
                 maximum_context: None,
                 auto_compact_threshold: None,
+                tool_output_max_tokens: None,
                 upstream: s.upstream.clone(),
                 machine: ralphus_core::schema::resolve_cell_machine(task, s),
+                share_session: false,
             });
             // Collect the cell's cwd and its optional review opt-in id. `review`
             // is a `<<review:<id>>>` / `<<ralphus:new-review/<key>>>` sentinel
@@ -631,6 +660,9 @@ pub fn derive_reviews(
                 .and_then(|r| r.machine.clone())
                 .filter(|s| !s.trim().is_empty()),
             maximum_budget_usd: rv.and_then(|r| r.maximum_budget_usd),
+            proof_scope: rv
+                .and_then(|r| r.proof_scope.clone())
+                .filter(|s| !s.trim().is_empty()),
         });
     }
 
@@ -866,6 +898,15 @@ fn apply_resolver(
             .set_guardian_maximum_budget_usd(gid, Some(cap))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
+    // This review's own Proof-scope override, authored via `[[review]]
+    // proof_scope`. Validated offline (`core::validate`) against
+    // `PROOF_SCOPE_VALUES`, so any value reaching here is already one of
+    // `each_branch`/`final_branch`/`nothing`.
+    if let Some(scope) = members.iter().find_map(|m| m.proof_scope.clone()) {
+        store
+            .set_guardian_proof_scope(gid, Some(&scope))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -935,6 +976,228 @@ fn add_new_branches(
     Ok(())
 }
 
+// ── Triage pooling (RAL-318) ─────────────────────────────────────────────────
+
+/// Pool every Triage-opted-in cell (`triage = true`) from `file` into each of
+/// its resolved `(project, triage_type)` pools -- a cell that resolved to
+/// more than one type (inline `triage_type` list, or a multi-type Arbiter
+/// classification) is pooled into every one of them independently -- then
+/// check whether any of those pools' count thresholds has now fired (a cron
+/// schedule can also fire one independently -- see `crate::scheduler`'s
+/// Triage tick). A firing pool is drained and turned into a fresh review
+/// guardian through the same Collecting -> Approved -> Deployed pipeline
+/// [`derive_reviews`] uses, flagged [`crate::guardian::GUARDIAN_ORIGIN_ARBITER`].
+/// Returns the created guardian ids (empty when no cell opts into Triage, or
+/// no pool fired).
+///
+/// Each cell's resolved Triage type(s) must already be persisted (see
+/// `Store::set_cell_triage_types`) -- classification itself
+/// (`crate::arbiter::classify`) runs earlier in the submit pipeline, before
+/// this is called; a cell with no resolved type yet is skipped rather than
+/// pooled with an unknown type (should not happen in the normal submit path).
+///
+/// Race-safety: the threshold-check here and the scheduler's independent
+/// cron-check race on the same pool, but both ultimately call
+/// [`Store::drain_triage_pool`], a single atomic `DELETE ... RETURNING`
+/// executed while holding the daemon's one `Arc<Mutex<Store>>` (same
+/// reliance every other cumulative-then-act sequence in this module makes) --
+/// whichever caller drains first empties the pool for the other, so no cell
+/// is ever double-counted across two forced reviews.
+///
+/// # Errors
+/// Returns [`ReviewError`] for the same class of problems [`derive_reviews`]
+/// does: a missing/unresolvable worktree, or no upstream tracking branch.
+pub fn derive_triage_pools(
+    store: &Store,
+    squad_id: &str,
+    file: &TaskFile,
+) -> std::result::Result<Vec<String>, ReviewError> {
+    if !file.task.iter().any(|t| t.cell.iter().any(|c| c.triage)) {
+        return Ok(Vec::new());
+    }
+    let (mut cells, tasks, _cell_info) = rows_from_file(file);
+    crate::worktrees::resolve_placeholders(store, squad_id, &mut cells, &tasks, &Context::new())
+        .map_err(ReviewError::new)?;
+    let tasks_by_idx: BTreeMap<i64, Option<&TaskRow>> =
+        tasks.iter().map(|t| (t.idx, Some(t))).collect();
+
+    let mut flat_cells: Vec<&ralphus_core::schema::CellDef> = Vec::new();
+    for task in &file.task {
+        for cell in &task.cell {
+            flat_cells.push(cell);
+        }
+    }
+
+    let mut touched_keys: HashSet<(String, String)> = HashSet::new();
+    for (cell_def, row) in flat_cells.iter().zip(cells.iter()) {
+        if !cell_def.triage {
+            continue;
+        }
+        let triage_types = store
+            .get_cell_triage_types(squad_id, row.task_idx, row.idx)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        if triage_types.is_empty() {
+            continue;
+        }
+        let remote = remote_cell_derivation(
+            store,
+            row,
+            row.cwd.as_deref(),
+            tasks_by_idx.get(&row.task_idx).copied().flatten(),
+        )?;
+        if let Some(rd) = &remote {
+            // A remote review-linked cell can declare its upstream on the
+            // `[[review]]` block; Triage has no per-cell equivalent to
+            // declare one on. Rather than guess or hard-error the whole
+            // submission, a remote Triage cell is skipped with a clear
+            // Cartographer note -- local-worktree Triage pooling is fully
+            // supported; remote-machine Triage is a documented follow-up.
+            crate::cartographer::Note::new("arbiter")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .emit(
+                    store,
+                    format!(
+                        "cell \"{}\" runs on machine \"{}\" and opts into Triage; \
+                         remote-machine Triage pooling is not yet supported, skipping",
+                        row.cell_id, rd.machine
+                    ),
+                    serde_json::json!({}),
+                );
+            continue;
+        }
+        let Some(cwd) = row.cwd.as_deref() else {
+            return Err(ReviewError::new(format!(
+                "cell \"{}\" opts into triage but has no cwd",
+                row.cell_id
+            )));
+        };
+        let cwd_path = Path::new(cwd);
+        let project =
+            worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+        let branch =
+            worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+        let upstream = worktree_upstream(cwd_path).map_err(|_| {
+            ReviewError::new(format!(
+                "{cwd}: Triage pooling requires a git upstream tracking branch for '{branch}', \
+                 but none is configured (set one with 'git branch --set-upstream-to=<branch>')"
+            ))
+        })?;
+        store
+            .set_cell_review_branch(squad_id, row.task_idx, row.idx, &branch)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        let project_str = project.to_string_lossy().into_owned();
+        // A cell resolved to more than one type (inline `triage_type` list,
+        // or a multi-type Arbiter classification) is pooled into every one
+        // of its types' `(project, triage_type)` pools independently --
+        // draining one pool never removes it from the others, since each is
+        // its own row in `triage_pool_cells`.
+        for triage_type in &triage_types {
+            store
+                .record_triage_pool_cell(
+                    &project_str,
+                    triage_type,
+                    squad_id,
+                    row.task_idx,
+                    row.idx,
+                    &branch,
+                    &upstream,
+                )
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+            crate::cartographer::Note::new("arbiter")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .emit(
+                    store,
+                    format!(
+                        "cell \"{}\" pooled for Triage type {triage_type:?}",
+                        row.cell_id
+                    ),
+                    serde_json::json!({"project": project_str, "triage_type": triage_type}),
+                );
+            touched_keys.insert((project_str.clone(), triage_type.clone()));
+        }
+    }
+
+    let mut created = Vec::new();
+    for (project, triage_type) in touched_keys {
+        let count = store
+            .triage_pool_count(&project, &triage_type)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        let threshold = store
+            .get_triage_pool_threshold(&project, &triage_type)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        if threshold.is_some_and(|t| count >= t) {
+            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
+                created.push(gid);
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// Drain the `(project, triage_type)` pool and, if it wasn't already emptied
+/// by a concurrent caller (the scheduler's cron tick, or another submission's
+/// own threshold check), create a fresh review guardian from its cells.
+/// Returns `None` when the pool was already empty by the time this drained it
+/// -- not an error, just "someone else already fired it".
+///
+/// # Errors
+/// Returns [`ReviewError`] on any store failure while creating the guardian
+/// or attaching its branches.
+pub(crate) fn create_review_from_triage_pool(
+    store: &Store,
+    project: &str,
+    triage_type: &str,
+) -> std::result::Result<Option<String>, ReviewError> {
+    let drained = store
+        .drain_triage_pool(project, triage_type)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    if drained.is_empty() {
+        return Ok(None);
+    }
+    let upstream = drained
+        .first()
+        .map(|c| c.upstream.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let name = format!("triage-{triage_type}");
+    let gid = store
+        .create_guardian_for_squad(&name, &upstream, project, None)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    store
+        .set_guardian_origin(&gid, crate::guardian::GUARDIAN_ORIGIN_ARBITER)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    if crate::config::resolve(Path::new(project)).skip_worktrees() {
+        store
+            .set_guardian_skip_worktrees(&gid, true)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for cell in &drained {
+        if seen.insert(cell.branch.clone()) {
+            store
+                .add_guardian_branch_with_project(&gid, &cell.branch, None)
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+        }
+        store
+            .set_cell_review_guardian(&cell.squad_id, cell.task_idx, cell.idx, &gid)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    crate::cartographer::Note::new("arbiter").guardian(&gid).emit(
+        store,
+        format!(
+            "Triage pool ({project}, {triage_type}) fired -> created review {gid} from {} cell(s)",
+            drained.len()
+        ),
+        serde_json::json!({
+            "project": project,
+            "triage_type": triage_type,
+            "cell_count": drained.len(),
+        }),
+    );
+    Ok(Some(gid))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -942,8 +1205,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, apply_resolver, rebase_onto, workspace_head_is_ancestor_of_upstream,
-        worktree_has_commits_ahead_of_upstream,
+        Membership, any_workspace_ahead_of_upstream, apply_resolver,
+        create_review_from_triage_pool, derive_triage_pools, rebase_onto,
+        workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::Store;
     use crate::workspace::Workspace;
@@ -979,7 +1243,7 @@ mod tests {
     #[test]
     fn stashes_dirty_changes_before_rebase_and_restores_them_after() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         // `rebase_onto` below shells out through `GitVcs::exec_raw`, which
         // (correctly, for real repos) never injects an identity -- so this
         // throwaway repo needs one in its own local config, not just on this
@@ -996,18 +1260,18 @@ mod tests {
         git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
 
         git(&root, &["checkout", "-b", "upstream"]);
         std::fs::write(root.join("upstream.txt"), "upstream\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "upstream"]);
+        git(&root, &["commit", "--message", "upstream"]);
 
         git(&root, &["checkout", "main"]);
         git(&root, &["checkout", "-b", "work"]);
         std::fs::write(root.join("work.txt"), "work\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "work"]);
+        git(&root, &["commit", "--message", "work"]);
 
         // Simulate a cell that stalled mid-flight: committed work + dirty file.
         std::fs::write(root.join("in_progress.txt"), "half done\n").unwrap();
@@ -1036,7 +1300,7 @@ mod tests {
     #[test]
     fn restores_stash_after_rebase_failure() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         // See the identical config in `stashes_dirty_changes_before_rebase_and_restores_them_after`
         // above: `rebase_onto` needs an identity, and stash pop must not let
         // a Windows runner's `core.autocrlf=true` default mangle line
@@ -1046,16 +1310,16 @@ mod tests {
         git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("conflict.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
 
         git(&root, &["checkout", "-b", "upstream"]);
         std::fs::write(root.join("conflict.txt"), "from upstream\n").unwrap();
-        git(&root, &["commit", "-am", "upstream"]);
+        git(&root, &["commit", "--all", "--message", "upstream"]);
 
         git(&root, &["checkout", "main"]);
         git(&root, &["checkout", "-b", "work"]);
         std::fs::write(root.join("conflict.txt"), "from work\n").unwrap();
-        git(&root, &["commit", "-am", "work"]);
+        git(&root, &["commit", "--all", "--message", "work"]);
 
         // Leave an untracked in-progress file.
         std::fs::write(root.join("in_progress.txt"), "half done\n").unwrap();
@@ -1108,8 +1372,10 @@ mod tests {
             maximum_budget_usd: None,
             maximum_context: None,
             auto_compact_threshold: None,
+            tool_output_max_tokens: None,
             upstream: None,
             machine: None,
+            share_session: false,
         }
     }
 
@@ -1127,10 +1393,10 @@ mod tests {
     #[test]
     fn upstream_display_falls_back_to_tracking_branch() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         git(&root, &["checkout", "-b", "feature"]);
         git(&root, &["branch", "--set-upstream-to", "main"]);
 
@@ -1145,10 +1411,10 @@ mod tests {
     #[test]
     fn upstream_display_resolves_chained_dependency_branch_over_tracking_ref() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
 
         let dep_wt = root.join("wt-dep");
         let work_wt = root.join("wt-work");
@@ -1191,10 +1457,10 @@ mod tests {
     #[test]
     fn upstream_display_none_when_chained_dependency_not_yet_materialized() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         git(&root, &["checkout", "-b", "work-branch"]);
 
         let dep_row = row(0, "dep-task", "work", None); // not materialized yet
@@ -1226,6 +1492,7 @@ mod tests {
             model: None,
             machine: None,
             maximum_budget_usd,
+            proof_scope: None,
         }
     }
 
@@ -1247,37 +1514,67 @@ mod tests {
         assert_eq!(store.guardian_maximum_budget_usd(&gid).unwrap(), None);
     }
 
+    // ── [[review]] proof_scope wiring ─────────────────────────────────────
+
+    #[test]
+    fn apply_resolver_sets_proof_scope_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            proof_scope: Some("final_branch".to_string()),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().proof_scope.as_deref(),
+            Some("final_branch")
+        );
+    }
+
+    #[test]
+    fn apply_resolver_leaves_proof_scope_unset_when_no_member_declares_one() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(store.get_guardian(&gid).unwrap().proof_scope, None);
+    }
+
     // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────
 
     #[test]
     fn false_when_head_equals_upstream() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         git(&root, &["branch", "base"]);
         git(&root, &["branch", "--set-upstream-to=base", "main"]);
 
-        assert!(!worktree_has_commits_ahead_of_upstream(&root));
+        assert!(!workspace_has_commits_ahead_of_upstream(&Workspace::local(
+            root.clone()
+        )));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn true_when_head_has_a_commit_the_upstream_lacks() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         git(&root, &["branch", "base"]);
         git(&root, &["branch", "--set-upstream-to=base", "main"]);
 
         std::fs::write(root.join("more.txt"), "more\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "more"]);
+        git(&root, &["commit", "--message", "more"]);
 
-        assert!(worktree_has_commits_ahead_of_upstream(&root));
+        assert!(workspace_has_commits_ahead_of_upstream(&Workspace::local(
+            root.clone()
+        )));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1288,10 +1585,10 @@ mod tests {
         // baseline sha, this must read the same whether the commit was made
         // just now or by an earlier, unrelated run that reused this worktree.
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         git(&root, &["branch", "base"]);
         git(&root, &["branch", "--set-upstream-to=base", "main"]);
 
@@ -1299,22 +1596,24 @@ mod tests {
         // worktree, well before this check ever runs.
         std::fs::write(root.join("prior-run.txt"), "already done\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "prior run's work"]);
+        git(&root, &["commit", "--message", "prior run's work"]);
 
-        assert!(worktree_has_commits_ahead_of_upstream(&root));
+        assert!(workspace_has_commits_ahead_of_upstream(&Workspace::local(
+            root.clone()
+        )));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn false_when_no_upstream_is_configured() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
 
         assert!(
-            !worktree_has_commits_ahead_of_upstream(&root),
+            !workspace_has_commits_ahead_of_upstream(&Workspace::local(root.clone())),
             "no upstream must fail closed, not silently pass"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1334,10 +1633,10 @@ mod tests {
         // `ralphus.<branch>.baseline` marker `set_explicit_upstream` writes
         // alongside `@{upstream}`, which this push never touches.
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         // Stand in for `ensure_worktree("feature-x", "main")`: a feature
         // branch forked from `main`, with the daemon's real config writes
         // (`branch.<b>.merge` -- i.e. the pre-push `@{upstream}` -- and the
@@ -1355,7 +1654,7 @@ mod tests {
 
         std::fs::write(root.join("work.txt"), "work\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "real work"]);
+        git(&root, &["commit", "--message", "real work"]);
 
         // A bare local "remote" to push to, plus the push itself with `-u`,
         // exactly as an agent reaches for on a branch with no upstream yet.
@@ -1370,7 +1669,7 @@ mod tests {
                 remote.to_str().expect("remote path"),
             ],
         );
-        git(&root, &["push", "-u", "origin", "feature-x"]);
+        git(&root, &["push", "--set-upstream", "origin", "feature-x"]);
 
         // The push must have actually retargeted `@{upstream}` -- otherwise
         // this test isn't reproducing the bug at all.
@@ -1386,7 +1685,7 @@ mod tests {
         assert_eq!(upstream_after_push.trim(), "origin/feature-x");
 
         assert!(
-            worktree_has_commits_ahead_of_upstream(&root),
+            workspace_has_commits_ahead_of_upstream(&Workspace::local(root.clone())),
             "the durable ralphus.<branch>.baseline marker must survive `git push -u` \
              retargeting @{{upstream}}, so real work isn't reported as no progress"
         );
@@ -1397,10 +1696,10 @@ mod tests {
     #[test]
     fn head_is_ancestor_of_upstream_only_after_upstream_contains_it() {
         let root = temp_repo();
-        git(&root, &["init", "-b", "main"]);
+        git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "base"]);
+        git(&root, &["commit", "--message", "base"]);
         git(&root, &["branch", "upstream"]);
         git(&root, &["branch", "--set-upstream-to=upstream", "main"]);
 
@@ -1408,11 +1707,271 @@ mod tests {
         assert!(workspace_head_is_ancestor_of_upstream(&workspace));
         std::fs::write(root.join("more.txt"), "more\n").unwrap();
         git(&root, &["add", "."]);
-        git(&root, &["commit", "-m", "more"]);
+        git(&root, &["commit", "--message", "more"]);
         assert!(!workspace_head_is_ancestor_of_upstream(&workspace));
-        git(&root, &["branch", "-f", "upstream", "HEAD"]);
+        git(&root, &["branch", "--force", "upstream", "HEAD"]);
         assert!(workspace_head_is_ancestor_of_upstream(&workspace));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fake provider script that answers the exact sequence
+    /// [`workspace_baseline_ref`]/[`workspace_has_commits_ahead_of_upstream`]
+    /// issues against a `main` branch with no `ralphus.main.baseline` marker
+    /// configured (so it falls through to `@{upstream}`), reporting
+    /// `ahead_count` commits ahead of it.
+    fn fake_baseline_check_provider(dir: &std::path::Path, ahead_count: u32) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let py = dir.join("provider.py");
+        std::fs::write(
+            &py,
+            format!(
+                r#"import json, sys
+req = json.load(sys.stdin)
+args = req.get("args", [])
+if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+    result = {{"ok": True, "protocol_version": 1, "exit_code": 0, "stdout": "main"}}
+elif args[:2] == ["config", "--get"]:
+    result = {{"ok": True, "protocol_version": 1, "exit_code": 1, "stdout": ""}}
+elif args == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{{upstream}}"]:
+    result = {{"ok": True, "protocol_version": 1, "exit_code": 0, "stdout": "origin/main"}}
+elif args[:2] == ["rev-list", "--count"]:
+    result = {{"ok": True, "protocol_version": 1, "exit_code": 0, "stdout": "{ahead_count}"}}
+else:
+    result = {{"ok": False, "protocol_version": 1, "error": "unexpected args " + repr(args)}}
+print(json.dumps(result))
+"#
+            ),
+        )
+        .unwrap();
+        py
+    }
+
+    #[test]
+    fn any_workspace_ahead_of_upstream_dispatches_a_remote_workspace_through_its_provider() {
+        // RAL-355 Phase 8: the no-new-commits guard must read a *remote*
+        // cell's workspace the same way it reads a local one -- proven here
+        // end-to-end through a real registered provider program, not just by
+        // trusting `Workspace::git`'s local branch (already covered above).
+        let dir = std::env::temp_dir().join(format!("ral355-guard-ahead-{}", std::process::id()));
+        let py = fake_baseline_check_provider(&dir, 2);
+        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .register_machine_provider(
+                "guardtest",
+                "",
+                "python",
+                &[py.to_string_lossy().into_owned()],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/remote/repo", Some("guardtest:A"))
+            .with_store(std::sync::Arc::clone(&store));
+        assert!(
+            any_workspace_ahead_of_upstream(std::slice::from_ref(&ws)),
+            "a remote workspace with commits ahead of its baseline must be reported as progress"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn any_workspace_ahead_of_upstream_is_false_when_no_workspace_has_progress() {
+        let dir =
+            std::env::temp_dir().join(format!("ral355-guard-no-ahead-{}", std::process::id()));
+        let py = fake_baseline_check_provider(&dir, 0);
+        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .register_machine_provider(
+                "guardtest2",
+                "",
+                "python",
+                &[py.to_string_lossy().into_owned()],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/remote/repo", Some("guardtest2:A"))
+            .with_store(std::sync::Arc::clone(&store));
+        assert!(!any_workspace_ahead_of_upstream(std::slice::from_ref(&ws)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Triage pooling (RAL-318) ─────────────────────────────────────────────
+
+    #[test]
+    fn create_review_from_triage_pool_creates_an_arbiter_origin_guardian_and_drains_the_pool() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", "squad-2", 0, 0, "b2", "main")
+            .unwrap();
+
+        let gid = create_review_from_triage_pool(&store, "proj", "security")
+            .unwrap()
+            .expect("pool was non-empty, must create a review");
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.origin, crate::guardian::GUARDIAN_ORIGIN_ARBITER);
+        assert_eq!(g.git_root, "proj");
+        assert_eq!(g.branches.len(), 2);
+        assert_eq!(store.triage_pool_count("proj", "security").unwrap(), 0);
+
+        // Firing an already-drained pool is a no-op, not an error (the race
+        // the scheduler tick and a concurrent submission's own threshold
+        // check must both tolerate).
+        assert!(
+            create_review_from_triage_pool(&store, "proj", "security")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn task_file_toml(cwd: &Path, triage_type: &str) -> String {
+        let cwd = cwd.to_string_lossy().replace('\\', "/");
+        format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nprompt=\"do it\"\ntriage=true\ntriage_type=\"{triage_type}\"\n"
+        )
+    }
+
+    #[test]
+    fn derive_triage_pools_pools_a_local_cell_and_fires_on_threshold() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_triage_type("security", "Security", "")
+            .unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+
+        let src = task_file_toml(&root, "security");
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        // Simulate the submit pipeline's earlier classification step, which
+        // always runs before `derive_triage_pools`.
+        store
+            .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
+            .unwrap();
+
+        // No threshold configured yet: pools, but does not fire.
+        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        assert!(created.is_empty());
+        let keys = store.triage_pool_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        let (project, triage_type) = keys[0].clone();
+        assert_eq!(triage_type, "security");
+        assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 1);
+
+        // A second submission of the same file re-pools (a fresh squad_id),
+        // and with a threshold of 2 now configured, this second call fires.
+        store
+            .set_triage_pool_threshold(&project, &triage_type, Some(2))
+            .unwrap();
+        let squad_id_2 = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_triage_types(&squad_id_2, 0, 0, &["security".to_string()])
+            .unwrap();
+        let created = derive_triage_pools(&store, &squad_id_2, &file).unwrap();
+        assert_eq!(created.len(), 1);
+        let g = store.get_guardian(&created[0]).unwrap();
+        assert_eq!(g.origin, crate::guardian::GUARDIAN_ORIGIN_ARBITER);
+        assert_eq!(
+            g.branches.len(),
+            1,
+            "both pooled cells share the same worktree branch"
+        );
+        assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn derive_triage_pools_pools_a_multi_type_cell_into_every_type_independently() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+
+        let cwd = root.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nprompt=\"do it\"\ntriage=true\ntriage_type=[\"bug\",\"investigation\"]\n"
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        // Simulate the submit pipeline's earlier classification step, which
+        // always runs before `derive_triage_pools`.
+        store
+            .set_cell_triage_types(
+                &squad_id,
+                0,
+                0,
+                &["bug".to_string(), "investigation".to_string()],
+            )
+            .unwrap();
+
+        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        assert!(created.is_empty(), "no threshold configured yet");
+        // The pool key's `project` is the git worktree root path (see
+        // `worktree_project`), not the registered project's logical name --
+        // read it back from the pool keys rather than assuming it matches
+        // the registration name, same as `derive_triage_pools_pools_a_local_cell_and_fires_on_threshold`.
+        let mut keys = store.triage_pool_keys().unwrap();
+        keys.sort();
+        assert_eq!(
+            keys.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+            vec!["bug", "investigation"]
+        );
+        let project = keys[0].0.clone();
+        assert_eq!(store.triage_pool_count(&project, "bug").unwrap(), 1);
+        assert_eq!(
+            store.triage_pool_count(&project, "investigation").unwrap(),
+            1
+        );
+
+        // Draining the "bug" pool (e.g. its own threshold/schedule firing)
+        // must not remove the cell from the still-pending "investigation"
+        // pool -- each type's pooling is independent.
+        let drained = store.drain_triage_pool(&project, "bug").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(store.triage_pool_count(&project, "bug").unwrap(), 0);
+        assert_eq!(
+            store.triage_pool_count(&project, "investigation").unwrap(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn derive_triage_pools_is_a_no_op_when_no_cell_opts_in() {
+        let store = Store::open_in_memory().unwrap();
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
+        let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
+        assert!(
+            derive_triage_pools(&store, "squad-1", &file)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

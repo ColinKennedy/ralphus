@@ -1,0 +1,34 @@
+# Dedicated remote-machine fixture. The Ralphus daemon stays on the host and
+# reaches this container through the real SSH provider boundary. This is
+# intentionally separate from docker/docker-compose.yml, which runs the daemon
+# itself inside a container and therefore does not exercise remote execution.
+
+name: ralphus-ssh-target
+
+services:
+  target:
+    build:
+      context: ..
+      dockerfile: docker/ssh-target/Dockerfile
+    init: true
+    ports:
+      - "127.0.0.1:${RALPHUS_SSH_TEST_PORT:-2222}:22"
+    volumes:
+      - type: bind
+        source: ${RALPHUS_SSH_TEST_AUTHORIZED_KEYS:?set RALPHUS_SSH_TEST_AUTHORIZED_KEYS to the generated public-key file}
+        target: /bootstrap/authorized_keys
+        read_only: true
+      - remote-root:/home/ralphus/.ralphus/remote-work
+      - origin:/srv/git
+      - host-keys:/etc/ssh/ralphus-host-keys
+    healthcheck:
+      test: ["CMD-SHELL", "sshd -t && test -s /home/ralphus/.ssh/authorized_keys && test -d /srv/git/ralphus-test.git"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+volumes:
+  remote-root:
+  origin:
+  host-keys:
