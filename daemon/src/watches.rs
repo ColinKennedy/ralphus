@@ -108,6 +108,7 @@ impl Store {
             crate::cartographer::Note::new("store").emit(
                 self,
                 format!("{user_name:?} unwatched {entity_uri:?}"),
+                format!("{user_name:?} unfollowed {entity_uri:?}"),
                 serde_json::json!({"user_name": user_name, "entity_uri": entity_uri}),
             );
         }

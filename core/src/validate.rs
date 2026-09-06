@@ -490,14 +490,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
         check_maximum_context(ctx, table, None, &path, header);
-        check_type(
-            ctx,
-            table,
-            "maximum_tool_output_tokens",
-            Ty::Int,
-            &path,
-            header,
-        );
+        check_type(ctx, table, "maximum_tool_output_tokens", Ty::Int, &path, header);
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
         check_maximum_tool_output_tokens(ctx, table, None, &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
@@ -726,14 +719,7 @@ fn validate_cells(
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
         check_maximum_context(ctx, table, task_agent, &path, header);
-        check_type(
-            ctx,
-            table,
-            "maximum_tool_output_tokens",
-            Ty::Int,
-            &path,
-            header,
-        );
+        check_type(ctx, table, "maximum_tool_output_tokens", Ty::Int, &path, header);
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
         check_maximum_tool_output_tokens(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
@@ -1684,14 +1670,7 @@ fn validate_proof_array(
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &vpath, None);
-        check_type(
-            ctx,
-            table,
-            "maximum_tool_output_tokens",
-            Ty::Int,
-            &vpath,
-            None,
-        );
+        check_type(ctx, table, "maximum_tool_output_tokens", Ty::Int, &vpath, None);
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &vpath, None);
         check_maximum_tool_output_tokens(ctx, table, agent, &vpath, None);
         check_type(ctx, table, "arguments", Ty::StrArray, &vpath, None);

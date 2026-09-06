@@ -766,20 +766,14 @@ pub fn resolve_cell_proof_machine(
 /// cell-then-task inheritance shape (RAL-333).
 #[must_use]
 pub fn resolve_cell_maximum_tool_output_tokens(task: &TaskDef, cell: &CellDef) -> Option<u64> {
-    cell.maximum_tool_output_tokens
-        .or(task.maximum_tool_output_tokens)
+    cell.maximum_tool_output_tokens.or(task.maximum_tool_output_tokens)
 }
 
 /// The effective `maximum_tool_output_tokens` for a task-scope proof step (one
 /// with no owning cell): the step's own value, else the task's (RAL-333).
 #[must_use]
-pub fn resolve_task_proof_maximum_tool_output_tokens(
-    task: &TaskDef,
-    proof: &ProofStep,
-) -> Option<u64> {
-    proof
-        .maximum_tool_output_tokens
-        .or(task.maximum_tool_output_tokens)
+pub fn resolve_task_proof_maximum_tool_output_tokens(task: &TaskDef, proof: &ProofStep) -> Option<u64> {
+    proof.maximum_tool_output_tokens.or(task.maximum_tool_output_tokens)
 }
 
 /// The effective `maximum_tool_output_tokens` for a cell-scope proof step: the
@@ -814,15 +808,12 @@ pub struct ReviewDef {
     pub name: Option<String>,
     /// Backend that resolves merge conflicts (and applies reviewer feedback) for
     /// this review, e.g. `"claude"` or `"ollama"`. Unset falls back to the
-    /// `RALPHUS_RESOLVER_AGENT` env override, then the project-level
-    /// `.ralphus.toml [review] default_resolver_agent` setting, then `ollama`.
+    /// `RALPHUS_RESOLVER_AGENT` env override, then `ollama`.
     #[serde(default)]
     pub agent: Option<String>,
     /// Model the resolver `agent` runs, e.g. `"qwen3:8b"`. Unset falls back to
-    /// the `RALPHUS_RESOLVER_MODEL` env override, then the project-level
-    /// `.ralphus.toml [review] default_resolver_model` setting, then
-    /// `qwen3:8b` for the ollama backend (other backends take their own
-    /// default).
+    /// the `RALPHUS_RESOLVER_MODEL` env override, then `qwen3:8b` for the ollama
+    /// backend (other backends take their own default).
     #[serde(default)]
     pub model: Option<String>,
     /// The branch this review's stack rebases onto, declared rather than
@@ -841,8 +832,7 @@ pub struct ReviewDef {
     pub upstream: Option<String>,
     /// The machine this review's worktrees and merge live on (RAL-185),
     /// written `scheme:uri`. Independent of any task's machine — a review may
-    /// run somewhere none of its contributing tasks did. Unset inherits the
-    /// project-level `.ralphus.toml [review] default_machine` setting, then
+    /// run somewhere none of its contributing tasks did. Unset means
     /// [`LOCAL_MACHINE`].
     ///
     /// Every worktree feeding one review must be on this machine: the stacked
@@ -855,16 +845,15 @@ pub struct ReviewDef {
     /// Enforced the same way [`TaskDef::maximum_budget_usd`]/
     /// [`CellDef::maximum_budget_usd`] are: once exceeded, the daemon
     /// stops making further resolver/prover calls for this review and
-    /// fails it. Unset inherits the project-level `.ralphus.toml [review]
-    /// default_maximum_budget_usd` setting, then unbounded.
+    /// fails it.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
     /// This review's own Proof-scope override: which branches run their
     /// proof steps during the Guardian merge -- one of
     /// [`PROOF_SCOPE_EACH_BRANCH`]/[`PROOF_SCOPE_FINAL_BRANCH`]/
     /// [`PROOF_SCOPE_NOTHING`] (see [`PROOF_SCOPE_VALUES`]). Unset inherits
-    /// the project-level `.ralphus.toml [review] default_proof_scope`
-    /// setting, then `"each_branch"`. Equivalent to setting it later via `ralphus review
+    /// the project-level `.ralphus.toml [review] proof_scope` default, then
+    /// `"each_branch"`. Equivalent to setting it later via `ralphus review
     /// settings <selector> --proof-scope <value>`, but declared up front so
     /// the review is created with the right scope from its first merge
     /// rather than needing a follow-up command.
