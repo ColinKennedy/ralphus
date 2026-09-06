@@ -33,7 +33,7 @@ use ralphus_cli::help_map;
 /// of entries, the chip format itself needs a "required" marker instead.
 const BUSINESS_RULE_ONLY_EXTRA_ARGS: &[(&[&str], &[&str])] = &[
     (&["review", "squash"], &["--on"]),
-    (&["mailbox", "set-preferences"], &["--auto-follow"]),
+    (&["mailbox", "set-preferences"], &["--auto-watch"]),
 ];
 
 /// Picks a dummy value for one `[hint]`/`[a|b]`/`[name=value...]` chip.

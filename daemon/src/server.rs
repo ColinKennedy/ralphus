@@ -437,12 +437,12 @@ struct CreateUserBody {
 }
 
 /// `POST /api/users/{name}/preferences` body (RAL-320) -- see
-/// `crate::users::UserView`'s field docs for what `auto_follow` and
+/// `crate::users::UserView`'s field docs for what `auto_watch` and
 /// `default_notify_tiers` mean.
 #[derive(Deserialize)]
 struct UserPreferencesBody {
     #[serde(default)]
-    auto_follow: bool,
+    auto_watch: bool,
     /// Tier names (`"urgent"`/`"high"`/`"normal"`), e.g.
     /// `["urgent", "high"]`. Omitted or empty means "everything" --
     /// see [`crate::mailbox::all_tiers`].
@@ -450,18 +450,18 @@ struct UserPreferencesBody {
     default_notify_tiers: Option<Vec<String>>,
 }
 
-/// `GET /api/follows?user=` response body (RAL-320).
+/// `GET /api/watches?user=` response body (RAL-320).
 #[derive(Serialize)]
-struct FollowsResponse {
-    follows: Vec<crate::follows::FollowView>,
+struct WatchesResponse {
+    watches: Vec<crate::watches::WatchView>,
 }
 
-/// `POST /api/follows?user=` body (RAL-320) -- `notify_tiers` omitted or
+/// `POST /api/watches?user=` body (RAL-320) -- `notify_tiers` omitted or
 /// empty defaults to the acting user's `default_notify_tiers` preference
 /// (see `crate::users::UserView`), falling back to every tier if that user
 /// isn't registered either.
 #[derive(Deserialize)]
-struct CreateFollowBody {
+struct CreateWatchBody {
     entity_uri: String,
     #[serde(default)]
     notify_tiers: Option<Vec<String>>,
@@ -773,8 +773,8 @@ fn route_for_user(
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
         ("GET", ["api", "ghosts", owner_uri]) => ghost_get(daemon, owner_uri),
         ("POST", ["api", "mailbox", "register"]) => mailbox_register(daemon),
-        // RAL-320: personal follows + the per-user mailbox view they filter.
-        // These literal "personal"/"follows" segments must stay ahead of the
+        // RAL-320: personal watches + the per-user mailbox view they filter.
+        // These literal "personal"/"watches" segments must stay ahead of the
         // client_id-parameterized mailbox routes just below, or the
         // client_id arm would swallow "personal" as if it were a client id.
         ("GET", ["api", "mailbox", "personal", "messages"]) => {
@@ -783,10 +783,10 @@ fn route_for_user(
         ("POST", ["api", "mailbox", "personal", "drain"]) => {
             personal_mailbox_drain(daemon, query, body)
         }
-        ("GET", ["api", "follows"]) => list_follows_endpoint(daemon, query),
-        ("POST", ["api", "follows"]) => create_follow_endpoint(daemon, query, body),
-        ("DELETE", ["api", "follows", entity_uri]) => {
-            delete_follow_endpoint(daemon, query, entity_uri)
+        ("GET", ["api", "watches"]) => list_watches_endpoint(daemon, query),
+        ("POST", ["api", "watches"]) => create_watch_endpoint(daemon, query, body),
+        ("DELETE", ["api", "watches", entity_uri]) => {
+            delete_watch_endpoint(daemon, query, entity_uri)
         }
         ("GET", ["api", "mailbox", client_id, "messages"]) => {
             mailbox_messages(daemon, client_id, query)
@@ -2850,7 +2850,7 @@ fn resolve_acting_user(query: &str) -> Option<String> {
 }
 
 /// Like [`resolve_acting_user`], but a `400` reply when no user can be
-/// resolved -- the shared guard for every follows/personal-mailbox endpoint,
+/// resolved -- the shared guard for every watches/personal-mailbox endpoint,
 /// none of which make sense for an anonymous caller.
 fn require_acting_user(query: &str) -> Result<String, Reply> {
     query_param(query, "user")
@@ -2894,13 +2894,13 @@ fn get_user_preferences(daemon: &Daemon, name: &str) -> Reply {
 }
 
 /// `POST /api/users/{name}/preferences` (RAL-320) -- registers `name` first
-/// if needed, same as [`create_follow_endpoint`].
+/// if needed, same as [`create_watch_endpoint`].
 fn set_user_preferences_endpoint(daemon: &Daemon, name: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<UserPreferencesBody>(body) else {
         return error(
             400,
             "bad_request",
-            "body must be {auto_follow, default_notify_tiers?}",
+            "body must be {auto_watch, default_notify_tiers?}",
             vec![],
         );
     };
@@ -2913,34 +2913,34 @@ fn set_user_preferences_endpoint(daemon: &Daemon, name: &str, body: &str) -> Rep
     };
     match daemon
         .lock()
-        .set_user_preferences(name, req.auto_follow, &tiers)
+        .set_user_preferences(name, req.auto_watch, &tiers)
     {
         Ok(u) => json(200, &u),
         Err(e) => store_error(&e),
     }
 }
 
-/// `GET /api/follows?user=` (RAL-320) -- every follow the acting user owns.
-fn list_follows_endpoint(daemon: &Daemon, query: &str) -> Reply {
+/// `GET /api/watches?user=` (RAL-320) -- every watch the acting user owns.
+fn list_watches_endpoint(daemon: &Daemon, query: &str) -> Reply {
     let user = match require_acting_user(query) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    match daemon.lock().list_follows(&user) {
-        Ok(follows) => json(200, &FollowsResponse { follows }),
+    match daemon.lock().list_watches(&user) {
+        Ok(watches) => json(200, &WatchesResponse { watches }),
         Err(e) => store_error(&e),
     }
 }
 
-/// `POST /api/follows?user=` (RAL-320) -- follow (or re-follow, updating
+/// `POST /api/watches?user=` (RAL-320) -- watch (or re-watch, updating
 /// tiers in place) an [`crate::entity_uri::EntityUri`] on the acting user's
 /// behalf.
-fn create_follow_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
+fn create_watch_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
     let user = match require_acting_user(query) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Ok(req) = serde_json::from_str::<CreateFollowBody>(body) else {
+    let Ok(req) = serde_json::from_str::<CreateWatchBody>(body) else {
         return error(
             400,
             "bad_request",
@@ -2970,27 +2970,27 @@ fn create_follow_endpoint(daemon: &Daemon, query: &str, body: &str) -> Reply {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(crate::mailbox::all_tiers),
     };
-    match store.create_follow(&user, &req.entity_uri, &tiers) {
-        Ok(follow) => json(201, &follow),
+    match store.create_watch(&user, &req.entity_uri, &tiers) {
+        Ok(watch) => json(201, &watch),
         Err(e) => store_error(&e),
     }
 }
 
-/// `DELETE /api/follows/{entity_uri}?user=` (RAL-320).
-fn delete_follow_endpoint(daemon: &Daemon, query: &str, entity_uri: &str) -> Reply {
+/// `DELETE /api/watches/{entity_uri}?user=` (RAL-320).
+fn delete_watch_endpoint(daemon: &Daemon, query: &str, entity_uri: &str) -> Reply {
     let user = match require_acting_user(query) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    match daemon.lock().delete_follow(&user, entity_uri) {
+    match daemon.lock().delete_watch(&user, entity_uri) {
         Ok(true) => json(200, &serde_json::json!({"deleted": true})),
-        Ok(false) => error(404, "not_found", "no such follow", vec![]),
+        Ok(false) => error(404, "not_found", "no such watch", vec![]),
         Err(e) => store_error(&e),
     }
 }
 
 /// `GET /api/mailbox/personal/messages?user=` (RAL-320) -- the acting
-/// user's personal mailbox view, filtered through their follows. Mirrors
+/// user's personal mailbox view, filtered through their watches. Mirrors
 /// [`mailbox_messages`]'s query handling.
 fn personal_mailbox_messages(daemon: &Daemon, query: &str) -> Reply {
     let user = match require_acting_user(query) {
@@ -3399,18 +3399,18 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
     } else {
         SquadState::Pending
     };
-    // RAL-320: auto-follow-on-submit -- a user who has opted in via
-    // `auto_follow` (`crate::users::set_user_preferences`) is followed to
+    // RAL-320: auto-watch-on-submit -- a user who has opted in via
+    // `auto_watch` (`crate::users::set_user_preferences`) is watched to
     // their own squad automatically, using their `default_notify_tiers`, so
-    // they don't have to separately `follow` every squad they submit.
+    // they don't have to separately `watch` every squad they submit.
     if let Some(user) = resolve_acting_user(query) {
         if let Ok(Some(u)) = store.get_user(&user) {
-            if u.auto_follow {
+            if u.auto_watch {
                 let entity_uri = crate::entity_uri::EntityUri::Squad {
                     squad_id: squad_id.clone(),
                 }
                 .to_string();
-                let _ = store.create_follow(&user, &entity_uri, &u.default_notify_tiers);
+                let _ = store.create_watch(&user, &entity_uri, &u.default_notify_tiers);
             }
         }
     }
@@ -19003,10 +19003,10 @@ command=\"cargo test\"
         assert_eq!(r.status, 400, "{}", r.body);
     }
 
-    // ── RAL-320: personal follows + notification preferences ────────────────
+    // ── RAL-320: personal watches + notification preferences ────────────────
 
     #[test]
-    fn follows_require_an_acting_user() {
+    fn watches_require_an_acting_user() {
         let d = daemon();
         let body =
             serde_json::to_string(&serde_json::json!({"entity_uri": "squad:squad-1"})).unwrap();
@@ -19018,25 +19018,25 @@ command=\"cargo test\"
         let cfg = crate::config::load_daemon_config();
         if cfg.default_user.is_some() {
             // Default user is configured, so the request should succeed
-            assert_eq!(route(&d, "GET", "/api/follows", "").status, 200);
-            assert_eq!(route(&d, "POST", "/api/follows", &body).status, 201);
+            assert_eq!(route(&d, "GET", "/api/watches", "").status, 200);
+            assert_eq!(route(&d, "POST", "/api/watches", &body).status, 201);
         } else {
             // No default user configured, so request should be rejected
-            assert_eq!(route(&d, "GET", "/api/follows", "").status, 400);
-            assert_eq!(route(&d, "POST", "/api/follows", &body).status, 400);
+            assert_eq!(route(&d, "GET", "/api/watches", "").status, 400);
+            assert_eq!(route(&d, "POST", "/api/watches", &body).status, 400);
         }
     }
 
     #[test]
-    fn follows_reject_an_unrecognized_entity_uri() {
+    fn watches_reject_an_unrecognized_entity_uri() {
         let d = daemon();
         let body = serde_json::to_string(&serde_json::json!({"entity_uri": "not-a-uri"})).unwrap();
-        let r = route(&d, "POST", "/api/follows?user=colin", &body);
+        let r = route(&d, "POST", "/api/watches?user=colin", &body);
         assert_eq!(r.status, 400, "{}", r.body);
     }
 
     #[test]
-    fn follow_lifecycle_over_http() {
+    fn watch_lifecycle_over_http() {
         let d = daemon();
         let squad_id = submit_squad(&d);
         let entity_uri = format!("squad:{squad_id}");
@@ -19046,38 +19046,38 @@ command=\"cargo test\"
             "notify_tiers": ["urgent", "high"],
         }))
         .unwrap();
-        let r = route(&d, "POST", "/api/follows?user=colin", &body);
+        let r = route(&d, "POST", "/api/watches?user=colin", &body);
         assert_eq!(r.status, 201, "{}", r.body);
 
-        let list = route(&d, "GET", "/api/follows?user=colin", "");
+        let list = route(&d, "GET", "/api/watches?user=colin", "");
         assert_eq!(list.status, 200, "{}", list.body);
         let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
-        let follows = parsed["follows"].as_array().unwrap();
-        assert_eq!(follows.len(), 1);
-        assert_eq!(follows[0]["entity_uri"], entity_uri);
+        let watches = parsed["watches"].as_array().unwrap();
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0]["entity_uri"], entity_uri);
 
-        // A follow is scoped per user -- someone else's list stays empty.
-        let others_list = route(&d, "GET", "/api/follows?user=alex", "");
+        // A watch is scoped per user -- someone else's list stays empty.
+        let others_list = route(&d, "GET", "/api/watches?user=alex", "");
         let others: serde_json::Value = serde_json::from_str(&others_list.body).unwrap();
-        assert!(others["follows"].as_array().unwrap().is_empty());
+        assert!(others["watches"].as_array().unwrap().is_empty());
 
         let delete = route(
             &d,
             "DELETE",
-            &format!("/api/follows/{entity_uri}?user=colin"),
+            &format!("/api/watches/{entity_uri}?user=colin"),
             "",
         );
         assert_eq!(delete.status, 200, "{}", delete.body);
         let after: serde_json::Value =
-            serde_json::from_str(&route(&d, "GET", "/api/follows?user=colin", "").body).unwrap();
-        assert!(after["follows"].as_array().unwrap().is_empty());
+            serde_json::from_str(&route(&d, "GET", "/api/watches?user=colin", "").body).unwrap();
+        assert!(after["watches"].as_array().unwrap().is_empty());
 
         // Deleting again is a 404, not a repeat success.
         assert_eq!(
             route(
                 &d,
                 "DELETE",
-                &format!("/api/follows/{entity_uri}?user=colin"),
+                &format!("/api/watches/{entity_uri}?user=colin"),
                 "",
             )
             .status,
@@ -19086,7 +19086,7 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn personal_mailbox_filters_by_followed_notify_tiers() {
+    fn personal_mailbox_filters_by_watched_notify_tiers() {
         let d = daemon();
         let squad_id = submit_squad(&d);
         let entity_uri = format!("squad:{squad_id}");
@@ -19096,7 +19096,7 @@ command=\"cargo test\"
         }))
         .unwrap();
         assert_eq!(
-            route(&d, "POST", "/api/follows?user=colin", &body).status,
+            route(&d, "POST", "/api/watches?user=colin", &body).status,
             201
         );
 
@@ -19127,24 +19127,24 @@ command=\"cargo test\"
         assert_eq!(messages.len(), 1, "{}", r.body);
         assert_eq!(messages[0]["message"], "urgent thing happened");
 
-        // Someone with no follows at all sees nothing, even unfiltered.
+        // Someone with no watches at all sees nothing, even unfiltered.
         let empty = route(&d, "GET", "/api/mailbox/personal/messages?user=alex", "");
         let empty_messages: Vec<serde_json::Value> = serde_json::from_str(&empty.body).unwrap();
         assert!(empty_messages.is_empty());
     }
 
     #[test]
-    fn personal_mailbox_cascades_from_a_followed_parent() {
+    fn personal_mailbox_cascades_from_a_watched_parent() {
         let d = daemon();
         let squad_id = submit_squad(&d);
-        // Follow the whole squad; a message scoped to one of its cells should
-        // still reach the follower -- `EntityUri::covers` cascade.
+        // Watch the whole squad; a message scoped to one of its cells should
+        // still reach the watcher -- `EntityUri::covers` cascade.
         let body = serde_json::to_string(&serde_json::json!({
             "entity_uri": format!("squad:{squad_id}"),
         }))
         .unwrap();
         assert_eq!(
-            route(&d, "POST", "/api/follows?user=colin", &body).status,
+            route(&d, "POST", "/api/watches?user=colin", &body).status,
             201
         );
 
@@ -19175,7 +19175,7 @@ command=\"cargo test\"
             let body =
                 serde_json::to_string(&serde_json::json!({"entity_uri": entity_uri})).unwrap();
             assert_eq!(
-                route(&d, "POST", &format!("/api/follows?user={user}"), &body).status,
+                route(&d, "POST", &format!("/api/watches?user={user}"), &body).status,
                 201
             );
         }
@@ -19219,7 +19219,7 @@ command=\"cargo test\"
     fn user_preferences_round_trip_over_http() {
         let d = daemon();
         let body = serde_json::to_string(&serde_json::json!({
-            "auto_follow": true,
+            "auto_watch": true,
             "default_notify_tiers": ["urgent", "high"],
         }))
         .unwrap();
@@ -19229,7 +19229,7 @@ command=\"cargo test\"
         let get = route(&d, "GET", "/api/users/colin/preferences", "");
         assert_eq!(get.status, 200, "{}", get.body);
         let parsed: serde_json::Value = serde_json::from_str(&get.body).unwrap();
-        assert_eq!(parsed["auto_follow"], true);
+        assert_eq!(parsed["auto_watch"], true);
         assert_eq!(
             parsed["default_notify_tiers"],
             serde_json::json!(["urgent", "high"])
@@ -19242,10 +19242,10 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn auto_follow_on_submit_uses_the_acting_users_preferences() {
+    fn auto_watch_on_submit_uses_the_acting_users_preferences() {
         let d = daemon();
         let prefs = serde_json::to_string(&serde_json::json!({
-            "auto_follow": true,
+            "auto_watch": true,
             "default_notify_tiers": ["urgent"],
         }))
         .unwrap();
@@ -19259,24 +19259,24 @@ command=\"cargo test\"
         let submitted: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         let squad_id = submitted["squad_id"].as_str().unwrap();
 
-        let list = route(&d, "GET", "/api/follows?user=colin", "");
+        let list = route(&d, "GET", "/api/watches?user=colin", "");
         let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
-        let follows = parsed["follows"].as_array().unwrap();
-        assert_eq!(follows.len(), 1, "{}", list.body);
-        assert_eq!(follows[0]["entity_uri"], format!("squad:{squad_id}"));
-        assert_eq!(follows[0]["notify_tiers"], serde_json::json!(["urgent"]));
+        let watches = parsed["watches"].as_array().unwrap();
+        assert_eq!(watches.len(), 1, "{}", list.body);
+        assert_eq!(watches[0]["entity_uri"], format!("squad:{squad_id}"));
+        assert_eq!(watches[0]["notify_tiers"], serde_json::json!(["urgent"]));
     }
 
     #[test]
-    fn submit_without_auto_follow_creates_no_follow() {
+    fn submit_without_auto_watch_creates_no_watch() {
         let d = daemon();
-        // colin isn't registered at all -- auto-follow-on-submit must be a
+        // colin isn't registered at all -- auto-watch-on-submit must be a
         // silent no-op, not an error, for an anonymous/unregistered submitter.
         let r = route(&d, "POST", "/api/squads?user=colin", &submit_body(GOOD));
         assert_eq!(r.status, 201, "{}", r.body);
-        let list = route(&d, "GET", "/api/follows?user=colin", "");
+        let list = route(&d, "GET", "/api/watches?user=colin", "");
         let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
-        assert!(parsed["follows"].as_array().unwrap().is_empty());
+        assert!(parsed["watches"].as_array().unwrap().is_empty());
     }
 
     // ── apply_default_user_admin (RAL-332) ──────────────────────────────

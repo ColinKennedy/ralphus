@@ -200,6 +200,17 @@ produced no pane output.
 | GET | `/api/mailbox/{client_id}/messages` | List messages visible to this client; `?unread=true` and `?priority=urgent\|high\|normal` filter |
 | POST | `/api/mailbox/{client_id}/drain` | Mark messages read; `{"message_ids": [...]}` or an empty body to drain every unread message |
 
+**Personal watches and notification preferences (RAL-320)**
+| Method | Path | What |
+|---|---|---|
+| GET | `/api/watches` | [List the acting user's watches](#get-apiwatches) |
+| POST | `/api/watches` | [Watch (or re-watch) an entity](#post-apiwatches) |
+| DELETE | `/api/watches/{entity_uri}` | Stop watching an entity |
+| GET | `/api/users/{name}/preferences` | Get a user's `auto_watch`/`default_notify_tiers` preferences |
+| POST | `/api/users/{name}/preferences` | Set a user's `auto_watch`/`default_notify_tiers` preferences |
+| GET | `/api/mailbox/personal/messages` | The acting user's personal mailbox view, filtered through their watches |
+| POST | `/api/mailbox/personal/drain` | Mark personal mailbox messages read for the acting user |
+
 ## Conventions
 
 - All request and response bodies are JSON (`Content-Type: application/json`).
@@ -2771,6 +2782,87 @@ a peek box:
   ralphus line that doesn't match one of these prefixes (e.g. a future log
   convention) — see `test/debug-strip.test.mjs` for the classifier's exact
   coverage.
+
+### Personal watches and notification preferences (RAL-320)
+
+A *watch* is one row binding the acting user to an [entity URI](#entity-uris-ral-155)
+(squad/task/cell/proof/review/review-worktree) plus the mailbox priority
+tiers (`urgent`/`high`/`normal`) that watch cares about. Watching a parent
+entity cascades: its notifications also cover every entity nested under it
+(watching a squad covers its tasks, cells, and proof steps). All five
+endpoints below require an acting user, resolved from `?user=<name>` or
+`.ralphus.toml`'s `default_user`; `400 bad_request` if neither is set.
+
+#### `GET /api/watches`
+Every watch the acting user owns.
+
+```
+GET /api/watches?user=colin
+```
+```json
+{
+  "watches": [
+    {
+      "id": "watch-000000000001",
+      "user_name": "colin",
+      "entity_uri": "squad:1a2b3c",
+      "notify_tiers": ["urgent", "high"],
+      "created_at_ms": 1730000000000
+    }
+  ]
+}
+```
+
+#### `POST /api/watches`
+Watch (or re-watch) an entity on the acting user's behalf. Re-watching the
+same `(user, entity_uri)` pair updates its notify tiers in place rather than
+creating a duplicate row.
+
+```
+POST /api/watches?user=colin
+{ "entity_uri": "squad:1a2b3c", "notify_tiers": ["urgent"] }
+```
+`notify_tiers` is optional; omitted or empty defaults to the acting user's
+`default_notify_tiers` preference (see below), falling back to every tier if
+that user has no stored preferences. `400 bad_request` if `entity_uri` isn't
+a recognized entity URI. Response `201` with the created/updated watch (same
+shape as one entry in `GET /api/watches`'s array).
+
+#### `DELETE /api/watches/{entity_uri}`
+Stop watching an entity.
+
+```
+DELETE /api/watches/squad%3A1a2b3c?user=colin
+```
+`200 {"deleted": true}`, or `404 not_found` if the acting user wasn't
+watching that entity.
+
+#### `GET /api/users/{name}/preferences` / `POST /api/users/{name}/preferences`
+A per-user preference pair: `auto_watch` (when `true`, submitting a squad
+automatically watches the submitted entity at that user's default notify
+tiers) and `default_notify_tiers` (the notify-tier fallback used whenever a
+watch — including auto-watch's implicit one — doesn't specify its own tiers
+explicitly). `POST` registers `name` first if it isn't already a known user,
+same as `POST /api/watches`.
+
+```
+POST /api/users/colin/preferences
+{ "auto_watch": true, "default_notify_tiers": ["urgent", "high"] }
+```
+`default_notify_tiers` is optional; omitted or empty means every tier. Both
+routes respond with the same `UserView` shape (`GET` is `404 not_found` for
+an unregistered user; `POST` never is, since it registers on demand).
+
+#### `GET /api/mailbox/personal/messages` / `POST /api/mailbox/personal/drain`
+The acting user's personal mailbox: the same broadcast mailbox stream
+(`GET /api/mailbox/{client_id}/messages`) filtered down to messages whose
+entity is covered by one of that user's watches and whose priority clears
+that watch's notify tiers. Not a separate message store — same rows, a
+narrower, per-user read. `GET` accepts the same `?unread=true` and
+`?priority=urgent|high|normal` filters as the broadcast mailbox; `POST`
+accepts the same `{"message_ids": [...]}` body (or an empty body to drain
+every unread message) as `POST /api/mailbox/{client_id}/drain`, scoped to the
+acting user.
 
 ## Notes on future evolution
 

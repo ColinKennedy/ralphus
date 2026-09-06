@@ -561,15 +561,15 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
-    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal follows and notification preferences layered over the same mailbox (RAL-320).}
+    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal watches and notification preferences layered over the same mailbox (RAL-320).}
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
-        - follow entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Follow an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-following updates the notification tiers in place (RAL-320).}
-        - (read-only-safe) follows --user [name]  {List the acting user's follows (RAL-320).}
-        - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their follows (RAL-320).}
+        - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their watches (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
-        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-follow and default notify tiers (RAL-320).}
-        - set-preferences --auto-follow --no-auto-follow --tier [urgent|high|normal...] --user [name]  {Set a user's auto-follow and default notification-tier preferences; requires exactly one of --auto-follow/--no-auto-follow (RAL-320).}
-        - unfollow entity_uri [str] --user [name]  {Stop following an entity (RAL-320).}
+        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-watch and default notify tiers (RAL-320).}
+        - set-preferences --auto-watch --no-auto-watch --tier [urgent|high|normal...] --user [name]  {Set a user's auto-watch and default notification-tier preferences; requires exactly one of --auto-watch/--no-auto-watch (RAL-320).}
+        - unwatch entity_uri [str] --user [name]  {Stop watching an entity (RAL-320).}
+        - watch entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-watching updates the notification tiers in place (RAL-320).}
+        - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-320).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
         - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}

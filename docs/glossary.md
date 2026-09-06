@@ -102,20 +102,20 @@ RAL-252 is done` comments at each one.
 | **UserContext** | The type (`daemon/src/agent_access.rs`) carrying a request's claimed user identity (`id: Option<String>`) through `AgentAccess`. Not a verified identity. |
 | **AgentAccess** | The trait deciding which agents a `UserContext` may select (`GET /api/agents`). Only implementation today, `DefaultAgentAccess`, ignores the user and is permissive by design. |
 
-## Personal follows and notification preferences (RAL-320)
+## Personal watches and notification preferences (RAL-320)
 
 A per-**user** subscription layer over the existing **mailbox** (RAL-241) —
 not a second notification system. CLI-only surface (`ralphus mailbox
-follow`/`unfollow`/`follows`/`preferences`/`set-preferences`/`personal`/
+watch`/`unwatch`/`watches`/`preferences`/`set-preferences`/`personal`/
 `personal-drain`); no board UI, no external delivery channel.
 
 | Term | Meaning |
 |---|---|
-| **follow** | One row (`follows` table, `daemon/src/follows.rs`) binding a **user** to an **entity URI** (squad/task/cell/proof/review — "review worktree" is the same `guardian:<id>` URI) plus that follow's own selected notify tiers. Re-following the same entity updates its tiers in place rather than creating a duplicate. Following a parent entity **cascades**: its notifications also cover every entity nested under it (a squad follow covers its tasks, cells, and proof steps). |
-| **notify tiers** (on a follow) | The subset of the mailbox's existing `urgent`/`high`/`normal` priority tiers a given follow cares about — the filter a personal mailbox message must clear to reach that follower. Distinct from **default notify tiers** (a user-level default, not tied to one follow). |
-| **personal mailbox** | The per-user *view* over the same broadcast mailbox message stream (RAL-241's `mailbox_messages`), filtered down to messages whose entity is covered by one of that user's follows and whose priority clears that follow's notify tiers. Not a separate message store — same rows, a narrower read. |
-| **auto-follow** | A persisted per-**user** preference (`users.auto_follow`): when set, submitting a squad automatically creates a follow (at that user's **default notify tiers**) on the submitted entity, so a user doesn't have to manually follow their own work. |
-| **default notify tiers** (user preference) | A per-**user** preference (`users.default_notify_tiers`) used as the notify-tier fallback whenever a follow doesn't specify its own tiers explicitly (including auto-follow's implicit follow). |
+| **watch** | One row (`watches` table, `daemon/src/watches.rs`) binding a **user** to an **entity URI** (squad/task/cell/proof/review — "review worktree" is the same `guardian:<id>` URI) plus that watch's own selected notify tiers. Re-watching the same entity updates its tiers in place rather than creating a duplicate. Watching a parent entity **cascades**: its notifications also cover every entity nested under it (a squad watch covers its tasks, cells, and proof steps). |
+| **notify tiers** (on a watch) | The subset of the mailbox's existing `urgent`/`high`/`normal` priority tiers a given watch cares about — the filter a personal mailbox message must clear to reach that watcher. Distinct from **default notify tiers** (a user-level default, not tied to one watch). |
+| **personal mailbox** | The per-user *view* over the same broadcast mailbox message stream (RAL-241's `mailbox_messages`), filtered down to messages whose entity is covered by one of that user's watches and whose priority clears that watch's notify tiers. Not a separate message store — same rows, a narrower read. |
+| **auto-watch** | A persisted per-**user** preference (`users.auto_watch`): when set, submitting a squad automatically creates a watch (at that user's **default notify tiers**) on the submitted entity, so a user doesn't have to manually watch their own work. |
+| **default notify tiers** (user preference) | A per-**user** preference (`users.default_notify_tiers`) used as the notify-tier fallback whenever a watch doesn't specify its own tiers explicitly (including auto-watch's implicit watch). |
 
 ## Scheduling
 
