@@ -883,7 +883,8 @@
        * @property {string|null} [system_prompt]
        * @property {string} [agent_session_id]
        * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
-       * @property {{id: string, name: string, status: string, branch?: string}[]} [reviews]
+       * @property {{id: string, name: string, status: string, branch?: string, origin: string}[]} [reviews]
+       * @property {string[]} [triage_types] - RAL-318: this cell's resolved Triage type(s) if it opted in via `triage = true` in its TOML -- absent/empty for a cell that never opted in. Populated at submit time (inline `triage_type` or the Arbiter's own classification) whether or not the cell has run yet, so non-empty here does not by itself mean the cell is done -- check `state`. A cell with types set here and no entry in `reviews` yet is pooled, waiting for its Triage pool to drain into an actual review.
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this cell (hierarchical env overrides, extending RAL-150); merged on top of the owning task's/squad's when the cell's own subprocess is spawned. Empty/absent for the vast majority of cells.
        * @property {{[key: string]: string}} [proof_env_overrides] - Persistent environment-variable overrides applied only to this cell's own proof steps, merged on top of `env_overrides` (and its ancestors).
        * @property {number|null} [started_at_ms]
@@ -1244,6 +1245,24 @@
        * @property {number|null} last_checked_ms
        */
       /**
+       * One cell across any squad that has opted into Triage (has at least
+       * one resolved type) and has not yet been linked to an actual review
+       * -- a row in the Triage tab's candidate list. Present from the
+       * moment its type(s) resolve at submit time, whether or not the cell
+       * has run yet; disappears once its pool drains into a review.
+       * @typedef {object} TriageCandidateView
+       * @property {string} squad_id
+       * @property {string|null} squad_label
+       * @property {number} task_idx
+       * @property {string} task_name
+       * @property {number} cell_idx
+       * @property {string} cell_id
+       * @property {string|null} cell_name
+       * @property {string} project
+       * @property {string} state - This cell's raw stored state, not the effective state folding in proof-step outcomes.
+       * @property {string[]} triage_types
+       */
+      /**
        * @typedef {object} ProjectView
        * @property {string} name
        * @property {string} description
@@ -1427,6 +1446,7 @@
       CLICK_HANDLERS.gotoReviewBranch = (e, ds) => gotoReviewBranch(ds.guardianId || "", ds.branch || "");
       CLICK_HANDLERS.restartCell = (e, ds) => restartCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.gotoSquadItem = (e, ds) => gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi));
+      CLICK_HANDLERS.gotoTriageCandidate = (e, ds) => gotoSquadItem(ds.squadId || "", "cell", Number(ds.ti), Number(ds.si), -1);
       CLICK_HANDLERS.gotoRunningItem = (e, ds) => { gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi)); byId("running-menu").classList.add("hidden"); };
       CLICK_HANDLERS.gotoRunningReview = (e, ds) => {
         if (ds.branch) gotoReviewBranch(ds.guardianId || "", ds.branch);
@@ -1572,6 +1592,15 @@
       let triagePools = [];
       /** @type {TriageScheduleView[]} every schedule across every pool key */
       let triageSchedules = [];
+      /** @type {TriageCandidateView[]} every cell that opted into Triage and hasn't been linked to a review yet, across every squad */
+      let triageCandidates = [];
+      /**
+       * Default (empty) filters for the Triage tab's candidate list.
+       * @returns {{type: string, project: string, q: string}}
+       */
+      function defaultTriageCandidateFilters() { return { type: "", project: "", q: "" }; }
+      /** Client-side filters for the Triage tab's candidate list -- empty string means "no filter" for each field. */
+      let triageCandidateFilters = defaultTriageCandidateFilters();
       /** Message from the last failed Triage action, shown inline above the tab's tables. */
       let triageError = "";
       /** @type {string|null} the project (display name) scoped by the open Projects-tab "auto-review thresholds" popup, or null when closed. */
@@ -6630,6 +6659,41 @@
         return `<div class="kv-row" data-tip="${MAXIMUM_TOOL_OUTPUT_TOKENS_TIP}"><span class="k">tool output cap</span><span class="v">${s.maximum_tool_output_tokens.toLocaleString()} tokens</span></div>`;
       }
       /**
+       * Renders a placeholder for a Triage-opted-in cell (RAL-318) that
+       * hasn't been swept into an actual review yet, shown in the cell
+       * details pane's "in reviews" section in place of a real review link.
+       * Empty once a real review exists (`s.reviews` non-empty) or the cell
+       * never opted into Triage (`s.triage_types` empty) -- `cellView()`
+       * only calls this as the fallback when `s.reviews` is empty.
+       *
+       * Two states, matching the cell's own `state` rather than any stored
+       * Triage/pool field (there's nothing to poll for beyond what
+       * `CellView` already carries): "scheduled" for a cell that hasn't
+       * reached `done` yet (pending, running, or failed -- nothing to
+       * meaningfully review), and "queued" once it has finished and is
+       * simply waiting on its Triage pool's count threshold or a cron
+       * schedule to fire. Both read the same `--arbiter` hue (this is the
+       * Arbiter/Triage subsystem's provenance color, not a distinct global
+       * status) and differ by icon/opacity/copy only.
+       * @param {CellView} s
+       * @returns {string}
+       */
+      function triagePlaceholderSection(s) {
+        const types = s.triage_types || [];
+        if (!types.length || (s.reviews || []).length) return "";
+        const done = s.state === "done";
+        const label = done ? "Queued for auto-review" : "Scheduled for auto-review";
+        const icon = done ? "✓" : "⏳";
+        const typeList = types.join(", ");
+        const tip = done
+          ? `This cell finished and resolved to Triage type(s): ${typeList}.\nIt's pooled and waiting for that pool's count threshold or a cron schedule to fire -- once it does, the Arbiter drains the pool into a fresh review automatically.\nCheck the Triage tab for the pool's current count vs. threshold.`
+          : `This cell opted into Triage (type(s): ${typeList}) and is already pooled for an automatic review, but hasn't reached "done" yet.\nOnce it finishes, this will show "Queued for auto-review" instead -- a pending, running, or failed cell has nothing to contribute to a review yet.`;
+        return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
+          `<span style="opacity:${done ? "1" : "0.55"}"><span class="dot" style="background:${cvar("--arbiter")}"></span></span>` +
+          `<span class="v" style="flex:1"><div>${icon} ${esc(label)}</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(typeList)}</div></span>` +
+          `</div>`;
+      }
+      /**
        * Renders the cell-level details pane.
        * @param {SquadView} r
        * @param {TaskView} t
@@ -6657,15 +6721,28 @@
         const inReviews = sReviews.length
           ? `<h3 class="section">in reviews</h3>` + [...sReviews]
               .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
-              .map((rv) => `<div class="kv-row"><span>${gdot(rv.status)}</span>` +
-                `<span class="v" style="flex:1"><div>${esc(rv.name)}</div>${rv.branch ? `<div class="mono" style="font-size:11px;color:var(--muted)">${esc(rv.branch)}</div>` : ""}</span>` +
-                `<span class="k">${esc(rv.status)}</span>` +
-                (rv.branch
-                  ? `<button class="btn" data-click="gotoReviewBranch" data-guardian-id="${esc(rv.id)}" data-branch="${esc(rv.branch)}" data-tip="Jump to the Reviews tab and select the branch ${esc(rv.branch)} in review '${esc(rv.name)}'.">Go to branch</button>`
-                  : `<button class="btn" data-click="gotoReview" data-guardian-id="${esc(rv.id)}" data-tip="Jump to this review on the Reviews tab to see its full status and branch stack.">Go to review</button>`
-                ) +
-                `</div>`).join("")
-          : "";
+              .map((rv) => {
+                const tip = rv.branch
+                  ? `Jump to the Reviews tab and select the branch ${esc(rv.branch)} in review '${esc(rv.name)}'.`
+                  : `Jump to this review on the Reviews tab to see its full status and branch stack.`;
+                // The whole row is clickable (not just the button) so the
+                // badge, name, and status text are all part of the same
+                // link region -- `closest("[data-click]")` resolves to the
+                // button when it's the actual click target, so this doesn't
+                // double-fire.
+                const rowClickAttrs = rv.branch
+                  ? `data-click="gotoReviewBranch" data-guardian-id="${esc(rv.id)}" data-branch="${esc(rv.branch)}"`
+                  : `data-click="gotoReview" data-guardian-id="${esc(rv.id)}"`;
+                return `<div class="kv-row" style="cursor:pointer" ${rowClickAttrs} data-tip="${tip}"><span>${gdot(rv.status)}</span>` +
+                  `<span class="v" style="flex:1"><div>${esc(rv.name)} ${originBadge(rv.origin)}</div>${rv.branch ? `<div class="mono" style="font-size:11px;color:var(--muted)">${esc(rv.branch)}</div>` : ""}</span>` +
+                  `<span class="k">${esc(rv.status)}</span>` +
+                  (rv.branch
+                    ? `<button class="btn" data-click="gotoReviewBranch" data-guardian-id="${esc(rv.id)}" data-branch="${esc(rv.branch)}" data-tip="${tip}">Go to branch</button>`
+                    : `<button class="btn" data-click="gotoReview" data-guardian-id="${esc(rv.id)}" data-tip="${tip}">Go to review</button>`
+                  ) +
+                  `</div>`;
+              }).join("")
+          : triagePlaceholderSection(s);
         const proofSteps = (s.proof || []).length
           ? `<h3 class="section">proof steps</h3>` + (s.proof || []).map((v, vi) =>
               `<div class="kv-row"><span>${sdot(v.state)}</span>` +
@@ -9519,6 +9596,20 @@
         return `<span class="dot" style="background:${cvar(color)}"></span>`;
       };
       /**
+       * Renders the small provenance badge for a review origin string
+       * ("explicit" or "arbiter"), or an empty string for "explicit" (the
+       * default -- no badge needed). Shared by `arbiterBadge()` (which has a
+       * full `GuardianView`) and any caller that only has the plain origin
+       * string, e.g. a cell's `SquadReviewRef`.
+       * @param {string} origin
+       * @returns {string}
+       */
+      function originBadge(origin) {
+        return origin === "arbiter"
+          ? `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px" data-tip="This review was created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired, draining cells from possibly-multiple past submissions into one fresh review -- not from an authored [[review]] block.">⚙ Arbiter</span>`
+          : "";
+      }
+      /**
        * Renders the small provenance badge for a review the Arbiter/Triage
        * subsystem created automatically (RAL-318), or an empty string for an
        * explicitly-authored review (the default -- no badge needed).
@@ -9526,9 +9617,7 @@
        * @returns {string}
        */
       function arbiterBadge(g) {
-        return originOf(g) === "arbiter"
-          ? `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px" data-tip="This review was created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired, draining cells from possibly-multiple past submissions into one fresh review -- not from an authored [[review]] block.">⚙ Arbiter</span>`
-          : "";
+        return originBadge(originOf(g));
       }
       /**
        * Selects a review and shows its detail pane.
@@ -12446,15 +12535,17 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       async function pollTriage() {
         try {
-          const [typesResp, poolsResp, schedulesResp] = await Promise.all([
+          const [typesResp, poolsResp, schedulesResp, candidatesResp] = await Promise.all([
             fetch("/api/triage/types"),
             fetch("/api/triage/pools"),
             fetch("/api/triage/schedules"),
+            fetch("/api/triage/candidates"),
           ]);
-          const [typesData, poolsData, schedulesData] = await Promise.all([
+          const [typesData, poolsData, schedulesData, candidatesData] = await Promise.all([
             typesResp.json(),
             poolsResp.json(),
             schedulesResp.json(),
+            candidatesResp.json(),
           ]);
           byId("conn").className = "dot on";
           byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
@@ -12462,24 +12553,31 @@ Work submitted against it will fail — fix the machine or deregister the provid
             (/** @type {TriageTypeView} */ a, /** @type {TriageTypeView} */ b) => a.name.localeCompare(b.name));
           triagePools = poolsData.pools || [];
           triageSchedules = schedulesData.schedules || [];
+          triageCandidates = candidatesData.candidates || [];
           renderTriage();
         } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
       }
       /**
        * Renders the Triage tab: the registered type registry, current pool
-       * state with editable count thresholds, and configured cron schedules
-       * (RAL-318).
+       * state with editable count thresholds, configured cron schedules,
+       * and (at the bottom) the candidate list of cells that opted into
+       * Triage but haven't been linked to a review yet (RAL-318). Wrapped in
+       * `preserveUserState` (RAL-7) so a periodic refresh or a filter
+       * keystroke on the candidate list's name search doesn't steal focus.
        * @returns {void}
        */
       function renderTriage() {
         byId("triage-summary").innerHTML =
           `${triageTypes.length} ${triageTypes.length === 1 ? "type" : "types"}, `
           + `${triagePools.length} pooled ${triagePools.length === 1 ? "key" : "keys"} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollTriage()" data-tip="Re-query the daemon for Triage types, pool state, and schedules.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollTriage()" data-tip="Re-query the daemon for Triage types, pool state, schedules, and candidates.">⟳ Refresh</button>`;
         const err = triageError
           ? `<div class="empty" style="color:var(--failed);margin-bottom:8px">${esc(triageError)}</div>`
           : "";
-        byId("triage").innerHTML = err + renderTriageTypesSection() + renderTriagePoolsSection() + renderTriageSchedulesSection();
+        const el = byId("triage");
+        preserveUserState(el, () => {
+          el.innerHTML = err + renderTriageTypesSection() + renderTriagePoolsSection() + renderTriageSchedulesSection() + renderTriageCandidatesSection();
+        });
       }
       /**
        * Renders the Triage type registry table plus its register form.
@@ -12715,6 +12813,111 @@ Work submitted against it will fail — fix the machine or deregister the provid
         } catch (e) { triageError = "daemon unreachable"; }
         await pollTriage();
       }
+      /**
+       * Computes the Triage tab's candidate list after applying the
+       * type/project/name-search filters.
+       * @returns {TriageCandidateView[]}
+       */
+      function visibleTriageCandidates() {
+        const q = triageCandidateFilters.q.trim().toLowerCase();
+        return triageCandidates.filter((c) =>
+          (!triageCandidateFilters.type || c.triage_types.includes(triageCandidateFilters.type))
+          && (!triageCandidateFilters.project || c.project === triageCandidateFilters.project)
+          && (!q
+            || c.task_name.toLowerCase().includes(q)
+            || c.cell_id.toLowerCase().includes(q)
+            || (c.cell_name || "").toLowerCase().includes(q)));
+      }
+      /**
+       * Renders the small status badge for one candidate row describing its
+       * relationship to Triage, not its own cell state: "Scheduled" (opted
+       * in, not done yet -- nothing to sweep into a review) or "Queued"
+       * (done, just waiting on its pool's count threshold or a cron
+       * schedule). Mirrors `triagePlaceholderSection()`'s per-cell
+       * placeholder wording/color, compacted for a table cell.
+       * @param {TriageCandidateView} c
+       * @returns {string}
+       */
+      function triageCandidateStatusBadge(c) {
+        const done = c.state === "done";
+        const label = done ? "Queued" : "Scheduled";
+        const icon = done ? "✓" : "⏳";
+        const tip = done
+          ? "This cell finished and is pooled, waiting for its Triage pool's count threshold or a cron schedule to fire."
+          : `This cell opted into Triage but hasn't reached "done" yet (state: ${esc(c.state)}) -- it can't be swept into an automatic review until it finishes.`;
+        return `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px;opacity:${done ? "1" : "0.7"}" data-tip="${tip}">${icon} ${label}</span>`;
+      }
+      /**
+       * Renders one Triage candidate's table row. The whole row is
+       * clickable and jumps to the Tasks tab with the owning squad/cell
+       * selected, via the same `gotoSquadItem` navigation the rest of the
+       * board uses.
+       * @param {TriageCandidateView} c
+       * @returns {string}
+       */
+      function triageCandidateRowHtml(c) {
+        const cellLabel = c.cell_name || c.cell_id;
+        return `<tr style="cursor:pointer" data-click="gotoTriageCandidate" data-squad-id="${esc(c.squad_id)}" data-ti="${c.task_idx}" data-si="${c.cell_idx}" data-tip="Jump to the Tasks tab and select this cell.">
+            <td>${triageCandidateStatusBadge(c)}</td>
+            <td>${c.triage_types.map((t) => esc(t)).join(", ")}</td>
+            <td>${esc(c.project)}</td>
+            <td><div>${esc(c.task_name)}</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(cellLabel)}</div></td>
+          </tr>`;
+      }
+      /**
+       * Renders the Triage candidate list: every cell across every squad
+       * that has opted into Triage and hasn't been linked to an actual
+       * review yet, filterable by type/project/name.
+       * @returns {string}
+       */
+      function renderTriageCandidatesSection() {
+        const list = visibleTriageCandidates();
+        const typeOptions = triageTypes.map((t) =>
+          `<option value="${esc(t.name)}" ${triageCandidateFilters.type === t.name ? "selected" : ""}>${esc(t.name)}</option>`).join("");
+        const projects = [...new Set(triageCandidates.map((c) => c.project))].sort();
+        const projectOptions = projects.map((p) =>
+          `<option value="${esc(p)}" ${triageCandidateFilters.project === p ? "selected" : ""}>${esc(p)}</option>`).join("");
+        const rows = list.length
+          ? list.map((c) => triageCandidateRowHtml(c)).join("")
+          : `<tr><td colspan="4" class="empty">${triageCandidates.length ? "No candidates match these filters." : "No cells have opted into Triage yet."}</td></tr>`;
+        const table = `<table class="proj-table"><thead><tr>`
+          + `<th data-tip="Whether this cell can be swept into an automatic review yet: Scheduled (opted in, still pending/running/failed) or Queued (done, waiting on its pool's count threshold or a cron schedule).">Status</th>`
+          + `<th data-tip="This cell's resolved Triage type(s).">Type</th>`
+          + `<th data-tip="The project this cell's owning task belongs to.">Project</th>`
+          + `<th data-tip="The task and cell this candidate belongs to. Click a row to jump to it on the Tasks tab.">Task / Cell</th>`
+          + `</tr></thead><tbody>${rows}</tbody></table>`;
+        return `<div style="margin-top:24px;padding-top:12px;border-top:1px solid var(--border)">
+            <div style="font-weight:600;margin-bottom:8px" data-tip="Every cell across every squad that has opted into Triage (triage = true) and hasn't been linked to an actual review yet -- decided at submission, before the cell even runs. A cell appears here the moment its Triage type(s) resolve, and drops off once its pool drains into a review.">Candidates (${triageCandidates.length})</div>
+            <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:8px">
+              <select id="triage-cand-type" onchange="onTriageCandidateTypeFilter(this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list down to one Triage type.">
+                <option value="">All types</option>${typeOptions}
+              </select>
+              <select id="triage-cand-project" onchange="onTriageCandidateProjectFilter(this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list down to one project.">
+                <option value="">All projects</option>${projectOptions}
+              </select>
+              <input id="triage-cand-q" type="text" placeholder="filter by task/cell name…" value="${esc(triageCandidateFilters.q)}" oninput="onTriageCandidateNameFilter(this.value)" style="flex:1;min-width:200px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list by task or cell name/id." />
+            </div>
+            ${table}
+          </div>`;
+      }
+      /**
+       * Updates the candidate list's Triage-type filter and re-renders.
+       * @param {string} v
+       * @returns {void}
+       */
+      function onTriageCandidateTypeFilter(v) { triageCandidateFilters.type = v; renderTriage(); }
+      /**
+       * Updates the candidate list's project filter and re-renders.
+       * @param {string} v
+       * @returns {void}
+       */
+      function onTriageCandidateProjectFilter(v) { triageCandidateFilters.project = v; renderTriage(); }
+      /**
+       * Updates the candidate list's name-search filter and re-renders.
+       * @param {string} v
+       * @returns {void}
+       */
+      function onTriageCandidateNameFilter(v) { triageCandidateFilters.q = v; renderTriage(); }
 
       /**
        * Polls `/api/users` and re-renders the Users tab.

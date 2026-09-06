@@ -89,6 +89,32 @@ pub struct TriagePoolCellRow {
     pub upstream: String,
 }
 
+/// One cell that has opted into Triage and is not yet linked to an actual
+/// review -- a "candidate" for the board's Triage tab candidate list. Spans
+/// every squad (not just currently-pooled cells, which are deleted the
+/// moment their pool drains), so a cell shows up here the moment its
+/// resolved type(s) are recorded at submit time, whether or not it has
+/// started running yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TriageCandidateView {
+    pub squad_id: String,
+    pub squad_label: Option<String>,
+    pub task_idx: i64,
+    pub task_name: String,
+    pub cell_idx: i64,
+    pub cell_id: String,
+    pub cell_name: Option<String>,
+    pub project: String,
+    /// This cell's raw stored `state` -- not the effective state
+    /// (`daemon::store::effective_cell_state`, which also folds in proof
+    /// step outcomes). A cell whose own state reads `done` but whose proof
+    /// step failed shows as "queued" here rather than "scheduled"; a minor
+    /// inaccuracy accepted for this secondary admin list rather than
+    /// joining proof state in as well.
+    pub state: String,
+    pub triage_types: Vec<String>,
+}
+
 /// One configured cron-style schedule entry for a `(project, triage_type)` pool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TriageScheduleRow {
@@ -264,6 +290,118 @@ impl Store {
             .query_map(params![squad_id, task_idx, idx], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Every cell's resolved Triage type(s) for a squad, grouped by
+    /// `(task_idx, idx)` -- the bulk counterpart to
+    /// [`Self::get_cell_triage_types`], used by `Store::cells_by_task` so a
+    /// `CellView` can show its Triage state without a per-cell query. A cell
+    /// absent from the map never opted into Triage.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn triage_types_by_cell(
+        &self,
+        squad_id: &str,
+    ) -> StoreResult<std::collections::HashMap<(i64, i64), Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx, triage_type FROM triage_cell_types WHERE squad_id=? ORDER BY task_idx, idx, triage_type",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut map: std::collections::HashMap<(i64, i64), Vec<String>> =
+            std::collections::HashMap::new();
+        for (task_idx, idx, triage_type) in rows {
+            map.entry((task_idx, idx)).or_default().push(triage_type);
+        }
+        Ok(map)
+    }
+
+    /// Every cell across every squad that has opted into Triage (has at
+    /// least one resolved type in `triage_cell_types`) and has not yet been
+    /// linked to an actual review (`cells.review_guardian_id IS NULL`) --
+    /// the board's Triage tab candidate list. Ordered newest-squad-first so
+    /// a currently-submitting batch of work surfaces at the top.
+    ///
+    /// Deliberately checks only `review_guardian_id`, not the two-tier
+    /// direct/fallback join `Store::reviews_by_branch` uses for a squad's
+    /// own `CellView.reviews` -- `review_branch` is stamped on every pooled
+    /// cell immediately at pool-entry time (before any guardian exists), so
+    /// it can't be used here to mean "already resolved". This means a cell
+    /// resolved only through the rare legacy/manual-attach fallback path
+    /// could still show as a candidate here after already being linked
+    /// on its `CellView` -- acceptable for this secondary admin list.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn triage_candidates(&self) -> StoreResult<Vec<TriageCandidateView>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT c.squad_id, c.task_idx, c.idx, c.sid, c.name, c.state, c.cwd,
+                    t.name, t.project, sq.label
+             FROM cells c
+             JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
+             JOIN squads sq ON sq.id = c.squad_id
+             WHERE c.review_guardian_id IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM triage_cell_types tct
+                 WHERE tct.squad_id = c.squad_id AND tct.task_idx = c.task_idx AND tct.idx = c.idx
+               )
+             ORDER BY sq.created_at_ms DESC, c.task_idx, c.idx",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (
+            squad_id,
+            task_idx,
+            idx,
+            cell_id,
+            cell_name,
+            state,
+            cwd,
+            task_name,
+            project,
+            squad_label,
+        ) in rows
+        {
+            let triage_types = self.get_cell_triage_types(&squad_id, task_idx, idx)?;
+            let project = project
+                .unwrap_or_else(|| crate::store::fallback_project_identifier(cwd.as_deref()));
+            out.push(TriageCandidateView {
+                squad_id,
+                squad_label,
+                task_idx,
+                task_name,
+                cell_idx: idx,
+                cell_id,
+                cell_name,
+                project,
+                state,
+                triage_types,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -1041,5 +1179,50 @@ mod tests {
         let errors = validate_task_file_triage_types(&s, src, &file);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn triage_candidates_lists_an_unresolved_cell_and_excludes_a_reviewed_one() {
+        let mut s = store();
+        let file = task_file_with_triage_type("security");
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
+            .unwrap();
+
+        let candidates = s.triage_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].squad_id, squad_id);
+        assert_eq!(candidates[0].task_name, "t");
+        assert_eq!(candidates[0].project, "proj");
+        assert_eq!(candidates[0].triage_types, vec!["security".to_string()]);
+        assert_eq!(candidates[0].state, "pending");
+
+        // Once the cell is linked to an actual review, it drops off the list.
+        s.set_cell_review_guardian(&squad_id, 0, 0, "guardian-1")
+            .unwrap();
+        assert!(s.triage_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn triage_candidates_falls_back_to_cwd_basename_when_task_project_is_unset() {
+        let mut s = store();
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"bug\"\n";
+        let file: TaskFile = toml::from_str(src).unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.set_cell_triage_types(&squad_id, 0, 0, &["bug".to_string()])
+            .unwrap();
+        let candidates = s.triage_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].project, "repo");
+    }
+
+    #[test]
+    fn triage_candidates_excludes_a_cell_that_never_opted_into_triage() {
+        let mut s = store();
+        let src =
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
+        let file: TaskFile = toml::from_str(src).unwrap();
+        s.insert_squad(&file, None, false).unwrap();
+        assert!(s.triage_candidates().unwrap().is_empty());
     }
 }

@@ -686,6 +686,9 @@ fn route_for_user(
         ("DELETE", ["api", "triage", "schedules", id]) => {
             admin_gated(daemon, user_header, || remove_triage_schedule(daemon, id))
         }
+        ("GET", ["api", "triage", "candidates"]) => {
+            admin_gated(daemon, user_header, || list_triage_candidates(daemon))
+        }
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
@@ -2341,6 +2344,23 @@ fn remove_triage_schedule(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+#[derive(Serialize)]
+struct TriageCandidatesResponse {
+    candidates: Vec<crate::triage::TriageCandidateView>,
+}
+
+/// `GET /api/triage/candidates`: every cell across every squad that has
+/// opted into Triage and has not yet been linked to an actual review -- the
+/// board's Triage tab candidate list. A cell appears here from the moment
+/// its Triage type(s) resolve at submit time, whether or not it has run
+/// yet, and drops off once its pool drains into a review.
+fn list_triage_candidates(daemon: &Daemon) -> Reply {
+    match daemon.lock().triage_candidates() {
+        Ok(candidates) => json(200, &TriageCandidatesResponse { candidates }),
+        Err(e) => store_error(&e),
+    }
+}
+
 fn list_projects(daemon: &Daemon) -> Reply {
     match daemon.lock().list_projects() {
         Ok(projects) => json(200, &ProjectsResponse { projects }),
@@ -2424,7 +2444,12 @@ fn require_admin(daemon: &Daemon, user_header: Option<&str>) -> Result<String, R
         Err(e) => return Err(store_error(&e)),
     };
     if !any_admin_exists {
-        return Ok(current_user(daemon, user_header)?.unwrap_or_default());
+        // Bootstrap exception: allow unregistered users in a fresh instance.
+        let user_name = current_user(daemon, user_header)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        return Ok(user_name);
     }
     let user_name = require_current_user(daemon, user_header)?;
     match daemon.lock().is_admin(&user_name) {
@@ -18274,6 +18299,38 @@ command=\"cargo test\"
         assert_eq!(r.status, 200, "{}", r.body);
         let r = route(&d, "DELETE", &format!("/api/triage/schedules/{id}"), "");
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn triage_candidates_route_lists_an_unresolved_cell() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/triage/candidates", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"candidates\":[]"));
+
+        let src = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"security\"\n";
+        let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
+        let squad_id = {
+            let mut guard = d.lock();
+            let squad_id = guard.insert_squad(&file, None, false).unwrap();
+            guard
+                .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
+                .unwrap();
+            squad_id
+        };
+
+        let r = route(&d, "GET", "/api/triage/candidates", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains(&squad_id));
+        assert!(r.body.contains("\"project\":\"proj\""));
+        assert!(r.body.contains("\"triage_types\":[\"security\"]"));
+
+        // Once linked to a review, it drops off the candidate list.
+        d.lock()
+            .set_cell_review_guardian(&squad_id, 0, 0, "guardian-1")
+            .unwrap();
+        let r = route(&d, "GET", "/api/triage/candidates", "");
+        assert!(r.body.contains("\"candidates\":[]"));
     }
 
     #[test]
