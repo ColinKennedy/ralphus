@@ -33,26 +33,26 @@ pub fn execute(cmd: MailboxCommand, client: &DaemonClient) -> ExecResult {
         MailboxCommand::PersonalDrain { message_ids, user } => {
             Ok(client.personal_mailbox_drain(message_ids.as_deref(), user.as_deref())?)
         }
-        MailboxCommand::Follow {
+        MailboxCommand::Watch {
             entity_uri,
             tiers,
             user,
         } => {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            Ok(client.create_follow(&entity_uri, tiers_opt, user.as_deref())?)
+            Ok(client.create_watch(&entity_uri, tiers_opt, user.as_deref())?)
         }
-        MailboxCommand::Unfollow { entity_uri, user } => {
-            Ok(client.delete_follow(&entity_uri, user.as_deref())?)
+        MailboxCommand::Unwatch { entity_uri, user } => {
+            Ok(client.delete_watch(&entity_uri, user.as_deref())?)
         }
-        MailboxCommand::Follows { user } => Ok(client.list_follows(user.as_deref())?),
+        MailboxCommand::Watches { user } => Ok(client.list_watches(user.as_deref())?),
         MailboxCommand::Preferences { user } => Ok(client.get_user_preferences(&user)?),
         MailboxCommand::SetPreferences {
             user,
-            auto_follow,
+            auto_watch,
             tiers,
         } => {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            Ok(client.set_user_preferences(&user, auto_follow, tiers_opt)?)
+            Ok(client.set_user_preferences(&user, auto_watch, tiers_opt)?)
         }
     }
 }

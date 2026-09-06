@@ -56,7 +56,7 @@ impl MailboxPriority {
     }
 }
 
-/// Every priority tier, most urgent first -- the default a follow/user
+/// Every priority tier, most urgent first -- the default a watch/user
 /// preference is given when a caller wants "notify me about everything"
 /// (RAL-320).
 #[must_use]
@@ -68,7 +68,7 @@ pub fn all_tiers() -> Vec<MailboxPriority> {
     ]
 }
 
-/// Parse a comma-separated tier list (`follows.notify_tiers`,
+/// Parse a comma-separated tier list (`watches.notify_tiers`,
 /// `users.default_notify_tiers`), silently dropping any unrecognized token --
 /// matching this file's "malformed data never blocks" precedent.
 #[must_use]
@@ -115,7 +115,7 @@ pub struct MailboxMessageView {
     pub read: bool,
     /// The entity this message concerns, in `crate::entity_uri::EntityUri`
     /// string form, when the enqueuing call site named one (RAL-320) --
-    /// what a personal follow's `covers()` check matches against. `None` for
+    /// what a personal watch's `covers()` check matches against. `None` for
     /// messages enqueued before this field existed, or with no addressable
     /// entity.
     pub entity_uri: Option<String>,
@@ -182,7 +182,7 @@ impl Store {
     /// may not have a specific task/cell to point at. `entity_uri` (RAL-320)
     /// is the `crate::entity_uri::EntityUri` string form of the same
     /// entity, when the call site can name one -- it's what a personal
-    /// follow's `covers()` check matches against; pass `None` when there's
+    /// watch's `covers()` check matches against; pass `None` when there's
     /// no addressable entity.
     pub fn enqueue_mailbox_message(
         &self,
@@ -231,13 +231,13 @@ impl Store {
     }
 
     /// List mailbox messages visible to `user_name` through their personal
-    /// follows (RAL-320) -- deliberately "opt-in": a user with zero follows
+    /// watches (RAL-320) -- deliberately "opt-in": a user with zero watches
     /// sees nothing here, never "everything", since the personal mailbox is
     /// a filtered view layered over the broadcast one, not a second copy of
-    /// it. A message matches when some follow's entity
+    /// it. A message matches when some watch's entity
     /// [`crate::entity_uri::EntityUri::covers`] the message's own
     /// `entity_uri` (a message with no `entity_uri` never matches any
-    /// follow) and the message's priority is one of that follow's
+    /// watch) and the message's priority is one of that watch's
     /// `notify_tiers`. `unread_only`/`priority` mirror
     /// [`Self::mailbox_messages_for_client`]; "read" here reflects
     /// [`Self::drain_personal_mailbox_messages`]'s per-user drain state, not
@@ -251,8 +251,8 @@ impl Store {
         unread_only: bool,
         priority: Option<MailboxPriority>,
     ) -> Result<Vec<MailboxMessageView>> {
-        let follows = self.list_follows(user_name)?;
-        if follows.is_empty() {
+        let watches = self.list_watches(user_name)?;
+        if watches.is_empty() {
             return Ok(Vec::new());
         }
         let priority_str = priority.map(MailboxPriority::as_str);
@@ -279,9 +279,9 @@ impl Store {
                 else {
                     return false;
                 };
-                follows.iter().any(|f| {
-                    crate::entity_uri::parse(&f.entity_uri).is_some_and(|followed| {
-                        followed.covers(&msg_uri)
+                watches.iter().any(|f| {
+                    crate::entity_uri::parse(&f.entity_uri).is_some_and(|watched| {
+                        watched.covers(&msg_uri)
                             && f.notify_tiers.iter().any(|t| t.as_str() == msg.priority)
                     })
                 })
@@ -292,7 +292,7 @@ impl Store {
     /// Mark messages as drained (read) for `user_name`'s personal mailbox --
     /// mirrors [`Self::drain_mailbox_messages`]'s per-client shape, but keyed
     /// on `user_mailbox_drains` (per-user) instead of `mailbox_drains`
-    /// (per-broadcast-client), since a personal follow and a broadcast
+    /// (per-broadcast-client), since a personal watch and a broadcast
     /// client track read state independently over the same underlying
     /// messages.
     ///
