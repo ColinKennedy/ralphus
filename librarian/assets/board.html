@@ -4046,8 +4046,8 @@
       // is set, since most cells set neither.
       const CONTEXT_LIMITS_TIP = "Context-window controls delivered to the backend at cell start, resolved from the cell (or its owning task) at submit time.\nmax = the context-window ceiling itself (maximum_context) — only codex and pi backends have a real lever for this.\ncompact @ = the token count at which the backend auto-compacts its own history (auto_compact_threshold) — also supported by claude-code, via its CLAUDE_CODE_AUTO_COMPACT_WINDOW env var.\nWho/when: check this on a long-running cell to see whether/where it's set up to compact instead of just running until it hits the wall and fails.\nRead-only here — edit the TOML and resubmit to change it.";
       // RAL-333: read-only — set via `maximum_tool_output_tokens` in the
-      // submitted TOML, not editable here. Only shown when set, since most
-      // cells/proof steps leave it unset.
+      // submitted TOML, not editable here. Always shown (RAL-356), as "—"
+      // when unset since most cells/proof steps leave it unset.
       const MAXIMUM_TOOL_OUTPUT_TOKENS_TIP = "Caps how many tokens a single tool-call result (e.g. a large file read) can inject into the agent's context, delivered via each backend's own mechanism: claude-code's CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS env var, codex's tool_output_token_limit config, or pi's models.json maxTokens.\nWho/when: check this to see whether a cell/proof step is guarded against one huge tool output blowing out its context and forcing an auto-compact.\nRead-only here — edit the TOML and resubmit to change it.";
       // Same idea as TOKENS_COST_TIP/LIFETIME_COST_TIP above, for proof steps
       // (RAL-172): a proof step's own token/cost usage is now tracked
@@ -8393,15 +8393,14 @@
       }
       /**
        * Renders the RAL-333 tool-output token cap row (`maximum_tool_output_tokens`)
-       * for the cell/proof-step details pane, or an empty string when unset —
-       * most cells/proof steps leave it unset, so the row is omitted rather
-       * than shown empty.
+       * for the cell/proof-step details pane, always shown — "—" when unset
+       * (RAL-356), matching the placeholder style used elsewhere in this pane.
        * @param {CellView|ProofView} s
        * @returns {string}
        */
       function maximumToolOutputTokensRow(s) {
-        if (s.maximum_tool_output_tokens == null) return "";
-        return `<div class="kv-row" data-tip="${MAXIMUM_TOOL_OUTPUT_TOKENS_TIP}"><span class="k">tool output cap</span><span class="v">${s.maximum_tool_output_tokens.toLocaleString()} tokens</span></div>`;
+        const value = s.maximum_tool_output_tokens == null ? "—" : `${s.maximum_tool_output_tokens.toLocaleString()} tokens`;
+        return `<div class="kv-row" data-tip="${MAXIMUM_TOOL_OUTPUT_TOKENS_TIP}"><span class="k">tool output cap</span><span class="v">${value}</span></div>`;
       }
       /**
        * Renders a placeholder for a Triage-opted-in cell (RAL-318) that
