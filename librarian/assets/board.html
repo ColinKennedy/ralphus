@@ -1701,6 +1701,10 @@
       CLICK_HANDLERS.removeSecretEnvName = (e, ds) => removeSecretEnvName(ds.name || "");
       CLICK_HANDLERS.saveProjectEdit = (e, ds) => saveProjectEdit(ds.name || "");
       CLICK_HANDLERS.openProjectTriageThresholds = (e, ds) => openProjectTriageThresholds(ds.name || "");
+      CLICK_HANDLERS.openProjectForksModal = (e, ds) => openProjectForksModal(ds.name || "");
+      CLICK_HANDLERS.startProjectForkEdit = (e, ds) => startProjectForkEdit(ds.user || "");
+      CLICK_HANDLERS.saveProjectForkEdit = (e, ds) => saveProjectForkEdit(ds.user || "");
+      CLICK_HANDLERS.removeProjectFork = (e, ds) => removeProjectFork(ds.user || "");
       CLICK_HANDLERS.saveProjectTriageThreshold = (e, ds) => saveProjectTriageThreshold(e, ds.triageType || "");
       CLICK_HANDLERS.queueToggleCollapse = (e, ds) => queueToggleCollapse(e, ds.key || "");
       CLICK_HANDLERS.queueHeaderClick = (e, ds) => queueHeaderClick(e, ds.key || "");
@@ -1769,6 +1773,19 @@
       let projectTriageModalProject = null;
       /** Message from the last failed action inside the open Projects-tab Triage-threshold popup. */
       let projectTriageModalError = "";
+      // ---- Fork registrations popup state (RAL-338) ----
+      /** @type {ForkRecord[]} one row per registered fork, across every project and user. */
+      let projectForks = [];
+      /** @type {string|null} project (display name) scoped by the open Projects-tab "fork registrations" popup, or null when closed. */
+      let projectForksModalProject = null;
+      /** Message from the last failed action inside the open Projects-tab fork-registrations popup. */
+      let projectForksModalError = "";
+      /** @type {{user: string, fork_url: string, remote_name: string, fork_owner: string}} draft for the "add a fork" row. */
+      let projectForksAddDraft = { user: "", fork_url: "", remote_name: "", fork_owner: "" };
+      /** @type {string|null} user of the fork row currently in inline edit mode, or null. */
+      let projectForksEditUser = null;
+      /** @type {{fork_url?: string, remote_name?: string, fork_owner?: string}} draft for the fork row being edited. */
+      let projectForksEditDraft = {};
       /** @type {ProjectView[]} */
       let projects = [];
       /** @type {{[key: string]: string|null}} name -> validation error message, or null/absent if valid/unknown */

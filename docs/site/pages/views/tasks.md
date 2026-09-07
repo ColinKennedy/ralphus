@@ -1,48 +1,48 @@
 # Tasks
 
-The Tasks tab is the default view and the one you'll live in most: every
-squad you've submitted, its tasks and cells, and the full detail of
-whichever one you've selected.
+The Tasks tab is a flat, searchable table of **every task across every
+squad** — one row per task, regardless of which squad it lives in, with
+usage, review, and PR state joined in. Use it to see what's outstanding
+board-wide without having to click through each squad's tree on the
+[Squads tab](../squads/).
 
-## The board at a glance
+## The task table
 
-![Tasks tab showing four squads in different states, with the running squad's task/cell tree expanded](../screenshots/tasks-overview.png)
+![Tasks tab showing a flat table of every task across every squad](../screenshots/tasks-overview.png)
 
-The **left sidebar** lists every squad, newest first, filterable by status
-and searchable by id/label:
+Each row is one task, sorted by default so the most recently started work
+sits on top:
 
-- The colored dot + label is the squad's **state** — `running`, `done`,
-  `failed`, or `queued` (held back with `hold=true`, waiting to be
-  activated). A `queued` squad shows a `▶ Run` button right there in the
-  sidebar.
-- Below the label, the small meta line repeats the state as text and (for
-  anything past `pending`/`queued`) offers a logs shortcut.
-- Right-click any squad for rename / retry / restart / cancel / delete, or to
-  manually override its status.
+- The **squad chip** (colored dot + label) names the owning squad; hover to
+  highlight the squad's other rows, or click to jump to that squad on the
+  Squads tab.
+- The **task name** and a summary of its cells, its own state (`running`,
+  `done`, `failed`, …), and its token/cost usage.
+- A **review/PR lane** shows review state and any submitted pull-request for
+  the task, and a **watch star** reflects whether you're watching the task
+  (directly or via its squad).
 
-The **main pane** shows the selected squad's task tree: each task's name,
-state, and declared task-level proof steps, with its cells nested below.
-In the screenshot above, `add-dark-mode-toggle` is `running` — one cell
-(`wire-theme-toggle`) already finished and its `fmt` proof step passed;
-the second cell (`persist-theme-choice`) is still in flight and depends
-on the first.
+The toolbar above the table filters rows:
 
-## Selecting a cell
+- **filter by task name** narrows the list with a case-insensitive substring
+  (tip: just start typing — the list narrows as you type).
+- **show hidden** includes tasks belonging to a squad you've hidden on the
+  Squads tab (hiding is squad-level only).
+- **needs me** shows only rows you're directly responsible for right now:
+  watched or watched-squad tasks that are `failed`, awaiting your review
+  approval, or approved with no PR submitted yet.
+- **status filters** toggle which task states are visible.
 
-![The same board with a specific cell selected, showing its details pane](../screenshots/tasks-session-detail.png)
+## Expanding a task
 
-Click any cell to open its **details pane**: the resolved agent and
-model, token/cost counters, the prompt or command it ran, its own dependency
-(`persist-theme-choice` waits on `wire-theme-toggle`, shown above), and any
-cell-level proof steps. This is where you'd go to read exactly what an
-agent was asked to do and what it reported back — the same pane a
-`command`-kind cell shows its captured output in.
+Rows are collapsed to one line by default. Click **Expand all** (or a task's
+expand arrow) to reveal the task's cells beneath it — each cell row shows its
+name, state, and agent/model, and pops its full details in the right-hand
+pane when selected. **Collapse all** folds the table back down.
 
-## Where task state comes from
+## Where the rows come from
 
-A task's state rolls up from its cells and proof steps — it only counts
-as `done` once every cell has finished and every proof step has passed.
-A `failed` cell (like `extract-token-parser` in the `refactor-auth-
-middleware` squad) fails its owning task, and any task-level proof step
-attached to it is shown alongside the failure so you can see exactly which
-check caught it.
+The table is built from the same squad data the Squads tab renders — the
+Tasks tab is a read-only, board-wide projection of it for triage. Nothing you
+do here changes a task's status; it only changes your own view (which rows
+are visible) and your watch on a task.

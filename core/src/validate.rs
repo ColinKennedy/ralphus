@@ -2054,40 +2054,44 @@ command = "cargo build"
     fn missing_name() {
         let src = "[[task]]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("name")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("name"))
+        );
     }
 
     #[test]
     fn cell_needs_cwd() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("cwd")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("cwd"))
+        );
     }
 
     #[test]
     fn prompt_and_command_conflict() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\ncommand=\"c\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::ConflictingKeys));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::ConflictingKeys)
+        );
     }
 
     #[test]
     fn cell_needs_prompt_or_command() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("prompt")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("prompt"))
+        );
     }
 
     #[test]
@@ -2197,10 +2201,11 @@ command = "cargo build"
     fn wrong_type_for_budget() {
         let src = "[[task]]\nname=\"t\"\nbudget_tokens=\"lots\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("budget_tokens")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("budget_tokens"))
+        );
     }
 
     #[test]
@@ -2358,46 +2363,53 @@ command = "cargo build"
     #[test]
     fn proof_needs_exactly_one_kind() {
         let none = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"v\"\n";
-        assert!(validate_toml(none)
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("exactly one")));
+        assert!(
+            validate_toml(none)
+                .errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("exactly one"))
+        );
 
         let many = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nbrain=\"b\"\n";
-        assert!(validate_toml(many)
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::ConflictingKeys));
+        assert!(
+            validate_toml(many)
+                .errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::ConflictingKeys)
+        );
     }
 
     #[test]
     fn duplicate_task_names() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("duplicate")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("duplicate"))
+        );
     }
 
     #[test]
     fn intra_task_dep_not_found() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"ghost\"]\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::IntraTaskRefNotFound));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::IntraTaskRefNotFound)
+        );
     }
 
     #[test]
     fn cross_task_dep_is_not_flagged_here() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"other/b\"]\n";
         let r = validate_toml(src);
-        assert!(!r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::IntraTaskRefNotFound));
+        assert!(
+            !r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::IntraTaskRefNotFound)
+        );
     }
 
     // ── upstream <<task:...>> existence checks ─────────────────────────────
@@ -2539,10 +2551,11 @@ command = "cargo build"
     fn restart_on_bad_grammar_reported() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nrestart_on=[\"nope\"]\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("restart_on")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("restart_on"))
+        );
     }
 
     #[test]
@@ -3305,10 +3318,11 @@ command = "cargo build"
     fn review_unknown_key_reported() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[review]]\nbranch=\"x\"\n";
         let r = validate_toml(src);
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.kind == ErrorKind::UnknownKey && e.message.contains("branch")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownKey && e.message.contains("branch"))
+        );
     }
 
     #[test]

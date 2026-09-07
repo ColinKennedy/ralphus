@@ -11,12 +11,13 @@
 //! boundary -- this module trusts its inputs, matching
 //! `Store::enqueue_mailbox_message`'s own precedent.
 
-use rusqlite::OptionalExtension as _;
 use rusqlite::params;
 use serde::Serialize;
 
 use crate::mailbox::{self, MailboxPriority};
-use crate::store::{Result, Store, now_ms};
+use crate::store::{Result, Store};
+
+pub use crate::watches::WatchView;
 
 /// The deliberately bounded set of changes that Monitor can notify about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -42,21 +43,6 @@ impl NotifiableEventKind {
             Self::ReviewFailed => "review_failed",
         }
     }
-}
-
-/// One user's subscription to an entity, with its own notification tiers.
-#[derive(Debug, Clone, Serialize)]
-pub struct WatchView {
-    /// Stable id (`watch-000000000001`, ...).
-    pub id: String,
-    /// The watching user's name (`users.name`).
-    pub user_name: String,
-    /// The watched entity, in `crate::entity_uri::EntityUri` string form.
-    pub entity_uri: String,
-    /// Which mailbox priority tiers this watch notifies for.
-    pub notify_tiers: Vec<MailboxPriority>,
-    /// When the watch was created (Unix epoch milliseconds).
-    pub created_at_ms: i64,
 }
 
 impl Store {
@@ -102,126 +88,11 @@ impl Store {
         Ok(id)
     }
 
-    /// Watch `entity_uri` as `user_name`, notified for `notify_tiers`.
-    /// Re-watching the same `(user_name, entity_uri)` pair updates the tier
-    /// selection in place rather than erroring -- "change what I'm notified
-    /// about" is a normal use of a watch, not a conflict. Ensures
-    /// `user_name` is registered first (see [`Store::ensure_user_row`]), so a
-    /// first-time watcher doesn't need a separate admin registration step.
-    ///
-    /// # Errors
-    /// Propagates any SQLite failure.
-    pub fn create_watch(
-        &self,
-        user_name: &str,
-        entity_uri: &str,
-        notify_tiers: &[MailboxPriority],
-    ) -> Result<WatchView> {
-        self.ensure_user_row(user_name)?;
-        let tiers_csv = mailbox::tiers_to_csv(notify_tiers);
-        let existing_id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM follows WHERE user_name=?1 AND entity_uri=?2",
-                params![user_name, entity_uri],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let (id, created_at_ms) = if let Some(id) = existing_id {
-            self.conn.execute(
-                "UPDATE follows SET notify_tiers=?1 WHERE id=?2",
-                params![tiers_csv, id],
-            )?;
-            let created_at_ms: i64 = self.conn.query_row(
-                "SELECT created_at_ms FROM follows WHERE id=?1",
-                params![id],
-                |r| r.get(0),
-            )?;
-            (id, created_at_ms)
-        } else {
-            let id = self.next_id("follow_seq", "follow")?;
-            let created_at_ms = now_ms();
-            self.conn.execute(
-                "INSERT INTO follows(id, user_name, entity_uri, notify_tiers, created_at_ms)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                params![id, user_name, entity_uri, tiers_csv, created_at_ms],
-            )?;
-            (id, created_at_ms)
-        };
-        crate::cartographer::Note::new("store").emit(
-            self,
-            format!("{user_name:?} watched {entity_uri:?}"),
-            serde_json::json!({"user_name": user_name, "entity_uri": entity_uri}),
-        );
-        Ok(WatchView {
-            id,
-            user_name: user_name.to_string(),
-            entity_uri: entity_uri.to_string(),
-            notify_tiers: notify_tiers.to_vec(),
-            created_at_ms,
-        })
-    }
-
-    /// Stop watching `entity_uri` as `user_name`. Returns `false` if no
-    /// such watch existed.
-    ///
-    /// # Errors
-    /// Propagates any SQLite failure.
-    pub fn delete_watch(&self, user_name: &str, entity_uri: &str) -> Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM follows WHERE user_name=?1 AND entity_uri=?2",
-            params![user_name, entity_uri],
-        )?;
-        if n > 0 {
-            crate::cartographer::Note::new("store").emit(
-                self,
-                format!("{user_name:?} stopped watching {entity_uri:?}"),
-                serde_json::json!({"user_name": user_name, "entity_uri": entity_uri}),
-            );
-        }
-        Ok(n > 0)
-    }
-
-    /// Every watch `user_name` has, newest first.
-    ///
-    /// # Errors
-    /// Propagates any SQLite failure.
-    pub fn list_watches(&self, user_name: &str) -> Result<Vec<WatchView>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, user_name, entity_uri, notify_tiers, created_at_ms
-             FROM follows WHERE user_name=?1 ORDER BY created_at_ms DESC, id",
-        )?;
-        let rows = stmt
-            .query_map(params![user_name], |r| {
-                let tiers_csv: String = r.get(3)?;
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    tiers_csv,
-                    r.get::<_, i64>(4)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, user_name, entity_uri, tiers_csv, created_at_ms)| WatchView {
-                    id,
-                    user_name,
-                    entity_uri,
-                    notify_tiers: mailbox::parse_tiers(&tiers_csv),
-                    created_at_ms,
-                },
-            )
-            .collect())
-    }
-
     /// Every user watching one whole squad or review, oldest first.
     pub fn watchers_for_entity(&self, entity_uri: &str) -> Result<Vec<WatchView>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user_name, entity_uri, notify_tiers, created_at_ms
-             FROM follows WHERE entity_uri=?1 ORDER BY created_at_ms, user_name",
+             FROM watches WHERE entity_uri=?1 ORDER BY created_at_ms, user_name",
         )?;
         let rows = stmt
             .query_map(params![entity_uri], |r| {
