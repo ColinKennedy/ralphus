@@ -191,6 +191,8 @@ fn log_llm_done(spec: &CellSpec, result: &CellResult) {
                 "tokens_out": result.tokens_out,
                 "cache_creation_tokens": result.cache_creation_tokens,
                 "cache_read_tokens": result.cache_read_tokens,
+                "compaction_input_tokens": result.compaction_input_tokens,
+                "compaction_count": result.compaction_count,
                 "cost_usd": result.cost_usd,
             }),
         );
@@ -301,6 +303,8 @@ fn run_with_backend(
     let mut total_tokens_out = 0i64;
     let mut total_cache_creation_tokens = 0i64;
     let mut total_cache_read_tokens = 0i64;
+    let mut total_compaction_input_tokens = 0i64;
+    let mut total_compaction_count = 0i64;
     let mut total_cost_usd = 0.0f64;
     let mut agent_session_id: Option<String> = None;
 
@@ -329,6 +333,8 @@ fn run_with_backend(
         total_tokens_out += outcome.tokens_out;
         total_cache_creation_tokens += outcome.cache_creation_tokens;
         total_cache_read_tokens += outcome.cache_read_tokens;
+        total_compaction_input_tokens += outcome.compaction_input_tokens;
+        total_compaction_count += outcome.compaction_count;
         total_cost_usd += outcome.cost_usd;
         agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
 
@@ -347,6 +353,8 @@ fn run_with_backend(
                 total_tokens_out,
                 total_cache_creation_tokens,
                 total_cache_read_tokens,
+                total_compaction_input_tokens,
+                total_compaction_count,
                 total_cost_usd,
                 agent_session_id,
             );
@@ -377,6 +385,8 @@ fn run_with_backend(
                     tokens_out: total_tokens_out,
                     cache_creation_tokens: total_cache_creation_tokens,
                     cache_read_tokens: total_cache_read_tokens,
+                    compaction_input_tokens: total_compaction_input_tokens,
+                    compaction_count: total_compaction_count,
                     cost_usd: total_cost_usd,
                     cost_is_estimated: false,
                     summary: outcome.summary,
@@ -433,6 +443,8 @@ fn run_with_backend(
                         tokens_out: total_tokens_out,
                         cache_creation_tokens: total_cache_creation_tokens,
                         cache_read_tokens: total_cache_read_tokens,
+                        compaction_input_tokens: total_compaction_input_tokens,
+                        compaction_count: total_compaction_count,
                         cost_usd: total_cost_usd,
                         cost_is_estimated: false,
                         summary: outcome.summary,
@@ -450,6 +462,8 @@ fn run_with_backend(
             total_tokens_out += outcome.tokens_out;
             total_cache_creation_tokens += outcome.cache_creation_tokens;
             total_cache_read_tokens += outcome.cache_read_tokens;
+            total_compaction_input_tokens += outcome.compaction_input_tokens;
+            total_compaction_count += outcome.compaction_count;
             total_cost_usd += outcome.cost_usd;
             agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
             if let Some(detail) = outcome.compaction_thrash {
@@ -461,6 +475,8 @@ fn run_with_backend(
                     total_tokens_out,
                     total_cache_creation_tokens,
                     total_cache_read_tokens,
+                    total_compaction_input_tokens,
+                    total_compaction_count,
                     total_cost_usd,
                     agent_session_id,
                 );
@@ -494,6 +510,8 @@ fn run_with_backend(
                     tokens_out: total_tokens_out,
                     cache_creation_tokens: total_cache_creation_tokens,
                     cache_read_tokens: total_cache_read_tokens,
+                    compaction_input_tokens: total_compaction_input_tokens,
+                    compaction_count: total_compaction_count,
                     cost_usd: total_cost_usd,
                     cost_is_estimated: false,
                     summary: outcome.summary,
@@ -509,6 +527,8 @@ fn run_with_backend(
                 tokens_out: total_tokens_out,
                 cache_creation_tokens: total_cache_creation_tokens,
                 cache_read_tokens: total_cache_read_tokens,
+                compaction_input_tokens: total_compaction_input_tokens,
+                compaction_count: total_compaction_count,
                 cost_usd: total_cost_usd,
                 cost_is_estimated: false,
                 summary: outcome.summary,
@@ -541,6 +561,8 @@ fn run_with_backend(
                 tokens_out: total_tokens_out,
                 cache_creation_tokens: total_cache_creation_tokens,
                 cache_read_tokens: total_cache_read_tokens,
+                compaction_input_tokens: total_compaction_input_tokens,
+                compaction_count: total_compaction_count,
                 cost_usd: total_cost_usd,
                 cost_is_estimated: false,
                 summary,
@@ -558,6 +580,8 @@ fn run_with_backend(
                 tokens_out: total_tokens_out,
                 cache_creation_tokens: total_cache_creation_tokens,
                 cache_read_tokens: total_cache_read_tokens,
+                compaction_input_tokens: total_compaction_input_tokens,
+                compaction_count: total_compaction_count,
                 cost_usd: total_cost_usd,
                 cost_is_estimated: false,
                 summary: outcome.summary,
@@ -578,6 +602,8 @@ fn run_with_backend(
             tokens_out: total_tokens_out,
             cache_creation_tokens: total_cache_creation_tokens,
             cache_read_tokens: total_cache_read_tokens,
+            compaction_input_tokens: total_compaction_input_tokens,
+            compaction_count: total_compaction_count,
             cost_usd: total_cost_usd,
             cost_is_estimated: false,
             summary: outcome.summary.clone(),
@@ -605,6 +631,8 @@ fn thrash_cell_result(
     tokens_out: i64,
     cache_creation_tokens: i64,
     cache_read_tokens: i64,
+    compaction_input_tokens: i64,
+    compaction_count: i64,
     cost_usd: f64,
     agent_session_id: Option<String>,
 ) -> CellResult {
@@ -627,6 +655,8 @@ fn thrash_cell_result(
         tokens_out,
         cache_creation_tokens,
         cache_read_tokens,
+        compaction_input_tokens,
+        compaction_count,
         cost_usd,
         cost_is_estimated: false,
         summary,

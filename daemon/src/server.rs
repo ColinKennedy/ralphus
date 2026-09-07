@@ -2839,10 +2839,14 @@ fn delete_user(daemon: &Daemon, name: &str) -> Reply {
 /// name one. `None` when neither is set -- callers that require a user
 /// should go through [`require_acting_user`] instead.
 fn resolve_acting_user(query: &str) -> Option<String> {
-    query_param(query, "user")
-        .map(url_decode)
-        .filter(|u| !u.is_empty())
-        .or_else(|| crate::config::load_daemon_config().default_user)
+    if let Some(user) = query_param(query, "user") {
+        // Query parameter was explicitly provided; use it as-is (don't fall back to config)
+        let decoded = url_decode(user);
+        (!decoded.is_empty()).then_some(decoded)
+    } else {
+        // No query parameter; fall back to config default
+        crate::config::load_daemon_config().default_user
+    }
 }
 
 /// Like [`resolve_acting_user`], but a `400` reply when no user can be
@@ -15898,6 +15902,8 @@ command = "true"
                     tokens_out: 1,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.0,
                     cost_is_estimated: false,
                     summary: "b finished undisturbed".to_string(),
@@ -16047,6 +16053,8 @@ command = "true"
                     tokens_out: 1,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.0,
                     cost_is_estimated: false,
                     summary: "never cancelled".to_string(),

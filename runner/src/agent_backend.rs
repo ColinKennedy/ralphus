@@ -193,6 +193,10 @@ impl ModelBackend for AgentBackend {
             // RAL-339: the hand-rolled tool loop has no compaction concept
             // of its own -- it never resumes a backend-native session.
             compaction_thrash: None,
+            // RAL-373: this backend reports no compaction data, not "never
+            // compacts".
+            compaction_input_tokens: 0,
+            compaction_count: 0,
         })
     }
 }

@@ -476,6 +476,15 @@ fn render_cell_detail(s: &Value) {
             s["cache_creation_tokens"].to_string(),
         ),
         ("cache_read_tokens", s["cache_read_tokens"].to_string()),
+        // RAL-373: input tokens spent on Claude Code's own auto-compaction
+        // summarization requests, plus how many compactions were observed --
+        // billed uncached, which is why `cost_usd` and the token columns
+        // above can diverge on a cell that compacted.
+        (
+            "compaction_input_tokens",
+            s["compaction_input_tokens"].to_string(),
+        ),
+        ("compaction_count", s["compaction_count"].to_string()),
         (label, value),
     ]);
     for (vi, v) in s["proof"].as_array().into_iter().flatten().enumerate() {

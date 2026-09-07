@@ -35,6 +35,28 @@ pub struct BackendOutcome {
     /// RAL-326: prompt-cache *read* tokens -- input served from an existing
     /// cache entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests (`compactMetadata.preTokens`
+    /// from every `compact_boundary` event), the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any cell that compacts -- verified against live billing to be
+    /// **billed at the uncached input rate**, not the cache-read rate a
+    /// resummarized context might suggest. Compaction *output* (the summary
+    /// itself, a few thousand tokens per compaction) is not currently
+    /// reported by Claude Code in `compactMetadata` and so is not recorded
+    /// anywhere -- captured once Claude Code exposes it. `0` for a backend
+    /// with no compaction concept of its own (`pi`, `codex`): that means
+    /// "this backend reports no compaction data", not "this backend never
+    /// compacts".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether `preTokens` was reported for each one. `preTokens` can be
+    /// absent or `0` on some Claude Code versions, so a nonzero count paired
+    /// with `compaction_input_tokens == 0` reads as "compactions happened,
+    /// sizes unreported" rather than "no compaction happened" -- do not
+    /// treat a zero `compaction_input_tokens` as evidence there was no
+    /// compaction; check this field instead.
+    pub compaction_count: i64,
     pub cost_usd: f64,
     pub agent_session_id: Option<String>,
     /// RAL-292: set when this turn ended with a backgrounded job the agent
