@@ -3466,7 +3466,7 @@ impl Store {
         };
         let effective_proof_skip_auto_clean = row
             .proof_skip_auto_clean
-            .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
+            .unwrap_or_else(|| project_review_config.proof_skip_auto_clean());
 
         // RAL-250: effective base-branch auto-update opt-out, layered
         // per-review override > explicit `.ralphus.toml [review]` value > this

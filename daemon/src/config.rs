@@ -138,9 +138,12 @@ pub struct ReviewConfig {
     /// on branches whose rebase applied cleanly with no conflict (an
     /// "auto-clean" branch) -- the old, lighter-weight default behavior.
     /// `None` means unset, which resolves to `false`; per-project scalars win
-    /// over the global layer, same as `skip_worktrees`.
-    #[serde(default)]
-    pub verify_skip_auto_clean: Option<bool>,
+    /// over the global layer, same as `skip_worktrees`. Named
+    /// `verify_skip_auto_clean` before the Verify→Proof rename (see
+    /// `AGENTS.md`'s Taxonomy section); `#[serde(alias)]` keeps existing
+    /// `.ralphus.toml` files using the old key working.
+    #[serde(alias = "verify_skip_auto_clean", default)]
+    pub proof_skip_auto_clean: Option<bool>,
     /// The conflict-resolver agent used when a review doesn't set its own
     /// `[[review]].agent` and `RALPHUS_RESOLVER_AGENT` isn't set -- a builtin
     /// backend name (`"claude"`, `"claude-code"`, `"codex"`, `"ollama"`,
@@ -201,6 +204,25 @@ pub struct ReviewConfig {
     pub auto_submit_pr_stack: Option<bool>,
 }
 
+/// Every `ReviewConfig` field's TOML key name, in declaration order. A later
+/// ticket in the review-settings-parity batch consumes this cross-crate (see
+/// `daemon/tests/`) to check it stays in lockstep with `ReviewConfig` itself.
+pub const REVIEW_CONFIG_KEYS: &[&str] = &[
+    "skip_worktrees",
+    "checks",
+    "auto_build",
+    "summary_format",
+    "default_proof_scope",
+    "proof_skip_auto_clean",
+    "default_resolver_agent",
+    "default_resolver_model",
+    "default_machine",
+    "default_maximum_budget_usd",
+    "skip_base_updates",
+    "match_pr_branch_name",
+    "auto_submit_pr_stack",
+];
+
 impl ReviewConfig {
     /// Whether worktrees should be skipped (unset resolves to `false`).
     #[must_use]
@@ -234,8 +256,8 @@ impl ReviewConfig {
     /// Whether `"each_branch"` scope additionally skips auto-clean branches
     /// (unset resolves to `false`).
     #[must_use]
-    pub fn verify_skip_auto_clean(&self) -> bool {
-        self.verify_skip_auto_clean.unwrap_or(false)
+    pub fn proof_skip_auto_clean(&self) -> bool {
+        self.proof_skip_auto_clean.unwrap_or(false)
     }
 
     /// The configured default conflict-resolver agent, unset resolves to
@@ -309,7 +331,7 @@ impl ReviewConfig {
             auto_build: over.auto_build.or(self.auto_build),
             summary_format: over.summary_format.or(self.summary_format),
             default_proof_scope: over.default_proof_scope.or(self.default_proof_scope),
-            verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
+            proof_skip_auto_clean: over.proof_skip_auto_clean.or(self.proof_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
             default_machine: over.default_machine.or(self.default_machine),
@@ -2250,10 +2272,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_skip_auto_clean_defaults_to_false() {
-        assert!(!ReviewConfig::default().verify_skip_auto_clean());
+    fn proof_skip_auto_clean_defaults_to_false() {
+        assert!(!ReviewConfig::default().proof_skip_auto_clean());
+        let c = from_toml_str("[review]\nproof_skip_auto_clean = true\n");
+        assert!(c.proof_skip_auto_clean());
+    }
+
+    #[test]
+    fn proof_skip_auto_clean_accepts_the_legacy_verify_skip_auto_clean_key() {
         let c = from_toml_str("[review]\nverify_skip_auto_clean = true\n");
-        assert!(c.verify_skip_auto_clean());
+        assert!(c.proof_skip_auto_clean());
     }
 
     #[test]
