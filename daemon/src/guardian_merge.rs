@@ -8554,6 +8554,14 @@ mod tests {
     ///
     /// Sets up: `main` branch with one commit, and a linked worktree on
     /// `feature/a` with one additional commit.
+    // Deliberately real `git` throughout, not libgit2: this module's own
+    // `a_full_merge_completes_from_a_repository_root_long_enough_to_have_failed_pre_ral_211`
+    // exercises the RAL-211 Windows long-path fix by giving `make_repo` a
+    // tag long enough to approach `MAX_PATH`. libgit2 hits its own internal
+    // path-length limit well before real `git.exe` does on Windows (no
+    // extended-length-prefix support for these calls), so switching this
+    // fixture to git2 would silently defeat the regression test it exists
+    // to protect.
     fn make_repo(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         let base = tmp_dir(tag);
         let repo = base.join("repo");

@@ -1257,13 +1257,39 @@ mod tests {
         );
     }
 
+    /// Stage every path in the worktree and commit, in-process via libgit2 --
+    /// pure fixture scaffolding (PR_SLOWNESS.local.md), never the code under
+    /// test, which stays on the real `git()`/`GitVcs` wrapper.
+    fn git2_commit_all(
+        repo: &git2::Repository,
+        sig: &git2::Signature,
+        message: &str,
+        parents: &[&git2::Commit],
+    ) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), sig, sig, message, &tree, parents)
+            .unwrap()
+    }
+
+    fn git2_checkout(repo: &git2::Repository, branch: &str) {
+        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+    }
+
     /// A fresh repo with one commit on `main`.
     fn init_repo(tag: &str) -> PathBuf {
         let repo = tmp_dir(tag);
-        g(&repo, &["init", "--initial-branch", "main"]);
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("main");
+        let r = git2::Repository::init_opts(&repo, &opts).unwrap();
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
-        g(&repo, &["add", "."]);
-        g(&repo, &["commit", "--message", "base"]);
+        git2_commit_all(&r, &git2::Signature::now("t", "t@t").unwrap(), "base", &[]);
         repo
     }
 
@@ -1273,52 +1299,47 @@ mod tests {
         let (_, remote_branch) = branch
             .split_once('/')
             .expect("remote-qualified branch placeholder");
-        g(
-            &base,
-            &[
-                "init",
-                "--bare",
-                "--initial-branch=main",
-                remote.to_str().expect("remote path"),
-            ],
-        );
+
+        let mut bare_opts = git2::RepositoryInitOptions::new();
+        bare_opts.bare(true).initial_head("main");
+        git2::Repository::init_opts(&remote, &bare_opts).unwrap();
 
         let seed = base.join("seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        g(&seed, &["init", "--initial-branch", "main"]);
-        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
-        g(&seed, &["add", "."]);
-        g(&seed, &["commit", "--message", "base"]);
-        g(
-            &seed,
-            &[
-                "remote",
-                "add",
-                "origin",
-                remote.to_str().expect("remote path"),
-            ],
-        );
-        g(&seed, &["push", "--set-upstream", "origin", "main"]);
+        let mut seed_opts = git2::RepositoryInitOptions::new();
+        seed_opts.initial_head("main");
+        let seed_repo = git2::Repository::init_opts(&seed, &seed_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
 
-        g(&seed, &["checkout", "-b", remote_branch]);
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        let base_oid = git2_commit_all(&seed_repo, &sig, "base", &[]);
+        let base_commit = seed_repo.find_commit(base_oid).unwrap();
+
+        let mut origin = seed_repo
+            .remote("origin", remote.to_str().expect("remote path"))
+            .unwrap();
+        origin
+            .push(&["refs/heads/main:refs/heads/main"], None)
+            .unwrap();
+
+        seed_repo
+            .branch(remote_branch, &base_commit, false)
+            .unwrap();
+        git2_checkout(&seed_repo, remote_branch);
         std::fs::write(seed.join("remote-only.txt"), format!("{branch}\n")).unwrap();
-        g(&seed, &["add", "."]);
-        g(&seed, &["commit", "--message", "remote branch"]);
-        let branch_sha = git(&seed, &["rev-parse", "HEAD"])
-            .expect("branch sha")
-            .trim()
-            .to_string();
-        g(&seed, &["push", "--set-upstream", "origin", remote_branch]);
+        let branch_oid = git2_commit_all(&seed_repo, &sig, "remote branch", &[&base_commit]);
+        let branch_sha = branch_oid.to_string();
+        origin
+            .push(
+                &[&format!(
+                    "refs/heads/{remote_branch}:refs/heads/{remote_branch}"
+                )],
+                None,
+            )
+            .unwrap();
 
         let clone = base.join("clone");
-        g(
-            &base,
-            &[
-                "clone",
-                remote.to_str().expect("remote path"),
-                clone.to_str().expect("clone path"),
-            ],
-        );
+        let clone_repo =
+            git2::Repository::clone(remote.to_str().expect("remote path"), &clone).unwrap();
         // `ensure_worktree`'s internal resync-rebase shells out through
         // `GitVcs::exec_raw`, which (correctly, for real repos) never
         // injects an identity -- so this clone (and the worktrees it grows)
@@ -1327,8 +1348,9 @@ mod tests {
         // checks on a CI runner with no global gitconfig. A fresh `clone`
         // does not inherit the source repo's local config, so this can't be
         // set once upstream and skipped here.
-        g(&clone, &["config", "user.name", "t"]);
-        g(&clone, &["config", "user.email", "t@t"]);
+        let mut clone_config = clone_repo.config().unwrap();
+        clone_config.set_str("user.name", "t").unwrap();
+        clone_config.set_str("user.email", "t@t").unwrap();
         (clone, branch_sha)
     }
 

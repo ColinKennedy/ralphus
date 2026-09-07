@@ -3816,6 +3816,7 @@ mod tests {
     use super::*;
     use crate::guardian::GuardianStatus;
     use crate::store::Store;
+    use git2::build::CheckoutBuilder;
     use std::process::Command;
 
     fn store() -> Store {
@@ -3859,6 +3860,108 @@ mod tests {
 
     fn gwrite(root: &Path, name: &str, content: &str) {
         std::fs::write(root.join(name), content).unwrap();
+    }
+
+    /// Stage every path in the worktree and commit, in-process via libgit2 --
+    /// the `git add . && git commit` two-step done by one `Repository`
+    /// handle, with no `git.exe` spawn. Used only for fixture scaffolding;
+    /// code under test still goes through the real `git()`/`GitVcs` wrapper.
+    fn git2_commit_all(
+        repo: &git2::Repository,
+        sig: &git2::Signature,
+        message: &str,
+        parents: &[&git2::Commit],
+    ) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), sig, sig, message, &tree, parents)
+            .unwrap()
+    }
+
+    fn git2_checkout(repo: &git2::Repository, branch: &str) {
+        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+        repo.checkout_head(Some(CheckoutBuilder::new().force()))
+            .unwrap();
+    }
+
+    /// Build `root` with a base commit (`write_base`) and one `review-branch`
+    /// commit on top of it (`write_review`), push `review-branch` to a fresh
+    /// local bare `remote_dir` as `refs/heads/pr-y`, and register a guardian
+    /// branch + PR row pointing at it. Returns the review-branch commit's SHA
+    /// alongside the usual fixture tuple.
+    ///
+    /// Pure scaffolding for `compute_sync_status`/`sync_open_pr_branches`
+    /// tests -- built via libgit2 in-process rather than one `git.exe` spawn
+    /// per step (PR_SLOWNESS.local.md: fixture cost, not assertion cost,
+    /// dominates this file's test time on Windows).
+    fn review_fixture(
+        tag: &str,
+        write_base: impl FnOnce(&Path),
+        write_review: impl FnOnce(&Path),
+    ) -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String, String) {
+        let root = tmp_dir(&format!("{tag}-root"));
+        let remote_dir = tmp_dir(&format!("{tag}-remote"));
+
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+
+        write_base(&root);
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        write_review(&root);
+        let review_oid = git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        git2_checkout(&repo, "main");
+
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap())
+            .unwrap()
+            .push(&["refs/heads/review-branch:refs/heads/pr-y"], None)
+            .unwrap();
+
+        let s = store();
+        let gid = s
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        s.add_guardian_branch(&gid, "review-branch").unwrap();
+        let branch_id = s.get_guardian(&gid).unwrap().branches[0].id.clone();
+        s.set_branch_review(
+            &gid,
+            &branch_id,
+            "review-branch",
+            root.join("wt-unused").to_str().unwrap(),
+        )
+        .unwrap();
+        let pr_id = s
+            .create_pull_request(
+                &gid,
+                Some(&branch_id),
+                "github",
+                "acme/w",
+                "pr-y",
+                "main",
+                "T",
+                "D",
+                None,
+                None,
+            )
+            .unwrap();
+        (
+            root,
+            remote_dir,
+            Arc::new(Mutex::new(s)),
+            pr_id,
+            review_oid.to_string(),
+        )
     }
 
     /// Minimal `BranchView` fixture for the pure `stack_base_for`/
@@ -4248,51 +4351,12 @@ mod tests {
     /// `review-branch` pushed to a bare remote as `pr-y`, and a guardian/PR
     /// row pointing at it.
     fn sync_status_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
-        let root = tmp_dir("sync-root");
-        g(&root, &["init", "--initial-branch", "main"]);
-        gwrite(&root, "base.txt", "base\n");
-        g(&root, &["add", "."]);
-        g(&root, &["commit", "--message", "base"]);
-        g(&root, &["checkout", "-b", "review-branch"]);
-        gwrite(&root, "feat.txt", "feat\n");
-        g(&root, &["add", "."]);
-        g(&root, &["commit", "--message", "feat"]);
-        g(&root, &["checkout", "main"]);
-
-        let remote_dir = tmp_dir("sync-remote");
-        g(&remote_dir, &["init", "--bare"]);
-        let remote = remote_dir.to_str().unwrap();
-        g(&root, &["remote", "add", "origin", remote]);
-        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
-
-        let s = store();
-        let gid = s
-            .create_guardian("demo", "main", root.to_str().unwrap())
-            .unwrap();
-        s.add_guardian_branch(&gid, "review-branch").unwrap();
-        let branch_id = s.get_guardian(&gid).unwrap().branches[0].id.clone();
-        s.set_branch_review(
-            &gid,
-            &branch_id,
-            "review-branch",
-            root.join("wt-unused").to_str().unwrap(),
-        )
-        .unwrap();
-        let pr_id = s
-            .create_pull_request(
-                &gid,
-                Some(&branch_id),
-                "github",
-                "acme/w",
-                "pr-y",
-                "main",
-                "T",
-                "D",
-                None,
-                None,
-            )
-            .unwrap();
-        (root, remote_dir, Arc::new(Mutex::new(s)), pr_id)
+        let (root, remote_dir, store, pr_id, _review_sha) = review_fixture(
+            "sync",
+            |root| gwrite(root, "base.txt", "base\n"),
+            |root| gwrite(root, "feat.txt", "feat\n"),
+        );
+        (root, remote_dir, store, pr_id)
     }
 
     /// [`sync_status_fixture`], plus recording `last_pushed_sha` the way a
@@ -4300,7 +4364,12 @@ mod tests {
     /// tests need a real fork point on record, not just matching SHAs.
     fn synced_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
         let (root, remote_dir, store, pr_id) = sync_status_fixture();
-        let sha = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
+        let sha = git2::Repository::open(&root)
+            .unwrap()
+            .revparse_single("review-branch")
+            .unwrap()
+            .id()
+            .to_string();
         {
             let guard = store.lock().unwrap();
             guard
@@ -4330,52 +4399,11 @@ mod tests {
     /// -- so a caller can force a real rebase conflict on demand, on either
     /// the worktree or the PR side, via [`rebase_with_conflict`].
     fn conflict_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
-        let root = tmp_dir("sync-conflict-root");
-        g(&root, &["init", "--initial-branch", "main"]);
-        gwrite(&root, "shared.txt", "line1\nline2\nline3\n");
-        g(&root, &["add", "."]);
-        g(&root, &["commit", "--message", "base"]);
-        g(&root, &["checkout", "-b", "review-branch"]);
-        gwrite(&root, "shared.txt", "line1\nline2-review\nline3\n");
-        g(&root, &["add", "."]);
-        g(&root, &["commit", "--message", "feat"]);
-        g(&root, &["checkout", "main"]);
-
-        let remote_dir = tmp_dir("sync-conflict-remote");
-        g(&remote_dir, &["init", "--bare"]);
-        let remote = remote_dir.to_str().unwrap();
-        g(&root, &["remote", "add", "origin", remote]);
-        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
-
-        let s = store();
-        let gid = s
-            .create_guardian("demo", "main", root.to_str().unwrap())
-            .unwrap();
-        s.add_guardian_branch(&gid, "review-branch").unwrap();
-        let branch_id = s.get_guardian(&gid).unwrap().branches[0].id.clone();
-        s.set_branch_review(
-            &gid,
-            &branch_id,
-            "review-branch",
-            root.join("wt-unused").to_str().unwrap(),
-        )
-        .unwrap();
-        let pr_id = s
-            .create_pull_request(
-                &gid,
-                Some(&branch_id),
-                "github",
-                "acme/w",
-                "pr-y",
-                "main",
-                "T",
-                "D",
-                None,
-                None,
-            )
-            .unwrap();
-        let sha = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
-        let store = Arc::new(Mutex::new(s));
+        let (root, remote_dir, store, pr_id, sha) = review_fixture(
+            "sync-conflict",
+            |root| gwrite(root, "shared.txt", "line1\nline2\nline3\n"),
+            |root| gwrite(root, "shared.txt", "line1\nline2-review\nline3\n"),
+        );
         store
             .lock()
             .unwrap()
@@ -4395,12 +4423,21 @@ mod tests {
     /// mirroring "rerere auto-patched it" vs "had to fix it myself".
     fn rebase_with_conflict(dir: &Path, target_branch: &str, use_rerere: bool) {
         let new_base = format!("{target_branch}-newbase");
-        g(dir, &["branch", &new_base, &format!("{target_branch}~1")]);
-        g(dir, &["checkout", &new_base]);
-        gwrite(dir, "shared.txt", "line1\nline2-newbase\nline3\n");
-        g(dir, &["add", "."]);
-        g(dir, &["commit", "--message", "advance base (conflicting)"]);
-        g(dir, &["checkout", target_branch]);
+        {
+            let repo = git2::Repository::open(dir).unwrap();
+            let sig = git2::Signature::now("t", "t@t").unwrap();
+            let target_commit = repo
+                .revparse_single(target_branch)
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            let parent_commit = target_commit.parent(0).unwrap();
+            repo.branch(&new_base, &parent_commit, false).unwrap();
+            git2_checkout(&repo, &new_base);
+            gwrite(dir, "shared.txt", "line1\nline2-newbase\nline3\n");
+            git2_commit_all(&repo, &sig, "advance base (conflicting)", &[&parent_commit]);
+            git2_checkout(&repo, target_branch);
+        }
 
         let run_rebase = |d: &Path| -> std::process::Output {
             Command::new("git")
@@ -4411,9 +4448,13 @@ mod tests {
         };
 
         if use_rerere {
-            g(dir, &["config", "rerere.enabled", "true"]);
-            g(dir, &["config", "rerere.autoupdate", "true"]);
-            let pre_rebase_sha = g(dir, &["rev-parse", target_branch]).trim().to_string();
+            let pre_rebase_oid = {
+                let repo = git2::Repository::open(dir).unwrap();
+                let mut config = repo.config().unwrap();
+                config.set_bool("rerere.enabled", true).unwrap();
+                config.set_bool("rerere.autoupdate", true).unwrap();
+                repo.revparse_single(target_branch).unwrap().id()
+            };
 
             // First pass: hit the conflict and resolve it by hand -- this
             // teaches rerere the resolution.
@@ -4427,7 +4468,16 @@ mod tests {
             // identical rebase -- this time rerere should recognize the
             // recorded resolution and stage it automatically, with no
             // manual edit on our part.
-            g(dir, &["checkout", "-B", target_branch, &pre_rebase_sha]);
+            {
+                // Already on `target_branch` at this point (the first
+                // `rebase --continue` reattached HEAD there), so this is a
+                // `git reset --hard <sha>`, not a branch-ref move -- git2
+                // refuses to force-move a branch that is the current HEAD.
+                let repo = git2::Repository::open(dir).unwrap();
+                let commit = repo.find_commit(pre_rebase_oid).unwrap();
+                repo.reset(commit.as_object(), git2::ResetType::Hard, None)
+                    .unwrap();
+            }
             let out2 = run_rebase(dir);
             assert!(!out2.status.success(), "expected the conflict to recur");
             let out3 = Command::new("git")
@@ -4454,7 +4504,12 @@ mod tests {
             g(dir, &["rebase", "--continue"]);
         }
 
-        g(dir, &["branch", "--delete", "--force", &new_base]);
+        git2::Repository::open(dir)
+            .unwrap()
+            .find_branch(&new_base, git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
     }
 
     #[test]

@@ -44,6 +44,7 @@ getrandom = { workspace = true }
 
 [dev-dependencies]
 ureq = { workspace = true }
+git2 = { workspace = true }
 
 [target."cfg(windows)".dependencies]
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
