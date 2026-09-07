@@ -22,8 +22,10 @@ installed at all. Talks to the daemon directly through `ralphus-cli`'s
   `ralphus_cli::help_map::registered_leaves()` (name, description,
   JSON-Schema `inputSchema`, `read_only` flag), so the tool surface can never
   drift from `help_map.rs`'s tree by hand -- see `src/chip.rs` for how a
-  chip string (`"selector [str]"`, `"--from [index]"`, `"forge
-  [github|gitlab]"`, ...) becomes a JSON-Schema property. `Tool::build_argv`
+  chip string (`"selector [uri]"`, `"--from [index]"`, `"forge
+  [github|gitlab]"`, ...) becomes a JSON-Schema property (a `[uri]` chip's
+  schema description points back at `help_map::URI_ARGUMENT_NOTE`, the one
+  canonical EntityUri/selector example block -- RAL-376). `Tool::build_argv`
   converts an MCP tool call's JSON `arguments` back into the argv
   `ralphus_cli::commands::parse_args` expects, so argument
   parsing/validation is still owned entirely by `cli`, never

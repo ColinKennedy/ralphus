@@ -272,7 +272,7 @@ fn help_precedes_missing_positionals_and_global_flag_validation() {
     );
     assert_eq!(code, 0);
     assert!(stdout.contains("ralphus task show"));
-    assert!(stdout.contains("selector [str]"));
+    assert!(stdout.contains("selector [uri]"));
 }
 
 #[test]

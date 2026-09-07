@@ -29,11 +29,14 @@
 //!   rather than a `task` child.
 //!
 //! Chip formatting: every positional's chip is `name [type]` (declared
-//! order) -- `[type]` is `str`/`integer`/`float`/`path`, with `, optional`
-//! appended for an optional positional and a repeatable positional spelled
-//! `name [type...]`; an optional flag that takes a value gets a `[hint]`
-//! suffix (`--status [states]`), a boolean flag gets none, a repeatable flag
-//! gets `[value...]`, and a `--flag/--no-flag` tri-state (this crate's
+//! order) -- `[type]` is `str`/`integer`/`float`/`path`/`uri` (`uri` for any
+//! `squad_id`/`entity_uri`/`pr_id`/`selector` argument that follows the
+//! `EntityUri` grammar or `selector`'s broader superset of it -- see
+//! [`URI_ARGUMENT_NOTE`]), with `, optional` appended for an optional
+//! positional and a repeatable positional spelled `name [type...]`; an
+//! optional flag that takes a value gets a `[hint]` suffix (`--status
+//! [states]`), a boolean flag gets none, a repeatable flag gets
+//! `[value...]`, and a `--flag/--no-flag` tri-state (this crate's
 //! `take_tri_bool`, mirroring Python's `argparse.BooleanOptionalAction`) is
 //! rendered as one combined chip.
 //!
@@ -133,12 +136,31 @@ tree -- it's a global flag, not a per-command one. Unlike other global flags, it
 before and after the subcommand: `ralphus --json status` and `ralphus status --json` are \
 equivalent.";
 
+/// The single canonical block of `[uri]`-format examples: every `squad_id`/`entity_uri`/
+/// `pr_id`/`selector` chip below points back here instead of repeating example text at its
+/// own call site (see this module's doc comment and RAL-376). Sourced from
+/// `daemon/src/entity_uri.rs`'s grammar doc comment -- `cli/src/entity_uri.rs` is a
+/// deliberate hand-mirrored duplicate of that grammar (its own doc comment says so); if the
+/// grammar ever changes, both copies need updating together, not just this text.
+pub const URI_ARGUMENT_NOTE: &str = "`[uri]` arguments accept the EntityUri grammar (colon-\
+separated, kind-prefixed, strict arity): `squad:<squad_id>` e.g. `squad:squad-1`; \
+`task:<squad_id>:<task_idx>` e.g. `task:squad-1:2`; `cell:<squad_id>:<task_idx>:<cell_idx>` \
+e.g. `cell:squad-1:0:1`; `proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>` \
+where `proof_scope` is `cell` or `task` and `cell_idx` is `-1` for a task-scoped proof, e.g. \
+`proof:squad-1:2:cell:0:1` (cell-scoped) or `proof:squad-1:0:task:-1:3` (task-scoped); and \
+`guardian:<guardian_id>` e.g. `guardian:g-1`. `squad_id`, `entity_uri`, and `pr_id` arguments \
+take exactly this grammar. `selector` arguments (see `cli/src/selector.rs`) accept this same \
+grammar PLUS more: a bare squad id, a legacy slash-separated path (`squad-1/0/1`, \
+`squad-1/0/proof/2`, `squad-1/0/1/proof/2`), a name matched against the entity's siblings \
+(e.g. a task/cell name), or a `~N` positional index -- selector is not strictly EntityUri, it's \
+a superset grammar layered on top of it.";
+
 // ---- review subgroups (defined separately to keep REVIEW_CHILDREN readable) --
 
 const REVIEW_UPSTREAM_CHILDREN: &[HelpNode] = &[
     node(
         "list",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "List candidate upstream branches.",
         false,
@@ -147,7 +169,7 @@ const REVIEW_UPSTREAM_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set",
-        &["selector [str]", "branch [str]"],
+        &["selector [uri]", "branch [str]"],
         &[],
         "Change the upstream branch.",
         false,
@@ -159,7 +181,7 @@ const REVIEW_UPSTREAM_CHILDREN: &[HelpNode] = &[
 const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     node(
         "comments",
-        &["pr_id [str]"],
+        &["pr_id [uri]"],
         &[],
         "List a PR's comments/notes.",
         false,
@@ -177,7 +199,7 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "list",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "List PRs submitted for a review.",
         false,
@@ -186,7 +208,7 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "pull-feedback",
-        &["pr_id [str]"],
+        &["pr_id [uri]"],
         &[],
         "Action a PR's un-actioned feedback into the owning review worktree.",
         false,
@@ -195,7 +217,7 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "pull-from-pr",
-        &["pr_id [str]"],
+        &["pr_id [uri]"],
         &[],
         "Pull a reviewer's commits pushed directly to the PR branch back into the owning review \
 worktree, resolving conflicts and restacking downstream branches (RAL-190).",
@@ -205,7 +227,7 @@ worktree, resolving conflicts and restacking downstream branches (RAL-190).",
     ),
     node(
         "show",
-        &["pr_id [str]"],
+        &["pr_id [uri]"],
         &[],
         "Show one PR row.",
         false,
@@ -214,7 +236,7 @@ worktree, resolving conflicts and restacking downstream branches (RAL-190).",
     ),
     node(
         "submit",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[
             "--alias [name]",
             "--allow-unlinked-fork",
@@ -233,7 +255,7 @@ error to a logged warning; ignored for a project with no registered fork.",
     ),
     node(
         "unlink",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Bulk-drop every currently open PR row for a review and clear its registered forge PR \
 stack number, so a later submission starts a fresh stack instead of appending to one whose PRs \
@@ -244,7 +266,7 @@ were just unlinked (RAL-317).",
     ),
     node(
         "update",
-        &["pr_id [str]"],
+        &["pr_id [uri]"],
         &[
             "--branch-alias [name]",
             "--pr-number [integer]",
@@ -262,7 +284,7 @@ number.",
 const REVIEW_BRANCH_CHILDREN: &[HelpNode] = &[
     node(
         "disable",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Disable a branch and kick off the rebase.",
         false,
@@ -271,7 +293,7 @@ const REVIEW_BRANCH_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "enable",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Enable a branch and kick off the rebase.",
         false,
@@ -280,7 +302,7 @@ const REVIEW_BRANCH_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "terminal",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--mode [open|readonly]"],
         "Print the command to resume a branch's conflict-resolver conversation locally.",
         false,
@@ -292,7 +314,7 @@ const REVIEW_BRANCH_CHILDREN: &[HelpNode] = &[
 const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
     node(
         "list",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "List the manual checks.",
         false,
@@ -301,7 +323,7 @@ const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "run",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--all", "--index [integer...]", "--input [name=value...]"],
         "Print the command(s) + cwd to run one/some/all manual checks yourself.",
         false,
@@ -310,7 +332,7 @@ const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "terminal",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--mode [open|readonly]"],
         "Print the command to resume the manual-checks-generation agent conversation locally.",
         false,
@@ -322,7 +344,7 @@ const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
 const REVIEW_ACTION_CHILDREN: &[HelpNode] = &[
     node(
         "list",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "List the action hints.",
         false,
@@ -331,7 +353,7 @@ const REVIEW_ACTION_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "run",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--index [integer]", "--input [name=value...]"],
         "Print the command + cwd for a command-kind action hint.",
         false,
@@ -352,7 +374,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "add-branch",
-        &["selector [str]", "branch [str]"],
+        &["selector [uri]", "branch [str]"],
         &[],
         "Add a branch to a review.",
         false,
@@ -361,7 +383,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "approve",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Approve a review that is in_review.",
         false,
@@ -388,7 +410,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "build-env",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[
             "--clear [key...]",
             "--set [key=value...]",
@@ -401,7 +423,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "cancel",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Cancel a review.",
         false,
@@ -410,7 +432,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "reopen",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.",
         false,
@@ -442,7 +464,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "delete",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--yes"],
         "Delete a review and its worktrees.",
         false,
@@ -451,7 +473,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "dismiss-reenable",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Dismiss the 're-enable' notification for a branch.",
         false,
@@ -460,7 +482,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "env",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--scope [build|tests|manual-checks|worktree]"],
         "List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.",
         false,
@@ -469,7 +491,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "feedback",
-        &["selector [str]", "text [str]"],
+        &["selector [uri]", "text [str]"],
         &[],
         "Post feedback on one branch, triggering a resolver re-attempt.",
         false,
@@ -478,7 +500,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "force-start",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Disable not-yet-done branches and merge immediately (only while collecting).",
         false,
@@ -496,7 +518,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "logs",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Show a review's state-transition audit log.",
         false,
@@ -505,7 +527,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "manual-checks-env",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[
             "--clear [key...]",
             "--set [key=value...]",
@@ -518,7 +540,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "merge",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Start (or continue) the stacked rebase.",
         false,
@@ -527,7 +549,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "move-branch",
-        &["selector [str]", "to_review [str]"],
+        &["selector [uri]", "to_review [str]"],
         &[],
         "Move a branch to another review, then rebuild both.",
         false,
@@ -545,7 +567,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "rename",
-        &["selector [str]", "name [str]"],
+        &["selector [uri]", "name [str]"],
         &[],
         "Rename a review.",
         false,
@@ -554,7 +576,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "reorder",
-        &["selector [str]", "order [str]"],
+        &["selector [uri]", "order [str]"],
         &["--disable [names]", "--enable [names]"],
         "Set the branch order and kick off the rebase.",
         false,
@@ -563,7 +585,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart-merge",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Cancel an in-progress rebase and start a fresh one.",
         false,
@@ -572,7 +594,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "stop-merge",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.",
         false,
@@ -581,7 +603,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "settings",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[
             "--auto-pr-feedback/--no-auto-pr-feedback",
             "--auto-submit-pr-stack/--no-auto-submit-pr-stack",
@@ -602,7 +624,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "show",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Show a single review's detail.",
         false,
@@ -611,7 +633,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "squash",
-        &["selector [str]", "project [str]"],
+        &["selector [uri]", "project [str]"],
         &["--off", "--on"],
         "Enable/disable squashing one git project's task branches to a single commit each in \
 the review worktree.",
@@ -621,7 +643,7 @@ the review worktree.",
     ),
     node(
         "status",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Per-branch readiness + a summary verdict ('is this review ready?').",
         false,
@@ -630,7 +652,7 @@ the review worktree.",
     ),
     node(
         "sync-pr",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Check the forge for a stack reorder made outside ralphus and apply it if found.",
         false,
@@ -639,7 +661,7 @@ the review worktree.",
     ),
     node(
         "worktrees",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "The worktrees/branches this review consumes.",
         false,
@@ -951,7 +973,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "watch",
-        &["entity_uri [str]"],
+        &["entity_uri [uri]"],
         &["--tier [urgent|high|normal...]", "--user [name]"],
         "Watch an entity so its notifications reach the personal mailbox; re-watching updates \
          the notification tiers in place (RAL-343).",
@@ -961,7 +983,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "unwatch",
-        &["entity_uri [str]"],
+        &["entity_uri [uri]"],
         &["--user [name]"],
         "Stop watching an entity (RAL-343).",
         false,
@@ -1045,7 +1067,7 @@ const QUEUE_CHILDREN: &[HelpNode] = &[
 const SQUAD_CHILDREN: &[HelpNode] = &[
     node(
         "activate",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "Promote a held (queued) squad to pending.",
         false,
@@ -1054,7 +1076,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "cancel",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "Cancel a squad.",
         false,
@@ -1063,7 +1085,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "delete",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &["--yes"],
         "Permanently delete a squad.",
         false,
@@ -1072,7 +1094,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "edit",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &["--label [text]"],
         "Edit a squad's fields.",
         false,
@@ -1081,7 +1103,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "env",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "List a squad's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.",
         false,
@@ -1103,7 +1125,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "logs",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "Show a squad's state-transition audit log.",
         false,
@@ -1112,7 +1134,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "rename",
-        &["squad_id [str]", "label [str]"],
+        &["squad_id [uri]", "label [str]"],
         &[],
         "Rename a squad's label.",
         false,
@@ -1121,7 +1143,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "Restart a whole squad, dirtying every squad that depends on it.",
         false,
@@ -1130,7 +1152,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "retry",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "Re-run with the same parameters (reset to pending).",
         false,
@@ -1139,7 +1161,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set-status",
-        &["squad_id [str]", "state [str]"],
+        &["squad_id [uri]", "state [str]"],
         &[],
         "Manually override a squad's status.",
         false,
@@ -1148,7 +1170,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "show",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &[],
         "Show a single squad's detail.",
         false,
@@ -1157,7 +1179,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "timeline",
-        &["squad_id [str]"],
+        &["squad_id [uri]"],
         &["--write [path]"],
         "Generate the merged, chronological uber-log-viewer timeline for a squad (RAL-155).",
         false,
@@ -1169,7 +1191,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
 const CELL_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[
             "--agent [name]",
             "--auto-compact-threshold [tokens]",
@@ -1187,7 +1209,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "env",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--scope [cell|proof]"],
         "List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.",
         false,
@@ -1196,7 +1218,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "open-agent",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.",
         false,
@@ -1205,7 +1227,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "remote-terminal",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).",
         false,
@@ -1214,7 +1236,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Restart a cell (and its downstream), dirtying dependent squads.",
         false,
@@ -1223,7 +1245,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart-proof",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--from [index]"],
         "Restart a cell's proof steps from an index onwards.",
         false,
@@ -1232,7 +1254,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "resume-automation",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).",
         false,
@@ -1241,7 +1263,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "reviews",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "The reviews this cell's branch participates in.",
         false,
@@ -1250,7 +1272,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set-status",
-        &["selector [str]", "state [str]"],
+        &["selector [uri]", "state [str]"],
         &[],
         "Manually override a cell's status.",
         false,
@@ -1259,7 +1281,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "show",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Show a single cell's detail.",
         false,
@@ -1268,7 +1290,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "terminal",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--mode [open|readonly]"],
         "Print the command to resume a cell's conversation locally.",
         false,
@@ -1277,7 +1299,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "worktree",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Show the worktree/project a cell is using.",
         false,
@@ -1300,7 +1322,7 @@ AI agent).",
 const TASK_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--name [name]", "--project [name]", "--model [name]"],
         "Edit a task node's name/project/model.",
         false,
@@ -1309,7 +1331,7 @@ const TASK_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "env",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--scope [task|proof]"],
         "List a task's resolved environment variables, read-only (RAL-324); --scope proof shows what its task-scoped proof steps inherit.",
         false,
@@ -1318,7 +1340,7 @@ const TASK_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart-proof",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--from [index]"],
         "Restart a task's proof steps from an index onwards.",
         false,
@@ -1327,7 +1349,7 @@ const TASK_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set-status",
-        &["selector [str]", "state [str]"],
+        &["selector [uri]", "state [str]"],
         &[],
         "Manually override a task's status.",
         false,
@@ -1336,7 +1358,7 @@ const TASK_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "show",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Show a single task node's detail.",
         false,
@@ -1351,7 +1373,7 @@ const TASK_CHILDREN: &[HelpNode] = &[
 const PROOF_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
-        &["selector [str]"],
+        &["selector [uri]"],
         &["--maximum-tool-output-tokens [tokens]", "--model [name]"],
         "Edit a proof step's model/tool-output-cap overrides.",
         false,
@@ -1360,7 +1382,7 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "env",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.",
         false,
@@ -1369,7 +1391,7 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Restart this proof step (and any later ones in its scope).",
         false,
@@ -1378,7 +1400,7 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set-status",
-        &["selector [str]", "state [str]"],
+        &["selector [uri]", "state [str]"],
         &[],
         "Manually override a proof step's status.",
         false,
@@ -1387,7 +1409,7 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "show",
-        &["selector [str]"],
+        &["selector [uri]"],
         &[],
         "Show a single proof step's detail.",
         false,
@@ -1584,7 +1606,7 @@ placeholder message; Python's `shell` argument is not read.)",
         ),
         node(
             "get",
-            &["selector [str]", "field [str, optional]"],
+            &["selector [uri]", "field [str, optional]"],
             &[],
             "Query one field from any entity's JSON view (jq-lite).",
             false,
@@ -1593,7 +1615,7 @@ placeholder message; Python's `shell` argument is not read.)",
         ),
         node(
             "graph",
-            &["squad_id [str, optional]"],
+            &["squad_id [uri, optional]"],
             &["--all", "--dot"],
             "Render the task-order dependency graph. (Rust port simplifies Python's \
 --global/--format ascii|dot choice to plain --dot/--all boolean flags.)",
@@ -1603,7 +1625,7 @@ placeholder message; Python's `shell` argument is not read.)",
         ),
         node(
             "history",
-            &["selector [str]"],
+            &["selector [uri]"],
             &[],
             "Show a cell/proof step's tmux history (one-shot snapshot; Python's --live \
 tailing and --wait-until-valid are not yet ported).",
@@ -1622,7 +1644,7 @@ tailing and --wait-until-valid are not yet ported).",
         ),
         node(
             "listen",
-            &["selector [str]"],
+            &["selector [uri]"],
             &["--timeout [seconds]", "--until [status]"],
             "Block until a squad/task/cell/proof/review/review-worktree reaches a status.",
             false,
@@ -1687,7 +1709,7 @@ tailing and --wait-until-valid are not yet ported).",
         ),
         node(
             "retry",
-            &["squad_id [str]"],
+            &["squad_id [uri]"],
             &[],
             "Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; \
 Python's per-selector --environment/--env-file overrides are not yet ported.)",
@@ -1733,7 +1755,7 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
         ),
         node(
             "status",
-            &["squad_id [str, optional]"],
+            &["squad_id [uri, optional]"],
             &["--concurrency"],
             "Show squad status from the daemon.",
             false,
@@ -1988,7 +2010,39 @@ pub fn command_help(path: &[&str]) -> Option<String> {
             ));
         }
     }
+    if node
+        .positionals
+        .iter()
+        .chain(node.options.iter())
+        .any(|chip| chip_type_token(chip) == Some("uri"))
+    {
+        out.push_str("\nURI ARGUMENTS:\n    ");
+        out.push_str(URI_ARGUMENT_NOTE);
+        out.push('\n');
+    }
     Some(out.trim_end().to_string())
+}
+
+/// Extracts a chip's bracketed base type token (`str`/`integer`/`float`/`path`/`uri`/...),
+/// or `None` for a bare boolean option chip or a literal-choice chip (`forge [github|gitlab]`)
+/// -- those don't carry a single base type token the way `name [type]` chips do.
+fn chip_type_token(chip: &str) -> Option<&str> {
+    let start = chip.find('[')? + 1;
+    let end = chip[start..].find(']')? + start;
+    let inner = &chip[start..end];
+    if inner.contains('|') {
+        return None;
+    }
+    Some(
+        inner
+            .split(',')
+            .next()
+            .unwrap_or(inner)
+            .split("...")
+            .next()
+            .unwrap_or(inner)
+            .trim(),
+    )
 }
 
 fn chip_description(chip: &str, option: bool) -> String {
@@ -2007,8 +2061,21 @@ fn chip_description(chip: &str, option: bool) -> String {
         }
     } else {
         match name {
-            "selector" => "Entity selector or URI identifying the target.".to_string(),
-            "squad_id" => "Squad identifier or accepted squad selector.".to_string(),
+            "selector" => {
+                "Entity selector: an EntityUri, or the broader name/index forms selector \
+also accepts -- see the URI ARGUMENTS note below."
+                    .to_string()
+            }
+            "squad_id" => "Squad identifier in EntityUri form -- see the URI ARGUMENTS note \
+below."
+                .to_string(),
+            "entity_uri" => "EntityUri identifying the target entity -- see the URI ARGUMENTS \
+note below."
+                .to_string(),
+            "pr_id" => {
+                "PR mapping identifier in EntityUri form -- see the URI ARGUMENTS note below."
+                    .to_string()
+            }
             "target" => "Optional review target supplied to the launched reviewer.".to_string(),
             "file" => "Input file path; repeat where the usage permits it.".to_string(),
             "field" => "Optional dotted field path to extract from the entity JSON.".to_string(),

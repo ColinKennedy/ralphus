@@ -166,7 +166,13 @@ fn chip_schema(chip: &Chip) -> Value {
         return json!({"type": "boolean", "description": "boolean flag"});
     }
     let base = chip.choices.as_ref().map_or_else(
-        || json!({"type": "string"}),
+        || {
+            if chip.type_hint.as_deref() == Some("uri") {
+                json!({"type": "string", "description": help_map::URI_ARGUMENT_NOTE})
+            } else {
+                json!({"type": "string"})
+            }
+        },
         |choices| json!({"type": "string", "enum": choices}),
     );
     if chip.repeatable {
@@ -218,6 +224,22 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&Value::String("selector".to_string()))
+        );
+    }
+
+    #[test]
+    fn uri_typed_chip_schema_carries_the_shared_uri_example_block() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.path == ["task", "show"])
+            .expect("task show tool");
+        let selector_schema = &tool.input_schema["properties"]["selector"];
+        assert_eq!(selector_schema["type"], "string");
+        assert_eq!(
+            selector_schema["description"],
+            help_map::URI_ARGUMENT_NOTE,
+            "MCP schema for a [uri] chip must point back at the one canonical example block"
         );
     }
 

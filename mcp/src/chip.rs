@@ -17,6 +17,11 @@ pub struct Chip {
     pub choices: Option<Vec<String>>,
     /// `false` for a bare boolean option chip (`--all`, no `[...]`).
     pub takes_value: bool,
+    /// The bracket's base type token (`str`/`integer`/`float`/`path`/`uri`/...), e.g.
+    /// `Some("uri")` for `selector [uri]`. `None` for a bare boolean chip or a
+    /// literal-choice chip (`forge [github|gitlab]`), neither of which carries a single
+    /// base type token the way a `name [type]` chip does.
+    pub type_hint: Option<String>,
 }
 
 impl Chip {
@@ -49,6 +54,7 @@ pub fn parse_chip(text: &str) -> Chip {
             repeatable: false,
             choices: None,
             takes_value: false,
+            type_hint: None,
         };
     };
     let name = text[..bracket_start].trim().to_string();
@@ -70,12 +76,24 @@ pub fn parse_chip(text: &str) -> Chip {
             .map(|s| s.trim().to_string())
             .collect()
     });
+    let type_hint = choices.is_none().then(|| {
+        inner
+            .split(',')
+            .next()
+            .unwrap_or(&inner)
+            .split("...")
+            .next()
+            .unwrap_or(&inner)
+            .trim()
+            .to_string()
+    });
     Chip {
         name,
         required: !optional,
         repeatable,
         choices,
         takes_value: true,
+        type_hint,
     }
 }
 
@@ -113,6 +131,32 @@ mod tests {
             c.choices,
             Some(vec!["github".to_string(), "gitlab".to_string()])
         );
+    }
+
+    #[test]
+    fn recognizes_uri_type_token() {
+        let c = parse_chip("selector [uri]");
+        assert_eq!(c.type_hint.as_deref(), Some("uri"));
+        assert_eq!(c.name, "selector");
+        assert!(c.required);
+    }
+
+    #[test]
+    fn uri_type_token_survives_optional_and_repeatable_modifiers() {
+        assert_eq!(
+            parse_chip("squad_id [uri, optional]").type_hint.as_deref(),
+            Some("uri")
+        );
+        assert_eq!(
+            parse_chip("selector [uri...]").type_hint.as_deref(),
+            Some("uri")
+        );
+    }
+
+    #[test]
+    fn choice_chip_has_no_type_hint() {
+        let c = parse_chip("forge [github|gitlab]");
+        assert_eq!(c.type_hint, None);
     }
 
     #[test]

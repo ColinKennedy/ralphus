@@ -96,6 +96,12 @@ fn dummy_json(chip: &ralphus_mcp::chip::Chip) -> serde_json::Value {
     // this shape out as a special case.
     let scalar = if chip.property_name() == "input" {
         serde_json::Value::String("x=1".to_string())
+    } else if chip.type_hint.as_deref() == Some("uri") {
+        // A `[uri]` chip (squad_id/entity_uri/pr_id/selector) -- "1" would dispatch fine too
+        // (commands::parse_args never validates EntityUri grammar at parse time), but a
+        // real-shaped EntityUri string is a better dummy value for a chip type that now
+        // documents a specific grammar.
+        serde_json::Value::String("squad:squad-1".to_string())
     } else {
         chip.choices.as_ref().map_or_else(
             || serde_json::Value::String("1".to_string()),
