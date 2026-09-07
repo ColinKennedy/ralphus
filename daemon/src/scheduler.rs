@@ -24,11 +24,6 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often to check reviews for a base-branch shift and auto-rebuild them.
 pub const REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Guardian worktrees are expensive but not urgent maintenance. One sweep per
-/// day keeps a long-running daemon bounded without putting git worktree scans
-/// on the normal review-maintenance hot path.
-pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// How often to sweep for guardians whose debounced final change-summary
 /// regen request (RAL-208) has gone quiet long enough to fire the LLM call.
 /// Finer-grained than [`REVIEW_MAINT_INTERVAL`] since it's checked against
@@ -387,7 +382,6 @@ pub fn run_loop(
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
 ) {
     let mut last_maintenance = std::time::Instant::now();
-    let mut last_worktree_retirement = std::time::Instant::now();
     let mut last_summary_sweep = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
     let mut last_terminal_log_prune = std::time::Instant::now();
@@ -397,25 +391,7 @@ pub fn run_loop(
     // cheap for projects whose configured interval has not elapsed.
     crate::ark::periodic_sweep(&store, &cancellations, &sem);
     let mut last_ark_check = std::time::Instant::now();
-    // Recovery: restart merges that were interrupted by a daemon shutdown.
-    // Guardians stuck in `merging` have no live background thread; reset them to
-    // `collecting` so `claim_guardian_merge` can claim them again. Notably we do
-    // NOT promote their branches to `ready` here: since RAL-265 the staged merge
-    // can run while only part of the stack's cells are done, so a blindly
-    // promoted `pending` branch (its cell not yet done) would be wrongly built.
-    // Once `collecting`, the all-cells-done case below and the partial-ready case
-    // further down re-trigger the right level of work.
-    {
-        let ids = {
-            let guard = store.lock().expect("store mutex poisoned");
-            let ids = guard.interrupted_merges().unwrap_or_default();
-            for gid in &ids {
-                let _ = guard.reset_guardian_to_collecting(gid);
-            }
-            ids
-        };
-        start_reviews(&store, ids, &sem, &cancellations);
-    }
+    recover_interrupted_reviews(&store, &sem, &cancellations);
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
     // completed but before the guardian auto-started, and a full-merge crash (its
@@ -448,10 +424,6 @@ pub fn run_loop(
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
             last_maintenance = std::time::Instant::now();
-        }
-        if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
-            crate::guardian_merge::retire_stale_worktrees(&store);
-            last_worktree_retirement = std::time::Instant::now();
         }
         if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
             crate::guardian_merge::sweep_pending_summaries(&store, &sem);
@@ -2052,6 +2024,8 @@ fn run_cell_worker(
                 "tokens_out": result.tokens_out,
                 "cache_creation_tokens": result.cache_creation_tokens,
                 "cache_read_tokens": result.cache_read_tokens,
+                "compaction_input_tokens": result.compaction_input_tokens,
+                "compaction_count": result.compaction_count,
                 "cost_usd": result.cost_usd,
                 "cost_is_estimated": result.cost_is_estimated,
                 "agent_session_id": result.agent_session_id,
@@ -2100,6 +2074,8 @@ fn run_cell_worker(
                 // a cache-token column missing there.
                 "cache_creation_tokens": result.cache_creation_tokens,
                 "cache_read_tokens": result.cache_read_tokens,
+                "compaction_input_tokens": result.compaction_input_tokens,
+                "compaction_count": result.compaction_count,
                 "cost_usd": result.cost_usd,
                 "cost_is_estimated": result.cost_is_estimated,
                 "error": result.error,
@@ -2638,6 +2614,112 @@ fn run_task_finalizer(
             cancellations,
         );
     }
+}
+
+/// RAL-375: recovery run once at scheduler startup so review work an unclean
+/// daemon shutdown interrupted resumes automatically, mirroring how
+/// [`crate::store::Store::recover_orphaned_squads`] already resumes squads
+/// (`running` → `pending`, picked back up by the ordinary scheduler loop)
+/// instead of leaving them for a human to manually retry.
+///
+/// Guardians stuck in `merging` have no live background thread; reset them to
+/// `collecting` so `claim_guardian_merge` can claim them again. Notably we do
+/// NOT promote their branches to `ready` here: since RAL-265 the staged merge
+/// can run while only part of the stack's cells are done, so a blindly
+/// promoted `pending` branch (its cell not yet done) would be wrongly built.
+/// Once `collecting`, the all-cells-done case and the partial-ready case in
+/// the two recovery passes after this one (in `run_loop`) re-trigger the
+/// right level of work.
+///
+/// Separately, any branch with feedback still durably marked pending (RAL-375
+/// -- an unclean shutdown mid-`guardian_merge::run_feedback`, whose feedback
+/// text was previously held only as that function's own in-memory argument
+/// and so silently lost) has that feedback reapplied directly. This must run
+/// before the guardian-level reclaim above finishes rebuilding the stack, or
+/// an ordinary rebuild would finalize the review having silently dropped the
+/// never-applied feedback.
+///
+/// MUST run before `server::serve`'s startup spawns any competing recovery
+/// that could flip a `merging` guardian to a terminal status first (see
+/// RAL-48's `Store::recover_orphaned_merges`, no longer called at startup for
+/// exactly this reason) -- this is the sole startup recovery path for
+/// interrupted merges/feedback.
+pub fn recover_interrupted_reviews(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+) {
+    let (interrupted, pending_feedback) = {
+        let guard = store.lock().expect("store mutex poisoned");
+        let interrupted = guard.interrupted_merges().unwrap_or_default();
+        for gid in &interrupted {
+            let _ = guard.reset_guardian_to_collecting(gid);
+        }
+        let pending_feedback = guard.branches_with_pending_feedback().unwrap_or_default();
+        (interrupted, pending_feedback)
+    };
+    for (gid, branch_id, feedback) in pending_feedback {
+        crate::rlog!(
+            WARNING,
+            "ralphus [recovery] review {gid} branch {branch_id}: reapplying feedback interrupted by daemon restart"
+        );
+        let _ = store
+            .lock()
+            .expect("store mutex poisoned")
+            .cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "recovery",
+                message: "reapplying feedback interrupted by daemon restart",
+                scope: Some("branch"),
+                squad_id: None,
+                guardian_id: Some(&gid),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"branch_id": branch_id}),
+                admin_only: false,
+            });
+        resume_feedback(store, sem, cancellations, gid, branch_id, feedback);
+    }
+    start_reviews(store, interrupted, sem, cancellations);
+}
+
+/// RAL-375: re-run [`crate::guardian_merge::run_feedback`] for a branch whose
+/// feedback application was interrupted by an unclean shutdown -- mirrors
+/// `guardian_merge::start_feedback`'s own thread-spawn shape (subprocess
+/// runner via `MachineRouter`, `guardian:{gid}`-keyed cancel token) since this
+/// is the same work, just re-entered from recovery instead of a fresh
+/// `POST .../feedback` request.
+fn resume_feedback(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+    gid: String,
+    branch_id: String,
+    feedback: String,
+) {
+    let store = Arc::clone(store);
+    let sem = Arc::clone(sem);
+    let cancellations = cancellations.clone();
+    std::thread::spawn(move || {
+        let _permit = sem.acquire();
+        let local: Arc<dyn Runner> =
+            Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)));
+        let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
+            local,
+            Arc::clone(&store),
+        ));
+        let token = cancellations.register(&format!("guardian:{gid}"));
+        crate::guardian_merge::run_feedback(
+            &store,
+            runner.as_ref(),
+            &gid,
+            &branch_id,
+            &feedback,
+            &token,
+        );
+        cancellations.remove(&format!("guardian:{gid}"));
+    });
 }
 
 /// Spawn a background merge for each guardian that is still `collecting`.
@@ -3291,6 +3373,8 @@ fn run_proofs(
                     "tokens_out": proof_usage.tokens_out,
                     "cache_creation_tokens": proof_usage.cache_creation_tokens,
                     "cache_read_tokens": proof_usage.cache_read_tokens,
+                    "compaction_input_tokens": proof_usage.compaction_input_tokens,
+                    "compaction_count": proof_usage.compaction_count,
                     "cost_usd": proof_usage.cost_usd,
                     "cost_is_estimated": proof_usage.cost_is_estimated,
                 }),
@@ -3441,6 +3525,8 @@ mod tests {
                     tokens_out: 2,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.5,
                     cost_is_estimated: false,
                     summary: "ok".to_string(),
@@ -3476,6 +3562,8 @@ mod tests {
                 tokens_out: 1,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.1,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -3730,6 +3818,8 @@ mod tests {
                         tokens_out: 0,
                         cache_creation_tokens: 0,
                         cache_read_tokens: 0,
+                        compaction_input_tokens: 0,
+                        compaction_count: 0,
                         cost_usd: 0.0,
                         cost_is_estimated: false,
                         summary: "ok".to_string(),
@@ -3757,6 +3847,8 @@ mod tests {
                         tokens_out: 0,
                         cache_creation_tokens: 0,
                         cache_read_tokens: 0,
+                        compaction_input_tokens: 0,
+                        compaction_count: 0,
                         cost_usd: 0.0,
                         cost_is_estimated: false,
                         summary: "ok".to_string(),
@@ -3971,6 +4063,8 @@ mod tests {
                 tokens_out: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -4377,6 +4471,8 @@ mod tests {
                             tokens_out: 1,
                             cache_creation_tokens: 0,
                             cache_read_tokens: 0,
+                            compaction_input_tokens: 0,
+                            compaction_count: 0,
                             cost_usd: 0.0,
                             cost_is_estimated: false,
                             summary: "a retried ok".to_string(),
@@ -4395,6 +4491,8 @@ mod tests {
                         tokens_out: 1,
                         cache_creation_tokens: 0,
                         cache_read_tokens: 0,
+                        compaction_input_tokens: 0,
+                        compaction_count: 0,
                         cost_usd: 0.0,
                         cost_is_estimated: false,
                         summary: "b finished".to_string(),
@@ -4517,6 +4615,8 @@ mod tests {
                     tokens_out: 1,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.0,
                     cost_is_estimated: false,
                     summary: "b done".to_string(),
@@ -4537,6 +4637,8 @@ mod tests {
                     tokens_out: 1,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.0,
                     cost_is_estimated: false,
                     summary: "proof passed".to_string(),
@@ -4555,6 +4657,8 @@ mod tests {
                 tokens_out: 1,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -4696,6 +4800,8 @@ mod tests {
                     tokens_out: 1,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.0,
                     cost_is_estimated: false,
                     summary: "b done".to_string(),
@@ -4717,6 +4823,8 @@ mod tests {
                 tokens_out: 1,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -4844,6 +4952,8 @@ mod tests {
                     tokens_out: 0,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.0,
                     cost_is_estimated: false,
                     summary: format!("did {cmd}"),
@@ -5446,6 +5556,8 @@ mod tests {
                 tokens_out: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -5514,6 +5626,8 @@ mod tests {
                 tokens_out: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -5664,6 +5778,8 @@ mod tests {
                     tokens_out: 2,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
                     cost_usd: 0.5,
                     cost_is_estimated: false,
                     summary: "ok".to_string(),
@@ -5784,6 +5900,8 @@ mod tests {
                 tokens_out: 2,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.5,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -6274,6 +6392,8 @@ mod tests {
                 tokens_out: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -6555,6 +6675,8 @@ mod tests {
                 tokens_out: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -6695,6 +6817,8 @@ mod tests {
                 tokens_out: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -7063,6 +7187,8 @@ mod tests {
                 tokens_out: 2,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.5,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
@@ -7231,6 +7357,8 @@ mod tests {
                 tokens_out: 2,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.5,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),

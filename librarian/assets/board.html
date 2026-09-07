@@ -62,7 +62,8 @@
       .logs-btn.fail { color: var(--failed); border-color: var(--failed); }
 
       /* RAL-12: sidebar/details widths are draggable (var-driven) and persisted. */
-      main#tasks-page { display: grid; grid-template-columns: var(--sidebar-w, 280px) 6px 1fr 6px var(--details-w, 340px); height: calc(100vh - 51px); }
+      main#squads-page { display: grid; grid-template-columns: var(--sidebar-w, 280px) 6px 1fr 6px var(--details-w, 340px); height: calc(100vh - 51px); }
+      main#tasks-page { display: grid; grid-template-columns: 1fr 6px var(--task-details-w, 340px); height: calc(100vh - 51px); }
       main#reviews-page { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 51px); }
       main#resources-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       .res-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -286,6 +287,69 @@
       .ctx-menu div { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
       .ctx-menu div:hover { background: var(--panel-2); }
       .ctx-menu div.danger { color: var(--danger); }
+      .ctx-menu .ctx-sep { height: 1px; background: var(--border); margin: 4px 2px; padding: 0; cursor: default; }
+      .ctx-menu .ctx-check { display: flex; align-items: center; gap: 6px; }
+      .ctx-menu .ctx-check.on { color: var(--accent); }
+
+      /* RAL-362: Tasks tab -- flat, virtualized, grid-based task table. */
+      .tt-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+      .tt-toolbar input[type=text] { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 5px 8px; min-width: 200px; }
+      .tt-summary { padding: 6px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--panel); }
+      .tt-table-wrap { flex: 1; overflow: auto; position: relative; }
+      .tt-head { display: grid; grid-template-columns: var(--tt-grid, 1fr); position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--border); }
+      .tt-head-cell { display: flex; align-items: center; gap: 4px; padding: 7px 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); position: relative; user-select: none; white-space: nowrap; overflow: hidden; }
+      .tt-head-cell.align-right { justify-content: flex-end; }
+      .tt-head-cell.sortable { cursor: pointer; }
+      .tt-head-cell:hover .tt-meatball { opacity: .85; }
+      .tt-sort-caret { display: inline-block; transition: transform .12s; opacity: .5; }
+      .tt-sort-caret.active { color: var(--accent); opacity: 1; }
+      .tt-sort-caret.desc { transform: rotate(180deg); }
+      .tt-meatball { opacity: .55; cursor: pointer; padding: 0 3px; border-radius: 4px; margin-left: auto; }
+      .tt-meatball:hover { opacity: 1 !important; background: var(--panel-2); }
+      .tt-col-resize { position: absolute; right: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; }
+      .tt-col-resize:hover, .tt-col-resize.dragging { background: var(--accent); opacity: .5; }
+      .tt-body { position: relative; }
+      .tt-row { display: grid; grid-template-columns: var(--tt-grid, 1fr); border-bottom: 1px solid var(--border); align-items: center; cursor: pointer; position: absolute; left: 0; right: 0; }
+      .tt-row:hover { background: var(--panel-2); }
+      .tt-row.selected { background: rgba(74,163,255,.16); border-color: var(--accent); }
+      /* RAL-362 Risks "Colour discipline": relationship highlight on hover of a squad chip -- the
+         documented --teal "linked / dependency-driven movement" role (docs/colors.md), reused here
+         for "every other row sharing this squad" rather than a per-squad generated hue. */
+      .tt-row.tt-squad-hover { background: rgba(57,197,207,.12); }
+      .tt-row.tt-cell-row { background: var(--bg); }
+      .tt-cell { padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; min-width: 0; }
+      .tt-cell.align-right { text-align: right; }
+      .tt-name-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+      .tt-name-cell .tt-chevron { flex: none; width: 14px; color: var(--muted); cursor: pointer; user-select: none; }
+      .tt-name-cell .tt-chevron.expanded { transform: rotate(90deg); }
+      .tt-name-cell .tt-chevron.hidden-chevron { visibility: hidden; }
+      .tt-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tt-star { flex: none; cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+      /* RAL-362 Risks "Colour discipline": watched is a neutral highlight, not a warning --
+         docs/colors.md reserves amber (--ignored) for the genuine ignored status, so this
+         uses --accent (explicit watch) / --teal (inherited-via-squad, the existing "linked"
+         relationship color) instead. */
+      .tt-star.watched { color: var(--accent); }
+      .tt-star.watched.inherited { color: var(--teal); }
+      .tt-squad-chip { border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; max-width: 100%; overflow: hidden; }
+      .tt-squad-chip:hover { border-color: var(--teal); }
+      .tt-squad-chip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tt-cells-bar { display: flex; align-items: center; gap: 6px; }
+      .tt-cells-progress { flex: 1; height: 7px; background: var(--panel-2); border-radius: 999px; overflow: hidden; display: flex; min-width: 40px; }
+      .tt-cells-progress > span { display: block; height: 100%; }
+      .tt-cells-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+      .tt-badges { display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
+      .tt-badge { font-size: 11px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); white-space: nowrap; }
+      .tt-badge.pr-badge { cursor: pointer; }
+      .tt-badge.pr-placeholder { border-style: dashed; color: var(--muted); opacity: .75; }
+      .tt-time.running { color: var(--running); }
+      .tt-needs-me-chip { display: inline-flex; align-items: center; gap: 4px; }
+      /* RAL-362 §2/§4: group headers are virtualized rows like any other (absolute-positioned,
+         placed by index in ttRenderVisibleRows) rather than `position: sticky` -- sticky requires
+         being a normal in-flow scroll sibling, which the fully virtualized row list can't offer. */
+      .tt-group-header { display: grid; grid-template-columns: var(--tt-grid, 1fr); background: var(--panel-2); border-bottom: 1px solid var(--border); position: absolute; left: 0; right: 0; z-index: 4; font-weight: 600; }
+      .tt-group-header .tt-cell { font-size: 12px; }
+      .tt-group-header .tt-group-label { display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: pointer; }
       .sel-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
       .sel-tab { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 5px; }
       .sel-tab.active { border-color: var(--accent); color: var(--text); }
@@ -375,7 +439,8 @@
       <div class="brand">
         <span class="logo" data-tip="ralphus — orchestrates autonomous AI agent tasks.\nSubmit a TOML task file; the scheduler runs cells with any model (Claude, Ollama, etc.).">ralphus</span><span id="conn" class="dot off" data-tip="Daemon connection — green means the daemon's live event stream is connected and the board updates as changes are pushed to it.\nRed means the daemon is down or unreachable."></span>
         <nav class="tabs">
-          <button id="tab-tasks" class="tab active" onclick="showTab('tasks', true)" data-tip="Tasks — view submitted squads, their cells, the dependency graph, and proof steps.">Tasks</button>
+          <button id="tab-squads" class="tab active" onclick="showTab('squads', true)" data-tip="Squads — view submitted squads, their cells, the dependency graph, and proof steps.">Squads</button>
+          <button id="tab-tasks" class="tab" onclick="showTab('tasks', true)" data-tip="Tasks — a flat list of every task across every squad, with cost, review/PR state, and watch status.">Tasks</button>
           <button id="tab-queue" class="tab" onclick="showTab('queue', true)" data-tip="Queue — reorder pending work by priority.\nDrag ready-to-run cells and proof steps into the order you want them picked up; set a status of 'ignored' to unblock downstream work.\nOrder is a best-effort hint honored when a compute slot frees.">Queue</button>
           <button id="tab-reviews" class="tab" onclick="showTab('reviews', true)" data-tip="Reviews — manage Guardian merge reviews: branch stacking, automated rebase, conflict resolution, and CI check gates.">Reviews</button>
           <button id="tab-resources" class="tab" onclick="showTab('resources', true)" data-tip="Resources — live CPU, RAM, and GPU usage per running cell. Useful for spotting runaway processes.">Resources</button>
@@ -405,10 +470,10 @@
 
     <div id="ready-banner"></div>
 
-    <main id="tasks-page">
+    <main id="squads-page">
       <div class="col sidebar">
         <div class="side-head">
-          <button class="newtask" onclick="openNewTask()" data-tip="Submit a new task — paste a TOML task definition, set an optional label, then Validate &amp; Queue sends it to the scheduler.">＋ New Task</button>
+          <button class="newtask" onclick="openNewTask()" data-tip="Submit a new squad — paste a TOML task definition, set an optional label, then Validate &amp; Queue sends it to the scheduler.">＋ New Squad</button>
           <input type="text" id="filter" placeholder="filter by squad id / label…" oninput="onFilter(this.value)" data-tip="Filter squads by squad ID or label. Only matching squads appear in the list." />
           <div class="row">
             <span class="chip" data-sort="date" onclick="setSort('date')" data-tip="Sort squads by creation date.">date</span>
@@ -429,6 +494,30 @@
       <div class="splitter" data-var="--details-w" data-invert="1" data-tip="Drag to resize the details pane. Your preference is saved between sessions."></div>
       <div class="col detail-pane" id="details">
         <div class="empty">Select a squad, task, cell, or proof step.</div>
+      </div>
+    </main>
+
+    <main id="tasks-page" style="display:none;grid-template-rows:auto auto 1fr;grid-template-areas:'toolbar toolbar toolbar' 'summary summary summary' 'table split details';">
+      <div style="grid-area:toolbar" class="tt-toolbar">
+        <input type="text" id="tt-filter" placeholder="filter by task name…" oninput="ttSetNameFilter(this.value)" data-tip="Filter rows by task name (case-insensitive substring).\nWho/when: narrow a board with thousands of tasks down to the ones you're looking for." />
+        <div class="row" id="tt-status-filters"></div>
+        <label data-tip="Include tasks belonging to a squad you've hidden from your own view (Squads tab).\nHiding is squad-level only -- there is no per-task hiding yet.\nA personal preference — it never changes anything's status, and never affects what other users see.">
+          <input type="checkbox" id="tt-show-hidden" onchange="ttToggleShowHidden(this.checked)"> show hidden
+        </label>
+        <label class="tt-needs-me-chip" data-tip="Only rows you're watching (directly or via a watched squad) that are blocked on you: failed, awaiting your review approval, or approved with no PR submitted yet.\nUnwatched work never appears here, even if it's failed -- turn on Auto-watch in Preferences to watch everything.">
+          <input type="checkbox" id="tt-needs-me" onchange="ttToggleNeedsMe(this.checked)"> needs me <span id="tt-needs-me-count" class="chip" style="padding:1px 6px"></span>
+        </label>
+        <button class="btn" onclick="ttExpandAll()" data-tip="Expand every currently-filtered task row to show its cells.">Expand all</button>
+        <button class="btn" onclick="ttCollapseAll()" data-tip="Collapse every task row back down to a single line.">Collapse all</button>
+      </div>
+      <div style="grid-area:summary" class="tt-summary" id="tt-summary"></div>
+      <div style="grid-area:table" class="tt-table-wrap" id="tt-table-wrap">
+        <div class="tt-head" id="tt-head"></div>
+        <div class="tt-body" id="tt-body"></div>
+      </div>
+      <div style="grid-area:split" class="splitter" data-var="--task-details-w" data-invert="1" data-tip="Drag to resize the details pane. Your preference is saved between sessions."></div>
+      <div style="grid-area:details" class="col detail-pane" id="task-details">
+        <div class="empty">Select a task.</div>
       </div>
     </main>
 
@@ -852,6 +941,8 @@
        * @property {number} [cost_usd]
        * @property {number} [cache_creation_tokens] - RAL-326: prompt-cache write tokens (input billed at the cache-creation rate). Kept out of `tokens_in`, which still means uncached input only. 0 for a backend whose harness reports no cache breakdown.
        * @property {number} [cache_read_tokens] - RAL-326: prompt-cache read tokens (input served from an existing cache entry). See `cache_creation_tokens`.
+       * @property {number} [compaction_input_tokens] - RAL-373: input tokens spent on Claude Code's own auto-compaction summarization requests, billed at the uncached input rate. Already included in `cost_usd` -- a derived slice of it, never additional spend. 0 for a backend that reports no compaction data (`pi`, `codex`) -- see `compaction_count` before reading that as "never compacted".
+       * @property {number} [compaction_count] - RAL-373: count of compactions observed, independent of whether each one's input size was reported. Nonzero here with `compaction_input_tokens` still 0 means "compactions happened, sizes unreported by this backend/version", not "no compaction happened".
        * @property {boolean} [cost_is_estimated] - RAL-326: true when the tokens/cost above are the last live mid-run snapshot rather than the backend's own final accounting, because the process was lost/cancelled/timed out before a terminal usage event.
        * @property {{[key: string]: string}} [env_overrides] - RAL-191: environment-variable overrides set on this individual proof step — the narrowest layer, merged on top of the owning scope's `proof_env_overrides` and its ancestors. Absent for the vast majority of steps.
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this step's own `env_overrides` (or its owning scope's `proof_env_overrides`) has been edited since the step last ran/retried or had its status explicitly set. No behavioral effect.
@@ -870,6 +961,8 @@
        * @property {number} [cost_usd]
        * @property {number} [cache_creation_tokens] - RAL-326: prompt-cache write tokens (input billed at the cache-creation rate). Kept out of `tokens_in`, which still means uncached input only. 0 for a backend whose harness reports no cache breakdown.
        * @property {number} [cache_read_tokens] - RAL-326: prompt-cache read tokens (input served from an existing cache entry). See `cache_creation_tokens`.
+       * @property {number} [compaction_input_tokens] - RAL-373: input tokens spent on Claude Code's own auto-compaction summarization requests, billed at the uncached input rate. Already included in `cost_usd` -- a derived slice of it, never additional spend. 0 for a backend that reports no compaction data (`pi`, `codex`) -- see `compaction_count` before reading that as "never compacted".
+       * @property {number} [compaction_count] - RAL-373: count of compactions observed, independent of whether each one's input size was reported. Nonzero here with `compaction_input_tokens` still 0 means "compactions happened, sizes unreported by this backend/version", not "no compaction happened".
        * @property {boolean} [cost_is_estimated] - RAL-326: true when the tokens/cost above are the last live mid-run snapshot rather than the backend's own final accounting, because the process was lost/cancelled/timed out before a terminal usage event.
        * @property {number} [maximum_budget_usd]
        * @property {number} [maximum_context] - RAL-304: resolved context-window token limit, or absent for no cap. Only ever set for a backend with a real delivery mechanism (codex, pi) -- see `agent_supports_maximum_context`.
@@ -883,7 +976,8 @@
        * @property {string|null} [system_prompt]
        * @property {string} [agent_session_id]
        * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
-       * @property {{id: string, name: string, status: string, branch?: string}[]} [reviews]
+       * @property {{id: string, name: string, status: string, branch?: string, origin: string}[]} [reviews]
+       * @property {string[]} [triage_types] - RAL-318: this cell's resolved Triage type(s) if it opted in via `triage = true` in its TOML -- absent/empty for a cell that never opted in. Populated at submit time (inline `triage_type` or the Arbiter's own classification) whether or not the cell has run yet, so non-empty here does not by itself mean the cell is done -- check `state`. A cell with types set here and no entry in `reviews` yet is pooled, waiting for its Triage pool to drain into an actual review.
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides set directly on this cell (hierarchical env overrides, extending RAL-150); merged on top of the owning task's/squad's when the cell's own subprocess is spawned. Empty/absent for the vast majority of cells.
        * @property {{[key: string]: string}} [proof_env_overrides] - Persistent environment-variable overrides applied only to this cell's own proof steps, merged on top of `env_overrides` (and its ancestors).
        * @property {number|null} [started_at_ms]
@@ -1112,6 +1206,30 @@
        * @property {PullRequestView[]} prs
        */
       /**
+       * One row of the flat PR index (RAL-362) -- see
+       * `GET /api/pull-requests/index`. Distinct from {@link PullRequestView}:
+       * narrower field set (no title/description/base_ref), plus the
+       * source squad/task/cell a `PullRequestView` doesn't carry, resolved
+       * server-side via `cells.review_branch` the same way `BranchView`'s
+       * `source_squad_id`/`source_task_idx`/`source_cell_idx` are. Backs the
+       * Tasks tab's review/PR badge lane.
+       * @typedef {object} PrIndexRow
+       * @property {string} id
+       * @property {string} guardian_id
+       * @property {string|null} [branch_id]
+       * @property {string|null} [branch_alias]
+       * @property {string} forge - "github" | "gitlab"
+       * @property {string} repo
+       * @property {number|null} [pr_number]
+       * @property {string|null} [pr_url]
+       * @property {string} state - "open" | "merged" | "closed" | "dropped"
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       * @property {string|null} [source_squad_id]
+       * @property {number|null} [source_task_idx]
+       * @property {number|null} [source_cell_idx]
+       */
+      /**
        * Live drift check between a PR's remote branch and its owning review
        * worktree (RAL-190) -- see `GET /api/pull-requests/{id}/sync-status`.
        * @typedef {object} PrSyncStatus
@@ -1121,6 +1239,14 @@
        * @property {boolean} in_sync
        * @property {boolean} pr_ahead
        * @property {boolean} worktree_ahead
+       */
+      /**
+       * One PR review comment/note (RAL-117) -- see `GET /api/pull-requests/{id}/comments`.
+       * @typedef {object} PrCommentItem
+       * @property {boolean} actioned
+       * @property {string} external_id
+       * @property {string} author
+       * @property {string} body
        */
       /**
        * One cross-squad task hit in the go-to search overlay (RAL-253).
@@ -1242,6 +1368,24 @@
        * @property {number} every_n
        * @property {number} occurrence_count
        * @property {number|null} last_checked_ms
+       */
+      /**
+       * One cell across any squad that has opted into Triage (has at least
+       * one resolved type) and has not yet been linked to an actual review
+       * -- a row in the Triage tab's candidate list. Present from the
+       * moment its type(s) resolve at submit time, whether or not the cell
+       * has run yet; disappears once its pool drains into a review.
+       * @typedef {object} TriageCandidateView
+       * @property {string} squad_id
+       * @property {string|null} squad_label
+       * @property {number} task_idx
+       * @property {string} task_name
+       * @property {number} cell_idx
+       * @property {string} cell_id
+       * @property {string|null} cell_name
+       * @property {string} project
+       * @property {"scheduled"|"queued"|"failed"} status - "scheduled" (not done yet), "queued" (done and viable, a live candidate for the next pool drain), or "failed" (done but its proof failed -- permanently excluded from ever being swept into an auto-review).
+       * @property {string[]} triage_types
        */
       /**
        * @typedef {object} ProjectView
@@ -1427,6 +1571,7 @@
       CLICK_HANDLERS.gotoReviewBranch = (e, ds) => gotoReviewBranch(ds.guardianId || "", ds.branch || "");
       CLICK_HANDLERS.restartCell = (e, ds) => restartCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.gotoSquadItem = (e, ds) => gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi));
+      CLICK_HANDLERS.gotoTriageCandidate = (e, ds) => gotoSquadItem(ds.squadId || "", "cell", Number(ds.ti), Number(ds.si), -1);
       CLICK_HANDLERS.gotoRunningItem = (e, ds) => { gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi)); byId("running-menu").classList.add("hidden"); };
       CLICK_HANDLERS.gotoRunningReview = (e, ds) => {
         if (ds.branch) gotoReviewBranch(ds.guardianId || "", ds.branch);
@@ -1548,7 +1693,7 @@
       const SQUAD_STATES = ["queued","pending","running","done","failed","cancelled","ignored"];
       const NODE_STATES = ["pending","running","done","failed","cancelled","ignored"];
       const IRREVERSIBLE_STATES = new Set(["done","failed","cancelled"]);
-      let tab = "tasks";
+      let tab = "squads";
       /** @type {SquadView[]} */
       let squads = [];
       let gotoSearchQuery = "";
@@ -1572,12 +1717,19 @@
       let triagePools = [];
       /** @type {TriageScheduleView[]} every schedule across every pool key */
       let triageSchedules = [];
+      /** @type {TriageCandidateView[]} every cell that opted into Triage and hasn't been linked to a review yet, across every squad */
+      let triageCandidates = [];
+      /**
+       * Default (empty) filters for the Triage tab's candidate list.
+       * @returns {{type: string, project: string, q: string}}
+       */
+      function defaultTriageCandidateFilters() { return { type: "", project: "", q: "" }; }
+      /** Client-side filters for the Triage tab's candidate list -- empty string means "no filter" for each field. */
+      let triageCandidateFilters = defaultTriageCandidateFilters();
       /** Message from the last failed Triage action, shown inline above the tab's tables. */
       let triageError = "";
       /** @type {string|null} the project (display name) scoped by the open Projects-tab "auto-review thresholds" popup, or null when closed. */
       let projectTriageModalProject = null;
-      /** The resolved git worktree root path for `projectTriageModalProject` -- the actual Triage pool key (see `openProjectTriageThresholds`), not the display name. Empty when unresolved. */
-      let projectTriageModalPath = "";
       /** Message from the last failed action inside the open Projects-tab Triage-threshold popup. */
       let projectTriageModalError = "";
       /** @type {ProjectView[]} */
@@ -1812,7 +1964,7 @@
             <div id="goto-search-list" class="goto-search-list" data-tip="Matching tasks across every squad, shown as squad-id > task-name so duplicate names stay unambiguous.\nClick once to select a row; double-click or press Enter to open it."></div>
             <div class="btn-row">
               <button class="btn" onclick="closeModal()" data-tip="Close task go-to search without navigating anywhere.">Cancel</button>
-              <button class="btn primary" onclick="gotoSelectedTaskSearchResult()" data-tip="Jump to the selected task on the Tasks tab.\nWho/when: use this after narrowing the list to the task you want.">Go To</button>
+              <button class="btn primary" onclick="gotoSelectedTaskSearchResult()" data-tip="Jump to the selected task on the Squads tab.\nWho/when: use this after narrowing the list to the task you want.">Go To</button>
             </div>
           </div></div>`;
         const input = /** @type {HTMLInputElement|null} */ (document.getElementById("goto-search-input"));
@@ -1834,7 +1986,7 @@
         clampGotoSearchSelection(results.length);
         summary.textContent = `${results.length} matching task${results.length === 1 ? "" : "s"} across ${squads.length} squad${squads.length === 1 ? "" : "s"}.`;
         list.innerHTML = results.length
-          ? results.map((result, index) => `<button type="button" id="goto-search-row-${index}" class="goto-search-row${index === gotoSearchSelected ? " selected" : ""}" onclick="selectGotoSearchResult(${index})" ondblclick="gotoSelectedTaskSearchResult()" data-tip="Open ${esc(result.label)} on the Tasks tab.\nWho/when: use this when several squads contain similarly named work and you need the exact owner shown.">${esc(result.label)}</button>`).join("")
+          ? results.map((result, index) => `<button type="button" id="goto-search-row-${index}" class="goto-search-row${index === gotoSearchSelected ? " selected" : ""}" onclick="selectGotoSearchResult(${index})" ondblclick="gotoSelectedTaskSearchResult()" data-tip="Open ${esc(result.label)} on the Squads tab.\nWho/when: use this when several squads contain similarly named work and you need the exact owner shown.">${esc(result.label)}</button>`).join("")
           : `<div class="empty" style="margin:0;padding:20px" data-tip="No current task names contain this substring.\nWho/when: clear or broaden the query to search across every squad again.">No matching tasks.</div>`;
         scrollGotoSearchSelectionIntoView();
       }
@@ -1902,7 +2054,1406 @@
        * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean}}
        */
       function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false }; }
+      /**
+       * @typedef {object} TaskTabFilters
+       * @property {string} q
+       * @property {string} sort - one of TASK_TAB_SORTS
+       * @property {number} dir - 1 (asc) or -1 (desc)
+       * @property {Set<string>} status
+       * @property {boolean} showHidden - include tasks belonging to hidden squads
+       * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
+       * @property {boolean} groupBySquad
+       */
+      /**
+       * @returns {TaskTabFilters}
+       */
+      // RAL-362 §2: the default view sorts by squad ascending -- deliberately
+      // *not* needs-me-first, so a first-time visitor sees the whole board
+      // grouped the way the Squads tab already is, before opting into any
+      // narrower filter.
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false }; }
+      /**
+       * @typedef {object} TaskTabSel
+       * @property {"task"|"cell"|null} kind
+       * @property {string|null} squadId
+       * @property {number} taskIdx
+       * @property {number} cellIdx - -1 when `kind === "task"`
+       */
+      /** @type {TaskTabSel} what's shown in the Tasks tab's details pane */
+      let taskTabSel = { kind: null, squadId: null, taskIdx: -1, cellIdx: -1 };
+      /** @type {TaskTabFilters} */
+      let taskTabFilters = defaultTaskTabFilters();
+      /** @type {Set<string>} `"<squadId>:<taskIdx>"` keys of expanded Tasks-tab rows (RAL-362 §4) */
+      let taskTabExpanded = new Set();
+      // RALPHUS-TASK-TAB-COLUMNS:BEGIN
+      /**
+       * RAL-362 §2: the Tasks tab's column model -- data, not markup. Drives
+       * both the CSS-grid template (`--grid`, built by `taskTabGridTemplate`)
+       * and the header's sort-caret/meatball-menu/resize behavior. Column
+       * order here is the default order; `hideable` columns can be toggled
+       * off via the meatball menu (state in `taskTabHiddenCols`).
+       * @typedef {object} TaskTabColumn
+       * @property {string} key
+       * @property {string} label
+       * @property {number} width - default px width
+       * @property {number} min - minimum resize px width
+       * @property {boolean} flex - true if this column's grid track is `1fr` (still resizable, `width` is just its initial basis)
+       * @property {boolean} sortable
+       * @property {boolean} hideable
+       * @property {boolean} groupable - whether `groupBySquad` headers key off this column
+       * @property {"left"|"right"} align
+       */
+      /** @type {TaskTabColumn[]} */
+      const TASK_TAB_COLUMNS = [
+        { key: "star", label: "", width: 24, min: 24, flex: false, sortable: false, hideable: false, groupable: false, align: "left" },
+        { key: "name", label: "Task", width: 320, min: 160, flex: true, sortable: true, hideable: false, groupable: false, align: "left" },
+        { key: "squad", label: "Squad", width: 150, min: 90, flex: false, sortable: true, hideable: false, groupable: true, align: "left" },
+        { key: "cells", label: "Cells", width: 150, min: 90, flex: false, sortable: false, hideable: true, groupable: false, align: "left" },
+        { key: "review", label: "Review / PR", width: 170, min: 120, flex: false, sortable: false, hideable: true, groupable: false, align: "right" },
+        { key: "time", label: "Time", width: 100, min: 80, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
+        { key: "tokens", label: "Tokens", width: 90, min: 70, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
+        { key: "cache", label: "Cache", width: 130, min: 90, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
+        { key: "cost", label: "Cost", width: 90, min: 70, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
+        { key: "meatball", label: "", width: 28, min: 28, flex: false, sortable: false, hideable: false, groupable: false, align: "left" },
+      ];
+      /** RAL-362 §2: sort keys the toolbar's sort chips accept; must line up with the `sortable` columns above. */
+      const TASK_TAB_SORTS = TASK_TAB_COLUMNS.filter((c) => c.sortable).map((c) => c.key);
+      /** RAL-362 §2: "Default view: all columns except Cache/Cost" -- everything else hideable starts shown. */
+      const TASK_TAB_DEFAULT_HIDDEN_COLS = ["cache", "cost"];
+      /**
+       * Builds the CSS-grid `grid-template-columns` value for the visible
+       * subset of `TASK_TAB_COLUMNS`, honoring any per-column widths the user
+       * has dragged (`widths`, keyed by column `key`).
+       * @param {TaskTabColumn[]} columns
+       * @param {Set<string>} hiddenCols
+       * @param {{[key: string]: number}} widths
+       * @returns {string}
+       */
+      function taskTabGridTemplate(columns, hiddenCols, widths) {
+        return columns
+          .filter((c) => !hiddenCols.has(c.key))
+          .map((c) => {
+            const w = widths[c.key] || c.width;
+            return c.flex ? `minmax(${c.min}px, 1fr)` : `${Math.max(w, c.min)}px`;
+          })
+          .join(" ");
+      }
+      // RALPHUS-TASK-TAB-COLUMNS:END
+      /** @type {Set<string>} hidden `TASK_TAB_COLUMNS` keys (RAL-362 §2 meatball menu), persisted to `TASK_TAB_COLS_LS_KEY` */
+      let taskTabHiddenCols = new Set(TASK_TAB_DEFAULT_HIDDEN_COLS);
+      /** @type {{[key: string]: number}} per-column dragged widths, keyed by `TaskTabColumn.key`, persisted to `TASK_TAB_WIDTHS_LS_KEY` */
+      let taskTabColWidths = {};
+      /** @type {"duration"|"start"} RAL-362 §3: the Time column's display mode, from its own meatball-menu options. */
+      let taskTabTimeMode = "duration";
+      /** @type {PrIndexRow[]} cached `GET /api/pull-requests/index` rows (RAL-362 §1) -- refetched every Tasks-tab poll. */
+      let taskTabPrIndex = [];
+      /** @type {{id:string,user_name:string,entity_uri:string,notify_tiers:string[],created_at_ms:number}[]} the acting user's own watches (RAL-362 §5), refreshed once per tick alongside `hiddenSquadIds`/`hiddenGuardianIds`. */
+      let taskTabWatches = [];
+      /**
+       * `task:<squadId>:<taskIdx>` entity URIs the user has explicitly
+       * un-starred despite being covered by a squad-level watch (RAL-362 §5
+       * "Un-watching such a task needs an explicit mechanism"). There is no
+       * server-side representation for "exception to a watch cascade", so
+       * this is tracked as a client-side muted set, persisted to
+       * `localStorage` per acting user -- a deliberately lightweight stand-in
+       * for a real negative-watch record, since the daemon's watches table
+       * has no notion of one.
+       * @type {Set<string>}
+       */
+      let taskTabMutedTasks = new Set();
+      /** @type {{squadId:string,taskIdx:number}|null} the task the on-demand PR drift/feedback check (RAL-362 §5) was last run for. */
+      let taskTabPrCheckFor = null;
+      /** @type {{loading:boolean, sync?:PrSyncStatus, comments?:PrCommentItem[], error?:string}|null} result of the on-demand PR check above. */
+      let taskTabPrCheckResult = null;
+      /** localStorage keys the Tasks tab persists under (RAL-362 §7) -- namespaced so they never collide with the Squads tab's `SPLIT_CFG` keys. */
+      const TT_LS = {
+        hiddenCols: "ralphus-tt-hidden-cols",
+        widths: "ralphus-tt-col-widths",
+        sort: "ralphus-tt-sort",
+        dir: "ralphus-tt-dir",
+        groupBy: "ralphus-tt-group-by",
+        timeMode: "ralphus-tt-time-mode",
+        muted: "ralphus-tt-muted-tasks",
+      };
+      /**
+       * Loads every Tasks-tab persisted preference from `localStorage`
+       * (RAL-362 §7) -- called once at startup, after every function/state
+       * it touches is defined.
+       * @returns {void}
+       */
+      function loadTaskTabPrefs() {
+        try {
+          const hidden = localStorage.getItem(TT_LS.hiddenCols);
+          if (hidden) taskTabHiddenCols = new Set(JSON.parse(hidden));
+          const widths = localStorage.getItem(TT_LS.widths);
+          if (widths) taskTabColWidths = JSON.parse(widths);
+          const sort = localStorage.getItem(TT_LS.sort);
+          if (sort && TASK_TAB_SORTS.includes(sort)) taskTabFilters.sort = sort;
+          const dir = localStorage.getItem(TT_LS.dir);
+          if (dir) taskTabFilters.dir = dir === "-1" ? -1 : 1;
+          taskTabFilters.groupBySquad = localStorage.getItem(TT_LS.groupBy) === "1";
+          const timeMode = localStorage.getItem(TT_LS.timeMode);
+          if (timeMode === "start" || timeMode === "duration") taskTabTimeMode = timeMode;
+          const muted = localStorage.getItem(TT_LS.muted);
+          if (muted) taskTabMutedTasks = new Set(JSON.parse(muted));
+        } catch (e) { /* corrupt/unavailable localStorage -- fall back to defaults */ }
+      }
+      /**
+       * Persists the current hidden-columns set (RAL-362 §7).
+       * @returns {void}
+       */
+      function saveTaskTabHiddenCols() { localStorage.setItem(TT_LS.hiddenCols, JSON.stringify([...taskTabHiddenCols])); }
+      /**
+       * Persists the current per-column widths (RAL-362 §7).
+       * @returns {void}
+       */
+      function saveTaskTabColWidths() { localStorage.setItem(TT_LS.widths, JSON.stringify(taskTabColWidths)); }
+      /**
+       * Persists the current sort key/direction (RAL-362 §7).
+       * @returns {void}
+       */
+      function saveTaskTabSort() { localStorage.setItem(TT_LS.sort, taskTabFilters.sort); localStorage.setItem(TT_LS.dir, String(taskTabFilters.dir)); }
+      /**
+       * Persists the current group-by-squad toggle (RAL-362 §7).
+       * @returns {void}
+       */
+      function saveTaskTabGroupBy() { localStorage.setItem(TT_LS.groupBy, taskTabFilters.groupBySquad ? "1" : "0"); }
+      /**
+       * Persists the current Time-column display mode (RAL-362 §7).
+       * @returns {void}
+       */
+      function saveTaskTabTimeMode() { localStorage.setItem(TT_LS.timeMode, taskTabTimeMode); }
+      /**
+       * Persists the current muted-task set (RAL-362 §5/§7).
+       * @returns {void}
+       */
+      function saveTaskTabMuted() { localStorage.setItem(TT_LS.muted, JSON.stringify([...taskTabMutedTasks])); }
       /** RAL-318: the two possible `GuardianView.origin` values -- a review is either authored explicitly or created automatically by the Arbiter/Triage subsystem. */
+      // RAL-362 §8: the Tasks tab's decision logic -- needsMe predicate, sort
+      // comparators, filter predicate, usage aggregation, review/PR picking,
+      // and virtualization-window maths -- kept pure and DOM/fetch-free (same
+      // discipline as RALPHUS-USAGE-SUMMARY above) so test/board-task-tab-logic.mjs
+      // can slice the real shipped source out and run it under `node --test`.
+      // RALPHUS-TASK-TAB-LOGIC:BEGIN
+      /**
+       * @typedef {object} TtUsage
+       * @property {number} tokensIn
+       * @property {number} tokensOut
+       * @property {number} cacheCreate
+       * @property {number} cacheRead
+       * @property {number} cost
+       * @property {boolean} anyCost - true once at least one constituent reported a nonzero cost_usd
+       * @property {boolean} estimated - true once any constituent has cost_is_estimated
+       */
+      /**
+       * @typedef {object} TtUsageItem
+       * @property {number} [tokens_in]
+       * @property {number} [tokens_out]
+       * @property {number} [cache_creation_tokens]
+       * @property {number} [cache_read_tokens]
+       * @property {number} [cost_usd]
+       * @property {boolean} [cost_is_estimated]
+       */
+      /**
+       * @typedef {object} TtRow
+       * @property {string} key - `"<squadId>:<taskIdx>"`
+       * @property {string} squadId
+       * @property {string|null} squadLabel
+       * @property {string} squadState
+       * @property {number} taskIdx
+       * @property {TaskView} task
+       * @property {string} name
+       * @property {string} state
+       * @property {CellView[]} cells
+       * @property {TtReview[]} reviews
+       * @property {{review: TtReview, count: number}|null} reviewBadge
+       * @property {PrIndexRow[]} prs
+       * @property {{pr: PrIndexRow, count: number}|null} prPick
+       * @property {TtUsage} usage
+       * @property {number|null} startedAtMs
+       * @property {number|null} finishedAtMs
+       * @property {number|null} sortTimeMs
+       * @property {{watched: boolean, inherited: boolean}} watch
+       * @property {boolean} needsMe
+       * @property {string|null} needsMeReason
+       */
+      /**
+       * @typedef {object} TtDisplayItem
+       * @property {"task"|"cell"|"group"} type
+       * @property {TtRow} [row]
+       * @property {CellView} [cell]
+       * @property {string} [squadId]
+       * @property {TtRow[]} [rows]
+       */
+      /**
+       * Sums tokens/cache/cost across a flat list of usage-bearing items
+       * (cells and/or proof steps) -- the shared reducer behind
+       * {@link ttTaskUsage}/{@link ttCellUsage}. `anyCost` distinguishes "no
+       * backend reported a cost" from "reported exactly $0" per RAL-362 §3 --
+       * only the former renders as a dash.
+       * @param {TtUsageItem[]} items
+       * @returns {TtUsage}
+       */
+      function ttUsageOf(items) {
+        const u = { tokensIn: 0, tokensOut: 0, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false };
+        for (const it of items) {
+          u.tokensIn += it.tokens_in || 0;
+          u.tokensOut += it.tokens_out || 0;
+          u.cacheCreate += it.cache_creation_tokens || 0;
+          u.cacheRead += it.cache_read_tokens || 0;
+          if (it.cost_usd) { u.cost += it.cost_usd; u.anyCost = true; }
+          if (it.cost_is_estimated) u.estimated = true;
+        }
+        return u;
+      }
+      /**
+       * A cell's own usage-bearing items: itself plus its cell-scope proof steps.
+       * @param {CellView} cell
+       * @returns {TtUsageItem[]}
+       */
+      function ttCellUsageItems(cell) { return [cell, .../** @type {TtUsageItem[]} */ (cell.proof || [])]; }
+      /**
+       * RAL-362 §3 cost-columns table: a task's aggregate is the sum over its
+       * cells, its cells' proof steps, and its own task-scope proof steps --
+       * `TaskView` itself carries no usage fields.
+       * @param {TaskView} task
+       * @returns {TtUsageItem[]}
+       */
+      function ttTaskUsageItems(task) {
+        /** @type {TtUsageItem[]} */
+        const items = [.../** @type {TtUsageItem[]} */ (task.proof || [])];
+        for (const c of task.cells || []) items.push(...ttCellUsageItems(c));
+        return items;
+      }
+      /**
+       * @param {TaskView} task
+       * @returns {TtUsage}
+       */
+      function ttTaskUsage(task) { return ttUsageOf(ttTaskUsageItems(task)); }
+      /**
+       * @param {CellView} cell
+       * @returns {TtUsage}
+       */
+      function ttCellUsage(cell) { return ttUsageOf(ttCellUsageItems(cell)); }
+      /**
+       * Formats the Tokens column's "in / out" pair, or a dash when the task
+       * consumed none.
+       * @param {TtUsage} u
+       * @returns {string}
+       */
+      function ttFmtTokens(u) { return (u.tokensIn || u.tokensOut) ? `${u.tokensIn} / ${u.tokensOut}` : "–"; }
+      /**
+       * Formats the Cache column's "write / read" pair (RAL-362 §3 -- deliberately
+       * not "in / out", since both figures are input-side), or a dash when zero.
+       * @param {TtUsage} u
+       * @returns {string}
+       */
+      function ttFmtCache(u) { return (u.cacheCreate || u.cacheRead) ? `${u.cacheCreate} / ${u.cacheRead}` : "–"; }
+      /**
+       * Formats the Cost column: a dash when no constituent reported a real
+       * cost figure (never "$0.00" -- RAL-362 §3), else "$0.42", prefixed
+       * "~" once any constituent's figure is a mid-run estimate.
+       * @param {TtUsage} u
+       * @returns {string}
+       */
+      function ttFmtCost(u) { return u.anyCost ? `${u.estimated ? "~" : ""}$${u.cost.toFixed(2)}` : "–"; }
+      /**
+       * @typedef {object} TtReview
+       * @property {string} id
+       * @property {string} name
+       * @property {string} status
+       * @property {string} origin
+       * @property {string[]} branches - every distinct branch this task's cells submitted under this review
+       */
+      /**
+       * Unions a task's per-cell `reviews` refs into one row per review id
+       * (RAL-362 Risks: "Review linkage is per-cell, not per-task" -- a task's
+       * reviews are the union over its cells). Counts/badges must be scoped
+       * to exactly this union, never inherited from the squad or siblings.
+       * @param {TaskView} task
+       * @returns {TtReview[]}
+       */
+      function ttTaskReviews(task) {
+        /** @type {Map<string, TtReview>} */
+        const map = new Map();
+        for (const c of task.cells || []) {
+          for (const r of c.reviews || []) {
+            let entry = map.get(r.id);
+            if (!entry) { entry = { id: r.id, name: r.name, status: r.status, origin: r.origin, branches: [] }; map.set(r.id, entry); }
+            entry.status = r.status;
+            if (r.branch && !entry.branches.includes(r.branch)) entry.branches.push(r.branch);
+          }
+        }
+        return [...map.values()];
+      }
+      /** RAL-362 §3: review statuses in most-attention-wanting-first order, for picking which review a multi-review task's badge is tinted by. */
+      const TT_REVIEW_ATTENTION_RANK = ["merge_failed", "merge_stopped", "in_review", "collecting", "merging", "proof_pending", "conflict_resolved", "approved", "deployed", "cancelled"];
+      /**
+       * Picks the single most-attention-wanting review out of a task's own
+       * review union, for the row's Review badge.
+       * @param {TtReview[]} reviews
+       * @returns {{review: TtReview, count: number}|null}
+       */
+      function ttPickReviewBadge(reviews) {
+        if (!reviews.length) return null;
+        const rank = (/** @type {string} */ s) => { const i = TT_REVIEW_ATTENTION_RANK.indexOf(s); return i === -1 ? TT_REVIEW_ATTENTION_RANK.length : i; };
+        let best = reviews[0];
+        for (const r of reviews.slice(1)) if (rank(r.status) < rank(best.status)) best = r;
+        return { review: best, count: reviews.length };
+      }
+      /**
+       * Every `PrIndexRow` submitted from any cell of task `(squadId, taskIdx)`
+       * -- the client-side half of RAL-362 §1's server-side join (matched on
+       * `source_task_idx` alone, deliberately ignoring `source_cell_idx`,
+       * since a task's PRs span every one of its cells).
+       * @param {PrIndexRow[]} prIndex
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {PrIndexRow[]}
+       */
+      function ttPrsForTask(prIndex, squadId, taskIdx) {
+        return prIndex.filter((p) => p.source_squad_id === squadId && p.source_task_idx === taskIdx);
+      }
+      /**
+       * Picks the task's PR badge: earliest-created (lowest `created_at_ms`,
+       * ties broken by lowest `pr_number`) -- RAL-362 §3.
+       * @param {PrIndexRow[]} prs
+       * @returns {{pr: PrIndexRow, count: number}|null}
+       */
+      function ttPickTaskPr(prs) {
+        if (!prs.length) return null;
+        const sorted = [...prs].sort((a, b) => (a.created_at_ms - b.created_at_ms) || ((a.pr_number ?? 0) - (b.pr_number ?? 0)));
+        return { pr: sorted[0], count: sorted.length };
+      }
+      /** RAL-362 §3: PR-state color roles, reusing existing status hues (docs/colors.md) rather than inventing new ones -- "open" reads as in-flight/awaiting-action like `in_review`, "merged" like `done`, "closed" like `cancelled`, "dropped" like `failed` (the review determined the branch couldn't be carried). */
+      /** @type {{[state: string]: string}} */
+      const TT_PR_COLORS = { open: "--accent", merged: "--done", closed: "--cancelled", dropped: "--failed" };
+      /**
+       * The task-level entity URI a squad/task watch is filed under (RAL-362
+       * §5), matching `crate::entity_uri::EntityUri`'s `Display` grammar.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {string}
+       */
+      function ttTaskEntityUri(squadId, taskIdx) { return `task:${squadId}:${taskIdx}`; }
+      /**
+       * The squad-level entity URI that covers every task underneath it
+       * (RAL-362 §5, `EntityUri::covers`).
+       * @param {string} squadId
+       * @returns {string}
+       */
+      function ttSquadEntityUri(squadId) { return `squad:${squadId}`; }
+      /**
+       * Resolves a task's effective watch state against the user's raw watch
+       * list: explicit beats inherited, and an inherited (squad-level) watch
+       * is suppressed by an explicit local mute (RAL-362 §5 -- "un-watching a
+       * squad-covered task" has no server-side representation, so it's
+       * tracked as a client-side muted set instead).
+       * @param {{entity_uri:string}[]} watches
+       * @param {Set<string>} mutedUris
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {{watched: boolean, inherited: boolean}}
+       */
+      function ttEffectiveWatch(watches, mutedUris, squadId, taskIdx) {
+        const taskUri = ttTaskEntityUri(squadId, taskIdx);
+        if (watches.some((w) => w.entity_uri === taskUri)) return { watched: true, inherited: false };
+        const squadUri = ttSquadEntityUri(squadId);
+        const inherited = watches.some((w) => w.entity_uri === squadUri) && !mutedUris.has(taskUri);
+        return { watched: inherited, inherited };
+      }
+      /**
+       * RAL-362 §5: maps each "needs me" trigger condition to the
+       * `MailboxPriority` tier it's gated by. The daemon does not yet emit a
+       * real mailbox message for the review-based triggers (only cell/proof
+       * failures do, always at `urgent` -- see `scheduler.rs`'s
+       * `enqueue_cell_failure_mailbox`), so this assigns the same tier
+       * ordering the mailbox already uses (urgent > high > normal) to keep
+       * "needs me" consistent with how notify tiers read everywhere else.
+       */
+      /** @type {{[key: string]: string}} */
+      const TT_NEEDS_ME_TIER = { failed: "urgent", in_review: "high", approved_no_pr: "normal" };
+      /**
+       * Whether an effectively-watched task's watch tiers permit a given
+       * trigger to count toward "needs me" (RAL-362 §5).
+       * @param {string[]} notifyTiers
+       * @param {string} trigger - key of {@link TT_NEEDS_ME_TIER}
+       * @returns {boolean}
+       */
+      function ttTierAllows(notifyTiers, trigger) {
+        return !notifyTiers || !notifyTiers.length || notifyTiers.includes(TT_NEEDS_ME_TIER[trigger]);
+      }
+      /**
+       * RAL-362 §5 "needs me" predicate: WATCHED and blocked on the user --
+       * failed, awaiting the user's review approval, or approved with no PR
+       * submitted. Unwatched work never nags, and PR-side signals (drift,
+       * un-actioned feedback) are deliberately excluded (they need per-PR
+       * network calls -- see Phase 5, offered on-demand instead).
+       * @param {TaskView} task
+       * @param {{watched:boolean}} effectiveWatch
+       * @param {string[]} notifyTiers
+       * @param {TtReview[]} reviews
+       * @param {number} prCount
+       * @returns {{needs: boolean, reason: string|null}}
+       */
+      function ttTaskNeedsMe(task, effectiveWatch, notifyTiers, reviews, prCount) {
+        if (!effectiveWatch.watched) return { needs: false, reason: null };
+        if (task.state === "failed" && ttTierAllows(notifyTiers, "failed")) {
+          return { needs: true, reason: "This task failed." };
+        }
+        const inReview = reviews.find((r) => r.status === "in_review");
+        if (inReview && ttTierAllows(notifyTiers, "in_review")) {
+          return { needs: true, reason: `Review "${inReview.name}" is in_review, awaiting your approval.` };
+        }
+        const approved = reviews.find((r) => r.status === "approved");
+        if (approved && !prCount && ttTierAllows(notifyTiers, "approved_no_pr")) {
+          return { needs: true, reason: `Review "${approved.name}" is approved with no PR submitted yet.` };
+        }
+        return { needs: false, reason: null };
+      }
+      /**
+       * Compares two Tasks-tab rows for the active sort key. Tokens/Cache
+       * sort by the SUM of their displayed pair (RAL-362 §3) even though both
+       * numbers stay visible in the cell.
+       * @param {TtRow} a
+       * @param {TtRow} b
+       * @param {string} sortKey
+       * @returns {number}
+       */
+      function ttCompareRows(a, b, sortKey) {
+        switch (sortKey) {
+          case "name": return a.name.localeCompare(b.name);
+          case "squad": return (a.squadLabel || a.squadId).localeCompare(b.squadLabel || b.squadId) || (a.taskIdx - b.taskIdx);
+          case "time": return (a.sortTimeMs ?? -1) - (b.sortTimeMs ?? -1);
+          case "tokens": return (a.usage.tokensIn + a.usage.tokensOut) - (b.usage.tokensIn + b.usage.tokensOut);
+          case "cache": return (a.usage.cacheCreate + a.usage.cacheRead) - (b.usage.cacheCreate + b.usage.cacheRead);
+          case "cost": return a.usage.cost - b.usage.cost;
+          default: return 0;
+        }
+      }
+      /**
+       * Whether a built row survives the toolbar's filters (RAL-362 §2):
+       * name substring, status set, hidden-squad inclusion, and "needs me".
+       * @param {TtRow} row
+       * @param {TaskTabFilters} filters
+       * @param {Set<string>} hiddenSquadIds
+       * @param {Set<string>} needsMeKeys
+       * @returns {boolean}
+       */
+      function ttRowMatchesFilters(row, filters, hiddenSquadIds, needsMeKeys) {
+        if (filters.q && !row.name.toLowerCase().includes(filters.q)) return false;
+        if (!filters.status.has(row.state)) return false;
+        if (!filters.showHidden && hiddenSquadIds.has(row.squadId)) return false;
+        if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
+        return true;
+      }
+      /**
+       * Aggregates the Tokens/Cache/Cost columns across a group of rows, for
+       * a group-by-squad header (RAL-362 §3) -- covers only the rows passed
+       * in (i.e. already post-filter).
+       * @param {TtRow[]} rows
+       * @returns {TtUsage}
+       */
+      function ttGroupAggregate(rows) {
+        const acc = { tokensIn: 0, tokensOut: 0, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false };
+        for (const r of rows) {
+          acc.tokensIn += r.usage.tokensIn; acc.tokensOut += r.usage.tokensOut;
+          acc.cacheCreate += r.usage.cacheCreate; acc.cacheRead += r.usage.cacheRead;
+          if (r.usage.anyCost) { acc.cost += r.usage.cost; acc.anyCost = true; }
+          if (r.usage.estimated) acc.estimated = true;
+        }
+        return acc;
+      }
+      /**
+       * Computes the visible window for a virtualized list (RAL-362 §2): the
+       * first/last indices to actually render, with a small overscan on each
+       * side so fast scrolling doesn't flash empty rows.
+       * @param {number} scrollTop
+       * @param {number} viewportH
+       * @param {number} rowH
+       * @param {number} totalRows
+       * @param {number} overscan
+       * @returns {{first: number, last: number}}
+       */
+      function ttVisibleRange(scrollTop, viewportH, rowH, totalRows, overscan) {
+        const first = Math.max(0, Math.floor(scrollTop / rowH) - overscan);
+        const count = Math.ceil(viewportH / rowH) + overscan * 2;
+        return { first, last: Math.min(totalRows, first + count) };
+      }
+      /**
+       * Flattens filtered/sorted task rows into the virtualized list's
+       * display items -- task rows, their expanded cell sub-rows, and (when
+       * grouping) one group-header item per squad (RAL-362 §2/§4).
+       * @param {TtRow[]} rows - already filtered + sorted
+       * @param {boolean} groupBySquad
+       * @param {Set<string>} expandedKeys
+       * @returns {TtDisplayItem[]}
+       */
+      function ttBuildDisplayList(rows, groupBySquad, expandedKeys) {
+        /** @type {TtDisplayItem[]} */
+        const items = [];
+        const pushTask = (/** @type {TtRow} */ r) => {
+          items.push({ type: "task", row: r });
+          if (expandedKeys.has(r.key)) for (const cell of r.cells) items.push({ type: "cell", row: r, cell });
+        };
+        if (!groupBySquad) { rows.forEach(pushTask); return items; }
+        /** @type {Map<string, TtRow[]>} */
+        const groups = new Map();
+        for (const r of rows) {
+          if (!groups.has(r.squadId)) groups.set(r.squadId, []);
+          /** @type {TtRow[]} */ (groups.get(r.squadId)).push(r);
+        }
+        for (const [squadId, groupRows] of groups) {
+          items.push({ type: "group", squadId, rows: groupRows });
+          groupRows.forEach(pushTask);
+        }
+        return items;
+      }
+      // RALPHUS-TASK-TAB-LOGIC:END
+
+      // ---------- Tasks tab: rendering + interaction (RAL-362) ----------
+      // Everything below turns the pure RALPHUS-TASK-TAB-LOGIC helpers above
+      // into DOM: fetching (`pollWatches`/`pollTasksTab`), building rows from
+      // `squads`/`taskTabPrIndex`/`taskTabWatches` (`ttBuildRows`), the
+      // virtualized header/body/group-header templates, the toolbar/column/
+      // row interaction handlers, and the read-only details pane.
+      /** Fixed row height (px) every virtualized Tasks-tab row -- task, cell, or group-header -- renders at; `ttVisibleRange` assumes a single uniform height. */
+      const TT_ROW_H = 32;
+      /** Extra rows rendered above/below the visible window so fast scrolling doesn't flash empty space. */
+      const TT_OVERSCAN = 8;
+      /** @type {TtRow[]} every task row built by the last `renderTasksTab()` pass, keyed for reuse by selection/watch/menu handlers. */
+      let ttAllRows = [];
+      /** @type {TtDisplayItem[]} the filtered/sorted/grouped display list built by the last `renderTasksTab()` pass. */
+      let ttDisplayItems = [];
+      /**
+       * Polls the acting user's own watches (RAL-362 §5). Unconditional in
+       * `tick()` alongside `pollHidden()` -- like hidden-items, watch state is
+       * cheap and shared, so the Tasks tab's own marginal cost is exactly the
+       * one `GET /api/pull-requests/index` call `pollTasksTab` makes below.
+       * @returns {Promise<void>}
+       */
+      async function pollWatches() {
+        try {
+          const qs = currentUserName ? `?user=${encodeURIComponent(currentUserName)}` : "";
+          const res = await fetch(`/api/watches${qs}`);
+          if (!res.ok) { taskTabWatches = []; return; }
+          const d = await res.json();
+          taskTabWatches = d.watches || [];
+        } catch (e) { /* transient -- the next tick retries */ }
+      }
+      /**
+       * Polls the Tasks tab's one additional endpoint (RAL-362 §1) and
+       * re-renders. `squads` itself is kept current by the shared
+       * `updateCounter()` call `tick()` already makes before this, so this
+       * is the only extra daemon request rendering the tab adds.
+       * @returns {Promise<void>}
+       */
+      async function pollTasksTab() {
+        try {
+          const res = await fetch("/api/pull-requests/index");
+          if (res.ok) taskTabPrIndex = await res.json();
+        } catch (e) { /* transient -- the next poll retries */ }
+        if (pendingHash && pendingHash.tab === "tasks") {
+          const want = pendingHash;
+          pendingHash = null;
+          if (want.uri) {
+            const wantSel = taskTabSelFromUri(want.uri);
+            if (wantSel) taskTabSel = wantSel;
+          }
+          renderTasksTab();
+          ttScrollSelectionIntoView();
+          return;
+        }
+        renderTasksTab();
+      }
+      /**
+       * Builds one `TtRow` per task across every loaded squad, joining in
+       * each task's usage/review/PR/watch derived state via the pure
+       * helpers above. The single place that turns raw `squads`/
+       * `taskTabPrIndex`/`taskTabWatches` into what the table renders.
+       * @returns {TtRow[]}
+       */
+      function ttBuildRows() {
+        /** @type {TtRow[]} */
+        const rows = [];
+        for (const squad of squads) {
+          const tasks = squad.tasks || [];
+          for (let taskIdx = 0; taskIdx < tasks.length; taskIdx++) {
+            const task = tasks[taskIdx];
+            const reviews = ttTaskReviews(task);
+            const prs = ttPrsForTask(taskTabPrIndex, squad.id, taskIdx);
+            const usage = ttTaskUsage(task);
+            const watch = ttEffectiveWatch(taskTabWatches, taskTabMutedTasks, squad.id, taskIdx);
+            const explicitWatch = taskTabWatches.find((w) => w.entity_uri === ttTaskEntityUri(squad.id, taskIdx));
+            const squadWatch = taskTabWatches.find((w) => w.entity_uri === ttSquadEntityUri(squad.id));
+            const notifyTiers = (explicitWatch || squadWatch || {}).notify_tiers || [];
+            const needs = ttTaskNeedsMe(task, watch, notifyTiers, reviews, prs.length);
+            const startedAtMs = task.started_at_ms ?? null;
+            const finishedAtMs = task.finished_at_ms ?? null;
+            const sortTimeMs = startedAtMs == null ? null : (taskTabTimeMode === "start" ? startedAtMs : (finishedAtMs ?? Date.now()) - startedAtMs);
+            rows.push({
+              key: `${squad.id}:${taskIdx}`,
+              squadId: squad.id,
+              squadLabel: squad.label,
+              squadState: squadDisplayState(squad),
+              taskIdx,
+              task,
+              name: task.name,
+              state: task.state,
+              cells: task.cells || [],
+              reviews,
+              reviewBadge: ttPickReviewBadge(reviews),
+              prs,
+              prPick: ttPickTaskPr(prs),
+              usage,
+              startedAtMs,
+              finishedAtMs,
+              sortTimeMs,
+              watch,
+              needsMe: needs.needs,
+              needsMeReason: needs.reason,
+            });
+          }
+        }
+        return rows;
+      }
+      /**
+       * Rebuilds `ttAllRows`/`ttDisplayItems` from current state and
+       * re-renders the summary, header, virtualized body and details pane.
+       * The single entry point every Tasks-tab mutation calls back into.
+       * @returns {void}
+       */
+      function renderTasksTab() {
+        ttAllRows = ttBuildRows();
+        const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
+        const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys));
+        filtered.sort((a, b) => ttCompareRows(a, b, taskTabFilters.sort) * taskTabFilters.dir);
+        ttDisplayItems = ttBuildDisplayList(filtered, taskTabFilters.groupBySquad, taskTabExpanded);
+        renderTtSummary(ttAllRows, filtered, needsMeKeys);
+        renderTtHead();
+        renderTtBody();
+        renderTaskDetailsPane();
+      }
+      /**
+       * Renders the "N tasks across M squads · K running · J waiting on you" summary line and the needs-me chip count.
+       * @param {TtRow[]} allRows
+       * @param {TtRow[]} filtered
+       * @param {Set<string>} needsMeKeys
+       * @returns {void}
+       */
+      function renderTtSummary(allRows, filtered, needsMeKeys) {
+        const squadCount = new Set(filtered.map((r) => r.squadId)).size;
+        const running = filtered.filter((r) => r.state === "running").length;
+        byId("tt-summary").textContent = `${filtered.length} task${filtered.length === 1 ? "" : "s"} across ${squadCount} squad${squadCount === 1 ? "" : "s"} · ${running} running · ${needsMeKeys.size} waiting on you`;
+        byId("tt-needs-me-count").textContent = needsMeKeys.size ? String(needsMeKeys.size) : "";
+      }
+      /**
+       * Per-column header tooltip text (RAL-40: why / who-when / caveat), keyed by `TaskTabColumn.key`.
+       * @type {{[key: string]: string}}
+       */
+      const TT_COLUMN_TIPS = {
+        star: "Watched status (RAL-362 §5). Click a row's star to watch/unwatch its task.\nA task covered by a watch on its whole squad shows a distinct inherited-watch glyph.",
+        name: "Task name. Click the row to select it; the chevron (when present) expands its cells.",
+        squad: "The owning squad's OWN state -- not a roll-up of this row -- plus its label.\nClick to open the squad on the Squads tab; hover to highlight every other row from the same squad.\nUse this menu to group the whole table by squad.",
+        cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
+        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
+        time: "Duration (live while running) or start time, per this menu's mode toggle. A dash means the task hasn't started.",
+        tokens: "Input / output token totals, summed over this task's cells, cell proof steps, and task-scope proof steps.",
+        cache: "Prompt-cache write / read token totals -- both are input-side figures, unlike Tokens' in/out split.",
+        cost: "Total cost in USD, aggregated the same way as Tokens.\nA dash means no backend reported a cost for this task; a \"~\" prefix means at least one contributing figure is a mid-run estimate, not final accounting.",
+        meatball: "Column options: sort, group-by (Squad column), duration/start-time (Time column), and show/hide any column.",
+      };
+      /**
+       * Renders one header cell -- label (click sorts), sort caret, meatball menu trigger, resize handle.
+       * @param {TaskTabColumn} c
+       * @returns {string}
+       */
+      function ttHeadCellHtml(c) {
+        const isSort = taskTabFilters.sort === c.key;
+        const label = c.sortable
+          ? `<span onclick="ttSetSort('${c.key}')" style="cursor:pointer">${esc(c.label)}</span>`
+          : `<span>${esc(c.label)}</span>`;
+        const caret = c.sortable
+          ? `<span class="tt-sort-caret ${isSort ? "active" : ""} ${isSort && taskTabFilters.dir === -1 ? "desc" : ""}" onclick="ttSetSort('${c.key}')">▲</span>`
+          : "";
+        const meatball = c.key !== "star" && c.key !== "meatball"
+          ? `<span class="tt-meatball" onclick="event.stopPropagation();ttOpenColMenu(event,'${c.key}')" data-tip="${esc(TT_COLUMN_TIPS[c.key] || "")}">⋯</span>`
+          : "";
+        const resize = c.key !== "meatball"
+          ? `<span class="tt-col-resize" data-col="${c.key}"></span>`
+          : "";
+        return `<div class="tt-head-cell ${c.sortable ? "sortable" : ""} align-${c.align}" data-tip="${esc(TT_COLUMN_TIPS[c.key] || "")}">${label}${caret}${meatball}${resize}</div>`;
+      }
+      /**
+       * Sets the active sort key (from an initial click) or flips its direction (on a repeat click of the same key).
+       * @param {string} key
+       * @returns {void}
+       */
+      function ttSetSort(key) {
+        if (!TASK_TAB_SORTS.includes(key)) return;
+        if (taskTabFilters.sort === key) taskTabFilters.dir *= -1;
+        else { taskTabFilters.sort = key; taskTabFilters.dir = 1; }
+        saveTaskTabSort();
+        syncHash();
+        renderTasksTab();
+      }
+      /**
+       * Sets the sort key/direction explicitly (from a column meatball menu item, as opposed to the caret's toggle).
+       * @param {string} key
+       * @param {number} dir
+       * @returns {void}
+       */
+      function ttSetSortDir(key, dir) {
+        taskTabFilters.sort = key;
+        taskTabFilters.dir = dir;
+        saveTaskTabSort();
+        ttCloseColMenu();
+        syncHash();
+        renderTasksTab();
+      }
+      /**
+       * Opens a column's meatball menu: sort shortcuts, column-specific options (group-by for Squad, duration/start-time for Time), and the Columns show/hide checklist shared by every column's menu.
+       * @param {MouseEvent} e
+       * @param {string} key
+       * @returns {void}
+       */
+      function ttOpenColMenu(e, key) {
+        e.preventDefault(); e.stopPropagation(); ttCloseColMenu();
+        const col = TASK_TAB_COLUMNS.find((c) => c.key === key);
+        if (!col) return;
+        const rows = [];
+        if (col.sortable) {
+          rows.push(`<div onclick="ttSetSortDir('${key}',1)">↑ Sort ascending</div>`);
+          rows.push(`<div onclick="ttSetSortDir('${key}',-1)">↓ Sort descending</div>`);
+          rows.push(`<div class="ctx-sep"></div>`);
+        }
+        if (key === "squad") {
+          rows.push(`<div class="ctx-check ${taskTabFilters.groupBySquad ? "on" : ""}" onclick="ttToggleGroupBy()">${taskTabFilters.groupBySquad ? "✓" : ""} Group by squad</div>`);
+          rows.push(`<div class="ctx-sep"></div>`);
+        }
+        if (key === "time") {
+          rows.push(`<div class="ctx-check ${taskTabTimeMode === "duration" ? "on" : ""}" onclick="ttSetTimeMode('duration')">${taskTabTimeMode === "duration" ? "✓" : ""} Duration</div>`);
+          rows.push(`<div class="ctx-check ${taskTabTimeMode === "start" ? "on" : ""}" onclick="ttSetTimeMode('start')">${taskTabTimeMode === "start" ? "✓" : ""} Start time</div>`);
+          rows.push(`<div class="ctx-sep"></div>`);
+        }
+        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">Columns</div>`);
+        for (const c of TASK_TAB_COLUMNS.filter((c) => c.hideable)) {
+          const on = !taskTabHiddenCols.has(c.key);
+          rows.push(`<div class="ctx-check ${on ? "on" : ""}" ${c.key === key ? 'style="color:var(--accent)"' : ""} onclick="ttToggleColumn('${c.key}')">${on ? "✓" : ""} ${esc(c.label)}</div>`);
+        }
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "tt-col-menu";
+        menu.innerHTML = rows.join("");
+        document.body.appendChild(menu);
+        const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+        menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
+      }
+      /** Closes the open column meatball menu, if any. @returns {void} */
+      function ttCloseColMenu() { const m = document.getElementById("tt-col-menu"); if (m) m.remove(); }
+      document.addEventListener("click", ttCloseColMenu);
+      /**
+       * Toggles a hideable column's visibility -- callable from any column's meatball menu (RAL-362 §2).
+       * @param {string} key
+       * @returns {void}
+       */
+      function ttToggleColumn(key) {
+        const col = TASK_TAB_COLUMNS.find((c) => c.key === key);
+        if (!col || !col.hideable) return;
+        if (taskTabHiddenCols.has(key)) taskTabHiddenCols.delete(key); else taskTabHiddenCols.add(key);
+        saveTaskTabHiddenCols();
+        ttCloseColMenu();
+        renderTasksTab();
+      }
+      /**
+       * Sets the Time column's display mode (from its own meatball menu).
+       * @param {"duration"|"start"} mode
+       * @returns {void}
+       */
+      function ttSetTimeMode(mode) {
+        taskTabTimeMode = mode;
+        saveTaskTabTimeMode();
+        ttCloseColMenu();
+        renderTasksTab();
+      }
+      /**
+       * Toggles group-by-squad (from the Squad column's meatball menu) and scrolls the current selection back into view.
+       * @returns {void}
+       */
+      function ttToggleGroupBy() {
+        taskTabFilters.groupBySquad = !taskTabFilters.groupBySquad;
+        saveTaskTabGroupBy();
+        ttCloseColMenu();
+        syncHash();
+        renderTasksTab();
+        ttScrollSelectionIntoView();
+      }
+      /** @type {{key: string, startX: number, startW: number, min: number}|null} the column-resize drag in progress, if any. */
+      let ttColResizeDrag = null;
+      /**
+       * mousedown handler on a column's resize handle -- starts a drag tracked by `ttColResizeDrag`.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function onTtColResizeDown(e) {
+        e.preventDefault(); e.stopPropagation();
+        const el = /** @type {HTMLElement} */ (e.currentTarget);
+        const key = el.dataset.col || "";
+        const col = TASK_TAB_COLUMNS.find((c) => c.key === key);
+        if (!col) return;
+        const startW = taskTabColWidths[key] || col.width;
+        ttColResizeDrag = { key, startX: e.clientX, startW, min: col.min };
+        el.classList.add("dragging");
+        document.body.style.userSelect = "none";
+        document.body.style.cursor = "col-resize";
+        window.addEventListener("mousemove", onTtColResizeMove);
+        window.addEventListener("mouseup", onTtColResizeUp);
+      }
+      /**
+       * mousemove handler while a column resize drag is active.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function onTtColResizeMove(e) {
+        if (!ttColResizeDrag) return;
+        const { key, startX, startW, min } = ttColResizeDrag;
+        taskTabColWidths[key] = Math.max(min, startW + (e.clientX - startX));
+        document.documentElement.style.setProperty("--tt-grid", taskTabGridTemplate(TASK_TAB_COLUMNS, taskTabHiddenCols, taskTabColWidths));
+      }
+      /** Ends the active column-resize drag and persists the final width. @returns {void} */
+      function onTtColResizeUp() {
+        if (!ttColResizeDrag) return;
+        document.querySelectorAll(".tt-col-resize.dragging").forEach((el) => el.classList.remove("dragging"));
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        window.removeEventListener("mousemove", onTtColResizeMove);
+        window.removeEventListener("mouseup", onTtColResizeUp);
+        saveTaskTabColWidths();
+        ttColResizeDrag = null;
+      }
+      /**
+       * Rebuilds the header row and wires up its resize handles.
+       * @returns {void}
+       */
+      function renderTtHead() {
+        document.documentElement.style.setProperty("--tt-grid", taskTabGridTemplate(TASK_TAB_COLUMNS, taskTabHiddenCols, taskTabColWidths));
+        const visible = TASK_TAB_COLUMNS.filter((c) => !taskTabHiddenCols.has(c.key));
+        const head = byId("tt-head");
+        head.innerHTML = visible.map((c) => ttHeadCellHtml(c)).join("");
+        head.querySelectorAll(".tt-col-resize").forEach((el0) => {
+          const el = /** @type {HTMLElement} */ (el0);
+          el.addEventListener("mousedown", (/** @type {MouseEvent} */ e) => onTtColResizeDown(e));
+        });
+      }
+      /**
+       * Renders one column's cell wrapper, or "" when that column is currently hidden (so the emitted grid-cell count matches the header's).
+       * @param {string} key
+       * @param {string} html
+       * @param {"left"|"right"} [forceAlign]
+       * @returns {string}
+       */
+      function ttColCell(key, html, forceAlign) {
+        if (taskTabHiddenCols.has(key)) return "";
+        const col = TASK_TAB_COLUMNS.find((c) => c.key === key);
+        const align = forceAlign || (col && col.align === "right" ? "right" : "left");
+        return `<div class="tt-cell ${align === "right" ? "align-right" : ""}">${html}</div>`;
+      }
+      /**
+       * Renders the squad chip: the squad's OWN state pip (never a roll-up of this row) plus its label.
+       * @param {TtRow} row
+       * @returns {string}
+       */
+      function ttSquadChipHtml(row) {
+        return `<span class="tt-squad-chip" onclick="event.stopPropagation();ttOpenSquadInSquadsTab('${esc(row.squadId)}')" data-tip="Squad ${esc(row.squadLabel || row.squadId)} — ${esc(row.squadState)} (this squad's own state, not a roll-up of this task).\nClick to open on the Squads tab; hover to highlight this squad's other rows.">${sdot(row.squadState)}<span class="name">${esc(row.squadLabel || row.squadId)}</span></span>`;
+      }
+      /**
+       * Opens a squad on the Squads tab.
+       * @param {string} squadId
+       * @returns {void}
+       */
+      function ttOpenSquadInSquadsTab(squadId) {
+        selectSquad(squadId);
+        showTab("squads", true);
+      }
+      /**
+       * Highlights (or un-highlights) every currently-rendered row sharing `squadId`, for the squad chip's hover relationship tint.
+       * @param {string} squadId
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function ttHoverSquad(squadId, on) {
+        document.querySelectorAll("#tt-body .tt-row").forEach((el) => {
+          const row = /** @type {HTMLElement} */ (el);
+          if (row.dataset.squadId === squadId) row.classList.toggle("tt-squad-hover", on);
+        });
+      }
+      /**
+       * Renders the Cells column: a segmented proportional bar by state, plus done/total.
+       * @param {CellView[]} cells
+       * @returns {string}
+       */
+      function ttCellsBarHtml(cells) {
+        if (!cells.length) return `<span class="tt-cells-count">–</span>`;
+        /** @type {{[state: string]: number}} */
+        const counts = {};
+        for (const c of cells) counts[c.state] = (counts[c.state] || 0) + 1;
+        const segs = STATES.filter((s) => counts[s]).map((s) => `<span style="flex:${counts[s]};background:${cvar("--" + safeState(s))}" data-tip="${counts[s]} ${esc(s)}"></span>`).join("");
+        const done = cells.filter((c) => c.state === "done").length;
+        return `<span class="tt-cells-bar"><span class="tt-cells-progress">${segs}</span><span class="tt-cells-count">${done}/${cells.length}</span></span>`;
+      }
+      /**
+       * Renders the right-aligned Review/PR badge lane: at most a review badge then a PR badge (or dashed placeholder), PR always last.
+       * @param {{review: TtReview, count: number}|null} reviewBadge
+       * @param {{pr: PrIndexRow, count: number}|null} prPick
+       * @returns {string}
+       */
+      function ttReviewPrBadgesHtml(reviewBadge, prPick) {
+        const parts = [];
+        if (reviewBadge) {
+          const r = reviewBadge.review;
+          const color = cvar(G_COLORS[r.status] || "--muted");
+          const shortName = r.name.length > 14 ? r.name.slice(0, 13) + "…" : r.name;
+          const extra = reviewBadge.count > 1 ? ` +${reviewBadge.count - 1}` : "";
+          parts.push(`<span class="tt-badge" style="color:${color};border-color:${color}" data-tip="Review &quot;${esc(r.name)}&quot; — ${esc(r.status)}.${reviewBadge.count > 1 ? ` This task is on ${reviewBadge.count} reviews total.` : ""}">${esc(shortName)}${extra}</span>`);
+        }
+        if (prPick) {
+          const pr = prPick.pr;
+          const color = cvar(TT_PR_COLORS[pr.state] || "--muted");
+          const label = pr.pr_number ? `#${pr.pr_number}` : "PR";
+          const extra = prPick.count > 1 ? ` +${prPick.count - 1}` : "";
+          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge.">${esc(label)}${extra}</span>`);
+        } else if (reviewBadge && (reviewBadge.review.status === "approved" || reviewBadge.review.status === "merging")) {
+          parts.push(`<span class="tt-badge pr-placeholder" data-tip="Review &quot;${esc(reviewBadge.review.name)}&quot; is ${esc(reviewBadge.review.status)} but has no PR submitted yet.">no PR</span>`);
+        }
+        return `<span class="tt-badges">${parts.join("")}</span>`;
+      }
+      /**
+       * Opens a PR's forge URL in a new tab.
+       * @param {string} url
+       * @returns {void}
+       */
+      function ttOpenPr(url) { if (url) window.open(url, "_blank", "noopener"); }
+      /**
+       * Renders the Time column per the current duration/start-time mode; the tooltip always shows both.
+       * @param {number|null} startedAtMs
+       * @param {number|null} finishedAtMs
+       * @param {string} state
+       * @returns {string}
+       */
+      function ttTimeCellHtml(startedAtMs, finishedAtMs, state) {
+        if (state === "queued" || state === "ignored") return `<span data-tip="Not started yet.">–</span>`;
+        if (!startedAtMs) return `<span data-tip="Not started yet.">–</span>`;
+        const durMs = (finishedAtMs ?? Date.now()) - startedAtMs;
+        const tip = `Started ${fmtActivityTime(startedAtMs)} (local).\nDuration: ${fmtDuration(durMs)}.`;
+        if (taskTabTimeMode === "start") return `<span data-tip="${esc(tip)}">${fmtRelativeAge(Date.now() - startedAtMs)} ago</span>`;
+        const running = state === "running" && finishedAtMs == null;
+        return `<span class="tt-time ${running ? "running" : ""}" ${running ? `data-running="1" data-started="${startedAtMs}"` : ""} data-tip="${esc(tip)}">${fmtDuration(durMs)}</span>`;
+      }
+      /**
+       * Renders the Cost column with a per-contributor tooltip breakdown.
+       * @param {TtUsage} usage
+       * @param {TtUsageItem[]} items
+       * @returns {string}
+       */
+      function ttCostCellHtml(usage, items) {
+        if (!usage.anyCost) return `<span data-tip="No backend reported a cost for this task's cells/proof steps.">–</span>`;
+        const parts = items.filter((it) => it.cost_usd).map((it) => `${it.cost_is_estimated ? "~" : ""}$${/** @type {number} */ (it.cost_usd).toFixed(2)}`);
+        const tip = `${usage.estimated ? "Estimated — includes at least one mid-run snapshot rather than a backend's final accounting.\n" : ""}Sum over ${parts.length} contributing cell/proof step(s): ${parts.join(", ")}.`;
+        return `<span data-tip="${esc(tip)}">${ttFmtCost(usage)}</span>`;
+      }
+      /**
+       * Renders one virtualized task row, absolutely positioned at `top`.
+       * @param {TtRow} row
+       * @param {number} top
+       * @returns {string}
+       */
+      function ttTaskRowHtml(row, top) {
+        const hasCells = row.cells.length > 0;
+        const expanded = taskTabExpanded.has(row.key);
+        const selected = taskTabSel.kind === "task" && taskTabSel.squadId === row.squadId && taskTabSel.taskIdx === row.taskIdx;
+        const chevron = hasCells
+          ? `<span class="tt-chevron ${expanded ? "expanded" : ""}" onclick="event.stopPropagation();ttToggleExpand('${esc(row.key)}')" data-tip="Expand to show this task's cells.">▶</span>`
+          : `<span class="tt-chevron hidden-chevron">▶</span>`;
+        const starCls = row.watch.watched ? `watched ${row.watch.inherited ? "inherited" : ""}` : "";
+        const starTip = !row.watch.watched
+          ? "Not watched. Click to watch — \"needs me\" only ever surfaces watched work."
+          : row.watch.inherited
+            ? "Watched via this task's squad. Click to mute this task only — the squad watch stays in effect for its other tasks."
+            : "Watching this task. Click to unwatch.";
+        const star = `<span class="tt-star ${starCls}" onclick="event.stopPropagation();ttToggleWatch('${esc(row.squadId)}',${row.taskIdx})" data-tip="${esc(starTip)}">${row.watch.inherited ? "◆" : "★"}</span>`;
+        const needsDot = row.needsMe ? `<span style="color:var(--accent)" data-tip="${esc(row.needsMeReason || "")}">●</span>` : "";
+        return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask('${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
+          + ttColCell("star", star)
+          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(row.name)}</span>${needsDot}</span>`)
+          + ttColCell("squad", ttSquadChipHtml(row))
+          + ttColCell("cells", ttCellsBarHtml(row.cells))
+          + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
+          + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.finishedAtMs, row.state))
+          + ttColCell("tokens", ttFmtTokens(row.usage))
+          + ttColCell("cache", ttFmtCache(row.usage))
+          + ttColCell("cost", ttCostCellHtml(row.usage, ttTaskUsageItems(row.task)))
+          + ttColCell("meatball", `<span class="tt-meatball" onclick="event.stopPropagation();ttOpenRowMenu(event,'${esc(row.squadId)}',${row.taskIdx})" data-tip="Task actions (restart, set status, stop, hide its squad) — the only place task actions live on this tab.">⋯</span>`)
+          + `</div>`;
+      }
+      /**
+       * Renders one virtualized expanded-cell sub-row, absolutely positioned at `top` -- re-purposes Squad/Cells/Review columns for agent-model/proof-pips/branch (RAL-362 §4).
+       * @param {TtRow} row
+       * @param {CellView} cell
+       * @param {number} top
+       * @returns {string}
+       */
+      function ttCellRowHtml(row, cell, top) {
+        const cellIdx = row.cells.indexOf(cell);
+        const selected = taskTabSel.kind === "cell" && taskTabSel.squadId === row.squadId && taskTabSel.taskIdx === row.taskIdx && taskTabSel.cellIdx === cellIdx;
+        const cu = ttCellUsage(cell);
+        const proofPips = (cell.proof || []).map((v) => `<span data-tip="${esc(v.kind)}: ${esc(v.state)}">${sdot(v.state)}</span>`).join("") || `<span class="tt-cells-count">–</span>`;
+        const branch = cell.reviews && cell.reviews.length ? cell.reviews.map((r) => esc(r.branch || "")).filter(Boolean).join(", ") : "–";
+        return `<div class="tt-row tt-cell-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="event.stopPropagation();ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${cellIdx})">`
+          + ttColCell("star", "")
+          + ttColCell("name", `<span class="tt-name-cell" style="padding-left:20px">${sdot(cell.state)}<span class="tt-name-text" data-tip="${esc(cell.name || cell.id)}">${esc(cell.name || cell.id)}</span></span>`)
+          + ttColCell("squad", cell.model ? `<span data-tip="Agent / model for this cell.">${esc(cell.agent)} / ${esc(cell.model)}</span>` : `<span data-tip="Agent for this cell.">${esc(cell.agent)}</span>`)
+          + ttColCell("cells", proofPips)
+          + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
+          + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.state))
+          + ttColCell("tokens", ttFmtTokens(cu))
+          + ttColCell("cache", ttFmtCache(cu))
+          + ttColCell("cost", ttCostCellHtml(cu, ttCellUsageItems(cell)))
+          + ttColCell("meatball", "")
+          + `</div>`;
+      }
+      /**
+       * Renders one virtualized group-by-squad header, absolutely positioned at `top` -- its Tokens/Cache/Cost cells aggregate only the rows visible in this group (post-filter), with the unfiltered total noted in the tooltip when a filter is active.
+       * @param {string} squadId
+       * @param {TtRow[]} groupRows
+       * @param {number} top
+       * @returns {string}
+       */
+      function ttGroupHeaderHtml(squadId, groupRows, top) {
+        const squad = findSquad(squadId);
+        const label = squad ? (squad.label || squad.id) : squadId;
+        const squadState = squad ? squadDisplayState(squad) : "pending";
+        const agg = ttGroupAggregate(groupRows);
+        const allForSquad = ttAllRows.filter((r) => r.squadId === squadId);
+        const filteredOut = allForSquad.length !== groupRows.length;
+        /**
+         * @param {string} formatted
+         * @returns {string}
+         */
+        const tip = (formatted) => filteredOut
+          ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest).`
+          : `${formatted} across all ${groupRows.length} tasks in this squad.`;
+        return `<div class="tt-group-header" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(squadId)}">`
+          + ttColCell("star", "")
+          + ttColCell("name", `<span class="tt-group-label" onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Squad ${esc(label)} — click to open on the Squads tab.">${sdot(squadState)} ${esc(label)} <span style="color:var(--muted);font-weight:400">(${groupRows.length})</span></span>`)
+          + ttColCell("squad", "")
+          + ttColCell("cells", "")
+          + ttColCell("review", "")
+          + ttColCell("time", "")
+          + ttColCell("tokens", `<span data-tip="${esc(tip(ttFmtTokens(agg)))}">${ttFmtTokens(agg)}</span>`)
+          + ttColCell("cache", `<span data-tip="${esc(tip(ttFmtCache(agg)))}">${ttFmtCache(agg)}</span>`)
+          + ttColCell("cost", `<span data-tip="${esc(tip(ttFmtCost(agg)))}">${agg.anyCost ? (agg.estimated ? "~" : "") + "$" + agg.cost.toFixed(2) : "–"}</span>`)
+          + ttColCell("meatball", "")
+          + `</div>`;
+      }
+      /**
+       * Sizes `#tt-body` to the full virtual content height and renders the current visible window.
+       * @returns {void}
+       */
+      function renderTtBody() {
+        byId("tt-body").style.height = (ttDisplayItems.length * TT_ROW_H) + "px";
+        ttRenderVisibleRows();
+        byId("tt-table-wrap").onscroll = ttRenderVisibleRows;
+      }
+      /**
+       * Renders only the rows within the current scrolled viewport (plus overscan) -- the virtualization step run on every scroll/data refresh.
+       * @returns {void}
+       */
+      function ttRenderVisibleRows() {
+        const wrap = byId("tt-table-wrap");
+        const head = byId("tt-head");
+        const bodyScrollTop = Math.max(0, wrap.scrollTop - head.offsetHeight);
+        const { first, last } = ttVisibleRange(bodyScrollTop, wrap.clientHeight, TT_ROW_H, ttDisplayItems.length, TT_OVERSCAN);
+        const parts = [];
+        for (let i = first; i < last; i++) {
+          const item = ttDisplayItems[i];
+          const top = i * TT_ROW_H;
+          if (item.type === "group") parts.push(ttGroupHeaderHtml(/** @type {string} */ (item.squadId), /** @type {TtRow[]} */ (item.rows), top));
+          else if (item.type === "cell") parts.push(ttCellRowHtml(/** @type {TtRow} */ (item.row), /** @type {CellView} */ (item.cell), top));
+          else parts.push(ttTaskRowHtml(/** @type {TtRow} */ (item.row), top));
+        }
+        byId("tt-body").innerHTML = parts.join("");
+      }
+      /**
+       * Toggles a task row's expanded (cells-visible) state.
+       * @param {string} key
+       * @returns {void}
+       */
+      function ttToggleExpand(key) {
+        if (taskTabExpanded.has(key)) taskTabExpanded.delete(key); else taskTabExpanded.add(key);
+        renderTasksTab();
+      }
+      /** Expands every currently-filtered task row that has cells. @returns {void} */
+      function ttExpandAll() {
+        for (const item of ttDisplayItems) if (item.type === "task" && /** @type {TtRow} */ (item.row).cells.length) taskTabExpanded.add(/** @type {TtRow} */ (item.row).key);
+        renderTasksTab();
+      }
+      /** Collapses every currently-filtered task row. @returns {void} */
+      function ttCollapseAll() {
+        for (const item of ttDisplayItems) if (item.type === "task") taskTabExpanded.delete(/** @type {TtRow} */ (item.row).key);
+        renderTasksTab();
+      }
+      /**
+       * Updates the name filter (RAL-362 §2). Mirrors `onFilter`'s squads-tab pattern -- mutate + re-render the list, without rebuilding the toolbar itself (which would fight the user's typing).
+       * @param {string} v
+       * @returns {void}
+       */
+      function ttSetNameFilter(v) { taskTabFilters.q = v.toLowerCase(); renderTasksTab(); syncHash(); }
+      /**
+       * Toggles the "show hidden" (include tasks of hidden squads) filter.
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function ttToggleShowHidden(on) { taskTabFilters.showHidden = on; renderTasksTab(); syncHash(); }
+      /**
+       * Toggles the "needs me" filter.
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function ttToggleNeedsMe(on) { taskTabFilters.needsMe = on; renderTasksTab(); syncHash(); }
+      /**
+       * Shows or hides one status in the toolbar's status filter.
+       * @param {string} s
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function ttToggleStatus(s, on) { if (on) taskTabFilters.status.add(s); else taskTabFilters.status.delete(s); renderTasksTab(); syncHash(); }
+      /**
+       * Shows or hides every status at once (the toolbar's all/none shortcuts) -- rebuilds the checkbox list since every box's checked state changes at once.
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function ttAllStatus(on) { taskTabFilters.status = on ? new Set(STATES) : new Set(); renderTtStatusFilters(); renderTasksTab(); syncHash(); }
+      /**
+       * Renders the toolbar's per-state checkboxes and syncs the filter input/checkboxes to `taskTabFilters` -- called on load and whenever filters are reset wholesale, never on every poll (which would fight the user's typing/checking).
+       * @returns {void}
+       */
+      function renderTtStatusFilters() {
+        const el = byId("tt-status-filters");
+        el.innerHTML = STATES.map((s) => `<label data-tip="Show or hide ${s} tasks.">${sdot(s)}<input type="checkbox" ${taskTabFilters.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="ttToggleStatus(this.dataset.state,this.checked)">${s}</label>`).join("")
+          + `<span class="chip" onclick="ttAllStatus(true)" data-tip="Show tasks of every status.">all</span><span class="chip" onclick="ttAllStatus(false)" data-tip="Hide all tasks — clear the status filter entirely.">none</span>`;
+        /** @type {HTMLInputElement} */ (byId("tt-filter")).value = taskTabFilters.q;
+        /** @type {HTMLInputElement} */ (byId("tt-show-hidden")).checked = taskTabFilters.showHidden;
+        /** @type {HTMLInputElement} */ (byId("tt-needs-me")).checked = taskTabFilters.needsMe;
+      }
+      /**
+       * Watches/unwatches/mutes a task's star (RAL-362 §5): explicit watch/unwatch round-trips through `/api/watches`; clicking an inherited (squad-covered) watch is a client-only mute/unmute since the daemon has no "exception to a cascade" of its own.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {Promise<void>}
+       */
+      async function ttToggleWatch(squadId, taskIdx) {
+        const uri = ttTaskEntityUri(squadId, taskIdx);
+        const squadUri = ttSquadEntityUri(squadId);
+        const hasExplicit = taskTabWatches.some((w) => w.entity_uri === uri);
+        const hasSquadWatch = taskTabWatches.some((w) => w.entity_uri === squadUri);
+        const isMuted = taskTabMutedTasks.has(uri);
+        if (hasSquadWatch && isMuted) { taskTabMutedTasks.delete(uri); saveTaskTabMuted(); renderTasksTab(); return; }
+        if (hasSquadWatch && !isMuted) { taskTabMutedTasks.add(uri); saveTaskTabMuted(); renderTasksTab(); return; }
+        const qs = currentUserName ? `?user=${encodeURIComponent(currentUserName)}` : "";
+        if (hasExplicit) {
+          let resp;
+          try { resp = await del(`/api/watches/${encodeURIComponent(uri)}${qs}`); } catch (e) { alert("daemon unreachable"); return; }
+          if (!resp.ok) { alert(await responseError(resp, "unwatch failed")); return; }
+          taskTabWatches = taskTabWatches.filter((w) => w.entity_uri !== uri);
+        } else {
+          let resp;
+          try { resp = await post(`/api/watches${qs}`, { entity_uri: uri }); } catch (e) { alert("daemon unreachable"); return; }
+          if (!resp.ok) { alert(await responseError(resp, "watch failed")); return; }
+          taskTabWatches.push(await resp.json());
+        }
+        renderTasksTab();
+      }
+      /**
+       * Selects a task for the details pane and re-renders.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {void}
+       */
+      function ttSelectTask(squadId, taskIdx) {
+        taskTabSel = { kind: "task", squadId, taskIdx, cellIdx: -1 };
+        syncHash(true);
+        renderTasksTab();
+      }
+      /**
+       * Selects a cell (within its task) for the details pane.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @param {number} cellIdx
+       * @returns {void}
+       */
+      function ttSelectCell(squadId, taskIdx, cellIdx) {
+        taskTabSel = { kind: "cell", squadId, taskIdx, cellIdx };
+        syncHash(true);
+        ttRenderVisibleRows();
+        renderTaskDetailsPane();
+      }
+      /**
+       * Runs the on-demand PR drift (git) + un-actioned-feedback (forge API) check for the selected task's picked PR (RAL-362 §5/§6) -- one PR, user-initiated, never part of the row predicate.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {Promise<void>}
+       */
+      async function ttRunPrCheck(squadId, taskIdx) {
+        const row = ttAllRows.find((r) => r.squadId === squadId && r.taskIdx === taskIdx);
+        const pr = row && row.prPick ? row.prPick.pr : null;
+        if (!pr) return;
+        taskTabPrCheckFor = { squadId, taskIdx };
+        taskTabPrCheckResult = { loading: true };
+        renderTaskDetailsPane();
+        try {
+          await fetchPrSyncStatus(pr.id);
+          let comments = [];
+          if (pr.pr_number != null) {
+            const res = await fetch(`/api/pull-requests/${pr.id}/comments`);
+            if (res.ok) comments = await res.json();
+          }
+          taskTabPrCheckResult = { loading: false, sync: prSyncStatus[pr.id], comments };
+        } catch (e) {
+          taskTabPrCheckResult = { loading: false, error: "check failed — daemon or forge unreachable" };
+        }
+        renderTaskDetailsPane();
+      }
+      /**
+       * Opens the row meatball menu (RAL-362 §3: "the only place task actions live") -- reuses the Squads tab's own task graph-node menu (restart/stop/status/solo) verbatim, plus Tasks-tab-only shortcuts (open on Squads tab, hide/unhide the squad).
+       * @param {MouseEvent} e
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {void}
+       */
+      function ttOpenRowMenu(e, squadId, taskIdx) {
+        ttCloseColMenu();
+        const item = graphNodeItem(squadId, "task", taskIdx, -1, -1);
+        if (!item) return;
+        openGraphNodeMenu(e, [item]);
+        const menu = document.getElementById("graph-node-menu");
+        if (!menu) return;
+        const hideRow = hiddenSquadIds.has(squadId)
+          ? `<div onclick="ttHideSquad('${esc(squadId)}',false)" data-tip="Re-enable this task's squad in your own view (Squads tab).">🙉 Unhide squad</div>`
+          : `<div onclick="ttHideSquad('${esc(squadId)}',true)" data-tip="Hide this task's whole squad from your own view.\nHiding is squad-level only -- there is no per-task hiding yet.">🙈 Hide squad</div>`;
+        menu.insertAdjacentHTML("beforeend", `<div class="ctx-sep"></div><div onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Open this task on the Squads tab, where the full dependency graph and every task action live.">↗ Open in Squads tab</div>${hideRow}`);
+      }
+      /**
+       * Hides/unhides a task's whole squad from the Tasks tab's row meatball (hiding is squad-level only, RAL-331).
+       * @param {string} squadId
+       * @param {boolean} hide
+       * @returns {Promise<void>}
+       */
+      async function ttHideSquad(squadId, hide) {
+        ttCloseColMenu();
+        closeGraphMenu();
+        let resp;
+        try { resp = await (hide ? post(`/api/hidden/squads/${squadId}`) : del(`/api/hidden/squads/${squadId}`)); } catch (e) { alert("daemon unreachable"); return; }
+        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        if (hide) hiddenSquadIds.add(squadId); else hiddenSquadIds.delete(squadId);
+        renderTasksTab();
+      }
+      /**
+       * Scrolls the currently-selected row into view by its computed offset in `ttDisplayItems` (RAL-362 §7) -- under virtualization the selected row may not be mounted, so this computes its position rather than querying the DOM for it.
+       * @returns {void}
+       */
+      function ttScrollSelectionIntoView() {
+        if (taskTabSel.kind !== "task" && taskTabSel.kind !== "cell") return;
+        const idx = ttDisplayItems.findIndex((it) => {
+          if (it.type === "group" || !it.row) return false;
+          if (it.row.squadId !== taskTabSel.squadId || it.row.taskIdx !== taskTabSel.taskIdx) return false;
+          return it.type === "task" ? taskTabSel.kind === "task" : it.cell === it.row.cells[taskTabSel.cellIdx];
+        });
+        if (idx < 0) return;
+        const wrap = byId("tt-table-wrap");
+        const head = byId("tt-head");
+        const targetTop = head.offsetHeight + idx * TT_ROW_H;
+        wrap.scrollTop = Math.max(0, targetTop - wrap.clientHeight / 2 + TT_ROW_H / 2);
+        ttRenderVisibleRows();
+      }
+      /**
+       * Renders the read-only task details pane (RAL-362 §6): header/needs-you/kv/reviews/cells/task-scope-proof, plus an on-demand PR check. The watch star in its header is the only interactive control -- no action buttons live here.
+       * @returns {void}
+       */
+      function renderTaskDetailsPane() {
+        const el = byId("task-details");
+        if (taskTabSel.kind !== "task" && taskTabSel.kind !== "cell") { el.innerHTML = `<div class="empty">Select a task.</div>`; return; }
+        const row = ttAllRows.find((r) => r.squadId === taskTabSel.squadId && r.taskIdx === taskTabSel.taskIdx);
+        if (!row) { el.innerHTML = `<div class="empty">Select a task.</div>`; return; }
+        const cell = taskTabSel.kind === "cell" ? row.cells[taskTabSel.cellIdx] : null;
+        let html = `<div class="row" style="align-items:center;gap:8px;margin-bottom:6px">${sdot(row.state)}<b style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(row.name)}</b>`
+          + `<span class="tt-star ${row.watch.watched ? `watched ${row.watch.inherited ? "inherited" : ""}` : ""}" onclick="ttToggleWatch('${esc(row.squadId)}',${row.taskIdx})" data-tip="${row.watch.watched ? "Watching this task. Click to change." : "Not watched. Click to watch."}">${row.watch.inherited ? "◆" : "★"}</span></div>`
+          + `<div class="meta" style="margin-bottom:10px;display:flex;align-items:center;gap:6px">${ttSquadChipHtml(row)}<span>·</span><span data-tip="Registered project.">${esc(row.task.project)}</span></div>`;
+        if (row.needsMe) {
+          html += `<div style="margin-bottom:10px;padding:8px;border:1px solid var(--accent);border-radius:6px" data-tip="Why the &quot;needs me&quot; filter surfaces this task."><span style="color:var(--accent)">●</span><b> Needs you</b><div>${esc(row.needsMeReason || "")}</div></div>`;
+        }
+        html += `<div class="kv-row"><span class="k">state</span><span class="v">${pill(row.state)}</span></div>`;
+        html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(row.task.agent || "–")}</span></div>`;
+        html += `<div class="kv-row"><span class="k">model</span><span class="v">${esc(row.task.model || "–")}</span></div>`;
+        html += timingRows(row.startedAtMs, row.finishedAtMs);
+        html += `<div class="kv-row"><span class="k">tokens</span><span class="v">${ttFmtTokens(row.usage)}</span></div>`;
+        html += `<div class="kv-row"><span class="k">cache</span><span class="v">${ttFmtCache(row.usage)}</span></div>`;
+        html += `<div class="kv-row"><span class="k">cost</span><span class="v">${ttCostCellHtml(row.usage, ttTaskUsageItems(row.task))}</span></div>`;
+        html += `<h4 style="margin:14px 0 6px">Reviews</h4>`;
+        if (!row.reviews.length) html += `<div class="empty" style="padding:6px 0">No reviews yet.</div>`;
+        else html += row.reviews.map((r) => {
+          const branchRows = r.branches.map((b) => {
+            const pr = row.prs.find((p) => p.branch_alias === b);
+            const badge = pr
+              ? `<span class="tt-badge pr-badge" style="color:${cvar(TT_PR_COLORS[pr.state] || "--muted")};border-color:${cvar(TT_PR_COLORS[pr.state] || "--muted")}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
+              : (r.status === "approved" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Approved/merging with no PR submitted yet.">no PR</span>` : "");
+            return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 14px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tip="${esc(b)}">${esc(b)}</span>${badge}</div>`;
+          }).join("");
+          return `<div style="margin-bottom:8px"><div style="display:flex;align-items:center;gap:6px">${sdot(r.status)}<b style="flex:1">${esc(r.name)}</b>${pill(r.status)}</div>${branchRows}</div>`;
+        }).join("");
+        html += `<h4 style="margin:14px 0 6px">Cells</h4>`;
+        if (!row.cells.length) html += `<div class="empty" style="padding:6px 0">No cells.</div>`;
+        else html += row.cells.map((c, ci) => `<div class="kv-row" style="cursor:pointer${cell === c ? ";color:var(--accent)" : ""}" onclick="ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${ci})">${sdot(c.state)}<span class="k">${esc(c.name || c.id)}</span><span class="v">${pill(c.state)}</span></div>`).join("");
+        if (cell) {
+          html += `<h4 style="margin:14px 0 6px">${esc(cell.name || cell.id)}</h4>`;
+          html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(cell.agent)}${cell.model ? " / " + esc(cell.model) : ""}</span></div>`;
+          html += timingRows(cell.started_at_ms ?? null, cell.finished_at_ms ?? null);
+          const cu = ttCellUsage(cell);
+          html += `<div class="kv-row"><span class="k">tokens</span><span class="v">${ttFmtTokens(cu)}</span></div>`;
+          html += `<div class="kv-row"><span class="k">cost</span><span class="v">${ttCostCellHtml(cu, ttCellUsageItems(cell))}</span></div>`;
+          if (cell.error) html += `<div class="kv-row"><span class="k">error</span><span class="v" style="color:var(--failed)">${esc(cell.error)}</span></div>`;
+        }
+        html += `<h4 style="margin:14px 0 6px">Task proof steps</h4>`;
+        const taskProof = row.task.proof || [];
+        if (!taskProof.length) html += `<div class="empty" style="padding:6px 0">No task-scope proof steps.</div>`;
+        else html += taskProof.map((v) => `<div class="kv-row">${sdot(v.state)}<span class="k">${esc(v.id || v.kind)}</span><span class="v">${pill(v.state)}</span></div>`).join("");
+        if (row.prPick) {
+          html += `<h4 style="margin:14px 0 6px">PR check</h4>`;
+          html += `<button class="btn" onclick="ttRunPrCheck('${esc(row.squadId)}',${row.taskIdx})" data-tip="On-demand only: fetches live drift (a git fetch) and un-actioned feedback (one forge API call) for this task's earliest PR.\nNot part of &quot;needs me&quot; or polled automatically -- at board scale that would be one round-trip per PR per refresh.">Check drift &amp; feedback</button>`;
+          if (taskTabPrCheckFor && taskTabPrCheckFor.squadId === row.squadId && taskTabPrCheckFor.taskIdx === row.taskIdx && taskTabPrCheckResult) {
+            const res = taskTabPrCheckResult;
+            if (res.loading) html += `<div class="meta">Checking…</div>`;
+            else if (res.error) html += `<div class="meta" style="color:var(--failed)">${esc(res.error)}</div>`;
+            else {
+              if (res.sync) html += `<div class="kv-row"><span class="k">in sync</span><span class="v">${res.sync.in_sync ? "yes" : "no"}${res.sync.pr_ahead ? " (PR ahead)" : ""}${res.sync.worktree_ahead ? " (worktree ahead)" : ""}</span></div>`;
+              if (res.comments) html += `<div class="kv-row"><span class="k">un-actioned feedback</span><span class="v">${res.comments.filter((c) => !c.actioned).length} of ${res.comments.length}</span></div>`;
+            }
+          }
+        }
+        el.innerHTML = html;
+      }
+      /**
+       * Repaints every visible live-ticking Time-column cell in place (RAL-362 §3/acceptance: never a full re-render) once a second while the Tasks tab is open in duration mode.
+       * @returns {void}
+       */
+      function ttTickRunningTimes() {
+        if (tab !== "tasks" || taskTabTimeMode !== "duration") return;
+        document.querySelectorAll('.tt-time[data-running="1"]').forEach((el) => {
+          const started = Number(/** @type {HTMLElement} */ (el).dataset.started);
+          if (started) el.textContent = fmtDuration(Date.now() - started);
+        });
+      }
+      setInterval(ttTickRunningTimes, 1000);
+
       const REVIEW_ORIGINS = ["explicit", "arbiter"];
       /**
        * @returns {{q: string, status: Set<string>, resolver: Set<string>, origin: Set<string>, showHidden: boolean}}
@@ -2057,6 +3608,7 @@
       //    as a second fragment delimiter.
       //  · `?id=` is authoritative and the board always emits it, so a link
       //    survives the label being renamed.
+      // RALPHUS-URI-CODEC:BEGIN
       /** Opens a segment's bracketed value: the `[` of `TASK[ral-178]`. */
       const URI_VALUE_OPEN_TOKEN = "[";
       /** Closes a segment's bracketed value: the `]` of `TASK[ral-178]`. */
@@ -2242,6 +3794,7 @@
         const value = name ? uriEncodeLabel(name) : `${URI_INDEX_SIGIL_TOKEN}${index}`;
         return `${kind}${URI_VALUE_OPEN_TOKEN}${value}${URI_VALUE_CLOSE_TOKEN}`;
       }
+      // RALPHUS-URI-CODEC:END
       /**
        * Builds the canonical URI for the current tasks-tab selection inside `squad`.
        * Always carries the `?id=` sidecar, so the link survives a rename (§C.3).
@@ -2315,6 +3868,50 @@
         const proofIdx = idx(proofSeg, (cells[cellIdx].proof || []).map((v) => v.id));
         if (proofIdx < 0) return null;
         return { kind: "proof", taskIdx, cellIdx, proofIdx, proofScope: "cell" };
+      }
+      /**
+       * Builds the canonical URI for the Tasks tab's own selection scheme
+       * (RAL-362 §7) -- deliberately disjoint from `squadSelectionUri`'s: it
+       * starts with a TASK segment (never SQUAD), carrying the squad only as
+       * a `?sq=` sidecar, so `isLegacySquadsTasksHash` can tell old squad-viewer
+       * links apart from links into this tab without any extra state.
+       * @param {string} squadId
+       * @param {TaskView} task
+       * @param {TaskTabSel} s
+       * @returns {string}
+       */
+      function taskTabSelectionUri(squadId, task, s) {
+        let path = uriSegment("TASK", task.name, s.taskIdx);
+        if (s.kind === "cell") {
+          const cell = (task.cells || [])[s.cellIdx];
+          path += URI_SEGMENT_SEPARATOR_TOKEN + uriSegment("CELL", cell && (cell.name || cell.id), s.cellIdx);
+        }
+        return `ralphus:${URI_SEGMENT_SEPARATOR_TOKEN}${path}${URI_QUERY_OPEN_TOKEN}sq${URI_QUERY_ASSIGN_TOKEN}${uriEncodeQueryValue(squadId)}`;
+      }
+      /**
+       * Resolves a Tasks-tab selection URI against the loaded squads list,
+       * turning its `?sq=`/TASK/CELL names back into positional indices.
+       * Returns null if the squad, task or cell it names can't be found.
+       * @param {ParsedUri} uri
+       * @returns {TaskTabSel|null}
+       */
+      function taskTabSelFromUri(uri) {
+        const squadId = uri.query.sq;
+        const squad = squadId ? findSquad(squadId) : null;
+        if (!squad) return null;
+        const bySegment = /** @type {{[kind: string]: UriSegment}} */ ({});
+        for (const segment of uri.segments) bySegment[segment.kind] = segment;
+        if (!bySegment.TASK) return null;
+        const tasks = squad.tasks || [];
+        const taskIdx = bySegment.TASK.index !== null ? bySegment.TASK.index : tasks.findIndex((t) => t.name === bySegment.TASK.name);
+        if (taskIdx < 0 || taskIdx >= tasks.length) return null;
+        if (!bySegment.CELL) return { kind: "task", squadId: squad.id, taskIdx, cellIdx: -1 };
+        const cells = tasks[taskIdx].cells || [];
+        const cellIdx = bySegment.CELL.index !== null
+          ? bySegment.CELL.index
+          : cells.findIndex((c) => (c.name || c.id) === bySegment.CELL.name);
+        if (cellIdx < 0 || cellIdx >= cells.length) return null;
+        return { kind: "cell", squadId: squad.id, taskIdx, cellIdx };
       }
       /**
        * Whitelists a state/status string to identifier-safe characters
@@ -2412,7 +4009,7 @@
       // RAL-160: token/cost figures shown in the cell detail pane reflect
       // only this cell's current squad — a restart overwrites them rather
       // than accumulating, so they are never a running total across retries.
-      const TOKENS_COST_TIP = "Input tokens: uncached text sent to the model (prompt, system prompt, tool results).\nOutput tokens: text the model generated in response.\ncache write / cache read: prompt-cache tokens (RAL-326), billed at their own rates and deliberately kept out of the input figure — for a long agentic cell they are usually the bulk of what was actually billed, which is why an input count on its own can look implausibly small.\nShown only when the backend reports them: claude-code, codex and pi do; the native pydantic backend and external harnesses do not.\n$ cost is for this squad only — it is not cumulative across restarts of this cell.\nN/A means this cell's agent backend reported no dollar figure at all (Codex and the native pydantic backend never do) — it does not mean the cell was free.\nWhile a cell is running these update as each agent turn completes, so they read 0 until the first turn finishes.";
+      const TOKENS_COST_TIP = "Input tokens: uncached text sent to the model (prompt, system prompt, tool results).\nOutput tokens: text the model generated in response.\ncache write / cache read: prompt-cache tokens (RAL-326), billed at their own rates and deliberately kept out of the input figure — for a long agentic cell they are usually the bulk of what was actually billed, which is why an input count on its own can look implausibly small.\ncompaction input: tokens spent on Claude Code's own auto-compaction summarization requests (RAL-373) — also kept out of the input figure. See the \"compaction\" row below for what that costs.\nShown only when the backend reports them: claude-code, codex and pi do; the native pydantic backend and external harnesses do not.\n$ cost is for this squad only — it is not cumulative across restarts of this cell.\nN/A means this cell's agent backend reported no dollar figure at all (Codex and the native pydantic backend never do) — it does not mean the cell was free.\nWhile a cell is running these update as each agent turn completes, so they read 0 until the first turn finishes.";
       // RAL-160: restarting a cell overwrites its tokens/cost in place, so
       // the running total across every attempt only survives in Cartographer's
       // "cell completed" event history — load it on demand rather than on
@@ -2435,8 +4032,17 @@
       // (RAL-172): a proof step's own token/cost usage is now tracked
       // per-attempt server-side, and its lifetime total is loaded the same
       // on-demand way, scoped to this exact step (task + scope + position).
-      const PROOF_TOKENS_COST_TIP = "Input tokens: uncached text sent to the model (prompt, system prompt, tool results) for this proof step.\nOutput tokens: text the model generated in response.\ncache write / cache read: prompt-cache tokens (RAL-326), billed at their own rates and kept out of the input figure; shown only when the backend reports them.\n$ cost is for this squad only — it is not cumulative across restarts of this proof step.\nN/A means this step's agent backend reported no dollar figure at all (Codex and the native pydantic backend never do) — it does not mean the step was free.";
+      const PROOF_TOKENS_COST_TIP = "Input tokens: uncached text sent to the model (prompt, system prompt, tool results) for this proof step.\nOutput tokens: text the model generated in response.\ncache write / cache read: prompt-cache tokens (RAL-326), billed at their own rates and kept out of the input figure; shown only when the backend reports them.\ncompaction input: tokens spent on Claude Code's own auto-compaction summarization requests (RAL-373); see the \"compaction\" row below for what that costs.\n$ cost is for this squad only — it is not cumulative across restarts of this proof step.\nN/A means this step's agent backend reported no dollar figure at all (Codex and the native pydantic backend never do) — it does not mean the step was free.";
       const PROOF_LIFETIME_COST_TIP = "Sums tokens and cost across every completed attempt of this proof step (same task + scope + step position) within this squad — every restart and retry of it, not just the attempt shown above.\nScoped to this squad for the same reason the cell-level total is: the step key is positional, so every squad running the same task file reuses it.\nWho/when: check this to see total spend on a proof step that has been restarted several times inside this squad.\nLoaded on demand from the Cartographer event log — click to fetch; older attempts may be missing if Cartographer retention has pruned them.";
+      // RAL-373: Claude Code's own auto-compaction summarization requests are
+      // billed at the uncached input rate and already folded into `cost_usd`
+      // by the backend's authoritative total — this row is a *derived slice*
+      // of that total, not additional spend, and must never be added on top
+      // of it. Shown unconditionally (unlike the cache write/read segments
+      // in usageSummary(), which are omitted at zero) because the count
+      // alone — including zero — is exactly the signal `auto_compact_threshold`
+      // gets sized from.
+      const COMPACTION_TIP = "How many times Claude Code auto-compacted this run's own conversation history, and the USD cost attributable to those compactions (compaction input tokens × the model's uncached input rate).\nThis cost is already included in the $ figure above — it's a breakdown of part of that total, not extra spend on top of it.\nWho/when: check this when deciding whether to raise or lower auto_compact_threshold for this cell/proof step's agent — frequent compaction usually means the threshold is too low for the work being done.\n\"size not reported\" means compactions happened but this Claude Code version didn't report how many tokens each one summarized away — treat it as a nonzero, unknown cost, not a free compaction.";
       // RAL-187: not every agent backend reports a dollar cost. Codex's CLI has
       // no cost field anywhere in its output, and the native pydantic backend
       // returns 0.0 unconditionally, so both land here as a bare 0. Rendering
@@ -2445,7 +4051,7 @@
       // zero/absent figure therefore renders as "N/A": no price table, no
       // estimated number, and deliberately no per-backend branching, since
       // "nothing was reported" is the honest answer wherever it comes from.
-      // The three helpers below are kept pure and DOM-free so `test/
+      // The helpers below are kept pure and DOM-free so `test/
       // board-usage-summary.mjs` can slice them out of this file and run the
       // real shipped source under `node --test`. Keep the markers around them.
       // RALPHUS-USAGE-SUMMARY:BEGIN
@@ -2463,9 +4069,12 @@
       // segments are omitted entirely when both are zero, which is both the
       // pre-RAL-326 row and the backend-reports-no-cache-breakdown case; there
       // is nothing to tell apart and nothing worth the row width either way.
+      // RAL-373: compaction-input tokens are billed the same way (own bucket,
+      // omitted at zero for the same reason) — see compactionSummary() below
+      // for the derived-cost breakdown of what they add up to.
       /**
        * Renders one run's token/cost figures as a single line.
-       * @param {{tokens_in?: number, tokens_out?: number, cache_creation_tokens?: number, cache_read_tokens?: number, cost_usd?: number}} u
+       * @param {{tokens_in?: number, tokens_out?: number, cache_creation_tokens?: number, cache_read_tokens?: number, compaction_input_tokens?: number, cost_usd?: number}} u
        * @returns {string}
        */
       function usageSummary(u) {
@@ -2473,8 +4082,58 @@
         const cc = u.cache_creation_tokens ?? 0;
         const cr = u.cache_read_tokens ?? 0;
         if (cc || cr) parts.push(`cache write ${cc}`, `cache read ${cr}`);
+        const ci = u.compaction_input_tokens ?? 0;
+        if (ci) parts.push(`compaction input ${ci}`);
         parts.push(fmtCostUsd(u.cost_usd));
         return parts.join(" · ");
+      }
+      // RAL-373: mirrors `estimate_cost_usd`'s `rate_in` selection in
+      // runner/src/claude_code_backend.rs so this display and the runner's
+      // own conservative kill-switch estimate agree on what a given model's
+      // uncached input costs per million tokens.
+      /**
+       * Approximate uncached-input rate (USD per million tokens) by
+       * model-name substring.
+       * @param {string|null|undefined} model
+       * @returns {number}
+       */
+      function uncachedInputRateUsd(model) {
+        const m = (model || "").toLowerCase();
+        if (m.includes("haiku")) return 1.0;
+        if (m.includes("sonnet") || m.includes("fable") || m.includes("mythos")) return 3.0;
+        return 15.0;
+      }
+      /**
+       * Derives the USD cost attributable to Claude Code's own auto-compaction
+       * summarization requests: `compaction_input_tokens` billed at the
+       * model's uncached input rate. This is a *slice* of `cost_usd` (which,
+       * on this code path, already bills the compaction requests as part of
+       * the backend's authoritative total) — never add it on top of `cost_usd`.
+       * @param {string|null|undefined} model
+       * @param {number} compactionInputTokens
+       * @returns {number}
+       */
+      function compactionCostUsd(model, compactionInputTokens) {
+        return (compactionInputTokens * uncachedInputRateUsd(model)) / 1_000_000;
+      }
+      /**
+       * Renders one run's compaction count and derived cost as a single line
+       * — e.g. "7 - $2.8200 USD", or "7 - size not reported" when
+       * `compaction_count` is nonzero but `compaction_input_tokens` is still
+       * 0 (an older Claude Code version that didn't report compaction size).
+       * Always renders, including "0", unlike the cache/compaction *token*
+       * segments in usageSummary() — the count alone is the signal
+       * `auto_compact_threshold` gets sized from.
+       * @param {{compaction_count?: number, compaction_input_tokens?: number}} u
+       * @param {string|null|undefined} model
+       * @returns {string}
+       */
+      function compactionSummary(u, model) {
+        const count = u.compaction_count ?? 0;
+        if (!count) return `${count}`;
+        const tokens = u.compaction_input_tokens ?? 0;
+        const costText = tokens ? fmtCostUsd(compactionCostUsd(model, tokens)) : "size not reported";
+        return `${count} - ${costText}`;
       }
       const ESTIMATED_COST_TIP = "These figures are the last live mid-run snapshot, not the backend's own final accounting (RAL-326).\nThe process was lost, cancelled, timed out, or killed for exceeding its cost cap before a terminal usage event arrived, so what got recorded stops at whatever agent turn died and is priced by the runner's approximate per-model table rather than the backend's own total.\nTreat it as a floor on what was really spent, not a settled bill.";
       /**
@@ -2649,8 +4308,9 @@
       applyTheme(localStorage.getItem("ralphus-theme") || "dark");
 
       // ---------- resizable panes (RAL-12) ----------
-      // The tasks-page sidebar and details columns are var-driven grid tracks; a
-      // thin splitter beside each drags its width. Widths persist in localStorage.
+      // The squads-page sidebar/details columns and the tasks-page details column
+      // are var-driven grid tracks; a thin splitter beside each drags its width.
+      // Widths persist in localStorage.
       /**
        * @typedef {object} SplitCfgEntry
        * @property {string} key
@@ -2665,6 +4325,9 @@
         // Its effective ceiling is computed dynamically by detailsMaxW() instead,
         // so the center graph pane never collapses below MIN_CENTER_W.
         "--details-w": { key: "ralphus-details-w", def: 340, min: 240 },
+        // Same idea for the flat Tasks tab's details pane, whose ceiling is
+        // computed by taskDetailsMaxW() so the table pane never collapses below MIN_CENTER_W.
+        "--task-details-w": { key: "ralphus-task-details-w", def: 340, min: 240 },
       };
       const MIN_CENTER_W = 240; // guard rail for the middle graph pane, matching --sidebar-w's existing min-width pattern
       /**
@@ -2676,12 +4339,19 @@
         return Math.max(SPLIT_CFG["--details-w"].min, window.innerWidth - sidebarW - 12 - MIN_CENTER_W);
       }
       /**
+       * Computes the Tasks tab details pane's dynamic max width so the table pane never collapses below MIN_CENTER_W.
+       * @returns {number}
+       */
+      function taskDetailsMaxW() {
+        return Math.max(SPLIT_CFG["--task-details-w"].min, window.innerWidth - 12 - MIN_CENTER_W);
+      }
+      /**
        * Resolves a pane's effective max width for the current viewport.
        * @param {string} varName
        * @param {SplitCfgEntry} c
        * @returns {number}
        */
-      function paneMax(varName, c) { return varName === "--details-w" ? detailsMaxW() : (c.max ?? Infinity); }
+      function paneMax(varName, c) { return varName === "--details-w" ? detailsMaxW() : varName === "--task-details-w" ? taskDetailsMaxW() : (c.max ?? Infinity); }
       /** @type {{el: Element, varName: string, invert: boolean, startX: number, startW: number, min: number}|null} */
       let splitDrag = null;
       /**
@@ -2725,12 +4395,12 @@
         splitDrag = null;
       }
       /**
-       * Wires up mousedown-drag behavior on every `.splitter` element in the tasks page.
+       * Wires up mousedown-drag behavior on every `.splitter` element in the squads and tasks pages.
        * @returns {void}
        */
       function initSplitters() {
         applyPaneWidths();
-        document.querySelectorAll("#tasks-page .splitter").forEach((sp0) => {
+        document.querySelectorAll("#squads-page .splitter, #tasks-page .splitter").forEach((sp0) => {
           const el = /** @type {HTMLElement} */ (sp0);
           el.addEventListener("mousedown", (/** @type {MouseEvent} */ e) => {
             e.preventDefault();
@@ -2749,7 +4419,7 @@
       initSplitters();
 
       // ---------- tabs ----------
-      const TABS = ["tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "prefs"];
+      const TABS = ["squads", "tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "prefs"];
       /**
        * Switches the active top-level tab, updates its URL hash, and re-renders.
        * @param {string} name
@@ -2761,7 +4431,7 @@
         // direct #/users-style hash -- the daemon enforces the real gate
         // server-side; this just keeps the client from rendering a page
         // whose data it can no longer fetch.
-        if (ADMIN_ONLY_TABS.includes(name) && whoAmIResolved && !currentUserIsAdmin) name = "tasks";
+        if (ADMIN_ONLY_TABS.includes(name) && whoAmIResolved && !currentUserIsAdmin) name = "squads";
         // RAL-332 "Edit Profile": viewing another user's Preferences ends the
         // instant the admin navigates anywhere else -- never persisted.
         if (tab === "prefs" && name !== "prefs") prefsViewingAs = null;
@@ -2808,7 +4478,7 @@
         applyAdminTabVisibility();
         // A non-admin whose admin flag was just revoked mid-session should
         // not stay parked on a page it can no longer fetch.
-        if (whoAmIResolved && !currentUserIsAdmin && ADMIN_ONLY_TABS.includes(tab)) showTab("tasks", true);
+        if (whoAmIResolved && !currentUserIsAdmin && ADMIN_ONLY_TABS.includes(tab)) showTab("squads", true);
       }
 
       // ---------- hash routing ----------
@@ -2828,6 +4498,7 @@
       // any character that isn't survives round-tripping as a `%XX` escape
       // `uriDecodeLabel` reads back.
       /** Matches the `sel=` parameter and everything after it, so an embedded `?id=…&…` stays intact. */
+      // RALPHUS-HASH-SEL:BEGIN
       const HASH_SEL_RE = /[?&]sel=/;
       /**
        * @typedef {object} ParsedHash
@@ -2847,6 +4518,7 @@
         const at = raw.search(HASH_SEL_RE);
         return at < 0 ? [raw, null] : [raw.slice(0, at), raw.slice(at + 5)];
       }
+      // RALPHUS-HASH-SEL:END
       /**
        * Joins a base route, a filter query string, and a trailing raw `sel=` value.
        * @param {string} base
@@ -2923,6 +4595,20 @@
             : "";
           const base = selectedGuardian && !guardian ? `#/reviews/${selectedGuardian}` : "#/reviews";
           url = hashWithSel(base, p.toString(), selUri);
+        } else if (tab === "tasks") {
+          const p = new URLSearchParams();
+          if (taskTabFilters.q) p.set("q", taskTabFilters.q);
+          if (taskTabFilters.sort !== "squad") p.set("sort", taskTabFilters.sort);
+          if (taskTabFilters.dir !== 1) p.set("dir", "desc");
+          if (taskTabFilters.status.size !== STATES.length) p.set("status", [...taskTabFilters.status].join(","));
+          if (taskTabFilters.showHidden) p.set("hidden", "1");
+          if (taskTabFilters.needsMe) p.set("needsme", "1");
+          if (taskTabFilters.groupBySquad) p.set("group", "1");
+          if (taskTabExpanded.size) p.set("expanded", [...taskTabExpanded].join(","));
+          const squad = taskTabSel.squadId ? findSquad(taskTabSel.squadId) : null;
+          const task = squad && taskTabSel.kind ? (squad.tasks || [])[taskTabSel.taskIdx] : null;
+          const selUri = squad && task ? taskTabSelectionUri(squad.id, task, taskTabSel) : "";
+          url = hashWithSel("#/tasks", p.toString(), selUri);
         } else {
           const p = new URLSearchParams();
           if (filters.q) p.set("q", filters.q);
@@ -2932,13 +4618,13 @@
           if (filters.showHidden) p.set("hidden", "1");
           const squad = selectedSquadId ? findSquad(selectedSquadId) : null;
           if (squad) {
-            url = hashWithSel("#/tasks", p.toString(), squadSelectionUri(squad, sel));
+            url = hashWithSel("#/squads", p.toString(), squadSelectionUri(squad, sel));
           } else {
             // The squad isn't in `squads` yet (first paint, or a hash applied
             // before the first poll) so there are no names to build a URI
             // from — emit the legacy positional form until it loads.
             if (sel.kind) { const vi = sel.kind === "proof" ? `:${sel.proofIdx ?? -1}` : ""; p.set("sel", `${sel.kind}:${sel.taskIdx}:${sel.cellIdx}${vi}`); }
-            const base = selectedSquadId ? `#/tasks/${selectedSquadId}` : "#/tasks";
+            const base = selectedSquadId ? `#/squads/${selectedSquadId}` : "#/squads";
             const qs = p.toString();
             url = qs ? `${base}?${qs}` : base;
           }
@@ -2989,6 +4675,46 @@
           const ptype = p.get("type"); if (ptype !== null) hiddenFilters.type = new Set(ptype.split(",").filter(Boolean));
           return { tab: "prefs" };
         }
+        if (raw.startsWith("squads")) return parseSquadsHashBody(raw);
+        if (raw.startsWith("tasks")) {
+          return isLegacySquadsTasksHash(raw) ? parseSquadsHashBody(raw) : parseTasksTabHash(raw);
+        }
+        return null;
+      }
+      // RALPHUS-LEGACY-TASKS-HASH:BEGIN
+      /**
+       * Whether a `#tasks...` hash is really an old (pre-RAL-362) squad-viewer
+       * link -- back when the squad viewer itself lived at `#/tasks` -- rather
+       * than a link into the new flat Tasks tab. Recognized by any of the
+       * three shapes the old viewer ever emitted: a positional squad id in the
+       * path, a bare legacy `kind:ti:si[:vi]` selector, or a URI selector whose
+       * first segment addresses a SQUAD (see `squadSelectionUri`). The new
+       * Tasks tab never emits any of these -- its own selector URIs start
+       * with a TASK segment (see `taskTabSelectionUri`).
+       * @param {string} raw
+       * @returns {boolean}
+       */
+      function isLegacySquadsTasksHash(raw) {
+        const [head, selValue] = splitHashSel(raw);
+        const [path] = head.split("?");
+        const seg = path.split("/");
+        if (seg[1]) return true;
+        if (selValue && !looksLikeUri(selValue) && /^(task|cell|proof):/.test(selValue)) return true;
+        if (selValue && looksLikeUri(selValue)) {
+          const uri = parseRalphusUri(selValue);
+          if (uri && uri.segments[0] && uri.segments[0].kind === "SQUAD") return true;
+        }
+        return false;
+      }
+      // RALPHUS-LEGACY-TASKS-HASH:END
+      /**
+       * Parses the squad-viewer's hash body -- shared by its own `#/squads`
+       * route and by legacy `#/tasks...` links from before RAL-362 renamed it.
+       * Side-effects `filters` for the squads-tab case.
+       * @param {string} raw
+       * @returns {ParsedHash}
+       */
+      function parseSquadsHashBody(raw) {
         const [head, selValue] = splitHashSel(raw);
         const [path, query] = head.split("?");
         const seg = path.split("/");
@@ -3004,7 +4730,30 @@
         // decoded against the loaded squad in `pollTasks`.
         const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
         const uriSquadId = uri ? uri.query.id || (uri.segments[0] && uri.segments[0].name) : null;
-        return { tab: "tasks", squadId: uriSquadId || seg[1] || null, uri, sel: uri ? null : selValue };
+        return { tab: "squads", squadId: uriSquadId || seg[1] || null, uri, sel: uri ? null : selValue };
+      }
+      /**
+       * Parses the new flat Tasks tab's hash -- its own filter/selection
+       * scheme, disjoint from the squad viewer's (see `isLegacySquadsTasksHash`).
+       * Side-effects `taskTabFilters`/`taskTabExpanded` for the tasks-tab case.
+       * @param {string} raw
+       * @returns {ParsedHash}
+       */
+      function parseTasksTabHash(raw) {
+        const [head, selValue] = splitHashSel(raw);
+        const [, query] = head.split("?");
+        const p = new URLSearchParams(query || "");
+        taskTabFilters = defaultTaskTabFilters();
+        const pq = p.get("q"); if (pq !== null) taskTabFilters.q = pq.toLowerCase();
+        const psort = p.get("sort"); if (psort) taskTabFilters.sort = psort;
+        if (p.get("dir") === "desc") taskTabFilters.dir = -1;
+        const pstatus = p.get("status"); if (pstatus !== null) taskTabFilters.status = new Set(pstatus.split(",").filter(Boolean));
+        taskTabFilters.showHidden = p.get("hidden") === "1";
+        taskTabFilters.needsMe = p.get("needsme") === "1";
+        taskTabFilters.groupBySquad = p.get("group") === "1";
+        const pexpanded = p.get("expanded"); if (pexpanded !== null) taskTabExpanded = new Set(pexpanded.split(",").filter(Boolean));
+        const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
+        return { tab: "tasks", uri, sel: uri ? null : selValue };
       }
 
       // ---------- filters ----------
@@ -6376,13 +8125,13 @@
         renderReviewDetail();
       }
       /**
-       * Navigates to the Tasks tab and selects a squad.
+       * Navigates to the Squads tab and selects a squad.
        * @param {string} id
        * @returns {void}
        */
-      function gotoSquad(id) { clearNodeMultiSel(); selectedSquadId = id; revealedSquadId = id; sel = { kind: "squad", taskIdx: 0, cellIdx: 0 }; editing = false; showTab("tasks", true); }
+      function gotoSquad(id) { clearNodeMultiSel(); selectedSquadId = id; revealedSquadId = id; sel = { kind: "squad", taskIdx: 0, cellIdx: 0 }; editing = false; showTab("squads", true); }
       /**
-       * Navigates to the Tasks tab and selects a specific task/cell/proof item within a squad.
+       * Navigates to the Squads tab and selects a specific task/cell/proof item within a squad.
        * @param {string} squadId
        * @param {string} kind
        * @param {number} ti
@@ -6390,7 +8139,7 @@
        * @param {number} vi
        * @returns {void}
        */
-      function gotoSquadItem(squadId, kind, ti, si, vi) { clearNodeMultiSel(); selectedSquadId = squadId; revealedSquadId = squadId; sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi }; editing = false; showTab("tasks", true); }
+      function gotoSquadItem(squadId, kind, ti, si, vi) { clearNodeMultiSel(); selectedSquadId = squadId; revealedSquadId = squadId; sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi }; editing = false; showTab("squads", true); }
       /**
        * Builds the tooltip text for an inherited resolved value in the details pane.
        * @param {string} field
@@ -6576,6 +8325,7 @@
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}${outOfDateBadge(v.env_out_of_date)}</span></div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(proofModel || "—", proofModelTip)}</div>
           <div class="kv-row" data-tip="${PROOF_TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(v)}${estimatedBadge(v.cost_is_estimated)}</span></div>
+          <div class="kv-row" data-tip="${COMPACTION_TIP}"><span class="k">compaction</span><span class="v">${compactionSummary(v, proofModel)}</span></div>
           <div class="kv-row" data-tip="${PROOF_LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="${proofCartoElId}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(proofCartoKey)}" data-carto-kind="proof" data-el-id="${esc(proofCartoElId)}" data-squad-id="${esc(r.id)}" data-tip="${PROOF_LIFETIME_COST_TIP}">Σ load total</button></span></div>
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
           ${maximumToolOutputTokensRow(v)}
@@ -6630,6 +8380,52 @@
         return `<div class="kv-row" data-tip="${MAXIMUM_TOOL_OUTPUT_TOKENS_TIP}"><span class="k">tool output cap</span><span class="v">${s.maximum_tool_output_tokens.toLocaleString()} tokens</span></div>`;
       }
       /**
+       * Renders a placeholder for a Triage-opted-in cell (RAL-318) that
+       * hasn't been swept into an actual review yet, shown in the cell
+       * details pane's "in reviews" section in place of a real review link.
+       * Empty once a real review exists (`s.reviews` non-empty) or the cell
+       * never opted into Triage (`s.triage_types` empty) -- `cellView()`
+       * only calls this as the fallback when `s.reviews` is empty.
+       *
+       * Three states, matching the cell's own `state` rather than any
+       * stored Triage/pool field (there's nothing to poll for beyond what
+       * `CellView` already carries -- and `CellView.state` is already the
+       * proof-aware effective state, not the raw persisted column): "failed"
+       * (permanently excluded -- a failed cell can never pass review, so it
+       * is never swept into an auto-review), "scheduled" for a cell that
+       * hasn't reached `done` yet (pending or running -- nothing to
+       * meaningfully review), and "queued" once it has finished and passed
+       * and is simply waiting on its Triage pool's count threshold or a cron
+       * schedule to fire. "scheduled"/"queued" read the same `--arbiter` hue
+       * (this is the Arbiter/Triage subsystem's provenance color, not a
+       * distinct global status) and differ by icon/opacity/copy only;
+       * "failed" reads the shared `--failed` status red instead.
+       * @param {CellView} s
+       * @returns {string}
+       */
+      function triagePlaceholderSection(s) {
+        const types = s.triage_types || [];
+        if (!types.length || (s.reviews || []).length) return "";
+        const typeList = types.join(", ");
+        if (s.state === "failed") {
+          const tip = `This cell opted into Triage (type(s): ${typeList}) but failed.\nA failed cell can never pass review, so it is permanently excluded from being swept into an automatic review.`;
+          return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
+            `<span><span class="dot" style="background:${cvar("--failed")}"></span></span>` +
+            `<span class="v" style="flex:1"><div>✗ Excluded (failed)</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(typeList)}</div></span>` +
+            `</div>`;
+        }
+        const done = s.state === "done";
+        const label = done ? "Queued for auto-review" : "Scheduled for auto-review";
+        const icon = done ? "✓" : "⏳";
+        const tip = done
+          ? `This cell finished and resolved to Triage type(s): ${typeList}.\nIt's pooled and waiting for that pool's count threshold or a cron schedule to fire -- once it does, the Arbiter drains the pool into a fresh review automatically.\nCheck the Triage tab for the pool's current count vs. threshold.`
+          : `This cell opted into Triage (type(s): ${typeList}) and is already pooled for an automatic review, but hasn't reached "done" yet.\nOnce it finishes, this will show "Queued for auto-review" instead -- a pending or running cell has nothing to contribute to a review yet.`;
+        return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
+          `<span style="opacity:${done ? "1" : "0.55"}"><span class="dot" style="background:${cvar("--arbiter")}"></span></span>` +
+          `<span class="v" style="flex:1"><div>${icon} ${esc(label)}</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(typeList)}</div></span>` +
+          `</div>`;
+      }
+      /**
        * Renders the cell-level details pane.
        * @param {SquadView} r
        * @param {TaskView} t
@@ -6657,15 +8453,28 @@
         const inReviews = sReviews.length
           ? `<h3 class="section">in reviews</h3>` + [...sReviews]
               .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
-              .map((rv) => `<div class="kv-row"><span>${gdot(rv.status)}</span>` +
-                `<span class="v" style="flex:1"><div>${esc(rv.name)}</div>${rv.branch ? `<div class="mono" style="font-size:11px;color:var(--muted)">${esc(rv.branch)}</div>` : ""}</span>` +
-                `<span class="k">${esc(rv.status)}</span>` +
-                (rv.branch
-                  ? `<button class="btn" data-click="gotoReviewBranch" data-guardian-id="${esc(rv.id)}" data-branch="${esc(rv.branch)}" data-tip="Jump to the Reviews tab and select the branch ${esc(rv.branch)} in review '${esc(rv.name)}'.">Go to branch</button>`
-                  : `<button class="btn" data-click="gotoReview" data-guardian-id="${esc(rv.id)}" data-tip="Jump to this review on the Reviews tab to see its full status and branch stack.">Go to review</button>`
-                ) +
-                `</div>`).join("")
-          : "";
+              .map((rv) => {
+                const tip = rv.branch
+                  ? `Jump to the Reviews tab and select the branch ${esc(rv.branch)} in review '${esc(rv.name)}'.`
+                  : `Jump to this review on the Reviews tab to see its full status and branch stack.`;
+                // The whole row is clickable (not just the button) so the
+                // badge, name, and status text are all part of the same
+                // link region -- `closest("[data-click]")` resolves to the
+                // button when it's the actual click target, so this doesn't
+                // double-fire.
+                const rowClickAttrs = rv.branch
+                  ? `data-click="gotoReviewBranch" data-guardian-id="${esc(rv.id)}" data-branch="${esc(rv.branch)}"`
+                  : `data-click="gotoReview" data-guardian-id="${esc(rv.id)}"`;
+                return `<div class="kv-row" style="cursor:pointer" ${rowClickAttrs} data-tip="${tip}"><span>${gdot(rv.status)}</span>` +
+                  `<span class="v" style="flex:1"><div>${esc(rv.name)} ${originBadge(rv.origin)}</div>${rv.branch ? `<div class="mono" style="font-size:11px;color:var(--muted)">${esc(rv.branch)}</div>` : ""}</span>` +
+                  `<span class="k">${esc(rv.status)}</span>` +
+                  (rv.branch
+                    ? `<button class="btn" data-click="gotoReviewBranch" data-guardian-id="${esc(rv.id)}" data-branch="${esc(rv.branch)}" data-tip="${tip}">Go to branch</button>`
+                    : `<button class="btn" data-click="gotoReview" data-guardian-id="${esc(rv.id)}" data-tip="${tip}">Go to review</button>`
+                  ) +
+                  `</div>`;
+              }).join("")
+          : triagePlaceholderSection(s);
         const proofSteps = (s.proof || []).length
           ? `<h3 class="section">proof steps</h3>` + (s.proof || []).map((v, vi) =>
               `<div class="kv-row"><span>${sdot(v.state)}</span>` +
@@ -6688,6 +8497,7 @@
           <div class="kv-row"><span class="k">worktree</span><span class="v mono">${esc(s.cwd || "—")}${s.cwd ? copyBtn(s.cwd) : ""}</span></div>
           ${upstreamRow}
           <div class="kv-row" data-tip="${TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(s)}${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}${estimatedBadge(s.cost_is_estimated)}</span></div>
+          <div class="kv-row" data-tip="${COMPACTION_TIP}"><span class="k">compaction</span><span class="v">${compactionSummary(s, s.model)}</span></div>
           <div class="kv-row" data-tip="${LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="cum-cost-${esc(s.id)}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(s.id)}" data-carto-kind="cell" data-el-id="cum-cost-${esc(s.id)}" data-squad-id="${esc(r.id)}" data-tip="${LIFETIME_COST_TIP}">Σ load total</button></span></div>
           ${contextLimitsRow(s)}
           ${maximumToolOutputTokensRow(s)}
@@ -7178,20 +8988,21 @@
           sortCol: "time", dir: "desc",
         });
         const completed = rows.filter((row) => row.message === message);
-        let tokensIn = 0, tokensOut = 0, cacheCreation = 0, cacheRead = 0, cost = 0;
+        let tokensIn = 0, tokensOut = 0, cacheCreation = 0, cacheRead = 0, compactionInput = 0, cost = 0;
         let anyEstimated = false;
         for (const row of completed) {
-          const payload = /** @type {{tokens_in?: number, tokens_out?: number, cache_creation_tokens?: number, cache_read_tokens?: number, cost_usd?: number, cost_is_estimated?: boolean}} */ (row.payload || {});
+          const payload = /** @type {{tokens_in?: number, tokens_out?: number, cache_creation_tokens?: number, cache_read_tokens?: number, compaction_input_tokens?: number, cost_usd?: number, cost_is_estimated?: boolean}} */ (row.payload || {});
           tokensIn += payload.tokens_in || 0;
           tokensOut += payload.tokens_out || 0;
           cacheCreation += payload.cache_creation_tokens || 0;
           cacheRead += payload.cache_read_tokens || 0;
+          compactionInput += payload.compaction_input_tokens || 0;
           cost += payload.cost_usd || 0;
           anyEstimated = anyEstimated || !!payload.cost_is_estimated;
         }
         const el = document.getElementById(elId);
         if (!el) return;
-        const total = usageSummary({ tokens_in: tokensIn, tokens_out: tokensOut, cache_creation_tokens: cacheCreation, cache_read_tokens: cacheRead, cost_usd: cost });
+        const total = usageSummary({ tokens_in: tokensIn, tokens_out: tokensOut, cache_creation_tokens: cacheCreation, cache_read_tokens: cacheRead, compaction_input_tokens: compactionInput, cost_usd: cost });
         el.textContent = completed.length
           ? `${total} across ${completed.length} attempt${completed.length === 1 ? "" : "s"}${anyEstimated ? " (includes estimated attempts)" : ""}`
           : "no completed attempts recorded yet";
@@ -7243,7 +9054,7 @@
        * @param {string} squadId
        * @returns {void}
        */
-      function gotoCartoSquad(e, squadId) { e.stopPropagation(); showTab("tasks", true); selectSquad(squadId); }
+      function gotoCartoSquad(e, squadId) { e.stopPropagation(); showTab("squads", true); selectSquad(squadId); }
       /**
        * Navigates from a Cartographer row to its owning review.
        * @param {MouseEvent} e
@@ -7676,13 +9487,13 @@
       function renderNewTaskModal() {
         const body = ntTab === "simple" ? ntSimpleTabHtml() : ntTab === "files" ? ntFilesTabHtml() : ntPasteTabHtml();
         const tip = ntTab === "simple"
-          ? "Fill in the form and queue a single deterministic task — no TOML to write by hand."
+          ? "Fill in the form and queue a single deterministic squad — no TOML to write by hand."
           : ntTab === "files"
             ? "Validate every loaded file and queue each as its own squad."
             : "Validate the TOML and queue the squad.";
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
-            <h2>New Task</h2>
+            <h2>New Squad</h2>
             <div class="modal-tabs">
               <button class="modal-tab ${ntTab === "simple" ? "active" : ""}" onclick="ntSwitchTab('simple')" data-tip="A guided form for the common case: one prompt, one agent/model, one project, an optional review.\nDeterministic — no LLM call is made just to build the submission (only the opt-in Generate buttons call an agent).">🧭 Simple</button>
               <button class="modal-tab ${ntTab === "files" ? "active" : ""}" onclick="ntSwitchTab('files')" data-tip="Load one or more .toml task files by dragging them in or browsing.\nUse this when the task is already saved as a file — each file is queued as its own separate squad.">📁 Files</button>
@@ -9471,7 +11282,7 @@
           const name = s ? (s.name ?? s.id) : branch.branch;
           const taskName = t ? t.name : "";
           const readyDot = state === "done" ? ` <span class="dot" style="background:var(--done)"></span>` : "";
-          const tip = `Open the task cell that worked on this review branch.\nCell: ${esc(name)} · Task: ${esc(taskName)} · State: ${esc(state)}\nSwitches to the Tasks tab and opens this cell in the detail pane.`;
+          const tip = `Open the task cell that worked on this review branch.\nCell: ${esc(name)} · Task: ${esc(taskName)} · State: ${esc(state)}\nSwitches to the Squads tab and opens this cell in the detail pane.`;
           return `<button class="btn" data-click="gotoSquadItem" data-squad-id="${esc(branch.source_squad_id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1" data-tip="${tip}">${sdot(state)} ${esc(name)}${readyDot}</button>`;
         }
         // Fallback: path-based linking (manually added branches with no submitted cell).
@@ -9483,7 +11294,7 @@
         const readyDot = allDone ? ` <span class="dot" style="background:var(--done)"></span>` : "";
         if (cells.length === 1) {
           const s = cells[0];
-          const tip = `Open the task cell that worked on this review branch.\nCell: ${esc(s.name)} · Task: ${esc(s.taskName)} · State: ${esc(s.state)}\nSwitches to the Tasks tab and opens this cell in the detail pane.`;
+          const tip = `Open the task cell that worked on this review branch.\nCell: ${esc(s.name)} · Task: ${esc(s.taskName)} · State: ${esc(s.state)}\nSwitches to the Squads tab and opens this cell in the detail pane.`;
           return `<button class="btn" data-click="gotoSquadItem" data-squad-id="${esc(s.squadId)}" data-kind="cell" data-ti="${s.taskIdx}" data-si="${s.cellIdx}" data-vi="-1" data-tip="${tip}">${sdot(s.state)} ${esc(s.name)}${readyDot}</button>`;
         }
         const worst = CELL_STATE_RANK.find(r => cells.some(s => s.state === r)) || cells[0].state;
@@ -9519,6 +11330,20 @@
         return `<span class="dot" style="background:${cvar(color)}"></span>`;
       };
       /**
+       * Renders the small provenance badge for a review origin string
+       * ("explicit" or "arbiter"), or an empty string for "explicit" (the
+       * default -- no badge needed). Shared by `arbiterBadge()` (which has a
+       * full `GuardianView`) and any caller that only has the plain origin
+       * string, e.g. a cell's `SquadReviewRef`.
+       * @param {string} origin
+       * @returns {string}
+       */
+      function originBadge(origin) {
+        return origin === "arbiter"
+          ? `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px" data-tip="This review was created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired, draining cells from possibly-multiple past submissions into one fresh review -- not from an authored [[review]] block.">⚙ Arbiter</span>`
+          : "";
+      }
+      /**
        * Renders the small provenance badge for a review the Arbiter/Triage
        * subsystem created automatically (RAL-318), or an empty string for an
        * explicitly-authored review (the default -- no badge needed).
@@ -9526,9 +11351,7 @@
        * @returns {string}
        */
       function arbiterBadge(g) {
-        return originOf(g) === "arbiter"
-          ? `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px" data-tip="This review was created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired, draining cells from possibly-multiple past submissions into one fresh review -- not from an authored [[review]] block.">⚙ Arbiter</span>`
-          : "";
+        return originBadge(originOf(g));
       }
       /**
        * Selects a review and shows its detail pane.
@@ -10294,7 +12117,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${conflictProgress(g)}
           ${reviewCostSummary(g)}
           <div class="kv-row"><span class="k">review id</span><span class="mono" style="cursor:pointer" data-tip="The unique identifier for this Guardian review.\nUse this ID in API calls, daemon logs, or to find the review worktree on disk.\nClick to copy the full ID." data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
-          ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Tasks tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
+          ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
           ${g.status === "collecting" && g.squad_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its squad finishes — or start it now below"}</span></div>` : ""}
           <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
           <div class="kv-row"><span class="k">upstream</span>${["approved","deployed"].includes(g.status) ? `<span class="mono">${esc(g.base_branch)}</span>` : `<div style="display:flex;flex-direction:column;gap:4px"><div style="display:flex;align-items:center;gap:4px"><input type="text" id="base-input" class="mono" list="base-datalist" value="${esc(g.base_branch)}" data-guardian-id="${esc(g.id)}" onfocus="loadBaseBranches(this.dataset.guardianId)" oninput="onBaseBranchInput(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="The branch every submitted branch is rebased onto.\nUsually 'main' or 'master'.\nType or use ▾ to pick from remote."><datalist id="base-datalist">${(baseBranchCache[g.id]||[]).map(b=>`<option value="${esc(b)}"></option>`).join('')}</datalist><button class="btn" style="padding:2px 6px;font-size:13px;line-height:1" data-click="loadBaseBranchesShowPicker" data-guardian-id="${esc(g.id)}" data-tip="Load all branches from the remote and show them as a pick list.\nClick a branch name to fill in the upstream field.">▾</button></div><div id="base-error" style="display:none;color:var(--failed);font-size:11px;margin-top:2px"></div><div id="base-pending" class="row" style="display:none;gap:4px;margin-top:2px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveBase" data-guardian-id="${esc(g.id)}" data-tip="Save the new upstream branch and trigger a full rebase of the review stack.\nReruns even if the branch name is unchanged — useful when the upstream has new commits.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelBase" data-guardian-id="${esc(g.id)}" data-tip="Cancel — revert the upstream branch input to its last saved value.">Cancel</button></div></div>`}</div>
@@ -11851,6 +13674,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       async function tick() {
         await pollWhoAmI();
         await pollHidden();
+        await pollWatches();
         if (tab === "reviews") { await updateCounter(); await pollReviews(); }
         else if (tab === "resources") { await updateCounter(); await pollResources(); }
         else if (tab === "queue") { await updateCounter(); if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
@@ -11861,6 +13685,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         else if (tab === "users") { await updateCounter(); await pollUsers(); }
         else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
         else if (tab === "prefs") { await updateCounter(); await pollPrefs(); }
+        else if (tab === "tasks") { await updateCounter(); await pollTasksTab(); }
         else await pollTasks();
         await refreshBanner();
       }
@@ -11904,8 +13729,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           // Every event is Cartographer-worthy by construction -- always
           // refresh this tab's own view of the log, regardless of kind.
           await pollCartographer();
-        } else if (tab === "tasks" && kinds.has("squad")) {
+        } else if (tab === "squads" && kinds.has("squad")) {
           await pollTasks();
+        } else if (tab === "tasks" && kinds.has("squad")) {
+          await pollTasksTab();
         }
         await refreshBanner();
       }
@@ -12044,7 +13871,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         } catch (e) { /* transient -- the next tick retries */ }
       }
       /**
-       * Polls `/api/tasks` and re-renders the Tasks tab, applying any pending hash-derived selection.
+       * Polls `/api/tasks` and re-renders the Squads tab, applying any pending hash-derived selection.
        * @returns {Promise<void>}
        */
       async function pollTasks() {
@@ -12282,13 +14109,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const arrow = (key) => resSort.key === key ? (resSort.dir < 0 ? " ↓" : " ↑") : "";
         const head = RES_COLS.map((c) =>
           `<th class="${resSort.key === c.key ? "sorted" : ""}" data-click="setResSort" data-col="${esc(c.key)}" data-tip="${esc(c.tip)}">${c.label}${arrow(c.key)}</th>`
-        ).join("") + `<th data-tip="Jump to the cell in the Tasks tab."></th>`;
+        ).join("") + `<th data-tip="Jump to the cell in the Squads tab."></th>`;
         const rows = sortedResources().map((r) => `<tr>
             <td>${esc(r.task_name)} <span style="color:var(--muted)">/ ${esc(r.cell_id)}</span><div style="color:var(--muted);font-size:11px">${esc(r.squad_label || r.squad_id)} · pid ${r.pid}</div></td>
             <td>${fmtPct(r.cpu_percent)}</td>
             <td>${fmtBytes(r.mem_bytes)}</td>
             <td>${fmtBytes(r.gpu_mem_bytes)}</td>
-            <td><button class="res-jump" data-click="jumpToTask" data-squad-id="${esc(r.squad_id)}" data-ti="${r.task_idx}" data-si="${r.cell_idx}" data-tip="Switch to the Tasks tab and scroll to this exact running cell.">Go to task →</button></td>
+            <td><button class="res-jump" data-click="jumpToTask" data-squad-id="${esc(r.squad_id)}" data-ti="${r.task_idx}" data-si="${r.cell_idx}" data-tip="Switch to the Squads tab and scroll to this exact running cell.">Go to task →</button></td>
           </tr>`).join("");
         el.innerHTML = `<table class="res-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
       }
@@ -12446,15 +14273,17 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       async function pollTriage() {
         try {
-          const [typesResp, poolsResp, schedulesResp] = await Promise.all([
+          const [typesResp, poolsResp, schedulesResp, candidatesResp] = await Promise.all([
             fetch("/api/triage/types"),
             fetch("/api/triage/pools"),
             fetch("/api/triage/schedules"),
+            fetch("/api/triage/candidates"),
           ]);
-          const [typesData, poolsData, schedulesData] = await Promise.all([
+          const [typesData, poolsData, schedulesData, candidatesData] = await Promise.all([
             typesResp.json(),
             poolsResp.json(),
             schedulesResp.json(),
+            candidatesResp.json(),
           ]);
           byId("conn").className = "dot on";
           byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
@@ -12462,24 +14291,31 @@ Work submitted against it will fail — fix the machine or deregister the provid
             (/** @type {TriageTypeView} */ a, /** @type {TriageTypeView} */ b) => a.name.localeCompare(b.name));
           triagePools = poolsData.pools || [];
           triageSchedules = schedulesData.schedules || [];
+          triageCandidates = candidatesData.candidates || [];
           renderTriage();
         } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
       }
       /**
        * Renders the Triage tab: the registered type registry, current pool
-       * state with editable count thresholds, and configured cron schedules
-       * (RAL-318).
+       * state with editable count thresholds, configured cron schedules,
+       * and (at the bottom) the candidate list of cells that opted into
+       * Triage but haven't been linked to a review yet (RAL-318). Wrapped in
+       * `preserveUserState` (RAL-7) so a periodic refresh or a filter
+       * keystroke on the candidate list's name search doesn't steal focus.
        * @returns {void}
        */
       function renderTriage() {
         byId("triage-summary").innerHTML =
           `${triageTypes.length} ${triageTypes.length === 1 ? "type" : "types"}, `
           + `${triagePools.length} pooled ${triagePools.length === 1 ? "key" : "keys"} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollTriage()" data-tip="Re-query the daemon for Triage types, pool state, and schedules.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollTriage()" data-tip="Re-query the daemon for Triage types, pool state, schedules, and candidates.">⟳ Refresh</button>`;
         const err = triageError
           ? `<div class="empty" style="color:var(--failed);margin-bottom:8px">${esc(triageError)}</div>`
           : "";
-        byId("triage").innerHTML = err + renderTriageTypesSection() + renderTriagePoolsSection() + renderTriageSchedulesSection();
+        const el = byId("triage");
+        preserveUserState(el, () => {
+          el.innerHTML = err + renderTriageTypesSection() + renderTriagePoolsSection() + renderTriageSchedulesSection() + renderTriageCandidatesSection();
+        });
       }
       /**
        * Renders the Triage type registry table plus its register form.
@@ -12715,6 +14551,116 @@ Work submitted against it will fail — fix the machine or deregister the provid
         } catch (e) { triageError = "daemon unreachable"; }
         await pollTriage();
       }
+      /**
+       * Computes the Triage tab's candidate list after applying the
+       * type/project/name-search filters.
+       * @returns {TriageCandidateView[]}
+       */
+      function visibleTriageCandidates() {
+        const q = triageCandidateFilters.q.trim().toLowerCase();
+        return triageCandidates.filter((c) =>
+          (!triageCandidateFilters.type || c.triage_types.includes(triageCandidateFilters.type))
+          && (!triageCandidateFilters.project || c.project === triageCandidateFilters.project)
+          && (!q
+            || c.task_name.toLowerCase().includes(q)
+            || c.cell_id.toLowerCase().includes(q)
+            || (c.cell_name || "").toLowerCase().includes(q)));
+      }
+      /**
+       * Renders the small status badge for one candidate row describing its
+       * relationship to Triage, not its own cell state: "Scheduled" (opted
+       * in, not done yet -- nothing to sweep into a review), "Queued" (done
+       * and viable, waiting on its pool's count threshold or a cron
+       * schedule), or "Excluded (failed)" (done, but its proof failed --
+       * permanently barred from ever being swept into an auto-review; see
+       * `Store::drain_triage_pool`). Mirrors `triagePlaceholderSection()`'s
+       * per-cell placeholder wording/color, compacted for a table cell.
+       * @param {TriageCandidateView} c
+       * @returns {string}
+       */
+      function triageCandidateStatusBadge(c) {
+        if (c.status === "failed") {
+          return `<span class="badge" style="color:var(--failed);border-color:var(--failed);font-size:11px" data-tip="This cell's proof failed -- a failed cell can never pass review, so it is permanently excluded from being swept into an automatic review.">✗ Excluded (failed)</span>`;
+        }
+        const done = c.status === "queued";
+        const label = done ? "Queued" : "Scheduled";
+        const icon = done ? "✓" : "⏳";
+        const tip = done
+          ? "This cell finished and passed, and is pooled, waiting for its Triage pool's count threshold or a cron schedule to fire."
+          : "This cell opted into Triage but hasn't finished yet -- it can't be swept into an automatic review until it finishes.";
+        return `<span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px;opacity:${done ? "1" : "0.7"}" data-tip="${tip}">${icon} ${label}</span>`;
+      }
+      /**
+       * Renders one Triage candidate's table row. The whole row is
+       * clickable and jumps to the Squads tab with the owning squad/cell
+       * selected, via the same `gotoSquadItem` navigation the rest of the
+       * board uses.
+       * @param {TriageCandidateView} c
+       * @returns {string}
+       */
+      function triageCandidateRowHtml(c) {
+        const cellLabel = c.cell_name || c.cell_id;
+        return `<tr style="cursor:pointer" data-click="gotoTriageCandidate" data-squad-id="${esc(c.squad_id)}" data-ti="${c.task_idx}" data-si="${c.cell_idx}" data-tip="Jump to the Squads tab and select this cell.">
+            <td>${triageCandidateStatusBadge(c)}</td>
+            <td>${c.triage_types.map((t) => esc(t)).join(", ")}</td>
+            <td>${esc(c.project)}</td>
+            <td><div>${esc(c.task_name)}</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(cellLabel)}</div></td>
+          </tr>`;
+      }
+      /**
+       * Renders the Triage candidate list: every cell across every squad
+       * that has opted into Triage and hasn't been linked to an actual
+       * review yet, filterable by type/project/name.
+       * @returns {string}
+       */
+      function renderTriageCandidatesSection() {
+        const list = visibleTriageCandidates();
+        const typeOptions = triageTypes.map((t) =>
+          `<option value="${esc(t.name)}" ${triageCandidateFilters.type === t.name ? "selected" : ""}>${esc(t.name)}</option>`).join("");
+        const projects = [...new Set(triageCandidates.map((c) => c.project))].sort();
+        const projectOptions = projects.map((p) =>
+          `<option value="${esc(p)}" ${triageCandidateFilters.project === p ? "selected" : ""}>${esc(p)}</option>`).join("");
+        const rows = list.length
+          ? list.map((c) => triageCandidateRowHtml(c)).join("")
+          : `<tr><td colspan="4" class="empty">${triageCandidates.length ? "No candidates match these filters." : "No cells have opted into Triage yet."}</td></tr>`;
+        const table = `<table class="proj-table"><thead><tr>`
+          + `<th data-tip="Whether this cell can be swept into an automatic review yet: Scheduled (opted in, still pending/running/failed) or Queued (done, waiting on its pool's count threshold or a cron schedule).">Status</th>`
+          + `<th data-tip="This cell's resolved Triage type(s).">Type</th>`
+          + `<th data-tip="The project this cell's owning task belongs to.">Project</th>`
+          + `<th data-tip="The task and cell this candidate belongs to. Click a row to jump to it on the Squads tab.">Task / Cell</th>`
+          + `</tr></thead><tbody>${rows}</tbody></table>`;
+        return `<div style="margin-top:24px;padding-top:12px;border-top:1px solid var(--border)">
+            <div style="font-weight:600;margin-bottom:8px" data-tip="Every cell across every squad that has opted into Triage (triage = true) and hasn't been linked to an actual review yet -- decided at submission, before the cell even runs. A cell appears here the moment its Triage type(s) resolve, and drops off once its pool drains into a review.">Candidates (${triageCandidates.length})</div>
+            <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:8px">
+              <select id="triage-cand-type" onchange="onTriageCandidateTypeFilter(this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list down to one Triage type.">
+                <option value="">All types</option>${typeOptions}
+              </select>
+              <select id="triage-cand-project" onchange="onTriageCandidateProjectFilter(this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list down to one project.">
+                <option value="">All projects</option>${projectOptions}
+              </select>
+              <input id="triage-cand-q" type="text" placeholder="filter by task/cell name…" value="${esc(triageCandidateFilters.q)}" oninput="onTriageCandidateNameFilter(this.value)" style="flex:1;min-width:200px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list by task or cell name/id." />
+            </div>
+            ${table}
+          </div>`;
+      }
+      /**
+       * Updates the candidate list's Triage-type filter and re-renders.
+       * @param {string} v
+       * @returns {void}
+       */
+      function onTriageCandidateTypeFilter(v) { triageCandidateFilters.type = v; renderTriage(); }
+      /**
+       * Updates the candidate list's project filter and re-renders.
+       * @param {string} v
+       * @returns {void}
+       */
+      function onTriageCandidateProjectFilter(v) { triageCandidateFilters.project = v; renderTriage(); }
+      /**
+       * Updates the candidate list's name-search filter and re-renders.
+       * @param {string} v
+       * @returns {void}
+       */
+      function onTriageCandidateNameFilter(v) { triageCandidateFilters.q = v; renderTriage(); }
 
       /**
        * Polls `/api/users` and re-renders the Users tab.
@@ -13373,18 +15319,15 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * Triage tab's own `triageTypes`/`triagePools` state first so the
        * popup reflects the latest registered types and pool counts.
        *
-       * A Triage pool's `project` key is the cell's git worktree root path
-       * (see the daemon's `worktree_project`), NOT this registered project's
-       * short `name` -- the two are different concepts that happen to share
-       * a label. `projectTriageModalPath` resolves that once at open time so
-       * every filter/API call below targets the pool key cells actually get
-       * pooled under, instead of a name that would never match.
+       * The daemon resolves this registered project's name to its actual
+       * Triage pool key server-side (falling back to a normalized worktree
+       * path only for cells under an unregistered project), so this popup
+       * only ever needs to pass `projectName` through as-is.
        * @param {string} projectName
        * @returns {Promise<void>}
        */
       async function openProjectTriageThresholds(projectName) {
         projectTriageModalProject = projectName;
-        projectTriageModalPath = projects.find((p) => p.name === projectName)?.path || "";
         projectTriageModalError = "";
         await pollTriage();
         renderProjectTriageModal();
@@ -13395,21 +15338,71 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function closeProjectTriageModal() {
         projectTriageModalProject = null;
-        projectTriageModalPath = "";
         closeModal();
       }
+      // RALPHUS-TRIAGE-POOL-MATCH:BEGIN
+      /**
+       * Best-effort, browser-side normalization (RAL-374) for comparing a
+       * Triage pool key against a project's registered path: slash direction
+       * and case folded away. This is a UI hint only -- the daemon
+       * (`crate::triage::pool_key_for_path`) remains the single source of
+       * truth for what a pool key actually resolves to, since only it can
+       * canonicalize a path against the real filesystem (symlinks, drive
+       * substitutions, etc). This just needs to be close enough to stop an
+       * orphaned pool row from silently vanishing from this popup.
+       * @param {string} value
+       * @returns {string}
+       */
+      function normalizeTriagePoolPathHint(value) {
+        return String(value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      }
+      /**
+       * Splits `triagePools` into the rows that exactly match `projectName`
+       * (everything this popup showed before RAL-374) and the rows that
+       * don't match by name but whose key looks like a path variant of
+       * `projectPath` -- i.e. an orphaned pool this popup would otherwise
+       * hide entirely, e.g. a threshold set via the CLI's `<project>`
+       * positional argument before the daemon resolved paths server-side,
+       * or a pre-fix row the once-per-restart `repair_triage_pool_keys` pass
+       * hasn't reached yet.
+       * @param {TriagePoolView[]} triagePools
+       * @param {string} projectName
+       * @param {string|undefined} projectPath
+       * @returns {{matched: TriagePoolView[], orphaned: TriagePoolView[]}}
+       */
+      function partitionTriagePoolsForProject(triagePools, projectName, projectPath) {
+        const matched = [];
+        const orphaned = [];
+        const normalizedProjectPath = projectPath ? normalizeTriagePoolPathHint(projectPath) : "";
+        for (const p of triagePools) {
+          if (p.project === projectName) {
+            matched.push(p);
+          } else if (normalizedProjectPath && normalizeTriagePoolPathHint(p.project) === normalizedProjectPath) {
+            orphaned.push(p);
+          }
+        }
+        return { matched, orphaned };
+      }
+      // RALPHUS-TRIAGE-POOL-MATCH:END
       /**
        * Renders the open Projects-tab Triage-threshold popup for
        * `projectTriageModalProject`: one row per Triage type this project
        * already has a pool or threshold for, plus a picker to add a
-       * threshold for a type it doesn't have one for yet.
+       * threshold for a type it doesn't have one for yet. Also surfaces
+       * (RAL-374) any pool that looks orphaned under a raw path key instead
+       * of this project's registered name, so a real accumulating pool
+       * never silently reads as "No thresholds configured yet".
        * @returns {void}
        */
       function renderProjectTriageModal() {
         const projectName = projectTriageModalProject;
         if (!projectName) return;
-        const path = projectTriageModalPath;
-        const rows = triagePools.filter((p) => p.project === path);
+        const thisProject = projects.find((pr) => pr.name === projectName);
+        const { matched: rows, orphaned } = partitionTriagePoolsForProject(
+          triagePools,
+          projectName,
+          thisProject ? thisProject.path : undefined,
+        );
         const rowsHtml = rows.length
           ? rows.map((p) => {
               const thresholdVal = p.threshold === null || p.threshold === undefined ? "" : String(p.threshold);
@@ -13425,9 +15418,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           : `<tr><td colspan="3" class="empty">No thresholds configured yet.</td></tr>`;
         const usedTypes = new Set(rows.map((p) => p.triage_type));
         const addableTypes = triageTypes.filter((t) => !usedTypes.has(t.name));
-        const addSection = !path
-          ? `<div class="empty" style="margin-top:12px">This project's registered path could not be resolved -- refresh the Projects tab and try again.</div>`
-          : addableTypes.length
+        const addSection = addableTypes.length
           ? `<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px">
               <select id="ptm-add-type" style="width:180px" data-tip="Which registered Triage type this threshold applies to. Register new types on the Triage tab.">
                 ${addableTypes.map((t) => `<option value="${esc(t.name)}">${esc(t.label || t.name)}</option>`).join("")}
@@ -13437,10 +15428,19 @@ Work submitted against it will fail — fix the machine or deregister the provid
             </div>`
           : `<div class="empty" style="margin-top:12px">Every registered Triage type already has a threshold row above.</div>`;
         const err = projectTriageModalError ? `<div class="verr" style="margin-top:8px">${esc(projectTriageModalError)}</div>` : "";
+        const orphanedBanner = orphaned.length
+          ? `<div class="verr" style="margin-bottom:8px" data-tip="These rows are stored under a raw filesystem-path key instead of this project's registered name, most likely from a threshold set before the daemon resolved the path to a name, or the CLI's <project> argument given a path. They already count toward the total pooled/threshold for this project's cells -- restart the daemon to merge them into the rows below via the automatic repair pass, or inspect them directly on the general Triage tab.">
+              ⚠ ${orphaned.length} orphaned ${orphaned.length === 1 ? "pool" : "pools"} for this project ${orphaned.length === 1 ? "is" : "are"} stored under a raw path key and not shown below:
+              <ul style="margin:4px 0 0 18px">
+                ${orphaned.map((o) => `<li><code>${esc(o.project)}</code> — ${esc(o.triage_type)}: pooled ${o.count}, threshold ${o.threshold === null || o.threshold === undefined ? "none" : o.threshold}</li>`).join("")}
+              </ul>
+            </div>`
+          : "";
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeProjectTriageModal()"><div class="modal" style="width:560px;max-width:94vw">
             <h2>Auto-review thresholds — ${esc(projectName)}</h2>
             <div class="k" style="margin-bottom:8px" data-tip="How many Triage-classified cells of a given type must accumulate for this project before the Arbiter automatically drains that pool into a fresh review. This races any cron schedules configured for the same (project, type) key on the Triage tab -- whichever fires first drains the pool.">How many cells of a given Triage type must accumulate for ${esc(projectName)} before a review is created automatically.</div>
+            ${orphanedBanner}
             <table class="proj-table"><thead><tr>
               <th>Type</th><th data-tip="Cells currently pooled for this project + type, waiting for this threshold (or a cron schedule) to fire.">Pooled</th><th data-tip="Draining this pool creates a review once it holds this many cells.">Threshold</th>
             </tr></thead><tbody>${rowsHtml}</tbody></table>
@@ -13459,8 +15459,8 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {Promise<void>}
        */
       async function saveProjectTriageThreshold(e, triageType) {
-        const path = projectTriageModalPath;
-        if (!path) return;
+        const projectName = projectTriageModalProject;
+        if (!projectName) return;
         const input = /** @type {HTMLInputElement|null} */ (document.getElementById(`ptm-threshold-${triageType}`));
         const raw = input ? input.value.trim() : "";
         if (raw !== "" && (!/^\d+$/.test(raw) || Number(raw) < 1)) {
@@ -13472,7 +15472,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           const r = await fetch("/api/triage/pools/threshold", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ project: path, triage_type: triageType, threshold: raw === "" ? null : Number(raw) }),
+            body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: raw === "" ? null : Number(raw) }),
           });
           projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
@@ -13485,8 +15485,8 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {Promise<void>}
        */
       async function addProjectTriageThreshold() {
-        const path = projectTriageModalPath;
-        if (!path) return;
+        const projectName = projectTriageModalProject;
+        if (!projectName) return;
         const typeSel = /** @type {HTMLSelectElement|null} */ (document.getElementById("ptm-add-type"));
         const thresholdInput = /** @type {HTMLInputElement|null} */ (document.getElementById("ptm-add-threshold"));
         const triageType = typeSel ? typeSel.value : "";
@@ -13500,16 +15500,16 @@ Work submitted against it will fail — fix the machine or deregister the provid
           const r = await fetch("/api/triage/pools/threshold", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ project: path, triage_type: triageType, threshold: Number(raw) }),
+            body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: Number(raw) }),
           });
           projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
         await pollTriage();
         renderProjectTriageModal();
       }
-      // Jump straight to a task/cell in the Tasks tab and scroll to it.
+      // Jump straight to a task/cell in the Squads tab and scroll to it.
       /**
-       * Switches to the Tasks tab and scrolls to a specific task or cell.
+       * Switches to the Squads tab and scrolls to a specific task or cell.
        * @param {string} squadId
        * @param {number} ti
        * @param {number} si
@@ -13521,7 +15521,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const cellIdx = +si;
         gotoSquadItem(squadId, kind, taskIdx, cellIdx, -1);
         if (!findSquad(squadId)) {
-          pendingHash = { tab: "tasks", squadId, sel: `${kind}:${taskIdx}:${cellIdx}` };
+          pendingHash = { tab: "squads", squadId, sel: `${kind}:${taskIdx}:${cellIdx}` };
         }
         const scrollId = kind === "task" ? `tk-${taskIdx}` : `n-${taskIdx}-${cellIdx}`;
         setTimeout(() => document.getElementById(scrollId)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
@@ -13871,7 +15871,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const grip = draggable ? `<span class="q-grip">⋮⋮</span>` : `<span class="q-grip" style="opacity:.3">▣</span>`;
         const gotoKind = it.kind === "cell" ? "cell" : "proof";
         const vi = gotoKind === "proof" ? it.proof_idx : -1;
-        const goto = `<button class="q-goto" data-click="gotoSquadItemStopProp" data-squad-id="${esc(it.squad_id)}" data-kind="${esc(gotoKind)}" data-ti="${it.task_idx}" data-si="${it.cell_idx}" data-vi="${vi}" data-tip="Jump to this ${esc(kindLabel)} on the Tasks tab.\nSelects the matching squad/task/cell/proof so you don't have to hunt for it manually.">↗</button>`;
+        const goto = `<button class="q-goto" data-click="gotoSquadItemStopProp" data-squad-id="${esc(it.squad_id)}" data-kind="${esc(gotoKind)}" data-ti="${it.task_idx}" data-si="${it.cell_idx}" data-vi="${vi}" data-tip="Jump to this ${esc(kindLabel)} on the Squads tab.\nSelects the matching squad/task/cell/proof so you don't have to hunt for it manually.">↗</button>`;
         return `<div class="q-row item${selCls}" data-path="${esc(it.path)}" data-drop-before="${esc(it.path)}" style="padding-left:${pad}px" ${dnd}
             data-click="queueRowClick" data-ctx="queueMenu"
             data-tip="${esc(kindLabel)} '${esc(it.name)}' — ${rd}.\nDrag to reorder (dependencies come along); right-click for Set position / Set status.\nOrder is a best-effort hint honored when a compute slot frees, not a hard guarantee.">${grip}${sdot(it.state)}<span class="q-name">${esc(it.name)} <span class="q-meta">${kindLabel}</span></span>${dep}${blocked}<span class="q-badge q-${rd}">${rd}</span>${goto}</div>`;
@@ -14321,13 +16321,13 @@ Work submitted against it will fail — fix the machine or deregister the provid
         else if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !isTypingShortcutTarget(e.target)) {
           e.preventDefault();
           openGotoSearch();
-        } else if ((e.key === "l" || e.key === "L") && tab === "tasks" && !isTypingShortcutTarget(e.target)) openLogs();
+        } else if ((e.key === "l" || e.key === "L") && tab === "squads" && !isTypingShortcutTarget(e.target)) openLogs();
       });
       window.addEventListener("popstate", () => {
         _inPopstate = true;
         try {
           const h = parseHash();
-          if (!h || h.tab === "tasks") {
+          if (!h || h.tab === "squads") {
             if (h && h.squadId) {
               if (findSquad(h.squadId)) {
                 clearNodeMultiSel();
@@ -14338,6 +16338,13 @@ Work submitted against it will fail — fix the machine or deregister the provid
               } else { pendingHash = h; }
             }
             renderSortChips(); renderStatusFilters();
+            showTab("squads");
+          } else if (h.tab === "tasks") {
+            renderTtStatusFilters();
+            if (h.uri) {
+              const wantSel = taskTabSelFromUri(h.uri);
+              if (wantSel) taskTabSel = wantSel; else pendingHash = h;
+            }
             showTab("tasks");
           } else if (h.tab === "reviews") {
             if (h.guardianId) { selectedGuardian = h.guardianId; revealedGuardianId = h.guardianId; }
@@ -14370,8 +16377,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
         }
       });
       pendingHash = parseHash();
-      renderStatusFilters(); renderSortChips(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters();
+      loadTaskTabPrefs();
+      renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters();
       if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId
+      else if (pendingHash && pendingHash.tab === "tasks") { showTab("tasks"); }  // keep pendingHash for pollTasksTab to apply the selection
       else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }
       else if (pendingHash && pendingHash.tab === "queue") { pendingHash = null; showTab("queue"); }
       else if (pendingHash && pendingHash.tab === "cartographer") { applyCartoQuery(pendingHash.cartoQuery || {}); pendingHash = null; showTab("cartographer"); }
