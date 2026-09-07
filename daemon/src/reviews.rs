@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use opentelemetry::Context;
 
-use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key};
+use ralphus_core::schema::{review_link_key, ReviewActionDef, ReviewDef, TaskFile};
 
 use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
@@ -340,10 +340,10 @@ struct Membership {
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
     auto_submit_pr_stack: Option<bool>,
-    /// Optional `[review.auto_build]` declaration (RAL-342): either a static
-    /// `command` or an agent-invocation shape, mutually exclusive with
-    /// `skip_auto_build`.
-    auto_build: Option<ralphus_core::schema::AutoBuildDef>,
+    /// Declared `[[review.auto_build]]` steps (RAL-342): zero or more build
+    /// steps, each either a static `command` or an agent-invocation shape,
+    /// mutually exclusive with `skip_auto_build`.
+    auto_build: Vec<ralphus_core::schema::AutoBuildDef>,
     /// Explicit opt-out of the auto_build requirement (`[[review]]
     /// skip_auto_build = true`, RAL-342), mutually exclusive with `auto_build`.
     skip_auto_build: bool,
@@ -674,7 +674,7 @@ pub fn derive_reviews(
                 .and_then(|r| r.proof_scope.clone())
                 .filter(|s| !s.trim().is_empty()),
             auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
-            auto_build: rv.and_then(|r| r.auto_build.clone()),
+            auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
             skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
         });
     }
@@ -971,7 +971,7 @@ fn apply_resolver(
 }
 
 /// Field-for-field conversion from the offline `core::schema` shape (as parsed
-/// from `[review.auto_build]`) to the runtime `guardian::GuardianAutoBuild`
+/// from `[[review.auto_build]]`) to the runtime `guardian::GuardianAutoBuild`
 /// shape persisted in the store.
 fn into_guardian_auto_build(
     def: &ralphus_core::schema::AutoBuildDef,
@@ -986,17 +986,18 @@ fn into_guardian_auto_build(
     }
 }
 
-/// Persist this review's declared build step (RAL-342), from the first member
-/// that sets `[review.auto_build]`, or -- failing that -- the first member
-/// that sets `skip_auto_build = true`. A no-op when no member declares
-/// either, leaving the guardian to fall back to the project-config default at
-/// merge time.
+/// Persist this review's declared build steps (RAL-342), from the first member
+/// that sets `[[review.auto_build]]` entries, or -- failing that -- the first
+/// member that sets `skip_auto_build = true`. Currently only the first step
+/// is persisted; multiple steps will be supported in the future. A no-op when
+/// no member declares either, leaving the guardian to fall back to the
+/// project-config default at merge time.
 fn apply_auto_build(
     store: &Store,
     gid: &str,
     members: &[&Membership],
 ) -> std::result::Result<(), ReviewError> {
-    if let Some(def) = members.iter().find_map(|m| m.auto_build.as_ref()) {
+    if let Some(def) = members.iter().find_map(|m| m.auto_build.first()) {
         store
             .set_guardian_auto_build(gid, Some(&into_guardian_auto_build(def)))
             .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -1009,7 +1010,7 @@ fn apply_auto_build(
 }
 
 /// RAL-342: every review must explicitly declare its finalize-time build step
-/// -- `[review.auto_build]` or `skip_auto_build = true` -- unless every
+/// -- `[[review.auto_build]]` or `skip_auto_build = true` -- unless every
 /// distinct project in the group already has a project-level `auto_build`
 /// default configured (`.ralphus.toml [review] auto_build`). Runs before the
 /// guardian is created, so a rejection here never leaves behind a partial
@@ -1027,7 +1028,7 @@ fn require_auto_build_declaration(
 ) -> std::result::Result<(), ReviewError> {
     let declared = members
         .iter()
-        .any(|m| m.auto_build.is_some() || m.skip_auto_build);
+        .any(|m| !m.auto_build.is_empty() || m.skip_auto_build);
     if declared {
         return Ok(());
     }
@@ -1039,7 +1040,7 @@ fn require_auto_build_declaration(
         return Ok(());
     }
     Err(ReviewError::new(format!(
-        "{review_ref} must declare [review.auto_build] or skip_auto_build = true \
+        "{review_ref} must declare [[review.auto_build]] or skip_auto_build = true \
          (or configure a project-level auto_build default in .ralphus.toml)"
     )))
 }
@@ -1373,18 +1374,20 @@ pub(crate) fn create_review_from_triage_pool(
             .set_cell_review_guardian(&cell.squad_id, cell.task_idx, cell.idx, &gid)
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
-    crate::cartographer::Note::new("arbiter").guardian(&gid).emit(
-        store,
-        format!(
+    crate::cartographer::Note::new("arbiter")
+        .guardian(&gid)
+        .emit(
+            store,
+            format!(
             "Triage pool ({project}, {triage_type}) fired -> created review {gid} from {} cell(s)",
             drained.len()
         ),
-        serde_json::json!({
-            "project": project,
-            "triage_type": triage_type,
-            "cell_count": drained.len(),
-        }),
-    );
+            serde_json::json!({
+                "project": project,
+                "triage_type": triage_type,
+                "cell_count": drained.len(),
+            }),
+        );
     Ok(Some(gid))
 }
 
@@ -1425,23 +1428,20 @@ pub fn repair_triage_pool_keys(store: &Store) {
         }
     };
     for (old_project, triage_type, cell) in cells {
-        let effective = match store.effective_state_for_cell(
-            &cell.squad_id,
-            cell.task_idx,
-            cell.idx,
-        ) {
-            Ok(s) => s.unwrap_or_default(),
-            Err(e) => {
-                crate::rlog!(
+        let effective =
+            match store.effective_state_for_cell(&cell.squad_id, cell.task_idx, cell.idx) {
+                Ok(s) => s.unwrap_or_default(),
+                Err(e) => {
+                    crate::rlog!(
                     ERROR,
                     "ralphus [triage] pool-key repair: failed to read cell state for {}/{}/{}: {e}",
                     cell.squad_id,
                     cell.task_idx,
                     cell.idx
                 );
-                continue;
-            }
-        };
+                    continue;
+                }
+            };
         if effective == "failed" {
             if let Err(e) = store.remove_triage_pool_cell(
                 &old_project,
@@ -1586,10 +1586,11 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_auto_build,
-        apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_triage_pools, rebase_onto, repair_triage_pool_keys, require_auto_build_declaration,
+        any_workspace_ahead_of_upstream, apply_auto_build, apply_project_review_defaults,
+        apply_resolver, create_review_from_triage_pool, derive_triage_pools, rebase_onto,
+        repair_triage_pool_keys, require_auto_build_declaration,
         workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
+        Membership,
     };
     use crate::store::Store;
     use crate::workspace::Workspace;
@@ -1876,7 +1877,7 @@ mod tests {
             maximum_budget_usd,
             proof_scope: None,
             auto_submit_pr_stack: None,
-            auto_build: None,
+            auto_build: Vec::new(),
             skip_auto_build: false,
         }
     }
@@ -1943,8 +1944,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_resolver_leaves_auto_submit_pr_stack_at_its_creation_stamp_when_no_member_declares_one()
-     {
+    fn apply_resolver_leaves_auto_submit_pr_stack_at_its_creation_stamp_when_no_member_declares_one(
+    ) {
         let store = Store::open_in_memory().unwrap();
         let gid = store.create_guardian("r", "main", "/repo").unwrap();
         // `create_guardian` already stamps a concrete `Some(false)` at creation
@@ -1969,7 +1970,7 @@ mod tests {
             ..Default::default()
         };
         let m = Membership {
-            auto_build: Some(def),
+            auto_build: vec![def],
             ..membership(None)
         };
         apply_auto_build(&store, &gid, &[&m]).unwrap();
@@ -2011,7 +2012,7 @@ mod tests {
             ..Default::default()
         };
         let m = Membership {
-            auto_build: Some(def),
+            auto_build: vec![def],
             ..membership(None)
         };
         let root = temp_repo();
@@ -2368,11 +2369,9 @@ print(json.dumps(result))
         // Firing an already-drained pool is a no-op, not an error (the race
         // the scheduler tick and a concurrent submission's own threshold
         // check must both tolerate).
-        assert!(
-            create_review_from_triage_pool(&store, "proj", "security")
-                .unwrap()
-                .is_none()
-        );
+        assert!(create_review_from_triage_pool(&store, "proj", "security")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2514,12 +2513,10 @@ print(json.dumps(result))
         repair_triage_pool_keys(&store);
 
         assert_eq!(store.triage_pool_count(&stale_key, "bug").unwrap(), 0);
-        assert!(
-            store
-                .get_triage_pool_threshold(&stale_key, "bug")
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .get_triage_pool_threshold(&stale_key, "bug")
+            .unwrap()
+            .is_none());
         // Its single cell, now correctly counted under "proj", already met
         // its carried-forward threshold of 1 -- the repair fires a real
         // review immediately rather than waiting for a future submission.
@@ -2590,18 +2587,14 @@ print(json.dumps(result))
             store.get_triage_pool_threshold("proj", "bug").unwrap(),
             Some(3)
         );
-        assert!(
-            store
-                .get_triage_pool_threshold(&key_a, "bug")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .get_triage_pool_threshold(&key_b, "bug")
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .get_triage_pool_threshold(&key_a, "bug")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_triage_pool_threshold(&key_b, "bug")
+            .unwrap()
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2777,11 +2770,9 @@ print(json.dumps(result))
         let store = Store::open_in_memory().unwrap();
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
         let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
-        assert!(
-            derive_triage_pools(&store, "squad-1", &file)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(derive_triage_pools(&store, "squad-1", &file)
+            .unwrap()
+            .is_empty());
     }
 
     // ── RAL-159 parity for Triage pooling ───────────────────────────────────

@@ -1567,7 +1567,7 @@ fn skip_auto_build_also_opts_out_of_config_auto_build() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// RAL-342: a review's own declared `[review.auto_build]` command takes
+// RAL-342: a review's own declared `[[review.auto_build]]` command takes
 // precedence over the project-level `.ralphus.toml [review] auto_build`
 // default when both are configured -- the project default here deliberately
 // fails, so if it ran instead the merge would incorrectly fail.
@@ -1634,7 +1634,7 @@ impl Runner for FailingAutoBuildRunner {
     }
 }
 
-// RAL-342/Q5: a review-declared `[review.auto_build]` *agent* invocation that
+// RAL-342/Q5: a review-declared `[[review.auto_build]]` *agent* invocation that
 // fails must not fail the merge -- it surfaces as an advisory notice (via the
 // existing notice mechanism) and a Cartographer log entry, but the review
 // still reaches `in_review` exactly as if the tier had been a no-op.
