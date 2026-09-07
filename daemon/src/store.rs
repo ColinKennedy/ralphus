@@ -240,6 +240,20 @@ pub struct ProofView {
     /// RAL-326: prompt-cache *read* tokens -- input served from an existing
     /// cache entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any step that compacts. `0` for a backend that reports no
+    /// compaction data (`pi`, `codex`) -- see `compaction_count` before
+    /// reading that as "never compacted".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    pub compaction_count: i64,
     /// Cost of this step's most recent run, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -300,6 +314,20 @@ pub struct CellView {
     /// RAL-326: prompt-cache *read* tokens -- input served from an existing
     /// cache entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any cell that compacts. `0` for a backend that reports no
+    /// compaction data (`pi`, `codex`) -- see `compaction_count` before
+    /// reading that as "never compacted".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    pub compaction_count: i64,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -340,6 +368,17 @@ pub struct CellView {
     /// Reviews (guardians) this cell participates in — those whose stack
     /// includes the cell's review branch (RAL-17). Empty for most cells.
     pub reviews: Vec<SquadReviewRef>,
+    /// This cell's resolved Triage type(s) (RAL-318), alphabetical, if it
+    /// opted into Triage via `triage = true` -- empty for a cell that never
+    /// opted in. Populated at submit time (inline `triage_type` or the
+    /// Arbiter's own classification) whether or not the cell has run yet, so
+    /// non-empty here does not by itself mean the cell is done -- check
+    /// `state`. Lets the board show a "scheduled"/"queued for auto-review"
+    /// placeholder for a Triage cell whose pool hasn't drained into an
+    /// actual review yet (see `Self::reviews`, which is what shows once it
+    /// has).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triage_types: Vec<String>,
     /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex
     /// resume`), captured from the owning backend's output. `None` for other
     /// agents or cells that have not yet completed.
@@ -464,6 +503,11 @@ pub struct SquadReviewRef {
     /// `None` for squad-level review refs (not tied to a branch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// `"explicit"` (an authored `[[review]]`, or any other non-Triage
+    /// creation path) or `"arbiter"` (RAL-318: created automatically when a
+    /// Triage pool's count threshold or cron schedule fired). Mirrors
+    /// `GuardianView::origin`.
+    pub origin: String,
 }
 
 /// One entry in the execution/transition log (CCTL-99).
@@ -574,25 +618,6 @@ pub struct ClearOutcome {
     /// each one's durable, on-disk terminal logs, mirroring the single-squad
     /// `delete_squad` endpoint's cleanup.
     pub squad_ids: Vec<String>,
-}
-
-/// A persisted path that may be owned by a cell, proof, or review.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorktreeClaim {
-    pub kind: String,
-    pub owner: String,
-    pub path: String,
-    pub state: String,
-}
-
-/// One review-worktree path and the timestamp of its owner's last activity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GuardianWorktreeRecord {
-    pub guardian_id: String,
-    pub guardian_name: String,
-    pub project_root: String,
-    pub path: String,
-    pub last_activity_ms: i64,
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -780,6 +805,43 @@ impl Store {
             )
             .unwrap_or(0)
             > 0;
+        // RAL-364: `follows` was renamed to `watches`. The `CREATE TABLE IF
+        // NOT EXISTS watches` inside the batch below would otherwise create
+        // an empty `watches` table on a database that still has the old
+        // `follows` table populated; a migration attempted *after* that
+        // (e.g. `ALTER TABLE follows RENAME TO watches`) would then fail
+        // with "table watches already exists" -- silently, since every
+        // migration statement below is wrapped in `let _ =`. So this has to
+        // run as a copy-and-drop *before* the batch instead, guarded so it
+        // only fires once (on the next call `follows` is gone and this
+        // block is skipped).
+        let follows_table_preexisting: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='follows'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if follows_table_preexisting {
+            let _ = self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS watches (
+                    id            TEXT PRIMARY KEY,
+                    user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                    entity_uri    TEXT NOT NULL,
+                    notify_tiers  TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    UNIQUE (user_name, entity_uri)
+                );
+                INSERT INTO watches SELECT * FROM follows;
+                UPDATE watches SET id = REPLACE(id, 'follow-', 'watch-');
+                UPDATE meta SET key = 'watch_seq' WHERE key = 'follow_seq';
+                DROP TABLE follows;
+                ",
+            );
+        }
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -833,6 +895,8 @@ impl Store {
                 tokens_out INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                compaction_input_tokens INTEGER NOT NULL DEFAULT 0,
+                compaction_count        INTEGER NOT NULL DEFAULT 0,
                 cost_usd   REAL NOT NULL DEFAULT 0,
                 cost_is_estimated INTEGER NOT NULL DEFAULT 0,
                 error      TEXT,
@@ -1006,7 +1070,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS users (
                 name                  TEXT PRIMARY KEY,
                 created_at_ms         INTEGER NOT NULL,
-                auto_follow           INTEGER NOT NULL DEFAULT 0,
+                auto_watch            INTEGER NOT NULL DEFAULT 0,
                 default_notify_tiers  TEXT NOT NULL DEFAULT 'urgent,high,normal'
             );
             -- RAL-328: view preferences are scoped to a registered user and
@@ -1199,12 +1263,15 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_user_mailbox_drains_user ON user_mailbox_drains(user_name);
             -- RAL-320: a user's personal subscription to an `EntityUri`
-            -- (squad/task/cell/proof/review/review-worktree). Following a
+            -- (squad/task/cell/proof/review/review-worktree). Watching a
             -- parent cascades to its children via `EntityUri::covers()` at
             -- read time -- no expansion is stored here. `notify_tiers` is a
-            -- per-follow override of which `MailboxPriority` tiers reach the
-            -- follower (see `crate::mailbox::{parse_tiers, tiers_to_csv}`).
-            CREATE TABLE IF NOT EXISTS follows (
+            -- per-watch override of which `MailboxPriority` tiers reach the
+            -- watcher (see `crate::mailbox::{parse_tiers, tiers_to_csv}`).
+            -- RAL-343 describes this same entity-subscription concept under
+            -- the name \"Monitor\"; if/when it's built, it should reuse this
+            -- table rather than add a parallel data model.
+            CREATE TABLE IF NOT EXISTS watches (
                 id            TEXT PRIMARY KEY,
                 user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
                 entity_uri    TEXT NOT NULL,
@@ -1212,7 +1279,7 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 UNIQUE (user_name, entity_uri)
             );
-            CREATE INDEX IF NOT EXISTS idx_follows_user ON follows(user_name);
+            CREATE INDEX IF NOT EXISTS idx_watches_user ON watches(user_name);
             -- Ark escalation dedup is entity-scoped and durable. Mailbox
             -- drain state is client-scoped and cannot provide this guarantee.
             CREATE TABLE IF NOT EXISTS ark_notifications (
@@ -1639,6 +1706,10 @@ impl Store {
             "ALTER TABLE proofs RENAME COLUMN claude_session_id TO agent_session_id",
             "ALTER TABLE guardian_branches RENAME COLUMN resolver_claude_session_id TO resolver_agent_session_id",
             "ALTER TABLE guardians RENAME COLUMN manual_commands_claude_session_id TO manual_commands_agent_session_id",
+            // RAL-364: `follows` was renamed to `watches`; same best-effort
+            // rename/fallback-ADD-COLUMN idiom as the `*claude_session_id`
+            // columns above.
+            "ALTER TABLE users RENAME COLUMN auto_follow TO auto_watch",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -1879,18 +1950,43 @@ impl Store {
             // every existing/manually-created row).
             "ALTER TABLE guardians ADD COLUMN origin TEXT NOT NULL DEFAULT 'explicit'",
             // RAL-320: the `EntityUri` a mailbox message is about, so a
-            // user's personal follows can match against it (see
+            // user's personal watches can match against it (see
             // `crate::mailbox::personal_mailbox_messages_for_user`). NULL for
             // pre-RAL-320 rows and for messages with no addressable entity.
             "ALTER TABLE mailbox_messages ADD COLUMN entity_uri TEXT",
             // RAL-320: per-user preference, consulted by the `ralphus submit`
-            // auto-follow hook -- when set, every entity a user submits is
-            // followed automatically using `default_notify_tiers` below.
-            "ALTER TABLE users ADD COLUMN auto_follow INTEGER NOT NULL DEFAULT 0",
+            // auto-watch hook -- when set, every entity a user submits is
+            // watched automatically using `default_notify_tiers` below.
+            "ALTER TABLE users ADD COLUMN auto_watch INTEGER NOT NULL DEFAULT 0",
             // RAL-320: the `MailboxPriority` tier set (CSV, see
-            // `crate::mailbox::{parse_tiers, tiers_to_csv}`) a new follow
+            // `crate::mailbox::{parse_tiers, tiers_to_csv}`) a new watch
             // defaults to when the caller doesn't specify one explicitly.
             "ALTER TABLE users ADD COLUMN default_notify_tiers TEXT NOT NULL DEFAULT 'urgent,high,normal'",
+            // RAL-375: feedback text still awaiting application by
+            // `guardian_merge::run_feedback`, persisted the moment feedback is
+            // received (see `Store::set_branch_pending_feedback`) rather than
+            // held only as a spawned thread's in-memory argument -- so an
+            // unclean shutdown mid-`run_feedback` leaves a durable record
+            // startup recovery can find and reapply, instead of the feedback
+            // being silently dropped. Cleared by every real completion path
+            // (success or a legitimate failure); only a literal crash mid-run
+            // leaves it set.
+            "ALTER TABLE guardian_branches ADD COLUMN pending_feedback TEXT",
+            // RAL-373: total input tokens spent on Claude Code's own
+            // auto-compaction summarization requests -- billed at the
+            // *uncached* input rate, the reason `cost_usd` and
+            // `tokens_in + cache_creation_tokens + cache_read_tokens`
+            // diverge on any cell that compacts. `compaction_count` is the
+            // number of compactions observed, incremented independently of
+            // whether each one's input size was reported: a nonzero count
+            // paired with `compaction_input_tokens = 0` means "compactions
+            // happened, sizes unreported by this backend/version", not "no
+            // compaction happened". `0` on every pre-RAL-373 row and for a
+            // backend that reports no compaction data (`pi`, `codex`).
+            "ALTER TABLE cells ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cells ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -2463,35 +2559,35 @@ impl Store {
     /// available and idempotent — even a squad that already reached a terminal
     /// state (`done`/`failed`/already `cancelled`) is (re-)flipped to
     /// `cancelled`, so it can never be picked up again by another trigger
-    /// (a restart, cross-squad gating, etc). In-flight nodes are flipped too;
-    /// the worker thread stops on its own via the cancel token, so it will
-    /// not re-run any node this flips.
+    /// (a restart, cross-squad gating, etc). Every task/cell/proof that did
+    /// not finish successfully — in-flight *and* already-`failed` ones — is
+    /// flipped to `cancelled` alongside it; the worker thread stops on its own
+    /// via the cancel token, so it will not re-run any node this flips.
     pub fn cancel(&self, id: &str) -> Result<SquadState> {
         self.squad_state(id)?;
         self.set_squad_state(id, SquadState::Cancelled)?;
-        self.cancel_nonterminal_nodes(id)?;
+        self.cancel_unfinished_nodes(id)?;
         Ok(SquadState::Cancelled)
     }
 
-    /// Flip every task/cell/proof still in a non-terminal state
-    /// (`pending`/`running`) to `cancelled`, so the board reflects a cancelled
-    /// squad immediately. Terminal nodes (`done`/`failed`/already `cancelled`) are
-    /// left untouched — a cell that already finished keeps its real outcome.
-    /// The worker thread stops on its own via the cancel token, so it will not
-    /// re-run any node this flips.
-    fn cancel_nonterminal_nodes(&self, squad_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE cells SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
-            params![squad_id],
-        )?;
-        self.conn.execute(
-            "UPDATE tasks SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
-            params![squad_id],
-        )?;
-        self.conn.execute(
-            "UPDATE proofs SET state='cancelled' WHERE squad_id=? AND state IN ('pending','running')",
-            params![squad_id],
-        )?;
+    /// Flip every task/cell/proof that did not finish successfully
+    /// (`pending`/`running`/`failed`) to `cancelled`, so the board reflects a
+    /// cancelled squad immediately and consistently across all three node
+    /// levels. This mirrors the squad row itself, which is (re-)flipped to
+    /// `cancelled` even from a terminal state (RAL-116): a squad whose cells
+    /// had already failed must not be left showing `failed` tasks and cells
+    /// under a `cancelled` squad. Only nodes carrying a real successful
+    /// outcome — `done`, and the deliberately user-set `ignored` — are left
+    /// untouched. The worker thread stops on its own via the cancel token, so
+    /// it will not re-run any node this flips.
+    fn cancel_unfinished_nodes(&self, squad_id: &str) -> Result<()> {
+        const UNFINISHED: &str = "('pending','running','failed')";
+        for table in ["cells", "tasks", "proofs"] {
+            self.conn.execute(
+                &format!("UPDATE {table} SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"),
+                params![squad_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -2787,6 +2883,46 @@ impl Store {
         Ok(raw.and_then(|s| NodeState::parse(&s)))
     }
 
+    /// The effective (proof-aware) state of one cell -- see
+    /// [`effective_cell_state`]'s doc comment for why the persisted
+    /// `cells.state` alone can misreport a cell whose proof failed as
+    /// `done`. Used by Triage pooling (`crate::triage`) to decide whether a
+    /// pooled cell is still a viable candidate (pending/running, or done and
+    /// passed) or has definitively failed and must never count toward a
+    /// threshold or be swept into an auto-review. `None` if the cell doesn't
+    /// exist.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn effective_state_for_cell(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        let Some(raw) = self
+            .conn
+            .query_row(
+                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT state FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+        )?;
+        let proof_states: Vec<String> = stmt
+            .query_map(params![squad_id, task_idx, idx], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some(effective_cell_state(
+            &raw,
+            proof_states.iter().map(String::as_str),
+        )))
+    }
+
     /// Current state of one task, or `None` if it doesn't exist. Same purpose
     /// as [`Store::cell_state`], for `server::restart_task_proof`.
     pub fn task_state(&self, squad_id: &str, task_idx: i64) -> Result<Option<NodeState>> {
@@ -3036,7 +3172,9 @@ impl Store {
         // the daemon's single store lock, which is what made `GET /api/tasks`
         // slow enough to stall restart/status-flip requests queued behind it.
         let proofs_by_scope = self.proofs_by_scope(&id)?;
-        let mut cells_by_task = self.cells_by_task(&id, &review_by_branch, &proofs_by_scope)?;
+        let triage_by_cell = self.triage_types_by_cell(&id)?;
+        let mut cells_by_task =
+            self.cells_by_task(&id, &review_by_branch, &proofs_by_scope, &triage_by_cell)?;
         let mut tasks = Vec::with_capacity(task_rows.len());
         for (
             t_idx,
@@ -3100,7 +3238,7 @@ impl Store {
     /// The reviews (guardians) derived from a squad, oldest first.
     fn reviews_for_squad(&self, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, status FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id",
+            "SELECT id, name, status, origin FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id",
         )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
@@ -3109,6 +3247,7 @@ impl Store {
                     name: r.get(1)?,
                     status: r.get(2)?,
                     branch: None,
+                    origin: r.get(3)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3125,9 +3264,10 @@ impl Store {
         squad_id: &str,
         review_by_branch: &HashMap<(i64, i64), Vec<SquadReviewRef>>,
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
+        triage_by_cell: &HashMap<(i64, i64), Vec<String>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -3135,6 +3275,10 @@ impl Store {
                 let task_idx: i64 = r.get(0)?;
                 let idx: i64 = r.get(1)?;
                 let reviews = review_by_branch
+                    .get(&(task_idx, idx))
+                    .cloned()
+                    .unwrap_or_default();
+                let triage_types = triage_by_cell
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
@@ -3158,6 +3302,7 @@ impl Store {
                         depends_on: from_json(&r.get::<_, String>(15)?),
                         proof: Vec::new(),
                         reviews,
+                        triage_types,
                         agent_session_id: r.get::<_, Option<String>>(17)?,
                         maximum_budget_usd: r.get::<_, Option<f64>>(18)?,
                         env_overrides: from_json_map(&r.get::<_, String>(19)?),
@@ -3173,6 +3318,8 @@ impl Store {
                         cache_read_tokens: r.get::<_, i64>(29)?,
                         cost_is_estimated: r.get::<_, bool>(30)?,
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(31)?,
+                        compaction_input_tokens: r.get::<_, i64>(32)?,
+                        compaction_count: r.get::<_, i64>(33)?,
                     },
                 ))
             })?
@@ -3183,7 +3330,8 @@ impl Store {
                 .get(&(task_idx, "cell".to_string(), idx))
                 .cloned()
                 .unwrap_or_default();
-            cell.state = effective_cell_state(&cell.state, &cell.proof);
+            cell.state =
+                effective_cell_state(&cell.state, cell.proof.iter().map(|p| p.state.as_str()));
             map.entry(task_idx).or_default().push(cell);
         }
         Ok(map)
@@ -3217,7 +3365,7 @@ impl Store {
         let mut map: HashMap<(i64, i64), Vec<SquadReviewRef>> = HashMap::new();
 
         let mut direct_stmt = self.conn.prepare(
-            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch
+            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch, g.origin
              FROM cells s
              JOIN guardians g ON g.id = s.review_guardian_id
              WHERE s.squad_id = ? AND s.review_guardian_id IS NOT NULL",
@@ -3232,6 +3380,7 @@ impl Store {
                         name: r.get(3)?,
                         status: r.get(4)?,
                         branch: r.get::<_, Option<String>>(5)?,
+                        origin: r.get(6)?,
                     },
                 ))
             })?
@@ -3241,7 +3390,7 @@ impl Store {
         }
 
         let mut fallback_stmt = self.conn.prepare(
-            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch
+            "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch, g.origin
              FROM cells s
              JOIN guardian_branches gb ON gb.branch = s.review_branch
              JOIN guardians g ON g.id = gb.guardian_id
@@ -3259,6 +3408,7 @@ impl Store {
                         name: r.get(3)?,
                         status: r.get(4)?,
                         branch: r.get::<_, Option<String>>(5)?,
+                        origin: r.get(6)?,
                     },
                 ))
             })?
@@ -3281,7 +3431,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -3309,6 +3459,8 @@ impl Store {
                         cache_read_tokens: r.get::<_, i64>(18)?,
                         cost_is_estimated: r.get::<_, bool>(19)?,
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(20)?,
+                        compaction_input_tokens: r.get::<_, i64>(21)?,
+                        compaction_count: r.get::<_, i64>(22)?,
                     },
                 ))
             })?
@@ -3328,7 +3480,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -3352,6 +3504,8 @@ impl Store {
                     cache_read_tokens: r.get::<_, i64>(15)?,
                     cost_is_estimated: r.get::<_, bool>(16)?,
                     maximum_tool_output_tokens: r.get::<_, Option<i64>>(17)?,
+                    compaction_input_tokens: r.get::<_, i64>(18)?,
+                    compaction_count: r.get::<_, i64>(19)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3730,78 +3884,6 @@ impl Store {
         Ok(())
     }
 
-    /// Persisted review worktrees, including per-branch and combined paths.
-    pub(crate) fn guardian_worktree_records(&self) -> Result<Vec<GuardianWorktreeRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT g.id, g.name, COALESCE(gb.project, g.git_root), gb.worktree,
-                    MAX(g.updated_at_ms, COALESCE(gb.started_at_ms, 0))
-             FROM guardians g
-             JOIN guardian_branches gb ON gb.guardian_id=g.id
-             WHERE gb.worktree IS NOT NULL
-             UNION ALL
-             SELECT id, name, git_root, combined_worktree, updated_at_ms
-             FROM guardians WHERE combined_worktree IS NOT NULL",
-        )?;
-        Ok(stmt
-            .query_map([], |r| {
-                Ok(GuardianWorktreeRecord {
-                    guardian_id: r.get(0)?,
-                    guardian_name: r.get(1)?,
-                    project_root: r.get(2)?,
-                    path: r.get(3)?,
-                    last_activity_ms: r.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// Every cell/proof/review claim whose persisted path can name a worktree.
-    /// Proof cwd selection mirrors `scheduler::run_proofs`.
-    pub(crate) fn worktree_claims(&self) -> Result<Vec<WorktreeClaim>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT 'cell', c.squad_id || ':' || c.task_idx || ':' || c.idx, c.cwd, c.state
-             FROM cells c WHERE c.cwd IS NOT NULL
-             UNION ALL
-             SELECT 'proof', p.squad_id || ':' || p.task_idx || ':' || p.scope || ':' || p.cell_idx || ':' || p.idx,
-                    c.cwd, p.state
-             FROM proofs p JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
-              AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
-                   (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
-                     WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
-             WHERE c.cwd IS NOT NULL
-             UNION ALL
-             SELECT 'review', g.id, gb.worktree, g.status
-             FROM guardians g JOIN guardian_branches gb ON gb.guardian_id=g.id
-             WHERE gb.worktree IS NOT NULL
-             UNION ALL
-             SELECT 'review', id, combined_worktree, status
-             FROM guardians WHERE combined_worktree IS NOT NULL",
-        )?;
-        Ok(stmt
-            .query_map([], |r| {
-                Ok(WorktreeClaim {
-                    kind: r.get(0)?,
-                    owner: r.get(1)?,
-                    path: r.get(2)?,
-                    state: r.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// Forget a review path after git confirmed that worktree was removed.
-    pub(crate) fn clear_guardian_worktree_path(&self, path: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE guardian_branches SET worktree=NULL WHERE worktree=?1",
-            params![path],
-        )?;
-        self.conn.execute(
-            "UPDATE guardians SET combined_worktree=NULL WHERE combined_worktree=?1",
-            params![path],
-        )?;
-        Ok(())
-    }
-
     /// Persist the effective read-only system prompt shown for a cell in
     /// the board details pane.
     pub fn set_cell_effective_system_prompt(
@@ -3944,19 +4026,18 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// cell being finished while its proof checklist is still running or
 /// has failed. This folds proof progress back in for display only, without
 /// touching the persisted column the scheduler relies on.
-fn effective_cell_state(raw: &str, proof: &[ProofView]) -> String {
+fn effective_cell_state<'a>(raw: &str, proof_states: impl IntoIterator<Item = &'a str>) -> String {
     if raw != "done" {
         return raw.to_string();
     }
-    if proof.iter().any(|v| v.state == "failed") {
+    let states: Vec<&str> = proof_states.into_iter().collect();
+    if states.contains(&"failed") {
         return "failed".to_string();
     }
-    if proof.iter().any(|v| {
-        !matches!(
-            v.state.as_str(),
-            "done" | "failed" | "cancelled" | "ignored"
-        )
-    }) {
+    if states
+        .iter()
+        .any(|s| !matches!(*s, "done" | "failed" | "cancelled" | "ignored"))
+    {
         return "running".to_string();
     }
     raw.to_string()
@@ -4029,7 +4110,7 @@ fn effective_squad_state(conn: &Connection, raw: String, squad_id: &str) -> Resu
 /// `ralphus:new-worktree/<branch>` placeholder cwd -- `project` is already
 /// structurally required for those (see `core::validate`), so this path is
 /// only reached for plain-path tasks.
-fn fallback_project_identifier(cwd: Option<&str>) -> String {
+pub(crate) fn fallback_project_identifier(cwd: Option<&str>) -> String {
     cwd.and_then(|c| Path::new(c).file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
@@ -4235,6 +4316,12 @@ pub struct CellEdit<'a> {
     pub command: Option<Option<&'a str>>,
     /// Per-cell auto-compact trigger, in tokens (RAL-304).
     pub auto_compact_threshold: Option<Option<i64>>,
+    /// Per-cell cap on a single tool-call output, in tokens (RAL-333). The
+    /// caller (`edit_squad`'s `"cell"` arm) rejects this up front when the
+    /// cell's effective agent has no delivery mechanism for it -- see
+    /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens` --
+    /// before it ever reaches the store.
+    pub maximum_tool_output_tokens: Option<Option<i64>>,
     /// Appended system prompt (RAL-341). The caller (`edit_squad`'s `"cell"`
     /// arm) is responsible for rejecting this up front when the cell's
     /// effective agent doesn't support it -- see
@@ -4267,6 +4354,10 @@ pub struct TaskEdit<'a> {
 pub struct ProofEdit<'a> {
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<Option<&'a str>>,
+    /// Per-step cap on a single tool-call output, in tokens (RAL-333).
+    /// Gated on the step's own `agent` by the caller, the same way
+    /// [`CellEdit::maximum_tool_output_tokens`] is gated on the cell's.
+    pub maximum_tool_output_tokens: Option<Option<i64>>,
 }
 
 /// A task's identity and dependencies, for scheduling.
@@ -4688,7 +4779,7 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, cost_is_estimated=?
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
@@ -4698,6 +4789,8 @@ impl Store {
                 usage.tokens_out,
                 usage.cache_creation_tokens,
                 usage.cache_read_tokens,
+                usage.compaction_input_tokens,
+                usage.compaction_count,
                 usage.cost_usd,
                 usage.cost_is_estimated,
                 squad_id,
@@ -4793,13 +4886,18 @@ impl Store {
     ) -> Result<()> {
         let model_touched = edit.model.is_some();
         let model_value = edit.model.flatten();
+        let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
+        let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
         let n = self.conn.execute(
             "UPDATE proofs SET
-                model = CASE WHEN :model_touched THEN :model ELSE model END
+                model = CASE WHEN :model_touched THEN :model ELSE model END,
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND scope=:scope AND cell_idx=:cell_idx AND idx=:idx",
             named_params! {
                 ":model_touched": model_touched,
                 ":model": model_value,
+                ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
+                ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":scope": scope,
@@ -4862,6 +4960,8 @@ impl Store {
         let command_value = edit.command.flatten();
         let auto_compact_threshold_touched = edit.auto_compact_threshold.is_some();
         let auto_compact_threshold_value = edit.auto_compact_threshold.flatten();
+        let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
+        let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
         let system_prompt_touched = edit.system_prompt.is_some();
         let system_prompt_value = edit.system_prompt.flatten();
         let effective_authored_system_prompt = if system_prompt_touched {
@@ -4882,7 +4982,8 @@ impl Store {
                 command = CASE WHEN :command_touched THEN :command ELSE command END,
                 system_prompt = CASE WHEN :system_prompt_touched THEN :system_prompt ELSE system_prompt END,
                 effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
-                auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END
+                auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END,
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
                 ":cwd_touched": cwd_touched,
@@ -4901,6 +5002,8 @@ impl Store {
                 ":effective_system_prompt": effective_system_prompt,
                 ":auto_compact_threshold_touched": auto_compact_threshold_touched,
                 ":auto_compact_threshold": auto_compact_threshold_value,
+                ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
+                ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":idx": idx,
@@ -5754,7 +5857,7 @@ impl Store {
         if !dry_run {
             for r in &squads {
                 self.set_squad_state(&r.id, SquadState::Cancelled)?;
-                self.cancel_nonterminal_nodes(&r.id)?;
+                self.cancel_unfinished_nodes(&r.id)?;
                 let _ = self.log_event(Some(&r.id), None, "squad", None, "cancelled");
             }
         }
@@ -6180,11 +6283,11 @@ impl Store {
             "DELETE FROM mailbox_messages WHERE squad_id=?",
             params![squad_id],
         )?;
-        // RAL-320: follows are keyed by `EntityUri` string, not a `squad_id`
-        // FK column, so a deleted squad's follows (and its tasks'/cells'/
+        // RAL-320: watches are keyed by `EntityUri` string, not a `squad_id`
+        // FK column, so a deleted squad's watches (and its tasks'/cells'/
         // proofs') need an explicit sweep rather than `ON DELETE CASCADE`.
         tx.execute(
-            "DELETE FROM follows WHERE entity_uri = 'squad:'||?1
+            "DELETE FROM watches WHERE entity_uri = 'squad:'||?1
                 OR entity_uri LIKE 'task:'||?1||':%'
                 OR entity_uri LIKE 'cell:'||?1||':%'
                 OR entity_uri LIKE 'proof:'||?1||':%'",
@@ -6359,7 +6462,7 @@ impl Store {
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
@@ -6368,6 +6471,8 @@ impl Store {
                 outcome.usage.tokens_out,
                 outcome.usage.cache_creation_tokens,
                 outcome.usage.cache_read_tokens,
+                outcome.usage.compaction_input_tokens,
+                outcome.usage.compaction_count,
                 outcome.usage.cost_usd,
                 outcome.usage.cost_is_estimated,
                 outcome.error.as_deref(),
@@ -6413,6 +6518,31 @@ impl Store {
             .query_row(
                 "SELECT agent FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, task_idx, cell_idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// The agent a proof step runs under, addressed the way `proofs` rows are
+    /// keyed: `scope` is `"cell"` or `"task"`, and `cell_idx` is ignored by
+    /// task-scope rows but still part of the key. Used by the edit path to
+    /// gate `maximum_tool_output_tokens` on the step's own agent rather than
+    /// the owning cell's, since the two can differ (RAL-333).
+    ///
+    /// `proofs.agent` is `NOT NULL`, so this is a plain `String`.
+    pub fn get_proof_agent(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT agent FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
@@ -6645,7 +6775,7 @@ impl Store {
     }
 
     /// Resolve `(squad_id, task_name, cell_sid)` into a `cell:...`
-    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 follows can match
+    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 watches can match
     /// against it. `None` when the triple doesn't match a row — mirrors
     /// [`Self::set_cell_agent_session_id_live`]'s same best-effort lookup.
     #[must_use]
@@ -6677,7 +6807,7 @@ impl Store {
     }
 
     /// Resolve `(squad_id, task_name)` into a `task:...`
-    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 follows can match
+    /// [`crate::entity_uri::EntityUri`] string, so RAL-320 watches can match
     /// against it. `None` when the pair doesn't match a row.
     #[must_use]
     pub fn task_entity_uri(&self, squad_id: &str, task_name: &str) -> Option<String> {
@@ -7559,6 +7689,21 @@ pub struct RecordedUsage {
     /// Prompt-cache *read* tokens -- input served from an existing cache
     /// entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any cell that compacts. Compaction *output* (the summary itself) is
+    /// not currently reported by Claude Code and so is not captured here.
+    /// `0` for a backend that reports no compaction data (`pi`, `codex`) --
+    /// see `compaction_count` before reading that as "never compacted".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    pub compaction_count: i64,
     /// Cost in USD.
     pub cost_usd: f64,
     /// `true` when the figures above are the last live mid-run snapshot
@@ -7576,6 +7721,8 @@ impl From<&crate::runner::RunnerResult> for RecordedUsage {
             tokens_out: r.tokens_out,
             cache_creation_tokens: r.cache_creation_tokens,
             cache_read_tokens: r.cache_read_tokens,
+            compaction_input_tokens: r.compaction_input_tokens,
+            compaction_count: r.compaction_count,
             cost_usd: r.cost_usd,
             cost_is_estimated: r.cost_is_estimated,
         }
@@ -8019,6 +8166,119 @@ command = "cargo test"
         );
     }
 
+    /// Same shape as `migration_renames_legacy_claude_session_id_columns`,
+    /// but for RAL-364's `follows` -> `watches` copy-and-drop migration and
+    /// the paired `auto_follow` -> `auto_watch` column rename: hand-rolls a
+    /// pre-migration database with the old table/column names and a real
+    /// row in each, runs `init_schema()` against it, and proves the row
+    /// (including its id and the `follow_seq` sequence counter) survives
+    /// under the new names rather than being stranded in a dropped table.
+    #[test]
+    fn migration_renames_legacy_follows_table_and_auto_follow_column() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE users (
+                name TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL,
+                auto_follow INTEGER NOT NULL DEFAULT 0,
+                is_admin INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+             );
+             CREATE TABLE follows (
+                id            TEXT PRIMARY KEY,
+                user_name     TEXT NOT NULL,
+                entity_uri    TEXT NOT NULL,
+                notify_tiers  TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+             );",
+        )
+        .expect("create legacy (pre-rename) schema");
+        conn.execute(
+            "INSERT INTO users (name, created_at_ms, auto_follow) VALUES ('colin', 1, 1)",
+            [],
+        )
+        .expect("insert legacy user row");
+        conn.execute("INSERT INTO meta (key, value) VALUES ('follow_seq', 1)", [])
+            .expect("insert legacy follow_seq counter");
+        conn.execute(
+            "INSERT INTO follows (id, user_name, entity_uri, notify_tiers, created_at_ms)
+             VALUES ('follow-000000000001', 'colin', 'squad:squad-1', 'urgent', 2)",
+            [],
+        )
+        .expect("insert legacy follow row");
+
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
+            stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
+        };
+        store
+            .init_schema()
+            .expect("migration must succeed against a legacy schema");
+
+        let (id, entity_uri): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT id, entity_uri FROM watches WHERE user_name='colin'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("watches table must exist and hold the migrated row");
+        assert_eq!(id, "watch-000000000001", "row id prefix must be rewritten");
+        assert_eq!(entity_uri, "squad:squad-1");
+
+        let watch_seq: i64 = store
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='watch_seq'", [], |r| {
+                r.get(0)
+            })
+            .expect("watch_seq counter must exist and hold the migrated value");
+        assert_eq!(watch_seq, 1);
+
+        let auto_watch: bool = store
+            .conn
+            .query_row("SELECT auto_watch FROM users WHERE name='colin'", [], |r| {
+                r.get(0)
+            })
+            .expect("auto_watch column must exist and hold the migrated value");
+        assert!(auto_watch);
+
+        let old_table_still_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='follows'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("sqlite_master query must succeed")
+            .is_some();
+        assert!(
+            !old_table_still_exists,
+            "old follows table should have been dropped, not left behind"
+        );
+
+        let old_column_still_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('users') WHERE name='auto_follow'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("pragma_table_info query must succeed")
+            .is_some();
+        assert!(
+            !old_column_still_exists,
+            "old auto_follow column should have been renamed away, not left behind"
+        );
+    }
+
     #[test]
     fn migration_adds_nullable_task_agent_and_model_columns() {
         let conn = Connection::open_in_memory().expect("open sqlite");
@@ -8439,7 +8699,7 @@ name = "empty"
     }
 
     #[test]
-    fn cancel_flips_nonterminal_nodes_but_preserves_finished_ones() {
+    fn cancel_flips_unfinished_nodes_but_preserves_succeeded_ones() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
         store.set_squad_state(&id, SquadState::Running).unwrap();
@@ -8454,6 +8714,34 @@ name = "empty"
         assert_eq!(squad.tasks[0].state, "cancelled");
         // …but the cell that already completed keeps its real outcome.
         assert_eq!(squad.tasks[0].cells[0].state, "done");
+    }
+
+    #[test]
+    fn cancel_flips_already_failed_tasks_cells_and_proofs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        // The squad already burned down to failure before the user hit cancel:
+        // the task and its cell are terminal-failed, the proof never ran.
+        store.set_squad_state(&id, SquadState::Failed).unwrap();
+        store.set_task_state(&id, 0, NodeState::Failed).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
+
+        store.cancel(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.state, "cancelled");
+        assert_eq!(squad.tasks[0].state, "cancelled");
+        assert_eq!(squad.tasks[0].cells[0].state, "cancelled");
+    }
+
+    #[test]
+    fn cancel_preserves_ignored_nodes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Ignored).unwrap();
+
+        store.cancel(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "ignored");
     }
 
     // RAL-157: two independent tasks, for solo/unsolo tests.
@@ -10079,6 +10367,8 @@ command = "y"
                 tokens_out: 5374,
                 cache_creation_tokens: 320_114,
                 cache_read_tokens: 7_204_990,
+                compaction_input_tokens: 115_000,
+                compaction_count: 1,
                 cost_usd: 0.6807,
                 cost_is_estimated: true,
             },
@@ -10093,6 +10383,9 @@ command = "y"
         assert_eq!(cell.tokens_out, 5374);
         assert_eq!(cell.cache_creation_tokens, 320_114);
         assert_eq!(cell.cache_read_tokens, 7_204_990);
+        // RAL-373: the same round trip, for the columns this ticket adds.
+        assert_eq!(cell.compaction_input_tokens, 115_000);
+        assert_eq!(cell.compaction_count, 1);
         assert!(
             cell.cost_is_estimated,
             "a snapshot-derived figure must not read as a settled bill"
@@ -10125,6 +10418,8 @@ command = "y"
                     tokens_out: 22,
                     cache_creation_tokens: 33,
                     cache_read_tokens: 44,
+                    compaction_input_tokens: 55,
+                    compaction_count: 2,
                     cost_usd: 0.5,
                     cost_is_estimated: true,
                 },
@@ -10137,6 +10432,9 @@ command = "y"
         assert_eq!(step.tokens_out, 22);
         assert_eq!(step.cache_creation_tokens, 33);
         assert_eq!(step.cache_read_tokens, 44);
+        // RAL-373: the same round trip, for the columns this ticket adds.
+        assert_eq!(step.compaction_input_tokens, 55);
+        assert_eq!(step.compaction_count, 2);
         assert!(step.cost_is_estimated);
     }
 
