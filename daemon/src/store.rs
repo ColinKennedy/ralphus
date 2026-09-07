@@ -1888,6 +1888,16 @@ impl Store {
             // `crate::mailbox::{parse_tiers, tiers_to_csv}`) a new follow
             // defaults to when the caller doesn't specify one explicitly.
             "ALTER TABLE users ADD COLUMN default_notify_tiers TEXT NOT NULL DEFAULT 'urgent,high,normal'",
+            // RAL-375: feedback text still awaiting application by
+            // `guardian_merge::run_feedback`, persisted the moment feedback is
+            // received (see `Store::set_branch_pending_feedback`) rather than
+            // held only as a spawned thread's in-memory argument -- so an
+            // unclean shutdown mid-`run_feedback` leaves a durable record
+            // startup recovery can find and reapply, instead of the feedback
+            // being silently dropped. Cleared by every real completion path
+            // (success or a legitimate failure); only a literal crash mid-run
+            // leaves it set.
+            "ALTER TABLE guardian_branches ADD COLUMN pending_feedback TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

@@ -909,6 +909,125 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-375: feedback interrupted by an unclean daemon shutdown must be
+/// reapplied on restart, not silently dropped. Previously the feedback text
+/// existed only as `run_feedback`'s own in-memory argument -- if the process
+/// died mid-run (during the resolver call, the push, or the downstream
+/// restack), nothing durable recorded that the feedback had never actually
+/// landed, so a later restart's ordinary rebuild produced a clean-looking
+/// review that silently never got the requested fix.
+///
+/// This simulates that crash directly: `set_branch_pending_feedback` is
+/// called on its own (exactly what `run_feedback`'s own first lines do,
+/// before invoking the resolver) with no matching `run_feedback` call ever
+/// completing -- reproducing precisely the DB state a kill -9 mid-run would
+/// leave. Recovery is then simulated the same way
+/// `scheduler::recover_interrupted_reviews`/`resume_feedback` do it: read
+/// back every branch with pending feedback and re-invoke `run_feedback` for
+/// each. The feedback must actually land (not just the status bookkeeping).
+#[test]
+fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
+    let root = temp_repo();
+    init_repo(&root);
+    // A bare `origin` so the reapplied feedback's push succeeds (see
+    // `feedback_edits_review_worktree_and_restacks_downstream`'s identical
+    // setup) -- without one the feedback is still committed but the detail
+    // becomes "feedback committed but push failed" instead of success.
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    // Simulate: a `POST .../feedback` request was received and durably
+    // recorded, then the daemon was killed before `run_feedback` ever ran
+    // (or partway through it -- either way, nothing cleared this record).
+    store
+        .lock()
+        .unwrap()
+        .set_branch_pending_feedback(&id, &bid0, "add a note file")
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .branches_with_pending_feedback()
+            .unwrap(),
+        vec![(id.clone(), bid0.clone(), "add a note file".to_string())],
+        "the crash-simulated pending feedback must be durably findable"
+    );
+
+    // Simulate daemon restart recovery: reapply every branch's pending
+    // feedback exactly as `scheduler::recover_interrupted_reviews` does.
+    let pending = store
+        .lock()
+        .unwrap()
+        .branches_with_pending_feedback()
+        .unwrap();
+    for (gid, branch_id, feedback) in pending {
+        run_feedback(
+            &store,
+            &FeedbackRunner,
+            &gid,
+            &branch_id,
+            &feedback,
+            &CancelToken::never(),
+        );
+    }
+
+    // The feedback actually landed -- not just a status flip.
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let rev0 = view.branches[0].review_branch.clone().unwrap();
+    let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
+    assert!(
+        files0.contains("note.txt"),
+        "the interrupted feedback must have been reapplied for real, not just marked resumed"
+    );
+    let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
+    assert!(
+        detail0.starts_with("feedback applied"),
+        "expected a real success detail after resumption, got: {detail0:?}"
+    );
+
+    // And the durable record is cleared again once resumed work completes,
+    // so a later restart doesn't try to reapply it a second time.
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .branches_with_pending_feedback()
+            .unwrap()
+            .is_empty(),
+        "resumed feedback must clear its own pending record on completion"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
 /// RAL-<new>: a feedback revision that pushes a real new commit must
 /// re-trigger the same PR auto-submit hook every other terminal transition
 /// fires via `promote_branch_terminal` -- otherwise, with

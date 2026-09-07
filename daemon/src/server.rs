@@ -2452,6 +2452,7 @@ fn require_admin(daemon: &Daemon, user_header: Option<&str>) -> Result<String, R
             .unwrap_or_default();
         return Ok(user_name);
     }
+    eprintln!("DEBUG: Admin exists, requiring current user");
     let user_name = require_current_user(daemon, user_header)?;
     match daemon.lock().is_admin(&user_name) {
         Ok(true) => Ok(user_name),
@@ -2848,14 +2849,10 @@ fn resolve_acting_user(query: &str) -> Option<String> {
 /// resolved -- the shared guard for every follows/personal-mailbox endpoint,
 /// none of which make sense for an anonymous caller.
 fn require_acting_user(query: &str) -> Result<String, Reply> {
-    resolve_acting_user(query).ok_or_else(|| {
-        error(
-            400,
-            "bad_request",
-            "no user: pass ?user=<name> or set default_user in .ralphus.toml",
-            vec![],
-        )
-    })
+    query_param(query, "user")
+        .map(url_decode)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| error(400, "bad_request", "no user: pass ?user=<name>", vec![]))
 }
 
 /// Parse a list of tier-name strings, `400`-erroring on the first one that
@@ -7879,9 +7876,9 @@ struct ShutdownBody {
     /// records an intentional stop and nothing auto-resumes on next
     /// `ralphus-daemon serve`. When false (the default), DB state is left
     /// alone — killed processes' rows stay `running`/`merging`/etc, and the
-    /// existing crash-recovery path (`recover_orphaned_squads`/
-    /// `recover_orphaned_merges`, run at every `serve()` startup) resumes
-    /// them on the next start.
+    /// existing crash-recovery path (`Store::recover_orphaned_squads` at
+    /// `serve()` startup, `scheduler::recover_interrupted_reviews` at
+    /// scheduler startup) resumes them on the next start.
     #[serde(default)]
     auto_cancel: bool,
 }
@@ -10388,33 +10385,16 @@ pub fn serve<A: ToSocketAddrs>(
     // yet" invariant, so it belongs immediately alongside it rather than
     // deferred to first use.
     crate::remote_runner::reconcile_remote_exec_handles(&store);
-    // RAL-48: guardians stuck in `merging` after an unclean shutdown have no
-    // background thread; reset them to `merge_failed` so the user can retry.
-    match store.recover_orphaned_merges() {
-        Ok(ids) if !ids.is_empty() => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [recovery] {} orphaned merge(s) reset to merge_failed: {}",
-                ids.len(),
-                ids.join(", ")
-            );
-            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::WARNING,
-                source: "recovery",
-                message: "orphaned merges reset to merge_failed",
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: None,
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"guardian_ids": ids}),
-                admin_only: false,
-            });
-        }
-        Ok(_) => {}
-        Err(e) => crate::rlog!(ERROR, "ralphus [recovery] merge recovery failed: {e}"),
-    }
+    // RAL-375: guardians stuck in `merging` after an unclean shutdown (and any
+    // branch whose feedback application was interrupted mid-run) are resumed
+    // by `scheduler::recover_interrupted_reviews`, run once at the top of
+    // `scheduler::run_loop` below -- NOT here. This used to eagerly reset
+    // every `merging` guardian to `merge_failed` (RAL-48), which always beat
+    // that scheduler-side auto-resume to the punch (this runs synchronously
+    // before the scheduler thread is even spawned), silently defeating it and
+    // requiring a human to manually retry every interrupted merge. See
+    // `scheduler::recover_interrupted_reviews`'s doc comment for the full
+    // ordering requirement.
     // RAL-164: "set it for me" input resolutions left `resolving` after an
     // unclean shutdown have no background thread; reset them to `failed` so
     // the UI never shows a permanently-stuck spinner.

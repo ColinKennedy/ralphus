@@ -391,25 +391,7 @@ pub fn run_loop(
     // cheap for projects whose configured interval has not elapsed.
     crate::ark::periodic_sweep(&store, &cancellations, &sem);
     let mut last_ark_check = std::time::Instant::now();
-    // Recovery: restart merges that were interrupted by a daemon shutdown.
-    // Guardians stuck in `merging` have no live background thread; reset them to
-    // `collecting` so `claim_guardian_merge` can claim them again. Notably we do
-    // NOT promote their branches to `ready` here: since RAL-265 the staged merge
-    // can run while only part of the stack's cells are done, so a blindly
-    // promoted `pending` branch (its cell not yet done) would be wrongly built.
-    // Once `collecting`, the all-cells-done case below and the partial-ready case
-    // further down re-trigger the right level of work.
-    {
-        let ids = {
-            let guard = store.lock().expect("store mutex poisoned");
-            let ids = guard.interrupted_merges().unwrap_or_default();
-            for gid in &ids {
-                let _ = guard.reset_guardian_to_collecting(gid);
-            }
-            ids
-        };
-        start_reviews(&store, ids, &sem, &cancellations);
-    }
+    recover_interrupted_reviews(&store, &sem, &cancellations);
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
     // completed but before the guardian auto-started, and a full-merge crash (its
@@ -2628,6 +2610,112 @@ fn run_task_finalizer(
             cancellations,
         );
     }
+}
+
+/// RAL-375: recovery run once at scheduler startup so review work an unclean
+/// daemon shutdown interrupted resumes automatically, mirroring how
+/// [`crate::store::Store::recover_orphaned_squads`] already resumes squads
+/// (`running` → `pending`, picked back up by the ordinary scheduler loop)
+/// instead of leaving them for a human to manually retry.
+///
+/// Guardians stuck in `merging` have no live background thread; reset them to
+/// `collecting` so `claim_guardian_merge` can claim them again. Notably we do
+/// NOT promote their branches to `ready` here: since RAL-265 the staged merge
+/// can run while only part of the stack's cells are done, so a blindly
+/// promoted `pending` branch (its cell not yet done) would be wrongly built.
+/// Once `collecting`, the all-cells-done case and the partial-ready case in
+/// the two recovery passes after this one (in `run_loop`) re-trigger the
+/// right level of work.
+///
+/// Separately, any branch with feedback still durably marked pending (RAL-375
+/// -- an unclean shutdown mid-`guardian_merge::run_feedback`, whose feedback
+/// text was previously held only as that function's own in-memory argument
+/// and so silently lost) has that feedback reapplied directly. This must run
+/// before the guardian-level reclaim above finishes rebuilding the stack, or
+/// an ordinary rebuild would finalize the review having silently dropped the
+/// never-applied feedback.
+///
+/// MUST run before `server::serve`'s startup spawns any competing recovery
+/// that could flip a `merging` guardian to a terminal status first (see
+/// RAL-48's `Store::recover_orphaned_merges`, no longer called at startup for
+/// exactly this reason) -- this is the sole startup recovery path for
+/// interrupted merges/feedback.
+pub fn recover_interrupted_reviews(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+) {
+    let (interrupted, pending_feedback) = {
+        let guard = store.lock().expect("store mutex poisoned");
+        let interrupted = guard.interrupted_merges().unwrap_or_default();
+        for gid in &interrupted {
+            let _ = guard.reset_guardian_to_collecting(gid);
+        }
+        let pending_feedback = guard.branches_with_pending_feedback().unwrap_or_default();
+        (interrupted, pending_feedback)
+    };
+    for (gid, branch_id, feedback) in pending_feedback {
+        crate::rlog!(
+            WARNING,
+            "ralphus [recovery] review {gid} branch {branch_id}: reapplying feedback interrupted by daemon restart"
+        );
+        let _ = store
+            .lock()
+            .expect("store mutex poisoned")
+            .cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "recovery",
+                message: "reapplying feedback interrupted by daemon restart",
+                scope: Some("branch"),
+                squad_id: None,
+                guardian_id: Some(&gid),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"branch_id": branch_id}),
+                admin_only: false,
+            });
+        resume_feedback(store, sem, cancellations, gid, branch_id, feedback);
+    }
+    start_reviews(store, interrupted, sem, cancellations);
+}
+
+/// RAL-375: re-run [`crate::guardian_merge::run_feedback`] for a branch whose
+/// feedback application was interrupted by an unclean shutdown -- mirrors
+/// `guardian_merge::start_feedback`'s own thread-spawn shape (subprocess
+/// runner via `MachineRouter`, `guardian:{gid}`-keyed cancel token) since this
+/// is the same work, just re-entered from recovery instead of a fresh
+/// `POST .../feedback` request.
+fn resume_feedback(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+    gid: String,
+    branch_id: String,
+    feedback: String,
+) {
+    let store = Arc::clone(store);
+    let sem = Arc::clone(sem);
+    let cancellations = cancellations.clone();
+    std::thread::spawn(move || {
+        let _permit = sem.acquire();
+        let local: Arc<dyn Runner> =
+            Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)));
+        let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
+            local,
+            Arc::clone(&store),
+        ));
+        let token = cancellations.register(&format!("guardian:{gid}"));
+        crate::guardian_merge::run_feedback(
+            &store,
+            runner.as_ref(),
+            &gid,
+            &branch_id,
+            &feedback,
+            &token,
+        );
+        cancellations.remove(&format!("guardian:{gid}"));
+    });
 }
 
 /// Spawn a background merge for each guardian that is still `collecting`.
