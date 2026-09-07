@@ -135,6 +135,8 @@ impl Runner for CapturingRunner {
             tokens_out: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd: 0.0,
             cost_is_estimated: false,
             summary: "captured".to_string(),

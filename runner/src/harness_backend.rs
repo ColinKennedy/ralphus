@@ -81,6 +81,10 @@ impl ModelBackend for HarnessBackend {
             // RAL-339: a generic external harness has no recognized
             // compaction signal at all.
             compaction_thrash: None,
+            // RAL-373: this backend reports no compaction data, not "never
+            // compacts".
+            compaction_input_tokens: 0,
+            compaction_count: 0,
         })
     }
 }

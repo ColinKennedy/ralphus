@@ -525,6 +525,10 @@ fn drive_json_events(
             agent_session_id: state.agent_session_id,
             abandoned_background_job: None,
             compaction_thrash: Some(detail),
+            // RAL-373: this backend reports no compaction data (it has no
+            // `compact_boundary`-equivalent event), not "never compacts".
+            compaction_input_tokens: 0,
+            compaction_count: 0,
         });
     }
 
@@ -549,6 +553,10 @@ fn drive_json_events(
         agent_session_id: state.agent_session_id,
         abandoned_background_job: None,
         compaction_thrash: None,
+        // RAL-373: this backend reports no compaction data (it has no
+        // `compact_boundary`-equivalent event), not "never compacts".
+        compaction_input_tokens: 0,
+        compaction_count: 0,
     })
 }
 
