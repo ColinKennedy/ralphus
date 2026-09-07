@@ -24,6 +24,15 @@ right — most of the collisions worth avoiding are with these.
 Do **not** reuse *cell* for anything else — notably not for connection reuse
 or transport (see **channel**).
 
+RAL-362 gave the board two separate tabs over this hierarchy, named for what
+they actually show rather than what they historically showed: the
+**Squads tab** (`#/squads`, previously misnamed "Tasks") is the squad-centric
+dependency-graph/sidebar/details viewer; the **Tasks tab** (`#/tasks`) is a
+flat, virtualized table listing every **task** across every squad, one row
+per task. Neither viewer is the other's superset — the Squads tab shows the
+full graph for one squad at a time, the Tasks tab is cross-squad but
+task-grained (no graph, no cell-level browsing except an expanded row).
+
 ## Reviews
 
 | Term | Meaning |
@@ -105,9 +114,10 @@ RAL-252 is done` comments at each one.
 ## Personal watches and notification preferences (RAL-320)
 
 A per-**user** subscription layer over the existing **mailbox** (RAL-241) —
-not a second notification system. CLI-only surface (`ralphus mailbox
+not a second notification system. Surfaced via the CLI (`ralphus mailbox
 watch`/`unwatch`/`watches`/`preferences`/`set-preferences`/`personal`/
-`personal-drain`); no board UI, no external delivery channel.
+`personal-drain`) and, since RAL-362, a star on each row of the board's
+**Tasks tab**; no external delivery channel either way.
 
 | Term | Meaning |
 |---|---|

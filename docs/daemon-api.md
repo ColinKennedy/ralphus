@@ -186,6 +186,7 @@ produced no pane output.
 | GET | `/api/guardians/{id}/pull-requests` | List every PR submitted for a review (bare array) |
 | GET | `/api/guardians/{id}/pull-request-stacks` | [List past PR stacks](#get-apiguardiansidpull-request-stacks) submitted for a review, most recent first (RAL-302) |
 | GET | `/api/pull-requests` | [Find the PR row](#get-apipull-requests) for a forge PR/MR number; `?forge=&repo=&pr_number=` |
+| GET | `/api/pull-requests/index` | [Flat index](#get-apipull-requestsindex) of every PR row across every guardian, annotated with source squad/task/cell (RAL-362, board Tasks tab) |
 | GET | `/api/pull-requests/{pr_id}` | One PR row |
 | POST | `/api/pull-requests/{pr_id}` | [Mutate the PR mapping](#post-apipull-requestspr_id) (number/url/alias/state) |
 | GET | `/api/pull-requests/{pr_id}/comments` | [Live-query the forge](#get-apipull-requestspr_idcomments) for this PR's comments |
@@ -1841,6 +1842,35 @@ Look up the ralphus PR row for a given forge PR/MR (the PR → worktree
 direction), query params `forge` (`github`|`gitlab`), `repo` (URL-encoded), and
 `pr_number`. `404` if nothing is recorded for that combination; `400` if any
 param is missing.
+
+### `GET /api/pull-requests/index`
+RAL-362: a flat, single-query index of every PR row across every guardian —
+distinct from `GET /api/pull-requests`, which looks up exactly one row by
+forge/repo/pr_number. Backs the board's Tasks tab review/PR badge lane, which
+needs every open PR's source task in one request rather than one lookup per
+row. No forge calls; each row is annotated with the squad/task/cell its
+branch was most recently submitted from (`null` if that source cell has since
+been deleted, or the branch was added manually):
+```json
+[
+  {
+    "id": "pr-abc123",
+    "guardian_id": "g-1",
+    "branch_id": "b-1",
+    "branch_alias": "feature/foo",
+    "forge": "github",
+    "repo": "acme/widget",
+    "pr_number": 43,
+    "pr_url": "https://github.com/acme/widget/pull/43",
+    "state": "open",
+    "created_at_ms": 1700000000000,
+    "updated_at_ms": 1700000001000,
+    "source_squad_id": "sq-1",
+    "source_task_idx": 0,
+    "source_cell_idx": 2
+  }
+]
+```
 
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
