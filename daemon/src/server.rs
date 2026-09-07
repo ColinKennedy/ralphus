@@ -10595,8 +10595,81 @@ pub fn serve<A: ToSocketAddrs>(
         );
     });
 
-    run_http_loop(server, &daemon);
+    // tiny_http 0.12 treats any accept() error as fatal: its accept thread
+    // reports the error via the `log` crate (no logger is installed here, so
+    // the message vanishes) and exits, after which the loop above ends. A
+    // transient WSAENOBUFS/WSAEMFILE under machine-wide socket pressure
+    // (many agents + board polling churning connections) therefore used to
+    // end the whole daemon silently mid-flight — and the kill-on-close job
+    // object (`jobobject.rs`) took every running cell down with it. Treat it
+    // as recoverable instead: log loudly, rebind the listener, keep serving.
+    // Only a real shutdown request ends this loop.
+    let bound_addr = server.server_addr().to_ip();
+    let mut server = server;
+    loop {
+        match run_http_loop(server, &daemon) {
+            HttpLoopEnd::Shutdown => break,
+            HttpLoopEnd::AcceptError(e) => {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [http] listener stopped accepting connections ({e}); rebinding"
+                );
+                let _ = daemon
+                    .lock()
+                    .cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::ERROR,
+                        source: "daemon",
+                        message: "http listener died; rebinding",
+                        scope: None,
+                        squad_id: None,
+                        guardian_id: None,
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({ "error": e.to_string() }),
+                        admin_only: false,
+                    });
+                let Some(addr) = bound_addr else {
+                    return Err(std::io::Error::other(
+                        "http listener died and the daemon is not bound to an IP socket; cannot rebind",
+                    ));
+                };
+                server = rebind_http_listener(addr)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Re-create the HTTP listener after tiny_http's accept thread died (see the
+/// rebind loop at the end of [`serve`]). Retries briefly: the port is freed
+/// when the previous `Server` is dropped, but the same resource pressure
+/// that killed the accept thread can make the first bind attempts fail too.
+fn rebind_http_listener(addr: std::net::SocketAddr) -> std::io::Result<tiny_http::Server> {
+    const ATTEMPTS: u32 = 20;
+    let mut last_err = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match tiny_http::Server::http(addr) {
+            Ok(server) => {
+                crate::rlog!(
+                    INFO,
+                    "ralphus [http] listener rebound on {addr} (attempt {attempt})"
+                );
+                return Ok(server);
+            }
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [http] rebind attempt {attempt}/{ATTEMPTS} on {addr} failed: {e}"
+                );
+                last_err = e.to_string();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "could not rebind the http listener on {addr} after {ATTEMPTS} attempts: {last_err}"
+    )))
 }
 
 /// Serve requests from an already-bound server against an already-open store.
@@ -10846,9 +10919,24 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     }
 }
 
-fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) {
+/// Why [`run_http_loop`] stopped serving.
+enum HttpLoopEnd {
+    /// `POST /api/daemon/shutdown` was handled — exit cleanly.
+    Shutdown,
+    /// `Server::recv()` failed: tiny_http 0.12 treats any `accept()` error
+    /// as fatal — its accept thread pushes the error and exits, after which
+    /// `recv()` yields it exactly once (and would block forever if called
+    /// again). The listener must be rebuilt to keep serving.
+    AcceptError(std::io::Error),
+}
+
+fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd {
     let read_pool = ReadPool::new(daemon, READ_WORKERS);
-    for mut request in server.incoming_requests() {
+    loop {
+        let mut request = match server.recv() {
+            Ok(r) => r,
+            Err(e) => return HttpLoopEnd::AcceptError(e),
+        };
         let method = request.method().as_str().to_string();
         // `route()` splits `path` on `?` itself (it needs the query string for
         // filtered/paginated endpoints like `/api/cartographer`), so the full
@@ -10985,7 +11073,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) {
                 INFO,
                 "ralphus [http] shutdown requested — stopping HTTP loop"
             );
-            break;
+            return HttpLoopEnd::Shutdown;
         }
     }
 }
