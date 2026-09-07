@@ -3285,7 +3285,7 @@ impl Store {
         let manual_checks_env = apply_branch_env(&combined_env, &manual_checks_env_overrides);
 
         // RAL-168: resolve this review's own Proof-scope override (if any)
-        // against the project-level `.ralphus.toml [review] verify_scope`
+        // against the project-level `.ralphus.toml [review] default_proof_scope`
         // default -- so the UI can show the effective value as the dropdown's
         // initial selection (interview Q7) without a second round-trip, and
         // the merge engine (`guardian_merge.rs`) has a single, always-populated
@@ -3303,7 +3303,7 @@ impl Store {
             row.proof_scope
                 .as_deref()
                 .filter(|s| matches!(*s, "each_branch" | "final_branch" | "nothing"))
-                .unwrap_or_else(|| project_review_config.verify_scope())
+                .unwrap_or_else(|| project_review_config.default_proof_scope())
                 .to_string()
         };
         let effective_proof_skip_auto_clean = row

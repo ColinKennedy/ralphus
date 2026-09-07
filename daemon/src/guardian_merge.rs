@@ -1044,14 +1044,21 @@ pub(crate) fn resolver_agent(stored: Option<&str>, cwd: &Path) -> String {
 }
 
 /// The model the resolver runs: the review's own `stored` model, else the
-/// `RALPHUS_RESOLVER_MODEL` env override, else `qwen3:8b` for the ollama backend.
-/// claude, claude-code, and codex each pick their own default when unset → `None`.
-pub(crate) fn resolver_model(stored: Option<&str>, agent: &str) -> Option<String> {
+/// `RALPHUS_RESOLVER_MODEL` env override, else `.ralphus.toml`'s
+/// `[review].default_resolver_model` (global layered under `cwd`'s project
+/// config), else `qwen3:8b` for the ollama backend. claude, claude-code, and
+/// codex each pick their own default when still unset → `None`.
+pub(crate) fn resolver_model(stored: Option<&str>, agent: &str, cwd: &Path) -> Option<String> {
     stored
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .or_else(|| std::env::var("RALPHUS_RESOLVER_MODEL").ok())
+        .or_else(|| {
+            crate::config::resolve(cwd)
+                .default_resolver_model()
+                .map(ToString::to_string)
+        })
         .or_else(|| match agent {
             "ollama" => Some("qwen3:8b".to_string()),
             _ => None, // codex, claude, claude-code: each picks its own default
@@ -1089,7 +1096,7 @@ fn resolve_resolver_agent(
     // Keyed off the *resolved* backend, not the raw profile name, so a custom
     // profile that resolves to `ollama` still gets the sensible `qwen3:8b`
     // default.
-    let model = resolver_model(stored_model, &selection.backend);
+    let model = resolver_model(stored_model, &selection.backend, cwd);
     Ok(ResolvedResolverAgent {
         backend: selection.backend,
         executable: selection.executable,
@@ -7985,6 +7992,55 @@ mod tests {
         .expect("utf8")
         .trim()
         .to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // RAL-342/RAL-338: resolver_model's project-config default tier
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolver_model_falls_back_to_the_project_default_when_stored_and_env_are_unset() {
+        let dir = tmp_dir("resolver-model");
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[review]\ndefault_resolver_model = \"claude-haiku-4-5\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolver_model(None, "claude-code", &dir),
+            Some("claude-haiku-4-5".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolver_model_stored_value_wins_over_the_project_default() {
+        let dir = tmp_dir("resolver-model-stored");
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[review]\ndefault_resolver_model = \"claude-haiku-4-5\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolver_model(Some("qwen3:8b"), "claude-code", &dir),
+            Some("qwen3:8b".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolver_model_with_no_project_default_still_falls_back_to_the_ollama_default() {
+        let dir = tmp_dir("resolver-model-none");
+        assert_eq!(
+            resolver_model(None, "ollama", &dir),
+            Some("qwen3:8b".to_string())
+        );
+        assert_eq!(resolver_model(None, "claude-code", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
