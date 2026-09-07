@@ -4368,6 +4368,8 @@ struct EditBody {
     #[serde(default)]
     auto_compact_threshold: Option<String>,
     #[serde(default)]
+    maximum_tool_output_tokens: Option<String>,
+    #[serde(default)]
     system_prompt: Option<String>,
 }
 
@@ -4401,19 +4403,55 @@ fn nullable_field_edit(v: Option<&String>) -> Option<Option<&str>> {
 }
 
 /// Like [`nullable_field_edit`] but for an integer-valued nullable field
-/// (currently only `auto_compact_threshold`): `None` -- untouched;
-/// `Some(None)` -- present but empty, clear it; `Some(Some(n))` -- present
-/// and non-empty, parsed to `n`. `Err` means the caller supplied a
-/// non-empty value that isn't a valid integer.
-fn nullable_i64_field_edit(v: Option<&String>) -> std::result::Result<Option<Option<i64>>, String> {
+/// (`auto_compact_threshold`, `maximum_tool_output_tokens`): `None` --
+/// untouched; `Some(None)` -- present but empty, clear it; `Some(Some(n))`
+/// -- present and non-empty, parsed to `n`. `Err` means the caller supplied
+/// a non-empty value that isn't a valid integer, or isn't positive.
+///
+/// `field` names the field in the error message, since more than one field
+/// decodes through here.
+///
+/// Positivity mirrors `core::validate`'s `check_positive_number`, which
+/// rejects `0` and negatives for both fields at submit time -- without it an
+/// edit could store a value no task file would have been accepted with.
+fn nullable_i64_field_edit(
+    field: &str,
+    v: Option<&String>,
+) -> std::result::Result<Option<Option<i64>>, String> {
     match v.map(|s| non_empty(Some(s))) {
         None => Ok(None),
         Some(None) => Ok(Some(None)),
-        Some(Some(s)) => s
-            .parse::<i64>()
-            .map(|n| Some(Some(n)))
-            .map_err(|_| format!("auto_compact_threshold: invalid integer '{s}'")),
+        Some(Some(s)) => match s.parse::<i64>() {
+            Ok(n) if n > 0 => Ok(Some(Some(n))),
+            Ok(n) => Err(format!("{field}: must be a positive integer, got {n}")),
+            Err(_) => Err(format!("{field}: invalid integer '{s}'")),
+        },
     }
+}
+
+/// Reject a `maximum_tool_output_tokens` edit up front when the agent that
+/// would run the edited node has no delivery mechanism for the cap (RAL-333),
+/// mirroring `core::validate`'s submit-time rule rather than storing a value
+/// the backend would silently never apply -- the same shape as the
+/// `system_prompt` guard in `edit_squad`'s `"cell"` arm.
+///
+/// A custom agent profile name (not in `RESERVED_AGENT_NAMES`) is deferred the
+/// way `core` defers it: resolving a profile's backend needs the cwd/config
+/// this edit path doesn't have on hand.
+fn reject_unsupported_maximum_tool_output_tokens(agent: &str) -> Option<Reply> {
+    if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !ralphus_core::schema::agent_supports_maximum_tool_output_tokens(agent)
+    {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!(
+                "'maximum_tool_output_tokens' is only supported for the 'claude-code'/'codex'/'pi' agents right now, not '{agent}'"
+            ),
+            vec![],
+        ));
+    }
+    None
 }
 
 /// Edit a squad's label, a task's name/project/model, a cell's fields, or a
@@ -4478,11 +4516,20 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             } else {
                 (None, None)
             };
-            let auto_compact_threshold =
-                match nullable_i64_field_edit(req.auto_compact_threshold.as_ref()) {
-                    Ok(v) => v,
-                    Err(msg) => return error(400, "bad_request", &msg, vec![]),
-                };
+            let auto_compact_threshold = match nullable_i64_field_edit(
+                "auto_compact_threshold",
+                req.auto_compact_threshold.as_ref(),
+            ) {
+                Ok(v) => v,
+                Err(msg) => return error(400, "bad_request", &msg, vec![]),
+            };
+            let maximum_tool_output_tokens = match nullable_i64_field_edit(
+                "maximum_tool_output_tokens",
+                req.maximum_tool_output_tokens.as_ref(),
+            ) {
+                Ok(v) => v,
+                Err(msg) => return error(400, "bad_request", &msg, vec![]),
+            };
             let system_prompt = nullable_field_edit(req.system_prompt.as_ref());
             let new_agent = non_empty(req.agent.as_ref());
             // Reject up front (mirroring `core::validate::check_system_prompt`'s
@@ -4513,6 +4560,22 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     );
                 }
             }
+            // Same up-front rejection as `system_prompt` above, for the same
+            // reason: a cap the cell's agent can't deliver is silently inert.
+            // Clearing the field back out (`Some(None)`) needs no check.
+            if let Some(Some(_)) = maximum_tool_output_tokens {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_unsupported_maximum_tool_output_tokens(&effective_agent)
+                {
+                    return reply;
+                }
+            }
             let edit = crate::store::CellEdit {
                 cwd: nullable_field_edit(req.cwd.as_ref()),
                 agent: new_agent,
@@ -4520,6 +4583,7 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 prompt,
                 command,
                 auto_compact_threshold,
+                maximum_tool_output_tokens,
                 system_prompt,
             };
             if let Err(e) = daemon
@@ -4551,8 +4615,33 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             }
         }
         "proof" => {
+            let maximum_tool_output_tokens = match nullable_i64_field_edit(
+                "maximum_tool_output_tokens",
+                req.maximum_tool_output_tokens.as_ref(),
+            ) {
+                Ok(v) => v,
+                Err(msg) => return error(400, "bad_request", &msg, vec![]),
+            };
+            // A proof step carries its own agent, so it is gated on that
+            // rather than on the owning cell's -- see the `"cell"` arm.
+            if let Some(Some(_)) = maximum_tool_output_tokens {
+                let agent = match daemon.lock().get_proof_agent(
+                    id,
+                    req.task_idx,
+                    &req.proof_scope,
+                    req.cell_idx,
+                    req.proof_idx,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => return store_error(&e),
+                };
+                if let Some(reply) = reject_unsupported_maximum_tool_output_tokens(&agent) {
+                    return reply;
+                }
+            }
             let edit = crate::store::ProofEdit {
                 model: nullable_field_edit(req.model.as_ref()),
+                maximum_tool_output_tokens,
             };
             if let Err(e) = daemon.lock().edit_proof_fields(
                 id,
@@ -12830,6 +12919,135 @@ machine=\"incredibuild:B\"
     }
 
     #[test]
+    fn edit_cell_maximum_tool_output_tokens_set_and_clear() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"claude-code\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let set = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_tool_output_tokens": "25000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.body.contains("\"maximum_tool_output_tokens\":25000"),
+            "{}",
+            r.body
+        );
+
+        // Present-but-empty clears it back to NULL, which `CellView` omits
+        // from the JSON entirely (`skip_serializing_if = "Option::is_none"`)
+        // rather than rendering as `null`.
+        let clear = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_tool_output_tokens": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("maximum_tool_output_tokens"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_omitted_maximum_tool_output_tokens_is_untouched() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"claude-code\"
+maximum_tool_output_tokens=8000
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "model": "sonnet"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.body.contains("\"maximum_tool_output_tokens\":8000"),
+            "{}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn edit_cell_maximum_tool_output_tokens_rejected_for_unsupported_agent() {
+        // GOOD's cell resolves to the default "claude", which has no
+        // tool-output-cap delivery mechanism (RAL-333).
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_tool_output_tokens": "25000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("maximum_tool_output_tokens"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_tool_output_tokens_accepted_with_supporting_agent_in_same_call() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "agent": "claude-code", "maximum_tool_output_tokens": "25000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_tool_output_tokens_clear_does_not_require_agent_support() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_tool_output_tokens": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_rejects_non_positive_and_non_numeric_integer_fields() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"claude-code\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        for (field, value) in [
+            ("maximum_tool_output_tokens", "0"),
+            ("maximum_tool_output_tokens", "-5"),
+            ("maximum_tool_output_tokens", "lots"),
+            ("auto_compact_threshold", "0"),
+            ("auto_compact_threshold", "-5"),
+            ("auto_compact_threshold", "lots"),
+        ] {
+            let body = serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0, field: value
+            })
+            .to_string();
+            let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+            assert_eq!(r.status, 400, "{field}={value}: {}", r.body);
+            assert!(r.body.contains(field), "{field}={value}: {}", r.body);
+        }
+    }
+
+    #[test]
     fn edit_cell_system_prompt_restarts_cell_to_pending() {
         let d = daemon();
         let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\n";
@@ -13190,6 +13408,69 @@ machine=\"incredibuild:B\"
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"model\":\"gpt-5\""), "{}", r.body);
         assert!(r.body.contains("\"state\":\"pending\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_maximum_tool_output_tokens_set_and_clear() {
+        // A proof step has no `agent` key of its own (not in `PROOF_KEYS`) --
+        // `proofs.agent` is populated from the owning cell/task at submit, and
+        // that stored value is what the cap is gated on (RAL-333).
+        const ONE_CELL: &str = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\".\"
+prompt=\"p\"
+agent=\"claude-code\"
+            [[task.cell.proof]]
+prompt=\"check\"
+";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        let set = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "maximum_tool_output_tokens": "8000",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.body.contains("\"maximum_tool_output_tokens\":8000"),
+            "{}",
+            r.body
+        );
+
+        let clear = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "maximum_tool_output_tokens": "",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("maximum_tool_output_tokens"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_maximum_tool_output_tokens_rejected_for_unsupported_agent() {
+        // No explicit proof `agent` -- resolves to the default "claude",
+        // which cannot deliver the cap.
+        const ONE_CELL: &str = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\".\"
+command=\"x\"
+            [[task.cell.proof]]
+command=\"check\"
+";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "maximum_tool_output_tokens": "8000",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("maximum_tool_output_tokens"), "{}", r.body);
     }
 
     #[test]

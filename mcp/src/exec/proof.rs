@@ -52,7 +52,11 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
                 )?)
             }
         }
-        ProofCommand::Edit { selector, model } => {
+        ProofCommand::Edit {
+            selector,
+            model,
+            maximum_tool_output_tokens,
+        } => {
             let resolved = proof::resolve_scoped(client, &selector, "proof")?;
             Ok(client.edit_proof(
                 &resolved.squad_id,
@@ -61,6 +65,7 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
                 resolved.cell_idx,
                 resolved.proof_idx,
                 model.as_deref(),
+                maximum_tool_output_tokens.as_deref(),
             )?)
         }
     }
