@@ -877,7 +877,7 @@ fn synthesize_pr_text(
     }
 
     let agent = guardian_merge::resolver_agent(guardian.resolver_agent.as_deref(), &root);
-    let model = guardian_merge::resolver_model(guardian.resolver_model.as_deref(), &agent);
+    let model = guardian_merge::resolver_model(guardian.resolver_model.as_deref(), &agent, &root);
     let template_note = template.map_or_else(String::new, |t| {
         format!(
             "\n\nThe target repository has a pull-request template you MUST \

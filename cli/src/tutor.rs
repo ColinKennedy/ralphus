@@ -359,7 +359,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 then "ollama".
  model  string  Model the resolver `agent` runs, e.g. "qwen3:8b".
                 Unset falls back to RALPHUS_RESOLVER_MODEL, then
-                "qwen3:8b" for the ollama backend.
+                .ralphus.toml's [review].default_resolver_model,
+                then "qwen3:8b" for the ollama backend.
  upstream
         string  The branch this review's stack rebases onto.
                 Optional for an all-local review (inferred from
@@ -373,8 +374,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 proved), "final_branch" (only the last, combined
                 branch is proved), or "nothing" (no proof steps
                 run at all). Unset inherits the project-level
-                .ralphus.toml [review] proof_scope default, then
-                "each_branch". Equivalent to setting it later via
+                .ralphus.toml [review] default_proof_scope setting,
+                then "each_branch". Equivalent to setting it later via
                 `ralphus review settings <selector> --proof-scope
                 <value>`, but declared up front so the review is
                 created with the right scope from its first merge.
@@ -412,6 +413,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  [[review]] block to author and no manual `ralphus review ...`
  step -- you just submit, and once enough related work has piled
  up (or on schedule) it folds into an auto-created review for you.
+
+ Since there's no [[review]] block for it, an auto-created review
+ gets its agent/model/machine/maximum_budget_usd/proof_scope from
+ the owning project's .ralphus.toml [review] table --
+ default_resolver_agent, default_resolver_model, default_machine,
+ default_maximum_budget_usd, default_proof_scope (RAL-342/RAL-338).
+ Set these once per project rather than per submission.
 
  Key         Type             Notes
  triage      bool             Opt this cell into Triage instead of
