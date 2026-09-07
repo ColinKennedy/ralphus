@@ -1588,9 +1588,8 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_triage_pools, rebase_onto, repair_triage_pool_keys,
-        require_auto_build_declaration, workspace_has_commits_ahead_of_upstream,
-        workspace_head_is_ancestor_of_upstream,
+        derive_triage_pools, rebase_onto, repair_triage_pool_keys, require_auto_build_declaration,
+        workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::Store;
     use crate::workspace::Workspace;

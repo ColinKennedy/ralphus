@@ -343,6 +343,7 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
             title,
             description,
             use_worktree_branch_name,
+            allow_unlinked_fork,
         } => {
             let mut pr_spec = serde_json::Map::new();
             if let Some(alias) = &alias {
@@ -379,7 +380,11 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
                     })?;
                 pr_spec.insert("branch_id".to_string(), found["id"].clone());
             }
-            Ok(client.guardian_submit_prs(&resolved.guardian_id, &[Value::Object(pr_spec)])?)
+            Ok(client.guardian_submit_prs_ex(
+                &resolved.guardian_id,
+                &[Value::Object(pr_spec)],
+                allow_unlinked_fork,
+            )?)
         }
         ReviewPrCommand::List { selector } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;

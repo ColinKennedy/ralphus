@@ -245,7 +245,7 @@ aborts the remaining batch).
 | `review checks run <selector> [--index N...] [--all] [--input NAME=VALUE...]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
 | `review action list <selector>` | List user-declared `[[review.action]]` hints |
 | `review action run <selector> --index N [--input NAME=VALUE...]` | Print the command + cwd for a `command`-kind hint |
-| `review pr submit <selector> (--position N \| --combined) [--alias] [--title] [--description]` | Submit a PR/MR (RAL-117); title/description default to an LLM suggestion |
+| `review pr submit <selector> (--position N \| --combined) [--alias] [--title] [--description] [--allow-unlinked-fork]` | Submit a PR/MR (RAL-117); title/description default to an LLM suggestion. `--allow-unlinked-fork` (RAL-338) downgrades a definite "no forge relationship" fork pre-flight result from a hard error to a logged warning; ignored for a project with no registered fork |
 | `review pr list <selector>` | List PRs submitted for a review |
 | `review pr show <pr_id>` | Show one PR row |
 | `review pr find <forge> <repo> <pr_number>` | Look up the PR row for a forge PR/MR number |
@@ -275,6 +275,24 @@ name, falling back to the input's own declared default. If an input ends up
 with no value from any source, the command errors listing the missing
 input name(s) instead of printing a command with a bare, unsubstituted
 `{name}` left in it.
+
+## project
+
+| Command | What |
+|---|---|
+| `project git --path <p> --name <n> [--url] [--clear-url] [--description] [--match-pr-branch-name]` | Register/update a project's git info |
+| `project list [--short]` | List registered projects |
+| `project get <name>` | One project's detail |
+| `project fork add <project> --url <url> [--user] [--remote-name] [--owner]` | [Register a fork](fork-workflows.md) (RAL-338), optionally scoped to one user (defaults to the project-wide fallback row when `--user` is omitted) |
+| `project fork list [<project>] [--user] [--short]` | List registered forks, optionally scoped to one project and/or filtered to one user |
+| `project fork set <project> [--user] [--url] [--remote-name] [--owner]` | Update fields on an existing fork registration |
+| `project fork remove <project> [--user]` | Remove a fork registration |
+
+See [`fork-workflows.md`](fork-workflows.md) for the fork registration
+surface's topology, promotion, and setup guidance, and
+[`daemon-api.md`](daemon-api.md#fork-registration-ral-338) for the HTTP wire
+shapes. `review pr submit` gains `--allow-unlinked-fork` (see below) once a
+project has a registered fork.
 
 ## show
 

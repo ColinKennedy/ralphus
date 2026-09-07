@@ -1073,6 +1073,21 @@ impl Store {
                 auto_watch            INTEGER NOT NULL DEFAULT 0,
                 default_notify_tiers  TEXT NOT NULL DEFAULT 'urgent,high,normal'
             );
+            -- RAL-338: a project's writable fork, keyed by the user who pushes
+            -- to it (`user = ''` is the project-wide fallback row). Rows
+            -- deliberately do not cascade on user deletion -- an
+            -- unregistered-user fork row must stay visible (see
+            -- `project_forks.rs`), not silently vanish.
+            CREATE TABLE IF NOT EXISTS project_forks (
+                project       TEXT NOT NULL,
+                user          TEXT NOT NULL,
+                fork_url      TEXT NOT NULL,
+                remote_name   TEXT NOT NULL,
+                fork_owner    TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (project, user)
+            );
             -- RAL-328: view preferences are scoped to a registered user and
             -- reference exactly one squad or review. Entity deletion removes
             -- the preference before sequential ids can be reused.
@@ -2003,6 +2018,16 @@ impl Store {
             // column meaningfully set) simply gets no auto_build tier at
             // finalize time (see `guardian_merge::final_checks`).
             "ALTER TABLE guardians ADD COLUMN auto_build_json TEXT",
+            // RAL-338: set on a fork-internal PR row once reconcile-first
+            // promotion closes it and files a fresh cross-repository PR
+            // against the parent in its place (its own branch became the
+            // stack's new root after the prior root merged) -- names the
+            // superseding row's own `id`. NULL for every other row,
+            // including one that was never promoted or is itself the
+            // current promoted replacement. Kept (not deleted) so the
+            // closed PR's discussion stays visible in `PrStackView`
+            // history, per this ticket's Q3.3.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN superseded_by TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3766,6 +3791,35 @@ impl Store {
     /// [`Self::project_skip_base_updates_stamp`].
     pub fn project_auto_submit_pr_stack_stamp(&self, path: &str) -> Option<bool> {
         self.project_bool_stamp(path, "auto_submit_pr_stack")
+    }
+
+    /// The registered project name whose `path` is `path` itself or an
+    /// ancestor of it (RAL-338) -- same lookup/ancestry semantics as
+    /// [`Self::project_skip_base_updates_stamp`], but returning the project's
+    /// `name` (the key [`Self::resolve_fork`] takes) instead of a stamped
+    /// bool column. Used to find "which registered project (if any) does
+    /// this guardian's `git_root` belong to" for fork resolution -- a
+    /// guardian has no direct project foreign key, only a filesystem path.
+    pub fn project_name_for_path(&self, path: &str) -> Option<String> {
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        let mut stmt = self.conn.prepare("SELECT name, path FROM projects").ok()?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .ok()?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        for (name, proj_path) in rows {
+            let proj_path = proj_path.trim_end_matches(['/', '\\']);
+            let matches = trimmed == proj_path
+                || trimmed
+                    .strip_prefix(proj_path)
+                    .map(|rest| rest.starts_with(['/', '\\']))
+                    .unwrap_or(false);
+            if matches {
+                return Some(name);
+            }
+        }
+        None
     }
 
     /// Shared lookup behind [`Self::project_skip_base_updates_stamp`] and
@@ -11920,6 +11974,23 @@ command = "check-c"
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"a".to_string()));
         assert!(names.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn project_name_for_path_matches_the_path_itself_and_descendants() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("ralphus", "orchestrator", "C:/repos/ralphus", "git")
+            .unwrap();
+        assert_eq!(
+            store.project_name_for_path("C:/repos/ralphus"),
+            Some("ralphus".to_string())
+        );
+        assert_eq!(
+            store.project_name_for_path("C:/repos/ralphus/"),
+            Some("ralphus".to_string())
+        );
+        assert_eq!(store.project_name_for_path("C:/repos/other"), None);
     }
 
     #[test]

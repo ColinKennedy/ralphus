@@ -46,6 +46,9 @@ task-grained (no graph, no cell-level browsing except an expanded row).
 | **check gate** | Commands run against the finished combined worktree before a review is considered done. From `[[review]]`'s checks, or a project's `auto_build`. |
 | **carry-forward** / **carry refs** | Reusing a previous build's already-resolved conflict commits when a review is rebuilt, so the same conflict isn't resolved twice. |
 | **combined worktree** | The read-only worktree at the head of the full stack — what a reviewer reads and what check gates run against. |
+| **fork** (RAL-338) | The writable repository a project's review branches are pushed to when the acting user cannot push directly to the project's registered **parent**. Registered per `(project, user)` (`daemon/src/project_forks.rs`), with `user = ""` acting as the project-wide fallback row. Ralphus only *registers* an existing fork; it never creates one through a forge API. Do not use "upstream" or "origin" for this — both are already taken (see **base branch**'s `upstream` entry above, and the git remote convention). |
+| **parent** (RAL-338) | A fork-enabled project's *non-fork* repository — the one it's registered against. Every alias in a fork-mode review is pushed to and fetched from the **fork**; only the lowest enabled unmerged branch's PR/MR is filed cross-repository against the parent's base branch. Every later branch stays fork-internal, based on the preceding branch's alias. |
+| **promotion** (RAL-338) | Reconcile-first: once a fork-mode review's cross-repository root PR merges, closing the next enabled branch's fork-internal PR and reopening it against the **parent** in its place, since a same-repo base PATCH (the ordinary resync mechanism) can't move a PR across repositories. The superseded PR's row survives (`superseded_by` points at its replacement) so its discussion stays visible in `PrStackView` history. |
 
 ## Arbiter and Triage (RAL-318)
 
@@ -176,9 +179,11 @@ Already carrying weight; pick something else:
 - **machine** — where work runs (RAL-185). Use **seat** for a licensing identity (`user@hostname`).
 - **Arbiter** / **Triage** — the same subsystem; don't add a third name (mirrors **review**/**guardian**). "Triage" is user-facing, "Arbiter" is internal.
 - **resolver** — a review's own conflict-resolving agent/model (RAL-318 disambiguation). Don't reuse it for the Arbiter's classification agent/model, or vice versa — prefix neither with the other.
+- **upstream** / **origin** — already git jargon with their own ambiguity (a git remote name, `@{upstream}` tracking, `[[review]] upstream`'s base-branch meaning). Use **parent** for a fork-enabled project's non-fork repository (RAL-338).
 
 ## See also
 
 - [`machine-providers.md`](machine-providers.md) — the provider contract
 - [`daemon-api.md`](daemon-api.md) — the wire shapes these names appear in
 - [`colors.md`](colors.md) — the semantic colors, which have their own naming rules
+- [`fork-workflows.md`](fork-workflows.md) — fork registration, routing, and promotion (RAL-338)

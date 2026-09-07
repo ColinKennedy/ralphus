@@ -139,12 +139,19 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
 /// Deliberately not PR-system-aware: this doesn't know or care whether
 /// `local_branch` is itself an open PR's branch (in which case the PR just
 /// shows the change immediately) or the basis a separate PR branch was built
-/// from (whose own rebase is a different, already-existing concern). It uses
-/// the branch's already-configured upstream (`@{u}`) when one exists;
-/// otherwise it falls back to the git default remote (`remote.pushDefault`,
-/// else `"origin"`) and pushes to a same-named remote branch, setting
-/// upstream tracking on that first push so later feedback pushes on this
-/// branch naturally follow `@{u}` from then on.
+/// from (whose own rebase is a different, already-existing concern).
+///
+/// `fork_remote` (RAL-338): when `Some`, always pushes there, ignoring
+/// `@{upstream}`/`remote.pushDefault` entirely -- the project has a
+/// registered fork, and every review branch lives there regardless of what a
+/// prior `git push -u` may have set `@{upstream}` to (a stray push can
+/// rewrite it and cause the fork remote to be mistaken for the parent's; see
+/// this ticket's Risks section). When `None` (no registered fork), behavior
+/// is unchanged: the branch's already-configured upstream (`@{u}`) when one
+/// exists, else the git default remote (`remote.pushDefault`, else
+/// `"origin"`), pushing to a same-named remote branch and setting upstream
+/// tracking on that first push so later feedback pushes on this branch
+/// naturally follow `@{u}` from then on.
 ///
 /// `force`: pass `false` when the local commit was `--amend`ed onto history
 /// the remote already has an older version of (the previous push already
@@ -159,8 +166,11 @@ pub(crate) fn push_feedback_branch(
     wt: &Workspace,
     local_branch: &str,
     force: bool,
+    fork_remote: Option<&str>,
 ) -> std::result::Result<String, String> {
-    let (remote, remote_branch) =
+    let (remote, remote_branch) = if let Some(fork_remote) = fork_remote {
+        (fork_remote.to_string(), local_branch.to_string())
+    } else {
         match wt.git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
             Ok(upstream) => {
                 let upstream = upstream.trim();
@@ -178,7 +188,8 @@ pub(crate) fn push_feedback_branch(
                     .unwrap_or_else(|| "origin".to_string());
                 (remote, local_branch.to_string())
             }
-        };
+        }
+    };
 
     if force {
         guard_against_clobber(wt, &remote, &remote_branch, local_branch)?;
@@ -4988,7 +4999,12 @@ pub fn run_feedback(
         // NOT amend (a plain new commit may not fast-forward the remote's
         // previous review push; an amend is a routine extension of history
         // the remote already expects to be rewritten).
-        match push_feedback_branch(&wt, &review_branch, !squash) {
+        // RAL-338: resolve the fork remote explicitly, if this branch's
+        // project has one registered, rather than letting
+        // `push_feedback_branch` infer it through `@{upstream}`.
+        let fork_remote =
+            crate::pr::resolve_feedback_fork_remote(store, Path::new(&branch_project));
+        match push_feedback_branch(&wt, &review_branch, !squash, fork_remote.as_deref()) {
             Ok(sha) => {
                 pushed = true;
                 pushed_sha = Some(sha);

@@ -194,6 +194,10 @@ pub enum ReviewPrCommand {
         /// passed, overriding the review's own `match_pr_branch_name`
         /// setting for this submission only; `None` defers to it.
         use_worktree_branch_name: Option<bool>,
+        /// RAL-338: downgrades a definite "no forge relationship" fork
+        /// pre-flight result from a hard error to a logged warning. Ignored
+        /// for a project with no registered fork.
+        allow_unlinked_fork: bool,
     },
     List {
         selector: String,
@@ -579,6 +583,7 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
             let use_worktree_branch_name = scanner
                 .take_bool("--use-worktree-branch-name")
                 .then_some(true);
+            let allow_unlinked_fork = scanner.take_bool("--allow-unlinked-fork");
             if position.is_some() == combined {
                 return ReviewPrCommand::UsageError(
                     "submit requires exactly one of --position or --combined".to_string(),
@@ -593,6 +598,7 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
                     title,
                     description,
                     use_worktree_branch_name,
+                    allow_unlinked_fork,
                 },
                 None => {
                     ReviewPrCommand::UsageError("missing required <selector> argument".to_string())
@@ -1592,6 +1598,7 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
             title,
             description,
             use_worktree_branch_name,
+            allow_unlinked_fork,
         } => run_and_report(opts, Some("ralphus review list --pr-ready"), || {
             let mut pr_spec = serde_json::Map::new();
             if let Some(alias) = &alias {
@@ -1628,8 +1635,11 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
                 };
                 pr_spec.insert("branch_id".to_string(), found["id"].clone());
             }
-            let result =
-                client.guardian_submit_prs(&resolved.guardian_id, &[Value::Object(pr_spec)])?;
+            let result = client.guardian_submit_prs_ex(
+                &resolved.guardian_id,
+                &[Value::Object(pr_spec)],
+                allow_unlinked_fork,
+            )?;
             emit(opts, &result, |_| {
                 println!("submitting PR for {selector}...")
             });
@@ -2941,6 +2951,30 @@ mod tests {
                 assert!(combined);
                 assert_eq!(position, None);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_submit_allow_unlinked_fork() {
+        match parse(&v(&[
+            "pr",
+            "submit",
+            "g1",
+            "--combined",
+            "--allow-unlinked-fork",
+        ])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit {
+                allow_unlinked_fork,
+                ..
+            }) => assert!(allow_unlinked_fork),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["pr", "submit", "g1", "--combined"])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit {
+                allow_unlinked_fork,
+                ..
+            }) => assert!(!allow_unlinked_fork),
             other => panic!("unexpected: {other:?}"),
         }
     }

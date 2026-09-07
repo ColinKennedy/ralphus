@@ -1416,6 +1416,29 @@
        * @property {number} created_at_ms
        */
       /**
+       * A registered fork row (RAL-338): the writable repository a project's
+       * review branches are pushed to when the user named by `user` can't
+       * push directly to the project's own repository. `user === ""` is the
+       * project-wide default row, used when no user-specific row exists.
+       * @typedef {object} ForkRecord
+       * @property {string} project
+       * @property {string} user - "" for the project-wide default row.
+       * @property {string} fork_url
+       * @property {string} remote_name
+       * @property {string} fork_owner - GitHub owner/org login; "" for GitLab, which addresses cross-project MRs by numeric project id instead.
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       */
+      /**
+       * One `GET /api/health/project-forks` finding for a registered fork row.
+       * @typedef {object} ForkHealthCheck
+       * @property {string} project
+       * @property {string} user
+       * @property {string} name - "fork-user" | "fork-project" | "fork-remote" | "fork-relationship"
+       * @property {string} status - "pass" | "warn" | "fail"
+       * @property {string} detail
+       */
+      /**
        * `GET /api/whoami` response (RAL-332).
        * @typedef {object} WhoAmI
        * @property {string|null} name
@@ -15618,9 +15641,234 @@ Work submitted against it will fail — fix the machine or deregister the provid
         await pollTriage();
         renderProjectTriageModal();
       }
-      // Jump straight to a task/cell in the Squads tab and scroll to it.
+
+      // ---------- Fork registrations popup (RAL-338) ----------
       /**
-       * Switches to the Squads tab and scrolls to a specific task or cell.
+       * Polls `/api/project-forks` -- every registered fork row, across
+       * every project and user.
+       * @returns {Promise<void>}
+       */
+      async function pollProjectForks() {
+        try {
+          const d = await (await fetch("/api/project-forks")).json();
+          projectForks = d.forks || [];
+        } catch (_) { /* transient fetch failure -- leave prior rows in place */ }
+      }
+      /**
+       * Opens the "fork registrations" popup for one project (RAL-338) --
+       * lets you register/edit/remove per-user (and the project-wide
+       * default) fork rows without leaving the Projects tab. Refreshes both
+       * the fork list and the user registry (to flag a row naming a user
+       * who's since been removed) before rendering.
+       * @param {string} projectName
+       * @returns {Promise<void>}
+       */
+      async function openProjectForksModal(projectName) {
+        projectForksModalProject = projectName;
+        projectForksModalError = "";
+        projectForksAddDraft = { user: "", fork_url: "", remote_name: "", fork_owner: "" };
+        projectForksEditUser = null;
+        projectForksEditDraft = {};
+        await Promise.all([pollProjectForks(), pollUsers()]);
+        renderProjectForksModal();
+      }
+      /**
+       * Closes the open Projects-tab fork-registrations popup.
+       * @returns {void}
+       */
+      function closeProjectForksModal() {
+        projectForksModalProject = null;
+        projectForksEditUser = null;
+        projectForksEditDraft = {};
+        closeModal();
+      }
+      /**
+       * Enters inline edit mode for one fork row inside the open popup.
+       * @param {string} user - "" for the project-wide default row.
+       * @returns {void}
+       */
+      function startProjectForkEdit(user) {
+        const projectName = projectForksModalProject;
+        const row = projectForks.find((f) => f.project === projectName && f.user === user);
+        if (!row) return;
+        projectForksEditUser = user;
+        projectForksEditDraft = { fork_url: row.fork_url, remote_name: row.remote_name, fork_owner: row.fork_owner };
+        projectForksModalError = "";
+        renderProjectForksModal();
+      }
+      /**
+       * Exits a fork row's inline edit mode without saving.
+       * @returns {void}
+       */
+      function cancelProjectForkEdit() {
+        projectForksEditUser = null;
+        projectForksEditDraft = {};
+        renderProjectForksModal();
+      }
+      /**
+       * Saves a fork row's inline edit draft (`PATCH .../forks[/{user}]`).
+       * @param {string} user - "" for the project-wide default row.
+       * @returns {Promise<void>}
+       */
+      async function saveProjectForkEdit(user) {
+        const projectName = projectForksModalProject;
+        if (!projectName) return;
+        const draft = projectForksEditDraft;
+        const path = user
+          ? `/api/projects/${encodeURIComponent(projectName)}/forks/${encodeURIComponent(user)}`
+          : `/api/projects/${encodeURIComponent(projectName)}/forks`;
+        try {
+          const r = await fetch(path, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(draft),
+          });
+          if (!r.ok) { projectForksModalError = await responseError(r, "save failed"); renderProjectForksModal(); return; }
+        } catch (_) { projectForksModalError = "daemon unreachable"; renderProjectForksModal(); return; }
+        projectForksEditUser = null;
+        projectForksEditDraft = {};
+        await pollProjectForks();
+        renderProjectForksModal();
+      }
+      /**
+       * Registers a new fork row from the open popup's "add a fork" form
+       * (`POST .../forks`). `user` blank registers the project-wide default
+       * row; `remote_name`/`fork_owner` blank let the daemon default them
+       * (`fork`/`fork-<user>`, and an auto-derived GitHub owner).
+       * @returns {Promise<void>}
+       */
+      async function addProjectFork() {
+        const projectName = projectForksModalProject;
+        if (!projectName) return;
+        const draft = projectForksAddDraft;
+        if (!draft.fork_url || !draft.fork_url.trim()) {
+          projectForksModalError = "A fork clone URL is required.";
+          renderProjectForksModal();
+          return;
+        }
+        /** @type {{user: string, fork_url: string, remote_name?: string, fork_owner?: string}} */
+        const body = { user: draft.user || "", fork_url: draft.fork_url.trim() };
+        if (draft.remote_name && draft.remote_name.trim()) body.remote_name = draft.remote_name.trim();
+        if (draft.fork_owner && draft.fork_owner.trim()) body.fork_owner = draft.fork_owner.trim();
+        try {
+          const r = await post(`/api/projects/${encodeURIComponent(projectName)}/forks`, body);
+          if (!r.ok) { projectForksModalError = await responseError(r, "add failed"); renderProjectForksModal(); return; }
+        } catch (_) { projectForksModalError = "daemon unreachable"; renderProjectForksModal(); return; }
+        projectForksAddDraft = { user: "", fork_url: "", remote_name: "", fork_owner: "" };
+        projectForksModalError = "";
+        await pollProjectForks();
+        renderProjectForksModal();
+      }
+      /**
+       * Removes a fork row after confirmation (`DELETE .../forks[/{user}]`).
+       * @param {string} user - "" for the project-wide default row.
+       * @returns {Promise<void>}
+       */
+      async function removeProjectFork(user) {
+        const projectName = projectForksModalProject;
+        if (!projectName) return;
+        if (!confirm(`Remove the ${user ? `"${user}"` : "default"} fork registration for "${projectName}"? This cannot be undone.`)) return;
+        const path = user
+          ? `/api/projects/${encodeURIComponent(projectName)}/forks/${encodeURIComponent(user)}`
+          : `/api/projects/${encodeURIComponent(projectName)}/forks`;
+        try {
+          const r = await del(path);
+          if (!r.ok) { projectForksModalError = await responseError(r, "remove failed"); renderProjectForksModal(); return; }
+        } catch (_) { projectForksModalError = "daemon unreachable"; renderProjectForksModal(); return; }
+        await pollProjectForks();
+        renderProjectForksModal();
+      }
+      /**
+       * Renders one fork row (read-only or inline-edit form) inside the
+       * open Projects-tab fork-registrations popup. A row naming a `user`
+       * no longer present in the user registry is marked, not hidden
+       * (RAL-338: fork rows deliberately survive user deletion).
+       * @param {ForkRecord} f
+       * @returns {string}
+       */
+      function projectForkRowHtml(f) {
+        const isDefault = f.user === "";
+        const unregistered = !isDefault && !users.some((u) => u.name === f.user);
+        const userCell = isDefault
+          ? `<span style="color:var(--muted)" data-tip="Used whenever no user-specific fork row applies for whoever is submitting.">(default)</span>`
+          : unregistered
+          ? `<span style="color:var(--ignored)" data-tip="This fork is registered for user \"${esc(f.user)}\", who is no longer in the user registry.\nThe row still applies if that name is ever used again -- it was not deleted, only flagged.">⚠ ${esc(f.user)}</span>`
+          : esc(f.user);
+        if (projectForksEditUser === f.user) {
+          const d = projectForksEditDraft;
+          return `<tr class="proj-edit-row">
+              <td>${userCell}</td>
+              <td><input type="text" value="${esc(d.fork_url || "")}" oninput="projectForksEditDraft.fork_url=this.value" data-tip="The fork's own clone URL (any form git accepts)." /></td>
+              <td><input type="text" value="${esc(d.remote_name || "")}" oninput="projectForksEditDraft.remote_name=this.value" data-tip="Local git remote name ralphus creates/updates automatically before the first fork-mode push." /></td>
+              <td><input type="text" value="${esc(d.fork_owner || "")}" oninput="projectForksEditDraft.fork_owner=this.value" data-tip="GitHub owner/org login the fork lives under (needed to build the cross-repository PR's \"owner:branch\" head). Leave blank for GitLab, which addresses cross-project MRs by numeric project id instead." /></td>
+              <td>
+                <div class="row" style="gap:6px;flex-wrap:nowrap">
+                  <button class="btn primary" data-click="saveProjectForkEdit" data-user="${esc(f.user)}" data-tip="Save these changes.">Save</button>
+                  <button class="btn" onclick="cancelProjectForkEdit()" data-tip="Discard your changes and exit edit mode.">Cancel</button>
+                </div>
+              </td>
+            </tr>`;
+        }
+        return `<tr>
+            <td>${userCell}</td>
+            <td class="mono">${esc(f.fork_url)}</td>
+            <td class="mono">${esc(f.remote_name)}</td>
+            <td class="mono">${f.fork_owner ? esc(f.fork_owner) : `<span style="color:var(--muted)">(none)</span>`}</td>
+            <td>
+              <div class="row" style="gap:6px;flex-wrap:nowrap">
+                <button class="btn" data-click="startProjectForkEdit" data-user="${esc(f.user)}" style="padding:2px 8px;font-size:12px" data-tip="Edit this fork registration.">Edit</button>
+                <button class="btn" data-click="removeProjectFork" data-user="${esc(f.user)}" style="padding:2px 8px;font-size:12px" data-tip="Remove this fork registration.\nThis cannot be undone.">Remove</button>
+              </div>
+            </td>
+          </tr>`;
+      }
+      /**
+       * Renders the open Projects-tab fork-registrations popup for
+       * `projectForksModalProject`: one row per registered fork (the
+       * project-wide default plus any per-user rows), plus a form to
+       * register a new one.
+       * @returns {void}
+       */
+      function renderProjectForksModal() {
+        const projectName = projectForksModalProject;
+        if (!projectName) return;
+        const rows = projectForks
+          .filter((f) => f.project === projectName)
+          .slice()
+          .sort((a, b) => (a.user === "" ? -1 : b.user === "" ? 1 : a.user.localeCompare(b.user)));
+        const rowsHtml = rows.length
+          ? rows.map((f) => projectForkRowHtml(f)).join("")
+          : `<tr><td colspan="5" class="empty">No forks registered for this project yet.</td></tr>`;
+        const d = projectForksAddDraft;
+        const err = projectForksModalError ? `<div class="verr" style="margin-top:8px">${esc(projectForksModalError)}</div>` : "";
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeProjectForksModal()"><div class="modal" style="width:720px;max-width:96vw">
+            <h2>Fork registrations — ${esc(projectName)}</h2>
+            <div class="k" style="margin-bottom:8px" data-tip="A fork is the writable repository review branches are pushed to when the acting user can't push directly to this project's own repository (RAL-338). The default (project-wide) row applies whenever no user-specific row exists for whoever is submitting.">Registered forks for ${esc(projectName)}, including the project-wide default (used when no user-specific row applies).</div>
+            <table class="proj-table"><thead><tr>
+              <th data-tip="Which user this fork row applies to. \"(default)\" is the project-wide fallback row.">User</th>
+              <th data-tip="The fork's own clone URL.">Fork URL</th>
+              <th data-tip="Local git remote name ralphus creates/updates automatically before the first fork-mode push.">Remote name</th>
+              <th data-tip="GitHub owner/org login the fork lives under. Blank for GitLab.">Owner</th>
+              <th></th>
+            </tr></thead><tbody>${rowsHtml}</tbody></table>
+            <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px">
+              <input type="text" placeholder="user (blank = default)" value="${esc(d.user || "")}" oninput="projectForksAddDraft.user=this.value" style="width:140px" data-tip="Leave blank to register/replace the project-wide default row." />
+              <input type="text" placeholder="fork clone URL" value="${esc(d.fork_url || "")}" oninput="projectForksAddDraft.fork_url=this.value" style="width:220px" data-tip="Required. The fork's own clone URL (any form git accepts)." />
+              <input type="text" placeholder="remote name (optional)" value="${esc(d.remote_name || "")}" oninput="projectForksAddDraft.remote_name=this.value" style="width:150px" data-tip="Defaults to \"fork\" for the default row, else \"fork-<user>\"." />
+              <input type="text" placeholder="owner (optional)" value="${esc(d.fork_owner || "")}" oninput="projectForksAddDraft.fork_owner=this.value" style="width:120px" data-tip="GitHub owner/org login. Auto-derived from the URL when it looks like a GitHub host; leave blank for GitLab." />
+              <button class="btn primary" onclick="addProjectFork()" data-tip="Register this fork. Replaces any existing row for the same user (or the default row, if user is blank).">Add / Replace</button>
+            </div>
+            ${err}
+            <div class="btn-row">
+              <button class="btn" onclick="closeProjectForksModal()" data-tip="Close this popup.">Close</button>
+            </div>
+          </div></div>`;
+      }
+
+      // Jump straight to a task/cell in the Tasks tab and scroll to it.
+      /**
+       * Switches to the Tasks tab and scrolls to a specific task or cell.
        * @param {string} squadId
        * @param {number} ti
        * @param {number} si

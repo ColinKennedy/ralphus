@@ -65,7 +65,11 @@ impl ForgeKind {
     }
 
     /// Guess from a remote host, e.g. `github.com`, `gitlab.example.com`.
-    fn from_host(host: &str) -> Option<Self> {
+    ///
+    /// `pub(crate)` (RAL-338) so fork registration can decide whether a
+    /// fork URL's `fork_owner` should be auto-derived (GitHub) or left
+    /// empty (GitLab addresses cross-project MRs by numeric id instead).
+    pub(crate) fn from_host(host: &str) -> Option<Self> {
         let host = host.to_lowercase();
         if host.contains("github") {
             Some(Self::GitHub)
@@ -138,6 +142,7 @@ pub struct CreatedStack {
 
 /// A resolved connection to one forge repository: enough to create PRs, list
 /// comments, and fetch a PR template. Built by [`resolve_remote`].
+#[derive(Clone)]
 pub struct ForgeClient {
     kind: ForgeKind,
     api_base: String,
@@ -204,6 +209,26 @@ impl ForgeClient {
         head: &str,
         base: &str,
     ) -> Result<CreatedPr, String> {
+        self.create_pull_request_routed(title, body, head, base, None)
+    }
+
+    /// Like [`Self::create_pull_request`], but additionally accepts a GitLab
+    /// `target_project_id` (RAL-338): the numeric id of the *parent* project
+    /// a cross-project MR filed on this (fork) client should target. `None`
+    /// reproduces [`Self::create_pull_request`]'s exact payload -- a
+    /// fork-mode root PR/MR is the only caller that ever passes `Some`.
+    /// GitHub ignores this parameter: a cross-repo PR there is expressed
+    /// entirely through an `owner:branch`-prefixed `head` called against the
+    /// *parent's* own client instead (see `PrRoute`), never through a field
+    /// on the request body.
+    pub fn create_pull_request_routed(
+        &self,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+        target_project_id: Option<i64>,
+    ) -> Result<CreatedPr, String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
@@ -211,7 +236,7 @@ impl ForgeClient {
             self.kind.as_str(),
             self.repo_path
         );
-        let result = self.create_pull_request_inner(title, body, head, base);
+        let result = self.create_pull_request_inner(title, body, head, base, target_project_id);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(pr) => crate::rlog!(
@@ -239,6 +264,7 @@ impl ForgeClient {
         body: &str,
         head: &str,
         base: &str,
+        target_project_id: Option<i64>,
     ) -> Result<CreatedPr, String> {
         let token = self.require_token()?;
         match self.kind {
@@ -267,12 +293,15 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests",
                     self.api_base, self.repo_path
                 );
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "source_branch": head,
                     "target_branch": base,
                     "title": title,
                     "description": body,
                 });
+                if let Some(id) = target_project_id {
+                    payload["target_project_id"] = serde_json::json!(id);
+                }
                 let resp = send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 let number = resp["iid"]
                     .as_i64()
@@ -281,6 +310,28 @@ impl ForgeClient {
                 Ok(CreatedPr { number, url })
             }
         }
+    }
+
+    /// Resolve this GitLab project's numeric id via `GET /projects/{path}`
+    /// (RAL-338) -- needed as the `target_project_id` of a cross-project MR
+    /// filed from a fork against its parent, since GitLab's merge request
+    /// API addresses the target project numerically, not by path. Callers
+    /// should resolve this once per submit and reuse it across every branch
+    /// in the stack rather than re-resolving per PR.
+    ///
+    /// # Errors
+    /// Returns `Err` on a GitHub client (this concept doesn't apply there),
+    /// a missing token, or any forge API/parse failure.
+    pub fn resolve_gitlab_project_id(&self) -> Result<i64, String> {
+        if self.kind != ForgeKind::GitLab {
+            return Err("resolve_gitlab_project_id is only meaningful for GitLab".to_string());
+        }
+        let token = self.require_token()?;
+        let url = format!("{}/projects/{}", self.api_base, self.repo_path);
+        let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+        resp["id"]
+            .as_i64()
+            .ok_or_else(|| format!("unexpected GitLab project response shape: {resp}"))
     }
 
     /// Fetch a PR/MR's *live* state from the forge, normalized to ralphus's
@@ -496,6 +547,126 @@ impl ForgeClient {
                 );
                 let payload = serde_json::json!({ "target_branch": new_base });
                 send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Close a PR/MR without merging it (RAL-338): used by reconcile-first
+    /// promotion to retire a fork-internal PR once its branch becomes the
+    /// stack's new cross-repository root and a fresh PR is filed against the
+    /// parent instead. Logs the outbound call (start/done/error) via
+    /// `rlog!`.
+    pub fn close_pull_request(&self, number: i64) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] close pr start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.close_pull_request_inner(number);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] close pr done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] close pr failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn close_pull_request_inner(&self, number: i64) -> Result<(), String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({ "state": "closed" });
+                send(
+                    ureq::patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "state_event": "close" });
+                send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Post a comment on a PR/MR (RAL-338): used by reconcile-first
+    /// promotion to leave a pointer from a superseded fork-internal PR to
+    /// its replacement cross-repository PR. Logs the outbound call
+    /// (start/done/error) via `rlog!`.
+    pub fn post_pr_comment(&self, number: i64, body: &str) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] post pr comment start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.post_pr_comment_inner(number, body);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] post pr comment done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] post pr comment failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn post_pr_comment_inner(&self, number: i64, body: &str) -> Result<(), String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!(
+                    "{}/repos/{}/issues/{number}/comments",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "body": body });
+                send(
+                    ureq::post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}/notes",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "body": body });
+                send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -893,7 +1064,10 @@ fn parse_body(resp: ureq::Response) -> Result<serde_json::Value, String> {
 /// slash, trailing slash, or `.git` suffix. Supports the three shapes git
 /// itself accepts: `git@host:owner/repo.git`, `https://host/owner/repo.git`,
 /// and `ssh://git@host/owner/repo.git`.
-fn parse_remote_url(url: &str) -> Option<(String, String)> {
+///
+/// `pub(crate)` (RAL-338) so `project_forks`/`pr.rs` can reuse it to derive a
+/// fork registration's owner without re-deriving this parsing a second time.
+pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
     let url = url.trim();
     let (host, path) = if let Some(rest) = url
         .strip_prefix("ssh://")
@@ -921,6 +1095,18 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((host.to_string(), path.to_string()))
+}
+
+/// Best-effort GitHub owner/org login parsed from a fork's remote URL
+/// (RAL-338), for the fork registration surface's optional `fork_owner`
+/// auto-fill. GitLab addresses cross-project MRs by numeric project id, not
+/// owner, so callers should only use this when the fork's forge is GitHub --
+/// a GitLab fork's `fork_owner` is meant to stay `""`.
+#[must_use]
+pub(crate) fn derive_owner_from_url(url: &str) -> Option<String> {
+    let (_, path) = parse_remote_url(url)?;
+    let owner = path.split('/').next()?;
+    (!owner.is_empty()).then(|| owner.to_string())
 }
 
 /// Fallback token resolution when `[forge].token_env` (or its default,
@@ -1011,9 +1197,274 @@ fn extract_glab_token(text: &str) -> Option<String> {
 /// it is a fallback only, consulted when neither of the above resolves.
 #[must_use]
 pub(crate) fn resolve_remote_name(root: &Path, base_branch: &str, cfg: &ForgeConfig) -> String {
+    resolve_remote_name_excluding(root, base_branch, cfg, None)
+}
+
+/// Like [`resolve_remote_name`], but steps 1-2 never resolve to `exclude`
+/// (RAL-338): used when computing the *parent's* remote for a fork-mode
+/// review, so a stray `@{upstream}` or `<remote>/<branch>`-form `base_branch`
+/// that happens to point at the project's registered fork remote can't be
+/// mistaken for the parent's remote. Every existing (non-fork) call site
+/// keeps calling [`resolve_remote_name`] unchanged, which passes `None` here
+/// and is therefore byte-identical to before this exclusion existed.
+#[must_use]
+pub(crate) fn resolve_remote_name_excluding(
+    root: &Path,
+    base_branch: &str,
+    cfg: &ForgeConfig,
+    exclude: Option<&str>,
+) -> String {
     remote_from_base_branch(root, base_branch)
-        .or_else(|| remote_from_branch_upstream(root, base_branch))
+        .filter(|r| Some(r.as_str()) != exclude)
+        .or_else(|| {
+            remote_from_branch_upstream(root, base_branch).filter(|r| Some(r.as_str()) != exclude)
+        })
         .unwrap_or_else(|| default_remote_name(cfg))
+}
+
+/// A resolved routing target for one fork-aware PR/MR operation (RAL-338):
+/// which client to call, what `head`/`base` the forge call itself needs, the
+/// GitLab-only `target_project_id`, and which repository label the
+/// created/queried PR is filed under (`PullRequestView.repo`). See
+/// `pr.rs`'s fork-aware stack route calculation for how this is built, and
+/// this module's doc comment's Risks-derived asymmetry: GitLab always calls
+/// the fork's client (setting `target_project_id` only for the cross-project
+/// root); GitHub calls the *parent's* client for the cross-repo root and the
+/// fork's client for everything else.
+#[derive(Clone)]
+pub struct PrRoute {
+    pub client: ForgeClient,
+    pub head: String,
+    pub base: String,
+    pub target_project_id: Option<i64>,
+    /// The repository label the PR/MR is filed under. GitHub: the parent's
+    /// `owner/repo` for the cross-repo root, else the fork's `owner/repo`.
+    /// GitLab: always the fork's encoded path, since a GitLab MR's `iid` is
+    /// scoped to whichever project it was created on, never the
+    /// `target_project_id`.
+    pub repo: String,
+}
+
+impl PrRoute {
+    /// Create the PR/MR this route describes.
+    ///
+    /// # Errors
+    /// Propagates the underlying forge API failure.
+    pub fn create_pull_request(&self, title: &str, body: &str) -> Result<CreatedPr, String> {
+        self.client.create_pull_request_routed(
+            title,
+            body,
+            &self.head,
+            &self.base,
+            self.target_project_id,
+        )
+    }
+}
+
+/// Pick whichever candidate client's repo label matches `repo` (RAL-338) --
+/// the reconstruction step per-PR operations need once a review has a
+/// registered fork, since a PR's stored `repo` column may name either the
+/// parent or the fork, and the two clients already resolved for a fork-mode
+/// review are the only two candidates that could ever apply. Returns `None`
+/// if neither matches (e.g. `repo` was recorded against a since-changed
+/// remote).
+#[must_use]
+pub(crate) fn client_for_repo<'a>(
+    repo: &str,
+    candidates: &[&'a ForgeClient],
+) -> Option<&'a ForgeClient> {
+    candidates.iter().find(|c| c.repo_label() == repo).copied()
+}
+
+/// One project's resolved fork-network membership, as returned by a live
+/// `lookup_fork_network` call. Kept separate from the HTTP call itself so
+/// [`classify_fork_relationship`] stays pure and offline-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkNetworkInfo {
+    /// This project's own repo label.
+    pub label: String,
+    /// The label of the project this one is directly forked from, if any.
+    pub forked_from: Option<String>,
+    /// The ultimate fork-network root label: walks `forked_from` to its end;
+    /// equal to `label` itself when this project isn't a fork of anything.
+    pub network_root: String,
+}
+
+/// The result of a live fork-network lookup for one project (RAL-338). A
+/// `404`/`403` is `NotVisible`, not an error -- see
+/// [`classify_fork_relationship`]'s doc comment for why that distinction
+/// matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkLookup {
+    Found(ForkNetworkInfo),
+    NotVisible,
+}
+
+/// How a `fork` project relates to its intended `parent`'s fork network
+/// (RAL-338), used as the required pre-flight before ever filing a
+/// cross-repository PR/MR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRelationship {
+    /// `fork` is directly forked from `parent`.
+    SameNetwork,
+    /// `fork` and `parent` share the same ultimate fork-network root, but
+    /// not directly -- a fork of a fork, or siblings. Not blocked, but
+    /// worth a warning: cross-repository behavior (promotion, base updates)
+    /// is only proven for a direct relationship.
+    SameNetworkIndirect,
+    /// Both projects are forge-visible, but share no fork network at all.
+    NoRelationship,
+    /// The fork or parent project could not be read (403/404). This is NOT
+    /// proof of no relationship -- a private fork the token can't see looks
+    /// identical to a nonexistent one over these APIs, so callers must not
+    /// treat this the same as [`Self::NoRelationship`].
+    NotVisible,
+    /// The two repositories live on different forge hosts/kinds. There is no
+    /// cross-repository PR path regardless of any real relationship.
+    CrossInstance,
+}
+
+impl ForkRelationship {
+    /// Whether a submit should be hard-blocked without
+    /// `--allow-unlinked-fork` -- only a definite absence of any
+    /// relationship. Every other outcome (indirect, not visible,
+    /// cross-instance) is either allowed-with-a-warning or already fatal for
+    /// a different, more specific reason the caller reports separately.
+    #[must_use]
+    pub fn blocks_submission(self) -> bool {
+        matches!(self, Self::NoRelationship)
+    }
+}
+
+/// Classify how `fork` relates to `parent`'s fork network from each side's
+/// already-resolved [`NetworkLookup`] (RAL-338). Pure and offline-testable --
+/// see `ForgeClient::lookup_fork_network` for the live HTTP lookups that
+/// produce a real `NetworkLookup`.
+///
+/// Guards `fork_kind != parent_kind` first (different forge instances have no
+/// cross-repository path at all, independent of whether either lookup even
+/// succeeded), then treats either side being unreadable as [`ForkRelationship::NotVisible`]
+/// rather than [`ForkRelationship::NoRelationship`] -- a 404/403 is never
+/// treated as proof of anything.
+#[must_use]
+pub fn classify_fork_relationship(
+    fork_kind: ForgeKind,
+    parent_kind: ForgeKind,
+    fork: &NetworkLookup,
+    parent: &NetworkLookup,
+) -> ForkRelationship {
+    if fork_kind != parent_kind {
+        return ForkRelationship::CrossInstance;
+    }
+    let (NetworkLookup::Found(f), NetworkLookup::Found(p)) = (fork, parent) else {
+        return ForkRelationship::NotVisible;
+    };
+    if f.network_root != p.network_root {
+        return ForkRelationship::NoRelationship;
+    }
+    if f.forked_from.as_deref() == Some(p.label.as_str()) {
+        ForkRelationship::SameNetwork
+    } else {
+        ForkRelationship::SameNetworkIndirect
+    }
+}
+
+impl ForgeClient {
+    /// Live fork-network lookup for [`classify_fork_relationship`] (RAL-338).
+    /// A `404`/`403` maps to [`NetworkLookup::NotVisible`] rather than
+    /// `Err`, since "can't read it" and "doesn't exist" are indistinguishable
+    /// over these APIs and both must be treated as "not proof of no
+    /// relationship" by the caller. Any other failure (network error,
+    /// missing token, unexpected shape) also degrades to `NotVisible` for
+    /// the same reason -- a relationship pre-flight that can't complete
+    /// must never silently read as "confirmed unrelated".
+    ///
+    /// GitLab's `forked_from_project` only names the *direct* parent, so
+    /// this walks it (bounded to 10 hops, matching the deepest ordinary fork
+    /// chain anyone would plausibly hit) to find the network root. GitHub's
+    /// `source` field already names the ultimate root directly.
+    #[must_use]
+    pub fn lookup_fork_network(&self) -> NetworkLookup {
+        match self.kind {
+            ForgeKind::GitHub => self.lookup_fork_network_github(),
+            ForgeKind::GitLab => self.lookup_fork_network_gitlab(),
+        }
+    }
+
+    fn lookup_fork_network_github(&self) -> NetworkLookup {
+        let Ok(token) = self.require_token() else {
+            return NetworkLookup::NotVisible;
+        };
+        let url = format!("{}/repos/{}", self.api_base, self.repo_path);
+        let Ok(resp) = get(ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json"))
+        else {
+            return NetworkLookup::NotVisible;
+        };
+        let Some(label) = resp["full_name"].as_str() else {
+            return NetworkLookup::NotVisible;
+        };
+        let is_fork = resp["fork"].as_bool().unwrap_or(false);
+        let forked_from = is_fork
+            .then(|| resp["parent"]["full_name"].as_str())
+            .flatten()
+            .map(str::to_string);
+        let network_root = if is_fork {
+            resp["source"]["full_name"]
+                .as_str()
+                .unwrap_or(label)
+                .to_string()
+        } else {
+            label.to_string()
+        };
+        NetworkLookup::Found(ForkNetworkInfo {
+            label: label.to_string(),
+            forked_from,
+            network_root,
+        })
+    }
+
+    fn lookup_fork_network_gitlab(&self) -> NetworkLookup {
+        let Ok(token) = self.require_token() else {
+            return NetworkLookup::NotVisible;
+        };
+        let Some(mut resp) = self.get_gitlab_project(token, &self.repo_path) else {
+            return NetworkLookup::NotVisible;
+        };
+        let Some(label) = resp["path_with_namespace"].as_str().map(str::to_string) else {
+            return NetworkLookup::NotVisible;
+        };
+        let forked_from = resp["forked_from_project"]["path_with_namespace"]
+            .as_str()
+            .map(str::to_string);
+        let mut network_root = label.clone();
+        let mut hops = 0;
+        while let Some(parent_id) = resp["forked_from_project"]["id"].as_i64() {
+            hops += 1;
+            if hops > 10 {
+                break;
+            }
+            let Some(parent_resp) = self.get_gitlab_project(token, &parent_id.to_string()) else {
+                break;
+            };
+            let Some(parent_label) = parent_resp["path_with_namespace"].as_str() else {
+                break;
+            };
+            network_root = parent_label.to_string();
+            resp = parent_resp;
+        }
+        NetworkLookup::Found(ForkNetworkInfo {
+            label,
+            forked_from,
+            network_root,
+        })
+    }
+
+    fn get_gitlab_project(&self, token: &str, path_or_id: &str) -> Option<serde_json::Value> {
+        let url = format!("{}/projects/{path_or_id}", self.api_base);
+        get(ureq::get(&url).set("PRIVATE-TOKEN", token)).ok()
+    }
 }
 
 /// Steps 3-4 of [`resolve_remote_name`] on their own: the branch-independent
@@ -1080,7 +1531,21 @@ pub fn resolve_remote(
     base_branch: &str,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
-    let result = resolve_remote_inner(root, base_branch, cfg);
+    let remote_name = resolve_remote_name(root, base_branch, cfg);
+    resolve_remote_for(root, &remote_name, cfg)
+}
+
+/// Like [`resolve_remote`], but takes an already-resolved remote name
+/// directly rather than deriving one from a review's `base_branch` (RAL-338).
+/// Used when the caller has already picked the remote itself: the parent's
+/// fork-excluded remote (see [`resolve_remote_name_excluding`]), or a
+/// registered fork's own `remote_name`.
+pub fn resolve_remote_for(
+    root: &Path,
+    remote_name: &str,
+    cfg: &ForgeConfig,
+) -> Result<ForgeClient, String> {
+    let result = resolve_remote_for_inner(root, remote_name, cfg);
     match &result {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Ok(client) => crate::rlog!(
@@ -1096,13 +1561,12 @@ pub fn resolve_remote(
     result
 }
 
-fn resolve_remote_inner(
+fn resolve_remote_for_inner(
     root: &Path,
-    base_branch: &str,
+    remote_name: &str,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
-    let remote_name = resolve_remote_name(root, base_branch, cfg);
-    let url = crate::guardian_merge::git(root, &["remote", "get-url", &remote_name])
+    let url = crate::guardian_merge::git(root, &["remote", "get-url", remote_name])
         .map_err(|e| format!("could not read remote '{remote_name}': {e}"))?;
     let (host, path) = parse_remote_url(url.trim())
         .ok_or_else(|| format!("could not parse remote url: {}", url.trim()))?;
@@ -1183,6 +1647,179 @@ mod tests {
     #[test]
     fn rejects_unparseable_remote() {
         assert!(parse_remote_url("not a url").is_none());
+    }
+
+    #[test]
+    fn derive_owner_from_url_handles_every_supported_url_form() {
+        assert_eq!(
+            derive_owner_from_url("git@github.com:alice/proj.git"),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            derive_owner_from_url("https://github.com/alice/proj.git"),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            derive_owner_from_url("https://github.com/alice/proj"),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            derive_owner_from_url("ssh://git@github.com/alice/proj.git"),
+            Some("alice".to_string())
+        );
+        assert_eq!(derive_owner_from_url("not a url"), None);
+    }
+
+    #[test]
+    fn client_for_repo_picks_the_matching_candidate() {
+        let parent = ForgeClient::new(
+            ForgeKind::GitHub,
+            "https://api.github.com".to_string(),
+            "acme/widget".to_string(),
+            None,
+        );
+        let fork = ForgeClient::new(
+            ForgeKind::GitHub,
+            "https://api.github.com".to_string(),
+            "alice/widget".to_string(),
+            None,
+        );
+        let candidates = [&parent, &fork];
+        assert_eq!(
+            client_for_repo("alice/widget", &candidates)
+                .unwrap()
+                .repo_label(),
+            "alice/widget"
+        );
+        assert_eq!(
+            client_for_repo("acme/widget", &candidates)
+                .unwrap()
+                .repo_label(),
+            "acme/widget"
+        );
+        assert!(client_for_repo("someone/else", &candidates).is_none());
+    }
+
+    fn network(label: &str, forked_from: Option<&str>, root: &str) -> NetworkLookup {
+        NetworkLookup::Found(ForkNetworkInfo {
+            label: label.to_string(),
+            forked_from: forked_from.map(str::to_string),
+            network_root: root.to_string(),
+        })
+    }
+
+    #[test]
+    fn classify_fork_relationship_direct_fork() {
+        let fork = network("alice/widget", Some("acme/widget"), "acme/widget");
+        let parent = network("acme/widget", None, "acme/widget");
+        assert_eq!(
+            classify_fork_relationship(ForgeKind::GitHub, ForgeKind::GitHub, &fork, &parent),
+            ForkRelationship::SameNetwork
+        );
+        assert!(!ForkRelationship::SameNetwork.blocks_submission());
+    }
+
+    #[test]
+    fn classify_fork_relationship_indirect_fork_of_a_fork() {
+        // `fork` was forked from an intermediate project, not directly from
+        // `parent`, but both ultimately trace back to the same root.
+        let fork = network("bob/widget", Some("alice/widget"), "acme/widget");
+        let parent = network("acme/widget", None, "acme/widget");
+        assert_eq!(
+            classify_fork_relationship(ForgeKind::GitHub, ForgeKind::GitHub, &fork, &parent),
+            ForkRelationship::SameNetworkIndirect
+        );
+        assert!(!ForkRelationship::SameNetworkIndirect.blocks_submission());
+    }
+
+    #[test]
+    fn classify_fork_relationship_no_relationship_blocks() {
+        let fork = network("bob/other", None, "bob/other");
+        let parent = network("acme/widget", None, "acme/widget");
+        assert_eq!(
+            classify_fork_relationship(ForgeKind::GitHub, ForgeKind::GitHub, &fork, &parent),
+            ForkRelationship::NoRelationship
+        );
+        assert!(ForkRelationship::NoRelationship.blocks_submission());
+    }
+
+    #[test]
+    fn classify_fork_relationship_not_visible_is_not_treated_as_no_relationship() {
+        let parent = network("acme/widget", None, "acme/widget");
+        let outcome = classify_fork_relationship(
+            ForgeKind::GitHub,
+            ForgeKind::GitHub,
+            &NetworkLookup::NotVisible,
+            &parent,
+        );
+        assert_eq!(outcome, ForkRelationship::NotVisible);
+        assert!(!outcome.blocks_submission());
+    }
+
+    #[test]
+    fn classify_fork_relationship_cross_instance_has_no_path() {
+        let fork = network("alice/widget", Some("acme/widget"), "acme/widget");
+        let parent = network("acme/widget", None, "acme/widget");
+        let outcome =
+            classify_fork_relationship(ForgeKind::GitHub, ForgeKind::GitLab, &fork, &parent);
+        assert_eq!(outcome, ForkRelationship::CrossInstance);
+        assert!(!outcome.blocks_submission());
+    }
+
+    #[test]
+    fn create_pull_request_routed_sends_gitlab_target_project_id_only_when_given() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["target_project_id"], serde_json::json!(42));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid": 1, "web_url": "http://x"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        client
+            .create_pull_request_routed("t", "b", "alias", "main", Some(42))
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_without_target_project_id_omits_the_field() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(json.get("target_project_id").is_none());
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid": 1, "web_url": "http://x"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        client
+            .create_pull_request("t", "b", "alias", "main")
+            .unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1765,6 +2402,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_remote_name_excluding_skips_a_registered_fork_remote() {
+        let root = tmp_dir("effective-remote-exclude-fork");
+        g(&root, &["init", "--initial-branch", "main"]);
+        g(
+            &root,
+            &["remote", "add", "origin", "https://example.com/a/b.git"],
+        );
+        g(
+            &root,
+            &["remote", "add", "fork", "https://example.com/me/b.git"],
+        );
+
+        let cfg = ForgeConfig::default();
+        // Without exclusion, the base branch's own remote prefix (the
+        // registered fork) would win, same as `resolve_remote_name`.
+        assert_eq!(
+            resolve_remote_name_excluding(&root, "fork/main", &cfg, None),
+            "fork"
+        );
+        // With the fork excluded, it falls through to the config/origin
+        // default instead of ever resolving to the excluded remote.
+        assert_eq!(
+            resolve_remote_name_excluding(&root, "fork/main", &cfg, Some("fork")),
+            "origin"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn resolve_remote_name_honors_a_bare_local_branchs_own_at_u_upstream() {
         let root = tmp_dir("effective-remote-at-u");
         g(&root, &["init", "--initial-branch", "main"]);
@@ -1838,7 +2504,7 @@ mod tests {
     fn resolve_remote_resolves_the_forge_host_from_a_remote_prefixed_base_branch() {
         let root = two_forge_repo("forge-host-prefix", "alternativeremote");
 
-        let client = resolve_remote_inner(&root, "alternativeremote/foo", &ForgeConfig::default())
+        let client = resolve_remote(&root, "alternativeremote/foo", &ForgeConfig::default())
             .expect("resolve");
         assert_eq!(
             client.kind,
@@ -1870,8 +2536,8 @@ mod tests {
             &["update-ref", "refs/remotes/alt/foo_branch_name", sha.trim()],
         );
 
-        let client = resolve_remote_inner(&root, "foo_branch_name", &ForgeConfig::default())
-            .expect("resolve");
+        let client =
+            resolve_remote(&root, "foo_branch_name", &ForgeConfig::default()).expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitLab,
@@ -1889,14 +2555,14 @@ mod tests {
             remote: Some("alt".to_string()),
             ..ForgeConfig::default()
         };
-        let client = resolve_remote_inner(&root, "main", &cfg).expect("resolve");
+        let client = resolve_remote(&root, "main", &cfg).expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitLab,
             "with no remote prefix and no @{{u}} upstream on \"main\", [forge].remote still decides"
         );
 
-        let client = resolve_remote_inner(&root, "main", &ForgeConfig::default()).expect("resolve");
+        let client = resolve_remote(&root, "main", &ForgeConfig::default()).expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitHub,
