@@ -476,7 +476,6 @@ pub fn resolve_pool_key_input(store: &Store, raw: &str) -> String {
         _ => pool_key_for_path(store, Path::new(raw)),
     }
 }
-}
 
 // ── Pool ─────────────────────────────────────────────────────────────────────
 

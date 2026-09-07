@@ -813,12 +813,14 @@ pub struct ReviewDef {
     #[serde(default)]
     pub name: Option<String>,
     /// Backend that resolves merge conflicts (and applies reviewer feedback) for
-    /// this review, e.g. `"claude"` or `"ollama"`. Unset falls back to the
-    /// `RALPHUS_RESOLVER_AGENT` env override, then `ollama`.
+    /// this review, e.g. `"claude"` or `"ollama"`. Unset inherits the
+    /// project-level `.ralphus.toml [review] default_resolver_agent` default,
+    /// then `RALPHUS_RESOLVER_AGENT` env override, then `ollama`.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Model the resolver `agent` runs, e.g. `"qwen3:8b"`. Unset falls back to
-    /// the `RALPHUS_RESOLVER_MODEL` env override, then `qwen3:8b` for the ollama
+    /// Model the resolver `agent` runs, e.g. `"qwen3:8b"`. Unset inherits the
+    /// project-level `.ralphus.toml [review] default_resolver_model` default,
+    /// then `RALPHUS_RESOLVER_MODEL` env override, then `qwen3:8b` for the ollama
     /// backend (other backends take their own default).
     #[serde(default)]
     pub model: Option<String>,
@@ -838,7 +840,8 @@ pub struct ReviewDef {
     pub upstream: Option<String>,
     /// The machine this review's worktrees and merge live on (RAL-185),
     /// written `scheme:uri`. Independent of any task's machine — a review may
-    /// run somewhere none of its contributing tasks did. Unset means
+    /// run somewhere none of its contributing tasks did. Unset inherits the
+    /// project-level `.ralphus.toml [review] default_machine` default, then
     /// [`LOCAL_MACHINE`].
     ///
     /// Every worktree feeding one review must be on this machine: the stacked
@@ -851,7 +854,8 @@ pub struct ReviewDef {
     /// Enforced the same way [`TaskDef::maximum_budget_usd`]/
     /// [`CellDef::maximum_budget_usd`] are: once exceeded, the daemon
     /// stops making further resolver/prover calls for this review and
-    /// fails it.
+    /// fails it. Unset inherits the project-level `.ralphus.toml [review]
+    /// default_maximum_budget_usd` default.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
     /// This review's own Proof-scope override: which branches run their
