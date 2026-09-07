@@ -39,15 +39,29 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        if: matrix.suite == 'full'
+        uses: taiki-e/install-action@nextest
       - name: Format check
         if: matrix.suite == 'full'
         run: cargo "+${{ matrix.toolchain }}" fmt --all -- --check
       - name: Clippy
         if: matrix.suite == 'full'
         run: cargo "+${{ matrix.toolchain }}" clippy --all-targets -- -D warnings
+      # PR_SLOWNESS.local.md: nextest schedules each test as its own process
+      # instead of cargo test's default, which matters a lot here since most
+      # of the daemon suite is real-git-subprocess-heavy (measured ~80%
+      # faster wall-clock on the same tests, no code changes). nextest does
+      # not run doctests, so that's a separate step below -- this workspace
+      # has none that execute today (everything under `/// ```...``` ` is
+      # `text`/`ignore`-fenced), so it's cheap insurance against a future one
+      # going unchecked rather than covering a present gap.
       - name: Test
         if: matrix.suite == 'full'
-        run: cargo "+${{ matrix.toolchain }}" test --all-targets
+        run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets
+      - name: Doctests
+        if: matrix.suite == 'full'
+        run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
       # MSRV leg: just prove the workspace compiles at the oldest supported
       # toolchain. (Cargo's default resolver is not MSRV-aware, so this is the
       # only guard against a dependency silently bumping the floor.)
