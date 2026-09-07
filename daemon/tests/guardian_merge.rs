@@ -909,6 +909,99 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-<new>: a feedback revision that pushes a real new commit must
+/// re-trigger the same PR auto-submit hook every other terminal transition
+/// fires via `promote_branch_terminal` -- otherwise, with
+/// `auto_submit_pr_stack` on, an already-open PR is silently left pointed at
+/// the pre-feedback sha (see the linked GitHub PR this regression test comes
+/// from: the daemon reported "feedback applied; pushed" while the actual PR
+/// on the forge never moved). `origin` here is a local bare repo, not a real
+/// forge host, so the auto-submit attempt is expected to fail deterministically
+/// at forge-URL resolution (no live network needed) -- recording that failure
+/// on the branch is exactly the observable proof the hook fired at all.
+#[test]
+fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.set_guardian_auto_submit_pr_stack(&id, Some(true))
+            .unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    // The initial merge above already ran the terminal-transition auto-submit
+    // hook once (and, against this local-bare-repo "origin", already failed
+    // to resolve a forge host). Clear that marker so the assertion below can
+    // only pass because `run_feedback` re-fires the hook itself, not because
+    // of leftover state from the merge that happened before it.
+    store
+        .lock()
+        .unwrap()
+        .set_branch_auto_submit_error(&id, &bid0, None)
+        .unwrap();
+    assert!(
+        store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+            .auto_submit_error
+            .is_none(),
+        "precondition: no stale auto-submit marker before feedback"
+    );
+
+    run_feedback(
+        &store,
+        &FeedbackRunner,
+        &id,
+        &bid0,
+        "add a note file",
+        &CancelToken::never(),
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
+    assert!(
+        detail0.starts_with("feedback applied"),
+        "feedback success detail, got: {detail0:?}"
+    );
+    assert!(
+        detail0.contains("pushed"),
+        "feedback must report a push, got: {detail0:?}"
+    );
+    assert!(
+        view.branches[0].auto_submit_error.is_some(),
+        "feedback that pushes a new commit must re-trigger the PR auto-submit \
+         hook, not just push the internal review branch"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
 #[test]
 fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() {
     // A concurrent failure (e.g. a racing "Merge / rebase" click hitting a
