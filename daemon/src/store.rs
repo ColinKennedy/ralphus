@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ralphus_core::schema::{ResolvedAgent, TaskFile};
-use rusqlite::{Connection, OptionalExtension, named_params, params};
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
@@ -2005,7 +2005,7 @@ impl Store {
             "ALTER TABLE proofs ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
             // RAL-342: this review's own declared build step, authored via
-            // `[review.auto_build]` and resolved once at submit time
+            // `[[review.auto_build]]` and resolved once at submit time
             // (`reviews::derive_reviews`) into a JSON-serialized
             // `GuardianAutoBuild`. NULL means the review declared
             // `skip_auto_build = true` instead -- unlike the
@@ -8581,18 +8581,14 @@ prompt = "confirm tests"
         let squad = store.get_squad(&id).unwrap();
         let cell_proof = &squad.tasks[0].cells[0].proof[0];
         let task_proof = &squad.tasks[0].proof[0];
-        assert!(
-            cell_proof
-                .system_prompt
-                .as_deref()
-                .is_some_and(|sp| sp.contains("PROOF step"))
-        );
-        assert!(
-            task_proof
-                .system_prompt
-                .as_deref()
-                .is_some_and(|sp| sp.contains("PROOF step"))
-        );
+        assert!(cell_proof
+            .system_prompt
+            .as_deref()
+            .is_some_and(|sp| sp.contains("PROOF step")));
+        assert!(task_proof
+            .system_prompt
+            .as_deref()
+            .is_some_and(|sp| sp.contains("PROOF step")));
     }
 
     #[test]
@@ -9234,7 +9230,7 @@ command = "y"
     fn add_squad_dependency_rejects_transitive_cycle() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, _b, c) = dependent_chain(&mut store); // a <- b <- c
-        // c already (transitively) depends on a; making a depend on c is a cycle.
+                                                      // c already (transitively) depends on a; making a depend on c is a cycle.
         assert!(matches!(
             store.add_squad_dependency(&a, &c),
             Err(StoreError::InvalidTransition(_))
@@ -9633,22 +9629,16 @@ command = "y"
             .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         assert!(store.get_task_env_overrides(&squad, 0).unwrap().is_empty());
-        assert!(
-            store
-                .get_task_proof_env_overrides(&squad, 0)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store.get_squad(&squad).unwrap().tasks[0]
-                .env_overrides
-                .is_empty()
-        );
-        assert!(
-            store.get_squad(&squad).unwrap().tasks[0]
-                .proof_env_overrides
-                .is_empty()
-        );
+        assert!(store
+            .get_task_proof_env_overrides(&squad, 0)
+            .unwrap()
+            .is_empty());
+        assert!(store.get_squad(&squad).unwrap().tasks[0]
+            .env_overrides
+            .is_empty());
+        assert!(store.get_squad(&squad).unwrap().tasks[0]
+            .proof_env_overrides
+            .is_empty());
     }
 
     #[test]
@@ -9879,18 +9869,14 @@ command = "y"
         let squad = store
             .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
-        assert!(
-            store
-                .get_cell_env_overrides(&squad, 0, 0)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store
-                .get_cell_proof_env_overrides(&squad, 0, 0)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .get_cell_env_overrides(&squad, 0, 0)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_cell_proof_env_overrides(&squad, 0, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -9910,18 +9896,14 @@ command = "y"
             Some(&"1".to_string())
         );
         // Sibling cell (t0/s1) and the other task's cell (t1/s0) are untouched.
-        assert!(
-            store
-                .get_cell_env_overrides(&squad, 0, 1)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store
-                .get_cell_env_overrides(&squad, 1, 0)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .get_cell_env_overrides(&squad, 0, 1)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_cell_env_overrides(&squad, 1, 0)
+            .unwrap()
+            .is_empty());
 
         let view = store.get_squad(&squad).unwrap();
         assert_eq!(
@@ -10257,19 +10239,15 @@ command = "y"
         // for a deleted ancestor.
         let missing = vec![("no-such-squad".to_string(), 0, 0)];
         let batched_missing = store.resolve_cell_env_overrides_batch(&missing).unwrap();
-        assert!(
-            batched_missing
-                .get(&("no-such-squad".to_string(), 0, 0))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(batched_missing
+            .get(&("no-such-squad".to_string(), 0, 0))
+            .unwrap()
+            .is_empty());
 
-        assert!(
-            store
-                .resolve_cell_env_overrides_batch(&[])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .resolve_cell_env_overrides_batch(&[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -10891,11 +10869,9 @@ command = "y"
         store.set_squad_state(&id, SquadState::Done).unwrap();
         let events = store.events_for_squad(&id, 100).unwrap();
         // Oldest-first, and the last transition is "done".
-        assert!(
-            events
-                .iter()
-                .any(|e| e.scope == "squad" && e.message.contains("running"))
-        );
+        assert!(events
+            .iter()
+            .any(|e| e.scope == "squad" && e.message.contains("running")));
         assert_eq!(events.last().unwrap().message, "squad → done");
         // Deleting the squad removes its events.
         store.delete_squad(&id).unwrap();
@@ -12012,12 +11988,10 @@ command = "check-c"
         store
             .register_project("ralphus", "", "C:/repos/ralphus", "git")
             .unwrap();
-        assert!(
-            store
-                .resolve_project("totally-unrelated-name")
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .resolve_project("totally-unrelated-name")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -12121,11 +12095,9 @@ command = "check-c"
         // restack, a manual-push rebase, a base-branch shift) requests the
         // same signature again -- this must not queue anything.
         store.request_final_summary("g1", "sig-a", 1_000, false);
-        assert!(
-            store
-                .take_due_final_summary_requests(1_000 + 60_000, 0)
-                .is_empty()
-        );
+        assert!(store
+            .take_due_final_summary_requests(1_000 + 60_000, 0)
+            .is_empty());
     }
 
     /// RAL-303: the handoff from the deterministic git-log summary to the LLM
@@ -12155,11 +12127,9 @@ command = "check-c"
         let mut store = Store::open_in_memory().unwrap();
         store.request_final_summary("g1", "sig-a", 1_000, false);
         // Not due yet -- the quiet period hasn't elapsed.
-        assert!(
-            store
-                .take_due_final_summary_requests(1_000 + 2_000, 5_000)
-                .is_empty()
-        );
+        assert!(store
+            .take_due_final_summary_requests(1_000 + 2_000, 5_000)
+            .is_empty());
         // Due once the full debounce window has elapsed.
         let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
         assert_eq!(due, vec![("g1".to_string(), "sig-a".to_string())]);
@@ -12177,11 +12147,9 @@ command = "check-c"
         // 5s after the FIRST request, but only 3s after the last -- still
         // not due, proving the clock restarted rather than accumulating from
         // the first request.
-        assert!(
-            store
-                .take_due_final_summary_requests(5_000, 5_000)
-                .is_empty()
-        );
+        assert!(store
+            .take_due_final_summary_requests(5_000, 5_000)
+            .is_empty());
         // 5s after the last request, only the final signature is due -- the
         // intermediate toggles never fired their own LLM call.
         let due = store.take_due_final_summary_requests(2_000 + 5_000, 5_000);
@@ -12196,11 +12164,9 @@ command = "check-c"
         assert_eq!(first, vec![("g1".to_string(), "sig-a".to_string())]);
         // A concurrent/subsequent sweep at the same instant finds nothing
         // left to claim for this guardian.
-        assert!(
-            store
-                .take_due_final_summary_requests(10_000, 5_000)
-                .is_empty()
-        );
+        assert!(store
+            .take_due_final_summary_requests(10_000, 5_000)
+            .is_empty());
     }
 
     /// RAL-230: the DB file (and its WAL/SHM siblings, when SQLite has

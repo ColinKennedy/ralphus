@@ -933,7 +933,11 @@ fn detect_rebase_step_content_loss(wt: &Workspace) -> Option<Vec<String>> {
         .map(|(path, _)| path.clone())
         .collect();
 
-    if lost.is_empty() { None } else { Some(lost) }
+    if lost.is_empty() {
+        None
+    } else {
+        Some(lost)
+    }
 }
 
 /// RAL-330: run [`detect_rebase_step_content_loss`] against `REBASE_HEAD`
@@ -1939,7 +1943,8 @@ fn resolve_conflicts_with_agent(
         // plus auto-fix. Running (and paying for) the same checks twice per
         // conflict-resolution cycle was the redundancy this ticket removes;
         // see the module-level RAL-168 notes.
-        let system_prompt = "You are a git merge-conflict resolver running inside a checked-out worktree \
+        let system_prompt =
+            "You are a git merge-conflict resolver running inside a checked-out worktree \
              during an active `git rebase`. Your job is to eliminate every conflict marker and \
              produce correctly merged files -- nothing more.\n\
              \n\
@@ -6089,7 +6094,7 @@ fn finalize_review(
 ///
 /// Four-tier precedence (RAL-342, replacing the old RAL-110 AI-guessed build):
 /// skip (opt-out) → this review's own explicit `checks` gates → this review's
-/// declared `[review.auto_build]` step → the project's `.ralphus.toml`
+/// declared `[[review.auto_build]]` step → the project's `.ralphus.toml`
 /// `auto_build` default → nothing. Only one tier ever runs.
 ///
 /// Returns `Some(note)` when checks were opted out, a review auto_build ran, or
@@ -6144,7 +6149,7 @@ fn final_checks(
         return Ok(None);
     }
     // RAL-342: no explicit checks -- try this review's own declared
-    // `[review.auto_build]` step next, ahead of the project-wide default.
+    // `[[review.auto_build]]` step next, ahead of the project-wide default.
     // Per Q5, a failure here is advisory only (a UI notice + Cartographer log)
     // rather than a merge-failing `Err` -- unlike explicit `checks`, which the
     // user wrote as a hard gate, an auto_build declaration is a convenience
@@ -6174,7 +6179,7 @@ fn final_checks(
     }
 }
 
-/// Run this review's declared `[review.auto_build]` step (RAL-342) against the
+/// Run this review's declared `[[review.auto_build]]` step (RAL-342) against the
 /// finished combined worktree -- either a static shell `command`, or an agent
 /// invocation described by `def`'s remaining fields (exactly one shape is
 /// populated, enforced by `core::validate` at parse time).
@@ -6618,7 +6623,11 @@ const WORST_CASE_WT_SUFFIX_LEN: usize = 3 + 12 + 3; // "wt-" + 12 chars + "-99"
 /// `MAX_PATH` is 260 characters; other platforms' limits are high enough in
 /// practice that enforcing this there too would only produce false failures).
 fn path_budget_limit() -> usize {
-    if cfg!(windows) { 260 } else { usize::MAX }
+    if cfg!(windows) {
+        260
+    } else {
+        usize::MAX
+    }
 }
 
 /// Preflight (RAL-211): before this project's branches start materializing
@@ -10450,15 +10459,13 @@ mod tests {
 
         // A branch still `pending` (no cell done yet) contributes nothing.
         recompute_preliminary_summary(&store, &id);
-        assert!(
-            store
-                .lock()
-                .unwrap()
-                .get_guardian(&id)
-                .unwrap()
-                .change_summary
-                .is_none()
-        );
+        assert!(store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .change_summary
+            .is_none());
 
         // Cell done -> mark the branch Ready (as the scheduler now does
         // per-branch, independent of any sibling) and recompute.
@@ -10947,15 +10954,13 @@ mod tests {
         };
 
         recompute_preliminary_summary(&store, &id);
-        assert!(
-            store
-                .lock()
-                .unwrap()
-                .get_guardian(&id)
-                .unwrap()
-                .change_summary
-                .is_none()
-        );
+        assert!(store
+            .lock()
+            .unwrap()
+            .get_guardian(&id)
+            .unwrap()
+            .change_summary
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -11163,13 +11168,11 @@ mod tests {
             .lock()
             .unwrap()
             .request_final_summary(&id, "sig-1", crate::store::now_ms(), false);
-        assert!(
-            store
-                .lock()
-                .unwrap()
-                .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
-                .is_empty()
-        );
+        assert!(store
+            .lock()
+            .unwrap()
+            .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -11379,7 +11382,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// RAL-342: a review's own declared `[review.auto_build]` command runs
+    /// RAL-342: a review's own declared `[[review.auto_build]]` command runs
     /// ahead of (and instead of) the project-level `.ralphus.toml [review]
     /// auto_build` default when both are configured. The project default is
     /// set to a command that would fail, so if it ran instead of the
@@ -11460,7 +11463,7 @@ mod tests {
         }
     }
 
-    /// RAL-342/Q5: a review-declared `[review.auto_build]` *agent* invocation
+    /// RAL-342/Q5: a review-declared `[[review.auto_build]]` *agent* invocation
     /// that fails must not fail the merge -- it surfaces as an advisory
     /// notice plus a Cartographer log entry, and `final_checks` still returns
     /// `Ok(Some(note))` (never `Err`) so the review reaches `InReview`. Cost
