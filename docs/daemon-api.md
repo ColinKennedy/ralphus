@@ -340,9 +340,10 @@ Request (all fields optional; an empty/absent body is equivalent to
 ```
 - `auto_cancel: false` (default) — DB state is left alone. Squads/guardians
   that were mid-flight stay `running`/`merging`/etc, so the existing
-  crash-recovery path (`Store::recover_orphaned_squads` /
-  `recover_orphaned_merges`, run at every `serve()` startup) resumes them
-  automatically the next time `ralphus-daemon serve` starts.
+  crash-recovery path (`Store::recover_orphaned_squads` at `serve()` startup,
+  `scheduler::recover_interrupted_reviews` at scheduler startup — including
+  reapplying any reviewer feedback an unclean shutdown interrupted mid-run)
+  resumes them automatically the next time `ralphus-daemon serve` starts.
 - `auto_cancel: true` — additionally cascade-cancels every non-terminal squad
   (same logic as [`POST /api/squads/{id}/cancel`](#post-apisquadsidcancel)) and
   every cancellable guardian, so history reflects an intentional stop and

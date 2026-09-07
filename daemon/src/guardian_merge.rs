@@ -4764,6 +4764,17 @@ pub fn run_feedback(
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         return FeedbackOutcome::default();
     };
+    // RAL-375: persist the feedback text durably before any work begins, so
+    // an unclean shutdown while this function is still running (the resolver
+    // agent, the push, or the downstream restack below) leaves a record
+    // startup recovery can find and reapply -- previously this text existed
+    // only as this function's own argument, so an interrupted feedback round
+    // was silently lost even after the guardian's merge later resumed
+    // normally. Cleared at every real exit point below.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .set_branch_pending_feedback(id, branch_id, feedback);
     // Stack-order math (downstream filtering) below is legitimately
     // position-based; resolve it once here from the addressed branch_id.
     let position = branch.position;
@@ -4804,6 +4815,10 @@ pub fn run_feedback(
     let wt_base = root.at(worktree_dir(&branch_project, id));
 
     let Some(wt_str) = branch.worktree.clone() else {
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .clear_branch_pending_feedback(id, branch_id);
         set_status(
             GuardianStatus::MergeFailed,
             Some("no review worktree yet; run the merge first"),
@@ -4845,6 +4860,10 @@ pub fn run_feedback(
     ) {
         Ok(r) => r,
         Err(message) => {
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .clear_branch_pending_feedback(id, branch_id);
             set_status(
                 GuardianStatus::MergeFailed,
                 Some(&format!("unresolvable resolver agent: {message}")),
@@ -5049,6 +5068,14 @@ pub fn run_feedback(
         branch_status,
         Some(&detail),
     );
+    // RAL-375: this is a real completion (success or a legitimate failure),
+    // not a crash -- clear the durable pending-feedback record set at the
+    // top of this function so startup recovery doesn't try to reapply
+    // feedback that already ran to completion.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .clear_branch_pending_feedback(id, branch_id);
     // RAL-<new>: a feedback revision can push a real new commit onto the
     // branch's review ref, so it needs the same auto-submit hook every other
     // route to a terminal status fires via `promote_branch_terminal` --

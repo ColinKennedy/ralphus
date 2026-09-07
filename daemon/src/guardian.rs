@@ -908,46 +908,6 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Crash recovery: guardians left `merging` after an unclean shutdown have
-    /// no background thread to complete them. Reset each to `merge_failed` so
-    /// the user can see the interruption and re-trigger. Run at daemon startup
-    /// before the scheduler begins; returns the recovered guardian ids.
-    pub fn recover_orphaned_merges(&self) -> Result<Vec<String>> {
-        let ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM guardians WHERE status='merging'")?;
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for id in &ids {
-            self.conn.execute(
-                "UPDATE guardians SET status='merge_failed', \
-                 detail='merge interrupted by daemon restart', \
-                 updated_at_ms=? WHERE id=?",
-                params![crate::store::now_ms(), id],
-            )?;
-            crate::rlog!(
-                WARNING,
-                "ralphus [recovery] guardian {id} merging → merge_failed (daemon restart)"
-            );
-            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::WARNING,
-                source: "recovery",
-                message: "guardian merge interrupted: merging → merge_failed (daemon restart)",
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({}),
-                admin_only: false,
-            });
-        }
-        Ok(ids)
-    }
-
     /// Atomically claim the right to resolve `input_name` for `guardian_id`
     /// (RAL-164) via "set it for me". Returns `true` when this call won the
     /// claim (the caller should proceed to spawn the resolver), `false` when
@@ -2557,6 +2517,58 @@ impl Store {
         };
         let _ = self.log_event(None, Some(guardian_id), "branch", Some(branch_id), &msg);
         Ok(())
+    }
+
+    /// RAL-375: persist feedback text as durably pending on a branch, before
+    /// `guardian_merge::run_feedback` does any work -- so an unclean daemon
+    /// shutdown mid-run leaves a record startup recovery can find and
+    /// reapply, instead of the feedback existing only as that function's own
+    /// argument (gone the instant the process dies).
+    pub fn set_branch_pending_feedback(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        feedback: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET pending_feedback=? WHERE guardian_id=? AND id=?",
+            params![feedback, guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-375: clear a branch's pending-feedback record. Called from every
+    /// real exit path of `guardian_merge::run_feedback` (success or a
+    /// legitimate failure) -- only a literal crash mid-run leaves this set,
+    /// which is exactly the signal startup recovery looks for.
+    pub fn clear_branch_pending_feedback(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET pending_feedback=NULL WHERE guardian_id=? AND id=?",
+            params![guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-375: every branch with feedback still awaiting application, as
+    /// `(guardian_id, branch_id, feedback_text)`. Non-empty only after an
+    /// unclean shutdown interrupted `guardian_merge::run_feedback` mid-run;
+    /// startup recovery reapplies each one directly, since an ordinary
+    /// rebuild would otherwise silently discard it.
+    pub fn branches_with_pending_feedback(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT guardian_id, id, pending_feedback FROM guardian_branches \
+             WHERE pending_feedback IS NOT NULL ORDER BY guardian_id, position",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// RAL-317: set or clear this branch's one-shot auto-submit-PR-stack
@@ -4755,29 +4767,87 @@ mod tests {
         assert!(store.reopen_cancelled_guardian(&id).is_err());
     }
 
+    /// RAL-375: a guardian left `merging` by an unclean shutdown must land
+    /// back in `collecting` -- reclaimable by `claim_guardian_merge` on the
+    /// very next scheduler tick -- not `merge_failed`, which used to sit idle
+    /// until a human ran `ralphus review merge` by hand. This is the
+    /// store-level half of the fix (`interrupted_merges` +
+    /// `reset_guardian_to_collecting`); `scheduler::recover_interrupted_reviews`
+    /// is what actually calls this pair at startup, ahead of the scheduler's
+    /// main loop, replacing the old `Store::recover_orphaned_merges`
+    /// (RAL-48) which reset to `merge_failed` instead and, worse, ran too
+    /// early in `server::serve` for this auto-resume path to ever see a
+    /// guardian still in `merging`.
     #[test]
-    fn recover_orphaned_merges_resets_merging_guardians_to_merge_failed() {
+    fn interrupted_merge_lands_back_in_collecting_not_merge_failed() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
 
-        assert!(store.recover_orphaned_merges().unwrap().is_empty());
+        assert!(store.interrupted_merges().unwrap().is_empty());
 
         store.claim_guardian_merge(&id).unwrap();
         assert_eq!(store.get_guardian(&id).unwrap().status, "merging");
 
-        let recovered = store.recover_orphaned_merges().unwrap();
-        assert_eq!(recovered, vec![id.clone()]);
+        let interrupted = store.interrupted_merges().unwrap();
+        assert_eq!(interrupted, vec![id.clone()]);
+        for gid in &interrupted {
+            store.reset_guardian_to_collecting(gid).unwrap();
+        }
 
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.status, "merge_failed");
-        assert!(
-            g.detail.as_deref().unwrap_or("").contains("restart"),
-            "detail should mention restart: {:?}",
-            g.detail
+        assert_eq!(
+            g.status, "collecting",
+            "an interrupted merge must auto-resume via `collecting`, not sit \
+             in `merge_failed` waiting on a human"
         );
 
+        // Reclaimable immediately, exactly as a fresh `collecting` guardian
+        // the scheduler picks up on its own would be -- this puts it back in
+        // `merging` for real, which is why a fresh `interrupted_merges` query
+        // right after this would (correctly) find it again.
         assert!(store.claim_guardian_merge(&id).unwrap());
+    }
+
+    /// RAL-375: feedback text is persisted durably the moment it's set, and
+    /// is found by `branches_with_pending_feedback` -- the mechanism startup
+    /// recovery uses to reapply feedback an unclean shutdown interrupted
+    /// mid-`guardian_merge::run_feedback`, instead of it being silently lost
+    /// (previously this text existed only as that function's own in-memory
+    /// argument). Clearing it (as every real completion path of
+    /// `run_feedback` does) removes it from that recovery set again.
+    #[test]
+    fn pending_feedback_persists_until_explicitly_cleared() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let pos = store.add_guardian_branch(&id, "feat").unwrap();
+        let branch_id = store.get_guardian(&id).unwrap().branches[pos as usize]
+            .id
+            .clone();
+
+        assert!(store.branches_with_pending_feedback().unwrap().is_empty());
+
+        store
+            .set_branch_pending_feedback(&id, &branch_id, "fix the compile error")
+            .unwrap();
+        assert_eq!(
+            store.branches_with_pending_feedback().unwrap(),
+            vec![(
+                id.clone(),
+                branch_id.clone(),
+                "fix the compile error".to_string()
+            )]
+        );
+
+        // Simulating a daemon restart (re-reading the same durable state)
+        // still finds it -- this is exactly what an in-memory-only argument
+        // would NOT survive.
+        assert_eq!(store.branches_with_pending_feedback().unwrap().len(), 1);
+
+        store
+            .clear_branch_pending_feedback(&id, &branch_id)
+            .unwrap();
+        assert!(store.branches_with_pending_feedback().unwrap().is_empty());
     }
 
     #[test]
