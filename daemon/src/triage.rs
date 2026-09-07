@@ -454,12 +454,26 @@ pub fn pool_key_for_path(store: &Store, path: &Path) -> String {
 /// resolves through that project's own registered path via
 /// [`pool_key_for_path`], so it agrees with the key a cell submitted under
 /// that project would be pooled under -- even before any cell has been
-/// pooled yet. Anything else is assumed to already be a literal pool key
-/// (e.g. copied from a pool listing) and is returned unchanged.
+/// pooled yet.
+///
+/// Anything else is run back through [`pool_key_for_path`] treating `raw`
+/// itself as a filesystem path (RAL-374) -- the same call
+/// `crate::reviews::derive_triage_pools` and the startup
+/// `crate::reviews::repair_triage_pool_keys` pass already make, so a caller
+/// that supplies a project's registered *path* (e.g. the CLI's
+/// `ralphus triage pool threshold <project>` positional argument, which
+/// accepts either) lands on the identical resolved-name key real pooled
+/// cells use, instead of silently creating a second, disconnected,
+/// unnormalized key. When `raw` isn't a project name and doesn't resolve as
+/// a path to one either, this degrades exactly like [`pool_key_for_path`]
+/// does for a genuinely unregistered path: a normalized (forward-slashed,
+/// verbatim-prefix-stripped) form of `raw`. A literal pool key copied from a
+/// pool listing is already in that normalized form, so it round-trips here
+/// unchanged.
 pub fn resolve_pool_key_input(store: &Store, raw: &str) -> String {
     match store.get_project(raw) {
         Ok(Some(p)) => pool_key_for_path(store, Path::new(&p.path)),
-        _ => raw.to_string(),
+        _ => pool_key_for_path(store, Path::new(raw)),
     }
 }
 
@@ -1156,6 +1170,42 @@ mod tests {
         assert_eq!(
             resolve_pool_key_input(&s, "C:/some/literal/pool/key"),
             "C:/some/literal/pool/key"
+        );
+    }
+
+    /// RAL-374: a caller (e.g. the CLI's positional `<project>` argument,
+    /// which accepts either a name or a path with zero validation) that
+    /// supplies a registered project's filesystem *path* rather than its
+    /// name must resolve to the exact same key `pool_key_for_path` computes
+    /// for that project -- the same key submit-time pooling
+    /// (`crate::reviews::derive_triage_pools`) lands cells under -- instead
+    /// of being stored as a second, disconnected, unresolved key.
+    #[test]
+    fn resolve_pool_key_input_resolves_a_registered_projects_path_to_its_name() {
+        let s = store();
+        let dir = real_tempdir("resolve-known-path");
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        assert_eq!(
+            resolve_pool_key_input(&s, dir.to_str().unwrap()),
+            pool_key_for_path(&s, &dir)
+        );
+        assert_eq!(resolve_pool_key_input(&s, dir.to_str().unwrap()), "proj");
+    }
+
+    /// A path for a genuinely unregistered project must still degrade to a
+    /// normalized (forward-slashed, verbatim-prefix-stripped) key -- the
+    /// same fallback `pool_key_for_path` itself uses -- rather than storing
+    /// the raw, potentially backslash-separated path verbatim.
+    #[test]
+    fn resolve_pool_key_input_degrades_an_unregistered_path_to_a_normalized_key() {
+        let s = store();
+        let dir = real_tempdir("resolve-unregistered-path");
+        let key = resolve_pool_key_input(&s, dir.to_str().unwrap());
+        assert_eq!(key, normalize_path_key(&dir));
+        assert!(
+            !key.contains('\\'),
+            "fallback key must be forward-slashed: {key:?}"
         );
     }
 
