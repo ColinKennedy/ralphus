@@ -319,6 +319,42 @@ fn check_projects(daemon_url: &str) -> Vec<CheckResult> {
         .collect()
 }
 
+/// RAL-338: fork registration health, evaluated daemon-side (see
+/// `DaemonClient::health_project_forks`'s doc comment for why). Silently
+/// contributes nothing if the daemon is unreachable or no forks are
+/// registered at all, matching [`check_projects`]'s precedent.
+fn check_project_forks(daemon_url: &str) -> Vec<CheckResult> {
+    let client = DaemonClient::new(daemon_url);
+    let Ok(response) = client.health_project_forks() else {
+        return Vec::new();
+    };
+    response["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let status = match c["status"].as_str() {
+                Some(PASS) => PASS,
+                Some(WARN) => WARN,
+                _ => FAIL,
+            };
+            let project = c["project"].as_str().unwrap_or_default();
+            let user = c["user"].as_str().unwrap_or_default();
+            let name = c["name"].as_str().unwrap_or("fork");
+            let check_name = if user.is_empty() {
+                format!("{name}:{project}")
+            } else {
+                format!("{name}:{project}:{user}")
+            };
+            CheckResult::new(
+                &check_name,
+                status,
+                c["detail"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 fn check_runner() -> CheckResult {
     let cmd = std::env::var("RALPHUS_RUNNER_CMD").unwrap_or_else(|_| "ralphus-runner".to_string());
     let program = cmd
@@ -949,6 +985,7 @@ pub fn run_checks(
     let mut results = check_daemon(daemon_url);
     results.push(check_git());
     results.extend(check_projects(daemon_url));
+    results.extend(check_project_forks(daemon_url));
     results.push(check_runner());
     results.push(check_ollama());
     results.push(check_nvidia_smi());

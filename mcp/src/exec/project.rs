@@ -1,7 +1,7 @@
 //! Mirrors `ralphus_cli::commands::project::dispatch`.
 
 use ralphus_cli::client::DaemonClient;
-use ralphus_cli::commands::project::ProjectCommand;
+use ralphus_cli::commands::project::{ProjectCommand, ProjectForkCommand};
 
 use super::{ExecResult, usage};
 
@@ -32,5 +32,45 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
         }
         ProjectCommand::List { short: _ } => Ok(client.list_projects()?),
         ProjectCommand::Get { name } => Ok(client.get_project(&name)?),
+        ProjectCommand::Fork(cmd) => exec_fork(cmd, client),
+    }
+}
+
+fn exec_fork(cmd: ProjectForkCommand, client: &DaemonClient) -> ExecResult {
+    match cmd {
+        ProjectForkCommand::Help | ProjectForkCommand::UsageError(_) => Err(usage("no such tool")),
+        ProjectForkCommand::Add {
+            project,
+            url,
+            user,
+            remote_name,
+            owner,
+        } => Ok(client.add_project_fork(
+            &project,
+            user.as_deref().unwrap_or(""),
+            &url,
+            remote_name.as_deref(),
+            owner.as_deref(),
+        )?),
+        ProjectForkCommand::List { project, .. } => Ok(match &project {
+            Some(p) => client.list_project_forks(p)?,
+            None => client.list_all_project_forks()?,
+        }),
+        ProjectForkCommand::Set {
+            project,
+            user,
+            url,
+            remote_name,
+            owner,
+        } => Ok(client.set_project_fork(
+            &project,
+            user.as_deref().unwrap_or(""),
+            url.as_deref(),
+            remote_name.as_deref(),
+            owner.as_deref(),
+        )?),
+        ProjectForkCommand::Remove { project, user } => {
+            Ok(client.remove_project_fork(&project, user.as_deref().unwrap_or(""))?)
+        }
     }
 }

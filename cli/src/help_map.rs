@@ -217,13 +217,16 @@ worktree, resolving conflicts and restacking downstream branches (RAL-190).",
         &["selector [str]"],
         &[
             "--alias [name]",
+            "--allow-unlinked-fork",
             "--combined",
             "--description [text]",
             "--position [integer]",
             "--title [text]",
             "--use-worktree-branch-name",
         ],
-        "Submit a PR/MR for one stacked branch or the combined worktree.",
+        "Submit a PR/MR for one stacked branch or the combined worktree. --allow-unlinked-fork \
+(RAL-338) downgrades a definite \"no forge relationship\" fork pre-flight result from a hard \
+error to a logged warning; ignored for a project with no registered fork.",
         false,
         false,
         &[],
@@ -812,7 +815,70 @@ const MACHINE_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+// RAL-338: per-project, per-user fork registration -- see
+// `crate::commands::project::ProjectForkCommand`.
+const PROJECT_FORK_CHILDREN: &[HelpNode] = &[
+    node(
+        "add",
+        &["project [str]"],
+        &[
+            "--owner [owner]",
+            "--remote-name [name]",
+            "--url [url]",
+            "--user [name]",
+        ],
+        "Register a fork for a project, optionally scoped to one user (defaults to the \
+project-wide fallback row when --user is omitted).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "list",
+        &["project [str, optional]"],
+        &["--short", "--user [name]"],
+        "List registered forks, optionally scoped to one project and/or filtered to one user.",
+        false,
+        true, // ("project", "fork", "list")
+        &[],
+    ),
+    node(
+        "set",
+        &["project [str]"],
+        &[
+            "--owner [owner]",
+            "--remote-name [name]",
+            "--url [url]",
+            "--user [name]",
+        ],
+        "Update fields on an existing fork registration (defaults to the project-wide \
+fallback row when --user is omitted).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["project [str]"],
+        &["--user [name]"],
+        "Remove a fork registration (defaults to the project-wide fallback row when \
+--user is omitted).",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const PROJECT_CHILDREN: &[HelpNode] = &[
+    node(
+        "fork",
+        &[],
+        &[],
+        "Manage per-project, per-user fork registrations for fork-based stacked PR routing.",
+        false,
+        false,
+        PROJECT_FORK_CHILDREN,
+    ),
     node(
         "get",
         &["name [str]"],

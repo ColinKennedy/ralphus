@@ -383,6 +383,32 @@ struct ProjectsResponse {
     projects: Vec<crate::store::ProjectView>,
 }
 
+#[derive(Deserialize)]
+struct CreateProjectForkBody {
+    #[serde(default)]
+    user: String,
+    fork_url: String,
+    #[serde(default)]
+    remote_name: Option<String>,
+    #[serde(default)]
+    fork_owner: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct PatchProjectForkBody {
+    #[serde(default)]
+    fork_url: Option<String>,
+    #[serde(default)]
+    remote_name: Option<String>,
+    #[serde(default)]
+    fork_owner: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProjectForksResponse {
+    forks: Vec<crate::project_forks::ForkRecord>,
+}
+
 #[derive(Serialize)]
 struct AgentProfilesHealthResponse {
     profiles: Vec<crate::agent_profiles::ProfileHealthResult>,
@@ -633,6 +659,39 @@ fn route_for_user(
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
         ("GET", ["api", "projects", name, "branches"]) => project_branches(daemon, name),
+        // RAL-338: fork registration. Reads open to every caller (matches the
+        // `projects` pattern above); mutations admin-gated like
+        // `register_project`. `GET /api/project-forks` is the unscoped list
+        // across every project. A trailing user segment targets one specific
+        // row (`.../forks/{user}`); PATCH/DELETE with *no* trailing segment
+        // target the project-wide default (`user=""`) row instead -- the
+        // literal empty segment form (`.../forks/`) is indistinguishable from
+        // the collection path once `path.trim_matches('/')` strips a trailing
+        // slash, so the no-segment form is this router's way of addressing
+        // the default row.
+        ("GET", ["api", "project-forks"]) => list_all_project_forks(daemon),
+        ("GET", ["api", "projects", name, "forks"]) => {
+            list_project_forks(daemon, &url_decode(name))
+        }
+        ("POST", ["api", "projects", name, "forks"]) => admin_gated(daemon, user_header, || {
+            create_project_fork(daemon, &url_decode(name), body)
+        }),
+        ("PATCH", ["api", "projects", name, "forks"]) => admin_gated(daemon, user_header, || {
+            patch_project_fork(daemon, &url_decode(name), "", body)
+        }),
+        ("DELETE", ["api", "projects", name, "forks"]) => admin_gated(daemon, user_header, || {
+            delete_project_fork(daemon, &url_decode(name), "")
+        }),
+        ("PATCH", ["api", "projects", name, "forks", user]) => {
+            admin_gated(daemon, user_header, || {
+                patch_project_fork(daemon, &url_decode(name), &url_decode(user), body)
+            })
+        }
+        ("DELETE", ["api", "projects", name, "forks", user]) => {
+            admin_gated(daemon, user_header, || {
+                delete_project_fork(daemon, &url_decode(name), &url_decode(user))
+            })
+        }
         // Machine provider registry (RAL-185) -- RAL-332: admin-only, client
         // and server side. Nothing outside the Machines tab reads this.
         ("GET", ["api", "machines"]) => admin_gated(daemon, user_header, || list_machines(daemon)),
@@ -691,6 +750,7 @@ fn route_for_user(
         }
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
+        ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
         ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
@@ -1150,7 +1210,7 @@ fn route_for_user(
             guardian_resolve_input(daemon, id, body)
         }
         ("POST", ["api", "guardians", id, "pull-requests"]) => {
-            guardian_submit_prs(daemon, id, body)
+            guardian_submit_prs(daemon, id, body, user_header)
         }
         ("GET", ["api", "guardians", id, "pull-requests"]) => guardian_list_prs(daemon, id),
         ("POST", ["api", "guardians", id, "pull-requests", "unlink"]) => {
@@ -2389,6 +2449,26 @@ fn agent_profiles_health(daemon: &Daemon, query: &str) -> Reply {
     json(200, &AgentProfilesHealthResponse { profiles })
 }
 
+/// Health-checks every registered fork row (RAL-338): missing local git
+/// remotes, unreachable forks, unregistered users, and forge relationship/
+/// instance problems -- daemon-side for the same reason
+/// [`agent_profiles_health`] is: this needs the daemon process's own git/
+/// forge-token environment, which can diverge from the CLI's. Advisory only
+/// (see [`crate::project_forks::check_fork_health`]'s doc comment);
+/// submission's own pre-flight remains authoritative.
+fn project_forks_health(daemon: &Daemon) -> Reply {
+    let store = daemon.lock();
+    let forks = match store.list_project_forks() {
+        Ok(forks) => forks,
+        Err(e) => return store_error(&e),
+    };
+    let checks: Vec<crate::project_forks::ForkHealthCheck> = forks
+        .iter()
+        .flat_map(|fork| crate::project_forks::check_fork_health(&store, fork))
+        .collect();
+    json(200, &serde_json::json!({ "checks": checks }))
+}
+
 /// Resolve the current placeholder identity from the request header, falling
 /// back to `[daemon].default_user`. Unknown names are rejected because they
 /// cannot own user-scoped rows in the store.
@@ -3180,6 +3260,115 @@ fn get_project(daemon: &Daemon, name: &str) -> Reply {
             404,
             "not_found",
             &format!("project \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/project-forks` (RAL-338): every registered fork row, across
+/// every project and user.
+fn list_all_project_forks(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_project_forks() {
+        Ok(forks) => json(200, &ProjectForksResponse { forks }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/projects/{name}/forks` (RAL-338): every fork row registered for
+/// one project, including its `user=""` default row if present.
+fn list_project_forks(daemon: &Daemon, project: &str) -> Reply {
+    match daemon.lock().list_project_forks_for_project(project) {
+        Ok(forks) => json(200, &ProjectForksResponse { forks }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/projects/{name}/forks` (RAL-338): register or replace a fork
+/// row. `user` defaults to `""` (the project-wide row) when omitted.
+fn create_project_fork(daemon: &Daemon, project: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<CreateProjectForkBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include a non-empty \"fork_url\" string",
+            vec![],
+        );
+    };
+    let fork_url = req.fork_url.trim();
+    if fork_url.is_empty() {
+        return error(400, "invalid_value", "'fork_url' must not be empty", vec![]);
+    }
+    let user = req.user.trim();
+    let remote_name = req
+        .remote_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::project_forks::default_remote_name(user));
+    let explicit_owner = req
+        .fork_owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // RAL-338: auto-derive `fork_owner` from the URL when the caller didn't
+    // give one explicitly and the URL looks like a GitHub host -- GitLab
+    // addresses cross-project MRs by numeric project id instead, so it's
+    // left empty there (`derive_owner_from_url` doesn't know the forge kind
+    // itself, only URL shape).
+    let derived_owner = explicit_owner.is_none().then(|| {
+        crate::forge::parse_remote_url(fork_url)
+            .and_then(|(host, _)| crate::forge::ForgeKind::from_host(&host))
+            .filter(|kind| *kind == crate::forge::ForgeKind::GitHub)
+            .and_then(|_| crate::forge::derive_owner_from_url(fork_url))
+    });
+    let fork_owner = explicit_owner
+        .map(str::to_string)
+        .or(derived_owner.flatten())
+        .unwrap_or_default();
+    match daemon
+        .lock()
+        .upsert_project_fork(project, user, fork_url, &remote_name, &fork_owner)
+    {
+        Ok(record) => json(201, &record),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `PATCH /api/projects/{name}/forks[/{user}]` (RAL-338): field-selective
+/// update of an existing fork row.
+fn patch_project_fork(daemon: &Daemon, project: &str, user: &str, body: &str) -> Reply {
+    let req: PatchProjectForkBody = serde_json::from_str(body).unwrap_or_default();
+    if req.fork_url.as_deref().is_some_and(str::is_empty) {
+        return error(400, "invalid_value", "'fork_url' must not be empty", vec![]);
+    }
+    match daemon.lock().patch_project_fork(
+        project,
+        user,
+        req.fork_url.as_deref(),
+        req.remote_name.as_deref(),
+        req.fork_owner.as_deref(),
+    ) {
+        Ok(record) => json(200, &record),
+        Err(crate::store::StoreError::NotFound) => error(
+            404,
+            "not_found",
+            &format!("no fork registered for project {project:?} user {user:?}"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/projects/{name}/forks[/{user}]` (RAL-338).
+fn delete_project_fork(daemon: &Daemon, project: &str, user: &str) -> Reply {
+    match daemon.lock().delete_project_fork(project, user) {
+        Ok(true) => json(200, &serde_json::json!({"removed": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("no fork registered for project {project:?} user {user:?}"),
             vec![],
         ),
         Err(e) => store_error(&e),
@@ -9183,18 +9372,39 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
 #[derive(Deserialize)]
 struct SubmitPrsBody {
     prs: Vec<crate::pr::PrRequest>,
+    /// RAL-338: downgrades a definite "no forge relationship" fork pre-flight
+    /// result from a hard error to a logged warning. Ignored for a project
+    /// with no registered fork.
+    #[serde(default)]
+    allow_unlinked_fork: bool,
 }
 
 /// Submit one or more PRs/MRs for a guardian's stacked and/or combined
 /// worktree(s). Kicks off in the background (git push + forge API calls);
 /// poll `GET .../pull-requests` for the resulting rows.
-fn guardian_submit_prs(daemon: &Daemon, id: &str, body: &str) -> Reply {
+///
+/// RAL-338: resolves the acting user once from the request context (falling
+/// back to `[daemon].default_user`, same as every other placeholder-identity
+/// call site -- see `current_user`'s doc comment) to decide which fork (if
+/// any) this submission routes through.
+fn guardian_submit_prs(daemon: &Daemon, id: &str, body: &str, user_header: Option<&str>) -> Reply {
     let Ok(req) = serde_json::from_str::<SubmitPrsBody>(body) else {
         return error(400, "bad_request", "body must be {prs: [...]}", vec![]);
     };
+    let user = match current_user(daemon, user_header) {
+        Ok(name) => name.unwrap_or_default(),
+        Err(_) => String::new(),
+    };
     let runner: Arc<dyn Runner> =
         Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::pr::start_submit_pull_requests(daemon.store_handle(), runner, id, req.prs)
+    crate::pr::start_submit_pull_requests(
+        daemon.store_handle(),
+        runner,
+        id,
+        req.prs,
+        user,
+        req.allow_unlinked_fork,
+    )
 }
 
 /// List every PR/MR submitted for a guardian, oldest first. Bare JSON array
@@ -11847,6 +12057,130 @@ mod tests {
         );
         assert_eq!(r.status, 201, "{}", r.body);
         assert!(r.body.contains("proj"));
+    }
+
+    #[test]
+    fn project_fork_crud_round_trip_including_default_user_row() {
+        let d = daemon();
+
+        // Create the project-wide default row (empty "user").
+        let created = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "git@x:default/proj.git"}).to_string(),
+        );
+        assert_eq!(created.status, 201, "{}", created.body);
+        assert!(created.body.contains("git@x:default/proj.git"));
+
+        // Create a user-specific row.
+        let created_user = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({
+                "user": "alice",
+                "fork_url": "git@x:alice/proj.git",
+                "remote_name": "fork-alice",
+                "fork_owner": "alice",
+            })
+            .to_string(),
+        );
+        assert_eq!(created_user.status, 201, "{}", created_user.body);
+
+        // List for the project sees both rows.
+        let listed = route(&d, "GET", "/api/projects/proj/forks", "");
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        assert!(listed.body.contains("git@x:default/proj.git"));
+        assert!(listed.body.contains("git@x:alice/proj.git"));
+
+        // The unscoped list also sees both.
+        let all = route(&d, "GET", "/api/project-forks", "");
+        assert_eq!(all.status, 200, "{}", all.body);
+        assert!(all.body.contains("git@x:alice/proj.git"));
+
+        // Patch the default row (no trailing user segment).
+        let patched_default = route(
+            &d,
+            "PATCH",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "git@x:default2/proj.git"}).to_string(),
+        );
+        assert_eq!(patched_default.status, 200, "{}", patched_default.body);
+        assert!(patched_default.body.contains("git@x:default2/proj.git"));
+
+        // Patch alice's row.
+        let patched_alice = route(
+            &d,
+            "PATCH",
+            "/api/projects/proj/forks/alice",
+            &serde_json::json!({"remote_name": "fork-alice-2"}).to_string(),
+        );
+        assert_eq!(patched_alice.status, 200, "{}", patched_alice.body);
+        assert!(patched_alice.body.contains("fork-alice-2"));
+        // fork_url is unchanged by the selective patch.
+        assert!(patched_alice.body.contains("git@x:alice/proj.git"));
+
+        // Delete alice's row; the default row survives.
+        let deleted = route(&d, "DELETE", "/api/projects/proj/forks/alice", "");
+        assert_eq!(deleted.status, 200, "{}", deleted.body);
+        let after_delete = route(&d, "GET", "/api/projects/proj/forks", "");
+        assert!(!after_delete.body.contains("alice"));
+        assert!(after_delete.body.contains("git@x:default2/proj.git"));
+
+        // Delete the default row too.
+        let deleted_default = route(&d, "DELETE", "/api/projects/proj/forks", "");
+        assert_eq!(deleted_default.status, 200, "{}", deleted_default.body);
+        let empty = route(&d, "GET", "/api/projects/proj/forks", "");
+        assert_eq!(empty.status, 200, "{}", empty.body);
+        assert!(empty.body.contains("\"forks\":[]"));
+    }
+
+    #[test]
+    fn patch_or_delete_a_missing_fork_row_is_not_found() {
+        let d = daemon();
+        let patch = route(
+            &d,
+            "PATCH",
+            "/api/projects/proj/forks/nobody",
+            &serde_json::json!({"fork_url": "x"}).to_string(),
+        );
+        assert_eq!(patch.status, 404, "{}", patch.body);
+        let delete = route(&d, "DELETE", "/api/projects/proj/forks/nobody", "");
+        assert_eq!(delete.status, 404, "{}", delete.body);
+    }
+
+    #[test]
+    fn project_forks_health_route_reports_one_check_set_per_registered_row() {
+        let d = daemon();
+        let created = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "git@x:default/proj.git"}).to_string(),
+        );
+        assert_eq!(created.status, 201, "{}", created.body);
+
+        let health = route(&d, "GET", "/api/health/project-forks", "");
+        assert_eq!(health.status, 200, "{}", health.body);
+        let body: serde_json::Value = serde_json::from_str(&health.body).unwrap();
+        let checks = body["checks"].as_array().unwrap();
+        assert!(!checks.is_empty(), "{}", health.body);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c["project"] == "proj" && c["name"] == "fork-project"),
+            "unregistered project should fail the fork-project check: {}",
+            health.body
+        );
+    }
+
+    #[test]
+    fn project_forks_health_route_is_empty_with_no_registered_forks() {
+        let d = daemon();
+        let health = route(&d, "GET", "/api/health/project-forks", "");
+        assert_eq!(health.status, 200, "{}", health.body);
+        assert!(health.body.contains("\"checks\":[]"));
     }
 
     #[test]
@@ -19414,3 +19748,4 @@ command=\"cargo test\"
         assert!(store.list_users().unwrap().is_empty());
     }
 }
+

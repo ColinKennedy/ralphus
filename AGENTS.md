@@ -100,6 +100,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `daemon/src/guardian.rs` — Guardian store + state machine (Collecting→Approved→Deployed).
 - `daemon/src/guardian_merge.rs` — stacked linear rebase in a worktree, agent conflict resolution.
 - `daemon/src/reviews.rs` — review derivation (per-guardian, per-branch merge status).
+- `daemon/src/project_forks.rs` — per-project, per-user fork registration; fork-aware PR/MR routing and reconcile-first promotion live in `pr.rs`/`forge.rs` (RAL-338, see [`docs/fork-workflows.md`](docs/fork-workflows.md)).
 - `daemon/src/config.rs` — layered config (global + per-project `.ralphus.toml`).
 - `daemon/src/cartographer.rs` — Cartographer: the unified, structured, cross-system event log — see [`.agent/logging-policy.md`](.agent/logging-policy.md).
 - `daemon/src/logging.rs` — the `rlog!` file/stderr sink (RAL-83); see [`.agent/logging-policy.md`](.agent/logging-policy.md).

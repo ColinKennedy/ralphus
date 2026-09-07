@@ -42,6 +42,40 @@ pub enum ProjectCommand {
     Get {
         name: String,
     },
+    Fork(ProjectForkCommand),
+    UsageError(String),
+}
+
+/// `ralphus project fork <subcommand>` (RAL-338): per-project, per-user fork
+/// registration. `user: None` means "the project-wide default row"
+/// throughout -- distinct from `Some(String::new())`, which this CLI never
+/// produces (an empty `--user` value is treated the same as omitting it).
+#[derive(Debug, Clone)]
+pub enum ProjectForkCommand {
+    Help,
+    Add {
+        project: String,
+        url: String,
+        user: Option<String>,
+        remote_name: Option<String>,
+        owner: Option<String>,
+    },
+    List {
+        project: Option<String>,
+        user: Option<String>,
+        short: bool,
+    },
+    Set {
+        project: String,
+        user: Option<String>,
+        url: Option<String>,
+        remote_name: Option<String>,
+        owner: Option<String>,
+    },
+    Remove {
+        project: String,
+        user: Option<String>,
+    },
     UsageError(String),
 }
 
@@ -62,8 +96,101 @@ pub fn parse(args: &[String]) -> ProjectCommand {
             Some(name) => ProjectCommand::Get { name },
             None => ProjectCommand::UsageError("get requires a <name> argument".to_string()),
         },
+        Some("fork") => ProjectCommand::Fork(parse_fork(&scanner.remaining())),
         Some(other) => ProjectCommand::UsageError(format!("unknown project subcommand: {other}")),
     }
+}
+
+fn non_empty(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
+fn parse_fork(args: &[String]) -> ProjectForkCommand {
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => ProjectForkCommand::Help,
+        Some("add") => match parse_fork_add(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectForkCommand::UsageError(e.0),
+        },
+        Some("list") => match parse_fork_list(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectForkCommand::UsageError(e.0),
+        },
+        Some("set") => match parse_fork_set(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectForkCommand::UsageError(e.0),
+        },
+        Some("remove") => match parse_fork_remove(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectForkCommand::UsageError(e.0),
+        },
+        Some(other) => {
+            ProjectForkCommand::UsageError(format!("unknown project fork subcommand: {other}"))
+        }
+    }
+}
+
+fn parse_fork_add(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageError> {
+    let url = scanner.take_value("--url")?;
+    let user = non_empty(scanner.take_value("--user")?);
+    let remote_name = non_empty(scanner.take_value("--remote-name")?);
+    let owner = non_empty(scanner.take_value("--owner")?);
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project fork add requires a <project> argument".to_string(),
+        ));
+    };
+    let Some(url) = url else {
+        return Err(UsageError("project fork add requires --url".to_string()));
+    };
+    Ok(ProjectForkCommand::Add {
+        project,
+        url,
+        user,
+        remote_name,
+        owner,
+    })
+}
+
+fn parse_fork_list(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageError> {
+    let user = non_empty(scanner.take_value("--user")?);
+    let short = scanner.take_bool("--short");
+    let project = scanner.clone().remaining().into_iter().next();
+    Ok(ProjectForkCommand::List {
+        project,
+        user,
+        short,
+    })
+}
+
+fn parse_fork_set(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageError> {
+    let user = non_empty(scanner.take_value("--user")?);
+    let url = scanner.take_value("--url")?;
+    let remote_name = scanner.take_value("--remote-name")?;
+    let owner = scanner.take_value("--owner")?;
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project fork set requires a <project> argument".to_string(),
+        ));
+    };
+    Ok(ProjectForkCommand::Set {
+        project,
+        user,
+        url,
+        remote_name,
+        owner,
+    })
+}
+
+fn parse_fork_remove(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageError> {
+    let user = non_empty(scanner.take_value("--user")?);
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project fork remove requires a <project> argument".to_string(),
+        ));
+    };
+    Ok(ProjectForkCommand::Remove { project, user })
 }
 
 fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
@@ -169,6 +296,168 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
                 2
             }
         },
+        ProjectCommand::Fork(cmd) => dispatch_fork(cmd, opts),
+    }
+}
+
+#[must_use]
+fn dispatch_fork(cmd: ProjectForkCommand, opts: &GlobalOpts) -> i32 {
+    let client = opts.client();
+    match cmd {
+        ProjectForkCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["project", "fork"])
+                    .expect("project fork help exists")
+            );
+            0
+        }
+        ProjectForkCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        ProjectForkCommand::Add {
+            project,
+            url,
+            user,
+            remote_name,
+            owner,
+        } => match client.add_project_fork(
+            &project,
+            user.as_deref().unwrap_or(""),
+            &url,
+            remote_name.as_deref(),
+            owner.as_deref(),
+        ) {
+            Ok(record) => {
+                println!(
+                    "registered fork for project \"{project}\" user {:?} -> {url}",
+                    user.as_deref().unwrap_or("(default)")
+                );
+                render_fork_detail(&record);
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        ProjectForkCommand::List {
+            project,
+            user,
+            short,
+        } => {
+            let result = match &project {
+                Some(p) => client.list_project_forks(p),
+                None => client.list_all_project_forks(),
+            };
+            match result {
+                Ok(payload) => {
+                    render_fork_list(&payload, user.as_deref(), short);
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    2
+                }
+            }
+        }
+        ProjectForkCommand::Set {
+            project,
+            user,
+            url,
+            remote_name,
+            owner,
+        } => match client.set_project_fork(
+            &project,
+            user.as_deref().unwrap_or(""),
+            url.as_deref(),
+            remote_name.as_deref(),
+            owner.as_deref(),
+        ) {
+            Ok(record) => {
+                println!("updated fork for project \"{project}\"");
+                render_fork_detail(&record);
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        ProjectForkCommand::Remove { project, user } => {
+            match client.remove_project_fork(&project, user.as_deref().unwrap_or("")) {
+                Ok(_) => {
+                    println!(
+                        "removed fork for project \"{project}\" user {:?}",
+                        user.as_deref().unwrap_or("(default)")
+                    );
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn render_fork_detail(f: &Value) {
+    println!("project:     {}", f["project"].as_str().unwrap_or_default());
+    let user = f["user"].as_str().unwrap_or_default();
+    println!(
+        "user:        {}",
+        if user.is_empty() { "(default)" } else { user }
+    );
+    println!(
+        "fork_url:    {}",
+        f["fork_url"].as_str().unwrap_or_default()
+    );
+    println!(
+        "remote_name: {}",
+        f["remote_name"].as_str().unwrap_or_default()
+    );
+    let owner = f["fork_owner"].as_str().unwrap_or_default();
+    if !owner.is_empty() {
+        println!("fork_owner:  {owner}");
+    }
+}
+
+fn render_fork_list(payload: &Value, user_filter: Option<&str>, short: bool) {
+    let forks: Vec<&Value> = payload["forks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| user_filter.is_none_or(|u| f["user"].as_str().unwrap_or_default() == u))
+        .collect();
+    if forks.is_empty() {
+        println!("no registered forks");
+        return;
+    }
+    for f in forks {
+        let user = f["user"].as_str().unwrap_or_default();
+        let user_display = if user.is_empty() { "(default)" } else { user };
+        if short {
+            println!(
+                "{:<20}  {:<12}  {}",
+                f["project"].as_str().unwrap_or_default(),
+                user_display,
+                f["fork_url"].as_str().unwrap_or_default()
+            );
+        } else {
+            println!(
+                "{:<20}  {:<12}  {}",
+                f["project"].as_str().unwrap_or_default(),
+                user_display,
+                f["fork_url"].as_str().unwrap_or_default()
+            );
+            println!(
+                "    remote: {}   owner: {}",
+                f["remote_name"].as_str().unwrap_or_default(),
+                f["fork_owner"].as_str().unwrap_or("")
+            );
+        }
     }
 }
 
@@ -407,5 +696,171 @@ mod tests {
     fn elide_right_truncates_long_text() {
         assert_eq!(elide_right("hello world", 8), "hello...");
         assert_eq!(elide_right("short", 80), "short");
+    }
+
+    #[test]
+    fn parses_fork_add_with_required_flags() {
+        match parse(&v(&[
+            "fork",
+            "add",
+            "proj",
+            "--url",
+            "git@x:alice/proj.git",
+        ])) {
+            ProjectCommand::Fork(ProjectForkCommand::Add {
+                project,
+                url,
+                user,
+                remote_name,
+                owner,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(url, "git@x:alice/proj.git");
+                assert_eq!(user, None);
+                assert_eq!(remote_name, None);
+                assert_eq!(owner, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fork_add_with_all_flags() {
+        match parse(&v(&[
+            "fork",
+            "add",
+            "proj",
+            "--url",
+            "git@x:alice/proj.git",
+            "--user",
+            "alice",
+            "--remote-name",
+            "fork-alice",
+            "--owner",
+            "alice",
+        ])) {
+            ProjectCommand::Fork(ProjectForkCommand::Add {
+                project,
+                url,
+                user,
+                remote_name,
+                owner,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(url, "git@x:alice/proj.git");
+                assert_eq!(user.as_deref(), Some("alice"));
+                assert_eq!(remote_name.as_deref(), Some("fork-alice"));
+                assert_eq!(owner.as_deref(), Some("alice"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_add_requires_project_and_url() {
+        assert!(matches!(
+            parse(&v(&["fork", "add", "--url", "url"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+        assert!(matches!(
+            parse(&v(&["fork", "add", "proj"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_fork_list_with_optional_project_and_user() {
+        match parse(&v(&["fork", "list"])) {
+            ProjectCommand::Fork(ProjectForkCommand::List {
+                project,
+                user,
+                short,
+            }) => {
+                assert_eq!(project, None);
+                assert_eq!(user, None);
+                assert!(!short);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["fork", "list", "proj", "--user", "alice", "--short"])) {
+            ProjectCommand::Fork(ProjectForkCommand::List {
+                project,
+                user,
+                short,
+            }) => {
+                assert_eq!(project.as_deref(), Some("proj"));
+                assert_eq!(user.as_deref(), Some("alice"));
+                assert!(short);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fork_set_fields() {
+        match parse(&v(&[
+            "fork", "set", "proj", "--user", "alice", "--url", "new-url",
+        ])) {
+            ProjectCommand::Fork(ProjectForkCommand::Set {
+                project,
+                user,
+                url,
+                remote_name,
+                owner,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(user.as_deref(), Some("alice"));
+                assert_eq!(url.as_deref(), Some("new-url"));
+                assert_eq!(remote_name, None);
+                assert_eq!(owner, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_set_requires_project() {
+        assert!(matches!(
+            parse(&v(&["fork", "set", "--url", "url"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_fork_remove() {
+        match parse(&v(&["fork", "remove", "proj", "--user", "alice"])) {
+            ProjectCommand::Fork(ProjectForkCommand::Remove { project, user }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(user.as_deref(), Some("alice"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["fork", "remove", "proj"])) {
+            ProjectCommand::Fork(ProjectForkCommand::Remove { project, user }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(user, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_remove_requires_project() {
+        assert!(matches!(
+            parse(&v(&["fork", "remove"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn bare_fork_and_unknown_fork_subcommand() {
+        assert!(matches!(
+            parse(&v(&["fork"])),
+            ProjectCommand::Fork(ProjectForkCommand::Help)
+        ));
+        assert!(matches!(
+            parse(&v(&["fork", "bogus"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
     }
 }

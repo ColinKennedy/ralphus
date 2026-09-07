@@ -194,6 +194,18 @@ produced no pane output.
 | GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
 
+**Fork registration (RAL-338)**
+| Method | Path | What |
+|---|---|---|
+| GET | `/api/project-forks` | [Every registered fork row](#fork-registration-ral-338), across every project and user |
+| GET | `/api/projects/{name}/forks` | Every fork row registered for one project, including its `user=""` default row |
+| POST | `/api/projects/{name}/forks` | [Register a fork](#fork-registration-ral-338); `{user?, fork_url, remote_name?, fork_owner?}` |
+| PATCH | `/api/projects/{name}/forks` | Field-selective update of the project-wide default (`user=""`) row |
+| DELETE | `/api/projects/{name}/forks` | Remove the project-wide default (`user=""`) row |
+| PATCH | `/api/projects/{name}/forks/{user}` | Field-selective update of one user's fork row |
+| DELETE | `/api/projects/{name}/forks/{user}` | Remove one user's fork row |
+| GET | `/api/health/project-forks` | [Advisory health checks](#fork-registration-ral-338) for every registered fork row |
+
 **Mailbox (RAL-241, poll-only scope)**
 | Method | Path | What |
 |---|---|---|
@@ -1757,6 +1769,23 @@ open PR (or the review's own base branch, if none precedes it). The local
 `base_ref` record always updates; the forge PR's base is best-effort PATCHed
 too (`GET .../pull-requests` reflects the recorded state either way).
 
+**Fork routing (RAL-338).** If the review's project has a registered
+[fork](#fork-registration-ral-338) resolvable for the acting user
+(`X-Ralphus-User`, else `[daemon].default_user`), every alias — including the
+lowest enabled unmerged branch's ("the root's") — is pushed to and fetched
+from the fork instead of the project's own remote. Only the root's PR/MR is
+filed cross-repository against the parent's base branch (GitLab: created on
+the fork with a numeric `target_project_id`; GitHub: created on the parent
+with an `owner:branch` head); every later branch stays fork-internal, based
+on the preceding branch's alias, exactly like the non-fork chain above. A
+project with no registered fork is unaffected — routing stays byte-identical
+to before this existed. Before the first push, a one-time pre-flight
+confirms the fork is forge-recognized as related to the parent; a definite
+"no relationship" blocks the whole submission unless the optional
+`allow_unlinked_fork: true` body field downgrades it to a logged warning
+(`fork-relationship` health check below covers the same classification for
+`ralphus check health`).
+
 ### `GET /api/guardians/{id}/pull-request-stacks`
 
 Read-only history (RAL-302): every PR row ralphus has ever created for this
@@ -1794,6 +1823,66 @@ guardian doesn't exist. `200`:
 ```json
 { "dropped": 2 }
 ```
+
+### Fork registration (RAL-338)
+
+A **fork** is the writable repository a project's review branches are pushed
+to when the acting user cannot push directly to the project's registered
+**parent**. Rows are keyed by `(project, user)`, with an empty `user`
+segment/field acting as the project-wide fallback row used when no
+user-specific row exists (`resolve_fork`: exact user match first, then the
+default row, then no fork at all). The `user` field is a lookup detail, not
+an authorization boundary — every mutation below is admin-gated the same way
+`POST /api/projects` is, but any admin can create/edit/remove any row,
+including one naming a user later deleted from the registry (rows
+deliberately do not cascade on user deletion, so a health check or the board
+can flag it rather than it silently vanishing). Ralphus only *registers* an
+existing fork; it never creates one through a forge API.
+
+```json
+{
+  "project": "widget",
+  "user": "alice",
+  "fork_url": "git@github.com:alice/widget.git",
+  "remote_name": "fork-alice",
+  "fork_owner": "alice",
+  "created_at_ms": 1234567890000,
+  "updated_at_ms": 1234567890000
+}
+```
+
+`GET /api/project-forks` and `GET /api/projects/{name}/forks` return
+`{"forks": [...]}` of the shape above. `POST /api/projects/{name}/forks`
+registers or replaces a row; `user` defaults to `""` (the project-wide row)
+when omitted. `remote_name` defaults to `"fork"` for the default row, else
+`"fork-<sanitized-user>"`. `fork_owner` (the GitHub owner/org login the fork
+lives under, used to build the `owner:branch` cross-repo PR head) is
+auto-derived from `fork_url` when omitted and the URL looks like a GitHub
+host; GitLab addresses cross-project MRs by numeric project id instead, so
+it's left `""` there unless given explicitly. `PATCH`/`DELETE` with no
+trailing `{user}` segment target the project-wide default row; a trailing
+segment (including a URL-encoded empty one) targets that specific user's row.
+`PATCH` is field-selective — only present fields change — and `404`s if no
+row exists yet for that `(project, user)`.
+
+`GET /api/health/project-forks` (advisory, evaluated daemon-side for the same
+reason `GET /api/health/agent-profiles` is — this needs the daemon process's
+own git/forge-token environment, which can diverge from the CLI's) returns
+`{"checks": [...]}`, one or more entries per registered row:
+```json
+{ "project": "widget", "user": "alice", "name": "fork-relationship", "status": "pass", "detail": "..." }
+```
+`name` is one of `fork-user` (an unregistered user), `fork-project` (the
+project itself is gone), `fork-remote` (missing/mismatched local git remote),
+or `fork-relationship` (reusing the exact same forge-side relationship
+classification submission's own pre-flight uses — same network, indirectly
+related, no relationship, not visible/confirmable, or cross-instance
+impossible). `status` is `pass`/`warn`/`fail`; a `fail` here is advisory only
+and does not itself block anything — submission's own pre-flight
+(`POST /api/guardians/{id}/pull-requests`, above) is what's authoritative.
+
+See [`fork-workflows.md`](fork-workflows.md) for topology, promotion, and
+setup guidance.
 
 ### `POST /api/guardians/{id}/stop`
 
@@ -1882,6 +1971,15 @@ Exists because PR numbers are not permanently stable — a PR closed and
 reopened gets a new number, and this is the only way to update the recorded
 mapping after the fact (the CLI's `review pr update` wraps this). Returns the
 updated PR row.
+
+Every PR row also carries `repo` (the filing repository — the project's own
+remote, or in fork mode the parent's for the root and the fork's for every
+other branch) and, since RAL-338, a nullable `superseded_by`: set on a
+fork-internal PR once [reconcile-first promotion](fork-workflows.md#promotion)
+closes it and files a fresh cross-repository PR against the parent in its
+place (its own branch became the stack's new root after the prior root
+merged). The superseded row is kept, not deleted, so its discussion stays
+visible in `GET .../pull-request-stacks` history.
 
 ### `GET /api/pull-requests/{pr_id}/comments`
 Live-queries the forge for this PR's comments/notes (GitHub issue comments;

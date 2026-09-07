@@ -35,6 +35,7 @@ pub mod otel;
 pub mod plan;
 pub mod pr;
 pub mod procreg;
+pub mod project_forks;
 pub mod proof;
 pub mod redact;
 pub mod remote_failure;
