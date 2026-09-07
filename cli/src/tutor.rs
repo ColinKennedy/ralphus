@@ -390,6 +390,30 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 declared up front so the review is created with the
                 right behavior from its first merge.
 
+ [[review.auto_build]]  (zero or more per [[review]])
+ Declare the build steps that run at merge/finalize time (RAL-342).
+ Each entry is run in order. Exactly ONE of `prompt` or `command`
+ is required per entry.
+
+ Key                     Type           Notes
+ command                 string  ONE-OF Verbatim shell command run directly.
+ prompt                  string  ONE-OF Agent prompt to figure out and run the
+                                       build. The agent is inferred from the
+                                       review's `agent` field (or the
+                                       project-level default).
+ system_prompt           string         Optional system prompt appended to the
+                                       agent call (only valid with `prompt`).
+ system_prompt_position  string         Must be "append" if set (only valid with
+                                       `prompt`).
+ agent                   string         Override the review's agent for this build
+                                       step (only valid with `prompt`). Unset falls
+                                       back to the review's `agent`, then the
+                                       project-level default.
+ model                   string         Override the review's model for this build
+                                       step (only valid with `prompt`). Unset falls
+                                       back to the review's `model`, then the
+                                       project-level default.
+
  [[review.action]]  (zero or more per [[review]])
  User-declared labelled buttons shown in the review pane.
  Exactly ONE of `prompt` or `command` is required per entry.
@@ -741,6 +765,16 @@ id       = "ralphus:new-review/ral-batch"
 name     = "RAL batch"
 upstream = "foo"
 agent    = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
+
+# Build step 1: static command (run verbatim in shell).
+[[review.auto_build]]
+command = "cargo build --release"
+
+# Build step 2: agent-driven command (agent figures out the build).
+# If agent/model are unset here, they inherit from the review's agent/model above.
+[[review.auto_build]]
+prompt  = "Build this Rust project. Figure out what build tool to use and run it."
+agent   = "{<insert recommended agent here>}"  # optional: uses review's agent if unset
 
 # Optional: user-declared test buttons shown in the review pane.
 [[review.action]]
