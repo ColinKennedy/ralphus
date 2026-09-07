@@ -441,13 +441,13 @@ discover the hard way, mid-Cell, if a provider got a verb's shape wrong.
 Run against two providers:
 
 - `examples/providers/loopback.py` (this doc's own worked example) —
-  unconditionally, on every `cargo test`.
+  unconditionally, on every `cargo nextest run`.
 - The real, compiled `ralphus-ssh-provider` binary against the SSH Docker
   fixture — opt-in, `#[ignore]`d by default:
   ```powershell
   $env:RALPHUS_SSH_DOCKER_TEST = '1'
   $env:RALPHUS_SSH_CONFIG_FILE = (Resolve-Path .docker-ssh-target/ssh_config)
-  cargo test -p ralphus-daemon --test provider_conformance -- --ignored --nocapture
+  cargo nextest run -p ralphus-daemon --test provider_conformance -- --ignored --nocapture
   ```
 
 Checks `ping`, `capabilities` (tolerating its absence), `provision`
@@ -803,7 +803,7 @@ machine = "ssh:alice@build-box"
   own machine (any dev box with OpenSSH server enabled and key-based auth to
   itself already satisfies it):
   ```bash
-  RALPHUS_SSH_LIVE_TEST_TARGET=127.0.0.1 cargo test -p ralphus-ssh-provider \
+  RALPHUS_SSH_LIVE_TEST_TARGET=127.0.0.1 cargo nextest run -p ralphus-ssh-provider \
       --test exec_live_ssh -- --ignored --nocapture
   ```
 - `ssh-provider/tests/docker_ssh_target.rs` exercises durable async startup,
