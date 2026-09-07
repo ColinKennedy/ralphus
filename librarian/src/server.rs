@@ -249,10 +249,54 @@ fn resolve_cors(request: &tiny_http::Request) -> ralphus_core::cors::CorsDecisio
 /// Returns an error if the listener cannot bind.
 pub fn serve(port: u16, daemon_url: &str) -> std::io::Result<()> {
     let bind_host = crate::resolve_bind_host(std::env::var(crate::BIND_ADDR_ENV).ok().as_deref());
-    let server = tiny_http::Server::http((bind_host.as_str(), port))
+    let mut server = tiny_http::Server::http((bind_host.as_str(), port))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    serve_with(server, daemon_url);
-    Ok(())
+    // tiny_http 0.12 treats any accept() error as fatal: its accept thread
+    // reports the error via the `log` crate (no logger is installed here, so
+    // the message vanishes) and exits, after which [`serve_with`]'s loop ends.
+    // A transient WSAENOBUFS/WSAEMFILE under machine-wide socket pressure
+    // used to end the librarian silently — and scripts/build-debug's cleanup
+    // then killed the daemon too, since the librarian is its foreground
+    // process. Rebind and keep serving instead; `serve_with` only returns
+    // when the accept thread has died.
+    loop {
+        serve_with(server, daemon_url);
+        eprintln!(
+            "ralphus-librarian: HTTP listener stopped accepting connections \
+             (tiny_http accept thread died); rebinding"
+        );
+        server = rebind_listener(&bind_host, port)?;
+    }
+}
+
+/// Re-create the HTTP listener after tiny_http's accept thread died (see the
+/// rebind loop in [`serve`]). Retries briefly: the port is freed when the
+/// previous `Server` is dropped, but the same resource pressure that killed
+/// the accept thread can make the first bind attempts fail too.
+fn rebind_listener(bind_host: &str, port: u16) -> std::io::Result<tiny_http::Server> {
+    const ATTEMPTS: u32 = 20;
+    let mut last_err = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match tiny_http::Server::http((bind_host, port)) {
+            Ok(server) => {
+                eprintln!(
+                    "ralphus-librarian: listener rebound on {bind_host}:{port} (attempt {attempt})"
+                );
+                return Ok(server);
+            }
+            Err(e) => {
+                eprintln!(
+                    "ralphus-librarian: rebind attempt {attempt}/{ATTEMPTS} on \
+                     {bind_host}:{port} failed: {e}"
+                );
+                last_err = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "could not rebind the librarian listener on {bind_host}:{port} after {ATTEMPTS} attempts: {last_err}"
+    )))
 }
 
 /// Serve requests from an already-bound server, proxying the API to
