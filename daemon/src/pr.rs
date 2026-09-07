@@ -154,6 +154,35 @@ pub fn group_into_stacks(prs: Vec<PullRequestView>) -> Vec<PrStackView> {
     stacks
 }
 
+/// One row of [`Store::list_pull_requests_index`] (RAL-362): a flat PR view
+/// annotated with the squad/task/cell it was submitted from, for the board's
+/// Tasks tab. Deliberately a narrower field set than [`PullRequestView`] —
+/// no `title`/`description`/`base_ref`/etc, since the Tasks tab row only ever
+/// needs enough to render a PR badge and link back to its source task.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrIndexRow {
+    pub id: String,
+    pub guardian_id: String,
+    pub branch_id: Option<String>,
+    /// The branch name actually pushed to the remote, joined in from
+    /// `guardian_branches` (this row's own table has no branch name).
+    pub branch_alias: Option<String>,
+    pub forge: String,
+    pub repo: String,
+    pub pr_number: Option<i64>,
+    pub pr_url: Option<String>,
+    pub state: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// Squad/task/cell this PR's branch was most recently submitted for,
+    /// resolved via `cells.review_branch` (see [`Store::list_pull_requests_index`]
+    /// doc comment) — `None` for a PR whose source cell has since been
+    /// deleted, or a manually-added branch with no source cell at all.
+    pub source_squad_id: Option<String>,
+    pub source_task_idx: Option<i64>,
+    pub source_cell_idx: Option<i64>,
+}
+
 struct PrRow {
     id: String,
     guardian_id: String,
@@ -365,6 +394,55 @@ impl Store {
             )
             .optional()?
             .map(PullRequestView::from))
+    }
+
+    /// RAL-362: flat, single-query index of every PR row, for the board's
+    /// Tasks tab. Unlike [`Self::get_pull_request`]/[`Self::find_pull_request_by_number`]
+    /// (which look up one specific PR), this returns every row across every
+    /// guardian in one shot, each annotated with the squad/task/cell it was
+    /// submitted from -- resolved the same way `guardian.rs`'s `hydrate_guardian`
+    /// resolves `BranchView::source_squad_id`/`source_task_idx`/`source_cell_idx`:
+    /// a correlated subquery to `cells` on `review_branch`, since that
+    /// coordinate isn't stored directly on `guardian_branches`. No forge
+    /// calls, no per-guardian N+1 -- one SELECT.
+    pub fn list_pull_requests_index(&self) -> Result<Vec<PrIndexRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pr.id, pr.guardian_id, pr.branch_id, gb.branch AS branch_alias,
+                    pr.forge, pr.repo, pr.pr_number, pr.pr_url, pr.state,
+                    pr.created_at_ms, pr.updated_at_ms,
+                    s.squad_id AS source_squad_id,
+                    s.task_idx AS source_task_idx,
+                    s.idx AS source_cell_idx
+             FROM guardian_pull_requests pr
+             LEFT JOIN guardian_branches gb ON gb.id = pr.branch_id
+             LEFT JOIN cells s ON s.rowid = (
+                 SELECT s2.rowid FROM cells s2
+                 WHERE s2.review_branch = gb.branch
+                 ORDER BY s2.rowid DESC LIMIT 1
+             )
+             ORDER BY pr.created_at_ms, pr.id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PrIndexRow {
+                    id: r.get(0)?,
+                    guardian_id: r.get(1)?,
+                    branch_id: r.get(2)?,
+                    branch_alias: r.get(3)?,
+                    forge: r.get(4)?,
+                    repo: r.get(5)?,
+                    pr_number: r.get(6)?,
+                    pr_url: r.get(7)?,
+                    state: r.get(8)?,
+                    created_at_ms: r.get(9)?,
+                    updated_at_ms: r.get(10)?,
+                    source_squad_id: r.get(11)?,
+                    source_task_idx: r.get(12)?,
+                    source_cell_idx: r.get(13)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Mutate the recorded PR mapping after the fact — e.g. the CLI updating
