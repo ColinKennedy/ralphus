@@ -585,6 +585,10 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
     PROOF_SCOPE_NOTHING,
 ];
 
+/// Every accepted `[[review]] summary_format` literal. See
+/// [`ReviewDef::summary_format`].
+pub const SUMMARY_FORMAT_VALUES: &[&str] = &["bullet", "prose"];
+
 /// If `id` is a new-review placeholder (`ralphus:new-review/<key>`), return its
 /// `<key>` trimmed of surrounding whitespace. Returns `None` for a plain id or a
 /// non-matching scheme, or when the key is empty.
@@ -881,6 +885,44 @@ pub struct ReviewDef {
     /// needing a follow-up command.
     #[serde(default)]
     pub auto_submit_pr_stack: Option<bool>,
+    /// This review's own override for whether contributing cells skip
+    /// creating dedicated worktrees. Unset inherits the project-level
+    /// `.ralphus.toml [review] skip_worktrees` default, then `false`.
+    #[serde(default)]
+    pub skip_worktrees: Option<bool>,
+    /// This review's own override for whether a submitted PR branch is
+    /// matched against an existing worktree/branch by name. Unset inherits
+    /// the project-level `.ralphus.toml [review] match_pr_branch_name`
+    /// default, then `false`.
+    #[serde(default)]
+    pub match_pr_branch_name: Option<bool>,
+    /// This review's own override for whether contributing branches skip
+    /// picking up upstream base-branch updates. Unset inherits the
+    /// project-level `.ralphus.toml [review] skip_base_updates` default,
+    /// then `false`.
+    #[serde(default)]
+    pub skip_base_updates: Option<bool>,
+    /// This review's own override for whether the Proof step's worktree is
+    /// auto-cleaned after running. Unset inherits the project-level
+    /// `.ralphus.toml [review] proof_skip_auto_clean` default, then `false`.
+    #[serde(default)]
+    pub proof_skip_auto_clean: Option<bool>,
+    /// User-declared check names this review's guardian runs, unioned with
+    /// every other declaration for the same guardian and with the
+    /// project-level `.ralphus.toml [review] checks` default.
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// This review's own override for the build command run against the
+    /// merged branch. Unset inherits the project-level `.ralphus.toml
+    /// [review] auto_build` default, then unset (no auto-build).
+    #[serde(default)]
+    pub auto_build: Option<String>,
+    /// This review's own override for the change-summary prompt's output
+    /// shape -- one of `"bullet"`/`"prose"` (see [`SUMMARY_FORMAT_VALUES`]).
+    /// Unset inherits the project-level `.ralphus.toml [review]
+    /// summary_format` default, then `"bullet"`.
+    #[serde(default)]
+    pub summary_format: Option<String>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,

@@ -227,8 +227,14 @@ pub const REVIEW_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "proof_scope",
     "auto_submit_pr_stack",
+    "skip_worktrees",
+    "match_pr_branch_name",
+    "skip_base_updates",
+    "proof_skip_auto_clean",
+    "checks",
     "auto_build",
     "skip_auto_build",
+    "summary_format",
 ];
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
@@ -1179,8 +1185,39 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             }
         }
         check_type(ctx, table, "auto_submit_pr_stack", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "skip_worktrees", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "match_pr_branch_name", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "skip_base_updates", Ty::Bool, &rpath, header);
+        check_type(
+            ctx,
+            table,
+            "proof_skip_auto_clean",
+            Ty::Bool,
+            &rpath,
+            header,
+        );
+        check_type(ctx, table, "checks", Ty::StrArray, &rpath, header);
         check_type(ctx, table, "skip_auto_build", Ty::Bool, &rpath, header);
         validate_auto_build_table(table, &rpath, ctx, header);
+        check_type(ctx, table, "summary_format", Ty::Str, &rpath, header);
+        if let Some(format) = table.get("summary_format").and_then(toml::Value::as_str) {
+            if !crate::schema::SUMMARY_FORMAT_VALUES.contains(&format) {
+                let line = ctx.key_line(header, "summary_format");
+                ctx.error(
+                    &format!("{rpath}.summary_format"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'summary_format' must be one of {} -- got \"{format}\"",
+                        crate::schema::SUMMARY_FORMAT_VALUES
+                            .iter()
+                            .map(|v| format!("\"{v}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    line,
+                );
+            }
+        }
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -2355,6 +2392,179 @@ command = "cargo build"
                 .iter()
                 .any(|e| e.kind == ErrorKind::WrongType
                     && e.message.contains("auto_submit_pr_stack")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] skip_worktrees ───────────────────────────────────────────
+
+    #[test]
+    fn review_skip_worktrees_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_worktrees=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_skip_worktrees_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_worktrees=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("skip_worktrees")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] match_pr_branch_name ─────────────────────────────────────
+
+    #[test]
+    fn review_match_pr_branch_name_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nmatch_pr_branch_name=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_match_pr_branch_name_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nmatch_pr_branch_name=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType
+                    && e.message.contains("match_pr_branch_name")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] skip_base_updates ────────────────────────────────────────
+
+    #[test]
+    fn review_skip_base_updates_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_base_updates=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_skip_base_updates_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_base_updates=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("skip_base_updates")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] proof_skip_auto_clean ────────────────────────────────────
+
+    #[test]
+    fn review_proof_skip_auto_clean_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_skip_auto_clean=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_proof_skip_auto_clean_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_skip_auto_clean=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType
+                    && e.message.contains("proof_skip_auto_clean")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] checks ────────────────────────────────────────────────────
+
+    #[test]
+    fn review_checks_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nchecks=[\"lint\", \"typecheck\"]\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_checks_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nchecks=[1, 2]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("checks")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] auto_build ────────────────────────────────────────────────
+
+    #[test]
+    fn review_auto_build_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_build=\"cargo build\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_auto_build_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_build=1\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("auto_build")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] summary_format ────────────────────────────────────────────
+
+    #[test]
+    fn review_summary_format_accepted_for_every_valid_value() {
+        for format in ["bullet", "prose"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nsummary_format=\"{format}\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{format}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_summary_format_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nsummary_format=1\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("summary_format")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_summary_format_unknown_value_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nsummary_format=\"bogus\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("summary_format")),
             "{:?}",
             r.errors
         );
