@@ -212,7 +212,11 @@ const CELL_KEYS: &[&str] = &[
     "triage",
     "triage_type",
 ];
-const REVIEW_KEYS: &[&str] = &[
+/// The full set of top-level `[[review]]` keys -- also the source of truth
+/// `daemon`'s `REVIEW_FIELD_PARITY` test (RAL-342/RAL-338) checks against, so
+/// every key here must map to a per-project auto-review default or a
+/// documented reason it doesn't.
+pub const REVIEW_KEYS: &[&str] = &[
     "id",
     "name",
     "agent",

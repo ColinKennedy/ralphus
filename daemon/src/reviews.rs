@@ -767,8 +767,8 @@ pub fn derive_reviews(
         let gid = store
             .create_guardian_for_squad(&name, &upstream, project, Some(squad_id))
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        apply_skip_worktrees(store, &gid, project)?;
         apply_resolver(store, &gid, &members)?;
+        apply_project_review_defaults(store, &gid, project)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Single-project: no need to tag branches with a project (they share git_root).
         add_new_branches(store, &gid, &[], &members, false)?;
@@ -804,7 +804,9 @@ pub fn derive_reviews(
         let gid = store
             .create_guardian_keyed(&name, &upstream, &project, Some(squad_id), Some(key))
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        // Apply skip_worktrees for every distinct project in the group.
+        apply_resolver(store, &gid, &members)?;
+        // Apply project-level defaults (skip_worktrees, machine,
+        // maximum_budget_usd) for every distinct project in the group.
         let distinct_projects: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
             members
@@ -814,9 +816,8 @@ pub fn derive_reviews(
                 .collect()
         };
         for proj in &distinct_projects {
-            apply_skip_worktrees(store, &gid, proj)?;
+            apply_project_review_defaults(store, &gid, proj)?;
         }
-        apply_resolver(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Freshly minted guardian: no branches attached yet. Tag each branch with
         // its project root (multi-project link group).
@@ -858,17 +859,50 @@ fn record_review_guardian(
     Ok(())
 }
 
-/// Layered review config (global under per-project) may opt a project's reviews
-/// out of per-branch worktrees (CCTL-156).
-fn apply_skip_worktrees(
+/// Layered review config (global under per-project) fills in whatever this
+/// guardian doesn't already have a concrete value for: opting reviews out of
+/// per-branch worktrees (CCTL-156), and -- RAL-342/RAL-338 -- a `machine`/
+/// `maximum_budget_usd` default. This is the single call site both guardian-
+/// creation paths share (an explicit `[[review]]` submission, after
+/// `apply_resolver` has already applied anything the block itself declared;
+/// and the Arbiter's `create_review_from_triage_pool`, which has no
+/// `[[review]]` block to read from at all), so it must never clobber a value
+/// that's already set -- it only fills gaps.
+///
+/// `agent`/`model`/`proof_scope` don't need an equivalent here: they're
+/// resolved lazily against the same project config, at the point each is
+/// actually used (`guardian_merge::resolver_agent`/`resolver_model`,
+/// `guardian.rs`'s `effective_proof_scope`), so they already pick up a
+/// project default regardless of how the guardian was created.
+/// `auto_submit_pr_stack` also doesn't need one: `create_guardian_keyed`
+/// already stamps it at INSERT time for every guardian, both paths included.
+fn apply_project_review_defaults(
     store: &Store,
     gid: &str,
     project: &str,
 ) -> std::result::Result<(), ReviewError> {
-    if crate::config::resolve(Path::new(project)).skip_worktrees() {
+    let cfg = crate::config::resolve(Path::new(project));
+    if cfg.skip_worktrees() {
         store
             .set_guardian_skip_worktrees(gid, true)
             .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    let row = store
+        .get_guardian(gid)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    if row.machine.is_none() {
+        if let Some(machine) = cfg.default_machine() {
+            store
+                .set_guardian_machine(gid, Some(machine))
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+        }
+    }
+    if row.maximum_budget_usd.is_none() {
+        if let Some(cap) = cfg.default_maximum_budget_usd() {
+            store
+                .set_guardian_maximum_budget_usd(gid, Some(cap))
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -1238,11 +1272,7 @@ pub(crate) fn create_review_from_triage_pool(
     store
         .set_guardian_origin(&gid, crate::guardian::GUARDIAN_ORIGIN_ARBITER)
         .map_err(|e| ReviewError::new(e.to_string()))?;
-    if crate::config::resolve(Path::new(project)).skip_worktrees() {
-        store
-            .set_guardian_skip_worktrees(&gid, true)
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-    }
+    apply_project_review_defaults(store, &gid, project)?;
     let mut seen: HashSet<String> = HashSet::new();
     for cell in &drained {
         if seen.insert(cell.branch.clone()) {
@@ -1467,7 +1497,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_resolver,
+        Membership, any_workspace_ahead_of_upstream, apply_project_review_defaults, apply_resolver,
         create_review_from_triage_pool, derive_triage_pools, rebase_onto, repair_triage_pool_keys,
         workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
     };
@@ -2167,6 +2197,85 @@ print(json.dumps(result))
             "the failed cell's branch must never be attached to the review"
         );
         assert_eq!(g.branches[0].branch, "b-ok");
+    }
+
+    // ── RAL-342/RAL-338: per-project auto-review defaults ────────────────────
+
+    #[test]
+    fn apply_project_review_defaults_fills_machine_and_maximum_budget_usd_from_project_config() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndefault_machine = \"ib:A\"\ndefault_maximum_budget_usd = 5.0\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let gid = store
+            .create_guardian_for_squad("r", "main", &root.to_string_lossy(), None)
+            .unwrap();
+
+        apply_project_review_defaults(&store, &gid, &root.to_string_lossy()).unwrap();
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.machine.as_deref(), Some("ib:A"));
+        assert_eq!(g.maximum_budget_usd, Some(5.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_project_review_defaults_does_not_clobber_an_already_set_machine() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndefault_machine = \"ib:from-config\"\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let gid = store
+            .create_guardian_for_squad("r", "main", &root.to_string_lossy(), None)
+            .unwrap();
+        store
+            .set_guardian_machine(&gid, Some("ib:explicit"))
+            .unwrap();
+
+        apply_project_review_defaults(&store, &gid, &root.to_string_lossy()).unwrap();
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.machine.as_deref(),
+            Some("ib:explicit"),
+            "an already-set machine must never be overwritten by the project default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_review_from_triage_pool_applies_project_default_machine_and_budget() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndefault_machine = \"ib:A\"\ndefault_maximum_budget_usd = 2.5\n",
+        )
+        .unwrap();
+        let project = root.to_string_lossy().into_owned();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_triage_pool_cell(&project, "security", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+
+        let gid = create_review_from_triage_pool(&store, &project, "security")
+            .unwrap()
+            .expect("pool was non-empty, must create a review");
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.machine.as_deref(),
+            Some("ib:A"),
+            "the Arbiter has no [[review]] block to declare a machine, so it must pick up \
+             the project's default_machine"
+        );
+        assert_eq!(g.maximum_budget_usd, Some(2.5));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

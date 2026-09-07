@@ -95,7 +95,7 @@ impl ArkConfig {
 }
 
 /// Resolved review configuration (after layering global under per-project).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct ReviewConfig {
     /// Skip creating a git worktree per branch during merge. `None` means unset
     /// (so a lower layer can supply it); resolved callers treat `None` as false.
@@ -123,14 +123,17 @@ pub struct ReviewConfig {
     /// layer, same as `skip_worktrees`.
     #[serde(default)]
     pub summary_format: Option<String>,
-    /// RAL-168: project-level default "Verify" scope for the LLM-based
+    /// RAL-168: project-level default Proof scope for the LLM-based
     /// final-verify pass -- one of `"each_branch"` (default), `"final_branch"`,
     /// or `"nothing"`. `None` means unset, which resolves to `"each_branch"`
-    /// (see [`Self::verify_scope`]); per-project scalars win over the global
-    /// layer, same as `skip_worktrees`. A per-review override (see
-    /// `Guardian::verify_scope` in `guardian.rs`) wins over this.
-    #[serde(default)]
-    pub verify_scope: Option<String>,
+    /// (see [`Self::default_proof_scope`]); per-project scalars win over the
+    /// global layer, same as `skip_worktrees`. A per-review override (see
+    /// `Guardian::proof_scope` in `guardian.rs`) wins over this. Named
+    /// `verify_scope` before the Verify→Proof rename (see `AGENTS.md`'s
+    /// Taxonomy section); `#[serde(alias)]` keeps existing `.ralphus.toml`
+    /// files using the old key working.
+    #[serde(alias = "verify_scope", default)]
+    pub default_proof_scope: Option<String>,
     /// RAL-168: within `"each_branch"` scope, additionally skip verification
     /// on branches whose rebase applied cleanly with no conflict (an
     /// "auto-clean" branch) -- the old, lighter-weight default behavior.
@@ -146,6 +149,29 @@ pub struct ReviewConfig {
     /// per-project scalars win over the global layer, same as `skip_worktrees`.
     #[serde(default)]
     pub default_resolver_agent: Option<String>,
+    /// RAL-342/RAL-338: the conflict-resolver model used when a review
+    /// doesn't set its own `[[review]].model` and `RALPHUS_RESOLVER_MODEL`
+    /// isn't set. `None` means unset, in which case each backend picks its
+    /// own default (see [`Self::default_resolver_model`]); per-project
+    /// scalars win over the global layer, same as `skip_worktrees`.
+    #[serde(default)]
+    pub default_resolver_model: Option<String>,
+    /// RAL-342/RAL-338: the machine (`scheme:uri`) a review's worktrees and
+    /// merge run on when neither an explicit `[[review]].machine` nor the
+    /// Arbiter (which never has a `[[review]]` block to read one from) sets
+    /// one. `None` means unset, which resolves to the local machine (see
+    /// [`Self::default_machine`]); per-project scalars win over the global
+    /// layer, same as `skip_worktrees`.
+    #[serde(default)]
+    pub default_machine: Option<String>,
+    /// RAL-342/RAL-338: the USD spend cap applied to a review's own
+    /// resolver/prover cost when neither an explicit
+    /// `[[review]].maximum_budget_usd` nor the Arbiter sets one. `None` means
+    /// unset, which resolves to unbounded (see
+    /// [`Self::default_maximum_budget_usd`]); per-project scalars win over
+    /// the global layer, same as `skip_worktrees`.
+    #[serde(default)]
+    pub default_maximum_budget_usd: Option<f64>,
     /// RAL-250: whether a review opts out of the automatic base-branch
     /// auto-update rebuild (`review_maintenance`'s base-shift pass in
     /// `guardian_merge.rs`). `None` means unset, which resolves to `false`
@@ -191,14 +217,14 @@ impl ReviewConfig {
         self.summary_format.as_deref() != Some("prose")
     }
 
-    /// The project-level default Verify scope (RAL-168), normalized to one of
+    /// The project-level default Proof scope (RAL-168), normalized to one of
     /// `"each_branch"`/`"final_branch"`/`"nothing"`. Unset or an unrecognized
     /// value resolves to `"each_branch"` (today's post-RAL-168 default
     /// behavior), so a typo in `.ralphus.toml` degrades to the safe default
     /// rather than silently disabling verification.
     #[must_use]
-    pub fn verify_scope(&self) -> &str {
-        match self.verify_scope.as_deref() {
+    pub fn default_proof_scope(&self) -> &str {
+        match self.default_proof_scope.as_deref() {
             Some("final_branch") => "final_branch",
             Some("nothing") => "nothing",
             _ => "each_branch",
@@ -219,6 +245,29 @@ impl ReviewConfig {
     #[must_use]
     pub fn default_resolver_agent(&self) -> &str {
         self.default_resolver_agent.as_deref().unwrap_or("ollama")
+    }
+
+    /// The configured default conflict-resolver model, unset resolves to
+    /// `None` -- `guardian_merge::resolver_model`'s fallback chain (per-review
+    /// `model` -> `RALPHUS_RESOLVER_MODEL` -> this -> the resolved backend's
+    /// own default) still lets the backend pick when this is also unset.
+    #[must_use]
+    pub fn default_resolver_model(&self) -> Option<&str> {
+        self.default_resolver_model.as_deref()
+    }
+
+    /// The configured default review machine (`scheme:uri`), unset resolves
+    /// to `None` (the local machine).
+    #[must_use]
+    pub fn default_machine(&self) -> Option<&str> {
+        self.default_machine.as_deref()
+    }
+
+    /// The configured default review USD spend cap, unset resolves to `None`
+    /// (unbounded).
+    #[must_use]
+    pub fn default_maximum_budget_usd(&self) -> Option<f64> {
+        self.default_maximum_budget_usd
     }
 
     /// Whether a review opts out of the automatic base-branch auto-update
@@ -259,15 +308,103 @@ impl ReviewConfig {
             checks,
             auto_build: over.auto_build.or(self.auto_build),
             summary_format: over.summary_format.or(self.summary_format),
-            verify_scope: over.verify_scope.or(self.verify_scope),
+            default_proof_scope: over.default_proof_scope.or(self.default_proof_scope),
             verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
+            default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
+            default_machine: over.default_machine.or(self.default_machine),
+            default_maximum_budget_usd: over
+                .default_maximum_budget_usd
+                .or(self.default_maximum_budget_usd),
             skip_base_updates: over.skip_base_updates.or(self.skip_base_updates),
             match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
             auto_submit_pr_stack: over.auto_submit_pr_stack.or(self.auto_submit_pr_stack),
         }
     }
 }
+
+/// Whether a `[[review]]` field has a per-project auto-review default
+/// (RAL-342/RAL-338), or a documented reason it deliberately doesn't. Used
+/// only via [`REVIEW_FIELD_PARITY`] -- see `daemon/tests/review_field_parity.rs`
+/// for the test that enforces every entry stays honest.
+pub enum ReviewFieldDefault {
+    /// A `fn` pointer rather than a field-name string: a `ReviewConfig` field
+    /// renamed or removed out from under this table fails to *compile*, not
+    /// just fails a string-matched test.
+    ProjectDefault(fn(&ReviewConfig) -> bool),
+    /// Deliberately has no per-project default; the reason is checked for
+    /// substance (not empty/placeholder text) by the parity test.
+    NotApplicable(&'static str),
+}
+
+/// The full parity mapping between `[[review]]`'s TOML fields
+/// (`ralphus_core::validate::REVIEW_KEYS`) and this project's auto-review
+/// defaults (RAL-342/RAL-338): every field a human can set explicitly in a
+/// `[[review]]` block must appear here, either wired to the `ReviewConfig`
+/// field that covers it for a review the Arbiter creates with no
+/// `[[review]]` block to read from, or with a real explanation of why no
+/// project-level default makes sense for it. `daemon/tests/review_field_parity.rs`
+/// fails the build the moment a new `[[review]]` field (and therefore a new
+/// entry in `core::validate::REVIEW_KEYS`) doesn't get an entry here.
+pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
+    (
+        "id",
+        ReviewFieldDefault::NotApplicable(
+            "id is the review's identity, assigned at creation time -- a human-authored \
+             key, or the Arbiter's own `triage-{type}` pool key. There is no sensible \
+             default identity to inherit from a project.",
+        ),
+    ),
+    (
+        "name",
+        ReviewFieldDefault::NotApplicable(
+            "name is derived from id/pool key at creation time; a fixed project-level \
+             default name would collide across every auto-review the project ever creates.",
+        ),
+    ),
+    (
+        "agent",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_resolver_agent.is_some()),
+    ),
+    (
+        "model",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_resolver_model.is_some()),
+    ),
+    (
+        "upstream",
+        ReviewFieldDefault::NotApplicable(
+            "for an Arbiter-created review, upstream is derived from the pooled cells' \
+             actual base branch (see `reviews::create_review_from_triage_pool`); a static \
+             project override would silently rebase pooled work onto the wrong branch. \
+             `ralphus review upstream set` already exists to correct one review afterward.",
+        ),
+    ),
+    (
+        "machine",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_machine.is_some()),
+    ),
+    (
+        "maximum_budget_usd",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_maximum_budget_usd.is_some()),
+    ),
+    (
+        "proof_scope",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_proof_scope.is_some()),
+    ),
+    (
+        "auto_submit_pr_stack",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_submit_pr_stack.is_some()),
+    ),
+    (
+        "action",
+        ReviewFieldDefault::NotApplicable(
+            "action hints are bespoke per-review manual-test buttons tied to review-specific \
+             prompts/commands; a single project-level default doesn't generalize the way a \
+             scalar setting does. Revisit as a separate feature (project-level default action \
+             templates) if a concrete need shows up.",
+        ),
+    ),
+];
 
 /// The daemon-singleton Arbiter's own agent/model/budget config (`[arbiter]`
 /// table, RAL-318) -- wholly separate from a review's own conflict-resolver
@@ -1951,6 +2088,62 @@ mod tests {
         );
     }
 
+    // ── default_resolver_model/default_machine/default_maximum_budget_usd
+    // (RAL-342/RAL-338) ──────────────────────────────────────────────────
+
+    #[test]
+    fn default_resolver_model_unset_resolves_to_none() {
+        assert_eq!(ReviewConfig::default().default_resolver_model(), None);
+    }
+
+    #[test]
+    fn parse_default_resolver_model() {
+        let c = from_toml_str("[review]\ndefault_resolver_model = \"claude-haiku-4-5\"\n");
+        assert_eq!(c.default_resolver_model(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn default_machine_unset_resolves_to_none() {
+        assert_eq!(ReviewConfig::default().default_machine(), None);
+    }
+
+    #[test]
+    fn parse_default_machine() {
+        let c = from_toml_str("[review]\ndefault_machine = \"ib:A\"\n");
+        assert_eq!(c.default_machine(), Some("ib:A"));
+    }
+
+    #[test]
+    fn default_maximum_budget_usd_unset_resolves_to_none() {
+        assert_eq!(ReviewConfig::default().default_maximum_budget_usd(), None);
+    }
+
+    #[test]
+    fn parse_default_maximum_budget_usd() {
+        let c = from_toml_str("[review]\ndefault_maximum_budget_usd = 5.0\n");
+        assert_eq!(c.default_maximum_budget_usd(), Some(5.0));
+    }
+
+    #[test]
+    fn merge_default_machine_project_wins() {
+        let global = ReviewConfig {
+            default_machine: Some("ib:A".to_string()),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            default_machine: Some("ib:B".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).default_machine(),
+            Some("ib:B")
+        );
+        assert_eq!(
+            global.merge(ReviewConfig::default()).default_machine(),
+            Some("ib:A")
+        );
+    }
+
     // ── arbiter (RAL-318) ──────────────────────────────────────────────────
 
     #[test]
@@ -2015,25 +2208,31 @@ mod tests {
         assert!(!global.merge(ReviewConfig::default()).bullet_summary());
     }
 
-    // ── verify_scope (RAL-168) ────────────────────────────────────────────────
+    // ── default_proof_scope (RAL-168) ───────────────────────────────────────
 
     #[test]
-    fn verify_scope_defaults_to_each_branch_when_unset() {
-        assert_eq!(ReviewConfig::default().verify_scope(), "each_branch");
+    fn default_proof_scope_defaults_to_each_branch_when_unset() {
+        assert_eq!(ReviewConfig::default().default_proof_scope(), "each_branch");
     }
 
     #[test]
-    fn verify_scope_parses_final_branch_and_nothing() {
+    fn default_proof_scope_parses_final_branch_and_nothing() {
+        let c = from_toml_str("[review]\ndefault_proof_scope = \"final_branch\"\n");
+        assert_eq!(c.default_proof_scope(), "final_branch");
+        let c = from_toml_str("[review]\ndefault_proof_scope = \"nothing\"\n");
+        assert_eq!(c.default_proof_scope(), "nothing");
+    }
+
+    #[test]
+    fn default_proof_scope_unrecognized_value_falls_back_to_each_branch() {
+        let c = from_toml_str("[review]\ndefault_proof_scope = \"bogus\"\n");
+        assert_eq!(c.default_proof_scope(), "each_branch");
+    }
+
+    #[test]
+    fn default_proof_scope_accepts_the_legacy_verify_scope_key() {
         let c = from_toml_str("[review]\nverify_scope = \"final_branch\"\n");
-        assert_eq!(c.verify_scope(), "final_branch");
-        let c = from_toml_str("[review]\nverify_scope = \"nothing\"\n");
-        assert_eq!(c.verify_scope(), "nothing");
-    }
-
-    #[test]
-    fn verify_scope_unrecognized_value_falls_back_to_each_branch() {
-        let c = from_toml_str("[review]\nverify_scope = \"bogus\"\n");
-        assert_eq!(c.verify_scope(), "each_branch");
+        assert_eq!(c.default_proof_scope(), "final_branch");
     }
 
     #[test]
@@ -2044,19 +2243,22 @@ mod tests {
     }
 
     #[test]
-    fn merge_verify_scope_project_wins() {
+    fn merge_default_proof_scope_project_wins() {
         let global = ReviewConfig {
-            verify_scope: Some("final_branch".to_string()),
+            default_proof_scope: Some("final_branch".to_string()),
             ..ReviewConfig::default()
         };
         let project = ReviewConfig {
-            verify_scope: Some("nothing".to_string()),
+            default_proof_scope: Some("nothing".to_string()),
             ..ReviewConfig::default()
         };
-        assert_eq!(global.clone().merge(project).verify_scope(), "nothing");
+        assert_eq!(
+            global.clone().merge(project).default_proof_scope(),
+            "nothing"
+        );
         // Project unset falls back to the global value.
         assert_eq!(
-            global.merge(ReviewConfig::default()).verify_scope(),
+            global.merge(ReviewConfig::default()).default_proof_scope(),
             "final_branch"
         );
     }

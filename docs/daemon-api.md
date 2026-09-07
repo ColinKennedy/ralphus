@@ -536,6 +536,26 @@ review falls back to when it sets no resolver agent of its own. Not
 guaranteed to name an entry in `agents` if misconfigured -- `ralphus check
 health` flags that case.
 
+`default_resolver_agent` has four siblings under the same `.ralphus.toml
+[review]` table (RAL-342/RAL-338), each the per-project default for a
+setting a `[[review]]` block can otherwise declare explicitly -- so a review
+the Arbiter creates automatically (Triage, RAL-318, which has no `[[review]]`
+block to read from at all) still picks up sensible per-project behavior
+instead of falling through to a global, non-project-aware default:
+
+| `.ralphus.toml [review]` key | Mirrors `[[review]]`'s... | Unset resolves to |
+| --- | --- | --- |
+| `default_resolver_model` | `model` | each backend's own default (`"qwen3:8b"` for ollama, `None` otherwise) |
+| `default_machine` | `machine` | the local machine |
+| `default_maximum_budget_usd` | `maximum_budget_usd` | unbounded |
+| `default_proof_scope` | `proof_scope` | `"each_branch"` |
+
+An explicitly declared `[[review]]` value always wins over its project
+default. `default_proof_scope` accepts the legacy `verify_scope` key name too
+(pre-dates the Verify→Proof rename, see the glossary). `id`/`name`/`upstream`/
+`action` have no project-default equivalent -- see
+`daemon/src/config.rs`'s `REVIEW_FIELD_PARITY` for why each is excluded.
+
 ```json
 { "agents": [
   { "id": "claude-code", "kind": "builtin", "backend": "claude-code" },
