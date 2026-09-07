@@ -108,6 +108,16 @@ impl DaemonClient {
         self.finish(path, req.send_string(&body.to_string()))
     }
 
+    fn patch(&self, path: &str, payload: Option<Value>) -> Result<Value, DaemonError> {
+        let req = self.authorize(
+            ureq::request("PATCH", &self.url(path))
+                .timeout(self.timeout)
+                .set("content-type", "application/json"),
+        );
+        let body = payload.unwrap_or_else(|| json!({}));
+        self.finish(path, req.send_string(&body.to_string()))
+    }
+
     fn finish(
         &self,
         path: &str,
@@ -387,6 +397,65 @@ impl DaemonClient {
         self.get(&format!("/api/projects/{name}"))
     }
 
+    /// `GET /api/project-forks` (RAL-338): every registered fork row.
+    pub fn list_all_project_forks(&self) -> Result<Value, DaemonError> {
+        self.get("/api/project-forks")
+    }
+
+    /// `GET /api/projects/{name}/forks` (RAL-338).
+    pub fn list_project_forks(&self, project: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/projects/{project}/forks"))
+    }
+
+    /// `POST /api/projects/{name}/forks` (RAL-338). `user` empty registers
+    /// the project-wide default row.
+    pub fn add_project_fork(
+        &self,
+        project: &str,
+        user: &str,
+        fork_url: &str,
+        remote_name: Option<&str>,
+        fork_owner: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({"user": user, "fork_url": fork_url});
+        set_if_some(&mut body, "remote_name", remote_name);
+        set_if_some(&mut body, "fork_owner", fork_owner);
+        self.post(&format!("/api/projects/{project}/forks"), Some(body))
+    }
+
+    /// `PATCH /api/projects/{name}/forks[/{user}]` (RAL-338). `user` empty
+    /// targets the project-wide default row.
+    pub fn set_project_fork(
+        &self,
+        project: &str,
+        user: &str,
+        fork_url: Option<&str>,
+        remote_name: Option<&str>,
+        fork_owner: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({});
+        set_if_some(&mut body, "fork_url", fork_url);
+        set_if_some(&mut body, "remote_name", remote_name);
+        set_if_some(&mut body, "fork_owner", fork_owner);
+        let path = if user.is_empty() {
+            format!("/api/projects/{project}/forks")
+        } else {
+            format!("/api/projects/{project}/forks/{user}")
+        };
+        self.patch(&path, Some(body))
+    }
+
+    /// `DELETE /api/projects/{name}/forks[/{user}]` (RAL-338). `user` empty
+    /// targets the project-wide default row.
+    pub fn remove_project_fork(&self, project: &str, user: &str) -> Result<Value, DaemonError> {
+        let path = if user.is_empty() {
+            format!("/api/projects/{project}/forks")
+        } else {
+            format!("/api/projects/{project}/forks/{user}")
+        };
+        self.delete(&path)
+    }
+
     /// Agent-profile health, evaluated inside the daemon process so
     /// `from_env`/`executable` resolution reflects the daemon's own
     /// environment/PATH rather than the CLI's -- see
@@ -394,6 +463,14 @@ impl DaemonClient {
     pub fn health_agent_profiles(&self, cwd: &Path) -> Result<Value, DaemonError> {
         let qs = query_string(&[("cwd", Some(cwd.to_string_lossy().into_owned()))]);
         self.get(&format!("/api/health/agent-profiles{qs}"))
+    }
+
+    /// Fork registration health, evaluated inside the daemon process so
+    /// remote/relationship checks reflect its own git/forge-token
+    /// environment -- see `ralphus_daemon::project_forks::check_fork_health`
+    /// (RAL-338).
+    pub fn health_project_forks(&self) -> Result<Value, DaemonError> {
+        self.get("/api/health/project-forks")
     }
 
     /// Agents selectable for `cwd` -- built-in backends plus configured
@@ -1339,9 +1416,26 @@ impl DaemonClient {
         guardian_id: &str,
         prs: &[Value],
     ) -> Result<Value, DaemonError> {
+        self.guardian_submit_prs_ex(guardian_id, prs, false)
+    }
+
+    /// Like [`Self::guardian_submit_prs`], but exposes RAL-338's
+    /// `--allow-unlinked-fork` override: downgrades a definite "no forge
+    /// relationship" fork pre-flight result from a hard error to a logged
+    /// warning. Ignored for a project with no registered fork.
+    pub fn guardian_submit_prs_ex(
+        &self,
+        guardian_id: &str,
+        prs: &[Value],
+        allow_unlinked_fork: bool,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({"prs": prs});
+        if allow_unlinked_fork {
+            body["allow_unlinked_fork"] = json!(true);
+        }
         self.post(
             &format!("/api/guardians/{guardian_id}/pull-requests"),
-            Some(json!({"prs": prs})),
+            Some(body),
         )
     }
 
