@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{ProofView, Result, Store, StoreError};
@@ -119,7 +119,7 @@ pub struct GuardianCheck {
 }
 
 /// This review's own declared build step (RAL-342), authored via
-/// `[review.auto_build]` and resolved once at submit time
+/// `[[review.auto_build]]` and resolved once at submit time
 /// (`reviews::derive_reviews`, converted from `ralphus_core::schema::AutoBuildDef`)
 /// into the JSON blob stored in the `guardians.auto_build_json` column. Either
 /// a static shell `command`, or an agent invocation described by the
@@ -746,7 +746,7 @@ pub struct GuardianView {
     /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
     /// `notice_kind: None`.
     pub notice_at_ms: Option<i64>,
-    /// This review's declared build step (RAL-342), from `[review.auto_build]`.
+    /// This review's declared build step (RAL-342), from `[[review.auto_build]]`.
     /// `None` means the review declared `skip_auto_build = true` instead --
     /// unlike [`Self::resolver_agent`]-style overrides, `None` here is never
     /// "inherit the project config default": every guardian created after
@@ -2028,7 +2028,7 @@ impl Store {
     }
 
     /// Set this review's declared build step (RAL-342), from
-    /// `[review.auto_build]`. Set once at review-derivation time
+    /// `[[review.auto_build]]`. Set once at review-derivation time
     /// (`reviews::derive_reviews`); blind-overwrite, not a read-then-merge
     /// like [`Self::set_guardian_build_env_overrides`], since the whole
     /// declaration is authored together in one TOML block. `None` records
@@ -4199,12 +4199,10 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert!(
-            !store
-                .resolve_guardian_branch_env(&id, &bid)
-                .unwrap()
-                .contains_key("SHARED")
-        );
+        assert!(!store
+            .resolve_guardian_branch_env(&id, &bid)
+            .unwrap()
+            .contains_key("SHARED"));
 
         store
             .set_guardian_branch_env_overrides(
@@ -4586,11 +4584,9 @@ mod tests {
         // the actual spam-proofing, not a UI-side disabled button.
         assert!(!store.claim_guardian_input_resolution(&id, "port").unwrap());
         // A DIFFERENT input on the same guardian is unaffected.
-        assert!(
-            store
-                .claim_guardian_input_resolution(&id, "branch")
-                .unwrap()
-        );
+        assert!(store
+            .claim_guardian_input_resolution(&id, "branch")
+            .unwrap());
 
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.input_resolutions["port"].status, "resolving");
@@ -4628,22 +4624,18 @@ mod tests {
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.claim_guardian_input_resolution(&id, "port").unwrap();
 
-        assert!(
-            !store
-                .recover_orphaned_input_resolutions()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!store
+            .recover_orphaned_input_resolutions()
+            .unwrap()
+            .is_empty());
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.input_resolutions["port"].status, "failed");
 
         // A second sweep finds nothing left to recover.
-        assert!(
-            store
-                .recover_orphaned_input_resolutions()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .recover_orphaned_input_resolutions()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -4770,11 +4762,9 @@ mod tests {
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.resolver_agent.as_deref(), Some("claude"));
         assert_eq!(g.resolver_model.as_deref(), Some("claude-opus-4-8"));
-        assert!(
-            store
-                .set_guardian_resolver("nope", Some("x"), None)
-                .is_err()
-        );
+        assert!(store
+            .set_guardian_resolver("nope", Some("x"), None)
+            .is_err());
     }
 
     #[test]
@@ -4788,11 +4778,9 @@ mod tests {
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.origin, GUARDIAN_ORIGIN_ARBITER);
-        assert!(
-            store
-                .set_guardian_origin("nope", GUARDIAN_ORIGIN_ARBITER)
-                .is_err()
-        );
+        assert!(store
+            .set_guardian_origin("nope", GUARDIAN_ORIGIN_ARBITER)
+            .is_err());
     }
 
     #[test]
@@ -4803,12 +4791,10 @@ mod tests {
             .add_guardian_message(&id, "reviewer", "hi", None, Some("branch-a"))
             .unwrap();
         store.delete_guardian(&id).unwrap();
-        assert!(
-            store
-                .guardian_branch_messages(&id, "branch-a")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .guardian_branch_messages(&id, "branch-a")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -4840,12 +4826,10 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].text, "feedback on b");
 
-        assert!(
-            store
-                .guardian_branch_messages(&id, "branch-c")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .guardian_branch_messages(&id, "branch-c")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -5139,16 +5123,12 @@ mod tests {
         assert_eq!(g.proof_scope, None);
         assert_eq!(g.effective_proof_scope, "each_branch");
 
-        assert!(
-            store
-                .set_guardian_proof_scope("nope", Some("nothing"))
-                .is_err()
-        );
-        assert!(
-            store
-                .set_guardian_proof_skip_auto_clean("nope", Some(true))
-                .is_err()
-        );
+        assert!(store
+            .set_guardian_proof_scope("nope", Some("nothing"))
+            .is_err());
+        assert!(store
+            .set_guardian_proof_skip_auto_clean("nope", Some(true))
+            .is_err());
     }
 
     #[test]
@@ -5175,11 +5155,9 @@ mod tests {
         assert_eq!(g.skip_base_updates, None);
         assert!(!g.effective_skip_base_updates);
 
-        assert!(
-            store
-                .set_guardian_skip_base_updates("nope", Some(true))
-                .is_err()
-        );
+        assert!(store
+            .set_guardian_skip_base_updates("nope", Some(true))
+            .is_err());
     }
 
     #[test]
@@ -5241,11 +5219,9 @@ mod tests {
         assert_eq!(g.auto_submit_pr_stack, None);
         assert!(!g.effective_auto_submit_pr_stack);
 
-        assert!(
-            store
-                .set_guardian_auto_submit_pr_stack("nope", Some(true))
-                .is_err()
-        );
+        assert!(store
+            .set_guardian_auto_submit_pr_stack("nope", Some(true))
+            .is_err());
     }
 
     #[test]
@@ -5265,11 +5241,9 @@ mod tests {
         assert_eq!(g.match_pr_branch_name, None);
         assert!(!g.effective_match_pr_branch_name);
 
-        assert!(
-            store
-                .set_guardian_match_pr_branch_name("nope", Some(true))
-                .is_err()
-        );
+        assert!(store
+            .set_guardian_match_pr_branch_name("nope", Some(true))
+            .is_err());
     }
 
     #[test]
@@ -5879,23 +5853,17 @@ mod tests {
             .set_guardian_base_branch_at(&id, "local-base", 2_000)
             .unwrap();
 
-        assert!(
-            !store
-                .set_guardian_base_branch_if_newer(&id, "older-forge", 1_999)
-                .unwrap()
-        );
-        assert!(
-            !store
-                .set_guardian_base_branch_if_newer(&id, "tied-forge", 2_000)
-                .unwrap()
-        );
+        assert!(!store
+            .set_guardian_base_branch_if_newer(&id, "older-forge", 1_999)
+            .unwrap());
+        assert!(!store
+            .set_guardian_base_branch_if_newer(&id, "tied-forge", 2_000)
+            .unwrap());
         assert_eq!(store.get_guardian(&id).unwrap().base_branch, "local-base");
 
-        assert!(
-            store
-                .set_guardian_base_branch_if_newer(&id, "newer-forge", 2_001)
-                .unwrap()
-        );
+        assert!(store
+            .set_guardian_base_branch_if_newer(&id, "newer-forge", 2_001)
+            .unwrap());
         assert_eq!(store.get_guardian(&id).unwrap().base_branch, "newer-forge");
         assert_eq!(store.guardian_base_changed_at_ms(&id).unwrap(), 2_001);
     }
