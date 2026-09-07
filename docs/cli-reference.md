@@ -569,7 +569,6 @@ use; see `READ_ONLY_NOTE`.
         - unwatch entity_uri [str] --user [name]  {Stop watching an entity (RAL-320).}
         - watch entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-watching updates the notification tiers in place (RAL-320).}
         - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-320).}
-        - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
         - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
