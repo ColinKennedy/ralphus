@@ -1109,6 +1109,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
             "--auto-compact-threshold [tokens]",
             "--command [cmd]",
             "--cwd [path]",
+            "--maximum-tool-output-tokens [tokens]",
             "--model [name]",
             "--prompt [text]",
             "--system-prompt [text]",
@@ -1285,8 +1286,8 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
         &["selector [str]"],
-        &["--model [name]"],
-        "Edit a proof step's model override.",
+        &["--maximum-tool-output-tokens [tokens]", "--model [name]"],
+        "Edit a proof step's model/tool-output-cap overrides.",
         false,
         false,
         &[],

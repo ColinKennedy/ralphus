@@ -994,6 +994,7 @@ impl DaemonClient {
         self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn edit_proof(
         &self,
         squad_id: &str,
@@ -1002,6 +1003,7 @@ impl DaemonClient {
         cell_idx: i64,
         proof_idx: i64,
         model: Option<&str>,
+        maximum_tool_output_tokens: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
             "kind": "proof",
@@ -1011,6 +1013,11 @@ impl DaemonClient {
             "proof_idx": proof_idx,
         });
         set_if_some(&mut body, "model", model.map(str::to_string));
+        set_if_some(
+            &mut body,
+            "maximum_tool_output_tokens",
+            maximum_tool_output_tokens.map(str::to_string),
+        );
         self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
     }
 
@@ -1026,6 +1033,7 @@ impl DaemonClient {
         prompt: Option<&str>,
         command: Option<&str>,
         auto_compact_threshold: Option<&str>,
+        maximum_tool_output_tokens: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"kind": "cell", "task_idx": task_idx, "cell_idx": cell_idx});
@@ -1038,6 +1046,11 @@ impl DaemonClient {
             &mut body,
             "auto_compact_threshold",
             auto_compact_threshold.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "maximum_tool_output_tokens",
+            maximum_tool_output_tokens.map(str::to_string),
         );
         set_if_some(
             &mut body,
