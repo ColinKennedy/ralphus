@@ -99,9 +99,17 @@ if "%db_path%"=="" (
 echo    librarian -^> http://127.0.0.1:%librarian_port%
 set "ps_arglist=serve','--port','%daemon_port%"
 if not "%db_path%"=="" set "ps_arglist=%ps_arglist%','--db','%db_path%"
-for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -WindowStyle Hidden).Id"') do set "daemon_pid=%%P"
+rem The daemon runs hidden, so its stderr (panic messages, pre-config log
+rem lines) would otherwise be discarded -- keep it in logs\ for post-mortems.
+if not exist "%root%\logs" mkdir "%root%\logs"
+for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -RedirectStandardError '%root%\logs\daemon-stderr.log' -PassThru -WindowStyle Hidden).Id"') do set "daemon_pid=%%P"
 
 "%root%\target\debug\ralphus-librarian.exe" serve --port %librarian_port%
 
+rem Reaching here means the librarian exited -- the daemon is killed next, so
+rem say so out loud: a silent teardown here has previously masqueraded as
+rem "the daemon crashes after ~2 minutes".
+echo == librarian exited (code %errorlevel%); stopping daemon pid %daemon_pid% ==
+echo    daemon stderr (if any): %root%\logs\daemon-stderr.log
 taskkill /f /pid %daemon_pid% >nul 2>&1
 endlocal

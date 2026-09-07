@@ -93,4 +93,9 @@ daemon_args=(serve --port "$daemon_port")
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 
-"$root/target/debug/ralphus-librarian${ext}" serve --port "$librarian_port"
+# Reaching past this line means the librarian exited -- the EXIT trap then
+# kills the daemon, so say so out loud: a silent teardown here has previously
+# masqueraded as "the daemon crashes after ~2 minutes".
+librarian_exit=0
+"$root/target/debug/ralphus-librarian${ext}" serve --port "$librarian_port" || librarian_exit=$?
+echo "== librarian exited (code ${librarian_exit}); stopping daemon (pid ${daemon_pid}) =="
