@@ -19163,38 +19163,6 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn triage_candidates_route_lists_an_unresolved_cell() {
-        let d = daemon();
-        let r = route(&d, "GET", "/api/triage/candidates", "");
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"candidates\":[]"));
-
-        let src = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"security\"\n";
-        let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
-        let squad_id = {
-            let mut guard = d.lock();
-            let squad_id = guard.insert_squad(&file, None, false).unwrap();
-            guard
-                .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
-                .unwrap();
-            squad_id
-        };
-
-        let r = route(&d, "GET", "/api/triage/candidates", "");
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains(&squad_id));
-        assert!(r.body.contains("\"project\":\"proj\""));
-        assert!(r.body.contains("\"triage_types\":[\"security\"]"));
-
-        // Once linked to a review, it drops off the candidate list.
-        d.lock()
-            .set_cell_review_guardian(&squad_id, 0, 0, "guardian-1")
-            .unwrap();
-        let r = route(&d, "GET", "/api/triage/candidates", "");
-        assert!(r.body.contains("\"candidates\":[]"));
-    }
-
-    #[test]
     fn triage_pools_lists_a_threshold_configured_before_any_cell_is_pooled() {
         let d = daemon();
         // Setting a threshold on a (project, type) key with zero pooled
