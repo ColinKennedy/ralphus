@@ -856,6 +856,23 @@ pub trait Runner: Send + Sync {
     fn run_cancellable(&self, spec: &RunnerSpec, _cancel: &CancelToken) -> RunnerResult {
         self.run(spec)
     }
+
+    /// RAL-377: verify this runner's backing executable is present and would
+    /// actually be spawnable, without spawning anything. The scheduler calls
+    /// this once per cell dispatch, before the cell is left sitting in
+    /// `NodeState::Running` with no further signal — a cell whose runner
+    /// program doesn't exist previously either failed fast (if the spawn
+    /// itself errored) or rode the tmux reattach/stall-detection logic for up
+    /// to several minutes before failing, since every spec runs tmux-wrapped
+    /// (RAL-151) and a bad program name just shows up as a shell error inside
+    /// the pane rather than a spawn failure — see
+    /// `missing_program_fails_gracefully` below. The default is a no-op
+    /// `Ok(())`, so in-process fakes used across the test suite (which have
+    /// no real subprocess to check) need no changes; only [`SubprocessRunner`]
+    /// overrides it.
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Runs a cell by spawning the configured runner program and speaking JSON
@@ -874,6 +891,40 @@ pub struct SubprocessRunner {
     /// mid-task detach (RAL-288 Stage 6) via the same registry, without
     /// touching the rest of that cell's squad.
     detachments: Option<crate::cancel::Detachments>,
+}
+
+/// RAL-377: whether `program` — the already-resolved first token of a
+/// `RALPHUS_RUNNER_CMD` command line (see [`SubprocessRunner::new`]'s
+/// `split_whitespace` parsing, which this deliberately does not re-derive) —
+/// exists on disk and would be spawnable. A literal path (absolute, or
+/// containing a directory component like `./ralphus-runner`) is checked
+/// directly, matching what a shell does; a bare name falls back to a PATH
+/// search via [`crate::tmux::find_on_path`], which also tries the Windows
+/// `.exe`/`.cmd`/`.bat` suffixes.
+pub(crate) fn runner_program_exists(program: &str) -> bool {
+    std::path::Path::new(program).is_file() || crate::tmux::find_on_path(program).is_some()
+}
+
+/// RAL-377: once-per-daemon-startup check that `runner`'s backing executable
+/// actually exists, logged as a warning only — never fatal, and never blocks
+/// `server::serve` from finishing startup. Unlike the per-cell gate
+/// (`Runner::preflight` called from `scheduler::run_cell_worker`, which fails
+/// a cell outright), a daemon instance may sit idle for its whole lifetime
+/// without ever dispatching a cell, so there is nothing to abort here — this
+/// exists purely so an operator sees the misconfiguration in the log/
+/// Cartographer immediately at startup instead of only much later, the first
+/// time a cell actually needs the runner.
+pub(crate) fn warn_if_runner_unavailable(runner: &dyn Runner, store: &Arc<Mutex<Store>>) {
+    if let Err(message) = runner.preflight() {
+        let guard = store.lock().expect("store mutex poisoned");
+        crate::cartographer::Note::new("daemon")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &guard,
+                format!("runner preflight failed at startup: {message}"),
+                serde_json::json!({"error": message}),
+            );
+    }
 }
 
 impl SubprocessRunner {
@@ -1028,6 +1079,18 @@ impl Runner for SubprocessRunner {
     /// view available for it.
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
         self.run_via_tmux(spec, cancel)
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        if runner_program_exists(&self.program) {
+            Ok(())
+        } else {
+            Err(format!(
+                "runner executable not found: {:?} (resolved from RALPHUS_RUNNER_CMD; \
+                 checked as a literal path and searched PATH)",
+                self.program
+            ))
+        }
     }
 }
 
@@ -3112,6 +3175,47 @@ prompt = "make it build"
         let r = SubprocessRunner::new("python -m ralphus.runner");
         assert_eq!(r.program, "python");
         assert_eq!(r.args, vec!["-m", "ralphus.runner"]);
+    }
+
+    /// RAL-377: the actual bug — a missing runner executable must be
+    /// detectable *before* a cell is dispatched, not discovered only after a
+    /// stall. `preflight` is what the scheduler now calls for exactly that,
+    /// and it must reject the same unresolvable program
+    /// `missing_program_fails_gracefully` below exercises end-to-end via a
+    /// real (slow, tmux-wrapped) timeout.
+    #[test]
+    fn preflight_rejects_an_unresolvable_program() {
+        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz");
+        let err = runner.preflight().expect_err("program does not exist");
+        assert!(
+            err.contains("definitely-not-a-real-program-xyz"),
+            "error should name the missing program, got: {err}"
+        );
+    }
+
+    /// A program resolvable on `PATH` (every CI/dev machine running this
+    /// suite has `python` per `tmux_and_python_available` above) passes.
+    #[test]
+    fn preflight_accepts_a_program_on_path() {
+        if std::process::Command::new("python")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            assert!(SubprocessRunner::new("python").preflight().is_ok());
+        } else {
+            println!("SKIP: python not found on PATH");
+        }
+    }
+
+    /// A literal, non-PATH path (containing a directory component) is
+    /// checked directly rather than searched on `PATH` -- mirrors what a
+    /// shell does with `./foo` or an absolute path.
+    #[test]
+    fn preflight_accepts_a_literal_path_to_an_existing_file() {
+        let this_exe = std::env::current_exe().expect("current test binary path");
+        let runner = SubprocessRunner::new(&this_exe.to_string_lossy());
+        assert!(runner.preflight().is_ok());
     }
 
     #[test]

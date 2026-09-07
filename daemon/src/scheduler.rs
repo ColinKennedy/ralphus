@@ -1631,6 +1631,58 @@ fn cell_dispatch_priority(
     }
 }
 
+/// Fail a cell that was already written as [`NodeState::Running`]
+/// (`run_cell_worker`'s dispatch-time write, well before the runner is ever
+/// invoked) but hit a fallible step *before* reaching the runner — the
+/// runner-executable preflight check and a failed [`resolve_agent_selection`]
+/// lookup are the two cases today (RAL-377). Gives both the same
+/// rlog!/Cartographer/mailbox shape the ordinary post-execution failure path
+/// at the tail of `run_cell_worker` already gets, which these early-return
+/// branches previously lacked — a cell failing here left no stderr line, no
+/// Cartographer row, and no mailbox notice, only a bare `error` column.
+fn fail_cell_early(
+    store: &Arc<Mutex<Store>>,
+    progress: &Mutex<Progress>,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    i: usize,
+    cartographer_message: &'static str,
+    error: String,
+) {
+    crate::rlog!(
+        ERROR,
+        "ralphus [scheduler] cell {squad_id}/{} failed before dispatch: {error}",
+        row.cell_id,
+    );
+    let outcome = CellOutcome {
+        state: NodeState::Failed,
+        usage: crate::store::RecordedUsage::default(),
+        error: Some(error.clone()),
+        agent_session_id: None,
+    };
+    {
+        let guard = store.lock().expect("store mutex poisoned");
+        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::ERROR,
+            source: "scheduler",
+            message: cartographer_message,
+            scope: Some("cell"),
+            squad_id: Some(squad_id),
+            guardian_id: None,
+            cell_id: Some(&row.cell_id),
+            task: Some(&row.task_name),
+            log_path: None,
+            payload: serde_json::json!({"error": error}),
+            admin_only: false,
+        });
+        enqueue_cell_failure_mailbox(&guard, squad_id, &row.cell_id, &row.task_name, Some(&error));
+    }
+    let mut prog = progress.lock().expect("progress mutex poisoned");
+    prog.status[i] = CellState::Failed;
+    prog.failed.insert(row.task_idx);
+}
+
 /// Run one cell — and, on success, its cell-level proofs — while
 /// holding a permit from the shared semaphore, then publish the result into the
 /// shared `progress` (status + failure flag). Dependency-waiting is the
@@ -1712,6 +1764,27 @@ fn run_cell_worker(
         let _ = guard.clear_cell_detached(squad_id, row.task_idx, row.idx);
     }
 
+    // RAL-377: verify the runner's backing executable actually exists before
+    // this cell is allowed to sit in `Running` with no further signal — a
+    // missing `RALPHUS_RUNNER_CMD` program previously either failed fast (if
+    // the spawn itself errored) or rode the tmux reattach/stall-detection
+    // logic for several minutes, since every spec runs tmux-wrapped and a bad
+    // program name just shows up as a shell error inside the pane. Checked
+    // fresh on every dispatch (not just once at daemon startup) since it's a
+    // cheap PATH/stat lookup and the executable could vanish mid-session.
+    if let Err(message) = runner.preflight() {
+        fail_cell_early(
+            store,
+            progress,
+            squad_id,
+            row,
+            i,
+            "cell failed: runner preflight",
+            message,
+        );
+        return;
+    }
+
     // Resolve handoff placeholders against completed upstream summaries.
     let summaries = progress
         .lock()
@@ -1746,19 +1819,15 @@ fn run_cell_worker(
     let selection = match resolve_agent_selection(&row.agent, row.cwd.as_deref().unwrap_or(".")) {
         Ok(selection) => selection,
         Err(message) => {
-            let outcome = crate::store::CellOutcome {
-                state: crate::store::NodeState::Failed,
-                usage: crate::store::RecordedUsage::default(),
-                error: Some(message.clone()),
-                agent_session_id: None,
-            };
-            {
-                let guard = store.lock().expect("store mutex poisoned");
-                let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
-            }
-            let mut prog = progress.lock().expect("progress mutex poisoned");
-            prog.status[i] = CellState::Failed;
-            prog.failed.insert(row.task_idx);
+            fail_cell_early(
+                store,
+                progress,
+                squad_id,
+                row,
+                i,
+                "cell failed: agent selection",
+                message,
+            );
             return;
         }
     };
@@ -3543,6 +3612,23 @@ mod tests {
         }
     }
 
+    /// RAL-377: a `Runner` whose `preflight` always fails, and whose `run`
+    /// panics if ever reached — proves the scheduler's preflight check
+    /// actually gates dispatch rather than merely being available to call.
+    struct PreflightFailRunner {
+        message: &'static str,
+    }
+
+    impl Runner for PreflightFailRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            panic!("run() must never be reached when preflight() fails");
+        }
+
+        fn preflight(&self) -> Result<(), String> {
+            Err(self.message.to_string())
+        }
+    }
+
     /// RAL-288 Stage 6: records whatever `resume_agent_session_id` (and, for
     /// the resume-automation preamble regression below, `prompt`) it was
     /// dispatched with, so a test can assert the scheduler actually resolved
@@ -4128,6 +4214,41 @@ mod tests {
         let guard = store.lock().unwrap();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         assert_eq!(guard.get_squad(&id).unwrap().tasks[0].state, "failed");
+    }
+
+    /// RAL-377: a cell whose runner executable doesn't exist must fail
+    /// immediately into `Failed` with a clear error, never sit in `Running`
+    /// waiting for a stall timer — the whole point of the ticket. `run()`
+    /// panicking (see [`PreflightFailRunner`]) proves the cell was never
+    /// actually dispatched, only failed by the preflight gate.
+    #[test]
+    fn missing_runner_executable_fails_the_cell_immediately_instead_of_stalling() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner: Arc<dyn Runner> = Arc::new(PreflightFailRunner {
+            message: "runner executable not found: \"definitely-not-a-real-program-xyz\"",
+        });
+        execute_squad(&store, runner.as_ref(), &id);
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].state, "failed");
+        assert_eq!(squad.tasks[0].cells[0].state, "failed");
+        let error = squad.tasks[0].cells[0]
+            .error
+            .as_deref()
+            .expect("failed cell should carry an error");
+        assert!(
+            error.contains("definitely-not-a-real-program-xyz"),
+            "error should name the missing executable, got: {error}"
+        );
+
+        let client_id = guard.register_mailbox_client().unwrap();
+        let messages = guard
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1, "expected exactly one mailbox message");
+        assert_eq!(messages[0].priority, "urgent");
     }
 
     // RAL-157: soloing task 0 ("a") must keep task 1 ("b")'s cell Pending

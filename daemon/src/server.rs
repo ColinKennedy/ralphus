@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cancel::Cancellations;
 use crate::procreg::ProcRegistry;
-use crate::runner::{Runner, SubprocessRunner};
+use crate::runner::{Runner, SubprocessRunner, warn_if_runner_unavailable};
 use crate::scheduler::Semaphore;
 use crate::store::{NodeState, SquadState, Store, StoreError};
 use crate::summary_worker::SummaryQueue;
@@ -10846,6 +10846,10 @@ pub fn serve<A: ToSocketAddrs>(
             .with_cartographer(daemon.store_handle())
             .with_detachments(daemon.detachments_handle()),
     );
+    // RAL-377: once-per-startup check that the resolved runner executable
+    // actually exists. Warn-only, never fatal -- see
+    // `warn_if_runner_unavailable`'s own doc comment.
+    warn_if_runner_unavailable(local_runner.as_ref(), &daemon.store_handle());
     // RAL-185: the scheduler holds a router rather than the local runner
     // directly, so a cell carrying a `machine` is dispatched to its provider
     // while every local cell takes exactly the path it always did.

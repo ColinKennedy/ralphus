@@ -507,8 +507,11 @@ fn env_override_flags(env: &BTreeMap<String, String>) -> Vec<String> {
 }
 
 /// Search `PATH` by hand (no extra dependency) for an executable named
-/// `program`, trying common Windows executable suffixes there.
-fn find_on_path(program: &str) -> Option<PathBuf> {
+/// `program`, trying common Windows executable suffixes there. `pub(crate)`
+/// so [`crate::runner::runner_program_exists`] (RAL-377) can reuse the same
+/// PATH/suffix resolution for the runner-executable preflight check, rather
+/// than re-deriving it.
+pub(crate) fn find_on_path(program: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let suffixes: &[&str] = if cfg!(target_os = "windows") {
         &["", ".exe", ".cmd", ".bat"]
