@@ -7,12 +7,54 @@
 //! and the page degrades gracefully.
 
 use std::io::{Cursor, Read, Write};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
 
 /// The board page (plain HTML + inline JS, so it restarts in seconds).
 const INDEX_HTML: &str = include_str!("../assets/board.html");
+
+/// The one connection-pooling HTTP client every proxied call reuses.
+///
+/// "Client" here is a `ureq::Agent` — ureq's name for an HTTP client that owns
+/// a pool of keep-alive TCP connections. It is **not** a ralphus agent (the
+/// AI backend that runs a cell); nothing about a cell, prompt, or model touches
+/// this path. The only thing shared across calls is the underlying TCP socket;
+/// every request built from it (`client.get(url)` etc.) is fully independent —
+/// its own URL, headers, body, and response, with no per-request state carried
+/// over.
+///
+/// The board polls a dozen `/api/*` endpoints every couple of seconds, per
+/// open tab. Using ureq's free `get`/`post`/`delete` functions (as this proxy
+/// originally did) builds a throwaway client per call, so each poll opens a
+/// fresh TCP connection to the daemon and drops it the instant the response is
+/// read — and on Windows every one of those closed sockets sits in `TIME_WAIT`
+/// for ~120s, holding an ephemeral port. Under a busy board (many tabs, fast
+/// polling) plus the daemon's own outbound `gh`/`git` churn, the ~16k-port
+/// dynamic range drains, socket operations start failing (`WSAENOBUFS`/
+/// `WSAEADDRINUSE`), and tiny_http's accept thread — which treats any
+/// `accept()` error as fatal — silently stops the whole server. A single
+/// pooled client keeps a small set of keep-alive connections to the daemon and
+/// reuses them, so steady-state board traffic no longer churns sockets at all.
+fn daemon_client() -> &'static ureq::Agent {
+    static CLIENT: OnceLock<ureq::Agent> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            // Default is 1 idle connection per host, which would still force a
+            // fresh connection whenever two board polls overlap; keep enough
+            // warm for the board's concurrent endpoint fan-out.
+            .max_idle_connections(64)
+            .max_idle_connections_per_host(64)
+            // Bound each hop so one stuck daemon call can't pin a pooled
+            // connection (and its thread) open forever.
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(60))
+            .timeout_write(Duration::from_secs(60))
+            .build()
+    })
+}
 
 /// A librarian response: status, content type, and body.
 pub struct Reply {
@@ -156,11 +198,12 @@ fn proxy(
             None => req,
         }
     };
+    let client = daemon_client();
     let result = match method {
-        "GET" => with_trace(ureq::get(&url)).call(),
-        "DELETE" => with_trace(ureq::delete(&url)).call(),
+        "GET" => with_trace(client.get(&url)).call(),
+        "DELETE" => with_trace(client.delete(&url)).call(),
         "POST" => {
-            with_trace(ureq::post(&url).set("Content-Type", "application/json")).send_string(body)
+            with_trace(client.post(&url).set("Content-Type", "application/json")).send_string(body)
         }
         other => {
             return Reply::json(
