@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use opentelemetry::Context;
 
-use ralphus_core::schema::{review_link_key, ReviewActionDef, ReviewDef, TaskFile};
+use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key};
 
 use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
@@ -1420,6 +1420,7 @@ pub fn repair_triage_pool_keys(store: &Store) {
     let cells = match store.all_pooled_cells() {
         Ok(c) => c,
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: transient startup recovery diagnostic; the repair loop emits its structured outcome per migrated cell
             crate::rlog!(
                 ERROR,
                 "ralphus [triage] pool-key repair: failed to list pooled cells: {e}"
@@ -1428,20 +1429,24 @@ pub fn repair_triage_pool_keys(store: &Store) {
         }
     };
     for (old_project, triage_type, cell) in cells {
-        let effective =
-            match store.effective_state_for_cell(&cell.squad_id, cell.task_idx, cell.idx) {
-                Ok(s) => s.unwrap_or_default(),
-                Err(e) => {
-                    crate::rlog!(
+        let effective = match store.effective_state_for_cell(
+            &cell.squad_id,
+            cell.task_idx,
+            cell.idx,
+        ) {
+            Ok(s) => s.unwrap_or_default(),
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: transient per-cell read diagnostic; migrated cells each log their own structured outcome
+                crate::rlog!(
                     ERROR,
                     "ralphus [triage] pool-key repair: failed to read cell state for {}/{}/{}: {e}",
                     cell.squad_id,
                     cell.task_idx,
                     cell.idx
                 );
-                    continue;
-                }
-            };
+                continue;
+            }
+        };
         if effective == "failed" {
             if let Err(e) = store.remove_triage_pool_cell(
                 &old_project,
@@ -1586,11 +1591,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        any_workspace_ahead_of_upstream, apply_auto_build, apply_project_review_defaults,
-        apply_resolver, create_review_from_triage_pool, derive_triage_pools, rebase_onto,
-        repair_triage_pool_keys, require_auto_build_declaration,
+        Membership, any_workspace_ahead_of_upstream, apply_auto_build,
+        apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
+        derive_triage_pools, rebase_onto, repair_triage_pool_keys, require_auto_build_declaration,
         workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
-        Membership,
     };
     use crate::store::Store;
     use crate::workspace::Workspace;
@@ -1944,8 +1948,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_resolver_leaves_auto_submit_pr_stack_at_its_creation_stamp_when_no_member_declares_one(
-    ) {
+    fn apply_resolver_leaves_auto_submit_pr_stack_at_its_creation_stamp_when_no_member_declares_one()
+     {
         let store = Store::open_in_memory().unwrap();
         let gid = store.create_guardian("r", "main", "/repo").unwrap();
         // `create_guardian` already stamps a concrete `Some(false)` at creation
@@ -2369,9 +2373,11 @@ print(json.dumps(result))
         // Firing an already-drained pool is a no-op, not an error (the race
         // the scheduler tick and a concurrent submission's own threshold
         // check must both tolerate).
-        assert!(create_review_from_triage_pool(&store, "proj", "security")
-            .unwrap()
-            .is_none());
+        assert!(
+            create_review_from_triage_pool(&store, "proj", "security")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2513,10 +2519,12 @@ print(json.dumps(result))
         repair_triage_pool_keys(&store);
 
         assert_eq!(store.triage_pool_count(&stale_key, "bug").unwrap(), 0);
-        assert!(store
-            .get_triage_pool_threshold(&stale_key, "bug")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_triage_pool_threshold(&stale_key, "bug")
+                .unwrap()
+                .is_none()
+        );
         // Its single cell, now correctly counted under "proj", already met
         // its carried-forward threshold of 1 -- the repair fires a real
         // review immediately rather than waiting for a future submission.
@@ -2587,14 +2595,18 @@ print(json.dumps(result))
             store.get_triage_pool_threshold("proj", "bug").unwrap(),
             Some(3)
         );
-        assert!(store
-            .get_triage_pool_threshold(&key_a, "bug")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_triage_pool_threshold(&key_b, "bug")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_triage_pool_threshold(&key_a, "bug")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_triage_pool_threshold(&key_b, "bug")
+                .unwrap()
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2770,9 +2782,11 @@ print(json.dumps(result))
         let store = Store::open_in_memory().unwrap();
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
         let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
-        assert!(derive_triage_pools(&store, "squad-1", &file)
-            .unwrap()
-            .is_empty());
+        assert!(
+            derive_triage_pools(&store, "squad-1", &file)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── RAL-159 parity for Triage pooling ───────────────────────────────────

@@ -549,7 +549,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
     - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
-        - edit selector [str] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
+        - edit selector [str] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
         - (read-only-safe) env selector [str] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
         - open-agent selector [str]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - remote-terminal selector [str]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
@@ -579,21 +579,21 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
-    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal watches and notification preferences layered over the same mailbox (RAL-320).}
+    - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal follows and notification preferences layered over the same mailbox (RAL-320).}
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
-        - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their watches (RAL-320).}
+        - follow entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Follow an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-following updates the notification tiers in place (RAL-320).}
+        - (read-only-safe) follows --user [name]  {List the acting user's follows (RAL-320).}
+        - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their follows (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
-        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-watch and default notify tiers (RAL-320).}
-        - set-preferences --auto-watch --no-auto-watch --tier [urgent|high|normal...] --user [name]  {Set a user's auto-watch and default notification-tier preferences; requires exactly one of --auto-watch/--no-auto-watch (RAL-320).}
-        - unwatch entity_uri [str] --user [name]  {Stop watching an entity (RAL-320).}
-        - watch entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-watching updates the notification tiers in place (RAL-320).}
-        - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-320).}
+        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-follow and default notify tiers (RAL-320).}
+        - set-preferences --auto-follow --no-auto-follow --tier [urgent|high|normal...] --user [name]  {Set a user's auto-follow and default notification-tier preferences; requires exactly one of --auto-follow/--no-auto-follow (RAL-320).}
+        - unfollow entity_uri [str] --user [name]  {Stop following an entity (RAL-320).}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
         - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
     - proof  {Inspect and act on proof steps.}
-        - edit selector [str] --model [name]  {Edit a proof step's model override.}
+        - edit selector [str] --maximum-tool-output-tokens [tokens] --model [name]  {Edit a proof step's model/tool-output-cap overrides.}
         - (read-only-safe) env selector [str]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - restart selector [str]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [str] state [str]  {Manually override a proof step's status.}
@@ -681,6 +681,9 @@ use; see `READ_ONLY_NOTE`.
         - set-status selector [str] state [str]  {Manually override a task's status.}
         - (read-only-safe) show selector [str]  {Show a single task node's detail.}
     - triage  {Register and inspect Triage types -- the Arbiter subsystem's automatic-review classification categories (RAL-318).}
+        - pool  {Inspect and configure Triage auto-review pools (RAL-318).}
+            - (read-only-safe) list  {List every Triage pool key with pooled cells and/or a configured count threshold, plus its resolved project name (RAL-318).}
+            - threshold project [str] triage_type [str] --clear --threshold [integer]  {Set (or --clear) the count threshold for a (project, triage_type) pool -- once it holds this many cells, it drains into a fresh review (RAL-318).}
         - type  {Register and inspect Triage types (RAL-318).}
             - deregister name [str]  {Remove a Triage type. The built-in "unclassified" type can never be deregistered.}
             - (read-only-safe) get name [str]  {Show one registered Triage type by exact name.}
