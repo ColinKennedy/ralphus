@@ -236,10 +236,10 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn resolve_fork(&self, project: &str, user: &str) -> StoreResult<Option<ForkRecord>> {
-        if !user.is_empty()
-            && let Some(row) = self.get_project_fork(project, user)?
-        {
-            return Ok(Some(row));
+        if !user.is_empty() {
+            if let Some(row) = self.get_project_fork(project, user)? {
+                return Ok(Some(row));
+            }
         }
         self.get_project_fork(project, "")
     }

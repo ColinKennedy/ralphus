@@ -3693,10 +3693,10 @@ fn submit_stack_for_guardian(
                         .iter()
                         .find(|p| p.branch_id.as_deref() == Some(branch.id.as_str()))
                 })?;
-            if let Some(routing) = fork_routing
-                && pr_view.repo != routing.fork_client.repo_label()
-            {
-                return None;
+            if let Some(routing) = fork_routing {
+                if pr_view.repo != routing.fork_client.repo_label() {
+                    return None;
+                }
             }
             let number = pr_view.pr_number?;
             Some((branch.id.clone(), branch.position, number))
