@@ -1273,10 +1273,6 @@ pub(crate) fn create_review_from_triage_pool(
         .set_guardian_origin(&gid, crate::guardian::GUARDIAN_ORIGIN_ARBITER)
         .map_err(|e| ReviewError::new(e.to_string()))?;
     apply_project_review_defaults(store, &gid, project)?;
-    let triage_by_cell = drained
-        .first()
-        .and_then(|c| store.triage_types_by_cell(&c.squad_id).ok())
-        .unwrap_or_default();
     let mut seen: HashSet<String> = HashSet::new();
     for cell in &drained {
         if seen.insert(cell.branch.clone()) {
@@ -1284,7 +1280,6 @@ pub(crate) fn create_review_from_triage_pool(
                 .add_guardian_branch_with_project(&gid, &cell.branch, None)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
         }
-        let _triage_types = triage_by_cell.get(&(cell.task_idx, cell.idx)).cloned().unwrap_or_default();
         store
             .set_cell_review_guardian(&cell.squad_id, cell.task_idx, cell.idx, &gid)
             .map_err(|e| ReviewError::new(e.to_string()))?;
