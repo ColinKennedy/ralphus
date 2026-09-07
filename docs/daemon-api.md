@@ -64,7 +64,7 @@ where one exists.
 | POST | `/api/squads/{id}/cancel/preview` | [Dry-run preview](#post-apisquadsidcancelpreview) of a cascading cancel's impact |
 | POST | `/api/squads/{id}/cancel` | [Cancel the squad](#post-apisquadsidcancel), cascading to downstream dependents |
 | POST | `/api/squads/{id}/set-status` | Manually override a squad/task/cell/proof's state — for a task/cell/proof, any target state but `pending` first captures its running agent's tmux pane into that cell's ghost and kills it (RAL-163) |
-| POST | `/api/squads/{id}/edit` | Edit a squad/task/cell's fields; a squad/task edit resets the whole squad to Pending, a cell edit resets only that cell + its downstream |
+| POST | `/api/squads/{id}/edit` | Edit a squad/task/cell/proof's fields; a squad/task edit resets the whole squad to Pending, a cell edit resets only that cell + its downstream, a proof edit only that step + later steps in its scope |
 | POST | `/api/squads/{id}/retry` | Re-run with existing parameters (reset to Pending) |
 | POST | `/api/squads/{id}/restart/preview` | [Dry-run preview](#post-apisquadsidrestartpreview) of a whole-squad restart's downstream impact |
 | POST | `/api/squads/{id}/restart` | [Restart the whole squad](#post-apisquadsidrestart), cascading dirtiness |
@@ -915,6 +915,57 @@ true, on-disk review worktrees for deleted guardians are purged. Response `200`:
 ```json
 { "squads_deleted": 3, "guardians_deleted": 1, "worktrees_purged": 1 }
 ```
+
+### `POST /api/squads/{id}/edit`
+Edit one node's definition fields. `kind` selects what is addressed and which
+other keys are read:
+
+| `kind` | Also required | Editable keys |
+|---|---|---|
+| `squad` | — | `label` |
+| `task` | `task_idx` | `name`, `project`, `model` |
+| `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `system_prompt` |
+| `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `model`, `maximum_tool_output_tokens` |
+
+Every editable key is optional and uses the same three-state convention: the
+key **absent** leaves the field untouched, present-but-empty (`""`) **clears**
+it back to NULL, and present-and-non-empty **sets** it. There is no way to
+distinguish "set to empty string" from "clear" — clearing is the meaning.
+
+`prompt` and `command` stay mutually exclusive: whichever of the two the
+caller supplies wins and clears the other; supplying neither leaves both
+as they were.
+
+`auto_compact_threshold` and `maximum_tool_output_tokens` are integers and must
+be **positive** — `0` and negatives are rejected with `400`, mirroring
+`core::validate`'s `check_positive_number` at submit time so an edit cannot
+store a value a task file would have been rejected for. A non-numeric value is
+likewise a `400`.
+
+`maximum_tool_output_tokens` is additionally rejected with `400` when the agent
+that would run the node has no delivery mechanism for it (RAL-333) — accepted
+only for `claude-code`/`claude-cli`, `codex`/`codex-cli` and `pi`. A cell is
+gated on its effective agent (the `agent` in this same request if given, else
+the stored one); a proof step is gated on its stored `agent`, which a task file
+cannot set directly -- `[[task.cell.proof]]` has no `agent` key, so the column
+is populated from the owning cell/task at submit time, and a later
+`kind: "cell"` edit of `agent` does not rewrite it. A custom
+`[agent.profiles.*]` name is deferred rather than rejected, the same way `core`
+defers it. Clearing the field needs no such check.
+
+Editing resets execution state, scoped as narrowly as the edited node allows:
+a `squad` label edit touches nothing, a `task` edit resets the whole squad to
+Pending, a `cell` edit resets only that cell and its downstream, and a `proof`
+edit resets only that step and later steps in its scope. Any in-flight worker
+the reset covers is cancelled and waited out first.
+
+Request:
+```json
+{ "kind": "cell", "task_idx": 1, "cell_idx": 0, "maximum_tool_output_tokens": "25000" }
+```
+Response `200` is the full squad view, the same shape
+[`GET /api/squads/{id}`](#get-apisquadsid) returns, reflecting the edit and any
+state reset it caused.
 
 ### `POST /api/squads/{id}/restart/preview`
 Dry-run preview of [`POST /api/squads/{id}/restart`](#post-apisquadsidrestart)

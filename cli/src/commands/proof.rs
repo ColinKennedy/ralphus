@@ -25,6 +25,7 @@ pub enum ProofCommand {
     Edit {
         selector: String,
         model: Option<String>,
+        maximum_tool_output_tokens: Option<String>,
     },
     /// RAL-324: read-only listing of this proof step's resolved environment.
     Env {
@@ -53,7 +54,15 @@ pub fn parse(args: &[String]) -> ProofCommand {
         Some("restart") => with_selector(scanner, |selector| ProofCommand::Restart { selector }),
         Some("edit") => {
             let model = scanner.take_value("--model").ok().flatten();
-            with_selector(scanner, |selector| ProofCommand::Edit { selector, model })
+            let maximum_tool_output_tokens = scanner
+                .take_value("--maximum-tool-output-tokens")
+                .ok()
+                .flatten();
+            with_selector(scanner, |selector| ProofCommand::Edit {
+                selector,
+                model,
+                maximum_tool_output_tokens,
+            })
         }
         Some(other) => ProofCommand::UsageError(format!("unknown proof subcommand: {other}")),
     }
@@ -168,7 +177,11 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, render_dirtied);
             Ok(())
         }),
-        ProofCommand::Edit { selector, model } => run_and_report(opts, None, || {
+        ProofCommand::Edit {
+            selector,
+            model,
+            maximum_tool_output_tokens,
+        } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "proof")?;
             let result = client.edit_proof(
                 &resolved.squad_id,
@@ -177,6 +190,7 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
                 resolved.cell_idx,
                 resolved.proof_idx,
                 model.as_deref(),
+                maximum_tool_output_tokens.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
             Ok(())
@@ -258,9 +272,35 @@ mod tests {
     #[test]
     fn parses_edit_with_model_flag() {
         match parse(&v(&["edit", "squad-1/build/proof/0", "--model", "gpt-5"])) {
-            ProofCommand::Edit { selector, model } => {
+            ProofCommand::Edit {
+                selector,
+                model,
+                maximum_tool_output_tokens,
+            } => {
                 assert_eq!(selector, "squad-1/build/proof/0");
                 assert_eq!(model.as_deref(), Some("gpt-5"));
+                assert_eq!(maximum_tool_output_tokens, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_maximum_tool_output_tokens() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/proof/0",
+            "--maximum-tool-output-tokens",
+            "8000",
+        ])) {
+            ProofCommand::Edit {
+                selector,
+                model,
+                maximum_tool_output_tokens,
+            } => {
+                assert_eq!(selector, "squad-1/build/proof/0");
+                assert_eq!(model, None);
+                assert_eq!(maximum_tool_output_tokens.as_deref(), Some("8000"));
             }
             other => panic!("unexpected: {other:?}"),
         }

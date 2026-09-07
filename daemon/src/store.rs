@@ -4211,6 +4211,12 @@ pub struct CellEdit<'a> {
     pub command: Option<Option<&'a str>>,
     /// Per-cell auto-compact trigger, in tokens (RAL-304).
     pub auto_compact_threshold: Option<Option<i64>>,
+    /// Per-cell cap on a single tool-call output, in tokens (RAL-333). The
+    /// caller (`edit_squad`'s `"cell"` arm) rejects this up front when the
+    /// cell's effective agent has no delivery mechanism for it -- see
+    /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens` --
+    /// before it ever reaches the store.
+    pub maximum_tool_output_tokens: Option<Option<i64>>,
     /// Appended system prompt (RAL-341). The caller (`edit_squad`'s `"cell"`
     /// arm) is responsible for rejecting this up front when the cell's
     /// effective agent doesn't support it -- see
@@ -4243,6 +4249,10 @@ pub struct TaskEdit<'a> {
 pub struct ProofEdit<'a> {
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<Option<&'a str>>,
+    /// Per-step cap on a single tool-call output, in tokens (RAL-333).
+    /// Gated on the step's own `agent` by the caller, the same way
+    /// [`CellEdit::maximum_tool_output_tokens`] is gated on the cell's.
+    pub maximum_tool_output_tokens: Option<Option<i64>>,
 }
 
 /// A task's identity and dependencies, for scheduling.
@@ -4769,13 +4779,18 @@ impl Store {
     ) -> Result<()> {
         let model_touched = edit.model.is_some();
         let model_value = edit.model.flatten();
+        let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
+        let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
         let n = self.conn.execute(
             "UPDATE proofs SET
-                model = CASE WHEN :model_touched THEN :model ELSE model END
+                model = CASE WHEN :model_touched THEN :model ELSE model END,
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND scope=:scope AND cell_idx=:cell_idx AND idx=:idx",
             named_params! {
                 ":model_touched": model_touched,
                 ":model": model_value,
+                ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
+                ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":scope": scope,
@@ -4838,6 +4853,8 @@ impl Store {
         let command_value = edit.command.flatten();
         let auto_compact_threshold_touched = edit.auto_compact_threshold.is_some();
         let auto_compact_threshold_value = edit.auto_compact_threshold.flatten();
+        let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
+        let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
         let system_prompt_touched = edit.system_prompt.is_some();
         let system_prompt_value = edit.system_prompt.flatten();
         let effective_authored_system_prompt = if system_prompt_touched {
@@ -4858,7 +4875,8 @@ impl Store {
                 command = CASE WHEN :command_touched THEN :command ELSE command END,
                 system_prompt = CASE WHEN :system_prompt_touched THEN :system_prompt ELSE system_prompt END,
                 effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
-                auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END
+                auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END,
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
                 ":cwd_touched": cwd_touched,
@@ -4877,6 +4895,8 @@ impl Store {
                 ":effective_system_prompt": effective_system_prompt,
                 ":auto_compact_threshold_touched": auto_compact_threshold_touched,
                 ":auto_compact_threshold": auto_compact_threshold_value,
+                ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
+                ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":idx": idx,
@@ -6389,6 +6409,31 @@ impl Store {
             .query_row(
                 "SELECT agent FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, task_idx, cell_idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// The agent a proof step runs under, addressed the way `proofs` rows are
+    /// keyed: `scope` is `"cell"` or `"task"`, and `cell_idx` is ignored by
+    /// task-scope rows but still part of the key. Used by the edit path to
+    /// gate `maximum_tool_output_tokens` on the step's own agent rather than
+    /// the owning cell's, since the two can differ (RAL-333).
+    ///
+    /// `proofs.agent` is `NOT NULL`, so this is a plain `String`.
+    pub fn get_proof_agent(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT agent FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
                 |r| r.get::<_, String>(0),
             )
             .optional()?

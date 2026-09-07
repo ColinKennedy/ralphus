@@ -41,6 +41,7 @@ pub enum CellCommand {
         prompt: Option<String>,
         command: Option<String>,
         auto_compact_threshold: Option<String>,
+        maximum_tool_output_tokens: Option<String>,
         system_prompt: Option<String>,
     },
     Terminal {
@@ -113,6 +114,10 @@ pub fn parse(args: &[String]) -> CellCommand {
                 .take_value("--auto-compact-threshold")
                 .ok()
                 .flatten();
+            let maximum_tool_output_tokens = scanner
+                .take_value("--maximum-tool-output-tokens")
+                .ok()
+                .flatten();
             let system_prompt = scanner.take_value("--system-prompt").ok().flatten();
             with_selector(scanner, |selector| CellCommand::Edit {
                 selector,
@@ -122,6 +127,7 @@ pub fn parse(args: &[String]) -> CellCommand {
                 prompt,
                 command,
                 auto_compact_threshold,
+                maximum_tool_output_tokens,
                 system_prompt,
             })
         }
@@ -362,6 +368,7 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             prompt,
             command,
             auto_compact_threshold,
+            maximum_tool_output_tokens,
             system_prompt,
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "cell")?;
@@ -375,6 +382,7 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
                 prompt.as_deref(),
                 command.as_deref(),
                 auto_compact_threshold.as_deref(),
+                maximum_tool_output_tokens.as_deref(),
                 system_prompt.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
@@ -618,6 +626,45 @@ mod tests {
                     Some("Do NOT commit and do NOT push.")
                 );
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_maximum_tool_output_tokens() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/0",
+            "--maximum-tool-output-tokens",
+            "25000",
+        ])) {
+            CellCommand::Edit {
+                selector,
+                maximum_tool_output_tokens,
+                ..
+            } => {
+                assert_eq!(selector, "squad-1/build/0");
+                assert_eq!(maximum_tool_output_tokens.as_deref(), Some("25000"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_clearing_maximum_tool_output_tokens_with_empty_value() {
+        // An empty value is the wire form for "clear it" -- it must survive
+        // parsing as `Some("")`, not collapse to `None` (which would mean
+        // "leave untouched").
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/0",
+            "--maximum-tool-output-tokens",
+            "",
+        ])) {
+            CellCommand::Edit {
+                maximum_tool_output_tokens,
+                ..
+            } => assert_eq!(maximum_tool_output_tokens.as_deref(), Some("")),
             other => panic!("unexpected: {other:?}"),
         }
     }
