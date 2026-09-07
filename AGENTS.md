@@ -59,6 +59,12 @@ alternatives to reach for are in
   logic for it — a closed enum, a numeric bound, or deliberately unvalidated
   are all plausible, and guessing wrong either rejects a wanted value or lets
   a typo through.
+- **Never run `cargo test --all-targets` / `cargo nextest run --all-targets`
+  when ralphus itself is the one driving the work** (a ralphus cell/proof
+  step developing ralphus, i.e. dogfooding) — that cell's own dev daemon/
+  librarian exe is locked from underneath it, so `--all-targets` doesn't just
+  fail, it often hangs. Use `cargo nextest run -p ralphus-daemon --lib` (and
+  the same for `ralphus-librarian`) instead. See `.agent/gotchas.md`.
 
 ## Architecture
 
