@@ -19,8 +19,8 @@ curl http://127.0.0.1:7890/api/tasks
 curl http://127.0.0.1:7890/api/squads/<id>
 
 # Run a specific Rust unit-test module
-cargo test -p ralphus-daemon scheduler::
-cargo test -p ralphus-core validate::
+cargo nextest run -p ralphus-daemon scheduler::
+cargo nextest run -p ralphus-core validate::
 
 # Run a single Python test by name
 cd cli && uv run pytest -k test_render_test_svg_includes_commit_labels -s

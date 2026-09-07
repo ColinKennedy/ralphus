@@ -69,7 +69,7 @@ moment a leaf has neither.
 ## Parity check (RAL-301's core requirement)
 
 `mcp/tests/parity.rs` is a normal `#[test]`, covered by the same
-`cargo test --all-targets` root `AGENTS.md` already asks developers to run
+`cargo nextest run --all-targets` root `AGENTS.md` already asks developers to run
 and `.github/workflows/ci.yml`'s `rust` job already runs -- there is no
 separate CI-only parity script. It checks, bidirectionally, against
 `help_map::registered_leaves()` (the same tree `cli`'s own

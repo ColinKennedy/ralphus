@@ -112,9 +112,9 @@ Every commit must pass all checks. **Rust is strict**: `[workspace.lints]` sets 
 # Rust (from repo root)
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets            # run one: cargo test -p ralphus-daemon scheduler::
+cargo nextest run --workspace        # run one: cargo nextest run -p ralphus-daemon scheduler::
 # ...but while the dev daemon/librarian are running, their exes are locked and
-# --all-targets can't relink them: use `cargo test -p ralphus-daemon --lib`
+# can't be relinked: use `cargo nextest run -p ralphus-daemon --lib`
 # for those two packages. See .agent/gotchas.md.
 
 # Python (from cli-py/, uv-managed) — see cli-py/AGENTS.md for the test-file table
