@@ -240,6 +240,20 @@ pub struct ProofView {
     /// RAL-326: prompt-cache *read* tokens -- input served from an existing
     /// cache entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any step that compacts. `0` for a backend that reports no
+    /// compaction data (`pi`, `codex`) -- see `compaction_count` before
+    /// reading that as "never compacted".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    pub compaction_count: i64,
     /// Cost of this step's most recent run, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -300,6 +314,20 @@ pub struct CellView {
     /// RAL-326: prompt-cache *read* tokens -- input served from an existing
     /// cache entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any cell that compacts. `0` for a backend that reports no
+    /// compaction data (`pi`, `codex`) -- see `compaction_count` before
+    /// reading that as "never compacted".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    pub compaction_count: i64,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -830,6 +858,8 @@ impl Store {
                 tokens_out INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                compaction_input_tokens INTEGER NOT NULL DEFAULT 0,
+                compaction_count        INTEGER NOT NULL DEFAULT 0,
                 cost_usd   REAL NOT NULL DEFAULT 0,
                 cost_is_estimated INTEGER NOT NULL DEFAULT 0,
                 error      TEXT,
@@ -1898,6 +1928,21 @@ impl Store {
             // (success or a legitimate failure); only a literal crash mid-run
             // leaves it set.
             "ALTER TABLE guardian_branches ADD COLUMN pending_feedback TEXT",
+            // RAL-373: total input tokens spent on Claude Code's own
+            // auto-compaction summarization requests -- billed at the
+            // *uncached* input rate, the reason `cost_usd` and
+            // `tokens_in + cache_creation_tokens + cache_read_tokens`
+            // diverge on any cell that compacts. `compaction_count` is the
+            // number of compactions observed, incremented independently of
+            // whether each one's input size was reported: a nonzero count
+            // paired with `compaction_input_tokens = 0` means "compactions
+            // happened, sizes unreported by this backend/version", not "no
+            // compaction happened". `0` on every pre-RAL-373 row and for a
+            // backend that reports no compaction data (`pi`, `codex`).
+            "ALTER TABLE cells ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cells ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3178,7 +3223,7 @@ impl Store {
         triage_by_cell: &HashMap<(i64, i64), Vec<String>>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -3229,6 +3274,8 @@ impl Store {
                         cache_read_tokens: r.get::<_, i64>(29)?,
                         cost_is_estimated: r.get::<_, bool>(30)?,
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(31)?,
+                        compaction_input_tokens: r.get::<_, i64>(32)?,
+                        compaction_count: r.get::<_, i64>(33)?,
                     },
                 ))
             })?
@@ -3340,7 +3387,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -3368,6 +3415,8 @@ impl Store {
                         cache_read_tokens: r.get::<_, i64>(18)?,
                         cost_is_estimated: r.get::<_, bool>(19)?,
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(20)?,
+                        compaction_input_tokens: r.get::<_, i64>(21)?,
+                        compaction_count: r.get::<_, i64>(22)?,
                     },
                 ))
             })?
@@ -3387,7 +3436,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -3411,6 +3460,8 @@ impl Store {
                     cache_read_tokens: r.get::<_, i64>(15)?,
                     cost_is_estimated: r.get::<_, bool>(16)?,
                     maximum_tool_output_tokens: r.get::<_, Option<i64>>(17)?,
+                    compaction_input_tokens: r.get::<_, i64>(18)?,
+                    compaction_count: r.get::<_, i64>(19)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4684,7 +4735,7 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, cost_is_estimated=?
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
@@ -4694,6 +4745,8 @@ impl Store {
                 usage.tokens_out,
                 usage.cache_creation_tokens,
                 usage.cache_read_tokens,
+                usage.compaction_input_tokens,
+                usage.compaction_count,
                 usage.cost_usd,
                 usage.cost_is_estimated,
                 squad_id,
@@ -6365,7 +6418,7 @@ impl Store {
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
@@ -6374,6 +6427,8 @@ impl Store {
                 outcome.usage.tokens_out,
                 outcome.usage.cache_creation_tokens,
                 outcome.usage.cache_read_tokens,
+                outcome.usage.compaction_input_tokens,
+                outcome.usage.compaction_count,
                 outcome.usage.cost_usd,
                 outcome.usage.cost_is_estimated,
                 outcome.error.as_deref(),
@@ -7590,6 +7645,21 @@ pub struct RecordedUsage {
     /// Prompt-cache *read* tokens -- input served from an existing cache
     /// entry at the discounted rate. See `cache_creation_tokens`.
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any cell that compacts. Compaction *output* (the summary itself) is
+    /// not currently reported by Claude Code and so is not captured here.
+    /// `0` for a backend that reports no compaction data (`pi`, `codex`) --
+    /// see `compaction_count` before reading that as "never compacted".
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    pub compaction_count: i64,
     /// Cost in USD.
     pub cost_usd: f64,
     /// `true` when the figures above are the last live mid-run snapshot
@@ -7607,6 +7677,8 @@ impl From<&crate::runner::RunnerResult> for RecordedUsage {
             tokens_out: r.tokens_out,
             cache_creation_tokens: r.cache_creation_tokens,
             cache_read_tokens: r.cache_read_tokens,
+            compaction_input_tokens: r.compaction_input_tokens,
+            compaction_count: r.compaction_count,
             cost_usd: r.cost_usd,
             cost_is_estimated: r.cost_is_estimated,
         }
@@ -10138,6 +10210,8 @@ command = "y"
                 tokens_out: 5374,
                 cache_creation_tokens: 320_114,
                 cache_read_tokens: 7_204_990,
+                compaction_input_tokens: 115_000,
+                compaction_count: 1,
                 cost_usd: 0.6807,
                 cost_is_estimated: true,
             },
@@ -10152,6 +10226,9 @@ command = "y"
         assert_eq!(cell.tokens_out, 5374);
         assert_eq!(cell.cache_creation_tokens, 320_114);
         assert_eq!(cell.cache_read_tokens, 7_204_990);
+        // RAL-373: the same round trip, for the columns this ticket adds.
+        assert_eq!(cell.compaction_input_tokens, 115_000);
+        assert_eq!(cell.compaction_count, 1);
         assert!(
             cell.cost_is_estimated,
             "a snapshot-derived figure must not read as a settled bill"
@@ -10184,6 +10261,8 @@ command = "y"
                     tokens_out: 22,
                     cache_creation_tokens: 33,
                     cache_read_tokens: 44,
+                    compaction_input_tokens: 55,
+                    compaction_count: 2,
                     cost_usd: 0.5,
                     cost_is_estimated: true,
                 },
@@ -10196,6 +10275,9 @@ command = "y"
         assert_eq!(step.tokens_out, 22);
         assert_eq!(step.cache_creation_tokens, 33);
         assert_eq!(step.cache_read_tokens, 44);
+        // RAL-373: the same round trip, for the columns this ticket adds.
+        assert_eq!(step.compaction_input_tokens, 55);
+        assert_eq!(step.compaction_count, 2);
         assert!(step.cost_is_estimated);
     }
 

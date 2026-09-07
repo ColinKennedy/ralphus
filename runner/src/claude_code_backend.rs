@@ -528,6 +528,8 @@ fn drive_stream_json(
             agent_session_id: state.agent_session_id,
             abandoned_background_job: state.open_background_job,
             compaction_thrash: Some(detail),
+            compaction_input_tokens: state.compaction_input_tokens,
+            compaction_count: state.compaction_count,
         });
     }
 
@@ -559,6 +561,8 @@ fn drive_stream_json(
         agent_session_id: state.agent_session_id,
         abandoned_background_job: state.open_background_job,
         compaction_thrash: None,
+        compaction_input_tokens: state.compaction_input_tokens,
+        compaction_count: state.compaction_count,
     })
 }
 
@@ -576,6 +580,19 @@ struct ParseState {
     cache_creation_tokens: i64,
     cache_read_tokens: i64,
     cost_usd: f64,
+    /// RAL-373: running total of `compactMetadata.preTokens` across every
+    /// `compact_boundary` event seen so far -- the context size Claude Code
+    /// discarded and re-summarized at each compaction, billed at the
+    /// uncached input rate. Accumulated with `+=` in a field the
+    /// `Some("result")` arm below never touches, since that arm's five
+    /// plain assignments would otherwise silently overwrite it.
+    compaction_input_tokens: i64,
+    /// RAL-373: count of `compact_boundary` events seen, incremented every
+    /// time regardless of whether `preTokens` was reported. Lets a `0`
+    /// `compaction_input_tokens` alongside a nonzero count read as "N
+    /// compactions happened, sizes not reported by this Claude Code
+    /// version" rather than "no compaction happened".
+    compaction_count: i64,
     saw_result: bool,
     /// RAL-288 Stage 2: `--include-partial-messages` streams token-level text
     /// deltas via `stream_event` ahead of the complete `assistant` message
@@ -666,6 +683,14 @@ fn process_event(
                 .as_str()
                 .unwrap_or("unknown");
             let pre_tokens = event["compactMetadata"]["preTokens"].as_i64().unwrap_or(0);
+            // RAL-373: `preTokens` is the size of the context this
+            // compaction just summarized away -- billed uncached, and the
+            // whole reason `cost_usd` and the token columns diverge on any
+            // cell that compacts. Incremented every time regardless of
+            // whether `preTokens` was reported (see `compaction_count`'s
+            // doc comment on `ParseState`).
+            state.compaction_input_tokens += pre_tokens;
+            state.compaction_count += 1;
             print_line(&format!(
                 "[compact] conversation history compacted (trigger={trigger}, preTokens={pre_tokens})"
             ));
@@ -1089,10 +1114,11 @@ mod tests {
     fn process_event_handles_compact_boundary_without_panicking_or_mutating_other_state() {
         // Compaction carries no session/usage/result data of its own -- this
         // just proves the new arm doesn't panic on a missing/malformed
-        // `compactMetadata` and doesn't fall through to the catch-all. A
-        // single, isolated compaction never thrashes (RAL-339), so
-        // `compaction_thrash` stays `None` even though the tracker itself
-        // now records the one compaction.
+        // `compactMetadata`, doesn't fall through to the catch-all, and
+        // (RAL-373) accumulates `preTokens` and the compaction count without
+        // touching anything else. A single, isolated compaction never
+        // thrashes (RAL-339), so `compaction_thrash` stays `None` even
+        // though the tracker itself now records the one compaction.
         let mut state = ParseState::default();
         let ws = test_workspace();
         process_event(
@@ -1107,13 +1133,97 @@ mod tests {
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.compaction_thrash, None);
+        assert_eq!(state.compaction_input_tokens, 164975);
+        assert_eq!(state.compaction_count, 1);
         assert_eq!(
             state,
             ParseState {
                 thrash: state.thrash,
+                compaction_input_tokens: state.compaction_input_tokens,
+                compaction_count: state.compaction_count,
                 ..ParseState::default()
             }
         );
+    }
+
+    /// RAL-373: `preTokens` missing (older Claude Code / malformed event)
+    /// still increments the count -- this is the "N compactions, sizes not
+    /// reported" case `compaction_count` exists to make self-describing.
+    #[test]
+    fn process_event_counts_a_compaction_even_when_pre_tokens_is_absent() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"system",
+                "subtype":"compact_boundary",
+                "compactMetadata":{"trigger":"auto"}
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.compaction_input_tokens, 0);
+        assert_eq!(state.compaction_count, 1);
+    }
+
+    /// RAL-373: multiple compactions across a run must accumulate, not
+    /// overwrite -- this is the difference between `+=` and `=` that the
+    /// ticket calls out as "the one way to get this wrong".
+    #[test]
+    fn process_event_accumulates_compaction_tokens_across_multiple_boundaries() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        for pre_tokens in [100_000, 120_000, 90_000] {
+            process_event(
+                &serde_json::json!({
+                    "type":"system",
+                    "subtype":"compact_boundary",
+                    "compactMetadata":{"trigger":"auto","preTokens":pre_tokens}
+                }),
+                &mut state,
+                &ws,
+                None,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+        }
+        assert_eq!(state.compaction_input_tokens, 310_000);
+        assert_eq!(state.compaction_count, 3);
+    }
+
+    /// RAL-373: the `Some("result")` arm is five plain assignments, not
+    /// `+=` -- proves it does not clobber the compaction accumulators a
+    /// prior `compact_boundary` already built up.
+    #[test]
+    fn process_event_result_event_does_not_clobber_compaction_accumulators() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"system",
+                "subtype":"compact_boundary",
+                "compactMetadata":{"trigger":"auto","preTokens":115_000}
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &serde_json::json!({
+                "type":"result",
+                "usage":{"input_tokens":12,"output_tokens":34},
+                "total_cost_usd":0.56,
+                "result":"all done"
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.compaction_input_tokens, 115_000);
+        assert_eq!(state.compaction_count, 1);
     }
 
     /// RAL-339: the default thresholds (N=3, M=2) -- three compactions with
@@ -1316,6 +1426,117 @@ mod tests {
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.cache_read_tokens, 52_000);
+    }
+
+    /// RAL-373: the reconciliation check the original bug would have failed.
+    /// A synthetic stream carries three known-size compactions plus a
+    /// `result` event with known per-tier usage; `total_cost_usd` is set to
+    /// what those tiers actually cost at real Anthropic Sonnet rates
+    /// (uncached in/out/cache-write/cache-read, from the ticket's worked
+    /// table -- deliberately *not* `estimate_cost_usd`'s single-rate
+    /// approximation, which exists only to be conservative for the live
+    /// kill switch), plus a small residual standing in for compaction's
+    /// unrecorded summary-output tokens. Pricing every recorded column --
+    /// including the new `compaction_input_tokens`, billed uncached like
+    /// the rest of compaction's input -- must land within ~10% of that
+    /// recorded cost. Pricing the same columns *without*
+    /// `compaction_input_tokens` (i.e. today's pre-fix behavior) must miss
+    /// by far more than that: that gap is the bug.
+    #[test]
+    fn reconciliation_pricing_recorded_columns_matches_recorded_cost_usd() {
+        const RATE_UNCACHED_IN: f64 = 3.0;
+        const RATE_OUT: f64 = 15.0;
+        const RATE_CACHE_WRITE: f64 = 3.75;
+        const RATE_CACHE_READ: f64 = 0.30;
+
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let compaction = serde_json::json!({
+            "type":"system",
+            "subtype":"compact_boundary",
+            "compactMetadata":{"trigger":"auto","preTokens":50_000}
+        });
+        for _ in 0..3 {
+            process_event(
+                &compaction,
+                &mut state,
+                &ws,
+                None,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+        }
+
+        let tokens_in = 1_000i64;
+        let tokens_out = 2_000i64;
+        let cache_creation = 5_000i64;
+        let cache_read = 200_000i64;
+
+        let priced_without_compaction = (tokens_in as f64 * RATE_UNCACHED_IN
+            + tokens_out as f64 * RATE_OUT
+            + cache_creation as f64 * RATE_CACHE_WRITE
+            + cache_read as f64 * RATE_CACHE_READ)
+            / 1_000_000.0;
+        // Compaction input is billed uncached (this is the measurement the
+        // ticket verified against live data, not an assumption).
+        let compaction_input_tokens = 3 * 50_000i64;
+        let compaction_cost = compaction_input_tokens as f64 * RATE_UNCACHED_IN / 1_000_000.0;
+        let priced_with_compaction = priced_without_compaction + compaction_cost;
+        // ~2.5% stand-in for compaction's unrecorded summary-output tokens
+        // (a few thousand per compaction, not currently reported by Claude
+        // Code) -- folded into the tolerance below per the ticket.
+        let recorded_cost_usd = priced_with_compaction * 1.025;
+
+        process_event(
+            &serde_json::json!({
+                "type":"result",
+                "usage":{
+                    "input_tokens":tokens_in,
+                    "output_tokens":tokens_out,
+                    "cache_creation_input_tokens":cache_creation,
+                    "cache_read_input_tokens":cache_read,
+                },
+                "total_cost_usd":recorded_cost_usd,
+                "result":"done"
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+
+        assert_eq!(state.compaction_input_tokens, compaction_input_tokens);
+        assert_eq!(state.compaction_count, 3);
+        assert!((state.cost_usd - recorded_cost_usd).abs() < f64::EPSILON);
+
+        let priced_from_recorded_columns = (state.tokens_in as f64 * RATE_UNCACHED_IN
+            + state.tokens_out as f64 * RATE_OUT
+            + state.cache_creation_tokens as f64 * RATE_CACHE_WRITE
+            + state.cache_read_tokens as f64 * RATE_CACHE_READ
+            + state.compaction_input_tokens as f64 * RATE_UNCACHED_IN)
+            / 1_000_000.0;
+        let relative_error = (priced_from_recorded_columns - state.cost_usd).abs() / state.cost_usd;
+        assert!(
+            relative_error < 0.10,
+            "priced {priced_from_recorded_columns} vs recorded {}: {relative_error:.3} relative error",
+            state.cost_usd
+        );
+
+        // The bug this ticket fixes: the same pricing but omitting
+        // `compaction_input_tokens` (i.e. what every recorded cell showed
+        // before this ticket) must fail reconciliation by far more than the
+        // tolerance above.
+        let priced_without_compaction_column = (state.tokens_in as f64 * RATE_UNCACHED_IN
+            + state.tokens_out as f64 * RATE_OUT
+            + state.cache_creation_tokens as f64 * RATE_CACHE_WRITE
+            + state.cache_read_tokens as f64 * RATE_CACHE_READ)
+            / 1_000_000.0;
+        let relative_error_without_compaction =
+            (priced_without_compaction_column - state.cost_usd).abs() / state.cost_usd;
+        assert!(
+            relative_error_without_compaction > 0.10,
+            "expected omitting compaction_input_tokens to badly miss reconciliation, \
+             but it was within tolerance: {relative_error_without_compaction:.3}"
+        );
     }
 
     /// The live estimate feeds the RAL-161 kill switch, so it must price the

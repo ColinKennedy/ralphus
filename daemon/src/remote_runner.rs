@@ -1471,6 +1471,8 @@ mod tests {
                 tokens_out: 8,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.25,
                 cost_is_estimated: false,
                 summary: "local".to_string(),

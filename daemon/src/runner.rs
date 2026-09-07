@@ -666,6 +666,23 @@ pub struct RunnerResult {
     /// cache entry. See `cache_creation_tokens`.
     #[serde(default)]
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests, billed at the *uncached*
+    /// input rate -- the reason `cost_usd` and
+    /// `tokens_in + cache_creation_tokens + cache_read_tokens` diverge on
+    /// any cell that compacts. Compaction *output* (the summary itself) is
+    /// not currently reported by Claude Code and so is not captured here.
+    /// `0` for a backend that reports no compaction data (`pi`, `codex`) --
+    /// see `compaction_count` before reading that as "never compacted".
+    #[serde(default)]
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, incremented independently of
+    /// whether each one's input size was reported. A nonzero count paired
+    /// with `compaction_input_tokens == 0` means "compactions happened,
+    /// sizes unreported by this backend/version", not "no compaction
+    /// happened".
+    #[serde(default)]
+    pub compaction_count: i64,
     /// Cost in USD.
     #[serde(default)]
     pub cost_usd: f64,
@@ -711,6 +728,8 @@ impl RunnerResult {
             tokens_out: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd: 0.0,
             cost_is_estimated: false,
             summary: String::new(),
@@ -737,6 +756,12 @@ impl RunnerResult {
             tokens_out: usage.tokens_out,
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            // RAL-373: `LiveUsage` carries no compaction breakdown (a live
+            // mid-run snapshot, not the backend's terminal accounting) --
+            // recorded as zero rather than guessed, same as every other
+            // snapshot-derived constructor here.
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd,
             // The cap fires off a live snapshot, never a terminal usage
             // event, so what it records is an estimate by construction
@@ -765,6 +790,10 @@ impl RunnerResult {
             tokens_out: usage.tokens_out,
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            // RAL-373: same reasoning as `cost_exceeded` -- no compaction
+            // breakdown in a live snapshot.
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd: usage.cost_usd,
             // Same reasoning as `cost_exceeded`: a detach point is a live
             // snapshot, not a final accounting (RAL-326).
@@ -2529,6 +2558,8 @@ mod tests {
             tokens_out: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd: 0.0,
             cost_is_estimated: false,
             summary: String::new(),

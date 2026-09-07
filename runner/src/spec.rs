@@ -250,6 +250,22 @@ pub struct CellResult {
     pub cache_creation_tokens: i64,
     #[serde(default)]
     pub cache_read_tokens: i64,
+    /// RAL-373: total input tokens spent on Claude Code's own
+    /// auto-compaction summarization requests -- billed at the *uncached*
+    /// input rate, which is why `cost_usd` and the other token columns
+    /// diverge on any cell that compacts. Compaction *output* (the summary
+    /// itself) is not currently reported by Claude Code and so is not
+    /// captured here. `0` for a backend that reports no compaction data
+    /// (`pi`, `codex`) -- see `compaction_count` before treating that as
+    /// "never compacted".
+    #[serde(default)]
+    pub compaction_input_tokens: i64,
+    /// RAL-373: count of compactions observed, independent of whether each
+    /// one's input size was reported. `compaction_count > 0` with
+    /// `compaction_input_tokens == 0` means "compactions happened, sizes
+    /// unreported by this backend/version" -- not "no compaction happened".
+    #[serde(default)]
+    pub compaction_count: i64,
     #[serde(default)]
     pub cost_usd: f64,
     /// RAL-326: set when `cost_usd`/the token counts are a *live snapshot*
@@ -277,6 +293,8 @@ impl CellResult {
             tokens_out: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd: 0.0,
             cost_is_estimated: false,
             summary: summary.into(),
@@ -295,6 +313,8 @@ impl CellResult {
             tokens_out: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
             cost_usd: 0.0,
             cost_is_estimated: false,
             summary: summary.into(),
@@ -312,11 +332,14 @@ impl CellResult {
     /// the same way [`Self::done`]'s caller fills those in, so the board's
     /// numbers don't regress to zero.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn detached(
         tokens_in: i64,
         tokens_out: i64,
         cache_creation_tokens: i64,
         cache_read_tokens: i64,
+        compaction_input_tokens: i64,
+        compaction_count: i64,
         cost_usd: f64,
         agent_session_id: Option<String>,
     ) -> Self {
@@ -326,6 +349,8 @@ impl CellResult {
             tokens_out,
             cache_creation_tokens,
             cache_read_tokens,
+            compaction_input_tokens,
+            compaction_count,
             cost_usd,
             // A detach carries whatever the live snapshot held at the detach
             // point, never a terminal usage event -- so it is an estimate by
