@@ -9193,7 +9193,7 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
             }
             if let Some(user) = auto_watch_user {
                 if let Ok(Some(preferences)) = store.get_user(&user) {
-                    if preferences.auto_follow {
+                    if preferences.auto_watch {
                         let entity_uri = format!("guardian:{id}");
                         let _ = store.create_watch(
                             &user,
@@ -19748,4 +19748,3 @@ command=\"cargo test\"
         assert!(store.list_users().unwrap().is_empty());
     }
 }
-

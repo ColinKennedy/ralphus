@@ -1806,6 +1806,7 @@ fn maybe_promote_fork_root(
         Ok(Some(routing)) => routing,
         Ok(None) => return, // not a fork-mode review
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: poll-time routing diagnostic; a successful promotion logs its structured outcome
             crate::rlog!(
                 ERROR,
                 "ralphus [pr] review {id} could not resolve fork routing for promotion: {e}"
@@ -1876,6 +1877,7 @@ fn maybe_promote_fork_root(
         // has this targeting the parent's base directly -- nothing to
         // reconcile. See this function's doc comment on why `base_ref`, not
         // `repo`, is the forge-agnostic "is this the root" signal.
+        // ralphus[ignore-rlog-pair]: no-op reconciliation diagnostic; an actual promotion emits the structured outcome
         crate::rlog!(
             INFO,
             "ralphus [pr] review {id} successor pr={} is already filed at the parent -- \

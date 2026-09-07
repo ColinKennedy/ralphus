@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ralphus_core::schema::{ResolvedAgent, TaskFile};
-use rusqlite::{named_params, params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::Serialize;
 
 use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
@@ -615,9 +615,27 @@ pub struct ClearOutcome {
     /// Multi-project guardians produce multiple entries with the same guardian_id.
     pub guardian_roots: Vec<(String, String)>,
     /// Ids of every squad actually deleted (RAL-154) — so the caller can purge
-    /// each one's durable, on-disk terminal logs, mirroring the single-squad
     /// `delete_squad` endpoint's cleanup.
     pub squad_ids: Vec<String>,
+}
+
+/// A persisted path that may be owned by a cell, proof, or review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeClaim {
+    pub kind: String,
+    pub owner: String,
+    pub path: String,
+    pub state: String,
+}
+
+/// One review-worktree path and the timestamp of its owner's last activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardianWorktreeRecord {
+    pub guardian_id: String,
+    pub guardian_name: String,
+    pub project_root: String,
+    pub path: String,
+    pub last_activity_ms: i64,
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -3950,6 +3968,78 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET cwd=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![cwd, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Persisted review worktrees, including per-branch and combined paths.
+    pub(crate) fn guardian_worktree_records(&self) -> Result<Vec<GuardianWorktreeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.name, COALESCE(gb.project, g.git_root), gb.worktree,
+                    MAX(g.updated_at_ms, COALESCE(gb.started_at_ms, 0))
+             FROM guardians g
+             JOIN guardian_branches gb ON gb.guardian_id=g.id
+             WHERE gb.worktree IS NOT NULL
+             UNION ALL
+             SELECT id, name, git_root, combined_worktree, updated_at_ms
+             FROM guardians WHERE combined_worktree IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(GuardianWorktreeRecord {
+                    guardian_id: r.get(0)?,
+                    guardian_name: r.get(1)?,
+                    project_root: r.get(2)?,
+                    path: r.get(3)?,
+                    last_activity_ms: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every cell/proof/review claim whose persisted path can name a worktree.
+    /// Proof cwd selection mirrors `scheduler::run_proofs`.
+    pub(crate) fn worktree_claims(&self) -> Result<Vec<WorktreeClaim>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 'cell', c.squad_id || ':' || c.task_idx || ':' || c.idx, c.cwd, c.state
+             FROM cells c WHERE c.cwd IS NOT NULL
+             UNION ALL
+             SELECT 'proof', p.squad_id || ':' || p.task_idx || ':' || p.scope || ':' || p.cell_idx || ':' || p.idx,
+                    c.cwd, p.state
+             FROM proofs p JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+              AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
+                   (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
+                     WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
+             WHERE c.cwd IS NOT NULL
+             UNION ALL
+             SELECT 'review', g.id, gb.worktree, g.status
+             FROM guardians g JOIN guardian_branches gb ON gb.guardian_id=g.id
+             WHERE gb.worktree IS NOT NULL
+             UNION ALL
+             SELECT 'review', id, combined_worktree, status
+             FROM guardians WHERE combined_worktree IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(WorktreeClaim {
+                    kind: r.get(0)?,
+                    owner: r.get(1)?,
+                    path: r.get(2)?,
+                    state: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Forget a review path after git confirmed that worktree was removed.
+    pub(crate) fn clear_guardian_worktree_path(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET worktree=NULL WHERE worktree=?1",
+            params![path],
+        )?;
+        self.conn.execute(
+            "UPDATE guardians SET combined_worktree=NULL WHERE combined_worktree=?1",
+            params![path],
         )?;
         Ok(())
     }
@@ -8581,14 +8671,18 @@ prompt = "confirm tests"
         let squad = store.get_squad(&id).unwrap();
         let cell_proof = &squad.tasks[0].cells[0].proof[0];
         let task_proof = &squad.tasks[0].proof[0];
-        assert!(cell_proof
-            .system_prompt
-            .as_deref()
-            .is_some_and(|sp| sp.contains("PROOF step")));
-        assert!(task_proof
-            .system_prompt
-            .as_deref()
-            .is_some_and(|sp| sp.contains("PROOF step")));
+        assert!(
+            cell_proof
+                .system_prompt
+                .as_deref()
+                .is_some_and(|sp| sp.contains("PROOF step"))
+        );
+        assert!(
+            task_proof
+                .system_prompt
+                .as_deref()
+                .is_some_and(|sp| sp.contains("PROOF step"))
+        );
     }
 
     #[test]
@@ -9230,7 +9324,7 @@ command = "y"
     fn add_squad_dependency_rejects_transitive_cycle() {
         let mut store = Store::open_in_memory().unwrap();
         let (a, _b, c) = dependent_chain(&mut store); // a <- b <- c
-                                                      // c already (transitively) depends on a; making a depend on c is a cycle.
+        // c already (transitively) depends on a; making a depend on c is a cycle.
         assert!(matches!(
             store.add_squad_dependency(&a, &c),
             Err(StoreError::InvalidTransition(_))
@@ -9629,16 +9723,22 @@ command = "y"
             .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
         assert!(store.get_task_env_overrides(&squad, 0).unwrap().is_empty());
-        assert!(store
-            .get_task_proof_env_overrides(&squad, 0)
-            .unwrap()
-            .is_empty());
-        assert!(store.get_squad(&squad).unwrap().tasks[0]
-            .env_overrides
-            .is_empty());
-        assert!(store.get_squad(&squad).unwrap().tasks[0]
-            .proof_env_overrides
-            .is_empty());
+        assert!(
+            store
+                .get_task_proof_env_overrides(&squad, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store.get_squad(&squad).unwrap().tasks[0]
+                .env_overrides
+                .is_empty()
+        );
+        assert!(
+            store.get_squad(&squad).unwrap().tasks[0]
+                .proof_env_overrides
+                .is_empty()
+        );
     }
 
     #[test]
@@ -9869,14 +9969,18 @@ command = "y"
         let squad = store
             .insert_squad(&parse(two_task_two_cell_toml()), Some("r"), false)
             .unwrap();
-        assert!(store
-            .get_cell_env_overrides(&squad, 0, 0)
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .get_cell_proof_env_overrides(&squad, 0, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .get_cell_env_overrides(&squad, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_cell_proof_env_overrides(&squad, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -9896,14 +10000,18 @@ command = "y"
             Some(&"1".to_string())
         );
         // Sibling cell (t0/s1) and the other task's cell (t1/s0) are untouched.
-        assert!(store
-            .get_cell_env_overrides(&squad, 0, 1)
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .get_cell_env_overrides(&squad, 1, 0)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .get_cell_env_overrides(&squad, 0, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_cell_env_overrides(&squad, 1, 0)
+                .unwrap()
+                .is_empty()
+        );
 
         let view = store.get_squad(&squad).unwrap();
         assert_eq!(
@@ -10239,15 +10347,19 @@ command = "y"
         // for a deleted ancestor.
         let missing = vec![("no-such-squad".to_string(), 0, 0)];
         let batched_missing = store.resolve_cell_env_overrides_batch(&missing).unwrap();
-        assert!(batched_missing
-            .get(&("no-such-squad".to_string(), 0, 0))
-            .unwrap()
-            .is_empty());
+        assert!(
+            batched_missing
+                .get(&("no-such-squad".to_string(), 0, 0))
+                .unwrap()
+                .is_empty()
+        );
 
-        assert!(store
-            .resolve_cell_env_overrides_batch(&[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .resolve_cell_env_overrides_batch(&[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -10869,9 +10981,11 @@ command = "y"
         store.set_squad_state(&id, SquadState::Done).unwrap();
         let events = store.events_for_squad(&id, 100).unwrap();
         // Oldest-first, and the last transition is "done".
-        assert!(events
-            .iter()
-            .any(|e| e.scope == "squad" && e.message.contains("running")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.scope == "squad" && e.message.contains("running"))
+        );
         assert_eq!(events.last().unwrap().message, "squad → done");
         // Deleting the squad removes its events.
         store.delete_squad(&id).unwrap();
@@ -11988,10 +12102,12 @@ command = "check-c"
         store
             .register_project("ralphus", "", "C:/repos/ralphus", "git")
             .unwrap();
-        assert!(store
-            .resolve_project("totally-unrelated-name")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .resolve_project("totally-unrelated-name")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -12095,9 +12211,11 @@ command = "check-c"
         // restack, a manual-push rebase, a base-branch shift) requests the
         // same signature again -- this must not queue anything.
         store.request_final_summary("g1", "sig-a", 1_000, false);
-        assert!(store
-            .take_due_final_summary_requests(1_000 + 60_000, 0)
-            .is_empty());
+        assert!(
+            store
+                .take_due_final_summary_requests(1_000 + 60_000, 0)
+                .is_empty()
+        );
     }
 
     /// RAL-303: the handoff from the deterministic git-log summary to the LLM
@@ -12127,9 +12245,11 @@ command = "check-c"
         let mut store = Store::open_in_memory().unwrap();
         store.request_final_summary("g1", "sig-a", 1_000, false);
         // Not due yet -- the quiet period hasn't elapsed.
-        assert!(store
-            .take_due_final_summary_requests(1_000 + 2_000, 5_000)
-            .is_empty());
+        assert!(
+            store
+                .take_due_final_summary_requests(1_000 + 2_000, 5_000)
+                .is_empty()
+        );
         // Due once the full debounce window has elapsed.
         let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
         assert_eq!(due, vec![("g1".to_string(), "sig-a".to_string())]);
@@ -12147,9 +12267,11 @@ command = "check-c"
         // 5s after the FIRST request, but only 3s after the last -- still
         // not due, proving the clock restarted rather than accumulating from
         // the first request.
-        assert!(store
-            .take_due_final_summary_requests(5_000, 5_000)
-            .is_empty());
+        assert!(
+            store
+                .take_due_final_summary_requests(5_000, 5_000)
+                .is_empty()
+        );
         // 5s after the last request, only the final signature is due -- the
         // intermediate toggles never fired their own LLM call.
         let due = store.take_due_final_summary_requests(2_000 + 5_000, 5_000);
@@ -12164,9 +12286,11 @@ command = "check-c"
         assert_eq!(first, vec![("g1".to_string(), "sig-a".to_string())]);
         // A concurrent/subsequent sweep at the same instant finds nothing
         // left to claim for this guardian.
-        assert!(store
-            .take_due_final_summary_requests(10_000, 5_000)
-            .is_empty());
+        assert!(
+            store
+                .take_due_final_summary_requests(10_000, 5_000)
+                .is_empty()
+        );
     }
 
     /// RAL-230: the DB file (and its WAL/SHM siblings, when SQLite has

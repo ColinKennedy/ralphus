@@ -933,11 +933,7 @@ fn detect_rebase_step_content_loss(wt: &Workspace) -> Option<Vec<String>> {
         .map(|(path, _)| path.clone())
         .collect();
 
-    if lost.is_empty() {
-        None
-    } else {
-        Some(lost)
-    }
+    if lost.is_empty() { None } else { Some(lost) }
 }
 
 /// RAL-330: run [`detect_rebase_step_content_loss`] against `REBASE_HEAD`
@@ -1943,8 +1939,7 @@ fn resolve_conflicts_with_agent(
         // plus auto-fix. Running (and paying for) the same checks twice per
         // conflict-resolution cycle was the redundancy this ticket removes;
         // see the module-level RAL-168 notes.
-        let system_prompt =
-            "You are a git merge-conflict resolver running inside a checked-out worktree \
+        let system_prompt = "You are a git merge-conflict resolver running inside a checked-out worktree \
              during an active `git rebase`. Your job is to eliminate every conflict marker and \
              produce correctly merged files -- nothing more.\n\
              \n\
@@ -6623,11 +6618,7 @@ const WORST_CASE_WT_SUFFIX_LEN: usize = 3 + 12 + 3; // "wt-" + 12 chars + "-99"
 /// `MAX_PATH` is 260 characters; other platforms' limits are high enough in
 /// practice that enforcing this there too would only produce false failures).
 fn path_budget_limit() -> usize {
-    if cfg!(windows) {
-        260
-    } else {
-        usize::MAX
-    }
+    if cfg!(windows) { 260 } else { usize::MAX }
 }
 
 /// Preflight (RAL-211): before this project's branches start materializing
@@ -6769,6 +6760,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         let records = match guard.guardian_worktree_records() {
             Ok(records) => records,
             Err(error) => {
+                // ralphus[ignore-rlog-pair]: transient snapshot read diagnostic; actual retirement emits its structured outcome
                 crate::rlog!(
                     WARNING,
                     "ralphus [guardian] worktree retirement snapshot failed: {error}"
@@ -10459,13 +10451,15 @@ mod tests {
 
         // A branch still `pending` (no cell done yet) contributes nothing.
         recompute_preliminary_summary(&store, &id);
-        assert!(store
-            .lock()
-            .unwrap()
-            .get_guardian(&id)
-            .unwrap()
-            .change_summary
-            .is_none());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian(&id)
+                .unwrap()
+                .change_summary
+                .is_none()
+        );
 
         // Cell done -> mark the branch Ready (as the scheduler now does
         // per-branch, independent of any sibling) and recompute.
@@ -10954,13 +10948,15 @@ mod tests {
         };
 
         recompute_preliminary_summary(&store, &id);
-        assert!(store
-            .lock()
-            .unwrap()
-            .get_guardian(&id)
-            .unwrap()
-            .change_summary
-            .is_none());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian(&id)
+                .unwrap()
+                .change_summary
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -11168,11 +11164,13 @@ mod tests {
             .lock()
             .unwrap()
             .request_final_summary(&id, "sig-1", crate::store::now_ms(), false);
-        assert!(store
-            .lock()
-            .unwrap()
-            .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
-            .is_empty());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

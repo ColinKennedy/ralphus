@@ -56,24 +56,34 @@ def _shoot(page: Page, name: str) -> None:
     _log(f"wrote {path.relative_to(REPO_ROOT)}")
 
 
+def _squads_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.TASKS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/squads/squad-000000000004")
+        page.wait_for_selector(".squad-item.selected")
+        _shoot(page, "squads-overview")
+
+
+def _squads_session_detail(page: Page) -> None:
+    with (
+        fixture_server(fixtures.TASKS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/squads/squad-000000000004?sel=cell:0:1")
+        page.wait_for_selector(".squad-item.selected")
+        _shoot(page, "squads-session-detail")
+
+
 def _tasks_overview(page: Page) -> None:
     with (
         fixture_server(fixtures.TASKS_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        _goto(page, base_url, "#/tasks/squad-000000000004")
-        page.wait_for_selector(".squad-item.selected")
+        _goto(page, base_url, "#/tasks")
+        page.wait_for_selector(".tt-row")
         _shoot(page, "tasks-overview")
-
-
-def _tasks_session_detail(page: Page) -> None:
-    with (
-        fixture_server(fixtures.TASKS_ROUTES) as daemon_url,
-        librarian_server(daemon_url) as base_url,
-    ):
-        _goto(page, base_url, "#/tasks/squad-000000000004?sel=cell:0:1")
-        page.wait_for_selector(".squad-item.selected")
-        _shoot(page, "tasks-session-detail")
 
 
 def _queue_overview(page: Page) -> None:
@@ -226,8 +236,9 @@ def _prefs_overview(page: Page) -> None:
 
 
 SCENARIOS = (
+    _squads_overview,
+    _squads_session_detail,
     _tasks_overview,
-    _tasks_session_detail,
     _queue_overview,
     _reviews,
     _resources_overview,
