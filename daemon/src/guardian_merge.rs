@@ -5049,6 +5049,16 @@ pub fn run_feedback(
         branch_status,
         Some(&detail),
     );
+    // RAL-<new>: a feedback revision can push a real new commit onto the
+    // branch's review ref, so it needs the same auto-submit hook every other
+    // route to a terminal status fires via `promote_branch_terminal` --
+    // otherwise an already-open PR with `auto_submit_pr_stack` on is left
+    // pointed at the pre-feedback sha. Gated on `Done` only, matching
+    // `promote_branch_terminal`/`fail_branch`'s existing split: auto-submit
+    // follows a real terminal success, never a failure.
+    if branch_status == MergeStatus::Done {
+        crate::pr::maybe_auto_submit_branch(store, runner, id, branch_id);
+    }
     let outcome = FeedbackOutcome {
         committed,
         sha,
