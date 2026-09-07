@@ -39,7 +39,7 @@ doesn't go through tmux/psmux at all.
 
 ## Testing — Rust integration tests
 
-`cargo test --all-targets` runs everything. Key integration test files in `daemon/tests/`:
+`cargo nextest run --all-targets` runs everything. Key integration test files in `daemon/tests/`:
 
 | File | Scope | Notes |
 |---|---|---|
@@ -49,14 +49,14 @@ doesn't go through tmux/psmux at all.
 | `reviews_derive.rs` | Full review flow end-to-end | 1 live-Ollama test, `#[ignore]`d by default; `RALPHUS_RESOLVER_MODEL` (default `qwen3:8b`) |
 | `monorepo.rs` | Monorepo pipeline | 3 always-run + 1 live-Ollama test, `#[ignore]`d by default |
 
-**Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo test`/`cargo test --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
+**Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo nextest run`/`cargo nextest run --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash
-cargo test -p ralphus-daemon --test reviews_derive full_flow -- --ignored --nocapture
-cargo test -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture
-cargo test -p ralphus-daemon --test prompt_verify -- --ignored --nocapture
-cargo test -p ralphus-daemon --test guardian_merge generate_summary_live_ollama -- --ignored --nocapture
+cargo nextest run -p ralphus-daemon --test reviews_derive full_flow -- --ignored --nocapture
+cargo nextest run -p ralphus-daemon --test monorepo full_monorepo_flow -- --ignored --nocapture
+cargo nextest run -p ralphus-daemon --test prompt_verify -- --ignored --nocapture
+cargo nextest run -p ralphus-daemon --test guardian_merge generate_summary_live_ollama -- --ignored --nocapture
 # or, to run every ignored (live-Ollama) test across the workspace at once:
-cargo test --all-targets -- --ignored
+cargo nextest run --all-targets -- --ignored
 ```
 
 Each still carries its own runtime guard too (prints `SKIP` and returns early) if Ollama isn't up on `127.0.0.1:11434` or the required model isn't pulled — so even an explicit `--ignored` run degrades gracefully without live infra.

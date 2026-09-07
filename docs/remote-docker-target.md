@@ -118,7 +118,7 @@ directory beneath the remote root.
 $env:RALPHUS_SSH_DOCKER_TEST = '1'
 $env:RALPHUS_SSH_CONFIG_FILE = `
   (Resolve-Path .\.docker-ssh-target\ssh_config).Path
-cargo test -p ralphus-ssh-provider `
+cargo nextest run -p ralphus-ssh-provider `
   --test docker_ssh_target -- --ignored --nocapture
 ```
 

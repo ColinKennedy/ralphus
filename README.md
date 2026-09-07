@@ -53,7 +53,7 @@ Rust (strict — warnings are errors):
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo nextest run --workspace
 ```
 
 Python (dev-only tooling — doc screenshots and bench-graph rendering, not the
