@@ -3941,6 +3941,7 @@ prompt = "make it build"
         // same as every other tmux-keyed endpoint (`attach_tmux_terminal`,
         // `capture_pane_reply`) already recomputes it.
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let _cleanup_session = crate::tmux::KillSessionOnDrop(session_name.clone());
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             detachments.cancel(&session_name);
