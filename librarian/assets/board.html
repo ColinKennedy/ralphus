@@ -13611,17 +13611,69 @@ Work submitted against it will fail — fix the machine or deregister the provid
         projectTriageModalProject = null;
         closeModal();
       }
+      // RALPHUS-TRIAGE-POOL-MATCH:BEGIN
+      /**
+       * Best-effort, browser-side normalization (RAL-374) for comparing a
+       * Triage pool key against a project's registered path: slash direction
+       * and case folded away. This is a UI hint only -- the daemon
+       * (`crate::triage::pool_key_for_path`) remains the single source of
+       * truth for what a pool key actually resolves to, since only it can
+       * canonicalize a path against the real filesystem (symlinks, drive
+       * substitutions, etc). This just needs to be close enough to stop an
+       * orphaned pool row from silently vanishing from this popup.
+       * @param {string} value
+       * @returns {string}
+       */
+      function normalizeTriagePoolPathHint(value) {
+        return String(value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      }
+      /**
+       * Splits `triagePools` into the rows that exactly match `projectName`
+       * (everything this popup showed before RAL-374) and the rows that
+       * don't match by name but whose key looks like a path variant of
+       * `projectPath` -- i.e. an orphaned pool this popup would otherwise
+       * hide entirely, e.g. a threshold set via the CLI's `<project>`
+       * positional argument before the daemon resolved paths server-side,
+       * or a pre-fix row the once-per-restart `repair_triage_pool_keys` pass
+       * hasn't reached yet.
+       * @param {TriagePoolView[]} triagePools
+       * @param {string} projectName
+       * @param {string|undefined} projectPath
+       * @returns {{matched: TriagePoolView[], orphaned: TriagePoolView[]}}
+       */
+      function partitionTriagePoolsForProject(triagePools, projectName, projectPath) {
+        const matched = [];
+        const orphaned = [];
+        const normalizedProjectPath = projectPath ? normalizeTriagePoolPathHint(projectPath) : "";
+        for (const p of triagePools) {
+          if (p.project === projectName) {
+            matched.push(p);
+          } else if (normalizedProjectPath && normalizeTriagePoolPathHint(p.project) === normalizedProjectPath) {
+            orphaned.push(p);
+          }
+        }
+        return { matched, orphaned };
+      }
+      // RALPHUS-TRIAGE-POOL-MATCH:END
       /**
        * Renders the open Projects-tab Triage-threshold popup for
        * `projectTriageModalProject`: one row per Triage type this project
        * already has a pool or threshold for, plus a picker to add a
-       * threshold for a type it doesn't have one for yet.
+       * threshold for a type it doesn't have one for yet. Also surfaces
+       * (RAL-374) any pool that looks orphaned under a raw path key instead
+       * of this project's registered name, so a real accumulating pool
+       * never silently reads as "No thresholds configured yet".
        * @returns {void}
        */
       function renderProjectTriageModal() {
         const projectName = projectTriageModalProject;
         if (!projectName) return;
-        const rows = triagePools.filter((p) => p.project === projectName);
+        const thisProject = projects.find((pr) => pr.name === projectName);
+        const { matched: rows, orphaned } = partitionTriagePoolsForProject(
+          triagePools,
+          projectName,
+          thisProject ? thisProject.path : undefined,
+        );
         const rowsHtml = rows.length
           ? rows.map((p) => {
               const thresholdVal = p.threshold === null || p.threshold === undefined ? "" : String(p.threshold);
@@ -13647,10 +13699,19 @@ Work submitted against it will fail — fix the machine or deregister the provid
             </div>`
           : `<div class="empty" style="margin-top:12px">Every registered Triage type already has a threshold row above.</div>`;
         const err = projectTriageModalError ? `<div class="verr" style="margin-top:8px">${esc(projectTriageModalError)}</div>` : "";
+        const orphanedBanner = orphaned.length
+          ? `<div class="verr" style="margin-bottom:8px" data-tip="These rows are stored under a raw filesystem-path key instead of this project's registered name, most likely from a threshold set before the daemon resolved the path to a name, or the CLI's <project> argument given a path. They already count toward the total pooled/threshold for this project's cells -- restart the daemon to merge them into the rows below via the automatic repair pass, or inspect them directly on the general Triage tab.">
+              ⚠ ${orphaned.length} orphaned ${orphaned.length === 1 ? "pool" : "pools"} for this project ${orphaned.length === 1 ? "is" : "are"} stored under a raw path key and not shown below:
+              <ul style="margin:4px 0 0 18px">
+                ${orphaned.map((o) => `<li><code>${esc(o.project)}</code> — ${esc(o.triage_type)}: pooled ${o.count}, threshold ${o.threshold === null || o.threshold === undefined ? "none" : o.threshold}</li>`).join("")}
+              </ul>
+            </div>`
+          : "";
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeProjectTriageModal()"><div class="modal" style="width:560px;max-width:94vw">
             <h2>Auto-review thresholds — ${esc(projectName)}</h2>
             <div class="k" style="margin-bottom:8px" data-tip="How many Triage-classified cells of a given type must accumulate for this project before the Arbiter automatically drains that pool into a fresh review. This races any cron schedules configured for the same (project, type) key on the Triage tab -- whichever fires first drains the pool.">How many cells of a given Triage type must accumulate for ${esc(projectName)} before a review is created automatically.</div>
+            ${orphanedBanner}
             <table class="proj-table"><thead><tr>
               <th>Type</th><th data-tip="Cells currently pooled for this project + type, waiting for this threshold (or a cron schedule) to fire.">Pooled</th><th data-tip="Draining this pool creates a review once it holds this many cells.">Threshold</th>
             </tr></thead><tbody>${rowsHtml}</tbody></table>
