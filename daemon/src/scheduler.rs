@@ -344,6 +344,17 @@ impl Semaphore {
         let state = self.state.lock().expect("semaphore mutex poisoned");
         self.capacity - state.permits
     }
+
+    /// Test-only: how many callers are currently blocked in
+    /// [`Self::acquire_ranked`]. Lets a test wait for waiters to actually
+    /// register in the queue instead of guessing with a fixed sleep — a
+    /// cell's DB row stays `Pending` until *after* `acquire_ranked` returns
+    /// (see `run_cell_worker`), so store state can't stand in for this.
+    #[cfg(test)]
+    pub(crate) fn waiting_len(&self) -> usize {
+        let state = self.state.lock().expect("semaphore mutex poisoned");
+        state.waiting.len()
+    }
 }
 
 /// Frees its semaphore slot when dropped.
@@ -4356,9 +4367,19 @@ mod tests {
             });
         });
 
-        // Give both cells time to be dispatched and pile up behind the held
-        // permit before it frees.
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait for both cells to actually register as `acquire_ranked`
+        // waiters before freeing the held permit. A fixed sleep is flaky
+        // when the full daemon suite saturates the test host: the
+        // dispatcher can be runnable without receiving a timeslice, so "y"
+        // may not have reached `sem.acquire_ranked()` yet, letting it grab
+        // the freed permit on plain wakeup order instead of losing to "x"'s
+        // priority as the test intends.
+        for _ in 0..4000 {
+            if sem.waiting_len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(held);
         assert_completes_within(Duration::from_secs(5), move || handle.join().unwrap());
 
@@ -4751,8 +4772,15 @@ mod tests {
             .restart_cell_proof(&id, 0, 0, 0)
             .unwrap();
 
-        // Give the still-alive worker plenty of dispatcher ticks to react.
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait for the still-alive worker to observe the restart. A fixed
+        // sleep is flaky when the full daemon suite saturates the test host:
+        // the dispatcher can be runnable without receiving a timeslice.
+        for _ in 0..4000 {
+            if proof_calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         assert!(
             proof_calls.load(Ordering::SeqCst) >= 2,
