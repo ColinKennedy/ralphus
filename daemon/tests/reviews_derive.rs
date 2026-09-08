@@ -1531,7 +1531,7 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
         &cwd_a,
         &cwd_b,
         "ralphus:new-review/cross",
-        "name=\"Cross Review\"",
+        "name=\"Cross Review\"\nskip_auto_build=true",
     ))
     .unwrap();
     let run = store.insert_squad(&file, None, false).unwrap();
@@ -1582,7 +1582,7 @@ fn link_key_same_repo_branches_have_no_project_tag() {
         &cwd_a,
         &cwd_b,
         "ralphus:new-review/same",
-        "name=\"Same Repo\"",
+        "name=\"Same Repo\"\nskip_auto_build=true",
     ))
     .unwrap();
     let run = store.insert_squad(&file, None, false).unwrap();
@@ -1670,7 +1670,7 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
         &cwd_a,
         &cwd_b,
         "ralphus:new-review/mp",
-        "name=\"MP Review\"",
+        "name=\"MP Review\"\nskip_auto_build=true",
     ))
     .unwrap();
     let gid = {
