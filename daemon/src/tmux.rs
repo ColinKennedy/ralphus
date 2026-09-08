@@ -1142,7 +1142,7 @@ pub fn find_server_pid(name: &str) -> Option<u32> {
 /// piece of this whole subsystem: PowerShell's own .NET startup cost is
 /// substantial even alone, and degrades sharply under the heavy concurrent
 /// subprocess-spawning a full `cargo test` run produces -- two individual
-/// tests (`registers_pid_while_the_subprocess_is_alive_and_clears_it_after`,
+/// tests (`live_tmux_registers_pid_while_the_subprocess_is_alive_and_clears_it_after`,
 /// `live_tmux_registers_and_clears_pid_for_a_command_kind_spec`) were
 /// measured at 31s and 28s respectively, dominated by this call. `sysinfo`
 /// reads the Windows process table directly (via `ntapi`/`winapi`, no
@@ -1622,6 +1622,7 @@ mod tests {
         find_on_path("tmux").is_some()
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_new_session_capture_and_kill_roundtrip() {
         if !tmux_on_path() {
@@ -1672,6 +1673,7 @@ mod tests {
         tmux.kill_session(&name).unwrap();
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_capture_pane_has_no_trailing_blank_lines_for_short_output() {
         // RAL-237: a session whose real output is far shorter than the
@@ -1726,6 +1728,7 @@ mod tests {
         tmux.kill_session(&name).unwrap();
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_has_session_false_for_unknown_name() {
         if !tmux_on_path() {
@@ -1744,6 +1747,7 @@ mod tests {
     /// token through that real delivery path and asserts the pane shows the
     /// command but never the value, while the process still sees the variable
     /// (proved by echoing its length, never the value).
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_env_override_delivered_without_leaking_its_value() {
         if !tmux_on_path() {
@@ -1831,6 +1835,7 @@ mod tests {
     /// bypasses the boundary check on purpose and drives such a value down the
     /// real delivery path to confirm the launch line is no longer a place a
     /// newline can corrupt or split a command.
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_env_value_newline_delivered_via_e_does_not_corrupt_the_command() {
         if !tmux_on_path() {
