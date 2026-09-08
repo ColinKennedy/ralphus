@@ -227,6 +227,12 @@ pub const REVIEW_KEYS: &[&str] = &[
     "maximum_budget_usd",
     "proof_scope",
     "auto_submit_pr_stack",
+    "skip_worktrees",
+    "auto_pr_feedback",
+    "skip_base_updates",
+    "skip_auto_clean",
+    "match_pr_branch_name",
+    "separate_pr_branch",
     "auto_build",
     "skip_auto_build",
 ];
@@ -1179,6 +1185,23 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             }
         }
         check_type(ctx, table, "auto_submit_pr_stack", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "skip_worktrees", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "auto_pr_feedback", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "skip_base_updates", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "skip_auto_clean", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "match_pr_branch_name", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "separate_pr_branch", Ty::Bool, &rpath, header);
+        if table.contains_key("skip_auto_clean")
+            && table.get("proof_scope").and_then(toml::Value::as_str)
+                != Some(crate::schema::PROOF_SCOPE_EACH_BRANCH)
+        {
+            ctx.error(
+                &format!("{rpath}.skip_auto_clean"),
+                ErrorKind::InvalidValue,
+                "'skip_auto_clean' requires 'proof_scope = \"each_branch\"' because auto-clean skipping only applies to each-branch proof runs",
+                ctx.key_line(header, "skip_auto_clean"),
+            );
+        }
         check_type(ctx, table, "skip_auto_build", Ty::Bool, &rpath, header);
         validate_auto_build_table(table, &rpath, ctx, header);
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
@@ -2358,6 +2381,55 @@ command = "cargo build"
             "{:?}",
             r.errors
         );
+    }
+
+    #[test]
+    fn review_settings_bool_fields_are_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_settings_bool_fields_reject_wrong_types() {
+        for key in [
+            "skip_worktrees",
+            "auto_pr_feedback",
+            "skip_base_updates",
+            "skip_auto_clean",
+            "match_pr_branch_name",
+            "separate_pr_branch",
+        ] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\n{key}=\"yes\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::WrongType && e.message.contains(key)),
+                "{key}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn review_skip_auto_clean_requires_each_branch_proof_scope() {
+        for scope in [None, Some("final_branch"), Some("nothing")] {
+            let scope = scope.map_or(String::new(), |value| format!("proof_scope=\"{value}\"\n"));
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n{scope}skip_auto_clean=true\n"
+            );
+            let r = validate_toml(&src);
+            assert!(
+                r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("skip_auto_clean")
+                    && e.message.contains("each_branch")),
+                "{scope:?}: {:?}",
+                r.errors
+            );
+        }
     }
 
     #[test]

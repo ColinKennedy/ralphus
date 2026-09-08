@@ -881,6 +881,28 @@ pub struct ReviewDef {
     /// needing a follow-up command.
     #[serde(default)]
     pub auto_submit_pr_stack: Option<bool>,
+    /// Whether this review skips per-branch worktrees. An explicit value wins
+    /// over the project-level `.ralphus.toml [review] skip_worktrees` default.
+    #[serde(default)]
+    pub skip_worktrees: Option<bool>,
+    /// Whether this review automatically incorporates PR feedback comments.
+    #[serde(default)]
+    pub auto_pr_feedback: Option<bool>,
+    /// Whether this review skips automatic base-branch update rebuilds.
+    #[serde(default)]
+    pub skip_base_updates: Option<bool>,
+    /// Whether each-branch proof runs skip auto-clean branches. This requires
+    /// `proof_scope = "each_branch"`.
+    #[serde(default)]
+    pub skip_auto_clean: Option<bool>,
+    /// Whether submitted PRs use the exact worktree branch name rather than
+    /// the convention-derived alias.
+    #[serde(default)]
+    pub match_pr_branch_name: Option<bool>,
+    /// Whether this review pushes its PR to a branch separate from its review
+    /// branch.
+    #[serde(default)]
+    pub separate_pr_branch: Option<bool>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,

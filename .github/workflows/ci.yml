@@ -239,6 +239,10 @@ jobs:
         run: python -m unittest scripts/test_check_rlog_cartographer_pairs.py
       - name: Check daemon rlog / Cartographer pairs
         run: python scripts/check_rlog_cartographer_pairs.py
+      - name: Test review settings parity checker
+        run: python -m unittest scripts/test_check_review_settings_parity.py
+      - name: Check review settings / TOML parity
+        run: python scripts/check_review_settings_parity.py
 
   docs:
     name: Docs (screenshot coverage lint)

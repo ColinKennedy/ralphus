@@ -379,6 +379,28 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 `ralphus review settings <selector> --proof-scope
                 <value>`, but declared up front so the review is
                 created with the right scope from its first merge.
+ skip_worktrees
+        bool    Skip per-branch worktrees. Overrides the project-level
+                .ralphus.toml [review] skip_worktrees setting.
+ auto_pr_feedback
+        bool    Automatically incorporate PR feedback comments for this
+                review. This setting has no project-level default.
+ skip_base_updates
+        bool    Skip automatic base-branch update rebuilds. Overrides the
+                project-level .ralphus.toml [review] skip_base_updates
+                setting.
+ skip_auto_clean
+        bool    Skip auto-clean branches during proof runs. Requires
+                `proof_scope = "each_branch"` because other proof scopes
+                have no per-branch proof run to skip.
+ match_pr_branch_name
+        bool    Use the exact worktree branch name for submitted PRs instead
+                of the convention-derived alias. Overrides the project-level
+                .ralphus.toml [review] match_pr_branch_name setting.
+ separate_pr_branch
+        bool    Push a PR to a branch separate from the review branch.
+                Overrides the project-level .ralphus.toml [review]
+                separate_pr_branch setting.
  auto_submit_pr_stack
         bool    Opt this review into auto-submitting/growing its PR
                 stack as each branch reaches a terminal merge state,

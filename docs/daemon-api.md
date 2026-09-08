@@ -1473,6 +1473,14 @@ body are changed, everything else is left as-is. Returns the updated
 `GuardianView`. Most fields are documented by their name alone (see
 `GuardianSettingsBody` in `daemon/src/server.rs` for the exhaustive list).
 
+The settings `skip_worktrees`, `auto_pr_feedback`, `skip_base_updates`,
+`proof_skip_auto_clean`, `match_pr_branch_name`, and `separate_pr_branch` are
+also declarable at submit time in `[[review]]` as the same names, except
+`proof_skip_auto_clean`, which is `skip_auto_clean`. `skip_auto_clean` requires
+`proof_scope = "each_branch"`. `base_branch` is represented at submit time by
+`[[review]] upstream`: the guardian's base branch is minted from that declared
+or inferred upstream when the review is created.
+
 `separate_pr_branch` (RAL-378, optional boolean) controls whether this
 review's pull request gets a remote branch of its own. `false` -- the default
 -- means the review branch *is* the PR branch: every branch registered since
