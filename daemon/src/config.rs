@@ -418,6 +418,34 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
         ReviewFieldDefault::ProjectDefault(|c| c.auto_submit_pr_stack.is_some()),
     ),
     (
+        "skip_worktrees",
+        ReviewFieldDefault::ProjectDefault(|c| c.skip_worktrees.is_some()),
+    ),
+    (
+        "match_pr_branch_name",
+        ReviewFieldDefault::ProjectDefault(|c| c.match_pr_branch_name.is_some()),
+    ),
+    (
+        "skip_base_updates",
+        ReviewFieldDefault::ProjectDefault(|c| c.skip_base_updates.is_some()),
+    ),
+    (
+        "proof_skip_auto_clean",
+        ReviewFieldDefault::ProjectDefault(|c| c.proof_skip_auto_clean.is_some()),
+    ),
+    (
+        "checks",
+        ReviewFieldDefault::ProjectDefault(|c| !c.checks.is_empty()),
+    ),
+    (
+        "auto_build",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_build.is_some()),
+    ),
+    (
+        "summary_format",
+        ReviewFieldDefault::ProjectDefault(|c| c.summary_format.is_some()),
+    ),
+    (
         "action",
         ReviewFieldDefault::NotApplicable(
             "action hints are bespoke per-review manual-test buttons tied to review-specific \
