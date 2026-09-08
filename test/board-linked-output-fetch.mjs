@@ -1,9 +1,9 @@
-// Loads `fetchLinkedOutputText` out of librarian/assets/board.html so its
+// Loads `fetchLinkedOutputText` out of the board chunk files (librarian/assets/board/) so its
 // terminal-log-attempts-first/pane-fallback logic can be exercised under
 // `node --test` with no browser and no build step.
 //
 // Same slice-the-real-source approach as ./board-peek-state.mjs — see that
-// file's header for why board.html can't simply be imported. The region
+// file's header for why the chunk files can't simply be imported. The region
 // between the RALPHUS-LINKED-OUTPUT-FETCH markers calls only
 // `terminalLogAttemptsUrlFor`/`peekUrlFor`/`scrubSecrets` (injected below as
 // parameters) and the ambient `fetch` global, which tests stub per-case via
@@ -11,7 +11,7 @@
 // scope resolves the bare `fetch` identifier straight through to whatever
 // `globalThis.fetch` is at call time.
 
-import { readFileSync } from "node:fs";
+import { boardScript } from "./board-source.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -19,9 +19,9 @@ const BEGIN = "// RALPHUS-LINKED-OUTPUT-FETCH:BEGIN";
 const END = "// RALPHUS-LINKED-OUTPUT-FETCH:END";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const boardPath = join(repoRoot, "librarian", "assets", "board.html");
+export const boardPath = join(repoRoot, "librarian", "assets", "board");
 
-const html = readFileSync(boardPath, "utf8");
+const html = boardScript();
 const from = html.indexOf(BEGIN);
 const to = html.indexOf(END);
 if (from === -1 || to === -1 || to < from) {
@@ -41,7 +41,7 @@ const factory = new Function(
 );
 
 /**
- * Builds `fetchLinkedOutputText`, evaluated straight from board.html, wired
+ * Builds `fetchLinkedOutputText`, evaluated straight from the board chunks, wired
  * to the given key-resolution stubs. `scrubSecrets` defaults to a no-op
  * pass-through — its own redaction behaviour has its own coverage elsewhere
  * and is out of scope here.

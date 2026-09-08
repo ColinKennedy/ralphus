@@ -1,54 +1,46 @@
-// Knip config for the librarian's inline board.html JavaScript.
+// Knip config for the librarian's board chunks (librarian/assets/board/*.js).
 //
-// board.html is a single static page whose entire client is one inline
-// <script> block (see eslint.config.mjs / tsconfig.board.json for the other
-// two lint layers). Knip only parses .js/.ts-family files, so board.html
-// can't be handed to it unmodified — but unlike the ESLint/tsc setup, it
-// doesn't need a separate physical extraction file + path-rewritten output
-// (scripts/extract-board-js.mjs + scripts/typecheck-board.mjs): knip's
-// `compilers` hook lets us transform a file's content in memory right before
-// parsing, so knip still runs against, and reports diagnostics against, the
-// real librarian/assets/board.html path — this *is* "using the .html as-is"
-// as far as knip's own extension model allows.
-//
-// board.html's script is a plain global script, not an ES module — no
-// import/export — so out of the box knip's cross-file reachability graph has
-// nothing to walk inside it: it can only tell whether board.html itself is
-// reachable, not whether any function *inside* it is dead. compileHtml()
-// below makes knip see intra-file dead code too, by faking a module graph
-// over the single file:
+// The chunks are plain global-scope scripts — no import/export — so knip's
+// cross-file reachability graph has nothing to walk inside them. The
+// librarian's board.html page shell is registered as the entry (knip cannot
+// parse HTML, hence the `html` compiler below), and compileHtml() fakes a
+// module over the page by inlining the chunk files in place of the shell's
+// <script src> tags, so knip sees them as one scope and also catches
+// intra-chunk dead code:
 //
 //   1. Every top-level `function foo(...)` / `async function foo(...)` /
-//      `const foo = (...) => ...` is rewritten to carry `export`, so it
-//      enters knip's exports analysis at all (`includeEntryExports: true`
-//      is required alongside this — entry-file exports are otherwise
-//      presumed to be a public API and skipped).
-//   2. Every OTHER occurrence of `declaredName(` anywhere in the raw
-//      document (i.e. excluding each function's own declaration site) is
-//      collected into a synthetic `void [...]` reference sink appended to
-//      the compiled output. This is the crux: most of board.html's handlers
-//      are wired via inline HTML on* attributes or dynamically-built
-//      `onclick="...foo(...)"` strings inside JS template literals — plain
-//      text as far as any parser is concerned, invisible to real reference
-//      tracking (the same reason ESLint's `no-unused-vars` is disabled
-//      below). The sink turns each such name into one real, trivial AST
-//      reference, so knip's reference finder counts it as used without
-//      needing to understand HTML or string contents at all.
+//      `const foo = (...) => ...` in the chunks is rewritten to carry
+//      `export`, so it enters knip's exports analysis at all
+//      (`includeEntryExports: true` is required alongside this, since
+//      entry-file exports are normally presumed to be public API and
+//      skipped).
+//   2. Every OTHER occurrence of `declaredName(` anywhere in the assembled
+//      chunks OR in the shell's own markup (i.e. excluding each function's
+//      own declaration site) is collected into a synthetic `void [...]`
+//      reference sink appended to the compiled output. This is the crux:
+//      most of the board's handlers are wired via inline HTML on*
+//      attributes in the shell or dynamically-built `onclick="...foo(...)"`
+//      strings inside the chunks' JS template literals — plain text as far
+//      as any parser is concerned, invisible to real reference tracking (the
+//      same reason ESLint's `no-unused-vars` is disabled in
+//      eslint.config.mjs). The sink turns each such name into one real,
+//      trivial AST reference, so knip's reference finder counts it as used
+//      without needing to understand HTML or string contents at all.
 //   3. `ignoreExportsUsedInFile: true` is also required: by default knip
 //      only counts an export as "used" if some *other* file imports it — a
 //      same-file reference (exactly what the sink produces) is otherwise
 //      still reported unused, since exporting normally signals "meant to be
 //      imported elsewhere". With this flag, same-file usage counts too.
 //
-// Net effect: a name left with zero occurrences anywhere in the document
-// other than its own declaration — not in real code, not inside any
-// on*="..." string, not passed through a helper like
-// `terminalMenuItem(key, label, \`foo(...)\`, tip)` — is genuinely dead and
-// gets reported. Verified against board.html: found 3 true positives
-// (openVerifyNodeMenu, setVerifyMidResolution, queueStabilize — all
-// superseded/orphaned handlers with zero other references) and zero false
-// positives after the sink was in place, including for functions wired
-// through several layers of string indirection.
+// Net effect: a name left with zero occurrences anywhere in the chunks or
+// the shell — not in real code, not inside any on*="..." string, not passed
+// through a helper like `terminalMenuItem(key, label, \`foo(...)\`, tip)` —
+// is genuinely dead and gets reported. Verified against the board source:
+// found 3 true positives (openVerifyNodeMenu, setVerifyMidResolution,
+// queueStabilize — all superseded/orphaned handlers with zero other
+// references) and zero false positives after the sink was in place,
+// including for functions wired through several layers of string
+// indirection.
 //
 // Caveats — this is a heuristic, not real reference tracking, and can in
 // principle miss a genuinely dead function (a false negative, which is
@@ -57,45 +49,75 @@
 //     dispatch table, where the literal name string never appears next to
 //     an opening paren; or
 //   - its name happens to coincide with some unrelated call elsewhere in
-//     the document (e.g. a same-named property/method on a different
-//     object) — low risk given this codebase's descriptive, distinctive
-//     naming.
+//     the assembled source (e.g. a same-named property/method on a
+//     different object) — low risk given this codebase's descriptive,
+//     distinctive naming.
 // It will not produce a false positive from any of the string-based wiring
 // patterns above, since those are exactly what the sink is built to catch.
-const SCRIPT_RE = /<script>\r?\n([\s\S]*?)<\/script>/;
+//
+// Line mapping: the compiled output is blank-padded so the shell's own
+// lines keep their board.html line numbers, and the chunks follow them in
+// order. `npm run knip` (scripts/knip-board.mjs) recomputes that same
+// layout and rewrites diagnostics to the real per-chunk paths, so an error
+// always names the chunk file to edit.
+
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = dirname(fileURLToPath(import.meta.url));
+const boardDir = join(repoRoot, "librarian", "assets", "board");
+
+// The chunks are plain global-script JS in original load order, indented the
+// same way the board's script body was before the split (6 spaces at top
+// level), so these regexes match the same declaration shapes the single-file
+// era compiled.
 const TOPLEVEL_FN_RE = /^(\s{6})(async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm;
 const TOPLEVEL_ARROW_RE = /^(\s{6})(const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(async\s+)?\(/gm;
 const CALL_RE = /\b([A-Za-z_$][\w$]*)\s*\(/g;
+const DECL_RE = /^(\s{6})(async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm;
+const ARROW_DECL_RE = /^(\s{6})(const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(async\s+)?\(/gm;
+
+const SCRIPT_SRC_RE = /^.*<script src="\/board\//m;
 
 /**
- * Extracts board.html's inline <script>, rewrites every top-level
- * function/arrow declaration into an export, and appends a synthetic
- * reference sink so string-only-dispatched handlers don't false-positive as
- * unused (see the file header for the full rationale).
- * @param {string} text raw board.html source
+ * Inlines the board chunk files into the shell in place of its
+ * `<script src="/board/...">` tags and rewrites every top-level
+ * function/arrow declaration into an export, plus a synthetic reference
+ * sink so string-only-dispatched handlers don't false-positive as unused
+ * (see the file header for the full rationale). Knip calls compilers as
+ * `(text, filePath)` — the file's contents first — so `text` is the shell.
+ * @param {string} text the board.html page shell
+ * @param {string} _filePath the shell's path (unused)
  * @returns {string} compiled pseudo-module, blank-padded to board.html's line numbers
  */
-function compileHtml(text) {
-  const match = text.match(SCRIPT_RE);
-  if (!match) return "";
-  const startLine = text.slice(0, match.index).split("\n").length;
-  const script = match[1];
+function compileHtml(text, _filePath) {
+  const shell = text;
+  const files = readdirSync(boardDir)
+    .filter((f) => f.endsWith(".js") && !f.startsWith("."))
+    .sort();
+  const chunks = files.map((f) => readFileSync(join(boardDir, f), "utf8"));
+  const contents = chunks.join("");
+  const scriptStart = shell.slice(0, shell.search(SCRIPT_SRC_RE)).split("\n").length;
 
   const declared = new Set();
-  for (const m of script.matchAll(TOPLEVEL_FN_RE)) declared.add(m[3]);
-  for (const m of script.matchAll(TOPLEVEL_ARROW_RE)) declared.add(m[3]);
+  for (const m of contents.matchAll(TOPLEVEL_FN_RE)) declared.add(m[3]);
+  for (const m of contents.matchAll(TOPLEVEL_ARROW_RE)) declared.add(m[3]);
 
   // Blank out each declaration's own header so it can't match CALL_RE and
   // count as a reference to itself.
-  const DECL_RE = /(\s{6})(async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
-  const scanText = text.replace(DECL_RE, (m) => " ".repeat(m.length));
+  const scanText = contents
+    .replace(DECL_RE, (m) => " ".repeat(m.length))
+    .replace(ARROW_DECL_RE, (m) => " ".repeat(m.length));
 
   const referenced = new Set();
-  for (const call of scanText.matchAll(CALL_RE)) {
-    if (declared.has(call[1])) referenced.add(call[1]);
+  for (const source of [scanText, shell]) {
+    for (const call of source.matchAll(CALL_RE)) {
+      if (declared.has(call[1])) referenced.add(call[1]);
+    }
   }
 
-  const exportedScript = script
+  const exportedScript = contents
     .replace(TOPLEVEL_FN_RE, (_m, indent, async, name) => `${indent}export ${async || ""}function ${name}(`)
     .replace(
       TOPLEVEL_ARROW_RE,
@@ -103,7 +125,7 @@ function compileHtml(text) {
     );
   const sink = referenced.size ? `\nvoid [${[...referenced].join(", ")}];\n` : "";
 
-  return "\n".repeat(startLine) + exportedScript + sink;
+  return "\n".repeat(scriptStart) + exportedScript + sink;
 }
 
 export default {
@@ -112,11 +134,14 @@ export default {
     // Knip's own config file is never imported by anything — it's loaded by
     // the knip CLI itself — so without this it reports itself as unused.
     "knip.config.js",
-    // A one-off, rerunnable maintenance tool invoked manually
+    // One-off, rerunnable maintenance tools invoked manually
     // (`node scripts/reformat-jsdoc.mjs`), not from an npm script or import
-    // — see its own header comment. Knip's docs recommend `entry` for
+    // — see their own header comments. Knip's docs recommend `entry` for
     // exactly this "intentionally manual, never referenced" case.
     "scripts/reformat-jsdoc.mjs",
+    // `npm run lint` / `npm run knip` invoke these via npm scripts; knip
+    // resolves them through the package.json scripts and needs no entry line
+    // for generate-board-globals.mjs or knip-board.mjs.
     // `npm test` (node --test) discovers these by filename, not by import, so
     // knip has no edge into them (RAL-186).
     "test/*.test.mjs",
@@ -126,9 +151,9 @@ export default {
   },
   includeEntryExports: true,
   ignoreExportsUsedInFile: true,
-  // No `project` override: knip's default project glob
-  // (**/*.{js,mjs,cjs,jsx,ts,tsx,mts,cts}, gitignore-filtered) already covers
-  // every other file in this Node package (eslint.config.mjs,
-  // scripts/*.mjs), so it also audits those for unused files/exports/deps —
-  // not just board.html.
+  // The chunk and vendor files are inlined into the compiled shell above and
+  // are never imported by anything — without this knip would report them as
+  // unused files. The shell itself is the entry and must NOT be covered by
+  // this ignore.
+  ignore: ["librarian/assets/board/**", "librarian/assets/vendor/**"],
 };

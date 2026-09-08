@@ -25,9 +25,10 @@ build/
 # .git/.ralphus_guardian/, which git already excludes — no entry needed.)
 /.worktrees/
 
-# Node (only for linting/type-checking board.html's inline JS — see package.json)
+# Node (lint/type-check tooling for the librarian's board chunk JS — see
+# package.json)
 node_modules/
-# tsc --checkJs input: board.html's <script> body extracted to a real .js file
+# lint/typecheck/knip scratch output (generated board globals, etc.)
 /.lint-tmp/
 
 # Docs site build output (docs/site/pages/*.md -> HTML). The screenshots

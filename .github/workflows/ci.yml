@@ -123,7 +123,7 @@ jobs:
         run: '& $env:RALPHUS_TMUX_CMD kill-server'
 
   web:
-    name: Web (eslint + tsc --checkJs + knip + node --test on board.html)
+    name: Web (eslint + tsc --checkJs + knip + node --test on the board chunks)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -134,13 +134,13 @@ jobs:
           node-version: "22"
       - name: Install lint deps
         run: npm install --no-audit --no-fund
-      - name: ESLint (inline board.html JS, incl. JSDoc coverage)
-        run: npx eslint librarian/assets/board.html
-      - name: Type-check board.html's JSDoc-annotated JS (tsc --checkJs)
+      - name: ESLint (board chunk JS, incl. JSDoc coverage)
+        run: npm run lint
+      - name: Type-check the board chunks' JSDoc-annotated JS (tsc --checkJs)
         run: npm run typecheck
       - name: Knip (dead code / unused deps)
         run: npm run knip
-      - name: Unit tests (board.html's pure peek state machine)
+      - name: Unit tests (the board's pure peek state machine)
         run: npm test
 
   python-lint:
@@ -254,7 +254,7 @@ jobs:
           enable-cache: true
       - name: Sync dependencies
         run: uv sync --dev
-      - name: Every board.html tab has a screenshot
+      - name: Every board tab has a screenshot
         run: uv run ralphus-docs-lint
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal

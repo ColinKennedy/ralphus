@@ -1,12 +1,12 @@
 # Ralphus UI Color Guide
 
 The single source of truth for **what color means what** in the Ralphus web board
-(`librarian/assets/board.html`). When you add or change any UI element, pick a
+(`librarian/assets/board.css`, the UI in `librarian/assets/board.html` + `board/*.js`). When you add or change any UI element, pick a
 color from this document — do not invent an ad-hoc color or hardcode a hex value.
 
 ## Where colors are defined
 
-All colors are CSS custom properties declared once in `board.html`:
+All colors are CSS custom properties declared once in `librarian/assets/board.css`:
 
 - `:root { … }` — the **dark theme** (the default).
 - `[data-theme="light"] { … }` — the **light theme**, which overrides only the
@@ -193,7 +193,7 @@ to write back to.
 ### Stale liveness — `--stale` only (RAL-170)
 The Live View peek box shows the timestamp of the last fresh pane output
 received for a running cell; once that gap passes a threshold
-(`PEEK_STALE_WARNING_MS` in `board.html`) the timestamp switches from
+(`PEEK_STALE_WARNING_MS` in `librarian/assets/board/35-terminal-logs.js`) the timestamp switches from
 `--muted` to `--stale`, a caution that a still-`running` cell may have
 silently hung rather than a normal quiet stretch. Distinct from the
 caution-reserved `--ignored` (that amber is for the genuine `ignored`
@@ -283,7 +283,7 @@ at runtime, so there is still exactly one place this color is defined.
 ## Adding a new UI element — checklist
 
 1. Is there an existing semantic role above that fits? Use its variable.
-2. If not, add a new `var(--name)` in `board.html` (`:root`, plus the light
+2. If not, add a new `var(--name)` in `board.css` (`:root`, plus the light
    override if needed), add a row to the palette + a semantic role here, then use it.
 3. Never hardcode a hex value or clone an existing hue's number inline — always go
    through a variable so the palette stays the one place colors are defined.

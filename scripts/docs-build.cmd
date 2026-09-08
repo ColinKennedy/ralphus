@@ -6,7 +6,7 @@ rem into docs\site\_site\ using whatever PNGs are already committed under
 rem docs\site\pages\screenshots\. Never touches Playwright, so this is cheap
 rem to re-run on every doc edit.
 rem
-rem To regenerate the screenshots themselves (only needed after a board.html
+rem To regenerate the screenshots themselves (only needed after a board
 rem UI change), run docs-screenshots.cmd instead -- a separate, heavier step.
 
 set "root=%~dp0.."

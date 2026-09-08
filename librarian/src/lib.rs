@@ -5,6 +5,8 @@
 //! own (a future flag will make that opt-in). Keeping the logic in a library
 //! makes the argument parsing and daemon-URL resolution unit-testable.
 
+pub mod asset_rules;
+pub mod assets;
 pub mod config;
 pub mod otel;
 pub mod server;

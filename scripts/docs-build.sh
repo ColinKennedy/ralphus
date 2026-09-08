@@ -5,7 +5,7 @@
 # docs/site/pages/screenshots/. Never touches Playwright, so this is cheap
 # to re-run on every doc edit.
 #
-# To regenerate the screenshots themselves (only needed after a board.html
+# To regenerate the screenshots themselves (only needed after a board
 # UI change), run docs-screenshots.sh instead -- a separate, explicit,
 # heavier step.
 set -euo pipefail
