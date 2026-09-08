@@ -68,3 +68,26 @@ Ollama-backed test that runs unconditionally. Keep the same runtime guard too
 (skip/return early with a clear message if Ollama isn't reachable on
 `127.0.0.1:11434` or the required model isn't pulled), so even an explicit
 opt-in run degrades gracefully without live infra.
+
+## Testing — real tmux/psmux
+
+Every Windows test that starts, queries, or kills a real psmux session is named
+`live_tmux_*` and `#[ignore]`d on Windows. A developer's psmux server is shared
+with the live Ralphus stack, while nextest launches each test in a separate
+process, so the crate's in-process `LIVE_TMUX_TEST_LOCK` cannot isolate a normal
+local run from either source of contention.
+
+The per-PR `psmux-integration` job in `.github/workflows/ci.yml` downloads a
+checksum-pinned psmux release, gives it a job-private `PSMUX_DATA_DIR`, and runs
+the ignored `live_tmux_*` tests serially. `.github/workflows/psmux-stress.yml`
+runs the same tests concurrently on a schedule or manual dispatch. This keeps
+the default local suite hermetic while preserving both reliable compatibility
+coverage and an explicit shared-server stress signal.
+
+When adding a test that touches the real binary on Windows:
+
+- give it a `live_tmux_*` name;
+- add `#[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]`;
+- use `unique_test_tag` and a cleanup guard for every session it creates; and
+- keep concurrency inside the test explicit when concurrency is the behavior
+  under test. Ambient load from unrelated tests is not an assertion.

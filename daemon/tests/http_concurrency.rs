@@ -11,30 +11,67 @@
 //!
 //! The slow endpoint here is the real one: `GET
 //! /api/pull-requests/{id}/sync-status` runs `git fetch` against the review's
-//! remote. Pointing that remote at a `git://` listener that accepts the
-//! connection and then simply waits makes the handler take a duration the
-//! test picks exactly, with no sleep injected into production code and no
-//! network access.
+//! remote. Pointing that remote at a `git://` listener that holds accepted
+//! connections lets each test observe which requests reached the remote before
+//! releasing them, with no sleep injected into production code and no network
+//! access.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ralphus_daemon::server::serve_with;
 use ralphus_daemon::store::Store;
 
-/// How long the fake git remote stalls each connection -- i.e. how long the
-/// slow GET takes. Long enough that a serialized accept loop is unmistakable,
-/// short enough to keep the test quick.
-const STALL: Duration = Duration::from_millis(1500);
+/// A generous deadlock backstop. Concurrency is proved by observing which
+/// connections reach the fake remote before it is released, not by comparing
+/// handler wall-clock time against this budget.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The budget a request that is *not* the slow one must fit in. Well under
-/// [`STALL`], so the assertion fails outright if the request was queued
-/// behind it rather than answered alongside it.
-const PROMPT: Duration = Duration::from_millis(750);
+#[derive(Default)]
+struct StallState {
+    connections: usize,
+    released: bool,
+}
+
+#[derive(Default)]
+struct StallController {
+    state: Mutex<StallState>,
+    changed: Condvar,
+}
+
+impl StallController {
+    fn connection_arrived(&self) {
+        let mut state = self.state.lock().expect("stall state mutex poisoned");
+        state.connections += 1;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .expect("stall state mutex poisoned");
+        }
+    }
+
+    fn wait_for_connections(&self, expected: usize, timeout: Duration) -> bool {
+        let state = self.state.lock().expect("stall state mutex poisoned");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.connections < expected)
+            .expect("stall state mutex poisoned");
+        state.connections >= expected
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("stall state mutex poisoned");
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
 
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -68,23 +105,25 @@ fn tmp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Bind a `git://` port that accepts connections and then stalls for
-/// [`STALL`] before dropping them, so `git fetch` against it takes a duration
-/// this test controls. The listener thread outlives the test on purpose --
-/// the test binary exiting is what cleans it up.
-fn stalling_git_remote() -> u16 {
+/// Bind a `git://` port that accepts connections and holds them until the test
+/// releases them. The controller lets tests prove overlap from observable
+/// ordering rather than scheduler-sensitive elapsed-time thresholds.
+fn stalling_git_remote() -> (u16, Arc<StallController>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalling remote");
     let port = listener.local_addr().expect("local addr").port();
+    let controller = Arc::new(StallController::default());
+    let controller_for_listener = Arc::clone(&controller);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
+            let controller = Arc::clone(&controller_for_listener);
             thread::spawn(move || {
-                thread::sleep(STALL);
+                controller.connection_arrived();
                 drop(stream);
             });
         }
     });
-    port
+    (port, controller)
 }
 
 /// A live daemon serving `repos` pull requests, **each in its own git
@@ -100,8 +139,8 @@ fn stalling_git_remote() -> u16 {
 /// the other half of this.
 ///
 /// Returns the daemon's base URL and one PR id per repository.
-fn fixture(repos: usize) -> (String, Vec<String>) {
-    let port = stalling_git_remote();
+fn fixture(repos: usize) -> (String, Vec<String>, Arc<StallController>) {
+    let (port, stall) = stalling_git_remote();
     let store = Store::open_in_memory().expect("store");
     let mut pr_ids = Vec::with_capacity(repos);
 
@@ -160,56 +199,55 @@ fn fixture(repos: usize) -> (String, Vec<String>) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral port");
     let addr = server.server_addr().to_ip().expect("ip addr");
     thread::spawn(move || serve_with(server, store, 4));
-    (format!("http://{addr}"), pr_ids)
+    (format!("http://{addr}"), pr_ids, stall)
 }
 
-fn request(method: &str, url: &str) -> (u16, Duration) {
-    let started = Instant::now();
+fn request(method: &str, url: &str) -> u16 {
     let resp = match method {
         "POST" => ureq::post(url).send_string(""),
         _ => ureq::get(url).call(),
     };
-    let status = match resp {
+    match resp {
         Ok(r) => r.status(),
         Err(ureq::Error::Status(code, _)) => code,
         Err(e) => panic!("request error: {e}"),
-    };
-    (status, started.elapsed())
+    }
 }
 
-/// The acceptance criterion: kicking off a rebase is answered promptly even
-/// while the board's own polling has a multi-second read in flight.
+/// The acceptance criterion: kicking off a rebase is answered before the
+/// board's in-flight polling read is released.
 #[test]
 fn merge_kickoff_is_answered_while_a_slow_read_is_in_flight() {
-    let (base, pr_ids) = fixture(1);
+    let (base, pr_ids, stall) = fixture(1);
 
     let slow_url = format!("{base}/api/pull-requests/{}/sync-status", pr_ids[0]);
     let slow = thread::spawn(move || request("GET", &slow_url));
 
-    // Let the slow read reach its `git fetch` before timing anything, so the
-    // accept loop really is occupied when the POST arrives.
-    thread::sleep(Duration::from_millis(400));
+    assert!(
+        stall.wait_for_connections(1, WAIT_TIMEOUT),
+        "slow read never reached the fake git remote"
+    );
 
     // A guardian id that does not exist: this exercises the real merge route
     // and its store access, and returns 404 without starting a rebase whose
     // worker would then outlive the test.
-    let (status, elapsed) = request(
-        "POST",
-        &format!("{base}/api/guardians/guardian-000000009999/merge"),
+    let (status_tx, status_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let status = request(
+            "POST",
+            &format!("{base}/api/guardians/guardian-000000009999/merge"),
+        );
+        let _ = status_tx.send(status);
+    });
+    let status = status_rx.recv_timeout(WAIT_TIMEOUT);
+    stall.release();
+    let status = status.expect(
+        "merge kickoff did not answer while the slow read was held; it queued behind the read",
     );
     assert_eq!(status, 404, "merge route reached and answered");
-    assert!(
-        elapsed < PROMPT,
-        "merge kickoff took {elapsed:?}, which means it queued behind the in-flight read"
-    );
 
-    let (slow_status, slow_elapsed) = slow.join().expect("slow read thread");
+    let slow_status = slow.join().expect("slow read thread");
     assert_eq!(slow_status, 200);
-    assert!(
-        slow_elapsed >= STALL,
-        "the read was supposed to be slow but took only {slow_elapsed:?} -- \
-         the fixture is not producing the load this test needs"
-    );
 }
 
 /// Reads are answered concurrently with each other, not one after another:
@@ -222,9 +260,8 @@ fn merge_kickoff_is_answered_while_a_slow_read_is_in_flight() {
 #[test]
 fn concurrent_slow_reads_overlap_instead_of_queueing() {
     const READS: usize = 3;
-    let (base, pr_ids) = fixture(READS);
+    let (base, pr_ids, stall) = fixture(READS);
 
-    let started = Instant::now();
     let readers: Vec<_> = pr_ids
         .iter()
         .map(|pr_id| {
@@ -232,19 +269,15 @@ fn concurrent_slow_reads_overlap_instead_of_queueing() {
             thread::spawn(move || request("GET", &url))
         })
         .collect();
+    let overlapped = stall.wait_for_connections(READS, WAIT_TIMEOUT);
+    stall.release();
     for reader in readers {
-        let (status, _) = reader.join().expect("reader thread");
+        let status = reader.join().expect("reader thread");
         assert_eq!(status, 200);
     }
-    let total = started.elapsed();
-
     assert!(
-        total >= STALL,
-        "each read must really have stalled; total was {total:?}"
-    );
-    assert!(
-        total < STALL * 2,
-        "{READS} {STALL:?} reads took {total:?} -- they were served one at a time"
+        overlapped,
+        "fewer than {READS} reads reached the fake remote together; they were served one at a time"
     );
 }
 
@@ -258,25 +291,26 @@ fn concurrent_slow_reads_overlap_instead_of_queueing() {
 /// the first place, so the lock preventing it is pinned here.
 #[test]
 fn same_repo_sync_status_reads_serialize() {
-    let (base, pr_ids) = fixture(1);
+    let (base, pr_ids, stall) = fixture(1);
     let url = format!("{base}/api/pull-requests/{}/sync-status", pr_ids[0]);
 
-    let started = Instant::now();
     let readers: Vec<_> = (0..2)
         .map(|_| {
             let url = url.clone();
             thread::spawn(move || request("GET", &url))
         })
         .collect();
+    assert!(
+        stall.wait_for_connections(1, WAIT_TIMEOUT),
+        "first read never reached the fake git remote"
+    );
+    assert!(
+        !stall.wait_for_connections(2, Duration::from_secs(1)),
+        "both same-repository fetches reached the remote together"
+    );
+    stall.release();
     for reader in readers {
-        let (status, _) = reader.join().expect("reader thread");
+        let status = reader.join().expect("reader thread");
         assert_eq!(status, 200);
     }
-    let total = started.elapsed();
-
-    assert!(
-        total >= STALL * 2,
-        "two fetches in one repository took {total:?} -- they overlapped, so each \
-         one's `rev-parse FETCH_HEAD` could read the other's fetch"
-    );
 }

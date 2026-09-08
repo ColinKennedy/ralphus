@@ -14614,8 +14614,9 @@ command=\"check\"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn shutdown_without_auto_cancel_leaves_squad_state_alone_but_requests_shutdown() {
+    fn live_tmux_shutdown_without_auto_cancel_leaves_squad_state_alone_but_requests_shutdown() {
         // Real production code kills each known squad/guardian's own
         // ralphus_{id}_-prefixed tmux.exe cells (see
         // `kill_squad_tmux_sessions`) — serialize against `tmux.rs`'s live
@@ -14658,9 +14659,10 @@ command=\"check\"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn shutdown_with_auto_cancel_cancels_active_squads_and_guardians() {
-        // See `shutdown_without_auto_cancel_leaves_squad_state_alone_but_requests_shutdown`'s
+    fn live_tmux_shutdown_with_auto_cancel_cancels_active_squads_and_guardians() {
+        // See `live_tmux_shutdown_without_auto_cancel_leaves_squad_state_alone_but_requests_shutdown`'s
         // comment for why each squad_id here is per-invocation-unique
         // (RAL-177), not just the literal deterministic id.
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
@@ -14711,8 +14713,9 @@ command=\"check\"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn shutdown_body_defaults_auto_cancel_to_false() {
+    fn live_tmux_shutdown_body_defaults_auto_cancel_to_false() {
         let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -15760,8 +15763,9 @@ command = "true"
         tmux
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn set_status_cell_captures_pane_into_ghost_and_kills_it() {
+    fn live_tmux_set_status_cell_captures_pane_into_ghost_and_kills_it() {
         // RAL-163: setting a cell to a terminal status while its agent is
         // still running must capture the pane's in-progress output into that
         // cell's ghost, then stop (kill) the pane -- turning the manual
@@ -15824,8 +15828,9 @@ command = "true"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn set_status_pending_does_not_stop_a_running_agent() {
+    fn live_tmux_set_status_pending_does_not_stop_a_running_agent() {
         // Per the ticket: "pending" is the only status that does not imply
         // "stop running" -- setting it must leave a live agent's pane alone.
         if !tmux_available() {
@@ -15876,8 +15881,9 @@ command = "true"
         tmux.kill_session(&name).unwrap();
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn set_status_ignored_still_captures_and_stops() {
+    fn live_tmux_set_status_ignored_still_captures_and_stops() {
         // Q1 of the ticket's interview: `ignored` is deliberately non-terminal
         // in the state machine (reversible back to `pending`), but the trigger
         // condition for stop-and-capture is "any status but pending" -- a user
