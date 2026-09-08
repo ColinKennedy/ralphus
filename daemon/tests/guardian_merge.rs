@@ -2010,6 +2010,23 @@ fn base_branch_shift_triggers_rebuild() {
         "no rebuild when base is unchanged"
     );
 
+    // RAL-375 follow-up: the transient "Merging" transition this rebuild
+    // records must name the actual old/new commit SHAs it shifted between --
+    // otherwise there is no way to later tell a real base-branch shift apart
+    // from the base branch simply being repointed to a different upstream
+    // during debugging (see guardian-000000000060's mystery 813-conflict
+    // rebuild, which had an empty payload and no recorded prior commit).
+    let events = store.lock().unwrap().events_for_guardian(&id, 500).unwrap();
+    let shift_event = events
+        .iter()
+        .find(|e| e.message.contains("base branch changed; rebuilding"))
+        .unwrap_or_else(|| panic!("no base-shift transition recorded: {events:?}"));
+    assert!(
+        shift_event.message.contains(&base_before[..8]),
+        "detail must name the prior base commit: {}",
+        shift_event.message
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
