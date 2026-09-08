@@ -69,6 +69,59 @@ jobs:
         if: matrix.suite == 'msrv'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
+  psmux-integration:
+    name: Windows psmux integration
+    runs-on: windows-latest
+    env:
+      PSMUX_VERSION: v3.3.8
+      PSMUX_X64_SHA256: 1ad127ba937194a890b933a73d9b023e297bd73dc742abd841bf159984c2effe
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install pinned psmux release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP "psmux-$env:PSMUX_VERSION-windows-x64.zip"
+          $installDir = Join-Path $env:RUNNER_TEMP 'psmux-bin'
+          $url = "https://github.com/psmux/psmux/releases/download/$env:PSMUX_VERSION/psmux-$env:PSMUX_VERSION-windows-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:PSMUX_X64_SHA256) {
+            throw "psmux archive checksum mismatch: expected $env:PSMUX_X64_SHA256, got $actual"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $installDir
+          $tmux = Get-ChildItem -LiteralPath $installDir -Filter tmux.exe -Recurse |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $tmux) { throw 'psmux archive did not contain tmux.exe' }
+          $binDir = Split-Path -Parent $tmux
+          $dataDir = Join-Path $env:RUNNER_TEMP "psmux-data-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $dataDir | Out-Null
+          $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "RALPHUS_TMUX_CMD=$tmux" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PSMUX_DATA_DIR=$dataDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PSMUX_CONFIG_FILE=NUL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify psmux installation
+        shell: pwsh
+        run: '& $env:RALPHUS_TMUX_CMD --version'
+      # All Windows tests that touch the real, machine-wide psmux server are
+      # `#[ignore]`d in the default suite and named `live_tmux_*`. Run them in
+      # this isolated namespace, one at a time, for a stable per-PR signal.
+      - name: Run real psmux tests serially
+        run: cargo nextest run --package ralphus-daemon --lib --run-ignored only --test-threads 1 --no-tests fail --filter-expr 'test(live_tmux)'
+      - name: Stop isolated psmux server
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: '& $env:RALPHUS_TMUX_CMD kill-server'
+
   web:
     name: Web (eslint + tsc --checkJs + knip + node --test on board.html)
     runs-on: ubuntu-latest

@@ -3210,8 +3210,9 @@ prompt = "make it build"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn registers_pid_while_the_subprocess_is_alive_and_clears_it_after() {
+    fn live_tmux_registers_pid_while_the_subprocess_is_alive_and_clears_it_after() {
         // A real, briefly-lived subprocess: the runner must register its PID for
         // the resource view while it runs, and drop it once it exits (RAL-11).
         //
@@ -3322,8 +3323,9 @@ prompt = "make it build"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
-    fn missing_program_fails_gracefully() {
+    fn live_tmux_missing_program_fails_gracefully() {
         // Every spec runs tmux-wrapped since RAL-151, so this is a real
         // live-tmux test — serialized under `LIVE_TMUX_TEST_LOCK` and given a
         // per-invocation-unique run_id (RAL-177), same as every other
@@ -3638,7 +3640,7 @@ prompt = "make it build"
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         // Backstop only — see the identical note on
-        // `registers_pid_while_the_subprocess_is_alive_and_clears_it_after`.
+        // `live_tmux_registers_pid_while_the_subprocess_is_alive_and_clears_it_after`.
         // Must stay above `PID_POLL_BUDGET` so a slow-starting session never
         // races its own timeout-kill against the poll loop (the RAL-171
         // failure signature); the test itself cancels on observation, so this
@@ -3933,6 +3935,7 @@ prompt = "make it build"
         );
     }
 
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_run_via_tmux_is_detachable() {
         if !tmux_and_python_available() {
