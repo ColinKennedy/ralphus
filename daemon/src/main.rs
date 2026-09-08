@@ -12,6 +12,41 @@ use std::time::Duration;
 
 use ralphus_daemon::{Command, command_usage, default_db_path, parse_args, server, validate_file};
 
+/// Match the normal CLI-client deadline so shutdown can finish cancelling
+/// active work before the caller concludes the daemon is unavailable.
+const DEFAULT_STOP_TIMEOUT_SECS: u64 = 60;
+
+fn stop_timeout() -> Duration {
+    stop_timeout_from(std::env::var("RALPHUS_DAEMON_TIMEOUT").ok().as_deref())
+}
+
+fn stop_timeout_from(value: Option<&str>) -> Duration {
+    Duration::from_secs(
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_STOP_TIMEOUT_SECS),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_timeout_defaults_to_the_cli_deadline() {
+        assert_eq!(stop_timeout_from(None), Duration::from_secs(60));
+        assert_eq!(
+            stop_timeout_from(Some("not-a-number")),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn stop_timeout_honors_the_daemon_timeout_override() {
+        assert_eq!(stop_timeout_from(Some("75")), Duration::from_secs(75));
+    }
+}
+
 fn main() -> ExitCode {
     // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
     // builds don't strip it as dead code ahead of the `ralphus license`
@@ -86,7 +121,7 @@ fn main() -> ExitCode {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             let mut req = ureq::post(&url)
-                .timeout(Duration::from_secs(10))
+                .timeout(stop_timeout())
                 .set("Content-Type", "application/json");
             if let Some(token) = &token {
                 req = req.set("Authorization", &format!("Bearer {token}"));
@@ -98,7 +133,9 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(ureq::Error::Transport(e)) => {
-                    println!("no daemon reachable on 127.0.0.1:{port} ({e}) — nothing to stop");
+                    println!(
+                        "could not confirm a daemon response on 127.0.0.1:{port} ({e}) — it may already be stopped, or shutdown may still be in progress"
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(ureq::Error::Status(code, resp)) => {
