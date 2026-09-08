@@ -340,6 +340,13 @@ struct Membership {
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
     auto_submit_pr_stack: Option<bool>,
+    /// Optional settings overrides declared on the review.
+    skip_worktrees: Option<bool>,
+    auto_pr_feedback: Option<bool>,
+    skip_base_updates: Option<bool>,
+    skip_auto_clean: Option<bool>,
+    match_pr_branch_name: Option<bool>,
+    separate_pr_branch: Option<bool>,
     /// Declared `[[review.auto_build]]` steps (RAL-342): zero or more build
     /// steps, each either a static `command` or an agent-invocation shape,
     /// mutually exclusive with `skip_auto_build`.
@@ -674,6 +681,12 @@ pub fn derive_reviews(
                 .and_then(|r| r.proof_scope.clone())
                 .filter(|s| !s.trim().is_empty()),
             auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
+            skip_worktrees: rv.and_then(|r| r.skip_worktrees),
+            auto_pr_feedback: rv.and_then(|r| r.auto_pr_feedback),
+            skip_base_updates: rv.and_then(|r| r.skip_base_updates),
+            skip_auto_clean: rv.and_then(|r| r.skip_auto_clean),
+            match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
+            separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
             auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
             skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
         });
@@ -965,6 +978,36 @@ fn apply_resolver(
     if let Some(enabled) = members.iter().find_map(|m| m.auto_submit_pr_stack) {
         store
             .set_guardian_auto_submit_pr_stack(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if let Some(skip) = members.iter().find_map(|m| m.skip_worktrees) {
+        store
+            .set_guardian_skip_worktrees(gid, skip)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if let Some(enabled) = members.iter().find_map(|m| m.auto_pr_feedback) {
+        store
+            .set_guardian_auto_pr_feedback(gid, enabled)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if let Some(skip) = members.iter().find_map(|m| m.skip_base_updates) {
+        store
+            .set_guardian_skip_base_updates(gid, Some(skip))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if let Some(skip) = members.iter().find_map(|m| m.skip_auto_clean) {
+        store
+            .set_guardian_proof_skip_auto_clean(gid, Some(skip))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if let Some(enabled) = members.iter().find_map(|m| m.match_pr_branch_name) {
+        store
+            .set_guardian_match_pr_branch_name(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if let Some(enabled) = members.iter().find_map(|m| m.separate_pr_branch) {
+        store
+            .set_guardian_separate_pr_branch(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -1881,6 +1924,12 @@ mod tests {
             maximum_budget_usd,
             proof_scope: None,
             auto_submit_pr_stack: None,
+            skip_worktrees: None,
+            auto_pr_feedback: None,
+            skip_base_updates: None,
+            skip_auto_clean: None,
+            match_pr_branch_name: None,
+            separate_pr_branch: None,
             auto_build: Vec::new(),
             skip_auto_build: false,
         }
@@ -1961,6 +2010,29 @@ mod tests {
             store.get_guardian(&gid).unwrap().auto_submit_pr_stack,
             before
         );
+    }
+
+    #[test]
+    fn apply_resolver_sets_declared_review_settings() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            skip_worktrees: Some(true),
+            auto_pr_feedback: Some(true),
+            skip_base_updates: Some(true),
+            skip_auto_clean: Some(true),
+            match_pr_branch_name: Some(true),
+            separate_pr_branch: Some(true),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert!(guardian.skip_worktrees);
+        assert!(guardian.auto_pr_feedback);
+        assert_eq!(guardian.skip_base_updates, Some(true));
+        assert_eq!(guardian.proof_skip_auto_clean, Some(true));
+        assert_eq!(guardian.match_pr_branch_name, Some(true));
+        assert_eq!(guardian.separate_pr_branch, Some(true));
     }
 
     // ── [[review]] auto_build wiring / required-declaration (RAL-342) ────

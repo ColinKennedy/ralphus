@@ -418,6 +418,36 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
         ReviewFieldDefault::ProjectDefault(|c| c.auto_submit_pr_stack.is_some()),
     ),
     (
+        "skip_worktrees",
+        ReviewFieldDefault::ProjectDefault(|c| c.skip_worktrees.is_some()),
+    ),
+    (
+        "auto_pr_feedback",
+        ReviewFieldDefault::NotApplicable(
+            "auto_pr_feedback has no project default because automatic feedback handling is a \
+             deliberate decision for each review and its PR conversation.",
+        ),
+    ),
+    (
+        "skip_base_updates",
+        ReviewFieldDefault::ProjectDefault(|c| c.skip_base_updates.is_some()),
+    ),
+    (
+        "skip_auto_clean",
+        ReviewFieldDefault::NotApplicable(
+            "skip_auto_clean only applies to a review's explicitly declared each-branch \
+             proof run, so a project default would be ambiguous for other proof scopes.",
+        ),
+    ),
+    (
+        "match_pr_branch_name",
+        ReviewFieldDefault::ProjectDefault(|c| c.match_pr_branch_name.is_some()),
+    ),
+    (
+        "separate_pr_branch",
+        ReviewFieldDefault::ProjectDefault(|c| c.separate_pr_branch.is_some()),
+    ),
+    (
         "action",
         ReviewFieldDefault::NotApplicable(
             "action hints are bespoke per-review manual-test buttons tied to review-specific \

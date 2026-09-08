@@ -206,7 +206,7 @@ fn single_project_makes_one_review() {
     let toml = session_toml(
         &cwd,
         "backend",
-        "agent=\"claude\"\nmodel=\"claude-opus-4-8\"\nskip_auto_build=true",
+        "agent=\"claude\"\nmodel=\"claude-opus-4-8\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\nskip_auto_build=true",
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -222,10 +222,43 @@ fn single_project_makes_one_review() {
     // The review's declared conflict-resolver backend/model is persisted.
     assert_eq!(g.resolver_agent.as_deref(), Some("claude"));
     assert_eq!(g.resolver_model.as_deref(), Some("claude-opus-4-8"));
+    assert!(g.skip_worktrees);
+    assert!(g.auto_pr_feedback);
+    assert_eq!(g.skip_base_updates, Some(true));
+    assert_eq!(g.proof_skip_auto_clean, Some(true));
+    assert_eq!(g.match_pr_branch_name, Some(true));
+    assert_eq!(g.separate_pr_branch, Some(true));
     assert_eq!(g.branches.len(), 1);
     assert_eq!(g.branches[0].branch, "feature/a");
     assert_eq!(store.guardians_for_squad(&run_id).unwrap(), ids);
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn declared_review_settings_override_project_defaults() {
+    let base = temp_base("review-settings-precedence");
+    let cwd = repo_with_worktree(&base, "feature/settings");
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".ralphus.toml"),
+        "[review]\nskip_worktrees=false\nskip_base_updates=false\nmatch_pr_branch_name=false\nseparate_pr_branch=false\n",
+    )
+    .unwrap();
+    let toml = session_toml(
+        &cwd,
+        "settings",
+        "proof_scope=\"each_branch\"\nskip_worktrees=true\nskip_base_updates=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\nskip_auto_build=true",
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    let squad_id = store.insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.get_guardian(&guardian_id).unwrap();
+
+    assert!(guardian.skip_worktrees);
+    assert_eq!(guardian.skip_base_updates, Some(true));
+    assert_eq!(guardian.match_pr_branch_name, Some(true));
+    assert_eq!(guardian.separate_pr_branch, Some(true));
     let _ = std::fs::remove_dir_all(&base);
 }
 
