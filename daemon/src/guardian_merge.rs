@@ -6314,6 +6314,7 @@ pub fn rebuild_on_base_shift(
     let mut any_shifted = false;
     let mut all_have_baseline = true;
     let mut fully_landed = !guardian.projects.is_empty();
+    let mut shift_detail: Vec<String> = Vec::new();
     for proj in &guardian.projects {
         let root = Workspace::for_guardian(store, id, Path::new(proj));
         let current = match resolve_base(&root, &guardian.base_branch) {
@@ -6333,8 +6334,14 @@ pub fn rebuild_on_base_shift(
                 all_have_baseline = false;
             }
             Some(prev) if prev == &current => {} // unchanged
-            Some(_) => {
+            Some(prev) => {
                 any_shifted = true;
+                shift_detail.push(format!(
+                    "{proj} ({}): {}..{}",
+                    guardian.base_branch,
+                    &prev[..prev.len().min(8)],
+                    &current[..current.len().min(8)]
+                ));
             }
         }
         if !project_already_in_base(&root, &guardian, proj, &current) {
@@ -6366,15 +6373,15 @@ pub fn rebuild_on_base_shift(
     }
     // Claim the review under one lock (flip to Merging) so a concurrent
     // maintenance pass cannot also start rebuilding it.
+    let detail = format!(
+        "base branch changed; rebuilding ({})",
+        shift_detail.join(", ")
+    );
     let claimed = {
         let g = store.lock().expect("poisoned");
         matches!(g.get_guardian(id), Ok(gv) if matches!(gv.status.as_str(), "in_review" | "merge_failed"))
-            && g.set_guardian_status(
-                id,
-                GuardianStatus::Merging,
-                Some("base branch changed; rebuilding"),
-            )
-            .is_ok()
+            && g.set_guardian_status(id, GuardianStatus::Merging, Some(&detail))
+                .is_ok()
     };
     if claimed {
         let _permit = sem.acquire();
