@@ -1487,6 +1487,27 @@ fn is_stack_base_restriction(err: &str) -> bool {
     err.to_ascii_lowercase().contains("part of a stack")
 }
 
+fn is_forge_not_found(err: &str) -> bool {
+    err.starts_with("forge API 404:")
+}
+
+fn create_and_record_native_stack(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    client: &crate::forge::ForgeClient,
+    ordered_pr_numbers: &[i64],
+) -> std::result::Result<Option<i64>, String> {
+    let Some(stack) = client.create_stack(ordered_pr_numbers)? else {
+        return Ok(None);
+    };
+    store
+        .lock()
+        .expect("poisoned")
+        .set_guardian_forge_stack_number(id, stack.number)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(stack.number))
+}
+
 /// Repoint PRs GitHub refused to move because they belong to a registered
 /// stack: dissolve the stack, retry each base change, then register the stack
 /// again so GitHub's UI still shows the chain.
@@ -1534,6 +1555,11 @@ fn repoint_stacked_prs(
         );
         return Err(format!("could not dissolve stack {stack_number}: {e}"));
     }
+    store
+        .lock()
+        .expect("poisoned")
+        .clear_guardian_forge_stack_number(id)
+        .map_err(|e| e.to_string())?;
     let mut errors = Vec::new();
     for (pr_id, number, new_base) in blocked {
         if let Err(e) = client.update_pull_request_base(*number, new_base) {
@@ -1553,18 +1579,14 @@ fn repoint_stacked_prs(
             Err(errors.join("; "))
         };
     }
-    match client.create_stack(ordered_pr_numbers) {
-        Ok(Some(created)) => {
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .set_guardian_forge_stack_number(id, created.number);
+    match create_and_record_native_stack(store, id, client, ordered_pr_numbers) {
+        Ok(Some(created_number)) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} re-registered stack {} after moving PR bases \
                  (was {stack_number})",
-                created.number
+                created_number
             );
         }
         Ok(None) => {}
@@ -3445,6 +3467,7 @@ enum StackAction {
     Append {
         stack_number: i64,
         new_ordered: Vec<i64>,
+        all_ordered: Vec<i64>,
     },
     /// Nothing to do this call.
     Skip { reason: &'static str },
@@ -3461,11 +3484,6 @@ fn decide_stack_action(
     newly_created_branch_ids: &std::collections::HashSet<String>,
     recorded_stack_number: Option<i64>,
 ) -> StackAction {
-    if newly_created_branch_ids.is_empty() {
-        return StackAction::Skip {
-            reason: "no new PRs to register",
-        };
-    }
     match recorded_stack_number {
         None => {
             if all_branches_with_prs.len() < 2 {
@@ -3483,6 +3501,11 @@ fn decide_stack_action(
             }
         }
         Some(stack_number) => {
+            if newly_created_branch_ids.is_empty() {
+                return StackAction::Skip {
+                    reason: "no new PRs to register",
+                };
+            }
             let prior_top_position = all_branches_with_prs
                 .iter()
                 .filter(|(bid, _, _)| !newly_created_branch_ids.contains(bid))
@@ -3508,6 +3531,14 @@ fn decide_stack_action(
             StackAction::Append {
                 stack_number,
                 new_ordered: new_ordered.into_iter().map(|(_, num)| num).collect(),
+                all_ordered: {
+                    let mut all_ordered: Vec<(i64, i64)> = all_branches_with_prs
+                        .iter()
+                        .map(|(_, pos, num)| (*pos, *num))
+                        .collect();
+                    all_ordered.sort_by_key(|(pos, _)| *pos);
+                    all_ordered.into_iter().map(|(_, num)| num).collect()
+                },
             }
         }
     }
@@ -3708,31 +3739,84 @@ fn submit_stack_for_guardian(
         .expect("poisoned")
         .get_guardian_forge_stack_number(id)
         .map_err(|e| e.to_string())?;
-    match decide_stack_action(&all_with_prs, &newly_created_branch_ids, recorded) {
-        StackAction::Create { all_ordered } => match client.create_stack(&all_ordered) {
-            Ok(Some(stack)) => {
-                let _ = store
+    let recorded = match recorded {
+        Some(stack_number) => match client.stack_exists(stack_number) {
+            Ok(true) => Some(stack_number),
+            Ok(false) => {
+                store
                     .lock()
                     .expect("poisoned")
-                    .set_guardian_forge_stack_number(id, stack.number);
+                    .clear_guardian_forge_stack_number(id)
+                    .map_err(|e| e.to_string())?;
                 crate::rlog!(
-                    INFO,
-                    "ralphus [pr] review {id} registered github pr stack number={}",
-                    stack.number
+                    WARNING,
+                    "ralphus [pr] review {id} recorded github pr stack {stack_number} no longer exists; recreating it"
                 );
+                None
             }
-            Ok(None) => {}
-            Err(e) => crate::rlog!(WARNING, "ralphus [pr] review {id} create stack failed: {e}"),
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not check github pr stack {stack_number}; preserving the recorded stack: {e}"
+                );
+                Some(stack_number)
+            }
         },
+        None => None,
+    };
+    match decide_stack_action(&all_with_prs, &newly_created_branch_ids, recorded) {
+        StackAction::Create { all_ordered } => {
+            match create_and_record_native_stack(store, id, client, &all_ordered) {
+                Ok(Some(stack_number)) => {
+                    crate::rlog!(
+                        INFO,
+                        "ralphus [pr] review {id} registered github pr stack number={stack_number}"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    crate::rlog!(WARNING, "ralphus [pr] review {id} create stack failed: {e}");
+                }
+            }
+        }
         StackAction::Append {
             stack_number,
             new_ordered,
+            all_ordered,
         } => {
             if let Err(e) = client.add_to_stack(stack_number, &new_ordered) {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [pr] review {id} add to stack {stack_number} failed: {e}"
-                );
+                if is_forge_not_found(&e) {
+                    let clear_result = store
+                        .lock()
+                        .expect("poisoned")
+                        .clear_guardian_forge_stack_number(id);
+                    if let Err(clear_error) = clear_result {
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [pr] review {id} could not clear missing github pr stack {stack_number}: {clear_error}"
+                        );
+                    } else {
+                        match create_and_record_native_stack(store, id, client, &all_ordered) {
+                            Ok(Some(new_stack_number)) => {
+                                crate::rlog!(
+                                    INFO,
+                                    "ralphus [pr] review {id} replaced missing github pr stack {stack_number} with stack {}",
+                                    new_stack_number
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(create_error) => crate::rlog!(
+                                WARNING,
+                                "ralphus [pr] review {id} could not replace missing github pr stack {stack_number}: {create_error}"
+                            ),
+                        }
+                    }
+                } else {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} add to stack {stack_number} failed: {e}"
+                    );
+                }
             }
         }
         StackAction::Skip { reason } => {
@@ -5124,7 +5208,8 @@ mod tests {
             decide_stack_action(&prs, &new_ids, Some(42)),
             StackAction::Append {
                 stack_number: 42,
-                new_ordered: vec![9]
+                new_ordered: vec![9],
+                all_ordered: vec![3, 6, 9]
             }
         );
     }
@@ -5155,6 +5240,17 @@ mod tests {
             decide_stack_action(&prs, &std::collections::HashSet::new(), Some(42)),
             StackAction::Skip {
                 reason: "no new PRs to register"
+            }
+        );
+    }
+
+    #[test]
+    fn decide_stack_action_repairs_an_unrecorded_stack_when_nothing_is_new() {
+        let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
+        assert_eq!(
+            decide_stack_action(&prs, &std::collections::HashSet::new(), None),
+            StackAction::Create {
+                all_ordered: vec![3, 6]
             }
         );
     }
@@ -5757,7 +5853,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut seen: Vec<(String, String)> = Vec::new();
             let mut created_payload = serde_json::Value::Null;
-            for _ in 0..3 {
+            for request_index in 0..3 {
                 let mut req = server.recv().unwrap();
                 let method = req.method().as_str().to_string();
                 let url = req.url().to_string();
@@ -5767,10 +5863,14 @@ mod tests {
                     created_payload = serde_json::from_str(&body).unwrap();
                 }
                 seen.push((method, url));
-                req.respond(
-                    tiny_http::Response::from_string("{\"number\": 99}").with_status_code(200),
-                )
-                .unwrap();
+                if request_index == 0 {
+                    req.respond(tiny_http::Response::empty(204)).unwrap();
+                } else {
+                    req.respond(
+                        tiny_http::Response::from_string("{\"number\": 99}").with_status_code(200),
+                    )
+                    .unwrap();
+                }
             }
             (seen, created_payload)
         });
@@ -5821,6 +5921,56 @@ mod tests {
             Some(99),
             "the rebuilt stack's number must replace the dissolved one"
         );
+    }
+
+    #[test]
+    fn repoint_stacked_prs_does_not_retain_a_dissolved_stack_number() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            for request_index in 0..3 {
+                let req = server.recv().unwrap();
+                match request_index {
+                    0 => req.respond(tiny_http::Response::empty(204)).unwrap(),
+                    1 => req.respond(tiny_http::Response::from_string("{}")).unwrap(),
+                    _ => req
+                        .respond(
+                            tiny_http::Response::from_string("unavailable").with_status_code(500),
+                        )
+                        .unwrap(),
+                }
+            }
+        });
+
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
+        s.set_guardian_forge_stack_number(&gid, 42).unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        let result = repoint_stacked_prs(
+            &store,
+            &gid,
+            &client,
+            &[7, 8],
+            &[("pr-x".to_string(), 7, "new-base".to_string())],
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian_forge_stack_number(&gid)
+                .unwrap(),
+            None,
+            "a dissolved stack must not remain recorded when rebuilding it fails"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

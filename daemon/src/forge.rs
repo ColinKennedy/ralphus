@@ -785,6 +785,53 @@ impl ForgeClient {
         Ok(())
     }
 
+    /// Whether a GitHub-native PR stack still exists on the forge.
+    ///
+    /// A recorded stack can disappear when it is dissolved outside ralphus or
+    /// when a successful `unstack` call is followed by a local interruption.
+    /// `404` is therefore a normal negative result rather than an API error.
+    pub fn stack_exists(&self, stack_number: i64) -> Result<bool, String> {
+        if self.kind != ForgeKind::GitHub {
+            return Ok(false);
+        }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its Store-owning caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] get stack start kind={} repo={} stack={stack_number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let token = self.require_token()?;
+        let url = format!(
+            "{}/repos/{}/stacks/{stack_number}",
+            self.api_base, self.repo_path
+        );
+        let result = match ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json")
+            .call()
+        {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(404, _)) => Ok(false),
+            Err(e) => Err(describe_error(e)),
+        };
+        match &result {
+            Ok(exists) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] get stack done kind={} repo={} stack={stack_number} exists={exists}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Err(e) => crate::rlog!(
+                WARNING,
+                "ralphus [forge] get stack failed kind={} repo={} stack={stack_number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
     /// Remove every unmerged PR from a registered GitHub stack
     /// (`POST /repos/{owner}/{repo}/stacks/{stack_number}/unstack`), which
     /// dissolves the stack once nothing is left in it. The PRs themselves are
@@ -834,12 +881,12 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}/unstack",
             self.api_base, self.repo_path
         );
-        send(
-            ureq::post(&url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-            &serde_json::json!({}),
-        )?;
+        ureq::post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json")
+            .set("Content-Type", "application/json")
+            .send_string("{}")
+            .map_err(describe_error)?;
         Ok(())
     }
 
@@ -2197,8 +2244,7 @@ mod tests {
             let req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42/unstack");
-            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
-                .unwrap();
+            req.respond(tiny_http::Response::empty(204)).unwrap();
         });
         let client = ForgeClient::new(
             ForgeKind::GitHub,
@@ -2207,6 +2253,47 @@ mod tests {
             Some("tok".to_string()),
         );
         client.unstack(42).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stack_exists_treats_not_found_as_absent() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
+            req.respond(tiny_http::Response::from_string("not found").with_status_code(404))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert!(!client.stack_exists(42).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stack_exists_accepts_a_live_stack_response() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
+            req.respond(tiny_http::Response::from_string(r#"{"number":42}"#))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert!(client.stack_exists(42).unwrap());
         handle.join().unwrap();
     }
 
