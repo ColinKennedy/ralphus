@@ -2581,7 +2581,10 @@ print(json.dumps(result))
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
         let key_a = root.to_string_lossy().replace('\\', "/");
-        let key_b = root.to_string_lossy().into_owned();
+        // Appending `/.` keeps the raw database keys byte-distinct on every
+        // platform while both paths still canonicalize to the same directory.
+        let key_b = format!("{key_a}/.");
+        assert_ne!(key_a, key_b);
         store
             .set_triage_pool_threshold(&key_a, "bug", Some(3))
             .unwrap();
@@ -2619,7 +2622,10 @@ print(json.dumps(result))
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
         let key_a = root.to_string_lossy().replace('\\', "/");
-        let key_b = root.to_string_lossy().into_owned();
+        // Appending `/.` keeps the raw database keys byte-distinct on every
+        // platform while both paths still canonicalize to the same directory.
+        let key_b = format!("{key_a}/.");
+        assert_ne!(key_a, key_b);
         store
             .set_triage_pool_threshold(&key_a, "bug", Some(3))
             .unwrap();
