@@ -1,10 +1,10 @@
 // Loads the Tasks tab's pure decision logic (RAL-362 §8) straight out of
-// librarian/assets/board.html, so it can't silently drift from what's
+// librarian/assets/board/, so it can't silently drift from what's
 // shipped. Same slice-the-real-source approach as ./board-legacy-tasks-hash.mjs
-// and ./board-peek-state.mjs -- see those files' headers for why board.html
-// can't simply be imported as a module.
+// and ./board-peek-state.mjs -- see those files' headers for why the chunk files
+// can't simply be imported as modules.
 
-import { readFileSync } from "node:fs";
+import { boardScript } from "./board-source.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -14,9 +14,9 @@ const REGIONS = [
 ];
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const boardPath = join(repoRoot, "librarian", "assets", "board.html");
+export const boardPath = join(repoRoot, "librarian", "assets", "board");
 
-const html = readFileSync(boardPath, "utf8");
+const html = boardScript();
 const slices = REGIONS.map(([BEGIN, END]) => {
   const from = html.indexOf(BEGIN);
   const to = html.indexOf(END);
@@ -64,5 +64,5 @@ const exported = [
 // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
 const factory = new Function(`${source}\nreturn { ${exported.join(", ")} };`);
 
-/** The Tasks tab's pure decision logic, evaluated straight from board.html. */
+/** The Tasks tab's pure decision logic, evaluated straight from the board chunks. */
 export const taskTabLogic = factory();

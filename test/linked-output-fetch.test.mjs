@@ -6,13 +6,13 @@
 // backend has ever captured anything for the key.
 //
 // Run with `npm test` (node --test). See ./board-linked-output-fetch.mjs for
-// how the function is loaded out of the real board.html with its URL-lookup
+// how the function is loaded out of the real board chunks with its URL-lookup
 // helpers injected as stubs.
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { makeFetchLinkedOutputText, boardPath } from "./board-linked-output-fetch.mjs";
+import { boardScript } from "./board-source.mjs";
+import { makeFetchLinkedOutputText } from "./board-linked-output-fetch.mjs";
 
 const originalFetch = globalThis.fetch;
 test.afterEach(() => {
@@ -170,7 +170,7 @@ test("both the attempt content and the pane fallback content are scrubbed for se
 // wiring.
 
 test("openLinkedOutputPopup shows a Loading state immediately, before the fetch resolves", () => {
-  const boardSource = readFileSync(boardPath, "utf8");
+  const boardSource = boardScript();
   const fnStart = boardSource.indexOf("async function openLinkedOutputPopup(key)");
   const fnBody = boardSource.slice(fnStart, boardSource.indexOf("\n      }\n", fnStart));
   const loadingAt = fnBody.indexOf('showTextPopup("Output", "Loading…")');
@@ -180,7 +180,7 @@ test("openLinkedOutputPopup shows a Loading state immediately, before the fetch 
 });
 
 test("openLinkedOutputPopup falls back to an explicit empty-state message, not a blank popup", () => {
-  const boardSource = readFileSync(boardPath, "utf8");
+  const boardSource = boardScript();
   const fnStart = boardSource.indexOf("async function openLinkedOutputPopup(key)");
   const fnBody = boardSource.slice(fnStart, boardSource.indexOf("\n      }\n", fnStart));
   assert.match(fnBody, /text \|\| "No output recorded yet\."/);

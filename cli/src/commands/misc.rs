@@ -869,7 +869,7 @@ pub fn history_debug_events(
 /// One `SquadTimelineEntry` (RAL-296) rendered as a human-readable line,
 /// with its inlined terminal-log excerpt (if any) indented beneath it —
 /// mirrors `daemon/src/timeline.rs::render_entry`'s plain-text rendering and
-/// `board.html`'s `formatDebugEvent`.
+/// the board's `formatDebugEvent` (`librarian/assets/board/30-live-view.js`).
 fn format_debug_event_line(e: &Value) -> String {
     let head = format!(
         "[{}] {}: {}",

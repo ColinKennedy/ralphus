@@ -1,17 +1,15 @@
 {
   "name": "ralphus-web-lint",
   "private": true,
-  "description": "Lint tooling for the librarian's inline board.html JavaScript. Not a runtime dependency — the librarian embeds board.html via include_str! and ships no Node code.",
+  "description": "Lint tooling for the librarian's board chunk JavaScript. Not a runtime dependency — the librarian embeds the board assets via include_str! (see librarian/build.rs) and ships no Node code.",
   "scripts": {
-    "lint": "eslint librarian/assets/board.html",
-    "extract-board-js": "node scripts/extract-board-js.mjs",
-    "typecheck": "npm run extract-board-js && node scripts/typecheck-board.mjs",
-    "knip": "knip",
+    "lint": "node scripts/generate-board-globals.mjs && eslint \"librarian/assets/board/**/*.js\"",
+    "typecheck": "tsc -p tsconfig.board.json",
+    "knip": "node scripts/knip-board.mjs",
     "test": "node --test \"test/*.test.mjs\""
   },
   "devDependencies": {
     "eslint": "^9.13.0",
-    "eslint-plugin-html": "^8.1.2",
     "eslint-plugin-jsdoc": "^50.4.3",
     "globals": "^15.11.0",
     "knip": "^5.33.3",

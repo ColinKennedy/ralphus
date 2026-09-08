@@ -47,8 +47,9 @@ named Docker volumes; `down` preserves them and `destroy` removes them. See
 fast, no Playwright, safe to re-run on every doc edit.
 `scripts/docs-screenshots.sh` / `.cmd` is the separate, heavier step that
 regenerates the committed PNGs under `docs/site/pages/screenshots/` from the
-real compiled `ralphus-librarian` — only needed after a `board.html` UI
-change. See [`docs/docs-site.md`](../docs/docs-site.md) for the full
+real compiled `ralphus-librarian` — only needed after a board UI change that
+can't be previewed in dev mode (the dev librarian serves `librarian/assets`
+from disk, so chunk/CSS/shell edits need no rebuild at all). See [`docs/docs-site.md`](../docs/docs-site.md) for the full
 breakdown of both, plus the separate `ralphus-docs-helpmap` command that
 regenerates `docs/cli-reference.md`'s help-map block.
 

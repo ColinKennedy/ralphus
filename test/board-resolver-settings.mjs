@@ -1,7 +1,7 @@
 // Loads the pure resolver-settings draft/request helpers out of the shipped
-// librarian/assets/board.html so their behavior cannot drift from the UI.
+// librarian/assets/board/ so their behavior cannot drift from the UI.
 
-import { readFileSync } from "node:fs";
+import { boardScript } from "./board-source.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -9,9 +9,9 @@ const BEGIN = "// RALPHUS-RESOLVER-SETTINGS:BEGIN";
 const END = "// RALPHUS-RESOLVER-SETTINGS:END";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const boardPath = join(repoRoot, "librarian", "assets", "board.html");
+export const boardPath = join(repoRoot, "librarian", "assets", "board");
 
-const html = readFileSync(boardPath, "utf8");
+const html = boardScript();
 const from = html.indexOf(BEGIN);
 const to = html.indexOf(END);
 if (from === -1 || to === -1 || to < from) {

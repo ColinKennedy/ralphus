@@ -1,26 +1,18 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import path from "node:path";
+import { boardScript as loadBoardScript } from "../../test/board-source.mjs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const boardHtmlPath = path.join(repoRoot, "librarian", "assets", "board.html");
-const boardHtml = readFileSync(boardHtmlPath, "utf8");
-const scriptMatch = boardHtml.match(/<script>\r?\n([\s\S]*?)<\/script>/);
-
-if (!scriptMatch) {
-  throw new Error(`no <script> block found in ${boardHtmlPath}`);
-}
-
-const boardScript = scriptMatch[1];
+const boardScript = loadBoardScript();
 
 function extractFunctionSource(name) {
   const needle = `function ${name}(`;
   const start = boardScript.indexOf(needle);
   if (start < 0) {
-    throw new Error(`function ${name} not found in board.html`);
+    throw new Error(`function ${name} not found in the board chunks`);
   }
   const bodyStart = boardScript.indexOf("{", start);
   if (bodyStart < 0) {

@@ -4,13 +4,13 @@ name: Docs screenshots
 # Chromium via Playwright) -- deliberately NOT run on every pull request
 # (see scripts/docs-screenshots.sh vs scripts/docs-build.sh, and
 # DOCS_PLAN.local.md). This runs once a change actually lands on master and
-# touches board.html or the docsgen fixtures/script, or on demand, and
+# touches the board assets or the docsgen fixtures/script, or on demand, and
 # commits any resulting PNG diff straight back to master.
 on:
   push:
     branches: [master]
     paths:
-      - "librarian/assets/board.html"
+      - "librarian/assets/**"
       - "cli-py/src/ralphus/docsgen/**"
   workflow_dispatch:
 
@@ -40,7 +40,7 @@ jobs:
       - name: Generate screenshots
         working-directory: cli-py
         run: uv run ralphus-docs-shots
-      - name: Every board.html tab still has a screenshot
+      - name: Every board tab still has a screenshot
         working-directory: cli-py
         run: uv run ralphus-docs-lint
       - name: Commit updated screenshots

@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 rem build-debug.cmd -- the FAST counterpart to build-release.cmd (mirrors build-debug.sh).
 rem Fast local dev loop -- NO dist\. Runs the whole stack from source so
-rem iterating on the GUI (librarian\assets\board.html) is quick:
+rem iterating on the GUI (librarian\assets's board) is quick:
 rem
 rem   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
 rem                                            seconds each; all four are Rust)
@@ -11,7 +11,10 @@ rem All four binaries are Rust -- there is no Python venv sync step. `cli-py\`
 rem still exists for `docsgen\` (Playwright screenshots, dev-only, never
 rem shipped).
 rem
-rem Loop: edit board.html -> re-run this script -> refresh the browser.
+rem Loop: edit a board asset (librarian\assets\board\*.js, board.css,
+rem board.html) and refresh the browser -- the librarian reads board assets from
+rem disk in dev mode (RALPHUS_BOARD_ASSETS_DIR is set below), so no rebuild is
+rem needed. Re-run this script only when Rust code changes.
 rem Ctrl-C stops both processes. For a distributable standalone build (slow),
 rem use build-release.cmd instead.
 rem
@@ -73,7 +76,7 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
 )
 
 rem 1. Build all four Rust bins in debug (fast incremental rebuild picks up
-rem    board.html and any CLI/runner source edit alike).
+rem    any CLI/runner/librarian source edit alike).
 echo == cargo build (debug) daemon + librarian + runner + cli ==
 cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
@@ -109,6 +112,7 @@ rem ~/.config/ralphus/config.toml [daemon].log_path), so file capture here is
 rem redundant anyway.
 for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -WindowStyle Hidden).Id"') do set "daemon_pid=%%P"
 
+set "RALPHUS_BOARD_ASSETS_DIR=%root%\librarian\assets"
 "%root%\target\debug\ralphus-librarian.exe" serve --port %librarian_port%
 
 rem Reaching here means the librarian exited -- the daemon is killed next, so

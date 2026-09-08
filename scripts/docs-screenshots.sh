@@ -2,7 +2,7 @@
 # docs-screenshots.sh -- regenerate docs/site/pages/screenshots/*.png.
 # Separate from docs-build.sh (the fast Markdown->HTML path) on purpose: this
 # launches headless Chromium via Playwright and is the only expensive part of
-# the docs build. Only run it after a librarian/assets/board.html UI change;
+# the docs build. Only run it after a librarian/assets UI change;
 # review and commit the resulting PNG diffs.
 set -euo pipefail
 

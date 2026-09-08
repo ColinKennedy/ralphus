@@ -1,10 +1,11 @@
 //! The librarian web server.
 //!
-//! Serves a single static HTML page and proxies `/api/*` requests (GET/POST/
-//! DELETE) to the daemon, so the browser only ever talks to one origin. The
-//! librarian holds no state and
-//! never starts the daemon; if the daemon is down, proxied calls return a 502
-//! and the page degrades gracefully.
+//! Serves the static board assets (page shell, stylesheet, JS chunks,
+//! vendored files — see `crate::assets`) and proxies `/api/*` requests
+//! (GET/POST/DELETE) to the daemon, so the browser only ever talks to one
+//! origin. The librarian holds no state and never starts the daemon; if the
+//! daemon is down, proxied calls return a 502 and the page degrades
+//! gracefully.
 
 use std::io::{Cursor, Read, Write};
 use std::sync::OnceLock;
@@ -13,8 +14,7 @@ use std::time::Duration;
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
 
-/// The board page (plain HTML + inline JS, so it restarts in seconds).
-const INDEX_HTML: &str = include_str!("../assets/board.html");
+use crate::assets::{self, is_allowed_route};
 
 /// The one connection-pooling HTTP client every proxied call reuses.
 ///
@@ -56,29 +56,26 @@ fn daemon_client() -> &'static ureq::Agent {
     })
 }
 
-/// A librarian response: status, content type, and body.
+/// A librarian response: status, headers, and body.
 pub struct Reply {
     /// HTTP status code.
     pub status: u16,
     /// Content-Type header value.
     pub content_type: &'static str,
+    /// `Cache-Control` header value for static board assets (`no-store`, so a
+    /// browser refresh always re-fetches the current bytes); `None` for API
+    /// replies.
+    pub cache_control: Option<&'static str>,
     /// Response body.
     pub body: String,
 }
 
 impl Reply {
-    fn html(body: impl Into<String>) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/html; charset=utf-8",
-            body: body.into(),
-        }
-    }
-
     fn json(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
             content_type: "application/json",
+            cache_control: None,
             body: body.into(),
         }
     }
@@ -87,6 +84,7 @@ impl Reply {
         Self {
             status: 404,
             content_type: "text/plain; charset=utf-8",
+            cache_control: None,
             body: "not found".into(),
         }
     }
@@ -101,7 +99,6 @@ impl Reply {
 pub fn handle(daemon_url: &str, method: &str, path: &str, body: &str) -> Reply {
     let path_only = path.split('?').next().unwrap_or(path);
     match (method, path_only) {
-        ("GET", "/" | "/index.html") => Reply::html(INDEX_HTML),
         (_, p) if p.starts_with("/api/") => proxy(
             daemon_url,
             method,
@@ -110,6 +107,7 @@ pub fn handle(daemon_url: &str, method: &str, path: &str, body: &str) -> Reply {
             None,
             daemon_token().as_deref(),
         ),
+        ("GET", _) => serve_static(path_only),
         _ => Reply::not_found(),
     }
 }
@@ -135,7 +133,6 @@ pub fn handle_with_trace(
     span.set_attribute("http.target", path.to_string());
 
     let reply = match (method, path_only) {
-        ("GET", "/" | "/index.html") => Reply::html(INDEX_HTML),
         (_, p) if p.starts_with("/api/") => proxy(
             daemon_url,
             method,
@@ -144,6 +141,7 @@ pub fn handle_with_trace(
             Some(&span.cx),
             daemon_token().as_deref(),
         ),
+        ("GET", _) => serve_static(path_only),
         _ => Reply::not_found(),
     };
 
@@ -154,6 +152,40 @@ pub fn handle_with_trace(
         span.set_status(Status::Ok);
     }
     reply
+}
+
+/// Resolve a GET static route to a board asset. `"/"` and `/index.html`
+/// map to the page shell; everything else must be an allowed route name
+/// (`board.css`, `board/05-engines.js`, `vendor/xterm.js`, ...) under the
+/// shared asset rules. Disallowed routes 404 without ever touching disk.
+fn serve_static(path_only: &str) -> Reply {
+    let name = match path_only {
+        "/" | "/index.html" => "board.html",
+        p => p.trim_start_matches('/'),
+    };
+    if !is_allowed_route(name) {
+        return Reply::not_found();
+    }
+    match assets::board_asset(name) {
+        Some(body) => Reply {
+            status: 200,
+            content_type: content_type_for(name),
+            cache_control: Some("no-store"),
+            body,
+        },
+        None => Reply::not_found(),
+    }
+}
+
+/// Content type for a board asset route name.
+fn content_type_for(name: &str) -> &'static str {
+    if name.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if name.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else {
+        "text/html; charset=utf-8"
+    }
 }
 
 /// Read the daemon's bearer token from `state_dir()/daemon.token` (RAL-219),
@@ -428,6 +460,12 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
         tiny_http::Header::from_bytes(&b"Content-Type"[..], reply.content_type.as_bytes())
             .expect("valid header"),
     ];
+    if let Some(cache_control) = reply.cache_control {
+        headers.push(
+            tiny_http::Header::from_bytes(&b"Cache-Control"[..], cache_control.as_bytes())
+                .expect("valid header"),
+        );
+    }
     if let ralphus_core::cors::CorsDecision::Allowed(origin) = &cors {
         headers.extend(cors_response_headers(origin));
     }
@@ -512,6 +550,32 @@ mod tests {
         assert_eq!(reply.status, 200);
         assert!(reply.body.contains("ralphus"));
         assert!(reply.content_type.starts_with("text/html"));
+    }
+
+    #[test]
+    fn serves_board_chunks_with_content_type_and_cache_header() {
+        let reply = handle("http://127.0.0.1:9", "GET", "/board/00-typedefs.js", "");
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type, "text/javascript; charset=utf-8");
+        assert_eq!(reply.cache_control, Some("no-store"));
+        assert!(reply.body.contains("@typedef"));
+
+        let css = handle("http://127.0.0.1:9", "GET", "/board.css", "");
+        assert_eq!(css.status, 200);
+        assert!(css.content_type.starts_with("text/css"));
+    }
+
+    #[test]
+    fn junk_asset_paths_are_404_without_disk_reads() {
+        // editor temp junk, traversal attempts, and unrelated names must all
+        // hit the 404 arm rather than resolve to any file.
+        for path in ["/board/foo.js~", "/board/../Cargo.toml", "/unknown.txt"] {
+            assert_eq!(
+                handle("http://127.0.0.1:9", "GET", path, "").status,
+                404,
+                "{path}"
+            );
+        }
     }
 
     #[test]

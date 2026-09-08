@@ -109,7 +109,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `daemon/src/timeline.rs` — RAL-155: `build_squad_timeline` merges a whole squad's Cartographer rows with inlined terminal-log excerpts. Backs `GET /api/squads/{id}/timeline` and the board's "⏱ Timeline" button.
 - `auth/src/lib.rs` — Ed25519 license check (`check_license()`; compiles away without `secure-dist`) — see `auth/AGENTS.md`.
 - `keygen/src/main.rs` — keypair generation + license signing CLI — see `keygen/AGENTS.md`.
-- `librarian/assets/board.html` — the entire dark-theme UI (plain HTML + inline JS, embedded via `include_str!`) — see `librarian/AGENTS.md`.
+- `librarian/assets/` — the entire dark-theme UI: `board.html` shell + `board/*.js` global-scope chunks + `board.css` + vendored xterm files; `build.rs` bakes them into the exe, dev mode reads them from disk — see `librarian/AGENTS.md`.
 
 ## Build / Test / Lint
 
@@ -130,14 +130,14 @@ uv sync --dev && uv run ruff check . && uv run ruff format --check . && uv run m
 # Bench patience comment lint (from repo root, stdlib-only, no uv sync needed)
 python scripts/check_bench_patience_comments.py
 
-# Web (from repo root; lints/type-checks librarian/assets/board.html's inline JS) — see librarian/AGENTS.md
+# Web (from repo root; lints/type-checks the librarian board chunks) — see librarian/AGENTS.md
 npm install --no-audit --no-fund && npm run lint && npm run typecheck && npm run knip && npm test
 ```
 
 CI is `.github/workflows/ci.yml` (a Rust job, a Python job, and a web job).
 
 Component-specific build/test detail (Rust integration tests, Python test
-table, board.html's JSDoc/lint/knip/frontend-test rules, bench harness
+table, the board chunks' JSDoc/lint/knip/frontend-test rules, bench harness
 commands, running the dev stack) lives in each folder's own `AGENTS.md` —
 see the Documentation Map below.
 
@@ -181,7 +181,7 @@ carrying too much weight to take, with the alternative to use instead.
 
 ## Design / UI colors
 
-Any color choice in `librarian/assets/board.html` or any UI must use a
+Any color choice in the web board or any UI must use a
 documented CSS variable from [`docs/colors.md`](docs/colors.md) — never a
 hardcoded hex value. Full rules and the tooltip requirement that pairs with
 every new UI element: [`librarian/AGENTS.md`](librarian/AGENTS.md).
@@ -223,7 +223,7 @@ only loads what's relevant to the folder it's touching. Subfolder `AGENTS.md`
 files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 
 - [`daemon/AGENTS.md`](daemon/AGENTS.md) — store/scheduler/API detail, Rust integration test table
-- [`librarian/AGENTS.md`](librarian/AGENTS.md) — board.html JSDoc/lint/knip/tooltip/color rules
+- [`librarian/AGENTS.md`](librarian/AGENTS.md) — board chunks JSDoc/lint/knip/tooltip/color rules
 - [`cli/AGENTS.md`](cli/AGENTS.md) — CLI module map, Read-Only Quick-Start Safety List
 - [`mcp/AGENTS.md`](mcp/AGENTS.md) — MCP server module map, tool-generation/exclusion/parity-check detail
 - [`cli-py/AGENTS.md`](cli-py/AGENTS.md) — Python docsgen/bench-graph project, its test table

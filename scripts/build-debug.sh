@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-debug.sh -- the FAST counterpart to build-release.sh.
 # Fast local dev loop -- NO dist/. Runs the whole stack from source so
-# iterating on the GUI (librarian/assets/board.html) is quick:
+# iterating on the GUI (librarian/assets's board) is quick:
 #
 #   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
 #                                            seconds each; all four are Rust)
@@ -10,7 +10,10 @@
 # still exists for `docsgen/` (Playwright screenshots, dev-only, never
 # shipped).
 #
-# Loop: edit board.html -> re-run this script -> refresh the browser.
+# Loop: edit a board asset (librarian/assets/board/*.js, board.css,
+# board.html) and refresh the browser — the librarian reads board assets from
+# disk in dev mode (RALPHUS_BOARD_ASSETS_DIR is exported below), so no rebuild
+# is needed. Re-run this script only when Rust code changes.
 # Ctrl-C stops both processes. For a distributable standalone build (slow),
 # use build-release.sh instead.
 #
@@ -69,7 +72,7 @@ fi
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
 # 1. Build all four Rust bins in debug (fast incremental rebuild picks up
-#    board.html and any CLI/runner source edit alike).
+#    any CLI/runner/librarian source edit alike).
 echo "== cargo build (debug) daemon + librarian + runner + cli =="
 cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "$root/Cargo.toml"
 
@@ -87,11 +90,16 @@ echo "   cli       -> $root/target/debug/ralphus${ext} (not started; run it your
 echo "   daemon    -> $RALPHUS_DAEMON_URL"
 echo "   db        -> ${db_path:-<default: ~/.ralphus/tasks.db>}"
 echo "   librarian -> http://127.0.0.1:${librarian_port}"
+echo "   board dev mode -> reading librarian/assets from disk (RALPHUS_BOARD_ASSETS_DIR); edits are live on browser refresh"
 daemon_args=(serve --port "$daemon_port")
 [ -n "$db_path" ] && daemon_args+=(--db "$db_path")
 "$root/target/debug/ralphus-daemon${ext}" "${daemon_args[@]}" &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+
+# Dev mode: board assets are read from the checkout on every request, so an
+# edit to a chunk/CSS/shell file is one browser-refresh away (no rebuild).
+export RALPHUS_BOARD_ASSETS_DIR="$root/librarian/assets"
 
 # Reaching past this line means the librarian exited -- the EXIT trap then
 # kills the daemon, so say so out loud: a silent teardown here has previously

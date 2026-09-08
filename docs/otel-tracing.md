@@ -62,9 +62,9 @@ shared implementation, since `runner` in particular shouldn't need to pull
 in the whole `daemon` lib (rusqlite, tiny_http, ...) just to reuse ~100 lines
 of tracing code.
 
-**Browser (`board.html`).** No `opentelemetry-js` SDK — the board is plain
-HTML with inline vanilla JS and no build step, and the full browser SDK is
-too heavy for that. `newTraceparent()` in `board.html` hand-rolls the W3C
+**Browser (`librarian/assets`).** No `opentelemetry-js` SDK — the board is
+plain HTML + vanilla JS chunk files with no build step, and the full browser
+SDK is too heavy for that. `newTraceparent()` in `board/20-util.js` hand-rolls the W3C
 `traceparent` wire format (`00-<32 hex trace id>-<16 hex span id>-01`,
 generated via `crypto.getRandomValues`) and attaches it as a header on every
 mutating action (the `post`/`del` fetch helpers, plus the task-submit and

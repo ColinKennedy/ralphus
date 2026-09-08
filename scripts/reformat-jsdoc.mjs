@@ -6,20 +6,20 @@
 // {void} */` (2+ tags) or a lone @returns following prose on the same line
 // can both make jsdoc/require-param and jsdoc/require-returns report
 // (incorrect) "missing" errors. This rewrites every single-line `/** ... */`
-// block in board.html that carries 1+ @tags into a standard multi-line block
-// (one tag per line), which comment-parser parses correctly. Only bare
-// description-only blocks (0 tags) are left as single-line.
+// block in the board chunk files that carries 1+ @tags into a standard
+// multi-line block (one tag per line), which comment-parser parses correctly.
+// Only bare description-only blocks (0 tags) are left as single-line.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-const path = "librarian/assets/board.html";
-const src = readFileSync(path, "utf8");
+const boardDir = "librarian/assets/board";
 
 const TAG_RE = /@(?:param|returns|type|typedef|property)\b/g;
 const BLOCK_RE = /^([ \t]*)\/\*\*[ \t]+([^\n]*?)[ \t]*\*\/[ \t]*$/gm;
 
 let count = 0;
-const out = src.replace(BLOCK_RE, (whole, indent, content) => {
+const reformat = (src) => src.replace(BLOCK_RE, (whole, indent, content) => {
   const tagStarts = [...content.matchAll(TAG_RE)].map((m) => m.index);
   if (tagStarts.length < 2 && !/@(?:param|returns)\b/.test(content)) return whole; // bare @type/@typedef single-tag — fine as one line
 
@@ -41,5 +41,10 @@ const out = src.replace(BLOCK_RE, (whole, indent, content) => {
   return lines.join("\n");
 });
 
-writeFileSync(path, out, "utf8");
+const files = readdirSync(boardDir).filter((f) => f.endsWith(".js") && !f.startsWith(".")).sort();
+for (const file of files) {
+  const path = join(boardDir, file);
+  const src = readFileSync(path, "utf8");
+  writeFileSync(path, reformat(src), "utf8");
+}
 console.log(`reformat-jsdoc: rewrote ${count} single-line JSDoc block(s) containing @param/@returns or 2+ tags`);

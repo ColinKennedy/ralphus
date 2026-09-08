@@ -1,11 +1,12 @@
 // Loads the pure Markdown-table serialization helpers backing the Logs
-// modal's "copy as Markdown" buttons (RAL-294) out of librarian/assets/board.html
+// modal's "copy as Markdown" buttons (RAL-294) out of the board chunk files (librarian/assets/board/)
 // so they can be exercised under `node --test` with no browser and no build step.
 //
-// board.html is a single static page whose entire client is one inline
-// <script> (see eslint.config.mjs / tsconfig.board.json / knip.config.js for
-// the three lint layers that read it the same way). It is not a module and
-// cannot be imported, so the region between the RALPHUS-LOGS-MARKDOWN markers
+// The board's JavaScript lives in the librarian/assets/board/*.js chunk files —
+// plain scripts sharing one global scope, loaded via board.html's sequential
+// <script> tags (and read the same way by eslint.config.mjs / tsconfig.board.json /
+// knip.config.js). The chunks are not modules and cannot be imported, so the region
+// between the RALPHUS-LOGS-MARKDOWN markers
 // — deliberately kept free of DOM, fetch and module-level state — is sliced
 // out and evaluated on its own. That region is the real shipped source: these
 // tests cannot drift from what the board actually runs, because there is only
@@ -15,7 +16,7 @@
 // dependencies are injected by createLogsMd(), while the copy-button/menu DOM
 // wiring stays outside the region.
 
-import { readFileSync } from "node:fs";
+import { boardScript } from "./board-source.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -23,9 +24,9 @@ const BEGIN = "// RALPHUS-LOGS-MARKDOWN:BEGIN";
 const END = "// RALPHUS-LOGS-MARKDOWN:END";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const boardPath = join(repoRoot, "librarian", "assets", "board.html");
+export const boardPath = join(repoRoot, "librarian", "assets", "board");
 
-const html = readFileSync(boardPath, "utf8");
+const html = boardScript();
 const from = html.indexOf(BEGIN);
 const to = html.indexOf(END);
 if (from === -1 || to === -1 || to < from) {
@@ -58,7 +59,7 @@ const factory = new Function(
   `${source}\nreturn { ${exported.join(", ")} };`,
 );
 
-/** The Logs-modal Markdown serialization helpers, evaluated straight from board.html. */
+/** The Logs-modal Markdown serialization helpers, evaluated straight from the board chunks. */
 export function createLogsMd({
   cartoModalCache = {},
   cartoFetch = async () => ({ rows: [], total: 0 }),
