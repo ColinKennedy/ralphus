@@ -1450,6 +1450,25 @@ impl Runner for MachineRouter {
             Err(e) => RunnerResult::failure(e),
         }
     }
+
+    fn preflight_agent(
+        &self,
+        agent: &str,
+        executable: Option<&str>,
+        machine: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(machine) = machine.map(str::trim).filter(|machine| !machine.is_empty()) else {
+            return self.local.preflight_agent(agent, executable, None);
+        };
+        match self.provider_for(machine)? {
+            Some(_) => {
+                // A provider executes on a different host, so its PATH and
+                // custom agent mappings cannot be inspected from this daemon.
+                Ok(())
+            }
+            None => self.local.preflight_agent(agent, executable, Some(machine)),
+        }
+    }
 }
 
 #[cfg(test)]

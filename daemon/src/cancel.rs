@@ -46,9 +46,20 @@ impl CancelToken {
     }
 }
 
+/// One shared cancellation signal and its active-worker count for a run key.
+///
+/// Multiple review-maintenance paths may temporarily work under the same
+/// guardian key. They must share a signal so one explicit stop reaches every
+/// worker, rather than replacing an older worker's token.
+#[derive(Clone)]
+struct ActiveCancellation {
+    token: CancelToken,
+    registrations: usize,
+}
+
 /// Registry of the cancel tokens of runs that are currently executing.
 #[derive(Clone, Default)]
-pub struct Cancellations(Arc<Mutex<HashMap<String, CancelToken>>>);
+pub struct Cancellations(Arc<Mutex<HashMap<String, ActiveCancellation>>>);
 
 impl Cancellations {
     /// An empty registry.
@@ -57,34 +68,49 @@ impl Cancellations {
         Self::default()
     }
 
-    /// Register a fresh token for a run that is about to execute, returning it
-    /// for the worker to poll. Replaces any stale token for the same id.
+    /// Register a token for a run that is about to execute, returning it for
+    /// the worker to poll. Concurrent registrations for the same id share the
+    /// same token so one cancellation stops every worker.
     #[must_use]
     pub fn register(&self, run_id: &str) -> CancelToken {
-        let token = CancelToken::new();
-        self.lock().insert(run_id.to_string(), token.clone());
-        token
+        let mut registrations = self.lock();
+        let active =
+            registrations
+                .entry(run_id.to_string())
+                .or_insert_with(|| ActiveCancellation {
+                    token: CancelToken::new(),
+                    registrations: 0,
+                });
+        active.registrations += 1;
+        active.token.clone()
     }
 
     /// Signal cancellation for a run if it is currently executing. A no-op when
     /// the run is not running (nothing to stop).
     pub fn cancel(&self, run_id: &str) {
-        if let Some(token) = self.lock().get(run_id) {
-            token.cancel();
+        if let Some(active) = self.lock().get(run_id) {
+            active.token.cancel();
         }
     }
 
     /// Drop a run's token once it has finished executing.
     pub fn remove(&self, run_id: &str) {
-        self.lock().remove(run_id);
+        let mut registrations = self.lock();
+        let remove = registrations.get_mut(run_id).is_some_and(|active| {
+            active.registrations -= 1;
+            active.registrations == 0
+        });
+        if remove {
+            registrations.remove(run_id);
+        }
     }
 
     /// Signal cancellation for every currently-registered run, regardless of
     /// id. Used by daemon-wide shutdown (`ralphus-daemon stop`) to stop every
     /// live worker's subprocess without having to enumerate run ids itself.
     pub fn cancel_all(&self) {
-        for token in self.lock().values() {
-            token.cancel();
+        for active in self.lock().values() {
+            active.token.cancel();
         }
     }
 
@@ -98,7 +124,7 @@ impl Cancellations {
         self.lock().contains_key(run_id)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancelToken>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ActiveCancellation>> {
         self.0.lock().expect("cancellation registry poisoned")
     }
 }
@@ -136,6 +162,20 @@ mod tests {
         assert!(!token.is_cancelled());
         reg.cancel("run-1");
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn registry_cancel_trips_every_concurrent_registration_for_the_same_key() {
+        let reg = Cancellations::new();
+        let first = reg.register("review-1");
+        let second = reg.register("review-1");
+        reg.cancel("review-1");
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        reg.remove("review-1");
+        assert!(reg.is_active("review-1"));
+        reg.remove("review-1");
+        assert!(!reg.is_active("review-1"));
     }
 
     #[test]

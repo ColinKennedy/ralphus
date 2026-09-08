@@ -14,7 +14,7 @@
 use std::io::Read as _;
 
 use opentelemetry::trace::SpanKind;
-use ralphus_runner::execute::run_cell;
+use ralphus_runner::execute::{preflight_agent, run_cell};
 use ralphus_runner::spec::{CellResult, CellSpec};
 use ralphus_runner::{config, otel};
 
@@ -24,6 +24,7 @@ const TMUX_DONE_MARKER: &str = "RALPHUS_TMUX_DONE";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelpCommand {
     Send,
+    Preflight,
     License,
     Version,
 }
@@ -33,6 +34,7 @@ impl HelpCommand {
     fn name(self) -> &'static str {
         match self {
             Self::Send => "send",
+            Self::Preflight => "preflight",
             Self::License => "license",
             Self::Version => "version",
         }
@@ -42,6 +44,7 @@ impl HelpCommand {
 #[cfg(test)]
 const HELP_COMMANDS: &[HelpCommand] = &[
     HelpCommand::Send,
+    HelpCommand::Preflight,
     HelpCommand::License,
     HelpCommand::Version,
 ];
@@ -54,6 +57,10 @@ enum Command {
     Send {
         spec_path: Option<String>,
         result_file: Option<String>,
+    },
+    Preflight {
+        agent: String,
+        executable: Option<String>,
     },
 }
 
@@ -71,6 +78,17 @@ fn main() -> std::process::ExitCode {
             spec_path,
             result_file,
         } => send(spec_path.as_deref(), result_file.as_deref()),
+        Command::Preflight { agent, executable } => preflight(&agent, executable.as_deref()),
+    }
+}
+
+fn preflight(agent: &str, executable: Option<&str>) -> std::process::ExitCode {
+    match preflight_agent(agent, executable, false) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -153,6 +171,7 @@ fn parse_args(args: &[String]) -> Command {
             Some(HelpCommand::Version) => Command::Version,
             Some(HelpCommand::License) => Command::License,
             Some(HelpCommand::Send) => parse_send_args(&args[1..]),
+            Some(HelpCommand::Preflight) => parse_preflight_args(&args[1..]),
             None => parse_send_args(args),
         },
         None => parse_send_args(args),
@@ -162,9 +181,33 @@ fn parse_args(args: &[String]) -> Command {
 fn registered_command(name: &str) -> Option<HelpCommand> {
     match name {
         "send" => Some(HelpCommand::Send),
+        "preflight" => Some(HelpCommand::Preflight),
         "license" => Some(HelpCommand::License),
         "version" => Some(HelpCommand::Version),
         _ => None,
+    }
+}
+
+fn parse_preflight_args(args: &[String]) -> Command {
+    let mut agent = None;
+    let mut executable = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--agent" if index + 1 < args.len() => {
+                agent = Some(args[index + 1].clone());
+                index += 2;
+            }
+            "--executable" if index + 1 < args.len() => {
+                executable = Some(args[index + 1].clone());
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+    Command::Preflight {
+        agent: agent.unwrap_or_default(),
+        executable,
     }
 }
 
@@ -207,10 +250,11 @@ fn parse_send_args(args: &[String]) -> Command {
 fn usage(command: Option<HelpCommand>) -> String {
     match command {
         Some(HelpCommand::Send) => "ralphus-runner send -- Execute one cell specification.\n\nUSAGE:\n    ralphus-runner send [spec.json] [--result-file <path>]\n\nARGUMENTS:\n    spec.json             Optional JSON file; stdin is used when omitted\n\nOPTIONS:\n    --result-file <path>  Write the CellResult JSON to this path\n    -h, --help            Print help and exit\n".to_string(),
+        Some(HelpCommand::Preflight) => "ralphus-runner preflight -- Check an agent launcher.\n\nUSAGE:\n    ralphus-runner preflight --agent <name> [--executable <path-or-command>]\n\nOPTIONS:\n    --agent <name>        Resolved backend name\n    --executable <value>  Optional backend launcher override\n    -h, --help            Print help and exit\n".to_string(),
         Some(HelpCommand::License) => "ralphus-runner license -- Print the embedded LICENSE text.\n\nUSAGE:\n    ralphus-runner license\n\nOPTIONS:\n    -h, --help            Print help and exit\n".to_string(),
         Some(HelpCommand::Version) => "ralphus-runner version -- Print the runner version.\n\nUSAGE:\n    ralphus-runner version\n\nOPTIONS:\n    -h, --help            Print help and exit\n".to_string(),
         None => format!(
-            "ralphus-runner {}\n\nUSAGE:\n    ralphus-runner <COMMAND> [ARGS...]\n\nCOMMANDS:\n    send              Execute one cell spec from stdin or a file path\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n",
+            "ralphus-runner {}\n\nUSAGE:\n    ralphus-runner <COMMAND> [ARGS...]\n\nCOMMANDS:\n    send              Execute one cell spec from stdin or a file path\n    preflight         Check whether an agent launcher is available\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n",
             ralphus_core::version()
         ),
     }

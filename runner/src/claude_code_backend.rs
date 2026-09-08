@@ -39,7 +39,22 @@ pub struct ClaudeCodeBackend {
     pub program_override: Option<String>,
 }
 
+impl ClaudeCodeBackend {
+    fn program(&self) -> String {
+        self.program_override.clone().unwrap_or_else(|| {
+            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
+        })
+    }
+}
+
 impl ModelBackend for ClaudeCodeBackend {
+    fn preflight(&self) -> Result<(), BackendError> {
+        crate::cli_agent_common::preflight_default_program(
+            &self.program(),
+            self.program_override.is_some() || std::env::var_os("RALPHUS_CLAUDE_COMMAND").is_some(),
+        )
+    }
+
     fn run(
         &self,
         prompt: &str,
@@ -61,9 +76,7 @@ impl ModelBackend for ClaudeCodeBackend {
         // which async tool calls (Monitor, ScheduleWakeup) need to finish
         // properly, and is what lets a mid-task detach (Stage 6) cleanly stop
         // it before a real interactive resume session safely takes over.
-        let program = self.program_override.clone().unwrap_or_else(|| {
-            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
-        });
+        let program = self.program();
         let compound = crate::cli_agent_common::is_compound_command(&program);
 
         let mut base_args: Vec<String> = vec![
