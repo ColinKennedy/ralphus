@@ -4472,7 +4472,9 @@ fn mailbox_register(daemon: &Daemon) -> Reply {
 
 /// RAL-241: list mailbox messages visible to `client_id`. Query params:
 /// `unread` (`1`/`true` to restrict to messages this client has not yet
-/// drained) and `priority` (`urgent`/`high`/`normal`).
+/// drained), `priority` (`urgent`/`high`/`normal`), and `category` (RAL-375,
+/// e.g. `review` -- restricts to messages tagged with that category; omitted
+/// means no category filtering).
 fn mailbox_messages(daemon: &Daemon, client_id: &str, query: &str) -> Reply {
     let store = daemon.lock();
     match store.mailbox_client_exists(client_id) {
@@ -4495,7 +4497,8 @@ fn mailbox_messages(daemon: &Daemon, client_id: &str, query: &str) -> Reply {
             }
         },
     };
-    match store.mailbox_messages_for_client(client_id, unread_only, priority) {
+    let category = query_param(query, "category");
+    match store.mailbox_messages_for_client_filtered(client_id, unread_only, priority, category) {
         Ok(messages) => json(200, &messages),
         Err(e) => store_error(&e),
     }

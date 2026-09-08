@@ -16,7 +16,6 @@ use serde::Serialize;
 
 use crate::mailbox::{self, MailboxPriority};
 use crate::store::{Result, Store};
-
 pub use crate::watches::WatchView;
 
 /// The deliberately bounded set of changes that Monitor can notify about.

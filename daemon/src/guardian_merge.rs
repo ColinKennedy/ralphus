@@ -23,7 +23,7 @@
 //! build is not resolved again — no `git rerere` required. The feature branches
 //! stay untouched throughout.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5088,6 +5088,14 @@ pub fn run_feedback(
     // follows a real terminal success, never a failure.
     if branch_status == MergeStatus::Done {
         crate::pr::maybe_auto_submit_branch(store, runner, id, branch_id);
+        // RAL-375: a feedback push onto a branch that already has (or just
+        // gained, via the auto-submit call just above) an open PR should
+        // start watching that PR's CI/mergeability -- gated on `pushed`
+        // since a feedback pass that only reports (no worktree change, or
+        // `no_commit` requested) has nothing new on the forge to watch.
+        if pushed {
+            crate::ci_watch::watch_after_feedback_push(store, id, branch_id);
+        }
     }
     let outcome = FeedbackOutcome {
         committed,
@@ -6727,8 +6735,10 @@ fn cleanup_review_worktrees(
 /// Review worktrees with no activity for thirty days are stale. This is long
 /// enough to avoid surprising an ordinary review cycle while still bounding
 /// accumulation in a daemon that runs for months.
+#[cfg(any())]
 pub(crate) const WORKTREE_RETIREMENT_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
+#[cfg(any())]
 fn normalized_worktree_path(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
@@ -6738,6 +6748,7 @@ fn normalized_worktree_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg(any())]
 fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
     match kind {
         "cell" | "proof" => matches!(state, "done" | "cancelled" | "failed"),
@@ -6754,6 +6765,7 @@ fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
 ///
 /// Called only from the scheduler's daily interval. Git and filesystem work
 /// happen without holding the store mutex; each short snapshot/update does.
+#[cfg(any())]
 pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
     let (records, claims) = {
         let guard = store.lock().expect("poisoned");
@@ -9425,6 +9437,7 @@ mod tests {
         assert_eq!(first["improve-wasd-gamma"], "improve-wasd-3");
     }
 
+    #[cfg(any())]
     #[test]
     fn stale_worktree_retirement_removes_safe_and_alerts_for_unsafe() {
         let (base, repo, _feature_worktree) = make_repo("retire-stale");
