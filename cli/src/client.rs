@@ -1287,6 +1287,7 @@ impl DaemonClient {
             "auto_submit_pr_stack",
             settings.auto_submit_pr_stack,
         );
+        set_if_some(&mut body, "separate_pr_branch", settings.separate_pr_branch);
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -1556,6 +1557,9 @@ pub struct GuardianSettings<'a> {
     /// RAL-317: whether this review's PR stack is auto-submitted/grown as
     /// each branch reaches a terminal merge state.
     pub auto_submit_pr_stack: Option<bool>,
+    /// RAL-378: whether this review's pull request is pushed to a branch
+    /// separate from its review branch.
+    pub separate_pr_branch: Option<bool>,
 }
 
 #[cfg(test)]

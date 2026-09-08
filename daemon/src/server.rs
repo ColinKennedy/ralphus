@@ -9112,6 +9112,11 @@ struct GuardianSettingsBody {
     /// default".
     #[serde(default)]
     auto_submit_pr_stack: Option<bool>,
+    /// RAL-378: this review's own override for whether its pull request is
+    /// pushed to a branch separate from its review branch. `None` (or the
+    /// field being absent) means "inherit the project/global default".
+    #[serde(default)]
+    separate_pr_branch: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -9317,6 +9322,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_submit_pr_stack {
         if let Err(e) = store.set_guardian_auto_submit_pr_stack(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.separate_pr_branch {
+        if let Err(e) = store.set_guardian_separate_pr_branch(id, Some(enabled)) {
             return store_error(&e);
         }
     }
