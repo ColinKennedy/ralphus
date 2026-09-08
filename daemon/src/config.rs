@@ -404,6 +404,20 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
              templates) if a concrete need shows up.",
         ),
     ),
+    (
+        "auto_build",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_build.is_some()),
+    ),
+    (
+        "skip_auto_build",
+        ReviewFieldDefault::NotApplicable(
+            "skip_auto_build is an explicit per-review opt-out of build gating; there is no \
+             project-level 'never build' default to inherit -- the project's own `auto_build` \
+             default (or its absence) already governs a declaration-less review, and a \
+             project-wide skip would silently disable build gating for every auto-review \
+             the project ever creates (see `reviews::require_auto_build_declaration`).",
+        ),
+    ),
 ];
 
 /// The daemon-singleton Arbiter's own agent/model/budget config (`[arbiter]`
