@@ -132,13 +132,40 @@ const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
         "action",
         "a bespoke per-review manual-test button, not a scalar setting",
     ),
+    (
+        "skip_auto_build",
+        "an explicit per-review opt-out with no project-default counterpart",
+    ),
 ];
 
 #[test]
 fn every_review_key_is_covered_by_a_pair_or_exclusion() {
     let review_keys: BTreeSet<&str> = REVIEW_KEYS.iter().copied().collect();
-    let paired: BTreeSet<&str> = PAIRS.iter().map(|(k, _)| *k).collect();
-    let excluded: BTreeSet<&str> = REVIEW_DEF_ONLY_EXCLUSIONS.iter().map(|(k, _)| *k).collect();
+    let mut paired = BTreeSet::new();
+    let mut duplicate_pairs = Vec::new();
+    for (review_key, _) in PAIRS {
+        if !paired.insert(*review_key) {
+            duplicate_pairs.push(*review_key);
+        }
+    }
+    assert!(
+        duplicate_pairs.is_empty(),
+        "these REVIEW_KEYS names appear more than once as a PAIRS left-hand side: \
+         {duplicate_pairs:?}"
+    );
+
+    let mut excluded = BTreeSet::new();
+    let mut duplicate_exclusions = Vec::new();
+    for (review_key, _) in REVIEW_DEF_ONLY_EXCLUSIONS {
+        if !excluded.insert(*review_key) {
+            duplicate_exclusions.push(*review_key);
+        }
+    }
+    assert!(
+        duplicate_exclusions.is_empty(),
+        "these REVIEW_KEYS names appear more than once in REVIEW_DEF_ONLY_EXCLUSIONS: \
+         {duplicate_exclusions:?}"
+    );
 
     let overlap: Vec<&&str> = paired.intersection(&excluded).collect();
     assert!(
@@ -196,13 +223,15 @@ fn every_review_config_key_is_covered_by_exactly_one_pair() {
 }
 
 #[test]
-fn review_def_only_exclusions_are_exactly_id_name_upstream_action() {
+fn review_def_only_exclusions_are_the_fields_without_project_defaults() {
     let names: BTreeSet<&str> = REVIEW_DEF_ONLY_EXCLUSIONS.iter().map(|(k, _)| *k).collect();
-    let expected: BTreeSet<&str> = ["id", "name", "upstream", "action"].into_iter().collect();
+    let expected: BTreeSet<&str> = ["id", "name", "upstream", "action", "skip_auto_build"]
+        .into_iter()
+        .collect();
     assert_eq!(
         names, expected,
-        "REVIEW_DEF_ONLY_EXCLUSIONS must be exactly {{id, name, upstream, action}} -- every \
-         other `[[review]]` field must map to a real project default in PAIRS"
+        "REVIEW_DEF_ONLY_EXCLUSIONS must list exactly the `[[review]]` fields without project \
+         defaults -- every other field must map to a real project default in PAIRS"
     );
 }
 
