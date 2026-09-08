@@ -158,6 +158,13 @@ pub const BACKGROUND_JOB_NUDGE_PROMPT: &str = "You ended your last turn with an 
     one.";
 
 pub trait ModelBackend {
+    /// Verify that this backend's configured launcher is available without
+    /// starting an agent session. Backends without a local CLI keep the
+    /// default because their availability needs a real request.
+    fn preflight(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn run(
         &self,
         prompt: &str,

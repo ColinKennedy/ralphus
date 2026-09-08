@@ -21,16 +21,29 @@ pub struct CodexBackend {
     pub program_override: Option<String>,
 }
 
+impl CodexBackend {
+    fn program(&self) -> String {
+        self.program_override.clone().unwrap_or_else(|| {
+            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
+        })
+    }
+}
+
 impl ModelBackend for CodexBackend {
+    fn preflight(&self) -> Result<(), BackendError> {
+        crate::cli_agent_common::preflight_default_program(
+            &self.program(),
+            self.program_override.is_some() || std::env::var_os("RALPHUS_CODEX_COMMAND").is_some(),
+        )
+    }
+
     fn run(
         &self,
         prompt: &str,
         workspace: &Workspace,
         options: &RunOptions<'_>,
     ) -> Result<BackendOutcome, BackendError> {
-        let program = self.program_override.clone().unwrap_or_else(|| {
-            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
-        });
+        let program = self.program();
         let compound = crate::cli_agent_common::is_compound_command(&program);
 
         // `-c developer_instructions=...` (and the RAL-304 context-limit

@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::tools::ToolError;
+use crate::{backend::BackendError, shellcmd};
 
 /// Whether `value` should be routed through a shell rather than exec'd
 /// directly: has a space, and isn't a single quoted/wrapped path token (a
@@ -17,6 +18,51 @@ pub fn is_compound_command(value: &str) -> bool {
         return false;
     }
     !is_quote_wrapped(trimmed)
+}
+
+/// Whether a launcher must be passed through a shell instead of directly to
+/// `Command::new`. Windows batch wrappers need `cmd /C` even when their path
+/// is already fully resolved; npm commonly installs CLIs in that form.
+#[must_use]
+pub fn launcher_requires_shell(value: &str) -> bool {
+    if is_compound_command(value) {
+        return true;
+    }
+    is_windows_batch_launcher(value)
+}
+
+/// Whether this direct launcher is a Windows batch wrapper. Unlike a
+/// user-authored compound command, it has one required interpreter: cmd.exe.
+#[must_use]
+pub fn is_windows_batch_launcher(value: &str) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    matches!(
+        Path::new(value)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cmd" | "bat")
+    )
+}
+
+/// Check a backend's default direct CLI launcher without executing it.
+///
+/// A configured command override is deliberately skipped: it can contain
+/// user-authored shell syntax, and validating it would require executing that
+/// command during a review preflight.
+pub fn preflight_default_program(
+    program: &str,
+    custom_program_configured: bool,
+) -> Result<(), BackendError> {
+    if custom_program_configured || is_compound_command(program) {
+        return Ok(());
+    }
+    shellcmd::find_program(program)
+        .ok_or_else(|| BackendError(format!("program {program:?} is not resolvable on PATH")))?;
+    Ok(())
 }
 
 fn is_quote_wrapped(value: &str) -> bool {
@@ -96,6 +142,14 @@ mod tests {
         assert!(is_compound_command("cd /foo && claude"));
         assert!(!is_compound_command("claude"));
         assert!(!is_compound_command("\"C:\\path with space\\claude.exe\""));
+    }
+
+    #[test]
+    fn batch_launcher_requires_a_shell_only_on_windows() {
+        assert_eq!(
+            launcher_requires_shell("C:\\npm\\pi.cmd"),
+            cfg!(target_os = "windows")
+        );
     }
 
     #[test]

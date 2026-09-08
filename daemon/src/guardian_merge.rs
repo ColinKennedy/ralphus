@@ -1135,6 +1135,19 @@ fn resolver_backend(store: &Arc<Mutex<Store>>, id: &str) -> Result<ResolvedResol
     )
 }
 
+/// Reject an unavailable built-in resolver before a merge changes any review
+/// worktree. Custom executable commands are intentionally skipped because they
+/// may be compound shell commands and cannot be checked without executing them.
+fn preflight_resolver_agent(
+    runner: &dyn Runner,
+    resolved: &ResolvedResolverAgent,
+    machine: Option<&str>,
+) -> Result<(), String> {
+    runner
+        .preflight_agent(&resolved.backend, resolved.executable.as_deref(), machine)
+        .map_err(|error| format!("resolver agent unavailable: {error}"))
+}
+
 /// The effective environment one review branch's worktree runs under
 /// (RAL-191): whatever the branch's *source cell* resolved to
 /// (`squad < task < cell`), with the branch's own overrides and tombstones
@@ -1964,8 +1977,9 @@ fn resolve_conflicts_with_agent(
         // This is either the commit's first pass (commit_attempts was reset to
         // 0 the last time the rebase advanced) or a retry -- in which case
         // current_commit_session_id carries the previous pass's session so the
-        // agent resumes its own conversation instead of starting cold.
-        commit_attempts += 1;
+        // agent resumes its own conversation instead of starting cold. Count
+        // only a completed agent pass below: a runner/backend invocation that
+        // cannot produce a result is not an attempt to resolve conflicts.
         let spec = RunnerSpec {
             // RAL-102: unique per (guardian, branch) so the tmux session this
             // resolves through (see `crate::tmux::session_name`) never
@@ -2141,25 +2155,10 @@ fn resolve_conflicts_with_agent(
                     admin_only: false,
                 });
             }
-            if commit_attempts >= MAX_ATTEMPTS_PER_COMMIT {
-                return Err(give_up_on_stuck_commit(
-                    store,
-                    id,
-                    branch,
-                    wt,
-                    found,
-                    committed,
-                    commit_attempts,
-                ));
-            }
-            crate::rlog!(
-                WARNING,
-                "ralphus [guardian] review {id} conflict resolver attempt \
-                 {commit_attempts}/{MAX_ATTEMPTS_PER_COMMIT} failed branch={branch:?}: {err} \
-                 -- retrying, resuming session={current_commit_session_id:?}"
-            );
-            continue;
+            return Err(format!("conflict resolver invocation failed: {err}"));
         }
+
+        commit_attempts += 1;
 
         // RAL-136: persist the resolver's self-summarized handoff note, if it
         // produced one (same `RALPHUS_GHOST:` marker/system-prompt path as a
@@ -3114,6 +3113,41 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) {
     }
 }
 
+/// Terminate every tmux-backed agent session belonging to this review.
+///
+/// The cancellation token remains the ordinary cooperative stop path. This is
+/// the immediate path for an agent already inside a blocking invocation: on
+/// Windows, [`crate::tmux::Tmux::kill_session`] also closes the confined job
+/// object, terminating the pane's entire process tree rather than merely
+/// removing the tmux session name.
+fn kill_guardian_agent_sessions(store: &Arc<Mutex<Store>>, id: &str) {
+    let prefix = format!("ralphus_guardian-{id}_");
+    let count = crate::tmux::Tmux::resolve()
+        .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
+        .unwrap_or(0);
+    if count == 0 {
+        return;
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} stopped {count} active agent session(s)"
+    );
+    let guard = store.lock().expect("store mutex poisoned");
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "guardian",
+        message: "stopped active review agent sessions",
+        scope: Some("guardian"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({ "session_count": count }),
+        admin_only: false,
+    });
+}
+
 /// Stop any in-flight merge worker for `id` (cancel token + the same bounded
 /// wait as [`restart_guardian_merge`]/[`stop_guardian_merge`]) before a plain
 /// cancel writes `cancelled` to the DB.
@@ -3152,6 +3186,7 @@ pub fn restart_guardian_merge(
 ) -> Reply {
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
+    kill_guardian_agent_sessions(&store, id);
     wait_for_merge_worker_stop(&cancellations, &key);
     if let Err(e) = store
         .lock()
@@ -3235,6 +3270,7 @@ pub fn stop_guardian_merge(
 ) -> Reply {
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
+    kill_guardian_agent_sessions(&store, id);
     wait_for_merge_worker_stop(&cancellations, &key);
     match store
         .lock()
@@ -3551,6 +3587,24 @@ pub fn run_merge_staged(
             .expect("poisoned")
             .set_guardian_status(id, s, detail);
     };
+    let resolved = match resolve_resolver_agent(
+        guardian.resolver_agent.as_deref(),
+        guardian.resolver_model.as_deref(),
+        Path::new(&guardian.git_root),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            set_status(
+                GuardianStatus::MergeFailed,
+                Some(&format!("unresolvable resolver agent: {error}")),
+            );
+            return;
+        }
+    };
+    if let Err(error) = preflight_resolver_agent(runner, &resolved, guardian.machine.as_deref()) {
+        set_status(GuardianStatus::MergeFailed, Some(&error));
+        return;
+    }
     set_status(GuardianStatus::Merging, None);
     {
         let guard = store.lock().expect("poisoned");
@@ -4184,6 +4238,24 @@ pub fn run_merge_cancellable(
             .expect("poisoned")
             .set_guardian_status(id, s, detail);
     };
+    let resolved = match resolve_resolver_agent(
+        guardian.resolver_agent.as_deref(),
+        guardian.resolver_model.as_deref(),
+        Path::new(&guardian.git_root),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            set_status(
+                GuardianStatus::MergeFailed,
+                Some(&format!("unresolvable resolver agent: {error}")),
+            );
+            return;
+        }
+    };
+    if let Err(error) = preflight_resolver_agent(runner, &resolved, guardian.machine.as_deref()) {
+        set_status(GuardianStatus::MergeFailed, Some(&error));
+        return;
+    }
     set_status(GuardianStatus::Merging, None);
     {
         let guard = store.lock().expect("poisoned");
@@ -7591,6 +7663,9 @@ fn generate_final_summary(
     let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
         return;
     };
+    if guardian.status != GuardianStatus::InReview.as_str() {
+        return;
+    }
     let enabled: Vec<&crate::guardian::BranchView> =
         guardian.branches.iter().filter(|b| b.enabled).collect();
     if enabled.is_empty() {

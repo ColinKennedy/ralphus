@@ -849,6 +849,20 @@ pub trait Runner: Send + Sync {
     /// Execute a cell and report its result.
     fn run(&self, spec: &RunnerSpec) -> RunnerResult;
 
+    /// Check whether an agent can be dispatched before mutating a worktree.
+    ///
+    /// Test runners deliberately accept every agent: they do not spawn an
+    /// external process, so requiring their host to have a CLI installed would
+    /// make in-process merge tests depend on local developer tooling.
+    fn preflight_agent(
+        &self,
+        _agent: &str,
+        _executable: Option<&str>,
+        _machine: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Like [`run`](Runner::run), but aborts — killing any spawned
     /// subprocess — as soon as `cancel` trips. The default ignores
     /// cancellation and just calls [`run`](Runner::run); the real
@@ -1028,6 +1042,35 @@ impl Runner for SubprocessRunner {
     /// view available for it.
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
         self.run_via_tmux(spec, cancel)
+    }
+
+    fn preflight_agent(
+        &self,
+        agent: &str,
+        executable: Option<&str>,
+        _machine: Option<&str>,
+    ) -> Result<(), String> {
+        let mut command = std::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .arg("preflight")
+            .arg("--agent")
+            .arg(agent);
+        if let Some(executable) = executable {
+            command.arg("--executable").arg(executable);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("could not start ralphus-runner preflight: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if detail.is_empty() {
+            format!("ralphus-runner preflight exited with {}", output.status)
+        } else {
+            detail
+        })
     }
 }
 

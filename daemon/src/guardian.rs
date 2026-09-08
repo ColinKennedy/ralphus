@@ -215,6 +215,9 @@ pub enum MergeStatus {
     Ready,
     /// Being rebased onto the stack.
     InProgress,
+    /// The review rebase was explicitly stopped while this branch was active.
+    /// Its worktree is left for the next merge attempt to clean up or resume.
+    Stopped,
     /// Reviewer feedback is being applied: the resolver agent is editing the
     /// worktree in response to `review feedback` (and, once it finishes, the
     /// target-branch proof/commit/push steps run). Transient — set right
@@ -245,6 +248,7 @@ impl MergeStatus {
             Self::Pending => "pending",
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
+            Self::Stopped => "stopped",
             Self::Actioning => "actioning",
             Self::Done => "done",
             Self::ProofPending => "proof_pending",
@@ -3819,6 +3823,21 @@ impl Store {
             None,
             "review → merge_stopped (stopped mid-rebase)",
         );
+        let active_branch_ids: Vec<String> = self
+            .get_guardian(id)?
+            .branches
+            .into_iter()
+            .filter(|branch| {
+                matches!(
+                    branch.merge_status.as_str(),
+                    "in_progress" | "proof_pending" | "actioning"
+                )
+            })
+            .map(|branch| branch.id)
+            .collect();
+        for branch_id in active_branch_ids {
+            self.set_branch_status(id, &branch_id, MergeStatus::Stopped, Some("merge stopped"))?;
+        }
         Ok(GuardianStatus::MergeStopped)
     }
 
@@ -4884,10 +4903,12 @@ mod tests {
     }
 
     #[test]
-    fn stop_guardian_merge_flips_merging_to_merge_stopped_only() {
+    fn stop_guardian_merge_stops_each_active_branch() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
+        store.add_guardian_branch(&id, "proof").unwrap();
+        store.add_guardian_branch(&id, "feedback").unwrap();
 
         // Not merging: stop must be rejected.
         assert!(store.stop_guardian_merge(&id).is_err());
@@ -4895,11 +4916,35 @@ mod tests {
 
         // Merging: stop flips to merge_stopped.
         store.claim_guardian_merge(&id).unwrap();
+        let branch_ids: Vec<String> = store
+            .get_guardian(&id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|branch| branch.id.clone())
+            .collect();
+        store
+            .set_branch_status(&id, &branch_ids[0], MergeStatus::InProgress, None)
+            .unwrap();
+        store
+            .set_branch_status(&id, &branch_ids[1], MergeStatus::ProofPending, None)
+            .unwrap();
+        store
+            .set_branch_status(&id, &branch_ids[2], MergeStatus::Actioning, None)
+            .unwrap();
         assert_eq!(
             store.stop_guardian_merge(&id).unwrap(),
             GuardianStatus::MergeStopped
         );
         assert_eq!(store.get_guardian(&id).unwrap().status, "merge_stopped");
+        assert!(
+            store
+                .get_guardian(&id)
+                .unwrap()
+                .branches
+                .iter()
+                .all(|branch| { branch.merge_status == MergeStatus::Stopped.as_str() })
+        );
 
         // merge_stopped is distinct from cancelled and is cancellable.
         assert_eq!(

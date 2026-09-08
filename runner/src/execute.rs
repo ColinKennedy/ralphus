@@ -94,6 +94,17 @@ fn load_backend(
     }
 }
 
+/// Ask the selected backend whether its launcher is available without opening
+/// an agent session.
+pub fn preflight_agent(
+    agent: &str,
+    executable: Option<&str>,
+    keep_temporary_files: bool,
+) -> Result<(), String> {
+    load_backend(agent, executable, keep_temporary_files)
+        .and_then(|backend| backend.preflight().map_err(|error| error.to_string()))
+}
+
 /// Runs one cell end-to-end. Never panics on a bad workspace/backend --
 /// every failure mode becomes a `"failed"` [`CellResult`], always
 /// producing a result rather than letting an

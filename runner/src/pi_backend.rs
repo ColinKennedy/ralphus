@@ -20,7 +20,42 @@ pub struct PiBackend {
     pub program_override: Option<String>,
 }
 
+impl PiBackend {
+    fn program(&self) -> String {
+        self.program_override.clone().unwrap_or_else(|| {
+            std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
+        })
+    }
+
+    /// Resolve Pi's direct launcher before spawning it. On Windows npm ships a
+    /// POSIX shim named `pi` beside the executable `pi.cmd`; the shell chooses
+    /// the latter through `PATHEXT`, but `Command::new("pi")` need not. Keeping
+    /// the resolution here makes every Pi invocation use the same launcher
+    /// selection while leaving compound user commands for the shell.
+    fn launch_program(&self) -> String {
+        let program = self.program();
+        if crate::cli_agent_common::launcher_requires_shell(&program) {
+            return program;
+        }
+        shellcmd::find_program(&program).unwrap_or(program)
+    }
+}
+
+fn real_config_dir(
+    ambient_dir: Option<std::path::PathBuf>,
+    home_dir: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    ambient_dir.or_else(|| home_dir.map(|home| home.join(".pi").join("agent")))
+}
+
 impl ModelBackend for PiBackend {
+    fn preflight(&self) -> Result<(), BackendError> {
+        crate::cli_agent_common::preflight_default_program(
+            &self.program(),
+            self.program_override.is_some() || std::env::var_os("RALPHUS_PI_COMMAND").is_some(),
+        )
+    }
+
     fn run(
         &self,
         prompt: &str,
@@ -36,25 +71,49 @@ impl ModelBackend for PiBackend {
         // `spawn`'s own env override.
         let isolate = !options.allow_personal_settings || !options.allow_personal_memory;
         let ambient_dir = std::env::var_os("PI_CODING_AGENT_DIR").map(std::path::PathBuf::from);
+        // Pi's documented default when PI_CODING_AGENT_DIR is absent is
+        // ~/.pi/agent.  Isolation must preserve the login from that real
+        // location too; otherwise a normal interactive Pi installation gets
+        // an empty isolated auth.json and can end a JSON-mode run without an
+        // assistant turn.
+        let real_config_dir =
+            real_config_dir(ambient_dir.clone(), crate::agent_isolation::home_dir());
         let isolated_dir = if isolate {
             let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "pi");
             // Best-effort: preserve a stored login so isolation doesn't force
             // a re-auth. Preserved regardless of the two opt-ins -- this is
             // about *authentication*, not personal settings/memory.
-            crate::agent_isolation::preserve_auth_file(ambient_dir.as_deref(), &dir, "auth.json");
+            crate::agent_isolation::preserve_auth_file(
+                real_config_dir.as_deref(),
+                &dir,
+                "auth.json",
+            );
+            // Pi resolves an explicit provider/model through this downloaded
+            // catalog. It contains model metadata rather than personal memory
+            // or settings, so carry it into the isolated directory whenever
+            // it exists; otherwise a valid `openrouter/...` model is unknown
+            // only to the isolated runner process.
+            crate::agent_isolation::preserve_auth_file(
+                real_config_dir.as_deref(),
+                &dir,
+                "models-store.json",
+            );
+            // `models.json` carries provider-specific routing and model
+            // overrides. In particular, an OpenRouter override can pin a
+            // model to an approved cheaper upstream and disable fallbacks;
+            // preserve that execution policy even while memory is isolated.
+            crate::agent_isolation::preserve_auth_file(
+                real_config_dir.as_deref(),
+                &dir,
+                "models.json",
+            );
             if options.allow_personal_settings {
-                // Settings opted back in but memory did not -- copy the
-                // settings/model-override files (not any memory file) into
-                // the isolated dir so personal settings still take effect.
+                // Settings opted back in but memory did not -- copy settings
+                // (not any memory file) into the isolated dir.
                 crate::agent_isolation::preserve_auth_file(
-                    ambient_dir.as_deref(),
+                    real_config_dir.as_deref(),
                     &dir,
                     "settings.json",
-                );
-                crate::agent_isolation::preserve_auth_file(
-                    ambient_dir.as_deref(),
-                    &dir,
-                    "models.json",
                 );
             }
             Some(dir)
@@ -71,10 +130,8 @@ impl ModelBackend for PiBackend {
             options.maximum_tool_output_tokens,
         )?;
 
-        let program = self.program_override.clone().unwrap_or_else(|| {
-            std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
-        });
-        let compound = crate::cli_agent_common::is_compound_command(&program);
+        let program = self.launch_program();
+        let compound = crate::cli_agent_common::launcher_requires_shell(&program);
 
         // Always send the cell's own prompt, even on resume -- matches
         // claude-code/codex (RAL-248 AC3): cross-cell session sharing needs
@@ -418,7 +475,14 @@ fn spawn(
     isolated_config_dir: Option<&Path>,
 ) -> std::io::Result<Child> {
     if compound {
-        let shell = shellcmd::resolve_shell(None);
+        // npm's `pi.cmd` is a batch file, not a generic user command. It
+        // must be interpreted by cmd.exe; routing it through the daemon's
+        // parent shell can change the one prompt argument after `-p`.
+        let shell = if crate::cli_agent_common::is_windows_batch_launcher(program) {
+            "cmd".to_string()
+        } else {
+            shellcmd::resolve_shell(None)
+        };
         let _ = shellcmd::detect_parent_shell(&Env::from_process());
         let line = shellcmd::build_compound_command_line(&shell, program, args);
         match shellcmd::shell_spawn_args(&shell, &line) {
@@ -795,6 +859,25 @@ fn finish_delta_line() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_config_dir_uses_pis_default_when_the_env_override_is_unset() {
+        assert_eq!(
+            real_config_dir(None, Some(std::path::PathBuf::from("C:/Users/tester"))),
+            Some(std::path::PathBuf::from("C:/Users/tester/.pi/agent"))
+        );
+    }
+
+    #[test]
+    fn real_config_dir_prefers_the_explicit_env_override() {
+        assert_eq!(
+            real_config_dir(
+                Some(std::path::PathBuf::from("D:/pi-config")),
+                Some(std::path::PathBuf::from("C:/Users/tester")),
+            ),
+            Some(std::path::PathBuf::from("D:/pi-config"))
+        );
+    }
 
     #[test]
     fn build_args_includes_resume_model_and_system_prompt() {
