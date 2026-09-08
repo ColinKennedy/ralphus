@@ -3454,19 +3454,24 @@ fn submit_stacked_branch_pr(
         .map_err(|e| e.to_string())
 }
 
-/// How (if at all) to register/grow the guardian's GitHub-native PR stack
-/// after a submission (best-effort, mirrors `resync_pr_bases`'s PATCH calls).
-/// A pure decision -- no I/O -- so it's unit-testable without git or network.
+/// How (if at all) to reconcile the guardian's GitHub-native PR stack after a
+/// submission. A pure decision -- no I/O -- so it is unit-testable without
+/// git or network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StackAction {
     /// No stack recorded yet -- create one from every currently-open PR,
     /// bottom to top.
     Create { all_ordered: Vec<i64> },
-    /// A stack is already recorded -- append the newly created PRs (in
-    /// position order) on top of it.
+    /// A recorded stack is a strict prefix of the review's expected PR order.
     Append {
         stack_number: i64,
-        new_ordered: Vec<i64>,
+        missing_ordered: Vec<i64>,
+        all_ordered: Vec<i64>,
+    },
+    /// A recorded stack contains the wrong members or order. Rebuild the
+    /// native grouping while retaining every existing PR.
+    Rebuild {
+        stack_number: i64,
         all_ordered: Vec<i64>,
     },
     /// Nothing to do this call.
@@ -3476,69 +3481,41 @@ enum StackAction {
 /// Decide the [`StackAction`] for one submission. `all_branches_with_prs` is
 /// every enabled branch that now has an open PR (existing + just-created),
 /// as `(branch_id, position, pr_number)`, in any order.
-/// `newly_created_branch_ids` are the branch ids submitted *this* call.
-/// `recorded_stack_number` is the guardian's previously-registered stack, if
-/// any.
+/// `recorded_stack` is the guardian's previously-registered native stack and
+/// its live ordered member PR numbers, if any.
 fn decide_stack_action(
     all_branches_with_prs: &[(String, i64, i64)],
-    newly_created_branch_ids: &std::collections::HashSet<String>,
-    recorded_stack_number: Option<i64>,
+    recorded_stack: Option<(i64, Vec<i64>)>,
 ) -> StackAction {
-    match recorded_stack_number {
-        None => {
-            if all_branches_with_prs.len() < 2 {
+    let mut all_ordered: Vec<(i64, i64)> = all_branches_with_prs
+        .iter()
+        .map(|(_, pos, num)| (*pos, *num))
+        .collect();
+    all_ordered.sort_by_key(|(pos, _)| *pos);
+    let all_ordered: Vec<i64> = all_ordered.into_iter().map(|(_, num)| num).collect();
+    if all_ordered.len() < 2 {
+        return StackAction::Skip {
+            reason: "fewer than 2 PRs in the stack",
+        };
+    }
+    match recorded_stack {
+        None => StackAction::Create { all_ordered },
+        Some((stack_number, members)) => {
+            if members == all_ordered {
                 return StackAction::Skip {
-                    reason: "fewer than 2 PRs in the stack",
+                    reason: "native stack already matches the review PR order",
                 };
             }
-            let mut ordered: Vec<(i64, i64)> = all_branches_with_prs
-                .iter()
-                .map(|(_, pos, num)| (*pos, *num))
-                .collect();
-            ordered.sort_by_key(|(pos, _)| *pos);
-            StackAction::Create {
-                all_ordered: ordered.into_iter().map(|(_, num)| num).collect(),
-            }
-        }
-        Some(stack_number) => {
-            if newly_created_branch_ids.is_empty() {
-                return StackAction::Skip {
-                    reason: "no new PRs to register",
+            if all_ordered.starts_with(&members) {
+                return StackAction::Append {
+                    stack_number,
+                    missing_ordered: all_ordered[members.len()..].to_vec(),
+                    all_ordered,
                 };
             }
-            let prior_top_position = all_branches_with_prs
-                .iter()
-                .filter(|(bid, _, _)| !newly_created_branch_ids.contains(bid))
-                .map(|(_, pos, _)| *pos)
-                .max();
-            let mut new_ordered: Vec<(i64, i64)> = all_branches_with_prs
-                .iter()
-                .filter(|(bid, _, _)| newly_created_branch_ids.contains(bid))
-                .map(|(_, pos, num)| (*pos, *num))
-                .collect();
-            new_ordered.sort_by_key(|(pos, _)| *pos);
-            let lowest_new_position = new_ordered.first().map(|(pos, _)| *pos);
-            let extends_top = match (prior_top_position, lowest_new_position) {
-                (Some(prior), Some(new_low)) => new_low > prior,
-                (None, Some(_)) => true,
-                (_, None) => false,
-            };
-            if !extends_top {
-                return StackAction::Skip {
-                    reason: "new PRs do not strictly extend the recorded stack's top",
-                };
-            }
-            StackAction::Append {
+            StackAction::Rebuild {
                 stack_number,
-                new_ordered: new_ordered.into_iter().map(|(_, num)| num).collect(),
-                all_ordered: {
-                    let mut all_ordered: Vec<(i64, i64)> = all_branches_with_prs
-                        .iter()
-                        .map(|(_, pos, num)| (*pos, *num))
-                        .collect();
-                    all_ordered.sort_by_key(|(pos, _)| *pos);
-                    all_ordered.into_iter().map(|(_, num)| num).collect()
-                },
+                all_ordered,
             }
         }
     }
@@ -3642,7 +3619,6 @@ fn submit_stack_for_guardian(
 ) -> std::result::Result<Vec<PullRequestView>, String> {
     let already_open = refresh_open_prs(store, client, open_prs_by_branch(existing_prs));
     let mut created = Vec::new();
-    let mut newly_created_branch_ids = std::collections::HashSet::new();
 
     for branch in ordered_enabled {
         if already_open.contains_key(branch.id.as_str()) {
@@ -3673,7 +3649,6 @@ fn submit_stack_for_guardian(
             stack_id,
             fork_routing,
         )?;
-        newly_created_branch_ids.insert(branch.id.clone());
         created.push(pr);
     }
 
@@ -3683,7 +3658,11 @@ fn submit_stack_for_guardian(
     // resubmission that raced a reorder) is treated as "already submitted,
     // nothing to do" forever, even though it's still pointed at the wrong
     // base and doesn't actually read as part of the stack on the forge.
-    let resynced = resync_pr_bases(store, id).unwrap_or_else(|e| {
+    // Submission is an explicit stack-reconciliation boundary for both the
+    // button and auto-submit. Confirm every forge-side base here instead of
+    // trusting a prior best-effort local update that may have failed after
+    // its row was written.
+    let resynced = resync_pr_bases_synchronously(store, id).unwrap_or_else(|e| {
         crate::rlog!(WARNING, "ralphus [pr] review {id} stack resync failed: {e}");
         0
     });
@@ -3740,9 +3719,9 @@ fn submit_stack_for_guardian(
         .get_guardian_forge_stack_number(id)
         .map_err(|e| e.to_string())?;
     let recorded = match recorded {
-        Some(stack_number) => match client.stack_exists(stack_number) {
-            Ok(true) => Some(stack_number),
-            Ok(false) => {
+        Some(stack_number) => match client.get_stack_pull_requests(stack_number) {
+            Ok(Some(members)) => Some((stack_number, members)),
+            Ok(None) => {
                 store
                     .lock()
                     .expect("poisoned")
@@ -3757,14 +3736,14 @@ fn submit_stack_for_guardian(
             Err(e) => {
                 crate::rlog!(
                     WARNING,
-                    "ralphus [pr] review {id} could not check github pr stack {stack_number}; preserving the recorded stack: {e}"
+                    "ralphus [pr] review {id} could not inspect github pr stack {stack_number}; leaving it unchanged: {e}"
                 );
-                Some(stack_number)
+                return Ok(created);
             }
         },
         None => None,
     };
-    match decide_stack_action(&all_with_prs, &newly_created_branch_ids, recorded) {
+    match decide_stack_action(&all_with_prs, recorded) {
         StackAction::Create { all_ordered } => {
             match create_and_record_native_stack(store, id, client, &all_ordered) {
                 Ok(Some(stack_number)) => {
@@ -3781,10 +3760,10 @@ fn submit_stack_for_guardian(
         }
         StackAction::Append {
             stack_number,
-            new_ordered,
+            missing_ordered,
             all_ordered,
         } => {
-            if let Err(e) = client.add_to_stack(stack_number, &new_ordered) {
+            if let Err(e) = client.add_to_stack(stack_number, &missing_ordered) {
                 if is_forge_not_found(&e) {
                     let clear_result = store
                         .lock()
@@ -3819,6 +3798,33 @@ fn submit_stack_for_guardian(
                 }
             }
         }
+        StackAction::Rebuild {
+            stack_number,
+            all_ordered,
+        } => match client.unstack(stack_number) {
+            Ok(()) => {
+                store
+                    .lock()
+                    .expect("poisoned")
+                    .clear_guardian_forge_stack_number(id)
+                    .map_err(|e| e.to_string())?;
+                match create_and_record_native_stack(store, id, client, &all_ordered) {
+                    Ok(Some(new_stack_number)) => crate::rlog!(
+                        INFO,
+                        "ralphus [pr] review {id} rebuilt github pr stack {stack_number} as {new_stack_number}"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} could not rebuild github pr stack {stack_number}: {e}"
+                    ),
+                }
+            }
+            Err(e) => crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} could not dissolve mismatched github pr stack {stack_number}: {e}"
+            ),
+        },
         StackAction::Skip { reason } => {
             crate::rlog!(
                 DEBUG,
@@ -3941,14 +3947,10 @@ fn auto_submit_terminal_branches(
 /// recorded per-branch via [`Store::set_branch_auto_submit_error`] instead of
 /// propagated, and a success clears any previously-recorded error.
 ///
-/// Does a cheap, local-only diff first -- comparing the branch's current
-/// review-ref sha against its existing open PR row's `last_pushed_sha`, no
-/// push/forge call involved -- so a re-entrant call for a branch whose state
-/// hasn't actually changed since its last successful auto-submit is a no-op
-/// before any network I/O happens (also clearing a stale failure marker, if
-/// any -- the branch's state is fine now regardless of how it got there).
-/// This is the anti-spam mechanism: no separate time-based debounce is
-/// needed.
+/// Reconciles the whole terminal portion of the review even when this branch
+/// already has a current PR. A PR row and its pushed SHA prove only that the
+/// branch was submitted; they do not prove that its forge-side base and
+/// GitHub-native stack membership still match the review.
 pub fn maybe_auto_submit_branch(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
@@ -3968,40 +3970,6 @@ pub fn maybe_auto_submit_branch(
     if !branch.enabled {
         return;
     }
-    let Some(review_ref) = branch.review_branch.as_deref() else {
-        return;
-    };
-    let root = PathBuf::from(&guardian.git_root);
-    let Ok(current_sha) = git(&root, &["rev-parse", review_ref]).map(|s| s.trim().to_string())
-    else {
-        return;
-    };
-
-    let existing_prs = match store
-        .lock()
-        .expect("poisoned")
-        .list_pull_requests_for_guardian(id)
-    {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let already_covered = existing_prs.iter().any(|pr| {
-        pr.branch_id.as_deref() == Some(branch_id)
-            && pr.state == "open"
-            && pr.last_pushed_sha.as_deref() == Some(current_sha.as_str())
-    });
-    if already_covered {
-        // The branch's state is already correctly reflected on the forge
-        // (e.g. a human ran `review pr submit` manually in the meantime) --
-        // clear any stale failure marker from a past attempt rather than
-        // leaving a resolved problem shown as still-failing.
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_branch_auto_submit_error(id, branch_id, None);
-        return;
-    }
-
     match auto_submit_terminal_branches(store, runner, id) {
         Ok(_) => {
             let _ = store
@@ -5175,9 +5143,8 @@ mod tests {
     #[test]
     fn decide_stack_action_creates_once_two_prs_exist() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
-        let new_ids: std::collections::HashSet<String> = ["b-b".to_string()].into_iter().collect();
         assert_eq!(
-            decide_stack_action(&prs, &new_ids, None),
+            decide_stack_action(&prs, None),
             StackAction::Create {
                 all_ordered: vec![3, 6]
             }
@@ -5187,9 +5154,8 @@ mod tests {
     #[test]
     fn decide_stack_action_skips_a_single_pr() {
         let prs = vec![("b-a".to_string(), 0, 3)];
-        let new_ids: std::collections::HashSet<String> = ["b-a".to_string()].into_iter().collect();
         assert_eq!(
-            decide_stack_action(&prs, &new_ids, None),
+            decide_stack_action(&prs, None),
             StackAction::Skip {
                 reason: "fewer than 2 PRs in the stack"
             }
@@ -5197,49 +5163,45 @@ mod tests {
     }
 
     #[test]
-    fn decide_stack_action_appends_new_prs_on_top_of_a_recorded_stack() {
+    fn decide_stack_action_appends_a_missing_terminal_pr_to_a_recorded_stack() {
         let prs = vec![
             ("b-a".to_string(), 0, 3),
             ("b-b".to_string(), 1, 6),
             ("b-c".to_string(), 2, 9),
         ];
-        let new_ids: std::collections::HashSet<String> = ["b-c".to_string()].into_iter().collect();
         assert_eq!(
-            decide_stack_action(&prs, &new_ids, Some(42)),
+            decide_stack_action(&prs, Some((42, vec![3, 6]))),
             StackAction::Append {
                 stack_number: 42,
-                new_ordered: vec![9],
+                missing_ordered: vec![9],
                 all_ordered: vec![3, 6, 9]
             }
         );
     }
 
     #[test]
-    fn decide_stack_action_skips_when_new_prs_do_not_extend_the_top() {
-        // b-b was filled in as a gap below the recorded stack's prior top
-        // (b-c, position 2) -- appending it wouldn't chain onto the stack's
-        // actual top, so this must be skipped rather than sent to the forge.
+    fn decide_stack_action_rebuilds_a_recorded_stack_with_wrong_members() {
         let prs = vec![
             ("b-a".to_string(), 0, 3),
             ("b-b".to_string(), 1, 6),
             ("b-c".to_string(), 2, 9),
         ];
-        let new_ids: std::collections::HashSet<String> = ["b-b".to_string()].into_iter().collect();
         assert_eq!(
-            decide_stack_action(&prs, &new_ids, Some(42)),
-            StackAction::Skip {
-                reason: "new PRs do not strictly extend the recorded stack's top"
+            decide_stack_action(&prs, Some((42, vec![3, 9]))),
+            StackAction::Rebuild {
+                stack_number: 42,
+                all_ordered: vec![3, 6, 9]
             }
         );
     }
 
     #[test]
-    fn decide_stack_action_skips_when_nothing_new() {
+    fn decide_stack_action_skips_when_recorded_stack_already_matches() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
         assert_eq!(
-            decide_stack_action(&prs, &std::collections::HashSet::new(), Some(42)),
+            decide_stack_action(&prs, Some((42, vec![3, 6]))),
             StackAction::Skip {
-                reason: "no new PRs to register"
+                reason: "native stack already matches the review PR order"
             }
         );
     }
@@ -5248,7 +5210,7 @@ mod tests {
     fn decide_stack_action_repairs_an_unrecorded_stack_when_nothing_is_new() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
         assert_eq!(
-            decide_stack_action(&prs, &std::collections::HashSet::new(), None),
+            decide_stack_action(&prs, None),
             StackAction::Create {
                 all_ordered: vec![3, 6]
             }
@@ -8455,7 +8417,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_auto_submit_branch_skips_forge_entirely_when_already_covered_by_a_matching_pr() {
+    fn maybe_auto_submit_branch_reconciles_even_when_its_pr_sha_is_current() {
         let root = setup_auto_submit_repo("auto-submit-covered");
         let store = Arc::new(Mutex::new(store()));
         let (gid, bid, tip) = setup_terminal_branch(&store, &root, true);
@@ -8502,11 +8464,9 @@ mod tests {
             )
             .unwrap();
 
-        // This guardian has NO git remote configured at all -- if
-        // `maybe_auto_submit_branch` attempted forge resolution despite
-        // already being covered, it would fail fast and record an error
-        // (proven by the next test), so "no error recorded" here is direct
-        // evidence the cheap diff short-circuited before any forge call.
+        // This guardian has no git remote configured. A current PR SHA is not
+        // enough to establish stack health, so auto-submit must attempt the
+        // shared reconciliation path and report that it could not do so.
         maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
 
         let prs = store
@@ -8520,13 +8480,14 @@ mod tests {
             "must not create a second pr for the same branch state"
         );
         let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
-        assert_eq!(
+        assert!(
             gv.branches
                 .iter()
                 .find(|b| b.id == bid)
                 .unwrap()
-                .auto_submit_error,
-            None
+                .auto_submit_error
+                .is_some(),
+            "auto-submit must reconcile an existing PR rather than treating its SHA as stack proof"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8565,12 +8526,9 @@ mod tests {
             "a failed submission must not leave a partial pr row behind"
         );
 
-        // Once the branch's state is otherwise covered (e.g. a human
-        // resubmitted manually), the stale failure marker is cleared even
-        // though it was never cleared by a fresh auto-submit success --
-        // `maybe_auto_submit_branch`'s cheap-diff path clears it too, since
-        // finding the state already healthy is itself evidence there's
-        // nothing left to report as failing.
+        // A current PR row alone cannot clear the failure marker: the
+        // forge-side base and native stack membership still need a successful
+        // shared reconciliation.
         store
             .lock()
             .unwrap()
@@ -8612,14 +8570,14 @@ mod tests {
 
         maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
         let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
-        assert_eq!(
+        assert!(
             gv.branches
                 .iter()
                 .find(|b| b.id == bid)
                 .unwrap()
-                .auto_submit_error,
-            None,
-            "the marker must clear once the branch's state is covered again"
+                .auto_submit_error
+                .is_some(),
+            "the marker must remain until stack reconciliation succeeds"
         );
 
         let _ = std::fs::remove_dir_all(&root);

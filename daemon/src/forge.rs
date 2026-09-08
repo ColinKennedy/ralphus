@@ -832,6 +832,73 @@ impl ForgeClient {
         result
     }
 
+    /// Return the ordered PR numbers in a GitHub-native stack. `None` means
+    /// the stack was removed from the forge. GitLab has no native stack
+    /// object, so it also returns `Ok(None)` without making a request.
+    pub fn get_stack_pull_requests(&self, stack_number: i64) -> Result<Option<Vec<i64>>, String> {
+        if self.kind != ForgeKind::GitHub {
+            return Ok(None);
+        }
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] get stack members start kind={} repo={} stack={stack_number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let token = self.require_token()?;
+        let url = format!(
+            "{}/repos/{}/stacks/{stack_number}",
+            self.api_base, self.repo_path
+        );
+        let result = match ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json")
+            .call()
+        {
+            Ok(response) => {
+                let body = response
+                    .into_string()
+                    .map_err(|e| format!("could not read GitHub stack response: {e}"))?;
+                let value: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|e| format!("could not parse GitHub stack response: {e}"))?;
+                let members = value["pull_requests"]
+                    .as_array()
+                    .ok_or_else(|| "GitHub stack response missing pull_requests".to_string())?
+                    .iter()
+                    .map(|pr| {
+                        pr["number"]
+                            .as_i64()
+                            .ok_or_else(|| "GitHub stack member missing number".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(members))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(describe_error(e)),
+        };
+        match &result {
+            Ok(Some(members)) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] get stack members done kind={} repo={} stack={stack_number} pull_requests={members:?}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Ok(None) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] get stack members done kind={} repo={} stack={stack_number} missing",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            Err(e) => crate::rlog!(
+                WARNING,
+                "ralphus [forge] get stack members failed kind={} repo={} stack={stack_number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
     /// Remove every unmerged PR from a registered GitHub stack
     /// (`POST /repos/{owner}/{repo}/stacks/{stack_number}/unstack`), which
     /// dissolves the stack once nothing is left in it. The PRs themselves are
@@ -2294,6 +2361,52 @@ mod tests {
             Some("tok".to_string()),
         );
         assert!(client.stack_exists(42).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_stack_pull_requests_returns_members_in_forge_order() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
+            req.respond(tiny_http::Response::from_string(
+                r#"{"number":42,"pull_requests":[{"number":3},{"number":6}]}"#,
+            ))
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(
+            client.get_stack_pull_requests(42).unwrap(),
+            Some(vec![3, 6])
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_stack_pull_requests_treats_not_found_as_absent() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
+            req.respond(tiny_http::Response::from_string("not found").with_status_code(404))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_stack_pull_requests(42).unwrap(), None);
         handle.join().unwrap();
     }
 
