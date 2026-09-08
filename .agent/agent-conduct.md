@@ -49,6 +49,21 @@ Reach for one of these instead:
 
 Treat typing `git stash` as a stop-and-ask trigger.
 
+## Extend agent backends through their existing abstractions
+
+When changing an agent, agent backend, model integration, launcher, or its
+availability behavior, route the work through the backend abstractions that
+already own that behavior. In particular, prefer the concrete Claude Code,
+Codex, Pi, and native-agent backend implementations and the shared
+`ModelBackend` interface over daemon-side tables or duplicated backend-specific
+conditionals.
+
+The daemon orchestrates agent work; it must not become a second source of
+truth for how a backend selects or invokes its program. If a capability needs
+to be shared across backends, add it to the shared backend abstraction and let
+each concrete backend implement it. This keeps backend-specific configuration,
+defaults, and launch semantics in the one place that executes them.
+
 ## Comments and docstrings describe the code as it is now
 
 No "used to", no "originally", no "ported from Python", no narrating a `TODO`

@@ -49,6 +49,10 @@ alternatives to reach for are in
   every worktree hanging off the same `.git`, and concurrent tasks collide on
   it. Use `git diff --stat`, `git show <ref>:path`, or a throwaway
   `git worktree add` instead.
+- **Extend agent backends through their existing abstractions** — keep
+  backend-specific behavior in the concrete Claude Code, Codex, Pi, and
+  native-agent implementations, not daemon-side lookup tables. See
+  [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
 - **Comments and docstrings describe the current code only** — no "used to",
   "originally", removed-`TODO` narration, or port history.
 - **Commit messages omit the `Claude-Session:` trailer**; keep `Co-Authored-By:`.
