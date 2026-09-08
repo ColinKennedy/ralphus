@@ -199,6 +199,20 @@ pub struct ReviewConfig {
     /// `Guardian::auto_submit_pr_stack` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub auto_submit_pr_stack: Option<bool>,
+    /// RAL-378: whether a review's pull request is pushed to a branch
+    /// *separate* from the review branch itself.
+    ///
+    /// `None` means unset, which resolves to `false` (see
+    /// [`Self::separate_pr_branch`]) -- the review branch, which is named
+    /// readably as `<task branch>-review`, *is* the branch the PR is opened
+    /// from, and neither `forge.pull_request_branch_convention` nor
+    /// `match_pr_branch_name` is consulted at all. Setting it to `true`
+    /// restores the older behavior of deriving a second, differently-named
+    /// remote branch from the task branch. Per-project scalars win over the
+    /// global layer, same as `skip_worktrees`; a per-review override (see
+    /// `Guardian::separate_pr_branch` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub separate_pr_branch: Option<bool>,
 }
 
 impl ReviewConfig {
@@ -292,6 +306,13 @@ impl ReviewConfig {
         self.auto_submit_pr_stack.unwrap_or(false)
     }
 
+    /// Whether a review's PR is pushed to a branch separate from the review
+    /// branch itself (unset resolves to `false` -- they are one and the same).
+    #[must_use]
+    pub fn separate_pr_branch(&self) -> bool {
+        self.separate_pr_branch.unwrap_or(false)
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -319,6 +340,7 @@ impl ReviewConfig {
             skip_base_updates: over.skip_base_updates.or(self.skip_base_updates),
             match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
             auto_submit_pr_stack: over.auto_submit_pr_stack.or(self.auto_submit_pr_stack),
+            separate_pr_branch: over.separate_pr_branch.or(self.separate_pr_branch),
         }
     }
 }

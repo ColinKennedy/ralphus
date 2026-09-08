@@ -1473,6 +1473,22 @@ body are changed, everything else is left as-is. Returns the updated
 `GuardianView`. Most fields are documented by their name alone (see
 `GuardianSettingsBody` in `daemon/src/server.rs` for the exhaustive list).
 
+`separate_pr_branch` (RAL-378, optional boolean) controls whether this
+review's pull request gets a remote branch of its own. `false` -- the default
+-- means the review branch *is* the PR branch: every branch registered since
+RAL-378 builds its review commits on a readable `<task branch>-review` ref
+(collision-suffixed `-2`, `-3`, ... against local branches, other reviews'
+claimed names and open PR aliases, then persisted and never recomputed), and
+that name is pushed verbatim, so there is one branch and nothing to reconcile
+between two. `true` restores the older behavior, deriving the PR branch from
+`[forge] pull_request_branch_convention` (or, with `match_pr_branch_name`, the
+task branch's own name). Both of those are read *only* when this is `true`.
+`null`/omitted inherits the project/global default, same stamped-at-creation
+shape as `match_pr_branch_name`; `GuardianView.effective_separate_pr_branch`
+is the resolved value submission gates on. A branch registered *before*
+RAL-378 has only an internal `guardian/<id>/wt-<branch>` ref, which is never
+published, so it keeps taking the derived path regardless of this setting.
+
 `auto_submit_pr_stack` (RAL-317, optional boolean) opts this review into
 auto-submitting/growing its PR stack as each branch reaches a terminal
 (`done`/`conflict_resolved`) merge state, instead of requiring the manual
@@ -1722,11 +1738,14 @@ and its branch gets a fresh PR instead of being silently skipped forever;
 the stale local row is corrected to match. `branch_alias`/`title`/`description` only apply to a
 stacked request (they don't make sense across N PRs at once, so they're
 ignored on a whole-stack request); an omitted `branch_alias` defaults to the
+review branch's own readable name (RAL-378 — `<task branch>-review`, collision
+suffix included). Under `separate_pr_branch: true` it instead defaults to the
 `[forge] pull_request_branch_convention`-templated name (`"{name}-review"` by
 default) — set `use_worktree_branch_name: true` (RAL-307) to default it to the
 feature branch's own name instead, bypassing the convention entirely; either
-way it's always templated from the feature branch's own name, never the
-internal `guardian/guardian-<id>/...` ref. `title`/`description` default to
+way it's templated from the feature branch's own name, never the internal
+`guardian/guardian-<id>/...` ref, which is likewise never published for a
+pre-RAL-378 branch that still has one. `title`/`description` default to
 an LLM-synthesized suggestion from the branch's commits, conforming to the
 target repo's PR template when one is found
 (`.github/PULL_REQUEST_TEMPLATE.md` or
@@ -1739,6 +1758,14 @@ own `match_pr_branch_name`/`effective_match_pr_branch_name` setting (see
 `POST /api/guardians/{id}/settings`); `true`/`false` here overrides that
 setting for this submission only, without changing the review's persisted
 default.
+
+RAL-378: all of the above -- the convention, `match_pr_branch_name` and
+`use_worktree_branch_name` -- describe how a PR branch is *derived* from the
+task branch, and so apply only when the review has `separate_pr_branch: true`.
+By default the alias is the review branch's own readable name, used verbatim
+(collision suffix included) and not re-suffixed by the `-002` rule below,
+because that name was already made unique against open PR aliases when the
+branch claimed it. An explicit `branch_alias` still wins in either mode.
 
 Runs in the background (`git push` + a forge API call are both networked);
 returns `202 {"status":"submitting"}` immediately. Poll `GET .../pull-requests`

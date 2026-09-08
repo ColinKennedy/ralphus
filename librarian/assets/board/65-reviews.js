@@ -680,8 +680,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return `<h3 class="section" data-tip="Pull/merge requests submitted for this review on GitHub/GitLab (RAL-117/RAL-190).">pull requests</h3>
             <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
               <button class="btn primary" style="padding:3px 10px;font-size:11px" data-click="submitPrStack" data-guardian-id="${esc(g.id)}" data-tip="Push every enabled branch in this review as its own PR, each based on the branch below it -- never one squashed PR containing everything.\nOn GitHub, also registers/grows a native PR stack so GitHub's own UI shows them as a linked stack.\nWho/when: once the stack looks good, open real PRs for the whole thing without leaving the board.\nSafe to press again after adding a new branch on top -- only the new branch gets its own PR.\nRuns in the background -- each branch's PR card above updates once its forge call completes.">submit PR stack</button>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Use the exact worktree/feature branch name as the PR branch, instead of the convention-derived alias (e.g. '{name}-review').\nWho/when: makes it easy to trace a submitted PR back to the review/worktree that produced it.\nStarts from this project's default (set via 'ralphus project git --match-pr-branch-name') and can be flipped per-review here; a --use-worktree-branch-name flag on 'ralphus review pr submit' can still override it for one submission.">
-                <input type="checkbox" ${g.effective_match_pr_branch_name ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setMatchPrBranchName(this.dataset.guardianId,this.checked)">match worktree branch name
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Push this review's PRs to a branch of their own, derived from the task branch, instead of opening them straight from the review branch.\nOff (the default): the review branch -- named '&lt;task branch&gt;-review' -- IS the PR branch, so there is one branch and nothing to reconcile between them.\nWho/when: turn this on only if your workflow needs the PR to live on a differently-named remote branch. The 'match worktree branch name' setting beside this one applies only in that case.\nStarts from this project's default ('[review] separate_pr_branch' in .ralphus.toml) and can be flipped per-review here.">
+                <input type="checkbox" ${g.effective_separate_pr_branch ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSeparatePrBranch(this.dataset.guardianId,this.checked)">separate PR branch
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)${g.effective_separate_pr_branch ? "" : ";opacity:0.5"}" data-tip="Only applies when 'separate PR branch' is on -- with one branch serving both roles there is no second name to pick.\nUse the exact worktree/feature branch name as the PR branch, instead of the convention-derived alias (e.g. '{name}-review').\nWho/when: makes it easy to trace a submitted PR back to the review/worktree that produced it.\nStarts from this project's default (set via 'ralphus project git --match-pr-branch-name') and can be flipped per-review here; a --use-worktree-branch-name flag on 'ralphus review pr submit' can still override it for one submission.">
+                <input type="checkbox" ${g.effective_match_pr_branch_name ? "checked" : ""} ${g.effective_separate_pr_branch ? "" : "disabled"} data-guardian-id="${esc(g.id)}" onchange="setMatchPrBranchName(this.dataset.guardianId,this.checked)">match worktree branch name
               </label>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Automatically submit/grow this review's PR stack as each branch finishes rebasing, instead of requiring the manual 'submit PR stack' button above.\nWho/when: turn this on for a review you want opened on the forge incrementally, branch by branch, with no extra clicks.\nA per-branch failure is shown as a badge next to that branch (⚠ auto-submit failed) rather than blocking the merge -- resubmit manually or wait for the next attempt.">
                 <input type="checkbox" ${g.effective_auto_submit_pr_stack ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setAutoSubmitPrStack(this.dataset.guardianId,this.checked)">auto-submit PR stack
@@ -1861,6 +1864,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function setSkipAutoBuild(id, skip) {
         await guardianAction(`/api/guardians/${id}/settings`, { skip_auto_build: skip });
+        tick();
+      }
+      /**
+       * Toggles a review's separate-PR-branch setting (RAL-378): whether the
+       * pull request is pushed to a branch of its own rather than opened
+       * straight from the review branch.
+       * @param {string} id
+       * @param {boolean} enabled
+       * @returns {Promise<void>}
+       */
+      async function setSeparatePrBranch(id, enabled) {
+        await guardianAction(`/api/guardians/${id}/settings`, { separate_pr_branch: enabled });
         tick();
       }
       /**

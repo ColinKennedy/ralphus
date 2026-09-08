@@ -589,6 +589,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
             "--match-pr-branch-name/--no-match-pr-branch-name",
             "--resolver-agent [name]",
             "--resolver-model [name]",
+            "--separate-pr-branch/--no-separate-pr-branch",
             "--skip-auto-build/--no-skip-auto-build",
             "--skip-auto-clean/--no-skip-auto-clean",
             "--skip-base-updates/--no-skip-base-updates",

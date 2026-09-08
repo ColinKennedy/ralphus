@@ -1723,6 +1723,49 @@ impl Store {
             // `crate::cartographer::Note::admin_only`'s doc comment. `0` for
             // every pre-RAL-332 row, unrestricted exactly as before.
             "ALTER TABLE cartographer_events ADD COLUMN admin_only INTEGER NOT NULL DEFAULT 0",
+            // RAL-378: `1` for a branch registered after readable review
+            // branches landed, `0` for every branch that predates them. The
+            // discriminator has to be its own column rather than
+            // `review_branch_name IS NULL`, because that name is resolved
+            // lazily at the branch's first build and so is legitimately NULL
+            // in between -- and it can't be `review_branch IS NULL` either,
+            // since `reset_guardian_branch` clears that on every rebuild.
+            // A `0` branch keeps its internal `guardian/<id>/wt-<branch>` ref
+            // forever, so no PR already open against one ever moves.
+            "ALTER TABLE guardian_branches ADD COLUMN readable_review_branch INTEGER NOT NULL DEFAULT 0",
+            // RAL-378: the *readable* name this branch's review branch is
+            // built under -- `<task-branch>-review`, collision-suffixed
+            // (`-2`, `-3`, ...) by
+            // `guardian_merge::claim_branch_review_branch_name`. Resolved at
+            // the branch's first build and sticky from then on: deliberately
+            // NOT cleared by `reset_guardian_branch`/`reset_guardian_branches`
+            // (which do clear `review_branch`), because re-resolving on every
+            // rebuild would walk the suffix forward (`-2` -> `-3` -> ...) and
+            // orphan any PR already open on the previous name. Only ever set
+            // when `readable_review_branch` is `1`.
+            "ALTER TABLE guardian_branches ADD COLUMN review_branch_name TEXT",
+            // RAL-378: the branch-level pair of columns above, for a
+            // combined-worktree review's single shared branch. The name is
+            // derived from the review's own `name` rather than from any one
+            // task branch, and -- being sticky -- survives a later rename of
+            // the review unchanged.
+            "ALTER TABLE guardians ADD COLUMN readable_review_branch INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE guardians ADD COLUMN review_branch_name TEXT",
+            // RAL-378: whether this review pushes its PR to a branch *other*
+            // than the review branch itself. NULL inherits the project/global
+            // `[review] separate_pr_branch` default, which resolves to `0` --
+            // the PR branch and the review branch are one and the same, and
+            // `forge.pull_request_branch_convention`/`match_pr_branch_name`
+            // are not consulted at all. See
+            // `GuardianView::effective_separate_pr_branch`.
+            "ALTER TABLE guardians ADD COLUMN separate_pr_branch INTEGER",
+            // RAL-378: the `separate_pr_branch` value a project stamped from
+            // the live global config when it was first registered, so a later
+            // global change does not retroactively flip reviews created under
+            // the old one. Same always-from-global shape, and the same
+            // deliberate no-backfill (NULL for every project registered
+            // earlier), as `auto_submit_pr_stack`.
+            "ALTER TABLE projects ADD COLUMN separate_pr_branch INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3629,6 +3672,9 @@ impl Store {
         // `skip_base_updates` -- no explicit per-registration override exists
         // for this one.
         let auto_submit_pr_stack = crate::config::global_review_config().auto_submit_pr_stack();
+        // RAL-378: same always-from-global stamping shape as
+        // `auto_submit_pr_stack`.
+        let separate_pr_branch = crate::config::global_review_config().separate_pr_branch();
         self.register_project_with_clone_url_and_stamp(
             name,
             description,
@@ -3638,6 +3684,7 @@ impl Store {
             Some(skip_base_updates),
             Some(match_pr_branch_name),
             Some(auto_submit_pr_stack),
+            Some(separate_pr_branch),
         )
     }
 
@@ -3659,6 +3706,7 @@ impl Store {
         skip_base_updates_stamp: Option<bool>,
         match_pr_branch_name_stamp: Option<bool>,
         auto_submit_pr_stack_stamp: Option<bool>,
+        separate_pr_branch_stamp: Option<bool>,
     ) -> Result<()> {
         self.register_project_with_clone_url_and_stamp(
             name,
@@ -3669,6 +3717,7 @@ impl Store {
             skip_base_updates_stamp,
             match_pr_branch_name_stamp,
             auto_submit_pr_stack_stamp,
+            separate_pr_branch_stamp,
         )
     }
 
@@ -3683,6 +3732,7 @@ impl Store {
         skip_base_updates_stamp: Option<bool>,
         match_pr_branch_name_stamp: Option<bool>,
         auto_submit_pr_stack_stamp: Option<bool>,
+        separate_pr_branch_stamp: Option<bool>,
     ) -> Result<()> {
         // An existing project being re-registered (an upsert update, not a
         // first insert) is deliberately left untouched -- the ticket's explicit
@@ -3709,9 +3759,14 @@ impl Store {
         } else {
             auto_submit_pr_stack_stamp
         };
+        let separate_pr_branch_stamp = if exists {
+            None
+        } else {
+            separate_pr_branch_stamp
+        };
         self.conn.execute(
-            "INSERT INTO projects(name, description, path, clone_url, vcs, created_at_ms, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack)
-             VALUES(?,?,?,?,?,?,?,?,?)
+            "INSERT INTO projects(name, description, path, clone_url, vcs, created_at_ms, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch)
+             VALUES(?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, path=excluded.path, clone_url=COALESCE(excluded.clone_url, projects.clone_url), vcs=excluded.vcs",
             params![
                 name,
@@ -3722,7 +3777,8 @@ impl Store {
                 now_ms(),
                 skip_base_updates_stamp.map(i64::from),
                 match_pr_branch_name_stamp.map(i64::from),
-                auto_submit_pr_stack_stamp.map(i64::from)
+                auto_submit_pr_stack_stamp.map(i64::from),
+                separate_pr_branch_stamp.map(i64::from)
             ],
         )?;
         crate::rlog!(
@@ -3809,6 +3865,14 @@ impl Store {
     /// [`Self::project_skip_base_updates_stamp`].
     pub fn project_auto_submit_pr_stack_stamp(&self, path: &str) -> Option<bool> {
         self.project_bool_stamp(path, "auto_submit_pr_stack")
+    }
+
+    /// RAL-378: the `separate_pr_branch` value a project stamped (from the
+    /// live global config) when it was first registered, looked up by repo
+    /// path -- same lookup/ancestry semantics as
+    /// [`Self::project_skip_base_updates_stamp`].
+    pub fn project_separate_pr_branch_stamp(&self, path: &str) -> Option<bool> {
+        self.project_bool_stamp(path, "separate_pr_branch")
     }
 
     /// The registered project name whose `path` is `path` itself or an
@@ -11826,6 +11890,7 @@ command = "check-c"
                 Some(true),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -11851,6 +11916,7 @@ command = "check-c"
                 Some(true),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -11865,6 +11931,7 @@ command = "check-c"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
                 None,
                 None,
             )
@@ -11887,6 +11954,7 @@ command = "check-c"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
                 None,
                 None,
             )
@@ -11974,6 +12042,7 @@ command = "check-c"
                 None,
                 None,
                 Some(true),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -11999,6 +12068,7 @@ command = "check-c"
                 None,
                 None,
                 Some(true),
+                None,
             )
             .unwrap();
         store
@@ -12010,6 +12080,7 @@ command = "check-c"
                 None,
                 None,
                 Some(false),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -12036,6 +12107,7 @@ command = "check-c"
                 None,
                 None,
                 Some(true),
+                None,
             )
             .unwrap();
         let gid = store

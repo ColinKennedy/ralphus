@@ -2734,7 +2734,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     let mut prev_ref = branches
         .iter()
         .find(|b| b.position == from_position)
-        .map(|b| format!("guardian/{id}/wt-{}", b.branch))
+        .map(|b| review_ref_of_ordered(id, b))
         .unwrap_or_default();
     for ob in branches.iter().filter(|b| b.position > from_position) {
         let squash = proj_by_branch
@@ -2746,7 +2746,22 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             MergeStatus::InProgress,
             None,
         );
-        let rev = format!("guardian/{id}/wt-{}", ob.branch);
+        let rev = match claim_branch_review_ref(
+            store,
+            root,
+            id,
+            &root.root().to_string_lossy(),
+            &ob.id,
+            &ob.branch,
+            ob.readable_review_branch,
+            ob.review_branch_name.as_deref(),
+        ) {
+            Ok(rev) => rev,
+            Err(e) => {
+                fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
+                return;
+            }
+        };
         let wt_j = branch_wt_dir(wt_base, &short_names, &ob.branch);
         let wt_j_str = wt_j.root().to_string_lossy().to_string();
         if let Err(e) = worktree_add_or_reset(root, &rev, &wt_j, &ob.branch) {
@@ -2815,6 +2830,262 @@ pub(crate) fn worktree_dir(git_root: &str, guardian_id: &str) -> PathBuf {
         .join(crate::short_paths::guardian_short_id(guardian_id))
 }
 
+/// The internal ref a *pre-RAL-378* branch's review commits are built on.
+///
+/// Namespaced under `guardian/<id>/` so it could never collide with a user's
+/// own branches. Readable naming trades that immunity for a name that can be
+/// pushed as the PR branch directly (see [`crate::review_branch`]), so this is
+/// only reached for branches registered before that landed.
+fn legacy_branch_review_ref(guardian_id: &str, branch: &str) -> String {
+    format!("guardian/{guardian_id}/wt-{branch}")
+}
+
+/// The internal combined-worktree ref for a pre-RAL-378 review.
+fn legacy_combined_review_ref(guardian_id: &str) -> String {
+    format!("guardian/{guardian_id}/review")
+}
+
+/// The ref one branch's review commits live on -- its claimed readable name
+/// when it has one, the internal ref otherwise.
+///
+/// Read-only: unlike [`claim_branch_review_ref`] this never resolves or
+/// persists a name, so a readable branch whose first build hasn't happened yet
+/// still reports the internal ref. Every caller here is inspecting refs that
+/// only exist *after* a build, so that fallback simply fails to resolve and the
+/// caller takes its "no prior state" path.
+pub(crate) fn review_ref_of(guardian_id: &str, branch: &crate::guardian::BranchView) -> String {
+    named_review_ref(
+        guardian_id,
+        &branch.branch,
+        branch.readable_review_branch,
+        branch.review_branch_name.as_deref(),
+    )
+}
+
+/// [`review_ref_of`] for the lighter [`crate::guardian::OrderedBranch`] the
+/// merge loops iterate.
+pub(crate) fn review_ref_of_ordered(
+    guardian_id: &str,
+    branch: &crate::guardian::OrderedBranch,
+) -> String {
+    named_review_ref(
+        guardian_id,
+        &branch.branch,
+        branch.readable_review_branch,
+        branch.review_branch_name.as_deref(),
+    )
+}
+
+fn named_review_ref(
+    guardian_id: &str,
+    branch: &str,
+    readable: bool,
+    claimed: Option<&str>,
+) -> String {
+    match claimed {
+        Some(name) if readable && !name.is_empty() => name.to_string(),
+        _ => legacy_branch_review_ref(guardian_id, branch),
+    }
+}
+
+/// The ref a review's combined worktree branch lives on, read-only.
+pub(crate) fn combined_review_ref_of(guardian: &crate::guardian::GuardianView) -> String {
+    match guardian.review_branch_name.as_deref() {
+        Some(name) if guardian.readable_review_branch && !name.is_empty() => name.to_string(),
+        _ => legacy_combined_review_ref(&guardian.id),
+    }
+}
+
+/// [`claim_combined_review_ref`] for the merge paths that hold `id` rather
+/// than an already-loaded [`crate::guardian::GuardianView`].
+fn claim_combined_review_ref_by_id(
+    store: &Arc<Mutex<Store>>,
+    root: &Workspace,
+    id: &str,
+) -> std::result::Result<String, String> {
+    let guardian = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?;
+    claim_combined_review_ref(store, root, &guardian)
+}
+
+/// Every readable review-branch name this review has claimed, restricted to
+/// `project` when one is given (a multi-project review's branches live in
+/// different repos, and a name only exists as a ref in its own).
+///
+/// The combined-worktree name is included for the review's primary
+/// `git_root` only -- there is exactly one combined branch, and it lives
+/// there.
+fn claimed_review_branches(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    project: Option<&str>,
+) -> Vec<String> {
+    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = guardian
+        .branches
+        .iter()
+        .filter(|b| {
+            project.is_none_or(|p| b.project.as_deref().unwrap_or(guardian.git_root.as_str()) == p)
+        })
+        .filter_map(|b| b.review_branch_name.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if project.is_none_or(|p| p == guardian.git_root) {
+        names.extend(
+            guardian
+                .review_branch_name
+                .clone()
+                .filter(|n| !n.is_empty()),
+        );
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Whether a local branch `name` already exists in `root`.
+fn local_branch_exists(root: &Workspace, name: &str) -> bool {
+    root.git(&[
+        "show-ref",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{name}"),
+    ])
+    .is_ok()
+}
+
+/// Serializes the whole check-then-persist of a review-branch name.
+///
+/// Resolving a name reads live git refs and live store rows, so it cannot be
+/// done under the store lock (subprocess waits never happen there) and is
+/// therefore not atomic on its own: two merges building different reviews of
+/// the same repo at the same time could both see `x-review` free and both
+/// claim it, after which each `worktree_add_or_reset` would reset the other's
+/// branch out from under it. Claims are rare and take milliseconds, so one
+/// process-wide lock held across the resolve and the write is the whole fix.
+static REVIEW_BRANCH_CLAIM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Resolve `base` to a name no local branch, claimed review-branch name or
+/// open PR alias in `project_root` is using, ignoring the branch `except`
+/// identifies (its own prior claim is not a collision with itself).
+///
+/// Callers must hold [`REVIEW_BRANCH_CLAIM_LOCK`] across this *and* the write
+/// that records the result.
+fn unique_review_branch_name(
+    store: &Arc<Mutex<Store>>,
+    root: &Workspace,
+    project_root: &str,
+    base: &str,
+    except: Option<(&str, &str)>,
+) -> std::result::Result<String, String> {
+    crate::review_branch::resolve_unique(base, |candidate| {
+        if local_branch_exists(root, candidate) {
+            return true;
+        }
+        // A store error is treated as "taken" so a name is never claimed on
+        // the strength of a failed lookup -- the loop then runs out of
+        // attempts and the caller fails the branch loudly.
+        store
+            .lock()
+            .expect("poisoned")
+            .review_branch_name_taken(project_root, candidate, except)
+            .unwrap_or(true)
+    })
+    .ok_or_else(|| {
+        format!(
+            "could not find a free review branch name for \"{base}\" after {} attempts",
+            crate::review_branch::MAX_SUFFIX_ATTEMPTS
+        )
+    })
+}
+
+/// The ref this branch's review commits are built on, claiming and persisting
+/// a readable name on first use (RAL-378).
+///
+/// Idempotent: once a name is persisted it is returned verbatim forever, which
+/// is what keeps an already-open PR pointing at the branch it was opened from.
+/// A pre-RAL-378 branch short-circuits to its internal ref and never claims
+/// anything.
+#[allow(clippy::too_many_arguments)]
+fn claim_branch_review_ref(
+    store: &Arc<Mutex<Store>>,
+    root: &Workspace,
+    guardian_id: &str,
+    project_root: &str,
+    branch_id: &str,
+    branch: &str,
+    readable: bool,
+    claimed: Option<&str>,
+) -> std::result::Result<String, String> {
+    if !readable {
+        return Ok(legacy_branch_review_ref(guardian_id, branch));
+    }
+    if let Some(name) = claimed.filter(|n| !n.is_empty()) {
+        return Ok(name.to_string());
+    }
+    let base = crate::review_branch::base_from_task_branch(branch);
+    let _claiming = REVIEW_BRANCH_CLAIM_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = unique_review_branch_name(
+        store,
+        root,
+        project_root,
+        &base,
+        Some((guardian_id, branch_id)),
+    )?;
+    store
+        .lock()
+        .expect("poisoned")
+        .set_branch_review_branch_name(guardian_id, branch_id, &name)
+        .map_err(|e| e.to_string())?;
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {guardian_id} branch {branch_id} review branch named {name}"
+    );
+    Ok(name)
+}
+
+/// [`claim_branch_review_ref`] for a combined-worktree review's single shared
+/// branch, named from the review's own name rather than any one task branch.
+fn claim_combined_review_ref(
+    store: &Arc<Mutex<Store>>,
+    root: &Workspace,
+    guardian: &crate::guardian::GuardianView,
+) -> std::result::Result<String, String> {
+    if !guardian.readable_review_branch {
+        return Ok(legacy_combined_review_ref(&guardian.id));
+    }
+    if let Some(name) = guardian
+        .review_branch_name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+    {
+        return Ok(name.to_string());
+    }
+    let base = crate::review_branch::base_from_review_name(&guardian.name);
+    let _claiming = REVIEW_BRANCH_CLAIM_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = unique_review_branch_name(store, root, &guardian.git_root, &base, None)?;
+    store
+        .lock()
+        .expect("poisoned")
+        .set_guardian_review_branch_name(&guardian.id, &name)
+        .map_err(|e| e.to_string())?;
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {} combined review branch named {name}",
+        guardian.id
+    );
+    Ok(name)
+}
+
 /// Best-effort removal of every review worktree/branch a guardian created, used
 /// when the guardian is deleted. All git operations are ignored on failure (a
 /// bare/fake `git_root`, e.g. in tests, simply removes nothing).
@@ -2835,7 +3106,8 @@ pub fn purge_worktrees(store: &Arc<Mutex<Store>>, git_root: &str, id: &str) {
     let num = id.replace("guardian-", "");
     let root = Workspace::for_guardian(store, id, Path::new(git_root));
     let wt_base = root.at(worktree_dir(git_root, id));
-    cleanup_review_worktrees(&root, &wt_base, id, &num, &[]);
+    let claimed = claimed_review_branches(store, id, Some(git_root));
+    cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
     // Also drop any carry-forward protection refs so a deleted guardian leaves
     // nothing pinning otherwise-unreachable commits.
     purge_carry_refs(&root, id);
@@ -3856,6 +4128,8 @@ fn staged_merge_pass(
                 position: b.position,
                 branch: b.branch.clone(),
                 enabled: b.enabled,
+                readable_review_branch: b.readable_review_branch,
+                review_branch_name: b.review_branch_name.clone(),
             })
             .collect::<Vec<_>>(),
     )
@@ -3894,7 +4168,7 @@ fn staged_merge_pass(
             old_base.and_then(|mut old_upstream| {
                 let mut chain = Vec::with_capacity(proj_branches.len());
                 for bv in proj_branches {
-                    let rev = format!("guardian/{id}/wt-{}", bv.branch);
+                    let rev = review_ref_of(id, bv);
                     let old_tip = root.git(&["rev-parse", "--verify", &rev]).ok()?;
                     let old_tip = old_tip.trim().to_string();
                     if !is_ancestor(&root, &old_upstream, &old_tip) {
@@ -3932,7 +4206,22 @@ fn staged_merge_pass(
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
                 return StagedPassOutcome::Failed;
             }
-            let rev = format!("guardian/{id}/wt-{}", bv.branch);
+            let rev = match claim_branch_review_ref(
+                store,
+                &root,
+                id,
+                proj,
+                &bv.id,
+                &bv.branch,
+                bv.readable_review_branch,
+                bv.review_branch_name.as_deref(),
+            ) {
+                Ok(rev) => rev,
+                Err(e) => {
+                    fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
+                    return StagedPassOutcome::Failed;
+                }
+            };
             let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
             let wt_str = wt.root().to_string_lossy().to_string();
             let (source_ref, upstream) = carry_chain
@@ -4019,7 +4308,7 @@ fn staged_resume_point(
         if !terminal {
             break;
         }
-        let rev = format!("guardian/{id}/wt-{}", bv.branch);
+        let rev = review_ref_of(id, bv);
         if root.git(&["rev-parse", "--verify", &rev]).is_err() {
             // The tip ref is gone (e.g. a worktree prune removed it) — the
             // prefix is no longer reusable; rebuild everything from here.
@@ -4118,7 +4407,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         // Combined worktree points at the head of this project's last branch.
         let prev_ref = project_branches[proj]
             .last()
-            .map(|b| format!("guardian/{id}/wt-{}", b.branch))
+            .map(|b| review_ref_of(id, b))
             .unwrap_or_else(|| base_sha.clone());
         match rebuild_combined(store, &root, &wt_base, id, &prev_ref) {
             Ok(combined_str) => {
@@ -4375,7 +4664,7 @@ pub fn run_merge_cancellable(
             carry.pin(proot.root(), id, "base", sha);
         }
         for ob in proj_branches {
-            let rev = format!("guardian/{id}/wt-{}", ob.branch);
+            let rev = review_ref_of(id, ob);
             if let Ok(sha) = proot.git(&["rev-parse", "--verify", &rev]) {
                 let sha = sha.trim().to_string();
                 carry.pin(proot.root(), id, &ob.position.to_string(), &sha);
@@ -4384,11 +4673,15 @@ pub fn run_merge_cancellable(
         }
     }
 
-    // Clean up prior worktrees for ALL projects before starting fresh.
+    // Clean up prior worktrees for ALL projects before starting fresh. The
+    // claimed readable names are deleted alongside the internal refs (RAL-378);
+    // the carry-forward pins taken just above keep their commits reachable, the
+    // same way they already did for the internal refs.
     for (proj, _) in &project_branches {
         let root = ws_root.at(PathBuf::from(proj));
         let wt_base = ws_root.at(worktree_dir(proj, id));
-        cleanup_review_worktrees(&root, &wt_base, id, &num, &[]);
+        let claimed = claimed_review_branches(store, id, Some(proj));
+        cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
     }
 
     // Track the last combined worktree (and its project root, for RAL-101
@@ -4436,6 +4729,8 @@ pub fn run_merge_cancellable(
                     position: b.position,
                     branch: b.branch.clone(),
                     enabled: b.enabled,
+                    readable_review_branch: b.readable_review_branch,
+                    review_branch_name: b.review_branch_name.clone(),
                 })
                 .collect();
             run_merge_shared(
@@ -4504,7 +4799,22 @@ pub fn run_merge_cancellable(
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
                 return;
             }
-            let rev = format!("guardian/{id}/wt-{}", ob.branch);
+            let rev = match claim_branch_review_ref(
+                store,
+                &root,
+                id,
+                proj,
+                &ob.id,
+                &ob.branch,
+                ob.readable_review_branch,
+                ob.review_branch_name.as_deref(),
+            ) {
+                Ok(rev) => rev,
+                Err(e) => {
+                    fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
+                    return;
+                }
+            };
             let wt = branch_wt_dir(&wt_base, &short_names, &ob.branch);
             let wt_str = wt.root().to_string_lossy().to_string();
             if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &ob.branch) {
@@ -4651,7 +4961,13 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     final_branch_id: Option<&str>,
     cancel: &CancelToken,
 ) {
-    let combined_branch = format!("guardian/{id}/review");
+    let combined_branch = match claim_combined_review_ref_by_id(store, root, id) {
+        Ok(name) => name,
+        Err(e) => {
+            set_status(GuardianStatus::MergeFailed, Some(&e));
+            return;
+        }
+    };
     let wt = wt_base.join("review");
     let wt_str = wt.root().to_string_lossy().to_string();
     if let Err(e) = worktree_add_or_reset(root, &combined_branch, &wt, base_sha) {
@@ -4671,6 +4987,12 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         );
         // Every branch shares the one combined worktree/branch; record it now so
         // the UI can show the expand row and feedback widget even if this branch fails.
+        //
+        // RAL-378: deliberately no per-branch `review_branch_name` claim here.
+        // N branches sharing one ref cannot each own a distinct PR branch, so
+        // this path keeps deriving each PR's alias from the convention exactly
+        // as it did before -- `resolve_pr_alias` sees `None` for the readable
+        // name and takes its separated path regardless of `separate_pr_branch`.
         let _ = store.lock().expect("poisoned").set_branch_review(
             id,
             &ob.id,
@@ -4900,7 +5222,7 @@ pub fn run_feedback(
         .review_branch
         .clone()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("guardian/{id}/wt-{}", branch.branch));
+        .unwrap_or_else(|| review_ref_of(id, branch));
     // RAL-91: same squash-membership check the downstream restack loop uses
     // below, computed once here so the target branch's own commit can also
     // respect it.
@@ -5264,7 +5586,7 @@ pub fn run_feedback(
         .review_branch
         .clone()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("guardian/{id}/wt-{}", branch.branch));
+        .unwrap_or_else(|| review_ref_of(id, branch));
     for ob in &downstream {
         let _ = store.lock().expect("poisoned").set_branch_status(
             id,
@@ -5272,12 +5594,22 @@ pub fn run_feedback(
             MergeStatus::InProgress,
             None,
         );
-        let rev = ob
-            .review_branch
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("guardian/{id}/wt-{}", ob.branch));
+        let rev = match claim_branch_review_ref(
+            store,
+            &root,
+            id,
+            &branch_project,
+            &ob.id,
+            &ob.branch,
+            ob.readable_review_branch,
+            ob.review_branch_name.as_deref(),
+        ) {
+            Ok(rev) => rev,
+            Err(e) => {
+                fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
+                return outcome;
+            }
+        };
         let wt_j = branch_wt_dir(&wt_base, &short_names, &ob.branch);
         let wt_j_str = wt_j.root().to_string_lossy().to_string();
         // Reset the review branch to the feature tip; drive_rebase replays its
@@ -6617,7 +6949,7 @@ fn rebuild_combined(
     id: &str,
     prev_ref: &str,
 ) -> std::result::Result<String, String> {
-    let combined_branch = format!("guardian/{id}/review");
+    let combined_branch = claim_combined_review_ref_by_id(store, root, id)?;
     let combined_wt = wt_base.join("review");
     let combined_str = combined_wt.root().to_string_lossy().to_string();
     worktree_add_or_reset(root, &combined_branch, &combined_wt, prev_ref)?;
@@ -6737,15 +7069,20 @@ fn preflight_worktree_budget_with_limit(
 /// component, not substring -- see [`crate::short_paths::worktree_belongs_to_guardian`]
 /// for why a substring match on a short id is unsafe (`g56` would match a
 /// worktree actually belonging to `g560`). Branches are removed via
-/// `for-each-ref` covering the current naming (`guardian/<id>/*`) and the
-/// legacy `guardian/<num>/*` scheme for reviews built before RAL-63, plus the
-/// interim `review`/`review-*` names.
+/// `for-each-ref` covering the internal naming (`guardian/<id>/*`) and the
+/// legacy `guardian/<num>/*` scheme for reviews built before RAL-63.
+///
+/// RAL-378: a readable review branch (`<task branch>-review`) matches no glob
+/// -- by design, since a glob over the user's own branch namespace would
+/// delete branches this review never created. Those are removed by exact name
+/// instead, via `claimed_branches`, which callers fill from the review's
+/// persisted `review_branch_name` columns.
 fn cleanup_review_worktrees(
     root: &Workspace,
     wt_base: &Workspace,
     id: &str,
     num: &str,
-    old_review_branches: &[String],
+    claimed_branches: &[String],
 ) {
     let list = root
         .git(&["worktree", "list", "--porcelain"])
@@ -6770,7 +7107,7 @@ fn cleanup_review_worktrees(
     // still-populated dir belonging to another guardian is left untouched).
     root.remove_path(root.root().join(".ralphus_guardian").join(id), true);
     root.remove_path(root.root().join(".ralphus_guardian"), true);
-    for branch in old_review_branches {
+    for branch in claimed_branches {
         let _ = root.git(&["branch", "--delete", "--force", branch]);
     }
     // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
@@ -6786,9 +7123,12 @@ fn cleanup_review_worktrees(
             // Legacy pre-RAL-63 naming: guardian/<num>/b*.
             &format!("refs/heads/guardian/{num}"),
             &format!("refs/heads/guardian/{num}/*"),
-            // Interim naming used between the two schemes: bare `review` and `review-*`.
-            "refs/heads/review",
-            "refs/heads/review-*",
+            // RAL-378: the interim `refs/heads/review` / `refs/heads/review-*`
+            // patterns this used to also sweep are gone. They date from a
+            // naming scheme no review has used since before RAL-63, they are
+            // not scoped to this guardian at all, and they sit in the same
+            // unprefixed namespace readable review branches now occupy -- so
+            // the only branches they can still match are a user's own.
         ])
         .unwrap_or_default();
     for branch in refs.lines().map(str::trim).filter(|b| !b.is_empty()) {
@@ -7316,6 +7656,10 @@ fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
 pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str) {
     struct Candidate {
         branch: String,
+        /// The ref this branch's stacked review commits live on -- resolved
+        /// once here, where the owning `BranchView` (and so its claimed
+        /// readable name) is still in hand.
+        review_ref: String,
         project: String,
         /// The producing task cell's worktree, when the store still knows one.
         cwd: Option<String>,
@@ -7345,6 +7689,7 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
             .filter(|b| !b.enabled || b.merge_status != "pending")
             .map(|b| Candidate {
                 branch: b.branch.clone(),
+                review_ref: review_ref_of(&guardian.id, b),
                 project: b
                     .project
                     .clone()
@@ -7415,7 +7760,7 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
                 }
                 continue;
             }
-            let review_ref = format!("guardian/{id}/wt-{}", c.branch);
+            let review_ref = c.review_ref.as_str();
             // A `skip_worktrees` project never gets per-branch refs, so this
             // read fails and the branch falls back to its task worktree --
             // which still gives it its own section, rather than being lumped
@@ -7430,7 +7775,7 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
             };
             let log = match from_review {
                 Some(log) => {
-                    prev_review = Some(review_ref);
+                    prev_review = Some(review_ref.to_string());
                     log
                 }
                 None => {
@@ -7696,11 +8041,11 @@ fn generate_final_summary(
             continue;
         };
         let root = ws_root.at(PathBuf::from(proj));
-        let first_ref = format!("guardian/{id}/wt-{}", branches[0].branch);
+        let first_ref = review_ref_of(id, branches[0]);
         if root.git(&["rev-parse", "--verify", &first_ref]).is_ok() {
             let mut prev = base_sha.clone();
             for b in branches {
-                let branch_ref = format!("guardian/{id}/wt-{}", b.branch);
+                let branch_ref = review_ref_of(id, b);
                 // RAL-201: was `git(root.root(), ...)`, a direct bypass of
                 // `root`'s machine.
                 let b_log = root
@@ -7719,7 +8064,7 @@ fn generate_final_summary(
             // `skip_worktrees`: no per-branch refs exist for this project --
             // fall back to the shared combined ref, labelling the section
             // with every branch this project contributed.
-            let combined_ref = format!("guardian/{id}/review");
+            let combined_ref = combined_review_ref_of(&guardian);
             // RAL-201: was `git(root.root(), ...)`, a direct bypass of
             // `root`'s machine.
             let log = root
@@ -10146,6 +10491,140 @@ mod tests {
         let readme = std::fs::read_to_string(&readme_path).expect("README.md must be written");
         assert!(readme.contains(&short_id), "{readme}");
         assert!(readme.contains("feature/a"), "{readme}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── RAL-378: readable review branches ──────────────────────────────────
+
+    #[test]
+    fn a_full_merge_builds_on_a_readable_review_branch() {
+        // End-to-end: the branch a review's commits land on is named after the
+        // task branch, not `guardian/<id>/wt-<branch>`, and the name is
+        // persisted so a later rebuild reuses it rather than re-resolving.
+        let (base, repo, _fwt) = make_repo("readable-review-branch");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
+        run_merge(&store, runner.as_ref(), &id);
+
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(g.status, "in_review", "{:?}", g.detail);
+        assert_eq!(
+            g.branches[0].review_branch_name.as_deref(),
+            Some("feature/a-review")
+        );
+        assert_eq!(
+            g.branches[0].review_branch.as_deref(),
+            Some("feature/a-review")
+        );
+        assert!(
+            git(&repo, &["rev-parse", "--verify", "feature/a-review"]).is_ok(),
+            "the readable branch must exist as a real ref"
+        );
+        assert!(
+            git(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("guardian/{id}/wt-feature/a")
+                ]
+            )
+            .is_err(),
+            "the internal ref must not be created for a readable branch"
+        );
+
+        // Rebuilding reuses the same name -- no walk to `-2`.
+        run_merge(&store, runner.as_ref(), &id);
+        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(
+            g.branches[0].review_branch_name.as_deref(),
+            Some("feature/a-review")
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_review_branch_name_already_taken_locally_is_suffixed() {
+        // A pre-existing branch of the same name is never reset out from under
+        // the user -- the review takes `-2` instead.
+        let (base, repo, _fwt) = make_repo("readable-review-branch-collision");
+        g(&repo, &["branch", "feature/a-review", "main"]);
+        let taken_sha = git(&repo, &["rev-parse", "feature/a-review"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
+        run_merge(&store, runner.as_ref(), &id);
+
+        let gv = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(gv.status, "in_review", "{:?}", gv.detail);
+        assert_eq!(
+            gv.branches[0].review_branch_name.as_deref(),
+            Some("feature/a-review-2")
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "feature/a-review"])
+                .unwrap()
+                .trim(),
+            taken_sha,
+            "the user's own branch must be left exactly where it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_combined_review_branch_is_named_from_the_reviews_own_name() {
+        let (base, repo, _fwt) = make_repo("readable-combined-review-branch");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("RAL-378 Readable Branches", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
+        run_merge(&store, runner.as_ref(), &id);
+
+        let gv = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(gv.status, "in_review", "{:?}", gv.detail);
+        assert_eq!(
+            gv.review_branch.as_deref(),
+            Some("ral-378-readable-branches-review")
+        );
+        // Renaming the review afterwards must not move the branch.
+        store
+            .lock()
+            .unwrap()
+            .rename_guardian(&id, "Something Else Entirely")
+            .unwrap();
+        run_merge(&store, runner.as_ref(), &id);
+        let gv = store.lock().unwrap().get_guardian(&id).unwrap();
+        assert_eq!(
+            gv.review_branch_name.as_deref(),
+            Some("ral-378-readable-branches-review")
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

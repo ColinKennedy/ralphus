@@ -331,6 +331,18 @@ pub struct BranchView {
     pub detail: Option<String>,
     /// The review-owned branch stacked for this feature (copy; never the task's).
     pub review_branch: Option<String>,
+    /// RAL-378: `true` once this branch's review branch is named readably
+    /// (`<task branch>-review`) rather than as the internal
+    /// `guardian/<id>/wt-<task branch>` ref. `false` for every branch
+    /// registered before readable naming landed, which keeps the internal ref
+    /// for the rest of its life so no PR already open against one ever moves.
+    pub readable_review_branch: bool,
+    /// RAL-378: the readable review-branch name claimed for this branch, once
+    /// its first build has resolved it. Sticky -- unlike [`Self::review_branch`]
+    /// this survives a reset, so a rebuild reuses the name rather than walking
+    /// the collision suffix forward. Always `None` when
+    /// [`Self::readable_review_branch`] is `false`.
+    pub review_branch_name: Option<String>,
     /// The review worktree this branch is assembled in (read/write for feedback).
     pub worktree: Option<String>,
     /// Total conflict marker blocks detected when this branch was being resolved, if any.
@@ -629,6 +641,34 @@ pub struct GuardianView {
     /// value PR submission actually gates on unless a per-submission
     /// `PrRequest::use_worktree_branch_name` overrides it.
     pub effective_match_pr_branch_name: bool,
+    /// RAL-378: this review's own override for whether its pull request is
+    /// pushed to a branch separate from its review branch. `None` means
+    /// "inherit the project/global default" (resolved into
+    /// [`Self::effective_separate_pr_branch`] at hydration time). Stamped from
+    /// the owning project's effective value at review creation, then editable
+    /// per-review afterward (board checkbox / `review settings`), the same
+    /// shape as [`Self::match_pr_branch_name`].
+    pub separate_pr_branch: Option<bool>,
+    /// RAL-378: [`Self::separate_pr_branch`] resolved against the
+    /// project-level `.ralphus.toml [review] separate_pr_branch` default, this
+    /// project's creation-time stamp, and the live global config.
+    ///
+    /// `false` -- the default -- means the PR is opened from the review branch
+    /// itself, so `pr::resolve_pr_alias` returns that branch's own name and
+    /// neither `forge.pull_request_branch_convention` nor
+    /// [`Self::effective_match_pr_branch_name`] is read. Those two only take
+    /// effect when this is `true`.
+    pub effective_separate_pr_branch: bool,
+    /// RAL-378: `true` once this review's *combined* worktree branch is named
+    /// readably rather than as the internal `guardian/<id>/review` ref.
+    /// `false` for every review created before readable naming landed. Only
+    /// meaningful for a combined-worktree review; a stacked one names each
+    /// branch individually (see [`BranchView::readable_review_branch`]).
+    pub readable_review_branch: bool,
+    /// RAL-378: the readable name claimed for this review's combined worktree
+    /// branch, derived from [`Self::name`] at the first combined build.
+    /// Sticky, so renaming the review afterwards does not move the branch.
+    pub review_branch_name: Option<String>,
     /// RAL-317: this review's own override for whether the PR stack is
     /// auto-submitted/grown as each branch reaches a terminal
     /// (`done`/`conflict_resolved`) merge state, instead of requiring the
@@ -866,6 +906,10 @@ pub struct OrderedBranch {
     pub branch: String,
     /// Whether this branch is enabled in the stack (RAL-43).
     pub enabled: bool,
+    /// RAL-378: see [`BranchView::readable_review_branch`].
+    pub readable_review_branch: bool,
+    /// RAL-378: see [`BranchView::review_branch_name`].
+    pub review_branch_name: Option<String>,
 }
 
 impl Store {
@@ -922,10 +966,20 @@ impl Store {
             .or(auto_submit_pr_stack_stamp)
             .or(live_global.auto_submit_pr_stack)
             .unwrap_or(false);
+        // RAL-378: same stamping shape again. `readable_review_branch` is set
+        // unconditionally here -- every review created from now on names its
+        // combined branch readably; only reviews that predate the column keep
+        // the internal `guardian/<id>/review` ref.
+        let separate_pr_branch_stamp = self.project_separate_pr_branch_stamp(git_root);
+        let separate_pr_branch = explicit_project
+            .separate_pr_branch
+            .or(separate_pr_branch_stamp)
+            .or(live_global.separate_pr_branch)
+            .unwrap_or(false);
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack)
-             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?)",
-            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack)],
+            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch)
+             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1)",
+            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch)],
         )?;
         Ok(id)
     }
@@ -1446,8 +1500,8 @@ impl Store {
         // `position`, which is a mutable display/order attribute only).
         let branch_id = self.next_id("branch_seq", "branch")?;
         self.conn.execute(
-            "INSERT INTO guardian_branches(guardian_id, position, branch, merge_status, detail, project, id)
-             VALUES(?,?,?,?,NULL,?,?)",
+            "INSERT INTO guardian_branches(guardian_id, position, branch, merge_status, detail, project, id, readable_review_branch)
+             VALUES(?,?,?,?,NULL,?,?,1)",
             params![
                 guardian_id,
                 next,
@@ -1576,9 +1630,15 @@ impl Store {
             |r| r.get(0),
         )?;
         tx.execute(
+            // RAL-378: a moved branch is a fresh row under a different
+            // review, and the move already discards its old review ref, so it
+            // opts into readable naming even when the branch it came from
+            // predates it. Its first build in the destination claims a name of
+            // its own, collision-checked against the source's open PR alias
+            // like any other.
             "INSERT INTO guardian_branches
-                 (guardian_id, position, branch, merge_status, detail, enabled, moved_from_guardian_id, id)
-             VALUES (?,?,?,?,NULL,1,?,?)",
+                 (guardian_id, position, branch, merge_status, detail, enabled, moved_from_guardian_id, id, readable_review_branch)
+             VALUES (?,?,?,?,NULL,1,?,?,1)",
             params![
                 to_guardian_id,
                 new_position,
@@ -2067,6 +2127,109 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound)?;
         Ok(json.as_deref().and_then(|s| serde_json::from_str(s).ok()))
+    }
+
+    /// RAL-378: set this review's own override for whether its pull request
+    /// is pushed to a branch separate from its review branch. `None` resets it
+    /// to "inherit the project/global default".
+    pub fn set_guardian_separate_pr_branch(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET separate_pr_branch=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-378: record the readable name claimed for this review's *combined*
+    /// worktree branch. Written once, at the first combined build; see
+    /// [`GuardianView::review_branch_name`] for why it is never recomputed.
+    pub fn set_guardian_review_branch_name(&self, id: &str, name: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET review_branch_name=?, updated_at_ms=? WHERE id=?",
+            params![name, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-378: record the readable name claimed for one stacked branch's
+    /// review branch. Written once, at that branch's first build; deliberately
+    /// not cleared by any of the reset paths (see
+    /// [`BranchView::review_branch_name`]).
+    pub fn set_branch_review_branch_name(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        name: &str,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_branches SET review_branch_name=? WHERE guardian_id=? AND id=?",
+            params![name, guardian_id, branch_id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-378: whether `name` is already spoken for as a branch name within
+    /// `project_root`, ignoring the branch identified by `except`.
+    ///
+    /// Checks all three places a readable review branch can collide: another
+    /// stacked branch's claimed name, another review's combined-branch name,
+    /// and the remote alias of any pull request opened from this project --
+    /// the last because with `separate_pr_branch` off the review branch *is*
+    /// the PR branch, so a name already pushed under a different review's PR
+    /// would be force-pushed over. Local refs are checked separately by the
+    /// caller, which is the side that can reach git.
+    ///
+    /// Scoped to one project root rather than globally: two unrelated repos
+    /// are free to have identically-named review branches, and a global check
+    /// would push every name in the second repo to `-2` for no reason. Both
+    /// sides of that comparison are trailing-separator-normalized; a residual
+    /// mismatch (e.g. differing drive-letter case) can only *under*-report,
+    /// and the caller's local-ref check is what actually stops two branches in
+    /// one repo from claiming the same name.
+    pub fn review_branch_name_taken(
+        &self,
+        project_root: &str,
+        name: &str,
+        except: Option<(&str, &str)>,
+    ) -> Result<bool> {
+        let (except_guardian, except_branch) = match except {
+            Some((g, b)) => (g, b),
+            None => ("", ""),
+        };
+        let project_root = project_root.trim_end_matches(['/', '\\']);
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                r"SELECT 1 FROM guardian_branches gb
+                    JOIN guardians g ON g.id = gb.guardian_id
+                   WHERE gb.review_branch_name = ?1
+                     AND rtrim(COALESCE(gb.project, g.git_root), '/\') = ?2
+                     AND NOT (gb.guardian_id = ?3 AND gb.id = ?4)
+                  UNION ALL
+                  SELECT 1 FROM guardians
+                   WHERE review_branch_name = ?1 AND rtrim(git_root, '/\') = ?2
+                  UNION ALL
+                  SELECT 1 FROM guardian_pull_requests p
+                    JOIN guardians g2 ON g2.id = p.guardian_id
+                   WHERE p.branch_alias = ?1 AND rtrim(g2.git_root, '/\') = ?2
+                  LIMIT 1",
+                params![name, project_root, except_guardian, except_branch],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Set this review's own Proof-scope override (RAL-168): one of
@@ -2822,7 +2985,8 @@ impl Store {
     /// The ordered branches of a guardian (all, including disabled).
     pub fn guardian_branches(&self, guardian_id: &str) -> Result<Vec<OrderedBranch>> {
         let mut stmt = self.conn.prepare(
-            "SELECT position, branch, enabled, id FROM guardian_branches WHERE guardian_id=? ORDER BY position",
+            "SELECT position, branch, enabled, id, readable_review_branch, review_branch_name
+             FROM guardian_branches WHERE guardian_id=? ORDER BY position",
         )?;
         let rows = stmt
             .query_map(params![guardian_id], |r| {
@@ -2831,6 +2995,8 @@ impl Store {
                     branch: r.get(1)?,
                     enabled: r.get::<_, i64>(2).map(|v| v != 0).unwrap_or(true),
                     id: r.get(3)?,
+                    readable_review_branch: r.get::<_, i64>(4)? != 0,
+                    review_branch_name: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3147,7 +3313,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -3160,7 +3326,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -3220,6 +3386,9 @@ impl Store {
             auto_submit_pr_stack: r.get::<_, Option<i64>>(46)?.map(|v| v != 0),
             origin: r.get(47)?,
             auto_build_json: r.get(48)?,
+            separate_pr_branch: r.get::<_, Option<i64>>(49)?.map(|v| v != 0),
+            readable_review_branch: r.get::<_, i64>(50)? != 0,
+            review_branch_name: r.get(51)?,
         })
     }
 
@@ -3240,7 +3409,8 @@ impl Store {
                     s.idx AS source_cell_idx,
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
                     gb.is_empty, s.machine AS source_cell_machine,
-                    gb.env_overrides, gb.started_at_ms, gb.auto_submit_error
+                    gb.env_overrides, gb.started_at_ms, gb.auto_submit_error,
+                    gb.readable_review_branch, gb.review_branch_name
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -3275,6 +3445,8 @@ impl Store {
                     merge_status,
                     detail: r.get(3)?,
                     review_branch: r.get(4)?,
+                    readable_review_branch: r.get::<_, i64>(24)? != 0,
+                    review_branch_name: r.get(25)?,
                     worktree,
                     conflicts_found: r.get(6)?,
                     conflicts_fixed: r.get(7)?,
@@ -3512,6 +3684,17 @@ impl Store {
             .or(live_global.auto_submit_pr_stack)
             .unwrap_or(false);
 
+        // RAL-378: same layering as `effective_match_pr_branch_name` above,
+        // for whether the PR gets a branch of its own or is opened straight
+        // from the review branch.
+        let separate_pr_branch_stamp = self.project_separate_pr_branch_stamp(&row.git_root);
+        let effective_separate_pr_branch = row
+            .separate_pr_branch
+            .or(explicit_project.separate_pr_branch)
+            .or(separate_pr_branch_stamp)
+            .or(live_global.separate_pr_branch)
+            .unwrap_or(false);
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -3573,6 +3756,10 @@ impl Store {
             effective_skip_base_updates,
             match_pr_branch_name: row.match_pr_branch_name,
             effective_match_pr_branch_name,
+            separate_pr_branch: row.separate_pr_branch,
+            effective_separate_pr_branch,
+            readable_review_branch: row.readable_review_branch,
+            review_branch_name: row.review_branch_name,
             auto_submit_pr_stack: row.auto_submit_pr_stack,
             effective_auto_submit_pr_stack,
             origin: row.origin,
@@ -3907,6 +4094,13 @@ struct GuardianRow {
     /// RAL-250: per-review base-branch auto-update opt-out. `None` inherits
     /// the project/global default.
     skip_base_updates: Option<bool>,
+    /// RAL-378: per-review separate-PR-branch override. `None` inherits the
+    /// project/global default.
+    separate_pr_branch: Option<bool>,
+    /// RAL-378: whether this review's combined branch is named readably.
+    readable_review_branch: bool,
+    /// RAL-378: the sticky readable name claimed for the combined branch.
+    review_branch_name: Option<String>,
     /// RAL-185: the machine this review runs on. NULL means the daemon's host.
     machine: Option<String>,
     /// RAL-203: this review's own env overrides for the finalize-time
@@ -4039,6 +4233,8 @@ mod tests {
             merge_status: merge_status.to_string(),
             detail: None,
             review_branch: None,
+            readable_review_branch: true,
+            review_branch_name: None,
             worktree: None,
             conflicts_found: None,
             conflicts_fixed: None,
@@ -5314,6 +5510,166 @@ mod tests {
             store
                 .set_guardian_match_pr_branch_name("nope", Some(true))
                 .is_err()
+        );
+    }
+
+    // ── RAL-378: separate_pr_branch + sticky review-branch names ───────────
+
+    #[test]
+    fn separate_pr_branch_is_stamped_false_at_creation() {
+        // Same concrete-value-from-the-start stamping shape as
+        // `match_pr_branch_name`: with no registered project it resolves to
+        // the live global default, `false` -- the PR branch and the review
+        // branch are one and the same.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.separate_pr_branch, Some(false));
+        assert!(!g.effective_separate_pr_branch);
+    }
+
+    #[test]
+    fn separate_pr_branch_toggles_independently_per_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_separate_pr_branch(&id, Some(true))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.separate_pr_branch, Some(true));
+        assert!(g.effective_separate_pr_branch);
+
+        // Resetting back to None restores "inherit the project/global default".
+        store.set_guardian_separate_pr_branch(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.separate_pr_branch, None);
+        assert!(!g.effective_separate_pr_branch);
+
+        assert!(
+            store
+                .set_guardian_separate_pr_branch("nope", Some(true))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_newly_registered_branch_opts_into_readable_naming_with_no_name_yet() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feature-a").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.branches[0].readable_review_branch);
+        // Unresolved until the branch's first build claims a name.
+        assert_eq!(g.branches[0].review_branch_name, None);
+        assert!(g.readable_review_branch);
+        assert_eq!(g.review_branch_name, None);
+    }
+
+    #[test]
+    fn a_claimed_review_branch_name_survives_a_branch_reset() {
+        // The whole point of the separate column: the reset paths clear
+        // `review_branch`, but re-resolving the *name* on every rebuild would
+        // walk the collision suffix forward and orphan an open PR.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feature-a").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review_branch_name(&id, &bid, "feature-a-review")
+            .unwrap();
+        store
+            .set_branch_review(&id, &bid, "feature-a-review", "/wt")
+            .unwrap();
+
+        store.reset_all_enabled_branches_to_pending(&id).unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.branches[0].review_branch, None);
+        assert_eq!(
+            g.branches[0].review_branch_name.as_deref(),
+            Some("feature-a-review")
+        );
+    }
+
+    #[test]
+    fn review_branch_name_taken_sees_names_claimed_by_other_branches() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feature-a").unwrap();
+        store.add_guardian_branch(&id, "feature-b").unwrap();
+        let branches = store.get_guardian(&id).unwrap().branches;
+        let (a, b) = (branches[0].id.clone(), branches[1].id.clone());
+        store
+            .set_branch_review_branch_name(&id, &a, "shared-review")
+            .unwrap();
+
+        assert!(
+            store
+                .review_branch_name_taken("/repo", "shared-review", Some((&id, &b)))
+                .unwrap()
+        );
+        // A branch never collides with its own prior claim.
+        assert!(
+            !store
+                .review_branch_name_taken("/repo", "shared-review", Some((&id, &a)))
+                .unwrap()
+        );
+        // A different repo is a different namespace.
+        assert!(
+            !store
+                .review_branch_name_taken("/other", "shared-review", Some((&id, &b)))
+                .unwrap()
+        );
+        // Trailing separators on either side don't split the namespace.
+        assert!(
+            store
+                .review_branch_name_taken("/repo/", "shared-review", Some((&id, &b)))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn review_branch_name_taken_sees_a_combined_reviews_name() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = store.create_guardian("owner", "main", "/repo").unwrap();
+        store
+            .set_guardian_review_branch_name(&owner, "owner-review")
+            .unwrap();
+        assert!(
+            store
+                .review_branch_name_taken("/repo", "owner-review", None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn review_branch_name_taken_sees_an_open_prs_remote_alias() {
+        // With `separate_pr_branch` off the review branch is pushed under its
+        // own name, so a name another review already has a PR on would be
+        // force-pushed over.
+        let store = Store::open_in_memory().unwrap();
+        let other = store.create_guardian("other", "main", "/repo").unwrap();
+        store
+            .create_pull_request(
+                &other,
+                None,
+                "github",
+                "acme/widget",
+                "feature-a-review",
+                "main",
+                "t",
+                "d",
+                Some(7),
+                Some("https://example.invalid/pr/7"),
+            )
+            .unwrap();
+        let mine = store.create_guardian("mine", "main", "/repo").unwrap();
+        store.add_guardian_branch(&mine, "feature-a").unwrap();
+        let bid = store.get_guardian(&mine).unwrap().branches[0].id.clone();
+        assert!(
+            store
+                .review_branch_name_taken("/repo", "feature-a-review", Some((&mine, &bid)))
+                .unwrap()
         );
     }
 

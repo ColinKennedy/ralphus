@@ -812,10 +812,7 @@ fn per_branch_and_combined_worktrees_are_recorded() {
     // Each feature has its own recorded review branch + worktree on disk.
     for b in &view.branches {
         let rb = b.review_branch.as_deref().expect("review branch recorded");
-        assert!(
-            rb.starts_with(&format!("guardian/{id}/wt-")),
-            "review branch: {rb}"
-        );
+        assert_eq!(rb, format!("{}-review", b.branch), "review branch: {rb}");
         let wt = b.worktree.as_deref().expect("worktree recorded");
         assert!(Path::new(wt).is_dir(), "worktree dir exists: {wt}");
     }
@@ -1908,8 +1905,12 @@ fn skip_worktrees_shared_stack_rebases_all_branches() {
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
-    // Every branch shares the one combined review branch.
-    let expected_combined = format!("guardian/{id}/review");
+    // Every branch shares the one combined review branch (RAL-378: named
+    // from the review's own name, not the internal `guardian/<id>/review`).
+    let expected_combined = view
+        .review_branch
+        .clone()
+        .expect("combined review branch recorded");
     assert!(
         view.branches
             .iter()
@@ -2911,9 +2912,9 @@ fn conflict_resolution_publishes_a_review_ghost() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// New naming convention: per-branch review refs are
-// `guardian/<id>/wt-<feature_branch>` and the combined ref is
-// `guardian/<id>/review`.
+// RAL-378 naming convention: a per-branch review ref is `<task branch>-review`
+// and the combined ref is `<review name>-review`, both readable and both
+// publishable as-is -- not the internal `guardian/<id>/...` refs they replaced.
 #[test]
 fn new_naming_convention_per_branch_and_combined() {
     let root = temp_repo();
@@ -2948,17 +2949,19 @@ fn new_naming_convention_per_branch_and_combined() {
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
-    // Per-branch refs follow `guardian/<id>/wt-<feature_branch>`.
+    // Per-branch refs follow `<task branch>-review`.
     let rb0 = view.branches[0].review_branch.as_deref().unwrap();
     let rb1 = view.branches[1].review_branch.as_deref().unwrap();
-    assert_eq!(rb0, format!("guardian/{id}/wt-feature/a"));
-    assert_eq!(rb1, format!("guardian/{id}/wt-feature/b"));
-
-    // The combined review branch is named `guardian/<id>/review`.
+    assert_eq!(rb0, "feature/a-review");
+    assert_eq!(rb1, "feature/b-review");
     assert_eq!(
-        view.review_branch.as_deref(),
-        Some(format!("guardian/{id}/review").as_str())
+        view.branches[0].review_branch_name.as_deref(),
+        Some("feature/a-review"),
+        "the name is persisted, not just derived per build"
     );
+
+    // The combined review branch is slugified from the review's own name.
+    assert_eq!(view.review_branch.as_deref(), Some("naming-review"));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -5342,8 +5345,8 @@ fn staged_merge_resumes_from_prior_built_tip() {
     let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b", "feature/c"]);
     mark_ready(&store, &id, &bids[0]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
-    let rev_a = format!("guardian/{id}/wt-feature/a");
-    let tip_a_before = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    let rev_a = "feature/a-review";
+    let tip_a_before = git(&root, &["rev-parse", rev_a]).trim().to_string();
 
     // Branch b becomes ready; branch c still pending.
     mark_ready(&store, &id, &bids[1]);
@@ -5355,13 +5358,13 @@ fn staged_merge_resumes_from_prior_built_tip() {
     assert_eq!(view.branches[1].merge_status, "done");
     assert_eq!(view.branches[2].merge_status, "pending");
 
-    let tip_a_after = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    let tip_a_after = git(&root, &["rev-parse", rev_a]).trim().to_string();
     assert_eq!(
         tip_a_before, tip_a_after,
         "a's already-built tip must be preserved on resume, not rebuilt"
     );
-    let rev_b = format!("guardian/{id}/wt-feature/b");
-    let tip_b = git(&root, &["rev-parse", &rev_b]).trim().to_string();
+    let rev_b = "feature/b-review";
+    let tip_b = git(&root, &["rev-parse", rev_b]).trim().to_string();
     // b is a descendant of the preserved a tip (stacked on top of it).
     git(
         &root,
@@ -5384,8 +5387,8 @@ fn staged_merge_rebuilds_prefix_when_base_moves() {
     let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
     mark_ready(&store, &id, &bids[0]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
-    let rev_a = format!("guardian/{id}/wt-feature/a");
-    let tip_a_old = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    let rev_a = "feature/a-review";
+    let tip_a_old = git(&root, &["rev-parse", rev_a]).trim().to_string();
 
     // Move the base forward while only branch a is built.
     git(&root, &["checkout", "main"]);
@@ -5405,7 +5408,7 @@ fn staged_merge_rebuilds_prefix_when_base_moves() {
     );
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
 
-    let tip_a_new = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    let tip_a_new = git(&root, &["rev-parse", rev_a]).trim().to_string();
     assert_ne!(
         tip_a_old, tip_a_new,
         "a must be rebuilt onto the new base, not carried forward stale"
@@ -5455,8 +5458,8 @@ fn staged_merge_rebuilds_when_branch_set_changes() {
     let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
     mark_ready(&store, &id, &bids[0]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
-    let rev_a = format!("guardian/{id}/wt-feature/a");
-    let tip_a_old = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    let rev_a = "feature/a-review";
+    let tip_a_old = git(&root, &["rev-parse", rev_a]).trim().to_string();
 
     // Reorder the branches: feature/b now sits at position 0. The enabled
     // branch set / order fed to the signature differs, so the built prefix is
@@ -5473,7 +5476,7 @@ fn staged_merge_rebuilds_when_branch_set_changes() {
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
-    let tip_a_new = git(&root, &["rev-parse", &rev_a]).trim().to_string();
+    let tip_a_new = git(&root, &["rev-parse", rev_a]).trim().to_string();
     assert_ne!(
         tip_a_old, tip_a_new,
         "a's tip must be rebuilt after the branch set changed"

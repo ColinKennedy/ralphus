@@ -98,6 +98,9 @@ pub enum ReviewCommand {
         /// auto-submitted/grown as each branch reaches a terminal merge
         /// state.
         auto_submit_pr_stack: Option<bool>,
+        /// RAL-378: this review's own override for whether its pull request
+        /// is pushed to a branch separate from its review branch.
+        separate_pr_branch: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -345,6 +348,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
             let auto_submit_pr_stack = take_tri_bool(&mut scanner, "--auto-submit-pr-stack");
+            let separate_pr_branch = take_tri_bool(&mut scanner, "--separate-pr-branch");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -358,6 +362,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 skip_base_updates,
                 match_pr_branch_name,
                 auto_submit_pr_stack,
+                separate_pr_branch,
             })
         }
         Some("env") => {
@@ -1247,6 +1252,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             skip_base_updates,
             match_pr_branch_name,
             auto_submit_pr_stack,
+            separate_pr_branch,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1261,6 +1267,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 skip_base_updates,
                 match_pr_branch_name,
                 auto_submit_pr_stack,
+                separate_pr_branch,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
