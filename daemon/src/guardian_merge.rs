@@ -2655,6 +2655,36 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     set_status: &F,
     cancel: &CancelToken,
 ) {
+    {
+        let mut guard = store.lock().expect("poisoned");
+        guard.request_guardian_restack(id, from_position);
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                "restack requested",
+                serde_json::json!({"from_position": from_position}),
+            );
+    }
+    let Some(from_position) = store
+        .lock()
+        .expect("poisoned")
+        .try_claim_guardian_restack(id)
+    else {
+        set_status(
+            GuardianStatus::InReview,
+            Some("restack queued: waiting for branch actioning"),
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .emit(
+                &store.lock().expect("poisoned"),
+                "restack deferred: branch actioning",
+                serde_json::json!({}),
+            );
+        return;
+    };
+    let _restack_claim = GuardianRestackClaim::new(Arc::clone(store), id);
     // Re-affirm `Merging` here rather than trusting the caller's earlier stamp:
     // both callers (`run_feedback`, `rebase_on_manual_push`) set it once before
     // dispatching a potentially slow resolver-agent call, and a concurrent
@@ -2797,6 +2827,29 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             set_status(GuardianStatus::InReview, note.as_deref());
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
+    }
+}
+
+struct GuardianRestackClaim {
+    store: Arc<Mutex<Store>>,
+    guardian_id: String,
+}
+
+impl GuardianRestackClaim {
+    fn new(store: Arc<Mutex<Store>>, guardian_id: &str) -> Self {
+        Self {
+            store,
+            guardian_id: guardian_id.to_string(),
+        }
+    }
+}
+
+impl Drop for GuardianRestackClaim {
+    fn drop(&mut self) {
+        self.store
+            .lock()
+            .expect("poisoned")
+            .finish_guardian_restack(&self.guardian_id);
     }
 }
 
@@ -4776,6 +4829,28 @@ pub fn run_feedback(
     // Stack-order math (downstream filtering) below is legitimately
     // position-based; resolve it once here from the addressed branch_id.
     let position = branch.position;
+    let lease_owner = format!("feedback:{branch_id}");
+    loop {
+        let acquired = store
+            .lock()
+            .expect("poisoned")
+            .try_acquire_guardian_worktree_lease(id, branch_id, &lease_owner);
+        if acquired {
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .emit(
+                    &store.lock().expect("poisoned"),
+                    "worktree lease acquired",
+                    serde_json::json!({"branch_id": branch_id, "owner": lease_owner}),
+                );
+            break;
+        }
+        if cancel.is_cancelled() {
+            return FeedbackOutcome::default();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} feedback applying position={position}"
@@ -4813,6 +4888,10 @@ pub fn run_feedback(
     let wt_base = root.at(worktree_dir(&branch_project, id));
 
     let Some(wt_str) = branch.worktree.clone() else {
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .release_guardian_worktree_lease(id, branch_id, &lease_owner);
         let _ = store
             .lock()
             .expect("poisoned")
@@ -4858,6 +4937,10 @@ pub fn run_feedback(
     ) {
         Ok(r) => r,
         Err(message) => {
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .release_guardian_worktree_lease(id, branch_id, &lease_owner);
             let _ = store
                 .lock()
                 .expect("poisoned")
@@ -4917,33 +5000,17 @@ pub fn run_feedback(
         allow_personal_settings: false,
         allow_personal_memory: false,
     };
-    let no_commit = is_no_commit_intent(feedback);
-    // Stash any pre-existing dirty state so we only include the agent's own
-    // changes in the new commit (not leftovers from a prior no-commit turn).
-    // RAL-283: named + uniquified, not a bare `git stash` — this worktree's
-    // stash lives on the shared `refs/stash` stack of the whole repo (git has
-    // no per-worktree stash), so a bare push/pop here could collide with
-    // another branch's feedback/rebase window on the same repo.
-    let stash_name = if !no_commit {
-        let pre = wt.git(&["status", "--porcelain"]).unwrap_or_default();
-        if pre.trim().is_empty() {
-            None
-        } else {
-            let name = crate::stash::unique_stash_name(
-                &format!("guardian/{id}/{review_branch}"),
-                "feedback",
-            );
-            wt.git(&["stash", "push", "--include-untracked", "--message", &name])
-                .ok()
-                .map(|_| name)
-        }
-    } else {
-        None
-    };
+    // A clean lease boundary takes precedence over a conversational request
+    // to leave edits uncommitted. Retain detection for the audit payload.
+    let requested_no_commit = is_no_commit_intent(feedback);
+    let no_commit = false;
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     let dirty = wt.git(&["status", "--porcelain"]).unwrap_or_default();
-    let committed = !dirty.trim().is_empty() && !no_commit;
+    // A resolver may exit unsuccessfully after making useful edits. The
+    // wrapper owns those edits and commits them before releasing its lease,
+    // making Actioning -> terminal imply a clean worktree.
+    let committed = !dirty.trim().is_empty();
     let mut proof_note: Option<String> = None;
     let mut pushed = false;
     let mut pushed_sha: Option<String> = None;
@@ -5019,15 +5086,6 @@ pub fn run_feedback(
     } else {
         None
     };
-    // Restore any pre-existing (no-commit) changes to the working tree.
-    if let Some(name) = &stash_name {
-        if let Err(e) = crate::stash::pop_named(|args| wt.git(args), name) {
-            crate::rlog!(
-                WARNING,
-                "ralphus [guardian] review {id} feedback: stash restore failed: {e}"
-            );
-        }
-    }
     // RAL-241 follow-up: every path here previously reported the same
     // "feedback applied" detail regardless of what actually happened --
     // an agent run that errored out, or one that simply left the worktree
@@ -5114,18 +5172,54 @@ pub fn run_feedback(
             payload: serde_json::json!({
                 "position": position,
                 "no_commit": no_commit,
+                "requested_no_commit": requested_no_commit,
                 "committed": committed,
             }),
             admin_only: false,
         });
     }
-    if no_commit {
-        // RAL-92: no commit was created so the review-branch tips are unchanged;
-        // re-baseline anyway to keep manual-push detection consistent.
-        snapshot_review_heads(store, id);
-        set_status(GuardianStatus::InReview, None);
-        return outcome;
+    let clean = wt
+        .git(&["status", "--porcelain"])
+        .is_ok_and(|status| status.trim().is_empty());
+    if clean {
+        let released = store
+            .lock()
+            .expect("poisoned")
+            .release_guardian_worktree_lease(id, branch_id, &lease_owner);
+        if released {
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .emit(
+                    &store.lock().expect("poisoned"),
+                    "worktree lease released",
+                    serde_json::json!({"branch_id": branch_id, "owner": lease_owner}),
+                );
+        }
     }
+    {
+        let mut guard = store.lock().expect("poisoned");
+        guard.request_guardian_restack(id, position);
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                "restack requested",
+                serde_json::json!({"from_position": position}),
+            );
+    }
+    let Some(restack_position) = store
+        .lock()
+        .expect("poisoned")
+        .try_claim_guardian_restack(id)
+    else {
+        set_status(
+            GuardianStatus::InReview,
+            Some("restack queued: waiting for concurrent branch actioning"),
+        );
+        return outcome;
+    };
+    let _restack_claim = GuardianRestackClaim::new(Arc::clone(store), id);
 
     // Re-affirm `Merging` before restacking downstream: the target branch's
     // resolver call above can run long enough for a concurrent failure
@@ -5177,7 +5271,7 @@ pub fn run_feedback(
     let downstream: Vec<_> = all_branches
         .iter()
         .filter(|b| {
-            b.position > position
+            b.position > restack_position
                 && b.project.as_deref().unwrap_or(&guardian.git_root) == branch_project
         })
         .collect();
@@ -7014,6 +7108,60 @@ fn drive_rebase(
         log_merge_cancelled(store, id);
         return Err("cancelled".to_string());
     }
+    let mut rescued_orphaned_edits = false;
+    loop {
+        let owner = store
+            .lock()
+            .expect("poisoned")
+            .guardian_worktree_lease_owner(id, branch_id);
+        if let Some(owner) = owner {
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .emit(
+                    &store.lock().expect("poisoned"),
+                    "restack deferred: branch worktree leased",
+                    serde_json::json!({"branch_id": branch_id, "owner": owner}),
+                );
+            if cancel.is_cancelled() {
+                return Err("cancelled".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        }
+        let dirty = wt.git(&["status", "--porcelain"])?;
+        if dirty.trim().is_empty() {
+            break;
+        }
+        wt.git(&["add", "--all"])?;
+        wt.git(&[
+            "commit",
+            "--message",
+            &format!("rescue: preserve orphaned review edits ({feature})"),
+        ])?;
+        let sha = wt.git(&["rev-parse", "HEAD"])?;
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} branch={feature:?} rescue commit created sha={}",
+            sha.trim()
+        );
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "guardian",
+            message: "rescue commit created for orphaned worktree edits",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"branch_id": branch_id, "branch": feature, "sha": sha.trim()}),
+            admin_only: false,
+        });
+        rescued_orphaned_edits = true;
+        break;
+    }
     // RAL-259: this `drive_rebase` call is one branch-resolution attempt, so
     // clear the branch's Live-View start time before anything runs — a
     // re-merge / restart re-stamps from scratch (see
@@ -7027,7 +7175,7 @@ fn drive_rebase(
     // `--empty=drop` discards commits already present on `newbase` (patch-equal),
     // which is exactly why rebase — not a range cherry-pick — is used here: a
     // shared or already-merged commit is dropped instead of halting the stack.
-    let args = [
+    let mut args = vec![
         "rebase",
         "--onto",
         newbase,
@@ -7036,6 +7184,12 @@ fn drive_rebase(
         base_sha,
         branch_arg,
     ];
+    // If the daemon just rescued orphaned edits, preserve that rescued
+    // commit's side of a content collision while replaying it. In a rebase,
+    // `theirs` is the commit being replayed (the rescued work), not newbase.
+    if rescued_orphaned_edits {
+        args.insert(1, "-Xtheirs");
+    }
     let mut result = wt.git(&args);
     if matches!(&result, Err(e) if e.contains("untracked working tree files would be overwritten"))
     {
@@ -9801,7 +9955,7 @@ mod tests {
     // exercises exactly the code path that broke in production — where Windows
     // CWD-lock prevents `ensure_worktree` from deleting the worktree directory.
     #[test]
-    fn drive_rebase_cleans_untracked_file_that_blocks_rebase_onto() {
+    fn dirty_worktree_guard_rescues_orphaned_edits_and_logs_before_rebase() {
         use crate::runner::RunnerResult;
 
         let base = tmp_dir("drive-rebase-blocker");
@@ -9914,6 +10068,11 @@ mod tests {
         assert!(
             matches!(result.unwrap().0, RebaseOutcome::Clean),
             "expected Clean rebase outcome"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("blocker.txt")).unwrap(),
+            "stale agent output\n",
+            "the rescue commit must preserve the orphaned content"
         );
 
         let _ = std::fs::remove_dir_all(&base);
