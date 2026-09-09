@@ -3227,6 +3227,15 @@ pub(crate) fn kickoff_merge(
     cancellations: Cancellations,
 ) -> Result<StartMergeOutcome, StartMergeError> {
     let kickoff_started = std::time::Instant::now();
+    // A nonexistent guardian must 404 before any preflight work runs.
+    // `sync_remote_pr_commits` below also looks the guardian up, but maps
+    // *any* lookup failure (including "no such guardian") to a 409
+    // `Preflight` error -- a nonexistent id would otherwise misreport as a
+    // sync failure instead of the 404 it actually is, after wastefully
+    // running preflight (forge/git) work with nothing to act on.
+    if let Err(e) = lock_timed(&store, id, "existence").get_guardian(id) {
+        return Err(StartMergeError::NotFound(e.to_string()));
+    }
     // RAL-300: a manual "Merge / rebase" trigger must not waste a rebuild
     // when every linked PR has already merged -- ask first, exactly like the
     // periodic sweep (`review_maintenance`) does. When this settles the
