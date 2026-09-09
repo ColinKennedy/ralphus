@@ -8,6 +8,7 @@ nav:
   - Overview: overview.md
   - Installation: installation.md
   - Views:
+      - Squads: views/squads.md
       - Tasks: views/tasks.md
       - Queue: views/queue.md
       - Reviews: views/reviews.md

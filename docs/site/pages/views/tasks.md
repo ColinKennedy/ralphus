@@ -4,7 +4,7 @@ The Tasks tab is a flat, searchable table of **every task across every
 squad** — one row per task, regardless of which squad it lives in, with
 usage, review, and PR state joined in. Use it to see what's outstanding
 board-wide without having to click through each squad's tree on the
-[Squads tab](../squads/).
+[Squads tab](squads.md).
 
 ## The task table
 
