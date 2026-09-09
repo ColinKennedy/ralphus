@@ -5566,6 +5566,14 @@ pub fn run_feedback(
     // follows a real terminal success, never a failure.
     if branch_status == MergeStatus::Done {
         crate::pr::maybe_auto_submit_branch(store, runner, id, branch_id);
+        // RAL-375: a feedback push onto a branch that already has (or just
+        // gained, via the auto-submit call just above) an open PR should
+        // start watching that PR's CI/mergeability -- gated on `pushed`
+        // since a feedback pass that only reports (no worktree change, or
+        // `no_commit` requested) has nothing new on the forge to watch.
+        if pushed {
+            crate::ci_watch::watch_after_feedback_push(store, id, branch_id);
+        }
     }
     let outcome = FeedbackOutcome {
         committed,

@@ -121,12 +121,19 @@ pub struct MailboxMessageView {
     pub entity_uri: Option<String>,
     /// Typed Monitor event that caused this message, when applicable.
     pub event_kind: Option<String>,
+    /// A broad classification of what this message is about (RAL-375), e.g.
+    /// `"review"` for a PR/CI-watch notice (see `crate::ci_watch`). `None`
+    /// for messages enqueued before this field existed, or with no specific
+    /// category -- a category filter treats `None` as "not this category"
+    /// (see [`Store::mailbox_messages_for_client_filtered`]), never as a
+    /// wildcard match.
+    pub category: Option<String>,
 }
 
-/// Shared row-mapper for `mailbox_messages` queries that select the eight
+/// Shared row-mapper for `mailbox_messages` queries that select the ten
 /// columns `id, priority, message, squad_id, task, cell_id, created_at_ms,
-/// <read-bool>, entity_uri` in that order -- both
-/// [`Store::mailbox_messages_for_client`] and
+/// <read-bool>, entity_uri, event_kind, category` in that order -- both
+/// [`Store::mailbox_messages_for_client_filtered`] and
 /// [`Store::personal_mailbox_messages_for_user`] shape their `SELECT` to
 /// match this so they can share one mapper.
 fn row_to_message_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxMessageView> {
@@ -141,6 +148,7 @@ fn row_to_message_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxMessage
         read: r.get(7)?,
         entity_uri: r.get(8)?,
         event_kind: r.get(9)?,
+        category: r.get(10)?,
     })
 }
 
@@ -196,37 +204,78 @@ impl Store {
         cell_id: Option<&str>,
         entity_uri: Option<&str>,
     ) -> Result<String> {
+        self.enqueue_mailbox_message_ex(
+            priority, message, squad_id, task, cell_id, entity_uri, None,
+        )
+    }
+
+    /// Full form of [`Self::enqueue_mailbox_message`] that also stamps
+    /// `category` (RAL-375) -- a broad classification (e.g. `"review"`)
+    /// consulted by [`Self::mailbox_messages_for_client_filtered`]'s category
+    /// filter. `None` behaves exactly like [`Self::enqueue_mailbox_message`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_mailbox_message_ex(
+        &self,
+        priority: MailboxPriority,
+        message: &str,
+        squad_id: Option<&str>,
+        task: Option<&str>,
+        cell_id: Option<&str>,
+        entity_uri: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<String> {
         let id = self.next_id("mailbox_message_seq", "mailbox")?;
         self.conn.execute(
-            "INSERT INTO mailbox_messages(id, priority, message, squad_id, task, cell_id, created_at_ms, entity_uri)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, priority.as_str(), message, squad_id, task, cell_id, now_ms(), entity_uri],
+            "INSERT INTO mailbox_messages(id, priority, message, squad_id, task, cell_id, created_at_ms, entity_uri, category)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, priority.as_str(), message, squad_id, task, cell_id, now_ms(), entity_uri, category],
         )?;
         Ok(id)
     }
 
     /// List mailbox messages visible to `client_id`, most-recently-enqueued
     /// last. `unread_only` restricts to messages this client has not yet
-    /// drained; `priority` further restricts to one tier.
+    /// drained; `priority` further restricts to one tier. Never filters by
+    /// category -- see [`Self::mailbox_messages_for_client_filtered`] for
+    /// that.
     pub fn mailbox_messages_for_client(
         &self,
         client_id: &str,
         unread_only: bool,
         priority: Option<MailboxPriority>,
     ) -> Result<Vec<MailboxMessageView>> {
+        self.mailbox_messages_for_client_filtered(client_id, unread_only, priority, None)
+    }
+
+    /// Full form of [`Self::mailbox_messages_for_client`] that also restricts
+    /// to one `category` (RAL-375), e.g. `"review"` -- used by `ralphus
+    /// mailbox check --category review`, which QuickStart Reviewer's system
+    /// prompt defaults to, so a reviewer session only ever drains PR/CI
+    /// notices rather than every broadcast escalation. `None` behaves
+    /// exactly like [`Self::mailbox_messages_for_client`] (no category
+    /// filtering) -- QuickStart Watcher relies on this to keep draining
+    /// everything, including `"review"`-category messages.
+    pub fn mailbox_messages_for_client_filtered(
+        &self,
+        client_id: &str,
+        unread_only: bool,
+        priority: Option<MailboxPriority>,
+        category: Option<&str>,
+    ) -> Result<Vec<MailboxMessageView>> {
         let priority_str = priority.map(MailboxPriority::as_str);
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
-                    d.client_id IS NOT NULL AS read, m.entity_uri, m.event_kind
+                    d.client_id IS NOT NULL AS read, m.entity_uri, m.event_kind, m.category
              FROM mailbox_messages m
              LEFT JOIN mailbox_drains d ON d.message_id = m.id AND d.client_id = ?1
              WHERE (?2 = 0 OR d.client_id IS NULL)
                AND (?3 IS NULL OR m.priority = ?3)
+               AND (?4 IS NULL OR m.category = ?4)
              ORDER BY m.created_at_ms ASC",
         )?;
         let rows = stmt
             .query_map(
-                params![client_id, unread_only, priority_str],
+                params![client_id, unread_only, priority_str, category],
                 row_to_message_view,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -261,7 +310,7 @@ impl Store {
         let priority_str = priority.map(MailboxPriority::as_str);
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
-                    d.user_name IS NOT NULL AS read, m.entity_uri, m.event_kind
+                    d.user_name IS NOT NULL AS read, m.entity_uri, m.event_kind, m.category
              FROM mailbox_messages m
              LEFT JOIN user_mailbox_drains d ON d.message_id = m.id AND d.user_name = ?1
              WHERE m.entity_uri IS NOT NULL
@@ -510,6 +559,52 @@ mod tests {
             .mailbox_messages_for_client(&client_id, true, None)
             .unwrap();
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn category_filter_narrows_results_and_none_is_unfiltered() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+        store
+            .enqueue_mailbox_message_ex(
+                MailboxPriority::High,
+                "ci failed",
+                None,
+                None,
+                None,
+                None,
+                Some("review"),
+            )
+            .unwrap();
+        store
+            .enqueue_mailbox_message_ex(
+                MailboxPriority::High,
+                "cell stalled",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let review_only = store
+            .mailbox_messages_for_client_filtered(&client_id, false, None, Some("review"))
+            .unwrap();
+        assert_eq!(review_only.len(), 1);
+        assert_eq!(review_only[0].message, "ci failed");
+        assert_eq!(review_only[0].category.as_deref(), Some("review"));
+
+        let everything = store
+            .mailbox_messages_for_client_filtered(&client_id, false, None, None)
+            .unwrap();
+        assert_eq!(everything.len(), 2, "no category filter must see both");
+
+        // The plain (non-`_filtered`) entry point never filters by category.
+        let via_plain = store
+            .mailbox_messages_for_client(&client_id, false, None)
+            .unwrap();
+        assert_eq!(via_plain.len(), 2);
     }
 
     #[test]

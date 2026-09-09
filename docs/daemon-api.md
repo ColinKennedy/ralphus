@@ -212,7 +212,7 @@ produced no pane output.
 | Method | Path | What |
 |---|---|---|
 | POST | `/api/mailbox/register` | Register a new client, returns `{"client_id": "..."}` |
-| GET | `/api/mailbox/{client_id}/messages` | List messages visible to this client; `?unread=true` and `?priority=urgent\|high\|normal` filter |
+| GET | `/api/mailbox/{client_id}/messages` | List messages visible to this client; `?unread=true`, `?priority=urgent\|high\|normal`, and `?category=<name>` (e.g. `review`, RAL-375) filter |
 | POST | `/api/mailbox/{client_id}/drain` | Mark messages read; `{"message_ids": [...]}` or an empty body to drain every unread message |
 
 **Personal watches and notification preferences (RAL-320)**
@@ -3120,7 +3120,11 @@ narrower, per-user read. `GET` accepts the same `?unread=true` and
 `?priority=urgent|high|normal` filters as the broadcast mailbox; `POST`
 accepts the same `{"message_ids": [...]}` body (or an empty body to drain
 every unread message) as `POST /api/mailbox/{client_id}/drain`, scoped to the
-acting user.
+acting user. No `?category` filter here (RAL-375) — a watched entity's
+messages (e.g. a `review`-category PR/CI-watch notice, see the Mailbox row
+above) always surface through a personal watch regardless of category, so a
+client polling this endpoint sees them no matter which mode it's operating
+in.
 
 ## Notes on future evolution
 

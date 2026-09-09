@@ -1274,7 +1274,8 @@ impl Store {
                 cell_id       TEXT,
                 created_at_ms INTEGER NOT NULL,
                 entity_uri    TEXT,
-                event_kind    TEXT
+                event_kind    TEXT,
+                category      TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_mailbox_messages_created ON mailbox_messages(created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_mailbox_messages_priority ON mailbox_messages(priority);
@@ -2110,6 +2111,14 @@ impl Store {
             // and NULL for a "guardian"-role row, which isn't actionable. NULL
             // for every pre-existing row.
             "ALTER TABLE guardian_messages ADD COLUMN action_status TEXT",
+            // RAL-375: a broad classification of what a mailbox message is
+            // about (e.g. `"review"` for a PR/CI-watch notice), so a client
+            // like QuickStart Reviewer can default to draining only messages
+            // in its own category instead of everything broadcast. NULL for
+            // pre-RAL-375 rows and for messages with no specific category --
+            // treated as "not this category" by a category filter (see
+            // `crate::mailbox::mailbox_messages_for_client_filtered`).
+            "ALTER TABLE mailbox_messages ADD COLUMN category TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

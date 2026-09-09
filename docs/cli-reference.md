@@ -473,20 +473,31 @@ reference. Delivery mechanism mirrors the matching `manager` entrypoint
   check/action commands rather than an assumed local checkout. All
   write-oriented review actions must go through an explicit `ralphus review
   ...` subcommand, never ad-hoc shell mutation in an inspected worktree.
+- RAL-375: after every user turn the injected prompt also runs `ralphus
+  mailbox check --category review` and shows its output verbatim, before the
+  agent would otherwise go idle. This drains PR/CI-watch notices: once
+  `review feedback` pushes a commit onto a PR-linked branch, the daemon
+  watches that PR's CI/CD and merge/rebase-blocker status in the background
+  and reports here on failure, with the PR URL, failing job URL, impacted
+  review worktree, and a trimmed log excerpt, asking whether to fix it
+  immediately in a subagent. The `--category` filter keeps this drain scoped
+  to review notices — see [mailbox](#mailbox) below.
 
 ### quick-start watcher
 
 RAL-241, poll-only scope: a mailbox-polling supervisor session. Both
 entrypoints register (or reuse a locally persisted) mailbox `client_id` with
 the daemon (`POST /api/mailbox/register`) before launch, then inject a system
-prompt instructing the agent to run `ralphus mailbox check` after every user
-turn and show its output verbatim — `urgent` messages must be read and acted
-on before continuing, `high` before the agent would otherwise go idle,
-`normal` is informational. Delivery mechanism mirrors the matching `manager`/
-`reviewer` entrypoints (temp-file for `claude-code`, `-c
-developer_instructions=...` for `codex`); the full help-map is still appended
-for reference, since the watcher may need to inspect/act on whatever the
-escalation is about.
+prompt instructing the agent to run `ralphus mailbox check` (no `--category`
+filter, unlike `quick-start reviewer`'s `--category review` — RAL-375) after
+every user turn and show its output verbatim — `urgent` messages must be read
+and acted on before continuing, `high` before the agent would otherwise go
+idle, `normal` is informational. This includes `review`-category PR/CI-watch
+notices, so a watcher session surfaces them too even when the user isn't in
+reviewer mode. Delivery mechanism mirrors the matching `manager`/`reviewer`
+entrypoints (temp-file for `claude-code`, `-c developer_instructions=...` for
+`codex`); the full help-map is still appended for reference, since the
+watcher may need to inspect/act on whatever the escalation is about.
 
 Direct-push delivery into a live tmux-tracked session (rather than this
 turn-boundary poll) is out of scope here — see the ticket's Q&A.
@@ -497,12 +508,15 @@ RAL-241, poll-only scope: the escalation mailbox client.
 
 | Command | What |
 |---|---|
-| `mailbox check [--priority urgent\|high\|normal]` | List this client's unread messages, print them, then drain (mark read) exactly the ones printed |
+| `mailbox check [--priority urgent\|high\|normal] [--category <name>]` | List this client's unread messages, print them, then drain (mark read) exactly the ones printed |
 
 `mailbox check` mints (or reuses) a `client_id` the same way `quick-start
 watcher` does, so a stray manual run before ever launching a watcher session
 still works. Not on the `--read-only` safety list — it mutates drain state as
-a side effect even though it takes no other flags.
+a side effect even though it takes no other flags. `--category` restricts to
+one broad message classification (e.g. `review`, RAL-375, for PR/CI-watch
+notices); omit it to drain every category, which is what `quick-start
+watcher` does while `quick-start reviewer` defaults to `--category review`.
 
 ## Machine-readable help-map (RAL-110)
 
@@ -580,7 +594,7 @@ use; see `READ_ONLY_NOTE`.
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
     - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal watches and notification preferences layered over the same mailbox (RAL-320).}
-        - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
+        - check --category [name] --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241). --category restricts to one message category, e.g. "review" (RAL-375).}
         - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their watches (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
         - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: automatic creator watches and default notify tiers.}
