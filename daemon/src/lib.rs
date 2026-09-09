@@ -14,6 +14,7 @@ pub mod cancel;
 pub mod cartographer;
 pub mod channel;
 pub mod chat_client;
+pub mod ci_watch;
 pub mod config;
 pub mod entity_uri;
 pub mod env_view;

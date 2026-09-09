@@ -123,6 +123,39 @@ pub struct PullRequestBaseState {
     pub updated_at_ms: i64,
 }
 
+/// A blocker a forge reports against a PR/MR ever landing on its base branch
+/// (RAL-375): a failed required check, or the forge's own merge-conflict
+/// verdict. Deliberately not narrower ("did CI pass") -- `crate::ci_watch`
+/// polls for anything that would stop this PR from merging or rebasing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrFailure {
+    /// Human-readable description of what's blocking, e.g. "check 'build'
+    /// failed" or "merge conflicts with the base branch".
+    pub reason: String,
+    /// A human-clickable URL for the failing job/check, when the forge gave
+    /// one -- `None` for a conflict verdict, which has no job to point at.
+    pub job_url: Option<String>,
+    /// Best-effort raw failure text pulled from the forge (a failed
+    /// check-run's `output.text`/`output.summary` on GitHub, a failed job's
+    /// trace on GitLab) -- `None` when the forge has none to offer. Full,
+    /// untrimmed text; trimming to a mailbox-safe excerpt is
+    /// `crate::ci_watch::trim_log_excerpt`'s job, not this layer's.
+    pub log_text: Option<String>,
+}
+
+/// The live outcome of polling a PR/MR's CI + mergeability (RAL-375, see
+/// [`ForgeClient::check_pr_ci_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrCiState {
+    /// No terminal signal yet -- checks still running, or the forge hasn't
+    /// reported a mergeability verdict yet. Keep polling.
+    Pending,
+    /// Every required check passed and the forge reports no merge blocker.
+    Passing,
+    /// Something would block this PR from merging or rebasing onto its base.
+    Failing(PrFailure),
+}
+
 /// A created pull/merge request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPr {
@@ -490,6 +523,229 @@ impl ForgeClient {
             base,
             updated_at_ms,
         })
+    }
+
+    /// Poll a PR/MR's live CI + mergeability status (RAL-375): the full set
+    /// of merge/rebase blockers the forge surfaces, not narrowly "did CI
+    /// pass" -- a failed required check-run/pipeline job, or a forge-verdict
+    /// merge conflict, both come back as [`PrCiState::Failing`]. Logs the
+    /// outbound call (start/done/error) via `rlog!`.
+    pub fn check_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] check pr ci status start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.check_pr_ci_status_inner(number);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(state) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] check pr ci status done kind={} repo={} number={number} state={state:?}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] check pr ci status failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, String> {
+        match self.kind {
+            ForgeKind::GitHub => self.check_github_pr_ci_status(number),
+            ForgeKind::GitLab => self.check_gitlab_pr_ci_status(number),
+        }
+    }
+
+    /// GitHub half of [`Self::check_pr_ci_status`]: `mergeable_state` for the
+    /// conflict verdict (`"dirty"` -- GitHub's own term for "has conflicts"),
+    /// then the head commit's check-runs for CI. `"blocked"`/`"behind"`/
+    /// `"unknown"` are treated as pending rather than failing -- they mean
+    /// GitHub hasn't finished computing mergeability yet (`"unknown"`) or a
+    /// branch-protection rule wants something other than a check result
+    /// (`"blocked"`/`"behind"`), neither of which this poll can act on
+    /// itself; a genuinely failing required check still surfaces via the
+    /// check-runs scan below regardless of `mergeable_state`.
+    fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        let token = self.require_token()?;
+        let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+        let pr = get(ureq::get(&pr_url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json"))?;
+        if pr["mergeable_state"].as_str() == Some("dirty") {
+            return Ok(PrCiState::Failing(PrFailure {
+                reason: "merge conflicts with the base branch".to_string(),
+                job_url: None,
+                log_text: None,
+            }));
+        }
+        let Some(sha) = pr["head"]["sha"].as_str() else {
+            return Ok(PrCiState::Pending);
+        };
+
+        let checks_url = format!(
+            "{}/repos/{}/commits/{sha}/check-runs",
+            self.api_base, self.repo_path
+        );
+        let checks = get(ureq::get(&checks_url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json"))?;
+        let runs = checks["check_runs"].as_array().cloned().unwrap_or_default();
+        for run in &runs {
+            let conclusion = run["conclusion"].as_str().unwrap_or_default();
+            if matches!(
+                conclusion,
+                "failure" | "timed_out" | "cancelled" | "action_required"
+            ) {
+                let name = run["name"].as_str().unwrap_or("check");
+                let job_url = run["details_url"]
+                    .as_str()
+                    .or_else(|| run["html_url"].as_str())
+                    .map(str::to_string);
+                let log_text = run["output"]["text"]
+                    .as_str()
+                    .or_else(|| run["output"]["summary"].as_str())
+                    .map(str::to_string);
+                return Ok(PrCiState::Failing(PrFailure {
+                    reason: format!("check '{name}' failed"),
+                    job_url,
+                    log_text,
+                }));
+            }
+        }
+        if runs
+            .iter()
+            .any(|r| r["status"].as_str() != Some("completed"))
+        {
+            return Ok(PrCiState::Pending);
+        }
+
+        let status_url = format!(
+            "{}/repos/{}/commits/{sha}/status",
+            self.api_base, self.repo_path
+        );
+        let status = get(ureq::get(&status_url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json"))?;
+        if matches!(status["state"].as_str(), Some("failure") | Some("error")) {
+            let failing_context = status["statuses"].as_array().and_then(|s| {
+                s.iter()
+                    .find(|c| matches!(c["state"].as_str(), Some("failure") | Some("error")))
+            });
+            let reason = failing_context
+                .and_then(|c| c["context"].as_str())
+                .map_or_else(
+                    || "a required status check failed".to_string(),
+                    |c| format!("status '{c}' failed"),
+                );
+            let job_url = failing_context
+                .and_then(|c| c["target_url"].as_str())
+                .map(str::to_string);
+            return Ok(PrCiState::Failing(PrFailure {
+                reason,
+                job_url,
+                log_text: None,
+            }));
+        }
+        if status["state"].as_str() == Some("pending") {
+            return Ok(PrCiState::Pending);
+        }
+
+        Ok(PrCiState::Passing)
+    }
+
+    /// GitLab half of [`Self::check_pr_ci_status`]: `merge_status` for the
+    /// conflict verdict, then the MR's pipeline + (on failure) that
+    /// pipeline's failed job trace for CI. GitLab reports `merge_status` as
+    /// `"cannot_be_merged"` for a real conflict; other non-`"can_be_merged"`
+    /// values (`"unchecked"`, `"checking"`) mean GitLab hasn't finished
+    /// computing it yet, so they're treated as pending, not failing.
+    fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        let token = self.require_token()?;
+        let mr_url = format!(
+            "{}/projects/{}/merge_requests/{number}",
+            self.api_base, self.repo_path
+        );
+        let mr = get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
+        if mr["merge_status"].as_str() == Some("cannot_be_merged") {
+            return Ok(PrCiState::Failing(PrFailure {
+                reason: "merge conflicts with the target branch".to_string(),
+                job_url: None,
+                log_text: None,
+            }));
+        }
+
+        let Some(pipeline_status) = mr["pipeline"]["status"].as_str() else {
+            // No pipeline has run against this MR yet.
+            return Ok(PrCiState::Pending);
+        };
+        match pipeline_status {
+            "success" => Ok(PrCiState::Passing),
+            "failed" => {
+                let Some(pipeline_id) = mr["pipeline"]["id"].as_i64() else {
+                    return Ok(PrCiState::Failing(PrFailure {
+                        reason: "pipeline failed".to_string(),
+                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                        log_text: None,
+                    }));
+                };
+                let jobs_url = format!(
+                    "{}/projects/{}/pipelines/{pipeline_id}/jobs?scope[]=failed",
+                    self.api_base, self.repo_path
+                );
+                let jobs = get(ureq::get(&jobs_url).set("PRIVATE-TOKEN", token))
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                let Some(job) = jobs.first() else {
+                    return Ok(PrCiState::Failing(PrFailure {
+                        reason: "pipeline failed".to_string(),
+                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                        log_text: None,
+                    }));
+                };
+                let job_name = job["name"].as_str().unwrap_or("job");
+                let job_id = job["id"].as_i64();
+                let job_url = job["web_url"].as_str().map(str::to_string);
+                let log_text = job_id.and_then(|id| self.gitlab_job_trace(id, token).ok());
+                Ok(PrCiState::Failing(PrFailure {
+                    reason: format!("job '{job_name}' failed"),
+                    job_url,
+                    log_text,
+                }))
+            }
+            "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
+                reason: format!("pipeline {pipeline_status}"),
+                job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                log_text: None,
+            })),
+            // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
+            _ => Ok(PrCiState::Pending),
+        }
+    }
+
+    /// Raw text of a GitLab job's trace log (`GET .../jobs/{id}/trace`) --
+    /// unlike every other GitLab call in this file, the response body is
+    /// plain text, not JSON, so this bypasses [`get`]/[`parse_body`].
+    fn gitlab_job_trace(&self, job_id: i64, token: &str) -> Result<String, String> {
+        let url = format!(
+            "{}/projects/{}/jobs/{job_id}/trace",
+            self.api_base, self.repo_path
+        );
+        ureq::get(&url)
+            .set("PRIVATE-TOKEN", token)
+            .call()
+            .map_err(describe_error)?
+            .into_string()
+            .map_err(|e| format!("forge API read: {e}"))
     }
 
     /// Retarget an already-open PR/MR's base/target branch (RAL-190: keeps a
@@ -2877,5 +3133,259 @@ mod tests {
              before origin"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_conflict_before_any_check_call() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"mergeable_state": "dirty"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            // A conflict verdict is terminal -- no check-runs call should follow.
+            assert!(
+                server
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.check_pr_ci_status(4).unwrap();
+        assert_eq!(
+            state,
+            PrCiState::Failing(PrFailure {
+                reason: "merge conflicts with the base branch".to_string(),
+                job_url: None,
+                log_text: None,
+            })
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_a_failing_github_check_run() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure", "details_url": "https://ci.example/job/1", "output": {"text": "error: build failed\nsee above"}}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.check_pr_ci_status(4).unwrap();
+        assert_eq!(
+            state,
+            PrCiState::Failing(PrFailure {
+                reason: "check 'build' failed".to_string(),
+                job_url: Some("https://ci.example/job/1".to_string()),
+                log_text: Some("error: build failed\nsee above".to_string()),
+            })
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_pending_while_a_check_is_still_running() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "unknown", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "in_progress", "conclusion": null}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_passing_when_everything_is_green() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_gitlab_conflict_before_any_pipeline_call() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"merge_status": "cannot_be_merged"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.check_pr_ci_status(9).unwrap();
+        assert_eq!(
+            state,
+            PrCiState::Failing(PrFailure {
+                reason: "merge conflicts with the target branch".to_string(),
+                job_url: None,
+                log_text: None,
+            })
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_a_failing_gitlab_pipeline_job_with_its_trace() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "pipeline": {"id": 55, "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed"
+            );
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id": 77, "name": "test", "web_url": "https://gitlab.example/jobs/77"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/jobs/77/trace");
+            req.respond(
+                tiny_http::Response::from_string("FAIL: assertion failed\n").with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.check_pr_ci_status(9).unwrap();
+        assert_eq!(
+            state,
+            PrCiState::Failing(PrFailure {
+                reason: "job 'test' failed".to_string(),
+                job_url: Some("https://gitlab.example/jobs/77".to_string()),
+                log_text: Some("FAIL: assertion failed\n".to_string()),
+            })
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_gitlab_pending_with_no_pipeline_yet() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"merge_status": "unchecked"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
     }
 }

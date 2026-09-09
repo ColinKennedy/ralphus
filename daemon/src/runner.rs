@@ -4109,7 +4109,14 @@ prompt = "make it build"
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let _cleanup_session = crate::tmux::KillSessionOnDrop(session_name.clone());
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            // Registration can take longer than a fixed sleep when the full
+            // suite has many tmux subprocesses competing for CPU. Cancelling
+            // before registration is intentionally a no-op, which would leave
+            // this hanging runner alive indefinitely.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !detachments.is_active(&session_name) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             detachments.cancel(&session_name);
         });
         let result = runner.run_cancellable(&spec, &CancelToken::never());

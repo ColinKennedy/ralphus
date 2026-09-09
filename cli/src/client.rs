@@ -657,9 +657,24 @@ impl DaemonClient {
         unread_only: bool,
         priority: Option<&str>,
     ) -> Result<Value, DaemonError> {
+        self.mailbox_messages_filtered(client_id, unread_only, priority, None)
+    }
+
+    /// Full form of [`Self::mailbox_messages`] that also restricts to one
+    /// `category` (RAL-375), e.g. `"review"` -- what `ralphus mailbox check
+    /// --category review` (QuickStart Reviewer's default) sends. `None`
+    /// behaves exactly like [`Self::mailbox_messages`].
+    pub fn mailbox_messages_filtered(
+        &self,
+        client_id: &str,
+        unread_only: bool,
+        priority: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<Value, DaemonError> {
         let qs = query_string(&[
             ("unread", unread_only.then(|| "true".to_string())),
             ("priority", priority.map(str::to_string)),
+            ("category", category.map(str::to_string)),
         ]);
         self.get(&format!("/api/mailbox/{client_id}/messages{qs}"))
     }

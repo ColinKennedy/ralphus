@@ -9,9 +9,14 @@ use super::{ExecResult, usage};
 pub fn execute(cmd: MailboxCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
         MailboxCommand::UsageError(_) => Err(usage("no such tool")),
-        MailboxCommand::Check { priority } => {
+        MailboxCommand::Check { priority, category } => {
             let client_id = mailbox::ensure_client_id(client)?;
-            let messages = client.mailbox_messages(&client_id, true, priority.as_deref())?;
+            let messages = client.mailbox_messages_filtered(
+                &client_id,
+                true,
+                priority.as_deref(),
+                category.as_deref(),
+            )?;
             let ids = mailbox::message_ids(&messages);
             let drained = if ids.is_empty() {
                 0
