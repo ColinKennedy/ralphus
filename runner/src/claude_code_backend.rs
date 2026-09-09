@@ -14,7 +14,7 @@ use crate::backend::{
     BACKGROUND_JOB_NUDGE_PROMPT, BackendError, BackendOutcome, ModelBackend, RunOptions,
 };
 use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
-use crate::shellcmd::{self, Env, SpawnArgs};
+use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
 /// How often [`spawn_stdin_closer`]'s thread polls for the visible turn's
@@ -283,34 +283,17 @@ fn spawn(
     if compound {
         let shell = shellcmd::resolve_shell(None);
         let _ = shellcmd::detect_parent_shell(&Env::from_process()); // documents intent; resolve_shell already covers detection
-        let line = shellcmd::build_compound_command_line(&shell, program, args);
-        match shellcmd::shell_spawn_args(&shell, &line) {
-            SpawnArgs::RawShellLine(raw) => {
-                let mut cmd = Command::new("cmd");
-                cmd.arg("/C")
-                    .arg(raw)
-                    .current_dir(workspace.root())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                apply_auto_compact_env(&mut cmd, auto_compact_threshold);
-                apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
-                apply_claude_config_dir_env(&mut cmd, claude_config_dir);
-                cmd.spawn()
-            }
-            SpawnArgs::Argv(argv) => {
-                let mut cmd = Command::new(&argv[0]);
-                cmd.args(&argv[1..]);
-                cmd.current_dir(workspace.root())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                apply_auto_compact_env(&mut cmd, auto_compact_threshold);
-                apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
-                apply_claude_config_dir_env(&mut cmd, claude_config_dir);
-                cmd.spawn()
-            }
-        }
+        let line = crate::cli_agent_common::shell_command_line(&shell, program, args);
+        let mut cmd =
+            shellcmd::command_for_spawn_args(shellcmd::shell_spawn_args(&shell, &line), args)?;
+        cmd.current_dir(workspace.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_auto_compact_env(&mut cmd, auto_compact_threshold);
+        apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
+        apply_claude_config_dir_env(&mut cmd, claude_config_dir);
+        cmd.spawn()
     } else {
         let mut cmd = Command::new(program);
         cmd.args(args)

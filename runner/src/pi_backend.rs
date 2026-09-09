@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
 use crate::cli_agent_common::{live_session_path, write_live_session_id};
-use crate::shellcmd::{self, Env, SpawnArgs};
+use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "pi";
@@ -133,10 +133,21 @@ impl ModelBackend for PiBackend {
         let program = self.launch_program();
         let compound = crate::cli_agent_common::launcher_requires_shell(&program);
 
+        // A shell-routed launcher (npm's `pi.cmd` shim included) cannot carry
+        // a multiline argument, so hand the system prompt over as a file --
+        // the same trade claude-code makes for the same reason.
+        let system_prompt_file = match options.append_system_prompt {
+            Some(sp) if compound => Some(
+                crate::cli_agent_common::write_prompt_file(sp)
+                    .map_err(|e| BackendError(e.to_string()))?,
+            ),
+            _ => None,
+        };
+
         // Always send the cell's own prompt, even on resume -- matches
         // claude-code/codex (RAL-248 AC3): cross-cell session sharing needs
         // the new cell's task text, not a generic "continue".
-        let args = build_args(prompt, options);
+        let args = build_args(options, system_prompt_file.as_deref());
 
         let mut child = spawn(
             &program,
@@ -146,6 +157,18 @@ impl ModelBackend for PiBackend {
             isolated_dir.as_deref(),
         )
         .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
+
+        // Written on its own thread for the same reason as Codex's: writing
+        // then closing stdin inline could deadlock against Pi filling its own
+        // stdout/stderr pipes before it starts reading. Dropping the handle at
+        // the end of the closure closes stdin, which is what ends Pi's
+        // `readPipedStdin`.
+        if let Some(mut stdin) = child.stdin.take() {
+            let prompt = prompt.to_string();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+            });
+        }
 
         print_header(options.model, workspace);
         let thrash_thresholds = crate::thrash::ThrashThresholds {
@@ -439,7 +462,18 @@ fn write_json_object(
         .map_err(|e| BackendError(format!("pi: could not write {}: {e}", path.display())))
 }
 
-fn build_args(prompt: &str, options: &RunOptions<'_>) -> Vec<String> {
+/// Pi's own argv, with the two potentially-multiline values kept out of it.
+///
+/// The prompt is not an argument at all -- it is piped to stdin, which Pi
+/// folds into the initial message (its `buildInitialMessage` puts piped stdin
+/// content first). `--append-system-prompt` stays an argument but carries a
+/// *path* when the launcher is shell-routed: Pi resolves that value as a file
+/// when one exists at it, and falls back to treating it as literal text.
+///
+/// Both matter because Windows resolves `pi` to npm's `pi.cmd` shim, and a
+/// batch launcher cannot carry a newline in any argument -- cmd truncates the
+/// line at it, silently dropping everything after (RAL-385).
+fn build_args(options: &RunOptions<'_>, system_prompt_file: Option<&Path>) -> Vec<String> {
     let mut args = vec![
         "--mode".to_string(),
         "json".to_string(),
@@ -453,12 +487,16 @@ fn build_args(prompt: &str, options: &RunOptions<'_>) -> Vec<String> {
         args.push("--model".to_string());
         args.push(model.to_string());
     }
-    if let Some(sp) = options.append_system_prompt {
+    if let Some(path) = system_prompt_file {
+        args.push("--append-system-prompt".to_string());
+        args.push(path.display().to_string());
+    } else if let Some(sp) = options.append_system_prompt {
         args.push("--append-system-prompt".to_string());
         args.push(sp.to_string());
     }
+    // Bare flag: Pi's `-p`/`--print` takes no value. The prompt arrives on
+    // stdin instead.
     args.push("-p".to_string());
-    args.push(prompt.to_string());
     args
 }
 
@@ -484,32 +522,20 @@ fn spawn(
             shellcmd::resolve_shell(None)
         };
         let _ = shellcmd::detect_parent_shell(&Env::from_process());
-        let line = shellcmd::build_compound_command_line(&shell, program, args);
-        match shellcmd::shell_spawn_args(&shell, &line) {
-            SpawnArgs::RawShellLine(raw) => {
-                let mut cmd = Command::new("cmd");
-                cmd.arg("/C")
-                    .arg(raw)
-                    .current_dir(workspace.root())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
-                cmd.spawn()
-            }
-            SpawnArgs::Argv(argv) => {
-                let mut cmd = Command::new(&argv[0]);
-                cmd.args(&argv[1..]);
-                cmd.current_dir(workspace.root())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
-                cmd.spawn()
-            }
-        }
+        let line = crate::cli_agent_common::shell_command_line(&shell, program, args);
+        let mut cmd =
+            shellcmd::command_for_spawn_args(shellcmd::shell_spawn_args(&shell, &line), args)?;
+        cmd.current_dir(workspace.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
+        cmd.spawn()
     } else {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(workspace.root())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
@@ -882,13 +908,13 @@ mod tests {
     #[test]
     fn build_args_includes_resume_model_and_system_prompt() {
         let args = build_args(
-            "do the work",
             &RunOptions {
                 model: Some("openrouter/deepseek"),
                 append_system_prompt: Some("be terse"),
                 resume_agent_session_id: Some("sess-123"),
                 ..Default::default()
             },
+            None,
         );
         assert!(args.windows(2).any(|w| w == ["--session", "sess-123"]));
         assert!(
@@ -902,7 +928,35 @@ mod tests {
         assert_eq!(args[0], "--mode");
         assert!(args.contains(&"--approve".to_string()));
         assert!(args.contains(&"-p".to_string()));
-        assert_eq!(args.last().map(String::as_str), Some("do the work"));
+    }
+
+    /// RAL-385: the prompt is piped to stdin, never passed as an argument --
+    /// npm's `pi.cmd` shim cannot carry a multiline argv token.
+    #[test]
+    fn build_args_never_carries_the_prompt() {
+        let args = build_args(&RunOptions::default(), None);
+        assert_eq!(args.last().map(String::as_str), Some("-p"));
+        assert!(!args.iter().any(|a| a.contains('\n')));
+    }
+
+    /// RAL-385: a shell-routed launcher gets the system prompt as a file path,
+    /// so no argument carries the multiline text itself.
+    #[test]
+    fn build_args_passes_system_prompt_as_a_file_when_given_one() {
+        let path = Path::new("C:/state/task_prompts/abc123.md");
+        let args = build_args(
+            &RunOptions {
+                append_system_prompt: Some("line one\n\nline two"),
+                ..Default::default()
+            },
+            Some(path),
+        );
+        let value = path.display().to_string();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--append-system-prompt" && w[1] == value)
+        );
+        assert!(!args.iter().any(|a| a.contains('\n')));
     }
 
     #[test]
