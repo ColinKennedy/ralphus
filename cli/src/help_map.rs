@@ -1993,7 +1993,32 @@ pub fn command_help(path: &[&str]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-fn chip_description(chip: &str, option: bool) -> String {
+/// The `selector [str]` chip's grammar, spelled out with concrete examples
+/// (RAL-376) -- both the legacy path form (`cli/src/selector.rs`'s
+/// `parse_squad_selector`) and the RAL-188 URI form
+/// (`core/src/uri.rs`) resolve to the same squad/task/cell/proof
+/// coordinates.
+const SELECTOR_GRAMMAR: &str = "e.g. squad-000000000001/build/0 (squad/task/cell path) or \
+squad-000000000001/build/proof/0 (proof path); also accepts the RAL-188 URI form, e.g. \
+ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000001";
+
+/// The `entity_uri [str]` chip's grammar, mirrored from
+/// `daemon/src/entity_uri.rs`/`cli/src/entity_uri.rs`'s `EntityUri` (RAL-155)
+/// -- kept in sync with that grammar by hand since it has no shared constant
+/// of its own to import here.
+const ENTITY_URI_GRAMMAR: &str = "a colon-separated entity URI: squad:<squad_id>, \
+task:<squad_id>:<task_idx>, cell:<squad_id>:<task_idx>:<cell_idx>, \
+proof:<squad_id>:<task_idx>:<task|cell>:<cell_idx>:<proof_idx> (cell_idx is -1 for a \
+task-scope proof), or guardian:<guardian_id>, e.g. task:squad-000000000001:0 or \
+proof:squad-000000000001:0:cell:0:1";
+
+/// Free-text description of one chip's grammar, keyed by its bare name --
+/// used by [`command_help`] to build `ralphus <cmd> --help`'s
+/// `ARGUMENTS:`/`OPTIONS:` sections, and by `ralphus-mcp`'s tool-schema
+/// generation (`mcp/src/tools.rs::chip_schema`) so the same grammar/example
+/// text shows up in an MCP tool's JSON-Schema `description`, per RAL-376.
+#[must_use]
+pub fn chip_description(chip: &str, option: bool) -> String {
     let name = chip.split_whitespace().next().unwrap_or(chip);
     let key = name.trim_start_matches('-').replace('-', " ");
     if option {
@@ -2004,13 +2029,30 @@ fn chip_description(chip: &str, option: bool) -> String {
             "--command" => "Override the agent harness command for this launch.".to_string(),
             "--shell" => "Shell used to interpret the command override.".to_string(),
             "--read-only" => "Launch the agent with read-only restrictions.".to_string(),
+            "--squad" => "Filter to this exact squad id, e.g. squad-000000000001.".to_string(),
+            "--guardian" => {
+                "Filter to this exact guardian (review) id, e.g. guardian-000000000001.".to_string()
+            }
+            "--entity" => format!("Filter to this exact entity URI: {ENTITY_URI_GRAMMAR}."),
+            "--for" => format!(
+                "Resolve this squad/task/cell/proof selector and filter to its entity URI, \
+                 {SELECTOR_GRAMMAR}."
+            ),
             _ if chip.contains('[') => format!("Set the {key} value using the shown value type."),
             _ => format!("Enable {key}."),
         }
     } else {
         match name {
-            "selector" => "Entity selector or URI identifying the target.".to_string(),
-            "squad_id" => "Squad identifier or accepted squad selector.".to_string(),
+            "selector" => {
+                format!("Entity selector or URI identifying the target, {SELECTOR_GRAMMAR}.")
+            }
+            "squad_id" => {
+                "Squad identifier or accepted squad selector, e.g. squad-000000000001.".to_string()
+            }
+            "entity_uri" => {
+                format!("Entity URI addressing any node uniformly: {ENTITY_URI_GRAMMAR}.")
+            }
+            "pr_id" => "Pull request identifier, e.g. pr-000000000001.".to_string(),
             "target" => "Optional review target supplied to the launched reviewer.".to_string(),
             "file" => "Input file path; repeat where the usage permits it.".to_string(),
             "field" => "Optional dotted field path to extract from the entity JSON.".to_string(),
