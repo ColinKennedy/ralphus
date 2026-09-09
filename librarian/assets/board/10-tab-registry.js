@@ -465,14 +465,14 @@
       /** @type {{id:string,user_name:string,entity_uri:string,notify_tiers:string[],created_at_ms:number}[]} the acting user's own watches (RAL-362 §5), refreshed once per tick alongside `hiddenSquadIds`/`hiddenGuardianIds`. */
       let taskTabWatches = [];
       /**
-       * `task:<squadId>:<taskIdx>` entity URIs the user has explicitly
-       * un-starred despite being covered by a squad-level watch (RAL-362 §5
-       * "Un-watching such a task needs an explicit mechanism"). There is no
-       * server-side representation for "exception to a watch cascade", so
-       * this is tracked as a client-side muted set, persisted to
-       * `localStorage` per acting user -- a deliberately lightweight stand-in
-       * for a real negative-watch record, since the daemon's watches table
-       * has no notion of one.
+       * `task:<squadId>:<taskIdx>` and `cell:<squadId>:<taskIdx>:<cellIdx>`
+       * entity URIs the user has explicitly un-starred despite being covered
+       * by a squad- or task-level watch (RAL-362 §5 "Un-watching such a task
+       * needs an explicit mechanism"). There is no server-side representation
+       * for "exception to a watch cascade", so this is tracked as a
+       * client-side muted set, persisted to `localStorage` per acting user --
+       * a deliberately lightweight stand-in for a real negative-watch record,
+       * since the daemon's watches table has no notion of one.
        * @type {Set<string>}
        */
       let taskTabMutedTasks = new Set();
@@ -539,7 +539,7 @@
        */
       function saveTaskTabTimeMode() { localStorage.setItem(TT_LS.timeMode, taskTabTimeMode); }
       /**
-       * Persists the current muted-task set (RAL-362 §5/§7).
+       * Persists the current muted task/cell set (RAL-362 §5/§7).
        * @returns {void}
        */
       function saveTaskTabMuted() { localStorage.setItem(TT_LS.muted, JSON.stringify([...taskTabMutedTasks])); }
@@ -759,6 +759,15 @@
        */
       function ttSquadEntityUri(squadId) { return `squad:${squadId}`; }
       /**
+       * The cell-level entity URI a cell watch is filed under, matching
+       * `crate::entity_uri::EntityUri`'s `Display` grammar.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @param {number} cellIdx
+       * @returns {string}
+       */
+      function ttCellEntityUri(squadId, taskIdx, cellIdx) { return `cell:${squadId}:${taskIdx}:${cellIdx}`; }
+      /**
        * Resolves a task's effective watch state against the user's raw watch
        * list: explicit beats inherited, and an inherited (squad-level) watch
        * is suppressed by an explicit local mute (RAL-362 §5 -- "un-watching a
@@ -776,6 +785,26 @@
         const squadUri = ttSquadEntityUri(squadId);
         const inherited = watches.some((w) => w.entity_uri === squadUri) && !mutedUris.has(taskUri);
         return { watched: inherited, inherited };
+      }
+      /**
+       * Resolves a cell's effective watch state, layering its own
+       * explicit watch/mute on top of its owning task's effective watch
+       * (itself possibly inherited from the squad) -- same explicit-beats-
+       * inherited, mute-suppresses-inherited rules as {@link ttEffectiveWatch},
+       * one level down.
+       * @param {{entity_uri:string}[]} watches
+       * @param {Set<string>} mutedUris
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @param {number} cellIdx
+       * @returns {{watched: boolean, inherited: boolean}}
+       */
+      function ttEffectiveCellWatch(watches, mutedUris, squadId, taskIdx, cellIdx) {
+        const cellUri = ttCellEntityUri(squadId, taskIdx, cellIdx);
+        if (watches.some((w) => w.entity_uri === cellUri)) return { watched: true, inherited: false };
+        if (mutedUris.has(cellUri)) return { watched: false, inherited: false };
+        const taskWatch = ttEffectiveWatch(watches, mutedUris, squadId, taskIdx);
+        return { watched: taskWatch.watched, inherited: taskWatch.watched };
       }
       /**
        * RAL-362 §5: maps each "needs me" trigger condition to the

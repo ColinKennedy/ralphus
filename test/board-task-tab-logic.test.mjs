@@ -24,7 +24,9 @@ const {
   ttPickTaskPr,
   ttTaskEntityUri,
   ttSquadEntityUri,
+  ttCellEntityUri,
   ttEffectiveWatch,
+  ttEffectiveCellWatch,
   ttTierAllows,
   ttTaskNeedsMe,
   ttCompareRows,
@@ -182,6 +184,47 @@ test("ttEffectiveWatch reports not watched when there's no explicit or squad-lev
 test("ttTaskEntityUri/ttSquadEntityUri match the daemon's EntityUri::Display grammar", () => {
   assert.equal(ttTaskEntityUri("s1", 2), "task:s1:2");
   assert.equal(ttSquadEntityUri("s1"), "squad:s1");
+});
+
+test("ttCellEntityUri matches the daemon's EntityUri::Display grammar", () => {
+  assert.equal(ttCellEntityUri("s1", 2, 1), "cell:s1:2:1");
+});
+
+test("ttEffectiveCellWatch reports an explicit cell watch as watched and not inherited, even with no parent watch", () => {
+  const watches = [{ entity_uri: "cell:s1:0:1" }];
+  const w = ttEffectiveCellWatch(watches, new Set(), "s1", 0, 1);
+  assert.deepEqual(w, { watched: true, inherited: false });
+});
+
+test("ttEffectiveCellWatch inherits from an explicit task watch", () => {
+  const watches = [{ entity_uri: "task:s1:0" }];
+  const w = ttEffectiveCellWatch(watches, new Set(), "s1", 0, 1);
+  assert.deepEqual(w, { watched: true, inherited: true });
+});
+
+test("ttEffectiveCellWatch inherits from a squad watch two levels up", () => {
+  const watches = [{ entity_uri: "squad:s1" }];
+  const w = ttEffectiveCellWatch(watches, new Set(), "s1", 0, 1);
+  assert.deepEqual(w, { watched: true, inherited: true });
+});
+
+test("ttEffectiveCellWatch is suppressed once the cell is explicitly muted, regardless of the parent watch source", () => {
+  const watches = [{ entity_uri: "task:s1:0" }];
+  const muted = new Set([ttCellEntityUri("s1", 0, 1)]);
+  const w = ttEffectiveCellWatch(watches, muted, "s1", 0, 1);
+  assert.deepEqual(w, { watched: false, inherited: false });
+});
+
+test("ttEffectiveCellWatch follows the task's own mute of a squad-level watch", () => {
+  const watches = [{ entity_uri: "squad:s1" }];
+  const muted = new Set([ttTaskEntityUri("s1", 0)]);
+  const w = ttEffectiveCellWatch(watches, muted, "s1", 0, 1);
+  assert.deepEqual(w, { watched: false, inherited: false });
+});
+
+test("ttEffectiveCellWatch reports not watched when nothing above it is watched", () => {
+  const w = ttEffectiveCellWatch([], new Set(), "s1", 0, 1);
+  assert.deepEqual(w, { watched: false, inherited: false });
 });
 
 // ---------- needs-me predicate ----------

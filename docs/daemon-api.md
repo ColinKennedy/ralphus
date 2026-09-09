@@ -3008,12 +3008,15 @@ a peek box:
 ### Personal watches and notification preferences (RAL-320)
 
 A *watch* is one row binding the acting user to an [entity URI](#entity-uris-ral-155)
-(squad/task/cell/proof/review/review-worktree) plus the mailbox priority
-tiers (`urgent`/`high`/`normal`) that watch cares about. Watching a parent
-entity cascades: its notifications also cover every entity nested under it
-(watching a squad covers its tasks, cells, and proof steps). All five
-endpoints below require an acting user, resolved from `?user=<name>` or
-`.ralphus.toml`'s `default_user`; `400 bad_request` if neither is set.
+-- `squad`, `task`, `cell`, or `guardian` (review); a `proof` entity URI is
+not watchable on its own, since its parent task/cell already covers it --
+plus the mailbox priority tiers (`urgent`/`high`/`normal`) that watch cares
+about. Watching a parent entity cascades: its notifications also cover every
+entity nested under it (watching a squad covers its tasks, cells, and proof
+steps; watching a task covers its cells and their proof steps; watching a
+cell covers its own cell-scope proof steps). All five endpoints below
+require an acting user, resolved from `?user=<name>` or `.ralphus.toml`'s
+`default_user`; `400 bad_request` if neither is set.
 
 #### `GET /api/watches`
 Every watch the acting user owns.

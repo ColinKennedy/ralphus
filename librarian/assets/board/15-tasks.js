@@ -661,6 +661,34 @@
         renderTasksTab();
       }
       /**
+       * Watches/unwatches/mutes a cell's star, one level down from {@link ttToggleWatch}: explicit watch/unwatch round-trips through `/api/watches`; clicking a watch inherited from the cell's owning task (itself possibly inherited from the squad) is a client-only mute/unmute, same as a task inheriting from its squad.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @param {number} cellIdx
+       * @returns {Promise<void>}
+       */
+      async function ttToggleCellWatch(squadId, taskIdx, cellIdx) {
+        const uri = ttCellEntityUri(squadId, taskIdx, cellIdx);
+        const hasExplicit = taskTabWatches.some((w) => w.entity_uri === uri);
+        const hasParentWatch = ttEffectiveWatch(taskTabWatches, taskTabMutedTasks, squadId, taskIdx).watched;
+        const isMuted = taskTabMutedTasks.has(uri);
+        if (hasParentWatch && isMuted) { taskTabMutedTasks.delete(uri); saveTaskTabMuted(); renderTasksTab(); return; }
+        if (hasParentWatch && !isMuted) { taskTabMutedTasks.add(uri); saveTaskTabMuted(); renderTasksTab(); return; }
+        const qs = currentUserName ? `?user=${encodeURIComponent(currentUserName)}` : "";
+        if (hasExplicit) {
+          let resp;
+          try { resp = await del(`/api/watches/${encodeURIComponent(uri)}${qs}`); } catch (e) { alert("daemon unreachable"); return; }
+          if (!resp.ok) { alert(await responseError(resp, "unwatch failed")); return; }
+          taskTabWatches = taskTabWatches.filter((w) => w.entity_uri !== uri);
+        } else {
+          let resp;
+          try { resp = await post(`/api/watches${qs}`, { entity_uri: uri }); } catch (e) { alert("daemon unreachable"); return; }
+          if (!resp.ok) { alert(await responseError(resp, "watch failed")); return; }
+          taskTabWatches.push(await resp.json());
+        }
+        renderTasksTab();
+      }
+      /**
        * Selects a task for the details pane and re-renders.
        * @param {string} squadId
        * @param {number} taskIdx
@@ -799,7 +827,17 @@
         }).join("");
         html += `<h4 style="margin:14px 0 6px">Cells</h4>`;
         if (!row.cells.length) html += `<div class="empty" style="padding:6px 0">No cells.</div>`;
-        else html += row.cells.map((c, ci) => `<div class="kv-row" style="cursor:pointer${cell === c ? ";color:var(--accent)" : ""}" onclick="ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${ci})">${sdot(c.state)}<span class="k">${esc(c.name || c.id)}</span><span class="v">${pill(c.state)}</span></div>`).join("");
+        else html += row.cells.map((c, ci) => {
+          const cw = ttEffectiveCellWatch(taskTabWatches, taskTabMutedTasks, row.squadId, row.taskIdx, ci);
+          const starCls = cw.watched ? `watched ${cw.inherited ? "inherited" : ""}` : "";
+          const starTip = !cw.watched
+            ? "Not watched. Click to watch this cell."
+            : cw.inherited
+              ? "Watched via this cell's task or squad. Click to mute this cell only — the parent watch stays in effect for its other cells."
+              : "Watching this cell. Click to unwatch.";
+          const star = `<span class="tt-star ${starCls}" onclick="event.stopPropagation();ttToggleCellWatch('${esc(row.squadId)}',${row.taskIdx},${ci})" data-tip="${esc(starTip)}">${cw.inherited ? "◆" : "★"}</span>`;
+          return `<div class="kv-row" style="cursor:pointer${cell === c ? ";color:var(--accent)" : ""}" onclick="ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${ci})">${sdot(c.state)}<span class="k">${esc(c.name || c.id)}</span>${star}<span class="v">${pill(c.state)}</span></div>`;
+        }).join("");
         if (cell) {
           html += `<h4 style="margin:14px 0 6px">${esc(cell.name || cell.id)}</h4>`;
           html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(cell.agent)}${cell.model ? " / " + esc(cell.model) : ""}</span></div>`;
