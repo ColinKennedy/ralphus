@@ -10872,6 +10872,9 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Err(crate::guardian_merge::StartMergeError::NotFound(message)) => {
             error(404, "not_found", &message, vec![])
         }
+        Err(crate::guardian_merge::StartMergeError::Preflight(message)) => {
+            error(409, "pr_sync_failed", &message, vec![])
+        }
         Err(crate::guardian_merge::StartMergeError::NoBranches) => json(
             200,
             &ChangeBaseReply {

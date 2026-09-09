@@ -113,7 +113,7 @@
         try {
           const d = await (await fetch("/api/queue")).json();
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           /** @type {QueueItem[]} */
           const items = d.items || [];
           queueItems = items;
@@ -136,8 +136,7 @@
           updateQueueFooter();
           queueEnsureSelectionVisible();
         } catch (e) {
-          byId("conn").className = "dot off";
-          byId("updated").textContent = "daemon unreachable";
+          markUnreachable();
         }
       }
 

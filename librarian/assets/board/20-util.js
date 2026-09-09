@@ -22,6 +22,19 @@
        * @returns {string}
        */
       const cvar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n) || "var(--muted)";
+      /**
+       * Stamps the shared freshness indicator with the current time. Call from a
+       * poller's success path, once that poller's own data has landed.
+       * @returns {void}
+       */
+      const markUpdated = () => { byId("updated").textContent = "updated " + new Date().toLocaleTimeString(); };
+      /**
+       * Marks the board as unable to reach the daemon: clears the connection dot
+       * and replaces the freshness stamp, so a stale time is never left standing
+       * next to data that failed to load.
+       * @returns {void}
+       */
+      const markUnreachable = () => { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; };
 
       // ---- ralphus URI scheme (RAL-188) ----
       // One self-describing way to address any squad/task/cell/proof or

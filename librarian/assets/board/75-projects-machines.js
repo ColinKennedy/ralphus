@@ -7,10 +7,10 @@
         try {
           const d = await (await fetch("/api/resources")).json();
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           resources = d.resources || [];
           if (!userIsSelecting()) renderResources();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * @typedef {object} ResCol
@@ -115,12 +115,12 @@
         try {
           const d = await (await fetch("/api/machines")).json();
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           machines = (d.machines || []).slice().sort(
             (/** @type {MachineProviderView} */ a, /** @type {MachineProviderView} */ b) => a.scheme.localeCompare(b.scheme));
           machineBuiltins = d.builtin || [];
           renderMachines();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * Renders one registered provider's table row.
@@ -263,14 +263,14 @@ Work submitted against it will fail — fix the machine or deregister the provid
             candidatesResp.json(),
           ]);
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           triageTypes = (typesData.types || []).slice().sort(
             (/** @type {TriageTypeView} */ a, /** @type {TriageTypeView} */ b) => a.name.localeCompare(b.name));
           triagePools = poolsData.pools || [];
           triageSchedules = schedulesData.schedules || [];
           triageCandidates = candidatesData.candidates || [];
           renderTriage();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * Renders the Triage tab: the registered type registry, current pool
@@ -647,10 +647,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
         try {
           const d = await (await fetch("/api/users")).json();
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           users = (d.users || []).slice().sort((/** @type {UserView} */ a, /** @type {UserView} */ b) => a.name.localeCompare(b.name));
           if (userEditState === null) renderUsers();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * Enters inline edit mode for a user row.
@@ -861,10 +861,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
         try {
           const d = await (await fetch("/api/secret-env-names")).json();
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           secretEnvNames = (d.names || []).slice().sort((/** @type {SecretEnvNameView} */ a, /** @type {SecretEnvNameView} */ b) => a.name.localeCompare(b.name));
           renderSecretEnvNames();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * Renders one secret env-var name's table row.
@@ -1057,7 +1057,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             fetch("/api/guardians"),
           ]);
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           if (hiddenResp.ok) {
             const d = await hiddenResp.json();
             hiddenItems = d.hidden || [];
@@ -1075,7 +1075,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             hiddenGuardianNames = new Map((g || []).map((/** @type {GuardianView} */ x) => [x.id, x.name || x.id]));
           }
         } catch (e) {
-          byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable";
+          markUnreachable();
           hiddenError = "daemon unreachable";
         }
         renderPrefs();
@@ -1207,11 +1207,11 @@ Work submitted against it will fail — fix the machine or deregister the provid
         try {
           const d = await (await fetch("/api/projects")).json();
           byId("conn").className = "dot on";
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           projects = (d.projects || []).slice().sort((/** @type {ProjectView} */ a, /** @type {ProjectView} */ b) => a.name.localeCompare(b.name));
           if (!projectsValidated) { projectsValidated = true; await validateAllProjects(); }
           if (projectEditState === null) renderProjects();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * Forces the Projects tab to re-validate every row on the next poll.

@@ -3913,7 +3913,7 @@ impl Store {
     /// this guardian's `git_root` belong to" for fork resolution -- a
     /// guardian has no direct project foreign key, only a filesystem path.
     pub fn project_name_for_path(&self, path: &str) -> Option<String> {
-        let trimmed = path.trim_end_matches(['/', '\\']);
+        let trimmed = Self::normalize_for_project_lookup(path);
         let mut stmt = self.conn.prepare("SELECT name, path FROM projects").ok()?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -3921,11 +3921,11 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()
             .ok()?;
         for (name, proj_path) in rows {
-            let proj_path = proj_path.trim_end_matches(['/', '\\']);
+            let proj_path = Self::normalize_for_project_lookup(&proj_path);
             let matches = trimmed == proj_path
                 || trimmed
-                    .strip_prefix(proj_path)
-                    .map(|rest| rest.starts_with(['/', '\\']))
+                    .strip_prefix(&proj_path)
+                    .map(|rest| rest.starts_with('/'))
                     .unwrap_or(false);
             if matches {
                 return Some(name);
@@ -3940,7 +3940,7 @@ impl Store {
     /// it. `column` is always a fixed internal string literal, never
     /// caller/user-supplied, so interpolating it into the query is safe.
     fn project_bool_stamp(&self, path: &str, column: &str) -> Option<bool> {
-        let trimmed = path.trim_end_matches(['/', '\\']);
+        let trimmed = Self::normalize_for_project_lookup(path);
         let mut stmt = match self
             .conn
             .prepare(&format!("SELECT path, {column} FROM projects"))
@@ -3956,17 +3956,33 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()
             .ok()?;
         for (proj, stamp) in rows {
-            let proj = proj.trim_end_matches(['/', '\\']);
+            let proj = Self::normalize_for_project_lookup(&proj);
             let matches = trimmed == proj
                 || trimmed
-                    .strip_prefix(proj)
-                    .map(|rest| rest.starts_with(['/', '\\']))
+                    .strip_prefix(&proj)
+                    .map(|rest| rest.starts_with('/'))
                     .unwrap_or(false);
             if matches {
                 return stamp.map(|v| v != 0);
             }
         }
         None
+    }
+
+    /// Normalizes `path` the same way [`crate::triage::pool_key_for_path`]
+    /// does (RAL-318): canonicalized, verbatim-prefix stripped, forward-slash
+    /// separated, with any resulting trailing slash trimmed. Without this, a
+    /// guardian's git-reported `git_root` (forward-slashed, e.g.
+    /// `C:/repos/ralphus`) and a project registered via a backslashed
+    /// Windows path (e.g. `C:\repos\ralphus`) compare unequal under a raw
+    /// string comparison, so `project_name_for_path`/`project_bool_stamp`
+    /// silently fail to find the project -- which in turn defeats
+    /// fork-aware PR routing ([`crate::pr::resolve_pr_repo_routing`]) and
+    /// sends a review's PR stack to the wrong remote with no error surfaced.
+    fn normalize_for_project_lookup(path: &str) -> String {
+        crate::triage::normalize_path_key(std::path::Path::new(path))
+            .trim_end_matches('/')
+            .to_string()
     }
 
     /// A project by its exact registered name, or `None` when absent.
@@ -12183,6 +12199,32 @@ command = "check-c"
             Some("ralphus".to_string())
         );
         assert_eq!(store.project_name_for_path("C:/repos/other"), None);
+    }
+
+    /// A registered project's path may be typed with backslashes (Windows
+    /// native form, e.g. via `ralphus project git`) while a guardian's
+    /// `git_root` is git-reported and forward-slashed. Without normalizing
+    /// slash direction before comparing, these never match -- which
+    /// silently defeats fork-aware PR routing
+    /// (`crate::pr::resolve_pr_repo_routing`) and sends a review's PR stack
+    /// to the wrong remote (the bug behind guardian-000000000065's PR stack
+    /// landing on `origin` instead of its project's registered fork).
+    #[test]
+    fn project_name_for_path_matches_regardless_of_slash_direction() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("ralphus", "orchestrator", r"C:\repos\ralphus", "git")
+            .unwrap();
+        assert_eq!(
+            store.project_name_for_path("C:/repos/ralphus"),
+            Some("ralphus".to_string()),
+            "a forward-slashed (git-reported) lookup path must match a backslashed registered path"
+        );
+        assert_eq!(
+            store.project_name_for_path("C:/repos/ralphus/worktrees/w1"),
+            Some("ralphus".to_string()),
+            "descendant matching must also survive the slash-direction mismatch"
+        );
     }
 
     #[test]

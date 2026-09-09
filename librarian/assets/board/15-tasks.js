@@ -28,6 +28,7 @@
           taskTabWatches = d.watches || [];
         } catch (e) { /* transient -- the next tick retries */ }
       }
+      // RALPHUS-POLL-TASKS-TAB:BEGIN
       /**
        * Polls the Tasks tab's one additional endpoint (RAL-362 §1) and
        * re-renders. `squads` itself is kept current by the shared
@@ -40,6 +41,7 @@
           const res = await fetch("/api/pull-requests/index");
           if (res.ok) taskTabPrIndex = await res.json();
         } catch (e) { /* transient -- the next poll retries */ }
+        markUpdated();
         if (pendingHash && pendingHash.tab === "tasks") {
           const want = pendingHash;
           pendingHash = null;
@@ -53,6 +55,7 @@
         }
         renderTasksTab();
       }
+      // RALPHUS-POLL-TASKS-TAB:END
       /**
        * Builds one `TtRow` per task across every loaded squad, joining in
        * each task's usage/review/PR/watch derived state via the pure

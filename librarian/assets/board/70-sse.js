@@ -73,6 +73,7 @@
       // counter and the `squads` cache (used by the running dropdown) without triggering
       // task-view rendering. Called by tick() on non-task tabs so the counter stays
       // accurate regardless of which tab is active.
+      // RALPHUS-UPDATE-COUNTER:BEGIN
       /**
        * Fetches /api/tasks for the daemon status counter and `squads` cache, without triggering task-view rendering.
        * @returns {Promise<void>}
@@ -83,8 +84,9 @@
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           squads = d.squads || [];
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
-        } catch (_) {}
+        } catch (_) { markUnreachable(); }
       }
+      // RALPHUS-UPDATE-COUNTER:END
       /**
        * Polls whichever data the active tab needs and refreshes the ready-review banner.
        * RAL-167: this is now driven primarily by SSE (see `connectEventStream`/
@@ -305,7 +307,7 @@
           byId("conn").className = "dot on";
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
-          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+          markUpdated();
           squads = d.squads || [];
           const wantSquad = pendingHash ? squadForPendingHash(pendingHash) : undefined;
           if (pendingHash && wantSquad) {
@@ -319,7 +321,7 @@
           else if (userIsSelecting()) { /* keep the user's text selection intact */ }
           else if (!editing) renderAll();
           else renderSquads();
-        } catch (e) { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; }
+        } catch (e) { markUnreachable(); }
       }
       /**
        * Fetches the live conflicting-files list for one review branch (RAL-148)
@@ -410,10 +412,11 @@
           const fresh = await (await fetch("/api/guardians")).json();
           // A newer poll started while this fetch was in flight — abandon this
           // one without touching `guardians`, whose fresher value belongs to it.
-          if (seq !== reviewPollSeq) return;
+          if (seq !== reviewPollSeq) { console.debug("pollReviews: superseded, abandoning"); return; }
           guardians = fresh;
           checkGuardianNotices(guardians);
           byId("conn").className = "dot on";
+          markUpdated();
           if (pendingHash && pendingHash.tab === "reviews") {
             const want = pendingHash; pendingHash = null;
             // `?id=` first (authoritative), then the REVIEW[...] label — which
@@ -458,7 +461,7 @@
             ]);
             // The awaited refreshes may have been overtaken by a newer poll
             // (or re-selection) — a stale render now would show old data.
-            if (seq !== reviewPollSeq) return;
+            if (seq !== reviewPollSeq) { console.debug("pollReviews: superseded, abandoning"); return; }
           }
           if (!userIsSelecting()) { renderReviews(); preserveUserState(document.getElementById("review-detail"), renderReviewDetail); }
         } catch (e) { byId("conn").className = "dot off"; }

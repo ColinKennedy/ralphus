@@ -95,7 +95,7 @@ export function makeGotoReview({ showTab = () => {}, findGuardian = () => false 
  * deterministic.
  */
 export function makePollReviews({ userIsSelecting = () => false, pendingHash = null, initialGuardians = [], slowRefresh = null } = {}) {
-  const calls = { renderReviews: 0, renderReviewDetail: 0, fetches: [] };
+  const calls = { renderReviews: 0, renderReviewDetail: 0, markUpdated: 0, fetches: [] };
   /** @type {{url: string, resolve: (r: {json: () => Promise<any>}) => void, reject: (e: unknown) => void}[]} */
   const pendingFetches = [];
   const fetchImpl = (url) => {
@@ -105,6 +105,7 @@ export function makePollReviews({ userIsSelecting = () => false, pendingHash = n
   const deps = {
     checkGuardianNotices: () => {},
     byId: () => ({ className: "" }),
+    markUpdated: () => { calls.markUpdated++; },
     findGuardian: (id) => (callState().guardians || []).find((g) => g.id === id),
     visibleGuardians: () => [],
     syncHash: () => {},
@@ -130,7 +131,7 @@ export function makePollReviews({ userIsSelecting = () => false, pendingHash = n
   const factory = new Function(
     "deps",
     "fetchImpl",
-    `const { checkGuardianNotices, byId, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
+    `const { checkGuardianNotices, byId, markUpdated, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
              pollBranchConflicts, pollPullRequests, pollPrErrors, preserveUserState, renderReviews, renderReviewDetail,
              userIsSelecting, document } = deps;
      const fetch = fetchImpl;

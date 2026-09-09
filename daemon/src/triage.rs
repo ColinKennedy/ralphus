@@ -424,8 +424,12 @@ impl Store {
 /// canonicalized (falling back to the path unchanged if canonicalization
 /// fails, e.g. a worktree deleted since), verbatim-prefix stripped, and
 /// forward-slash separated so a Windows `git rev-parse` path and a Rust
-/// `Path::canonicalize()` path for the same directory compare equal.
-fn normalize_path_key(path: &Path) -> String {
+/// `Path::canonicalize()` path for the same directory compare equal. Also
+/// used by [`crate::store::Store::project_name_for_path`] and its sibling
+/// project-stamp lookups, which need the identical normalization to match a
+/// guardian's (git-reported, forward-slashed) `git_root` against a
+/// registered project's (however-the-user-typed-it) path.
+pub(crate) fn normalize_path_key(path: &Path) -> String {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     ralphus_core::strip_verbatim_prefix(canon)
         .to_string_lossy()

@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -3164,6 +3164,9 @@ pub fn start_merge(
             "{\"status\":\"approved\",\"message\":\"this review's work was already merged\"}",
         ),
         Err(StartMergeError::NotFound(message)) => reply(404, &error_body("not_found", &message)),
+        Err(StartMergeError::Preflight(message)) => {
+            reply(409, &error_body("pr_sync_failed", &message))
+        }
         Err(StartMergeError::NoBranches) => reply(
             400,
             &error_body("no_branches", "guardian has no branches to merge"),
@@ -3175,6 +3178,7 @@ pub fn start_merge(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartMergeError {
     NotFound(String),
+    Preflight(String),
     NoBranches,
     Store(String),
 }
@@ -3238,6 +3242,13 @@ pub(crate) fn kickoff_merge(
         if now_approved {
             return Ok(StartMergeOutcome::AlreadyMerged);
         }
+    }
+    // A manual merge must never build from a stale review worktree. The fast
+    // path only fetches and compares each open PR branch; if a reviewer (or
+    // another ralphus worktree) pushed commits, integrate and restack them
+    // before claiming this new merge.
+    if let Err(e) = crate::pr::sync_remote_pr_commits(&store, runner.as_ref(), id) {
+        return Err(StartMergeError::Preflight(e));
     }
     // RAL-300: same idea, but via git ancestry rather than the forge -- a
     // review whose base branch already contains every enabled branch's
@@ -4120,11 +4131,7 @@ fn staged_merge_pass(
         let root = Workspace::for_guardian(store, id, PathBuf::from(&proj));
         match resolve_base(&root, &guardian.base_branch) {
             Ok(sha) => {
-                base_shas.insert(proj.clone(), sha.clone());
-                let _ = store
-                    .lock()
-                    .expect("poisoned")
-                    .set_guardian_project_base_commit(id, proj, &sha);
+                base_shas.insert(proj.clone(), sha);
             }
             Err(e) => {
                 set_status(
@@ -4323,13 +4330,18 @@ fn staged_merge_pass(
         }
     }
 
-    // Record the current config/base so the next pass recognizes this prefix as
-    // valid to resume from (it IS valid — it was just built against this
-    // signature, and it is the longest built prefix).
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .set_guardian_build_signature(id, &current_sig);
+    // Commit the base/signature baseline only after the pass succeeds. If a
+    // conflict resolver or check fails, the worktrees are rolled back to the
+    // prior review state; recording the attempted base before that point would
+    // make the maintenance sweep believe the rolled-back review was current
+    // and suppress a later retry.
+    {
+        let guard = store.lock().expect("poisoned");
+        for (proj, sha) in &base_shas {
+            let _ = guard.set_guardian_project_base_commit(id, proj, sha);
+        }
+        let _ = guard.set_guardian_build_signature(id, &current_sig);
+    }
 
     StagedPassOutcome::Ok { built_any }
 }
@@ -5952,6 +5964,88 @@ pub fn pull_pr_commits(
     }
 }
 
+/// Guardian ids with a `review_maintenance` worker currently in flight.
+///
+/// The worker makes forge REST calls and a `git fetch` per guardian, which
+/// routinely outlast `scheduler::REVIEW_MAINT_INTERVAL`. Without this claim a
+/// slow pass is joined by a second, third, ... worker for the same guardian
+/// on every later tick; each takes the store lock in short bursts, starving
+/// the HTTP read pool.
+static MAINTAINING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Guardian ids with a straggler reopen in flight. Separate from
+/// [`MAINTAINING`]: a reopen and a maintenance pass for the same guardian are
+/// different operations and must not block each other.
+static REOPENING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Last idle-tier maintenance pass per guardian id — see
+/// `scheduler::REVIEW_IDLE_MAINT_INTERVAL`. Pruned on every pass to the set of
+/// guardians still in a maintained status, so it cannot grow without bound
+/// across a long-lived daemon.
+static IDLE_MAINT_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Applies the per-status maintenance cadence to a candidate `(id, status)`
+/// list: `in_review`/`merging` guardians pass through on every call, while
+/// `merge_failed`/`merge_stopped` guardians are throttled to at most once per
+/// [`crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL`]. Also prunes
+/// [`IDLE_MAINT_LAST`] to the ids present in `candidates`, so it cannot grow
+/// unbounded as guardians leave the maintained-status set entirely.
+fn filter_by_idle_cadence(candidates: &[(String, String)]) -> Vec<String> {
+    let now = std::time::Instant::now();
+    let mut last = IDLE_MAINT_LAST.lock().expect("poisoned");
+    let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+    last.retain(|id, _| live.contains(id.as_str()));
+    candidates
+        .iter()
+        .filter(|(id, status)| {
+            if !matches!(status.as_str(), "merge_failed" | "merge_stopped") {
+                return true;
+            }
+            match last.get(id) {
+                Some(prev)
+                    if now.duration_since(*prev) < crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL =>
+                {
+                    false
+                }
+                _ => {
+                    last.insert(id.clone(), now);
+                    true
+                }
+            }
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Releases a claim from one of the in-flight sets on drop, so an early
+/// `return` inside a worker cannot strand an id and lock that guardian out of
+/// all future passes.
+struct InFlightClaim {
+    set: &'static LazyLock<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl InFlightClaim {
+    /// Claims `id` in `set`, or returns `None` when it is already claimed.
+    fn acquire(set: &'static LazyLock<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+        if set.lock().expect("poisoned").insert(id.to_string()) {
+            Some(Self {
+                set,
+                id: id.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlightClaim {
+    fn drop(&mut self) {
+        self.set.lock().expect("poisoned").remove(&self.id);
+    }
+}
+
 /// Poll every review for a base-branch shift and rebuild any that drifted, each
 /// on its own thread. Called periodically by the scheduler loop so that new
 /// commits landing on a review's base branch are picked up automatically.
@@ -5968,10 +6062,19 @@ pub fn review_maintenance(
         guard.guardians_with_ready_stragglers().unwrap_or_default()
     };
     for id in straggler_ids {
+        let Some(claim) = InFlightClaim::acquire(&REOPENING, &id) else {
+            crate::rlog!(
+                DEBUG,
+                "ralphus [guardian] review {id} straggler reopen skipped: already in flight"
+            );
+            continue;
+        };
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
         std::thread::spawn(move || {
+            // Released when this worker exits, by any path.
+            let _claim = claim;
             let runner = crate::runner::SubprocessRunner::from_env();
             // RAL-213: register/remove around the merge this may trigger, same
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
@@ -5982,7 +6085,7 @@ pub fn review_maintenance(
         });
     }
 
-    let ids: Vec<String> = {
+    let candidates: Vec<(String, String)> = {
         let guard = store.lock().expect("poisoned");
         guard
             .list_guardians()
@@ -6001,14 +6104,27 @@ pub fn review_maintenance(
                     "in_review" | "merge_failed" | "merging" | "merge_stopped"
                 )
             })
-            .map(|g| g.id)
+            .map(|g| (g.id, g.status))
             .collect()
     };
+    // Store lock released. Now apply the per-status cadence: an idle-tier
+    // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
+    let ids = filter_by_idle_cadence(&candidates);
     for id in ids {
+        let Some(claim) = InFlightClaim::acquire(&MAINTAINING, &id) else {
+            crate::rlog!(
+                DEBUG,
+                "ralphus [guardian] review {id} maintenance skipped: already in flight"
+            );
+            continue;
+        };
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
         std::thread::spawn(move || {
+            // Released when this worker exits, including via the early return
+            // on the PR-commit-sync error path below.
+            let _claim = claim;
             let runner: Arc<dyn Runner> = Arc::new(
                 crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
             );
@@ -6024,6 +6140,23 @@ pub fn review_maintenance(
             // themselves and naturally no-op once it's no longer
             // `in_review`/`merge_failed`, so no extra branching is needed here.
             crate::pr::check_pr_merges(&store, &id);
+            // Pull remote PR commits before considering a local base shift or
+            // manual worktree push. This keeps the review's source of truth
+            // current and prevents a later branch sync from treating remote
+            // work as safe to overwrite.
+            if let Err(e) = crate::pr::sync_remote_pr_commits(&store, runner.as_ref(), &id) {
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::ERROR)
+                    .scope("guardian")
+                    .guardian(&id)
+                    .emit(
+                        &store.lock().expect("poisoned"),
+                        "automatic PR commit sync failed",
+                        serde_json::json!({"error": e}),
+                    );
+                cancellations.remove(&format!("guardian:{id}"));
+                return;
+            }
             // A base-shift rebuild (full re-derive) subsumes any manual push via
             // carry-forward, so only look for a manual push when no rebuild ran.
             if !rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem, &token) {
@@ -8759,6 +8892,141 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // -----------------------------------------------------------------------
+    // review_maintenance in-flight guard + idle-tier cadence (contention fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn in_flight_claim_blocks_a_second_acquire() {
+        static SET: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+        let first = InFlightClaim::acquire(&SET, "g-1");
+        assert!(first.is_some());
+        let second = InFlightClaim::acquire(&SET, "g-1");
+        assert!(
+            second.is_none(),
+            "a second acquire for the same id must be refused while the first is held"
+        );
+    }
+
+    #[test]
+    fn in_flight_claim_is_released_on_drop() {
+        static SET: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+        {
+            let _claim = InFlightClaim::acquire(&SET, "g-2").expect("first acquire succeeds");
+        }
+        let reacquired = InFlightClaim::acquire(&SET, "g-2");
+        assert!(
+            reacquired.is_some(),
+            "dropping the claim must release the id for a later acquire"
+        );
+    }
+
+    #[test]
+    fn in_flight_claim_is_released_on_an_early_return() {
+        static SET: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+        // The explicit `return` is the point of this test -- it exercises the
+        // early-return path the RAII guard must survive.
+        #[allow(clippy::needless_return)]
+        fn acquires_then_returns_early(id: &str) {
+            let Some(_claim) = InFlightClaim::acquire(&SET, id) else {
+                panic!("expected the first acquire to succeed");
+            };
+            return;
+        }
+
+        acquires_then_returns_early("g-3");
+        assert!(
+            !SET.lock().expect("poisoned").contains("g-3"),
+            "an early return inside the worker must not strand the claim"
+        );
+    }
+
+    #[test]
+    fn straggler_and_maintenance_claims_are_independent() {
+        let reopen_claim = InFlightClaim::acquire(&REOPENING, "g-shared");
+        let maint_claim = InFlightClaim::acquire(&MAINTAINING, "g-shared");
+        assert!(reopen_claim.is_some());
+        assert!(
+            maint_claim.is_some(),
+            "REOPENING and MAINTAINING must be independent claim sets for the same guardian id"
+        );
+    }
+
+    #[test]
+    fn merge_failed_guardians_are_maintained_on_the_idle_cadence() {
+        let id = "g-idle-cadence".to_string();
+        IDLE_MAINT_LAST.lock().expect("poisoned").remove(&id);
+
+        let candidates = vec![(id.clone(), "merge_failed".to_string())];
+        let first_pass = filter_by_idle_cadence(&candidates);
+        assert_eq!(
+            first_pass,
+            vec![id.clone()],
+            "the first pass must always run"
+        );
+
+        let second_pass = filter_by_idle_cadence(&candidates);
+        assert!(
+            second_pass.is_empty(),
+            "a second pass immediately after the first must be skipped on the idle cadence"
+        );
+
+        IDLE_MAINT_LAST.lock().expect("poisoned").remove(&id);
+    }
+
+    #[test]
+    fn in_review_guardians_stay_on_the_fast_cadence() {
+        let id = "g-fast-cadence".to_string();
+        let candidates = vec![(id.clone(), "in_review".to_string())];
+        let first_pass = filter_by_idle_cadence(&candidates);
+        let second_pass = filter_by_idle_cadence(&candidates);
+        assert_eq!(first_pass, vec![id.clone()]);
+        assert_eq!(
+            second_pass,
+            vec![id],
+            "an active-tier status must be maintained on every pass, not throttled"
+        );
+    }
+
+    #[test]
+    fn a_guardian_leaving_the_idle_tier_is_maintained_immediately() {
+        let id = "g-tier-transition".to_string();
+        IDLE_MAINT_LAST.lock().expect("poisoned").remove(&id);
+
+        let idle = vec![(id.clone(), "merge_failed".to_string())];
+        assert_eq!(filter_by_idle_cadence(&idle), vec![id.clone()]);
+        assert!(
+            filter_by_idle_cadence(&idle).is_empty(),
+            "still throttled while idle"
+        );
+
+        let active = vec![(id.clone(), "merging".to_string())];
+        assert_eq!(
+            filter_by_idle_cadence(&active),
+            vec![id.clone()],
+            "moving to an active-tier status must be maintained immediately, not wait out the idle interval"
+        );
+
+        IDLE_MAINT_LAST.lock().expect("poisoned").remove(&id);
+    }
+
+    #[test]
+    fn idle_bookkeeping_is_pruned_for_guardians_no_longer_maintained() {
+        let id = "g-pruned".to_string();
+        let idle = vec![(id.clone(), "merge_failed".to_string())];
+        filter_by_idle_cadence(&idle);
+        assert!(IDLE_MAINT_LAST.lock().expect("poisoned").contains_key(&id));
+
+        // The guardian is no longer in the candidate set at all (e.g. it was
+        // approved/cancelled and dropped out of the maintained-status filter).
+        filter_by_idle_cadence(&[]);
+        assert!(
+            !IDLE_MAINT_LAST.lock().expect("poisoned").contains_key(&id),
+            "IDLE_MAINT_LAST must not grow unbounded for guardians no longer maintained"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers shared by worktree-recovery tests
     // -----------------------------------------------------------------------
 
@@ -9392,6 +9660,70 @@ mod tests {
         g(&fwt, &["add", "."]);
         g(&fwt, &["commit", "--message", "feature"]);
         (base, repo, fwt)
+    }
+
+    #[test]
+    fn failed_staged_rebase_does_not_advance_the_built_base_baseline() {
+        let base = tmp_dir("failed-staged-base-baseline");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "--initial-branch", "main"]);
+        std::fs::write(repo.join("shared.txt"), "original\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "base"]);
+        let old_base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let old_base = old_base.trim().to_string();
+
+        g(&repo, &["checkout", "-b", "feature/a"]);
+        std::fs::write(repo.join("shared.txt"), "feature\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "feature"]);
+        g(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("shared.txt"), "new base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "advance base"]);
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let id = {
+            let guard = store.lock().unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_branch_status(&id, &branch_id, MergeStatus::Ready, None)
+                .unwrap();
+            guard
+                .set_guardian_project_base_commit(&id, repo.to_str().unwrap(), &old_base)
+                .unwrap();
+            id
+        };
+
+        struct QuotaRejectedRunner;
+        impl Runner for QuotaRejectedRunner {
+            fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+                RunnerResult::failure("You've hit your session limit")
+            }
+        }
+
+        assert!(matches!(
+            staged_merge_pass(&store, &QuotaRejectedRunner, &id, &CancelToken::never()),
+            StagedPassOutcome::Failed
+        ));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian(&id)
+                .unwrap()
+                .base_commits
+                .get(repo.to_str().unwrap()),
+            Some(&old_base),
+            "a failed rebase was rolled back, so its attempted base must not become the baseline"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn current_branch(wt: &Path) -> String {

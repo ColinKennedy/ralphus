@@ -156,6 +156,10 @@
         // instant the admin navigates anywhere else -- never persisted.
         if (tab === "prefs" && name !== "prefs") prefsViewingAs = null;
         tab = name;
+        // A freshness stamp belongs to the tab that fetched it -- carrying one
+        // over from the previous tab reads as "this tab just refreshed" when
+        // it didn't.
+        byId("updated").textContent = "—";
         for (const t of TABS) {
           const page = byId(t + "-page");
           page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "triage" || t === "users" || t === "secrets" || t === "prefs" ? "block" : "grid") : "none";

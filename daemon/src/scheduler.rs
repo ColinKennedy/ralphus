@@ -24,6 +24,13 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often to check reviews for a base-branch shift and auto-rebuild them.
 pub const REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often to run review maintenance for guardians parked in a state only a
+/// human action leaves (`merge_failed`, `merge_stopped`). They still need the
+/// out-of-band PR-merge check (RAL-300), but at five minutes rather than five
+/// seconds — re-polling a stuck review's forge PRs every tick is the dominant
+/// source of idle daemon load.
+pub const REVIEW_IDLE_MAINT_INTERVAL: Duration = Duration::from_secs(300);
+
 /// How often to sweep for guardians whose debounced final change-summary
 /// regen request (RAL-208) has gone quiet long enough to fire the LLM call.
 /// Finer-grained than [`REVIEW_MAINT_INTERVAL`] since it's checked against

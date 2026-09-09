@@ -212,3 +212,29 @@ test("a hash-navigated review that IS loaded doesn't flip the loading placeholde
   await promise;
   assert.equal(poll.state().reviewDetailLoading, null);
 });
+
+// ---------- pollReviews: freshness stamp (board freshness-indicator honesty fix) ----------
+
+test("a completed poll stamps the freshness indicator", async () => {
+  const poll = makePollReviews();
+  const promise = poll.pollReviews();
+  resolveJson(poll.pendingFetches[0], [{ id: "review-a", name: "a", status: "in_review" }]);
+  await promise;
+  assert.equal(poll.calls.markUpdated, 1);
+});
+
+test("a poll abandoned by a newer one (RAL-382 guard) never stamps a time it did not render", async () => {
+  const poll = makePollReviews();
+  const promiseA = poll.pollReviews(); // seq 1 -- its list fetch stays pending
+  const promiseB = poll.pollReviews(); // seq 2
+
+  const [, fetchB] = poll.pendingFetches;
+  resolveJson(fetchB, [{ id: "review-b", name: "b", status: "in_review" }]);
+  await promiseB;
+  assert.equal(poll.calls.markUpdated, 1, "the newer poll stamps once");
+
+  const [fetchA] = poll.pendingFetches;
+  resolveJson(fetchA, [{ id: "review-a", name: "a", status: "collecting" }]);
+  await promiseA;
+  assert.equal(poll.calls.markUpdated, 1, "the abandoned older poll must not stamp a second time");
+});

@@ -1372,11 +1372,12 @@ fn resync_pr_bases_inner(
             branch.position,
             &base_branch_name,
         );
-        // A synchronous user-authored base change verifies every open member
-        // of the chain on the forge, including unchanged N-1 links. Besides
-        // satisfying the all-or-error request contract, this repairs a prior
-        // partial attempt whose local row was already updated.
-        if new_base != pr.base_ref || require_forge_success {
+        // A synchronous resync verifies every open member on the forge, but
+        // does not PATCH a base that is already correct. GitHub rejects even
+        // a no-op base update while a PR belongs to a native stack; treating
+        // that rejection as a real move would unnecessarily rebuild it.
+        let local_base_changed = new_base != pr.base_ref;
+        if local_base_changed || require_forge_success {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 INFO,
@@ -1396,7 +1397,6 @@ fn resync_pr_bases_inner(
                     None,
                 );
             }
-            changed += 1;
             // RAL-338: only a registered fork makes `pr.repo` potentially
             // differ from the guardian's single resolved client (a
             // fork-mode root PR is filed against the parent, everything
@@ -1413,6 +1413,39 @@ fn resync_pr_bases_inner(
                 parent_client.as_ref()
             };
             if let (Some(c), Some(num)) = (branch_client, pr.pr_number) {
+                let forge_base_matches = if require_forge_success {
+                    match c.get_pull_request_base_state(num) {
+                        Ok(state) if state.base == new_base => {
+                            let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                                &pr.id,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(&new_base),
+                                None,
+                                Some(Some(&new_base)),
+                            );
+                            true
+                        }
+                        Ok(_) => false,
+                        Err(e) => {
+                            forge_errors.push(format!("pr {}: {e}", pr.id));
+                            continue;
+                        }
+                    }
+                } else {
+                    false
+                };
+                if forge_base_matches {
+                    if local_base_changed {
+                        changed += 1;
+                    }
+                    continue;
+                }
+                if local_base_changed {
+                    changed += 1;
+                }
                 match c.update_pull_request_base(num, &new_base) {
                     // RAL-279: only record `last_pushed_base_ref` once the
                     // forge has actually confirmed the new base -- this is
@@ -1451,6 +1484,8 @@ fn resync_pr_bases_inner(
                     "pr {} has no forge client or forge PR/MR number",
                     pr.id
                 ));
+            } else if local_base_changed {
+                changed += 1;
             }
         }
     }
@@ -4496,6 +4531,66 @@ pub fn pull_pr_commits(
     Ok(true)
 }
 
+/// Fetch every open PR branch in `id` and incorporate any forge-side commits
+/// into its review worktree before another local rebase can run. PRs are
+/// considered in stack order, so pulling a lower branch restacks its
+/// descendants before their own remote tips are checked.
+///
+/// This is deliberately the same conflict-aware pull path the explicit board
+/// action uses, rather than a plain `git pull`: it preserves remote commits,
+/// resolves conflicts through the review resolver, restacks downstream review
+/// branches, and writes the resulting tips back to the PR branches.
+///
+/// Returns how many PR branches supplied commits. An idle review with no
+/// remote changes only performs the inexpensive fetch-and-compare checks.
+pub fn sync_remote_pr_commits(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    id: &str,
+) -> std::result::Result<usize, String> {
+    let guardian = store
+        .lock()
+        .expect("poisoned")
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?;
+    if guardian.status.as_str() != "in_review" {
+        return Ok(0);
+    }
+
+    let positions: HashMap<&str, i64> = guardian
+        .branches
+        .iter()
+        .map(|branch| (branch.id.as_str(), branch.position))
+        .collect();
+    let mut pr_ids: Vec<_> = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|pr| pr.state == "open")
+        .collect();
+    pr_ids.sort_by_key(|pr| {
+        pr.branch_id
+            .as_deref()
+            .and_then(|branch_id| positions.get(branch_id).copied())
+            .unwrap_or(i64::MAX)
+    });
+
+    let mut pulled = 0;
+    for pr in pr_ids {
+        if !compute_sync_status(store, &pr.id)?.pr_ahead {
+            continue;
+        }
+        if pull_pr_commits(store, runner, &pr.id)
+            .map_err(|e| format!("could not pull remote commits for PR {}: {e}", pr.id))?
+        {
+            pulled += 1;
+        }
+    }
+    Ok(pulled)
+}
+
 /// Kick off [`pull_pr_commits`] in the background; returns immediately.
 pub fn start_pull_pr_commits(
     store: Arc<Mutex<Store>>,
@@ -6090,6 +6185,61 @@ mod tests {
     // -- RAL-285: keep already-open PR branches level with their review branch --
 
     #[test]
+    fn sync_remote_pr_commits_pulls_a_reviewer_push_before_a_rebase() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let (guardian_id, branch_id) = {
+            let guard = store.lock().unwrap();
+            let pr = guard.get_pull_request(&pr_id).unwrap();
+            (pr.guardian_id, pr.branch_id.unwrap())
+        };
+        // The lightweight sync fixture normally records a deliberately
+        // nonexistent worktree because its other tests only inspect refs.
+        // This path drives a real rebase, so point it at the actual fixture
+        // checkout and make that checkout the review branch.
+        store
+            .lock()
+            .unwrap()
+            .set_branch_review(
+                &guardian_id,
+                &branch_id,
+                "review-branch",
+                root.to_str().unwrap(),
+            )
+            .unwrap();
+        g(&root, &["checkout", "review-branch"]);
+        let clone_dir = tmp_dir("remote-pr-sync-clone");
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        g(
+            clone_dir.parent().unwrap(),
+            &[
+                "clone",
+                remote_dir.to_str().unwrap(),
+                clone_dir.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        g(&clone_dir, &["checkout", "pr-y"]);
+        gwrite(&clone_dir, "reviewer.txt", "preserve this remote commit\n");
+        g(&clone_dir, &["add", "."]);
+        g(&clone_dir, &["commit", "--message", "reviewer fix"]);
+        g(&clone_dir, &["push", "origin", "pr-y"]);
+
+        assert_eq!(
+            sync_remote_pr_commits(&store, &NoopRunner, &guardian_id).unwrap(),
+            1
+        );
+        let status = compute_sync_status(&store, &pr_id).unwrap();
+        assert!(status.in_sync, "{status:?}");
+        assert_eq!(
+            g(&remote_dir, &["rev-parse", "pr-y"]).trim(),
+            g(&root, &["rev-parse", "review-branch"]).trim()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
     fn sync_open_pr_branches_pushes_a_worktree_tip_that_moved_locally() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
         let gid = store
@@ -6367,13 +6517,45 @@ mod tests {
         assert_eq!(s.get_pull_request(&pr_b).unwrap().base_ref, "a");
     }
 
-    fn synchronous_multi_branch_base_sync(forge: &str) {
+    fn synchronous_multi_branch_base_sync(forge: &str, already_synced: bool) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let forge_name = forge.to_string();
         let handle = std::thread::spawn(move || {
             let mut bases = Vec::new();
-            for number in 1..=3 {
+            for (number, forge_base) in (1..=3).zip(if already_synced {
+                ["release", "a-alias", "b-alias"]
+            } else {
+                ["main", "a-alias", "b-alias"]
+            }) {
+                let req = server.recv().unwrap();
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                let expected_get_path = if forge_name == "github" {
+                    format!("/repos/acme/widget/pulls/{number}")
+                } else {
+                    format!("/projects/acme%2Fwidget/merge_requests/{number}")
+                };
+                assert_eq!(req.url(), expected_get_path);
+                let state = if forge_name == "github" {
+                    serde_json::json!({
+                        "base": {"ref": forge_base},
+                        "updated_at": "2026-01-01T00:00:00Z",
+                    })
+                } else {
+                    serde_json::json!({
+                        "target_branch": forge_base,
+                        "updated_at": "2026-01-01T00:00:00Z",
+                    })
+                };
+                req.respond(
+                    tiny_http::Response::from_string(state.to_string()).with_status_code(200),
+                )
+                .unwrap();
+
+                if already_synced || number != 1 {
+                    continue;
+                }
+
                 let mut req = server.recv().unwrap();
                 let expected_method = if forge_name == "github" {
                     tiny_http::Method::Patch
@@ -6461,7 +6643,11 @@ mod tests {
                     forge,
                     "acme/widget",
                     alias,
-                    old_base,
+                    if already_synced {
+                        ["release", "a-alias", "b-alias"][idx]
+                    } else {
+                        old_base
+                    },
                     alias,
                     "",
                     Some(i64::try_from(idx).unwrap() + 1),
@@ -6470,10 +6656,17 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(resync_pr_bases_synchronously(&store, &gid).unwrap(), 3);
+        assert_eq!(
+            resync_pr_bases_synchronously(&store, &gid).unwrap(),
+            if already_synced { 0 } else { 1 }
+        );
         assert_eq!(
             handle.join().unwrap(),
-            vec!["release", "a-alias", "b-alias"]
+            if already_synced {
+                Vec::new()
+            } else {
+                vec!["release"]
+            }
         );
         let rows = store
             .lock()
@@ -6490,13 +6683,23 @@ mod tests {
     }
 
     #[test]
-    fn synchronous_multi_branch_base_sync_updates_every_github_pr() {
-        synchronous_multi_branch_base_sync("github");
+    fn synchronous_multi_branch_base_sync_retargets_only_drifted_github_prs() {
+        synchronous_multi_branch_base_sync("github", false);
     }
 
     #[test]
-    fn synchronous_multi_branch_base_sync_updates_every_gitlab_mr() {
-        synchronous_multi_branch_base_sync("gitlab");
+    fn synchronous_multi_branch_base_sync_retargets_only_drifted_gitlab_mrs() {
+        synchronous_multi_branch_base_sync("gitlab", false);
+    }
+
+    #[test]
+    fn synchronous_multi_branch_base_sync_does_not_retarget_an_already_correct_github_stack() {
+        synchronous_multi_branch_base_sync("github", true);
+    }
+
+    #[test]
+    fn synchronous_multi_branch_base_sync_does_not_retarget_an_already_correct_gitlab_stack() {
+        synchronous_multi_branch_base_sync("gitlab", true);
     }
 
     #[test]

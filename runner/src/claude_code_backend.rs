@@ -546,6 +546,9 @@ fn drive_stream_json(
             "claude-code exited ({status:?}) without a terminal result event"
         )));
     }
+    if let Some(error) = state.result_error.as_deref() {
+        return Err(BackendError(format!("claude-code: {error}")));
+    }
 
     Ok(BackendOutcome {
         summary: state.result_summary,
@@ -571,6 +574,11 @@ fn drive_stream_json(
 struct ParseState {
     agent_session_id: Option<String>,
     result_summary: String,
+    /// A terminal result that Claude emitted instead of running the requested
+    /// turn. Claude normally sets `is_error`, but account/session quota
+    /// rejections can arrive as a zero-token "successful" result whose text is
+    /// the only indication that no model invocation happened.
+    result_error: Option<String>,
     tokens_in: i64,
     tokens_out: i64,
     cache_creation_tokens: i64,
@@ -827,6 +835,27 @@ fn process_event(
                 .unwrap_or(0.0);
             let text = event["result"].as_str().unwrap_or_default();
             state.result_summary = tail(text, RESULT_SUMMARY_TAIL_CHARS);
+            let normalized = text.to_ascii_lowercase();
+            let no_usage = state.tokens_in == 0
+                && state.tokens_out == 0
+                && state.cache_creation_tokens == 0
+                && state.cache_read_tokens == 0;
+            let quota_rejection = no_usage
+                && normalized.contains("you've hit your")
+                && (normalized.contains("session limit")
+                    || normalized.contains("usage limit")
+                    || normalized.contains("rate limit"));
+            state.result_error = (event["is_error"].as_bool() == Some(true) || quota_rejection)
+                .then(|| {
+                    if text.trim().is_empty() {
+                        event["subtype"]
+                            .as_str()
+                            .unwrap_or("claude-code returned an unspecified error")
+                            .to_string()
+                    } else {
+                        text.trim().to_string()
+                    }
+                });
         }
         _ => {}
     }
@@ -1336,6 +1365,29 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.result_summary, "all done");
         assert!(state.saw_result);
+    }
+
+    #[test]
+    fn process_event_rejects_zero_token_session_limit_result() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"result",
+                "subtype":"success",
+                "is_error":false,
+                "usage":{},
+                "result":"You've hit your session limit · resets 1:10am (America/Los_Angeles)"
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(
+            state.result_error.as_deref(),
+            Some("You've hit your session limit · resets 1:10am (America/Los_Angeles)")
+        );
     }
 
     /// RAL-326: an agentic claude-code session bills most of its input through
