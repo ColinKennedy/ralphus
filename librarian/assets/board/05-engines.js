@@ -111,7 +111,14 @@
         openCellNodeMenu: (e, ds) => openCellNodeMenu(e, ds.squadId || "", Number(ds.ti), Number(ds.si)),
         openTaskNodeMenu: (e, ds) => openTaskNodeMenu(e, ds.squadId || "", Number(ds.ti)),
       };
-      CLICK_HANDLERS.gotoReview = (e, ds) => { e.preventDefault(); gotoReview(ds.guardianId || ""); };
+      // RAL-382: stopPropagation before navigating — the Tasks table renders this
+      // handler inside a task row whose inline onclick selects the task; capture-
+      // phase stopPropagation keeps that row click from firing on top of the jump.
+      CLICK_HANDLERS.gotoReview = (e, ds) => { e.preventDefault(); e.stopPropagation(); gotoReview(ds.guardianId || ""); };
+      // RAL-382: the +N suffix on a multi-review task row — opens the Reviews tab's
+      // full list without changing the selection, so the user picks which review to
+      // open rather than the badge silently choosing one.
+      CLICK_HANDLERS.openReviewList = (e, ds) => { e.stopPropagation(); showTab("reviews", true); };
       CLICK_HANDLERS.pick = (e, ds) => pick(/** @type {"squad"|"task"|"cell"|"proof"} */ (ds.kind || "squad"), ds.ti !== undefined ? Number(ds.ti) : 0, ds.si !== undefined ? Number(ds.si) : 0, ds.vi !== undefined ? Number(ds.vi) : -1);
       CLICK_HANDLERS.removeEnvOverrideAt = (e, ds) => removeEnvOverrideAt(ds.apiPath || "", ds.key || "");
       CLICK_HANDLERS.addEnvOverrideAt = (e, ds) => addEnvOverrideAt(ds.apiPath || "");

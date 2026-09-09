@@ -394,14 +394,20 @@
        * @param {{pr: PrIndexRow, count: number}|null} prPick
        * @returns {string}
        */
+      // RALPHUS-TT-REVIEW-BADGES:BEGIN
       function ttReviewPrBadgesHtml(reviewBadge, prPick) {
         const parts = [];
         if (reviewBadge) {
           const r = reviewBadge.review;
           const color = cvar(G_COLORS[r.status] || "--muted");
           const shortName = r.name.length > 14 ? r.name.slice(0, 13) + "…" : r.name;
-          const extra = reviewBadge.count > 1 ? ` +${reviewBadge.count - 1}` : "";
-          parts.push(`<span class="tt-badge" style="color:${color};border-color:${color}" data-tip="Review &quot;${esc(r.name)}&quot; — ${esc(r.status)}.${reviewBadge.count > 1 ? ` This task is on ${reviewBadge.count} reviews total.` : ""}">${esc(shortName)}${extra}</span>`);
+          // RAL-382: the badge body opens the review it displays (the attention-ranked
+          // pick, per the ticket's interview decision); the +N count is a separate
+          // affordance that jumps to the Reviews tab's full list instead of silently
+          // picking one of the other reviews. data-click (not inline onclick) so the
+          // delegation engine can stop propagation before the row's ttSelectTask fires.
+          const extra = reviewBadge.count > 1 ? `<span class="tt-badge review-extra" data-click="openReviewList" data-tip="This task is on ${reviewBadge.count} reviews — the badge shows the one needing attention most.\nClick to open the full list on the Reviews tab and pick one.">+${reviewBadge.count - 1}</span>` : "";
+          parts.push(`<span class="tt-badge review-badge" style="color:${color};border-color:${color}" data-click="gotoReview" data-guardian-id="${esc(r.id)}" data-tip="Review &quot;${esc(r.name)}&quot; — ${esc(r.status)}.${reviewBadge.count > 1 ? ` This task is on ${reviewBadge.count} reviews total; +N opens the full list.` : ""}\nClick to open this review on the Reviews tab.">${esc(shortName)}</span>${extra}`);
         }
         if (prPick) {
           const pr = prPick.pr;
@@ -420,6 +426,7 @@
        * @returns {void}
        */
       function ttOpenPr(url) { if (url) window.open(url, "_blank", "noopener"); }
+      // RALPHUS-TT-REVIEW-BADGES:END
       /**
        * Renders the Time column per the current duration/start-time mode; the tooltip always shows both.
        * @param {number|null} startedAtMs
@@ -861,6 +868,13 @@
       let reviewResolverDefaulted = false;
       /** @type {string|null} */
       let selectedGuardian = null;
+      // RAL-382: set by gotoReview when the target review isn't in the loaded
+      // `guardians` set yet — renderReviewDetail then shows a "Loading review…"
+      // placeholder for that id instead of the previously selected review's
+      // details (or a misleading "Select a review."), and clears it once the
+      // review's data arrives in a poll.
+      /** @type {string|null} */
+      let reviewDetailLoading = null;
       let _inPopstate = false;
       /** @type {{[key: string]: string}} gid -> project root shown in the tab view */
       let selectedProjectTabs = {};

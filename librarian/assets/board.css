@@ -336,6 +336,9 @@
       .tt-badge { font-size: 11px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); white-space: nowrap; }
       .tt-badge.pr-badge { cursor: pointer; }
       .tt-badge.pr-placeholder { border-style: dashed; color: var(--muted); opacity: .75; }
+      /* RAL-382: the review badge opens the review it displays; its +N suffix opens the full review list. */
+      .tt-badge.review-badge { cursor: pointer; }
+      .tt-badge.review-extra { cursor: pointer; color: var(--muted); }
       .tt-time.running { color: var(--running); }
       .kv-row .v[data-running="1"] { color: var(--running); }
       .tt-needs-me-chip { display: inline-flex; align-items: center; gap: 4px; }

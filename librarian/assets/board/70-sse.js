@@ -393,13 +393,25 @@
           await Promise.all(open.map((p) => fetchPrSyncStatus(p.id)));
         } catch (e) { /* transient -- the next poll retries */ }
       }
+      // RALPHUS-REVIEW-POLL:BEGIN
+      /** Monotonic sequence over `pollReviews` invocations — each call captures its number at start; a call that is no longer the freshest abandons itself (RAL-382). */
+      let reviewPollSeq = 0;
       /**
        * Polls `/api/guardians` and re-renders the Reviews tab.
+       * RAL-382: overlapping invocations are guarded by a monotonic sequence
+       * counter — each call captures its number at start and abandons itself if
+       * a newer poll has started by the time any of its awaits resolve, so an
+       * older, slower poll can never overwrite the newer poll's data or render.
        * @returns {Promise<void>}
        */
       async function pollReviews() {
+        const seq = ++reviewPollSeq;
         try {
-          guardians = await (await fetch("/api/guardians")).json();
+          const fresh = await (await fetch("/api/guardians")).json();
+          // A newer poll started while this fetch was in flight — abandon this
+          // one without touching `guardians`, whose fresher value belongs to it.
+          if (seq !== reviewPollSeq) return;
+          guardians = fresh;
           checkGuardianNotices(guardians);
           byId("conn").className = "dot on";
           if (pendingHash && pendingHash.tab === "reviews") {
@@ -411,6 +423,9 @@
             if (want.guardianId && findGuardian(want.guardianId)) selectedGuardian = want.guardianId;
             else if (byName.length === 1) selectedGuardian = byName[0].id;
             else if (want.guardianId) selectedGuardian = want.guardianId;
+            // RAL-382: a hash-navigated review may not be in the loaded set yet;
+            // show the loading placeholder instead of the previous selection.
+            if (selectedGuardian && !findGuardian(selectedGuardian)) reviewDetailLoading = selectedGuardian;
           }
           if (!selectedGuardian && guardians.length) {
             const firstVisible = visibleGuardians()[0];
@@ -441,8 +456,12 @@
               pollPullRequests(selectedGuardian),
               pollPrErrors(selectedGuardian),
             ]);
+            // The awaited refreshes may have been overtaken by a newer poll
+            // (or re-selection) — a stale render now would show old data.
+            if (seq !== reviewPollSeq) return;
           }
           if (!userIsSelecting()) { renderReviews(); preserveUserState(document.getElementById("review-detail"), renderReviewDetail); }
         } catch (e) { byId("conn").className = "dot off"; }
       }
+      // RALPHUS-REVIEW-POLL:END
 

@@ -759,7 +759,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function renderReviewDetail() {
         const el = byId("review-detail");
         const g = guardians.find((x) => x.id === selectedGuardian);
-        if (!g) { el.innerHTML = `<div class="empty">Select a review.</div>`; return; }
+        if (!g) {
+          // RAL-382: a review just navigated to (gotoReview) whose data hasn't
+          // arrived yet shows a loading placeholder — never the previously
+          // selected review's details, and never a bare "Select a review." that
+          // reads as if the click did nothing.
+          el.innerHTML = (selectedGuardian && reviewDetailLoading === selectedGuardian) ? `<div class="empty">Loading review…</div>` : `<div class="empty">Select a review.</div>`;
+          return;
+        }
+        reviewDetailLoading = null;
         // RAL-14: reorder is allowed while the review is still open — not once it
         // is approved/deployed (those branches are considered merged/shipped).
         const canReorder = !["approved", "cancelled", "deployed"].includes(g.status);
