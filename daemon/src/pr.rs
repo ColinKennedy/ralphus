@@ -3822,6 +3822,7 @@ fn submit_stack_for_guardian(
                     } else {
                         match create_and_record_native_stack(store, id, client, &all_ordered) {
                             Ok(Some(new_stack_number)) => {
+                                // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
                                 crate::rlog!(
                                     INFO,
                                     "ralphus [pr] review {id} replaced missing github pr stack {stack_number} with stack {}",
@@ -3858,10 +3859,13 @@ fn submit_stack_for_guardian(
                     .clear_guardian_forge_stack_number(id)
                     .map_err(|e| e.to_string())?;
                 match create_and_record_native_stack(store, id, client, &all_ordered) {
-                    Ok(Some(new_stack_number)) => crate::rlog!(
-                        INFO,
-                        "ralphus [pr] review {id} rebuilt github pr stack {stack_number} as {new_stack_number}"
-                    ),
+                    Ok(Some(new_stack_number)) => {
+                        // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+                        crate::rlog!(
+                            INFO,
+                            "ralphus [pr] review {id} rebuilt github pr stack {stack_number} as {new_stack_number}"
+                        );
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
