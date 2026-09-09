@@ -190,6 +190,14 @@
        * @property {number} hidden_at_ms
        */
       /**
+       * Response from `POST /api/hidden/squads/batch` (RAL-331) -- every
+       * requested id that failed (e.g. already deleted), reported instead of
+       * aborting the whole batch.
+       * @typedef {object} HiddenBatchResult
+       * @property {boolean} hidden
+       * @property {{id: string, error: string}[]} failed
+       */
+      /**
        * @typedef {object} GuardianView
        * @property {string} id
        * @property {string} name

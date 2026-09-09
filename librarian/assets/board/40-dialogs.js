@@ -400,37 +400,57 @@
         renderSquads();
       }
       /**
-       * Hides every multi-selected squad from the current user's own view
-       * (RAL-331). Reports (via `alert`) any squad the daemon refused to hide.
+       * Hides or unhides from the squad context menu (RAL-331) -- applies to
+       * every multi-selected squad when the clicked squad is part of an
+       * active multi-selection (size > 1), otherwise just the clicked squad.
+       * @param {string} id
+       * @param {boolean} hide
        * @returns {Promise<void>}
        */
-      async function bulkHideSquads() {
-        const failed = [];
-        for (const id of [...multiSel]) {
-          try {
-            const r = await post(`/api/hidden/squads/${id}`);
-            if (r.ok) hiddenSquadIds.add(id); else failed.push(`${id}: ${await responseError(r, "hide failed")}`);
-          } catch (e) { failed.push(`${id}: daemon unreachable`); }
-        }
-        renderSquads();
-        if (failed.length) alert(failed.join("\n"));
+      async function setSquadHiddenFromMenu(id, hide) {
+        closeSquadMenu();
+        if (multiSel.has(id) && multiSel.size > 1) await (hide ? bulkHideSquads() : bulkUnhideSquads());
+        else await setSquadHidden(id, hide);
       }
       /**
-       * Re-enables every multi-selected squad in the current user's own view
-       * (RAL-331). Reports (via `alert`) any squad the daemon refused to unhide.
+       * Hides or unhides every multi-selected squad in a single request
+       * (RAL-331) -- one POST to the batch endpoint instead of one round
+       * trip per squad. Reports (via `alert`) any squad the daemon refused
+       * to hide/unhide; a squad that fails does not block the rest of the
+       * batch.
+       * @param {boolean} hide
        * @returns {Promise<void>}
        */
-      async function bulkUnhideSquads() {
-        const failed = [];
-        for (const id of [...multiSel]) {
-          try {
-            const r = await del(`/api/hidden/squads/${id}`);
-            if (r.ok) hiddenSquadIds.delete(id); else failed.push(`${id}: ${await responseError(r, "unhide failed")}`);
-          } catch (e) { failed.push(`${id}: daemon unreachable`); }
+      async function setSquadsHiddenBatch(hide) {
+        const ids = [...multiSel];
+        if (!ids.length) return;
+        let resp;
+        try {
+          resp = await post("/api/hidden/squads/batch", { ids, hidden: hide });
+        } catch (e) { alert("daemon unreachable"); return; }
+        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        /** @type {HiddenBatchResult} */
+        const result = await resp.json();
+        const failedIds = new Set(result.failed.map((f) => f.id));
+        for (const id of ids) {
+          if (failedIds.has(id)) continue;
+          if (hide) hiddenSquadIds.add(id); else hiddenSquadIds.delete(id);
         }
         renderSquads();
-        if (failed.length) alert(failed.join("\n"));
+        if (result.failed.length) alert(result.failed.map((f) => `${f.id}: ${f.error}`).join("\n"));
       }
+      /**
+       * Hides every multi-selected squad from the current user's own view
+       * (RAL-331) in one batch request.
+       * @returns {Promise<void>}
+       */
+      async function bulkHideSquads() { await setSquadsHiddenBatch(true); }
+      /**
+       * Re-enables every multi-selected squad in the current user's own view
+       * (RAL-331) in one batch request.
+       * @returns {Promise<void>}
+       */
+      async function bulkUnhideSquads() { await setSquadsHiddenBatch(false); }
       // selection tabs / bulk actions (multi mode)
       /**
        * Focuses one multi-selected squad's details pane without changing the selection set.

@@ -758,9 +758,15 @@
         const items = [`<div data-click="renameSquad" data-squad-id="${esc(id)}" data-tip="Rename this squad — changes the display label only.">✎ Rename</div>`];
         const squadUri = `squad:${id}`;
         items.push(`<div data-click="toggleWatch" data-entity-uri="${esc(squadUri)}" data-tip="${isWatching(squadUri) ? "Stop receiving watcher notifications for this squad." : "Watch this whole squad and choose which mailbox priority tiers should notify you."}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
-        items.push(hiddenSquadIds.has(id)
-          ? `<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show this squad again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
-          : `<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide this squad from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
+        const menuBatchSize = (multiSel.has(id) && multiSel.size > 1) ? multiSel.size : 0;
+        if (menuBatchSize) {
+          items.push(`<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide all ${menuBatchSize} selected squads from your own view — they stay fully intact and keep running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide ${menuBatchSize}</div>`);
+          items.push(`<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show all ${menuBatchSize} selected squads again in your own view, if hidden.\nWho/when: use this to undo an earlier hide across a whole selection.\nA personal preference — it never affects what other users see.">👁 Unhide ${menuBatchSize}</div>`);
+        } else {
+          items.push(hiddenSquadIds.has(id)
+            ? `<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show this squad again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
+            : `<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide this squad from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
+        }
         if (r.state === "queued") items.push(`<div data-click="squadMenuActivate" data-squad-id="${esc(id)}" data-tip="Start this queued squad immediately — it was held with hold=true and is waiting to be scheduled.">▶ Run</div>`);
         if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div data-click="retrySquad" data-squad-id="${esc(id)}" data-tip="Re-run with the same parameters.\nA succeeded squad will prompt for extra confirmation since it may duplicate side effects.">↻ Retry</div>`);
         if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div data-click="restartSquad" data-squad-id="${esc(id)}" data-tip="Re-run this squad and mark all downstream squads as dirty so they re-run too.\nThis cannot be undone.">⟳ Restart + downstream</div>`);
