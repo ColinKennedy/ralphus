@@ -561,32 +561,32 @@ use; see `READ_ONLY_NOTE`.
 - ralphus --daemon-url [url] --json --version  {Submit and manage autonomous agent tasks against the ralphus daemon.}
     - agent  {Inspect agent backends ralphus can run.}
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
-    - cartographer --ascending --cell [str] --entity [str] --for [str] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
+    - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
-        - edit selector [str] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
-        - (read-only-safe) env selector [str] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
-        - open-agent selector [str]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
-        - remote-terminal selector [str]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
-        - restart selector [str]  {Restart a cell (and its downstream), dirtying dependent squads.}
-        - restart-proof selector [str] --from [index]  {Restart a cell's proof steps from an index onwards.}
-        - resume-automation selector [str]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
-        - (read-only-safe) reviews selector [str]  {The reviews this cell's branch participates in.}
-        - set-status selector [str] state [str]  {Manually override a cell's status.}
-        - (read-only-safe) show selector [str]  {Show a single cell's detail.}
-        - (read-only-safe) terminal selector [str] --mode [open|readonly]  {Print the command to resume a cell's conversation locally.}
-        - (read-only-safe) worktree selector [str]  {Show the worktree/project a cell is using.}
+        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
+        - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
+        - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
+        - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
+        - restart selector [uri]  {Restart a cell (and its downstream), dirtying dependent squads.}
+        - restart-proof selector [uri] --from [index]  {Restart a cell's proof steps from an index onwards.}
+        - resume-automation selector [uri]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
+        - (read-only-safe) reviews selector [uri]  {The reviews this cell's branch participates in.}
+        - set-status selector [uri] state [str]  {Manually override a cell's status.}
+        - (read-only-safe) show selector [uri]  {Show a single cell's detail.}
+        - (read-only-safe) terminal selector [uri] --mode [open|readonly]  {Print the command to resume a cell's conversation locally.}
+        - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
         - (read-only-safe) health --all-remotes --enable-developer-checks --json (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9).}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
-    - (read-only-safe) get selector [str] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
+    - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [str, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
-    - (read-only-safe) history selector [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
+    - (read-only-safe) history selector [uri]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
-    - (read-only-safe) listen selector [str] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
+    - (read-only-safe) listen selector [uri] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
         - cleanup machine [str] --branch [name] --project [name]  {Tear down one project's provisioned workspace on a machine provider -- the whole project directory, or just --branch's worktree (RAL-201, reshaped by RAL-355 Phase 2).}
         - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
@@ -599,8 +599,8 @@ use; see `READ_ONLY_NOTE`.
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
         - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: automatic creator watches and default notify tiers.}
         - set-preferences --auto-watch --no-auto-watch --tier [urgent|high|normal...] --user [name]  {Set a user's automatic-watch and default notification-tier preferences; requires exactly one of --auto-watch/--no-auto-watch (RAL-320).}
-        - unwatch entity_uri [str] --user [name]  {Stop watching an entity (RAL-343).}
-        - watch entity_uri [str] --tier [urgent|high|normal...] --user [name]  {Watch an entity so its notifications reach the personal mailbox; re-watching updates the notification tiers in place (RAL-343).}
+        - unwatch entity_uri [uri] --user [name]  {Stop watching an entity (RAL-343).}
+        - watch entity_uri [uri] --tier [urgent|high|normal...] --user [name]  {Watch an entity so its notifications reach the personal mailbox; re-watching updates the notification tiers in place (RAL-343).}
         - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-343).}
     - project  {Register and inspect projects known to the daemon.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
@@ -612,11 +612,11 @@ use; see `READ_ONLY_NOTE`.
         - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
     - proof  {Inspect and act on proof steps.}
-        - edit selector [str] --maximum-tool-output-tokens [tokens] --model [name]  {Edit a proof step's model/tool-output-cap overrides.}
-        - (read-only-safe) env selector [str]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
-        - restart selector [str]  {Restart this proof step (and any later ones in its scope).}
-        - set-status selector [str] state [str]  {Manually override a proof step's status.}
-        - (read-only-safe) show selector [str]  {Show a single proof step's detail.}
+        - edit selector [uri] --maximum-tool-output-tokens [tokens] --model [name]  {Edit a proof step's model/tool-output-cap overrides.}
+        - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
+        - restart selector [uri]  {Restart this proof step (and any later ones in its scope).}
+        - set-status selector [uri] state [str]  {Manually override a proof step's status.}
+        - (read-only-safe) show selector [uri]  {Show a single proof step's detail.}
     - queue  {Inspect and reorder the squad queue by priority.}
         - (read-only-safe) list --all  {List queued work items (ready-to-run by default).}
         - reorder paths [str...]  {Set the queue order to the given item paths (dependency-repaired).}
@@ -626,56 +626,56 @@ use; see `READ_ONLY_NOTE`.
     - retry squad_id [str]  {Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; Python's per-selector --environment/--env-file overrides are not yet ported.)}
     - review (subagent)  {Inspect and act on reviews (guardians).}
         - action  {User-declared [[review.action]] test/action hints.}
-            - (read-only-safe) list selector [str]  {List the action hints.}
-            - (read-only-safe) run selector [str] --index [integer] --input [name=value...]  {Print the command + cwd for a command-kind action hint.}
-        - add-branch selector [str] branch [str]  {Add a branch to a review.}
-        - approve selector [str]  {Approve a review that is in_review.}
+            - (read-only-safe) list selector [uri]  {List the action hints.}
+            - (read-only-safe) run selector [uri] --index [integer] --input [name=value...]  {Print the command + cwd for a command-kind action hint.}
+        - add-branch selector [uri] branch [str]  {Add a branch to a review.}
+        - approve selector [uri]  {Approve a review that is in_review.}
         - branch  {Enable/disable one review branch.}
-            - disable selector [str]  {Disable a branch and kick off the rebase.}
-            - enable selector [str]  {Enable a branch and kick off the rebase.}
-            - terminal selector [str] --mode [open|readonly]  {Print the command to resume a branch's conflict-resolver conversation locally.}
-        - build-env selector [str] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's build/check-gate step environment overrides.}
-        - cancel selector [str]  {Cancel a review.}
+            - disable selector [uri]  {Disable a branch and kick off the rebase.}
+            - enable selector [uri]  {Enable a branch and kick off the rebase.}
+            - terminal selector [uri] --mode [open|readonly]  {Print the command to resume a branch's conflict-resolver conversation locally.}
+        - build-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's build/check-gate step environment overrides.}
+        - cancel selector [uri]  {Cancel a review.}
         - checks  {LLM-synthesized manual review-verification commands.}
-            - (read-only-safe) list selector [str]  {List the manual checks.}
-            - (read-only-safe) run selector [str] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
-            - terminal selector [str] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
+            - (read-only-safe) list selector [uri]  {List the manual checks.}
+            - (read-only-safe) run selector [uri] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
+            - terminal selector [uri] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
         - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-auto-build --skip-worktrees  {Create a new review.}
-        - delete selector [str] --yes  {Delete a review and its worktrees.}
-        - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
-        - (read-only-safe) env selector [str] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
-        - feedback selector [str] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
-        - force-start selector [str]  {Disable not-yet-done branches and merge immediately (only while collecting).}
+        - delete selector [uri] --yes  {Delete a review and its worktrees.}
+        - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
+        - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
+        - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
+        - force-start selector [uri]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
-        - (read-only-safe) logs selector [str]  {Show a review's state-transition audit log.}
-        - manual-checks-env selector [str] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}
-        - merge selector [str]  {Start (or continue) the stacked rebase.}
-        - move-branch selector [str] to_review [str]  {Move a branch to another review, then rebuild both.}
+        - (read-only-safe) logs selector [uri]  {Show a review's state-transition audit log.}
+        - manual-checks-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}
+        - merge selector [uri]  {Start (or continue) the stacked rebase.}
+        - move-branch selector [uri] to_review [str]  {Move a branch to another review, then rebuild both.}
         - pr  {Submit/query pull requests for a review.}
             - (read-only-safe) comments pr_id [str]  {List a PR's comments/notes.}
             - (read-only-safe) find forge [github|gitlab] repo [str] pr_number [integer]  {Look up the ralphus PR row for a forge PR/MR number.}
-            - (read-only-safe) list selector [str]  {List PRs submitted for a review.}
+            - (read-only-safe) list selector [uri]  {List PRs submitted for a review.}
             - pull-feedback pr_id [str]  {Action a PR's un-actioned feedback into the owning review worktree.}
             - pull-from-pr pr_id [str]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
             - (read-only-safe) show pr_id [str]  {Show one PR row.}
-            - submit selector [str] --alias [name] --allow-unlinked-fork --combined --description [text] --position [integer] --title [text] --use-worktree-branch-name  {Submit a PR/MR for one stacked branch or the combined worktree. --allow-unlinked-fork (RAL-338) downgrades a definite "no forge relationship" fork pre-flight result from a hard error to a logged warning; ignored for a project with no registered fork.}
-            - unlink selector [str]  {Bulk-drop every currently open PR row for a review and clear its registered forge PR stack number, so a later submission starts a fresh stack instead of appending to one whose PRs were just unlinked (RAL-317).}
+            - submit selector [uri] --alias [name] --allow-unlinked-fork --combined --description [text] --position [integer] --title [text] --use-worktree-branch-name  {Submit a PR/MR for one stacked branch or the combined worktree. --allow-unlinked-fork (RAL-338) downgrades a definite "no forge relationship" fork pre-flight result from a hard error to a logged warning; ignored for a project with no registered fork.}
+            - unlink selector [uri]  {Bulk-drop every currently open PR row for a review and clear its registered forge PR stack number, so a later submission starts a fresh stack instead of appending to one whose PRs were just unlinked (RAL-317).}
             - update pr_id [str] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
-        - rename selector [str] name [str]  {Rename a review.}
-        - reopen selector [str]  {Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.}
-        - reorder selector [str] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
-        - restart-merge selector [str]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
-        - (read-only-safe) show selector [str]  {Show a single review's detail.}
-        - squash selector [str] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
-        - (read-only-safe) status selector [str]  {Per-branch readiness + a summary verdict ('is this review ready?').}
-        - stop-merge selector [str]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
-        - sync-pr selector [str]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
+        - rename selector [uri] name [str]  {Rename a review.}
+        - reopen selector [uri]  {Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.}
+        - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
+        - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
+        - settings selector [uri] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - (read-only-safe) show selector [uri]  {Show a single review's detail.}
+        - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
+        - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
+        - stop-merge selector [uri]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
+        - sync-pr selector [uri]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
         - upstream  {Inspect/change a review's upstream branch.}
-            - (read-only-safe) list selector [str]  {List candidate upstream branches.}
-            - set selector [str] branch [str]  {Change the upstream branch.}
+            - (read-only-safe) list selector [uri]  {List candidate upstream branches.}
+            - set selector [uri] branch [str]  {Change the upstream branch.}
         - (read-only-safe) worktree-retirements --state [scheduled|eligible|claimed|failed|retired]  {List review worktrees across every review by retirement state -- scheduled, eligible, claimed, failed, retired -- with failure context and the eligible-at timestamp. Repeat --state to filter (no --state lists everything).}
-        - (read-only-safe) worktrees selector [str]  {The worktrees/branches this review consumes.}
+        - (read-only-safe) worktrees selector [uri]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}
     - squad  {Inspect and act on squads.}
@@ -695,11 +695,11 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) status squad_id [str, optional] --concurrency  {Show squad status from the daemon.}
     - submit file [str...] --activate --hold --label [text] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
-        - edit selector [str] --model [name] --name [name] --project [name]  {Edit a task node's name/project/model.}
-        - (read-only-safe) env selector [str] --scope [task|proof]  {List a task's resolved environment variables, read-only (RAL-324); --scope proof shows what its task-scoped proof steps inherit.}
-        - restart-proof selector [str] --from [index]  {Restart a task's proof steps from an index onwards.}
-        - set-status selector [str] state [str]  {Manually override a task's status.}
-        - (read-only-safe) show selector [str]  {Show a single task node's detail.}
+        - edit selector [uri] --model [name] --name [name] --project [name]  {Edit a task node's name/project/model.}
+        - (read-only-safe) env selector [uri] --scope [task|proof]  {List a task's resolved environment variables, read-only (RAL-324); --scope proof shows what its task-scoped proof steps inherit.}
+        - restart-proof selector [uri] --from [index]  {Restart a task's proof steps from an index onwards.}
+        - set-status selector [uri] state [str]  {Manually override a task's status.}
+        - (read-only-safe) show selector [uri]  {Show a single task node's detail.}
     - triage  {Register and inspect Triage types -- the Arbiter subsystem's automatic-review classification categories (RAL-318).}
         - pool  {Inspect and configure Triage auto-review pools (RAL-318).}
             - (read-only-safe) list  {List every Triage pool key with pooled cells and/or a configured count threshold, plus its resolved project name (RAL-318).}
