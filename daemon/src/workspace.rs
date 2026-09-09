@@ -361,6 +361,41 @@ impl Workspace {
         f(&provider, &spec)
     }
 
+    /// Retire the worktree at `path` in this workspace (RAL-386).
+    ///
+    /// The abstraction the daily worktree-retirement sweep
+    /// (`guardian_merge::retire_stale_worktrees`) uses instead of calling
+    /// [`Self::git`] directly, so local and remote retirement share one seam
+    /// the way every other operation on this type already does. A local
+    /// workspace runs exactly the `git worktree remove` it always did --
+    /// unaffected by, and unaware of, anything RAL-386 added. A remote one
+    /// asks the machine's provider via its `retire` verb, whose default for
+    /// a provider that has never heard of it is a safe
+    /// [`RetirementOutcome::OptedOut`], never a silent deletion attempt
+    /// against an unrelated verb.
+    #[must_use]
+    pub fn retire_worktree(&self, path: &str) -> crate::remote_runner::RetirementOutcome {
+        use crate::remote_runner::RetirementOutcome;
+        match &self.machine {
+            None => match crate::guardian_merge::git(
+                &self.root,
+                &["worktree", "remove", "--force", "--force", path],
+            ) {
+                Ok(_) => RetirementOutcome::Removed,
+                Err(error) => RetirementOutcome::Failed { error },
+            },
+            Some(_) => {
+                let req = crate::remote_runner::RetireRequest {
+                    path: path.to_string(),
+                };
+                match self.with_provider(|p, spec| p.retire(&req, spec)) {
+                    Ok(outcome) => outcome,
+                    Err(error) => RetirementOutcome::Failed { error },
+                }
+            }
+        }
+    }
+
     /// Dispatch a git command to a remote machine's provider.
     ///
     /// Deliberately kept out of [`Self::git`]'s hot path so the local case is a
@@ -537,5 +572,69 @@ echo {json}
         assert!(err.contains("git status"), "must name the command: {err}");
         assert!(err.contains("exit 1"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_script(dir: &Path, json: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let (script, body) = if cfg!(windows) {
+            (dir.join("p.cmd"), format!("@echo off\r\necho {json}\r\n"))
+        } else {
+            (dir.join("p.sh"), format!("#!/bin/sh\necho '{json}'\n"))
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    #[test]
+    fn retire_worktree_dispatches_to_the_providers_retire_verb() {
+        // RAL-386: the abstraction seam a remote worktree's automatic
+        // retirement goes through -- proves it actually reaches the
+        // machine's provider via `retire` rather than attempting a local
+        // `git worktree remove` against a path that isn't on this host.
+        let dir = std::env::temp_dir().join(format!("ral386-ws-retire-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"outcome":"deferred","reason":"still in use","retry_at_ms":99}"#,
+        );
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/remote/repo", Some("ib:A")).with_store(store);
+        let outcome = ws.retire_worktree("/remote/repo/worktrees/feat");
+        assert_eq!(
+            outcome,
+            crate::remote_runner::RetirementOutcome::Deferred {
+                retry_at_ms: Some(99),
+                reason: Some("still in use".to_string()),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retire_worktree_on_an_unregistered_remote_machine_fails_rather_than_running_locally() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let ws = Workspace::on("/remote/repo", Some("ghostfarm:A")).with_store(store);
+        match ws.retire_worktree("/remote/repo/worktrees/feat") {
+            crate::remote_runner::RetirementOutcome::Failed { error } => {
+                assert!(error.contains("ghostfarm"), "{error}");
+            }
+            other => panic!("must fail rather than silently succeed or opt out: {other:?}"),
+        }
     }
 }

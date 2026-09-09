@@ -2489,8 +2489,18 @@ fn render_review_worktrees(g: &Value) {
     crate::output::print_table(&["POS", "BRANCH", "WORKTREE", "SOURCE"], &rows);
 }
 
-/// RAL-385: every retirement state the view can report, in lifecycle order.
-const STATES: [&str; 5] = ["scheduled", "eligible", "claimed", "failed", "retired"];
+/// RAL-385: every retirement state the view can report, in lifecycle order
+/// (RAL-386 added `deferred`/`opted_out` for machine-provider-backed
+/// worktrees).
+const STATES: [&str; 7] = [
+    "scheduled",
+    "eligible",
+    "claimed",
+    "failed",
+    "deferred",
+    "opted_out",
+    "retired",
+];
 
 /// RAL-385: the cross-review retirement view. `states` is the caller's
 /// repeatable `--state` filter (empty = every state).

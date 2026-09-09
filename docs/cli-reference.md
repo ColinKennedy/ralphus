@@ -674,7 +674,7 @@ use; see `READ_ONLY_NOTE`.
         - upstream  {Inspect/change a review's upstream branch.}
             - (read-only-safe) list selector [uri]  {List candidate upstream branches.}
             - set selector [uri] branch [str]  {Change the upstream branch.}
-        - (read-only-safe) worktree-retirements --state [scheduled|eligible|claimed|failed|retired]  {List review worktrees across every review by retirement state -- scheduled, eligible, claimed, failed, retired -- with failure context and the eligible-at timestamp. Repeat --state to filter (no --state lists everything).}
+        - (read-only-safe) worktree-retirements --state [scheduled|eligible|claimed|failed|deferred|opted_out|retired]  {List review worktrees across every review by retirement state -- scheduled, eligible, claimed, failed, deferred, opted_out, retired -- with failure context and the eligible-at timestamp. Repeat --state to filter (no --state lists everything).}
         - (read-only-safe) worktrees selector [uri]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}

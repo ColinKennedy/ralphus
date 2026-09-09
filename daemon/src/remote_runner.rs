@@ -90,6 +90,18 @@ pub const VERB_CANCEL: &str = "cancel";
 /// since RAL-185 Phase 1, but had no daemon-side dispatch until now.
 pub const VERB_CLEANUP: &str = "cleanup";
 
+/// The `retire` verb (RAL-386): decide, and possibly carry out, one
+/// automatic worktree-retirement attempt.
+///
+/// Unlike [`VERB_CLEANUP`], this **is** called automatically -- once a day,
+/// per stale review worktree on a machine-backed provider, from
+/// `guardian_merge::retire_stale_worktrees`. Optional: a provider that does
+/// not implement it is not a hard failure, the same way an unanswered
+/// `capabilities` call isn't -- [`ProviderRunner::retire`] treats "does not
+/// implement" as [`RetirementOutcome::OptedOut`], the safe default for a
+/// provider nobody has taught about automatic retirement yet.
+pub const VERB_RETIRE: &str = "retire";
+
 /// How often an async `exec` handle is polled for status/output.
 ///
 /// Fast enough that Live View feels live, slow enough not to hammer a provider
@@ -215,6 +227,58 @@ pub struct CleanupRequest {
     pub remote_root: Option<String>,
 }
 
+/// The payload sent to a provider's `retire` verb (RAL-386).
+///
+/// Unlike [`CleanupRequest`] (project/clone-URL/branch identity, resolving a
+/// workspace through the durable `provision` layout), this names the exact
+/// worktree path the daemon already has on file -- the same address
+/// [`FileRequest`]/`remove-path` use. `retire` runs automatically, once a
+/// day, against whatever a review worktree's `Workspace` actually resolved
+/// to; re-deriving that path from project identity would risk disagreeing
+/// with it, and the whole point of automatic retirement is never acting on
+/// the wrong directory.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetireRequest {
+    /// Absolute path, **on the provider's machine**, of the worktree to
+    /// retire.
+    pub path: String,
+}
+
+/// What a provider (or, for [`RetirementOutcome::Failed`], a raw git/transport
+/// failure) decided about one automatic retirement attempt (RAL-386).
+///
+/// Distinct from [`Result<String, String>`][Result] the way [`cleanup`]
+/// reports itself, because retirement is unattended and daily: a provider
+/// needs to be able to say "not yet, ask again later" or "never, by design"
+/// without either being folded into the same generic-failure bucket a real
+/// error lands in (`docs/machine-providers.md`'s "The `retire` verb").
+///
+/// [`cleanup`]: ProviderRunner::cleanup
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetirementOutcome {
+    /// The worktree is gone.
+    Removed,
+    /// Not removed, but not a failure: the provider asked to be tried again
+    /// later (e.g. a workspace is still in active use by something the
+    /// daemon does not know about). Retried on the sweep's normal daily
+    /// cadence regardless -- `retry_at_ms` is a display hint, not a
+    /// schedule the sweep honours precisely.
+    Deferred {
+        retry_at_ms: Option<i64>,
+        reason: Option<String>,
+    },
+    /// The provider (or a static `[machine.targets.*.retirement]` policy,
+    /// checked before the provider is ever asked) declines to ever retire
+    /// this worktree automatically. Never reported as a generic cleanup
+    /// failure -- an operator reading the retirement view should be able to
+    /// tell "nobody is trying" from "something is broken" at a glance.
+    OptedOut { reason: Option<String> },
+    /// An attempt was made and it failed outright (a provider's own refusal,
+    /// or a transport/invocation error reaching it). Retried on the next
+    /// daily sweep, same as a local `git worktree remove` failure always was.
+    Failed { error: String },
+}
+
 /// Runner policy resolved from `[machine.targets.*]` for provider use.
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetRunnerConfig {
@@ -316,6 +380,17 @@ struct ProviderResponse {
     /// `capabilities` only.
     #[serde(default)]
     capabilities: Option<Capabilities>,
+    /// `retire` only: `"removed"`, `"deferred"`, or `"opted_out"` (RAL-386).
+    #[serde(default)]
+    outcome: Option<String>,
+    /// `retire` only: human-readable context for a `deferred`/`opted_out`
+    /// outcome.
+    #[serde(default)]
+    reason: Option<String>,
+    /// `retire` only: a `deferred` outcome's hint of when to try again.
+    /// Display-only -- see [`RetirementOutcome::Deferred`].
+    #[serde(default)]
+    retry_at_ms: Option<i64>,
 }
 
 /// Runs cells on one machine by invoking a registered provider program.
@@ -1040,6 +1115,59 @@ impl ProviderRunner {
             .map_err(|e| format!("could not serialize cleanup request: {e}"))?;
         let resp = self.invoke(VERB_CLEANUP, &payload, spec)?;
         Ok(resp.removed)
+    }
+}
+
+impl ProviderRunner {
+    /// Ask this machine's provider to retire one worktree (RAL-386).
+    ///
+    /// `Ok` never carries a failure -- a provider's own refusal to run the
+    /// verb at all, or any transport problem reaching it, is an `Err`, same
+    /// as every other verb here. An unimplemented verb is the one exception:
+    /// it reads as [`RetirementOutcome::OptedOut`] rather than an error, the
+    /// same "optional verb" treatment [`Self::capabilities`] already gives
+    /// unimplemented verbs, and for the same reason (RAL-386's own design
+    /// interview): an existing provider that predates this feature must
+    /// default to leaving remote worktrees alone, not to an alarming stream
+    /// of daily "cleanup failed" reports for a verb it was never asked to
+    /// support.
+    ///
+    /// # Errors
+    /// The provider's own refusal reason, or a transport failure reaching
+    /// it, verbatim -- or a description of the reply itself being malformed
+    /// (missing/unrecognized `outcome`), which is a provider bug, not a
+    /// worktree that failed to retire.
+    pub fn retire(
+        &self,
+        req: &RetireRequest,
+        spec: &RunnerSpec,
+    ) -> Result<RetirementOutcome, String> {
+        let payload = serde_json::to_string(req)
+            .map_err(|e| format!("could not serialize retire request: {e}"))?;
+        match self.invoke(VERB_RETIRE, &payload, spec) {
+            Ok(resp) => match resp.outcome.as_deref() {
+                Some("removed") => Ok(RetirementOutcome::Removed),
+                Some("deferred") => Ok(RetirementOutcome::Deferred {
+                    retry_at_ms: resp.retry_at_ms,
+                    reason: resp.reason,
+                }),
+                Some("opted_out") => Ok(RetirementOutcome::OptedOut {
+                    reason: resp.reason,
+                }),
+                Some(other) => Err(format!(
+                    "provider returned an unrecognized retire outcome {other:?}"
+                )),
+                None => Err("provider's retire reply is missing \"outcome\"".to_string()),
+            },
+            Err(e) if e.contains("does not implement") => Ok(RetirementOutcome::OptedOut {
+                reason: Some(
+                    "provider does not implement automatic worktree retirement (\"retire\"); \
+                     see docs/machine-providers.md"
+                        .to_string(),
+                ),
+            }),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -2753,6 +2881,119 @@ else:
         // own reason verbatim, not a swallowed/generic failure, since nothing
         // on the daemon side tracks the workspace to retry against.
         assert!(err.contains("workspace busy"), "{err}");
+    }
+
+    fn retire_req(path: &str) -> RetireRequest {
+        RetireRequest {
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn retire_reports_removed_deferred_and_opted_out() {
+        let removed = fake_provider(
+            "retire-removed",
+            r#"{"ok":true,"protocol_version":1,"outcome":"removed"}"#,
+            &[],
+        );
+        let provider =
+            ProviderRunner::new(removed.to_string_lossy().into_owned(), vec![], "ct", "A");
+        assert_eq!(
+            provider
+                .retire(&retire_req("/srv/wt/a"), &spec(Some("ct:A")))
+                .expect("ok:true must succeed"),
+            RetirementOutcome::Removed
+        );
+
+        let deferred = fake_provider(
+            "retire-deferred",
+            r#"{"ok":true,"protocol_version":1,"outcome":"deferred","reason":"still in use","retry_at_ms":42}"#,
+            &[],
+        );
+        let provider =
+            ProviderRunner::new(deferred.to_string_lossy().into_owned(), vec![], "ct", "B");
+        assert_eq!(
+            provider
+                .retire(&retire_req("/srv/wt/b"), &spec(Some("ct:B")))
+                .expect("a deferred outcome is not an error"),
+            RetirementOutcome::Deferred {
+                retry_at_ms: Some(42),
+                reason: Some("still in use".to_string()),
+            }
+        );
+
+        let opted_out = fake_provider(
+            "retire-opted-out",
+            r#"{"ok":true,"protocol_version":1,"outcome":"opted_out","reason":"policy"}"#,
+            &[],
+        );
+        let provider =
+            ProviderRunner::new(opted_out.to_string_lossy().into_owned(), vec![], "ct", "C");
+        assert_eq!(
+            provider
+                .retire(&retire_req("/srv/wt/c"), &spec(Some("ct:C")))
+                .expect("an opted-out outcome is not an error"),
+            RetirementOutcome::OptedOut {
+                reason: Some("policy".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn retire_from_a_provider_that_does_not_implement_the_verb_opts_out_safely() {
+        // RAL-386's core safety property: an existing provider that predates
+        // this feature must never have a remote worktree deleted out from
+        // under it just because the daemon learned a new verb.
+        let unimplemented = fake_provider(
+            "retire-unimplemented",
+            r#"{"ok":false,"protocol_version":1,"error":"some-provider does not implement \"retire\"; see docs/machine-providers.md for its supported verbs"}"#,
+            &[],
+        );
+        let provider = ProviderRunner::new(
+            unimplemented.to_string_lossy().into_owned(),
+            vec![],
+            "ct",
+            "A",
+        );
+        let outcome = provider
+            .retire(&retire_req("/srv/wt/a"), &spec(Some("ct:A")))
+            .expect("an unimplemented verb must not be an error");
+        assert_eq!(
+            outcome,
+            RetirementOutcome::OptedOut {
+                reason: Some(
+                    "provider does not implement automatic worktree retirement (\"retire\"); \
+                     see docs/machine-providers.md"
+                        .to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn retire_reports_a_genuine_provider_failure_and_a_malformed_reply() {
+        let fail = fake_provider(
+            "retire-fail",
+            r#"{"ok":false,"protocol_version":1,"error":"permission denied"}"#,
+            &[],
+        );
+        let provider = ProviderRunner::new(fail.to_string_lossy().into_owned(), vec![], "ct", "A");
+        let err = provider
+            .retire(&retire_req("/srv/wt/a"), &spec(Some("ct:A")))
+            .expect_err("a provider replying ok:false must surface its reason");
+        assert!(err.contains("permission denied"), "{err}");
+
+        let malformed = fake_provider(
+            "retire-malformed",
+            r#"{"ok":true,"protocol_version":1,"outcome":"sideways"}"#,
+            &[],
+        );
+        let provider =
+            ProviderRunner::new(malformed.to_string_lossy().into_owned(), vec![], "ct", "B");
+        let err = provider
+            .retire(&retire_req("/srv/wt/a"), &spec(Some("ct:B")))
+            .expect_err("an unrecognized outcome must be a reported error, not a silent no-op");
+        assert!(err.contains("sideways"), "{err}");
     }
 
     #[test]

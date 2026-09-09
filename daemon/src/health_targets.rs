@@ -330,6 +330,7 @@ mod tests {
             runner_command: "ralphus-runner".to_string(),
             runner_artifacts: std::collections::BTreeMap::new(),
             agent_executables: std::collections::BTreeMap::new(),
+            retirement_opt_out: false,
         }
     }
 
