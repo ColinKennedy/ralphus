@@ -5177,7 +5177,6 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 };
                 promote_branch_terminal(
                     store,
-                    runner,
                     id,
                     &ob.id,
                     status,
@@ -5695,7 +5694,7 @@ pub fn run_feedback(
     // `promote_branch_terminal`/`fail_branch`'s existing split: auto-submit
     // follows a real terminal success, never a failure.
     if branch_status == MergeStatus::Done {
-        crate::pr::maybe_auto_submit_branch(store, runner, id, branch_id);
+        crate::pr::schedule_auto_submit_branch(store, id, branch_id);
         // RAL-375: a feedback push onto a branch that already has (or just
         // gained, via the auto-submit call just above) an open PR should
         // start watching that PR's CI/mergeability -- gated on `pushed`
@@ -6195,14 +6194,17 @@ fn filter_by_idle_cadence(candidates: &[(String, String)]) -> Vec<String> {
 /// Releases a claim from one of the in-flight sets on drop, so an early
 /// `return` inside a worker cannot strand an id and lock that guardian out of
 /// all future passes.
-struct InFlightClaim {
+pub(crate) struct InFlightClaim {
     set: &'static LazyLock<Mutex<HashSet<String>>>,
     id: String,
 }
 
 impl InFlightClaim {
     /// Claims `id` in `set`, or returns `None` when it is already claimed.
-    fn acquire(set: &'static LazyLock<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+    pub(crate) fn acquire(
+        set: &'static LazyLock<Mutex<HashSet<String>>>,
+        id: &str,
+    ) -> Option<Self> {
         if set.lock().expect("poisoned").insert(id.to_string()) {
             Some(Self {
                 set,
@@ -6845,7 +6847,6 @@ fn stack_pick(
             };
             promote_branch_terminal(
                 store,
-                runner,
                 id,
                 branch_id,
                 status,
@@ -8066,18 +8067,15 @@ pub(crate) fn worktree_retirement_view(
 
 /// RAL-317: record a branch's terminal (`Done`/`ConflictResolved`) merge
 /// outcome and, if the review's effective `auto_submit_pr_stack` setting is
-/// on, auto-submit/grow its PR stack to include the newly-terminal branch.
+/// on, queue its PR stack to include the newly-terminal branch.
 /// Shared by every site that can move a branch to a terminal status --
 /// `stack_pick` (the real per-branch stacked-rebase path `run_merge_staged`
 /// drives) and `run_merge_shared`'s legacy/shared-worktree fallback -- so the
-/// auto-submit hook is written once rather than duplicated per call site. The
-/// PR-stack side effect (`crate::pr::maybe_auto_submit_branch`) is a
-/// best-effort side channel: it never fails or blocks this transition, and
-/// any failure is recorded per-branch (`BranchView::auto_submit_error`)
-/// rather than surfaced here.
+/// auto-submit hook is written once rather than duplicated per call site.
+/// RAL-389 defers the push and forge work to the durable debounce sweep, so
+/// this transition never blocks on network round trips.
 fn promote_branch_terminal(
     store: &Arc<Mutex<Store>>,
-    runner: &dyn Runner,
     id: &str,
     branch_id: &str,
     status: MergeStatus,
@@ -8091,7 +8089,7 @@ fn promote_branch_terminal(
             let _ = guard.set_branch_resolver_session_id(id, branch_id, sid);
         }
     }
-    crate::pr::maybe_auto_submit_branch(store, runner, id, branch_id);
+    crate::pr::schedule_auto_submit_branch(store, id, branch_id);
 }
 
 /// Mark a branch failed and the guardian merge-failed with a reason.

@@ -1232,21 +1232,12 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
         .id
         .clone();
 
-    // The initial merge above already ran the terminal-transition auto-submit
-    // hook once (and, against this local-bare-repo "origin", already failed
-    // to resolve a forge host). Clear that marker so the assertion below can
-    // only pass because `run_feedback` re-fires the hook itself, not because
-    // of leftover state from the merge that happened before it.
-    store
-        .lock()
-        .unwrap()
-        .set_branch_auto_submit_error(&id, &bid0, None)
-        .unwrap();
+    // RAL-389 queues terminal transitions without running forge work inline.
     assert!(
         store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
             .auto_submit_error
             .is_none(),
-        "precondition: no stale auto-submit marker before feedback"
+        "precondition: no auto-submit work ran synchronously"
     );
 
     run_feedback(
@@ -1259,6 +1250,17 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
         &CancelToken::never(),
     );
 
+    let due = store
+        .lock()
+        .unwrap()
+        .take_due_auto_submits(i64::MAX / 2, 0)
+        .unwrap();
+    assert_eq!(
+        due,
+        vec![id.clone()],
+        "feedback must queue the PR auto-submit hook"
+    );
+    ralphus_daemon::pr::maybe_auto_submit_branch(&store, &NoopRunner, &id, &bid0);
     let view = store.lock().unwrap().get_guardian(&id).unwrap();
     let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
     assert!(
@@ -1271,9 +1273,85 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
     );
     assert!(
         view.branches[0].auto_submit_error.is_some(),
-        "feedback that pushes a new commit must re-trigger the PR auto-submit \
-         hook, not just push the internal review branch"
+        "the queued PR auto-submit must reach the normal submission path"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+fn auto_submit_debounce_runs_off_thread_for_every_terminal_branch() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    for name in ["a", "b", "c"] {
+        git(&root, &["checkout", "-b", &format!("feature/{name}")]);
+        write(&root, &format!("{name}.txt"), &format!("from {name}\n"));
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("add {name}")]);
+        git(&root, &["checkout", "main"]);
+    }
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let guard = store.lock().unwrap();
+        let id = guard
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        for name in ["a", "b", "c"] {
+            guard
+                .add_guardian_branch(&id, &format!("feature/{name}"))
+                .unwrap();
+        }
+        guard
+            .set_guardian_auto_submit_pr_stack(&id, Some(true))
+            .unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert_eq!(view.branches.len(), 3);
+    assert!(
+        view.branches
+            .iter()
+            .all(|branch| branch.auto_submit_error.is_none()),
+        "merge must not run PR submission synchronously"
+    );
+
+    std::thread::sleep(Duration::from_millis(500));
+    ralphus_daemon::pr::sweep_pending_pr_auto_submits_once(&store);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let view = store.lock().unwrap().get_guardian(&id).unwrap();
+        if view
+            .branches
+            .iter()
+            .all(|branch| branch.auto_submit_error.is_some())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "asynchronous submission did not process every terminal branch: {:?}",
+            view.branches
+                .iter()
+                .map(|branch| (&branch.id, &branch.auto_submit_error))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);

@@ -4295,6 +4295,107 @@ pub fn maybe_auto_submit_branch(
     }
 }
 
+/// RAL-389: trailing-debounce window that coalesces branches completing in
+/// the same restack pass before PR submission begins off-thread.
+const AUTO_SUBMIT_DEBOUNCE_MS: i64 = 400;
+
+/// Queue a guardian for asynchronous PR-stack submission. The durable row is
+/// guardian-scoped; the worker reads the terminal branches fresh when it runs.
+pub(crate) fn schedule_auto_submit_branch(store: &Arc<Mutex<Store>>, id: &str, branch_id: &str) {
+    if let Err(e) = store
+        .lock()
+        .expect("poisoned")
+        .request_auto_submit_branch(id, now_ms())
+    {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} branch {branch_id} failed to queue auto-submit request: {e}"
+        );
+    }
+}
+
+/// Guardian ids currently being processed by the asynchronous auto-submit
+/// sweep. The claim prevents later ticks from racing a slow forge operation.
+static AUTO_SUBMIT_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Claim due requests and process each guardian on its own background thread.
+/// Every enabled terminal branch receives the normal stack-aware submission
+/// path, preserving the review's linear PR/MR chain.
+pub fn sweep_pending_pr_auto_submits_once(store: &Arc<Mutex<Store>>) {
+    let due = match store
+        .lock()
+        .expect("poisoned")
+        .take_due_auto_submits(now_ms(), AUTO_SUBMIT_DEBOUNCE_MS)
+    {
+        Ok(due) => due,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [pr] auto-submit sweep: listing due guardians failed: {e}"
+            );
+            return;
+        }
+    };
+    for id in due {
+        let Some(claim) = guardian_merge::InFlightClaim::acquire(&AUTO_SUBMIT_IN_FLIGHT, &id)
+        else {
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .request_auto_submit_branch(&id, now_ms());
+            continue;
+        };
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            let _claim = claim;
+            let branch_ids: Vec<String> = match store.lock().expect("poisoned").get_guardian(&id) {
+                Ok(g) => g
+                    .branches
+                    .iter()
+                    .filter(|b| {
+                        b.enabled && matches!(b.merge_status.as_str(), "done" | "conflict_resolved")
+                    })
+                    .map(|b| b.id.clone())
+                    .collect(),
+                Err(_) => return,
+            };
+            let runner = crate::runner::SubprocessRunner::from_env();
+            for branch_id in branch_ids {
+                maybe_auto_submit_branch(&store, &runner, &id, &branch_id);
+            }
+        });
+    }
+}
+
+/// Re-queue eligible terminal branches at startup, closing the crash window
+/// between their terminal-status update and durable request insertion.
+pub fn recover_pending_auto_submits_on_startup(store: &Arc<Mutex<Store>>) {
+    let guard = store.lock().expect("poisoned");
+    let guardians = match guard.list_guardians() {
+        Ok(guardians) => guardians,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [pr] auto-submit startup recovery: listing guardians failed: {e}"
+            );
+            return;
+        }
+    };
+    let now = now_ms();
+    for guardian in guardians {
+        if !guardian.effective_auto_submit_pr_stack {
+            continue;
+        }
+        let has_terminal = guardian.branches.iter().any(|branch| {
+            branch.enabled && matches!(branch.merge_status.as_str(), "done" | "conflict_resolved")
+        });
+        if has_terminal {
+            let _ = guard.request_auto_submit_branch(&guardian.id, now);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn submit_pull_requests_inner(
     store: &Arc<Mutex<Store>>,
@@ -9917,6 +10018,48 @@ mod tests {
             .unwrap();
         let tip = g(root, &["rev-parse", "feature/x"]).trim().to_string();
         (gid, bid, tip)
+    }
+
+    #[test]
+    fn startup_recovery_queues_terminal_auto_submit_guardian() {
+        let root = setup_auto_submit_repo("recovery-queues");
+        let store = Arc::new(Mutex::new(store()));
+        let (id, _branch_id, _tip) = setup_terminal_branch(&store, &root, true);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .take_due_auto_submits(i64::MAX / 2, 0)
+                .unwrap()
+                .is_empty()
+        );
+        recover_pending_auto_submits_on_startup(&store);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .take_due_auto_submits(i64::MAX / 2, 0)
+                .unwrap(),
+            vec![id]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_recovery_ignores_guardian_with_auto_submit_off() {
+        let root = setup_auto_submit_repo("recovery-ignores-off");
+        let store = Arc::new(Mutex::new(store()));
+        setup_terminal_branch(&store, &root, false);
+        recover_pending_auto_submits_on_startup(&store);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .take_due_auto_submits(i64::MAX / 2, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
