@@ -182,6 +182,18 @@
           byId("tab-" + t).style.display = currentUserIsAdmin ? "" : "none";
         }
       }
+      // RALPHUS-WHOAMI-POLL-SEQ:BEGIN
+      /**
+       * Monotonic sequence over `pollWhoAmI` invocations (RAL-390, same
+       * latest-wins pattern `reviewPollSeq` proved out for `pollReviews`,
+       * RAL-382) -- a call that is no longer the freshest abandons itself
+       * instead of overwriting a newer poll's identity/admin state, so a
+       * stale "not admin" response can never land after a fresher "is
+       * admin" one and blink the admin-only tabs back out.
+       */
+      let whoAmIPollSeq = 0;
+      // RALPHUS-WHOAMI-POLL-SEQ:END
+      // RALPHUS-WHOAMI-POLL:BEGIN
       /**
        * Polls `GET /api/whoami` (RAL-332) for the caller's own resolved
        * identity and admin flag, and applies admin-only tab visibility.
@@ -190,20 +202,24 @@
        * @returns {Promise<void>}
        */
       async function pollWhoAmI() {
+        const seq = ++whoAmIPollSeq;
         try {
           const res = await fetch("/api/whoami");
           if (!res.ok) return;
           /** @type {WhoAmI} */
           const d = await res.json();
+          if (seq !== whoAmIPollSeq) return; // superseded -- a newer poll's identity wins
           currentUserName = d.name;
           currentUserIsAdmin = d.is_admin;
           whoAmIResolved = true;
         } catch (e) { /* transient -- the next tick retries */ }
+        if (seq !== whoAmIPollSeq) return;
         applyAdminTabVisibility();
         // A non-admin whose admin flag was just revoked mid-session should
         // not stay parked on a page it can no longer fetch.
         if (whoAmIResolved && !currentUserIsAdmin && ADMIN_ONLY_TABS.includes(tab)) showTab("squads", true);
       }
+      // RALPHUS-WHOAMI-POLL:END
 
       // ---------- hash routing ----------
       // RAL-188 §C.8: the board *produces* the ralphus URI form and accepts it

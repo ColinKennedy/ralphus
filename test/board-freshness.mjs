@@ -7,7 +7,11 @@
 // regions are the shipped code itself, so the tests can't silently drift from
 // what the librarian serves. `markUpdated`/`markUnreachable` (20-util.js) are
 // pulled in by their real source rather than hand-reimplemented, so a change
-// to either can't drift unnoticed from what these tests exercise.
+// to either can't drift unnoticed from what these tests exercise -- still
+// true for `pollTasksTab`; `updateCounter` inlines their effect directly
+// instead of calling them (RAL-390, see ./board-tasks-poll.mjs), so it also
+// needs the shared `RALPHUS-TASKS-POLL-SEQ` region (`fetchTasksShared`) that
+// region's sandbox pulls in alongside it.
 
 import { boardScript } from "./board-source.mjs";
 
@@ -35,6 +39,7 @@ function constSourceOf(name) {
 const FRESHNESS_HELPERS_SRC = `${constSourceOf("markUpdated")}\n${constSourceOf("markUnreachable")}`;
 
 const REGIONS = {
+  tasksSeqDecl: ["// RALPHUS-TASKS-POLL-SEQ:BEGIN", "// RALPHUS-TASKS-POLL-SEQ:END"],
   updateCounter: ["// RALPHUS-UPDATE-COUNTER:BEGIN", "// RALPHUS-UPDATE-COUNTER:END"],
   pollTasksTab: ["// RALPHUS-POLL-TASKS-TAB:BEGIN", "// RALPHUS-POLL-TASKS-TAB:END"],
 };
@@ -76,6 +81,7 @@ export function makeUpdateCounter() {
      const fetch = fetchImpl;
      var squads = [];
      ${FRESHNESS_HELPERS_SRC}
+     ${sliceRegion(REGIONS.tasksSeqDecl)}
      ${sliceRegion(REGIONS.updateCounter)}
      return {
        updateCounter,
