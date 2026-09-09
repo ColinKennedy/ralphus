@@ -158,6 +158,7 @@
         else if (tab === "triage") { await updateCounter(); await pollTriage(); }
         else if (tab === "users") { await updateCounter(); await pollUsers(); }
         else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
+        else if (tab === "worktree-retirement") { await updateCounter(); await pollWorktreeRetirements(); }
         else if (tab === "prefs") { await updateCounter(); await pollPrefs(); }
         else if (tab === "tasks") { await updateCounter(); await pollTasksTab(); }
         else await pollTasks();

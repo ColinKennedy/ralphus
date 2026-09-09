@@ -24,6 +24,7 @@
           <button id="tab-projects" class="tab" style="display:none" onclick="showTab('projects', true)" data-tip="Projects — registered git repositories a task's cell cwd can materialize a worktree under (RAL-100).\nDouble-click Description, Path, or VCS to edit a field, then Save or Cancel.\nA row highlighted in red failed validation — hover its name for why.\nAdmin-only (RAL-332) -- registering/editing a project is gated, but every user's task submissions still read the underlying project/branch list.">Projects</button>
           <button id="tab-users" class="tab" style="display:none" onclick="showTab('users', true)" data-tip="Users — placeholder identities a request can attribute itself to (see AgentAccess/UserContext).\nThis is NOT authentication: no password, no session, no permissions — a name grants nothing on its own.\nTODO: replace with user auth once RAL-252 is done.\nAdmin-only (RAL-332).">Users</button>
           <button id="tab-secrets" class="tab" style="display:none" onclick="showTab('secrets', true)" data-tip="Secrets — env-var names treated as secret (RAL-281).\nA cell/proof step's resolved env is checked by name against this list; a match scrubs that variable's value from durable pane text and terminal logs, in addition to the existing from_env-sourced agent-profile secrets.\nChanges apply immediately, no daemon restart needed.\nAdmin-only (RAL-332).">Secrets</button>
+          <button id="tab-worktree-retirement" class="tab" style="display:none" onclick="showTab('worktree-retirement', true)" data-tip="Worktree retirement (RAL-385/386) — every review worktree across every review, by retirement state: scheduled, eligible, claimed, failed, deferred, opted_out, retired.\nA daily daemon sweep removes review worktrees idle 30+ days; anyone watching a review gets one mailbox heads-up before its worktree is actually removed.\nAdmin-only in this UI (RAL-332) -- the same data is queryable by any user via `ralphus review worktree-retirements`, admin or not.">⏳ Retirement</button>
           <!-- RAL-329: reached via the ⚙ button in the header, not the visible tab row -- kept as a real tab button (hidden) so it shares showTab's page show/hide bookkeeping. -->
           <button id="tab-prefs" class="tab" style="display:none" onclick="showTab('prefs', true)" data-tip="Preferences — your theme setting and your hidden squads/reviews.">Preferences</button>
         </nav>
@@ -100,7 +101,6 @@
           <div class="row" style="justify-content:space-between">
             <b>Reviews</b>
             <span class="row" style="gap:4px">
-              <button class="btn" onclick="openWorktreeRetirementModal()" data-tip="Worktree retirement — every review worktree by retirement state: scheduled (too young), eligible (awaiting the daily cleanup sweep), claimed (kept because a live task/proof/review still needs it), failed (a cleanup attempt failed — hover the detail column for why), retired (removed). Retired rows are kept as history for as long as the review exists.">⏳ Retirement</button>
               <button class="newtask" onclick="openCreateReview()" data-tip="Create a new Guardian review — set up a branch stack to rebase, validate with check gates, and approve for deployment.">＋ Create</button>
             </span>
           </div>
@@ -252,6 +252,14 @@
       <div id="triage"><div class="empty">Loading…</div></div>
     </main>
 
+    <main id="worktree-retirement-page" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <b data-tip="Review worktrees idle for 30 days are retired by a daily daemon sweep.\nscheduled = too young; eligible = old enough -- watchers of the review get one mailbox heads-up, then the sweep after that removes it; claimed = kept because a live task/proof/review still needs it; failed = the last attempt failed; deferred = a machine provider asked to try again later; opted_out = a machine provider or policy declined to ever retire this worktree; retired = removed (kept here as history for as long as the review exists).">Worktree retirement</b>
+        <button class="btn" onclick="pollWorktreeRetirements()" data-tip="Re-fetch the retirement view from the daemon.">↻ Refresh</button>
+      </div>
+      <div id="worktree-retirement"><div class="empty">Loading…</div></div>
+    </main>
+
     <div id="queue-footer" class="queue-footer">
       <span id="queue-footer-msg">Unsaved reordering — nothing is applied until you Save.</span>
       <button onclick="queueCancel()" data-tip="Discard your staged reordering and revert to the last saved order.">Cancel</button>
@@ -294,5 +302,6 @@
     <script src="/board/70-sse.js"></script>
     <script src="/board/75-projects-machines.js"></script>
     <script src="/board/80-queue.js"></script>
+    <script src="/board/81-worktree-retirement.js"></script>
   </body>
 </html>

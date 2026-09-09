@@ -139,7 +139,7 @@
       initSplitters();
 
       // ---------- tabs ----------
-      const TABS = ["squads", "tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "prefs"];
+      const TABS = ["squads", "tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "worktree-retirement", "prefs"];
       /**
        * Switches the active top-level tab, updates its URL hash, and re-renders.
        * @param {string} name
@@ -162,7 +162,7 @@
         byId("updated").textContent = "—";
         for (const t of TABS) {
           const page = byId(t + "-page");
-          page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "triage" || t === "users" || t === "secrets" || t === "prefs" ? "block" : "grid") : "none";
+          page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "triage" || t === "users" || t === "secrets" || t === "worktree-retirement" || t === "prefs" ? "block" : "grid") : "none";
           byId("tab-" + t).classList.toggle("active", name === t);
         }
         // Entering the Queue tab is a deliberate action, so refresh it once on
