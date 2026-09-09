@@ -29,12 +29,29 @@
 //! forcing a hypothetical non-git adapter to implement rebase semantics it
 //! has no way to express.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The VCS kind assumed when a project's kind is unknown or unregistered.
 /// Matches `Store::register_project`'s own default.
 pub const DEFAULT_KIND: &str = "git";
+
+/// Wall-clock cap on any single `git` subprocess this module spawns.
+///
+/// Every git call in the daemon funnels through [`GitVcs::exec_raw`] — including
+/// `git fetch` against a remote (`pr.rs`'s [`compute_sync_status`](crate::pr::compute_sync_status)),
+/// which has no OS-level timeout of its own and can hang indefinitely on a
+/// dead remote, a stalled TCP connection, or an interactive auth prompt with
+/// no TTY to answer it. Without a cap, one stuck fetch blocks every request
+/// serialized behind it (a per-PR `sync_fetch_lock`, or just the daemon's
+/// shared read-thread pool) for as long as the network stays wedged. 60s is
+/// generous for any of this module's *local* operations (diff, rev-parse,
+/// rebase steps) while still bounding a hung network call to something a
+/// user waiting on the board will merely notice rather than have to restart
+/// the daemon over.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The content operations the review path needs from a project's VCS.
 pub trait Vcs: Send + Sync {
@@ -108,9 +125,18 @@ impl GitVcs {
     /// Spawn `git` in `root`, returning the raw process output.
     ///
     /// The single place this module (and, transitively, the whole daemon)
-    /// spawns a `git` subprocess — see the module doc.
+    /// spawns a `git` subprocess — see the module doc. Bounded by
+    /// [`GIT_TIMEOUT`]: the child is killed and an `Err` returned if it
+    /// hasn't exited by then, rather than blocking the caller (and anything
+    /// serialized behind it) forever.
+    ///
+    /// stdout/stderr are drained on background threads rather than read
+    /// after the fact, so a chatty command can't deadlock against the OS
+    /// pipe buffer while this function is busy polling `try_wait` — the same
+    /// reason `std::process::Command::output()` normally does this itself;
+    /// this hand-rolls it only because `output()` has no timeout variant.
     fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-        Command::new("git")
+        let mut child = Command::new("git")
             .args(args)
             .current_dir(root)
             // Harmless for the read-only callers in this impl block, and
@@ -119,8 +145,48 @@ impl GitVcs {
             // site to audit.
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true")
-            .output()
-            .map_err(|e| format!("could not run git: {e}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run git: {e}"))?;
+
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped above");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped above");
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        let deadline = Instant::now() + GIT_TIMEOUT;
+        let status = loop {
+            match child
+                .try_wait()
+                .map_err(|e| format!("could not wait on git {}: {e}", args.join(" ")))?
+            {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "git {} timed out after {GIT_TIMEOUT:?}",
+                        args.join(" ")
+                    ));
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+
+        Ok(std::process::Output {
+            status,
+            stdout: stdout_thread.join().unwrap_or_default(),
+            stderr: stderr_thread.join().unwrap_or_default(),
+        })
     }
 }
 

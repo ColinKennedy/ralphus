@@ -989,6 +989,8 @@
       let pullRequests = {};
       /** @type {{[prId: string]: PrSyncStatus}} last-fetched drift check per still-open PR with a recorded forge number (RAL-190). */
       let prSyncStatus = {};
+      /** @type {Set<string>} PR ids with a `fetchPrSyncStatus` request currently in flight -- lets `pollPullRequests` skip a PR whose previous poll's fetch hasn't resolved yet (the daemon's per-PR git fetch can take several seconds) instead of piling up redundant concurrent requests for the same PR every poll tick. */
+      const prSyncStatusInFlight = new Set();
       /** @type {Map<string, number>} gid -> highest Cartographer row id of a `source=pr` failure already surfaced as a toast, so the passive poll doesn't re-toast one `waitForPrOutcome` already showed, or re-toast on every subsequent poll. */
       const prErrorHighWater = new Map();
       /** @type {{[key: string]: boolean}} peek key -> whether the durable terminal-log attempt-history box (RAL-154) is expanded */

@@ -764,6 +764,16 @@ fn tighten_unix_db_permissions(db_path: &Path) {
     }
 }
 
+/// All four boolean "stamp" columns a project can carry (RAL-250/307/317/
+/// 378), for a single guardian's `git_root`. See
+/// [`Store::load_all_project_stamps`]/[`Store::match_project_stamps`].
+pub(crate) struct ProjectStamps {
+    pub skip_base_updates: Option<bool>,
+    pub match_pr_branch_name: Option<bool>,
+    pub auto_submit_pr_stack: Option<bool>,
+    pub separate_pr_branch: Option<bool>,
+}
+
 impl Store {
     /// Open (creating if needed) a store at `path`, in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
@@ -4000,6 +4010,59 @@ impl Store {
             }
         }
         None
+    }
+
+    /// Loads every registered project's path and all four `project_bool_stamp`
+    /// columns in one query (GUARDIAN_PERF.local.md) -- callers that need
+    /// several guardians' worth of stamps (e.g. `Store::list_guardians`)
+    /// should call this once and reuse the result via
+    /// [`Self::match_project_stamps`], instead of `project_bool_stamp`'s four
+    /// separate full-table-scan queries *per guardian*. Same
+    /// swallow-and-return-empty failure mode as `project_bool_stamp` (a
+    /// project lookup is best-effort, never a hard error).
+    pub(crate) fn load_all_project_stamps(&self) -> Vec<(String, ProjectStamps)> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT path, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch FROM projects",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ProjectStamps {
+                    skip_base_updates: r.get::<_, Option<i64>>(1)?.map(|v| v != 0),
+                    match_pr_branch_name: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                    auto_submit_pr_stack: r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                    separate_pr_branch: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                },
+            ))
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(std::result::Result::ok).collect()
+    }
+
+    /// Prefix-matches `path` against `stamps` (from
+    /// [`Self::load_all_project_stamps`]), using the exact same
+    /// exact-or-ancestor rule as `project_bool_stamp`'s per-column lookup --
+    /// the match is a pure function of `path` and each registered project's
+    /// `path`, independent of which column is read, so one match serves all
+    /// four columns at once. `None` if no registered project owns `path`.
+    pub(crate) fn match_project_stamps<'a>(
+        path: &str,
+        stamps: &'a [(String, ProjectStamps)],
+    ) -> Option<&'a ProjectStamps> {
+        let trimmed = Self::normalize_for_project_lookup(path);
+        stamps.iter().find_map(|(proj, s)| {
+            let proj = Self::normalize_for_project_lookup(proj);
+            let matches = trimmed == proj
+                || trimmed
+                    .strip_prefix(&proj)
+                    .map(|rest| rest.starts_with('/'))
+                    .unwrap_or(false);
+            matches.then_some(s)
+        })
     }
 
     /// Normalizes `path` the same way [`crate::triage::pool_key_for_path`]
@@ -12126,6 +12189,80 @@ command = "check-c"
             None,
             "an unstamped legacy project must resolve to None (not backfilled)"
         );
+    }
+
+    #[test]
+    fn list_guardians_stamp_resolution_matches_get_guardian_across_shared_and_distinct_git_roots() {
+        // GUARDIAN_PERF.local.md: `list_guardians()` now resolves every
+        // guardian's project-stamp fields via one shared, call-scoped
+        // context (`GuardianHydrationCtx`) instead of `hydrate_guardian`
+        // re-querying `projects` per guardian. This proves that batching
+        // didn't introduce cross-guardian contamination: two guardians
+        // sharing a git_root must resolve identically to each other AND to
+        // an independent `get_guardian` call, while a guardian at a
+        // *different* registered project (with a different stamp) and one
+        // at an *unregistered* path must each resolve their own, distinct
+        // value -- not leak another guardian's cached config.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_stamp(
+                "proj-a",
+                "",
+                "C:/repos/proj-a",
+                "git",
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .register_project_with_stamp(
+                "proj-b",
+                "",
+                "C:/repos/proj-b",
+                "git",
+                Some(false),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Two guardians share proj-a's git_root (exercises the per-git_root
+        // memoization); one is at proj-b; one is at an unregistered path.
+        let id_a1 = store
+            .create_guardian("a1", "main", "C:/repos/proj-a")
+            .unwrap();
+        let id_a2 = store
+            .create_guardian("a2", "main", "C:/repos/proj-a")
+            .unwrap();
+        let id_b = store
+            .create_guardian("b", "main", "C:/repos/proj-b")
+            .unwrap();
+        let id_unregistered = store
+            .create_guardian("u", "main", "C:/repos/unregistered")
+            .unwrap();
+
+        let list = store.list_guardians().unwrap();
+        let find = |id: &str| list.iter().find(|g| g.id == id).unwrap();
+
+        assert!(find(&id_a1).effective_skip_base_updates);
+        assert!(find(&id_a2).effective_skip_base_updates);
+        assert!(!find(&id_b).effective_skip_base_updates);
+        // Unregistered path: no project stamp, live global default (false).
+        assert!(!find(&id_unregistered).effective_skip_base_updates);
+
+        // The batched list path must agree with the unbatched single-guardian
+        // path for every guardian, not just happen to match by coincidence.
+        for id in [&id_a1, &id_a2, &id_b, &id_unregistered] {
+            let listed = find(id);
+            let fetched = store.get_guardian(id).unwrap();
+            assert_eq!(
+                listed.effective_skip_base_updates, fetched.effective_skip_base_updates,
+                "list_guardians and get_guardian disagree for {id}"
+            );
+        }
     }
 
     #[test]

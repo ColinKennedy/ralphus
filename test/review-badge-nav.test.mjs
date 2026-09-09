@@ -213,6 +213,32 @@ test("a hash-navigated review that IS loaded doesn't flip the loading placeholde
   assert.equal(poll.state().reviewDetailLoading, null);
 });
 
+// ---------- pollReviews: renders immediately, doesn't wait on the slow per-branch/PR refreshes ----------
+
+test("the list/detail render fires as soon as the guardian list lands, before the slower branch/PR/conflict refreshes resolve", async () => {
+  // Regression coverage for the 30-50s Reviews-tab freeze: `pollPullRequests`
+  // hits PR sync-status, which can take many real seconds per open PR. The
+  // whole tab must not sit blank waiting on that -- the list is already
+  // loaded and should render right away.
+  const slowRefresh = deferred();
+  const poll = makePollReviews({ slowRefresh: slowRefresh.promise });
+  const promise = poll.pollReviews();
+
+  resolveJson(poll.pendingFetches[0], [{ id: "review-a", name: "a", status: "in_review" }]);
+  // Let the guardian-list handling (selection, hash sync) run, but the
+  // per-selected-guardian refreshes are still parked on `slowRefresh`.
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(poll.calls.renderReviews, 1, "the list must render before the slow refreshes resolve, not after");
+  assert.equal(poll.calls.renderReviewDetail, 1);
+
+  slowRefresh.resolve();
+  await promise;
+  assert.equal(poll.calls.renderReviews, 2, "a second render reflects the branch/PR/conflict data once it lands");
+  assert.equal(poll.calls.renderReviewDetail, 2);
+});
+
 // ---------- pollReviews: freshness stamp (board freshness-indicator honesty fix) ----------
 
 test("a completed poll stamps the freshness indicator", async () => {
